@@ -104,6 +104,11 @@ FOOTPRINT_NAME = "daemon-footprint"
 # leftover with a one-byte operator budget in it.
 GIB = 1024 * 1024 * 1024
 
+# An endpoint nothing can be listening on, for the arms that need a dispatch to
+# fail rather than a daemon to answer. Port 1 is privileged and unused, so a
+# connection there refuses immediately and deterministically instead of hanging.
+DEAD_ENDPOINT = "http://127.0.0.1:1"
+
 
 def tail(text, limit=400):
     """The END of a command's output, which is where its error is."""
@@ -276,6 +281,47 @@ def status_discloses_the_refusal(text):
     return "memory pressure" in text and "⚠" in text
 
 
+def offers_the_idle_window(text):
+    """Whether the text explains a lost daemon as an idle-window exit.
+
+    The exact advice the measured run gave for an OOM kill, and the reason
+    FIR-2650 is a defect rather than a wording preference: re-running is a
+    terminating fix for a daemon that retired, and a loop that cannot terminate
+    for one the kernel killed at this repository's size.
+
+    Graded in both directions on purpose. A build that simply deleted the
+    sentence would pass a one-sided check while telling every ordinary reader
+    nothing, so the control arm requires this to be TRUE where the daemon really
+    did retire.
+    """
+    text = text or ""
+    return "idle window" in text and "re-run" in text
+
+
+def enrichment_line(text):
+    """The durable enrichment line out of `kin status`, or None.
+
+    None is UNREADABLE rather than a verdict: a build whose status page carries
+    no such line cannot be graded by a check that is about that line.
+    """
+    for line in (text or "").splitlines():
+        if line.startswith("Durable semantic enrichment:"):
+            return line
+    return None
+
+
+def enrichment_names_a_kill(line):
+    """Whether the enrichment line says a daemon serving this store was killed.
+
+    "Completion not attested" is true of every store, which is exactly why it
+    hid this one: the counts, the presence and the caveat were identical to a
+    store whose enrichment simply had not been certified yet. Both halves are
+    required, because the caveat alone is what the defect looked like.
+    """
+    line = line or ""
+    return "completion not attested" in line and "killed" in line
+
+
 GRADERS = {
     "names_a_death": names_a_death,
     "names_memory_with_a_figure": names_memory_with_a_figure,
@@ -284,6 +330,8 @@ GRADERS = {
     "status_discloses_the_refusal": status_discloses_the_refusal,
     "reason_names_the_budget": reason_names_the_budget,
     "status_publishes_the_standing": status_publishes_the_standing,
+    "offers_the_idle_window": offers_the_idle_window,
+    "enrichment_names_a_kill": enrichment_names_a_kill,
 }
 
 
@@ -306,6 +354,10 @@ class Suite(object):
         self.env["KIN_VFS_DISABLE"] = "1"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
+        # An inherited endpoint would decide every probe below for it, and the
+        # lost-request checks would then be grading whatever daemon the operator
+        # happened to have running.
+        self.env.pop("KIN_DAEMON_URL", None)
         # Inherited pressure would decide this suite's control runs for it. The
         # runner's own state is never an input here.
         self.env.pop("KIN_MEMORY_PRESSURE", None)
@@ -322,13 +374,20 @@ class Suite(object):
                 "-c", "commit.gpgsign=false"]
         return run(base + args, cwd=cwd, env=self.env)
 
-    def kin_run(self, args, repo, pressure=None, budget=None, timeout=600):
+    def kin_run(self, args, repo, pressure=None, budget=None, timeout=600,
+                daemon_url=None):
         """One `kin` command, optionally under a pinned pressure level.
 
         The level reaches the daemon only through the command that STARTS one:
         a repo worker captures its environment at process start and a later
         command talking to it over HTTP cannot change what it holds. Every
         pressured probe below therefore stops the daemon first.
+
+        `daemon_url` pins the endpoint the command dispatches to, which is how
+        the checks about a LOST request stay deterministic. Without it the CLI
+        resolves an endpoint and starts a replacement daemon when it finds
+        none, so a probe meant to grade a failed dispatch would race a respawn
+        and usually lose.
         """
         env = dict(self.env)
         if pressure is None:
@@ -339,6 +398,10 @@ class Suite(object):
             env.pop("KIN_DAEMON_MEMORY_BUDGET_BYTES", None)
         else:
             env["KIN_DAEMON_MEMORY_BUDGET_BYTES"] = str(budget)
+        if daemon_url is None:
+            env.pop("KIN_DAEMON_URL", None)
+        else:
+            env["KIN_DAEMON_URL"] = daemon_url
         return run([self.kin] + args, cwd=repo, env=env, timeout=timeout)
 
     def restart_daemon(self, repo, pressure=None, budget=None):
@@ -366,6 +429,20 @@ class Suite(object):
                 return int(handle.read().strip().splitlines()[0])
         except (IOError, OSError, ValueError, IndexError):
             return None
+
+    def daemon_endpoint(self, repo):
+        """The endpoint this store's daemon published, or None.
+
+        Read from the store rather than parsed out of a log, because it is the
+        same file the CLI resolves an endpoint from, so a check pinning it sends
+        its request exactly where the CLI would have sent it.
+        """
+        try:
+            with open(os.path.join(repo, ".kin", "daemon.port")) as handle:
+                port = int(handle.read().strip().splitlines()[0])
+        except (IOError, OSError, ValueError, IndexError):
+            return None
+        return "http://127.0.0.1:%d" % port
 
     def read_kill_record(self, repo):
         """The kill record this store carries, or None."""
@@ -869,8 +946,178 @@ def check_7(suite):
     return result
 
 
+def check_8(suite):
+    """FIR-2650: the sentence a lost request ends with stops asserting the idle window.
+
+    Checks 6 and 7 prove the store RECORDS a death and that `kin graph status`
+    and `kin doctor` read it. This is the surface the measured sentence actually
+    came from, and it was still wrong after them:
+
+        the kin daemon at http://127.0.0.1:39767 stopped answering while the lsp
+        sweep status request was in flight; it exits after its idle window, so
+        re-run the command and kin will start a fresh one
+
+    That is built from the endpoint and the request name alone. It asks nothing
+    about whether the daemon is alive, so it says "idle window" for a daemon the
+    kernel OOM-killed fourteen seconds earlier, and its advice is to re-run,
+    which at that repository size is a loop that cannot terminate.
+
+    Both arms run against real daemons and a real SIGKILL, which is the signal
+    the OOM killer sends. The difference between them is one file: the serving
+    record a killed daemon leaves behind and a retiring one takes with it.
+
+    The control is not decoration. A build that deleted the idle-window sentence
+    outright would pass the killed arm and would have told every ordinary reader
+    nothing, so the control REQUIRES the old sentence where the daemon really
+    did retire.
+    """
+    result = Result(
+        "8", TICKET,
+        "a request lost to a killed daemon is not explained as an idle-window exit",
+    )
+
+    # The control arm. A daemon that stops on its own terms retires its serving
+    # record with its endpoint, so this store can prove no death, and the
+    # ordinary explanation is the right one.
+    quiet = suite.fixture("retired")
+    rc, out = suite.restart_daemon(quiet, pressure="nominal")
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    run([suite.kin, "daemon", "stop"], cwd=quiet, env=suite.env, timeout=180)
+    rc, out = suite.kin_run(["graph", "status"], quiet, pressure="nominal",
+                            daemon_url=DEAD_ENDPOINT)
+    if offers_the_idle_window(out):
+        result.ok("a store whose daemon retired still reads as an idle-window exit")
+    else:
+        result.bad("the idle-window explanation is gone from a store that has lost no "
+                   "daemon, so every ordinary reader now gets nothing. Output: %s"
+                   % tail(out, 700))
+
+    # The measured arm.
+    repo = suite.fixture("lostrequest")
+    rc, out = suite.restart_daemon(repo, pressure="nominal")
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    pid = suite.daemon_pid(repo)
+    if pid is None:
+        result.unknown("no daemon pid was published at %s" % suite.pid_path(repo))
+        return result
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError as error:
+        result.unknown("could not kill the daemon at pid %s: %s" % (pid, error))
+        return result
+
+    # Pinned at the endpoint that daemon published, so the request goes where
+    # the measured one went and fails the way it failed. Pinning also keeps the
+    # CLI from starting a replacement, which is what makes this deterministic
+    # rather than a race against a respawn.
+    endpoint = suite.daemon_endpoint(repo) or DEAD_ENDPOINT
+    rc, out = suite.kin_run(["graph", "status"], repo, pressure="nominal",
+                            daemon_url=endpoint)
+    if rc == 0:
+        result.unknown("the request to %s succeeded after the daemon was killed, so nothing "
+                       "here graded a lost request" % endpoint)
+        return result
+    if offers_the_idle_window(out):
+        result.bad("kin explained a SIGKILLed daemon as an idle-window exit and advised a "
+                   "re-run, which is the advice that cannot terminate when the cause "
+                   "recurs. Output: %s" % tail(out, 900))
+    elif names_a_death(out):
+        result.ok("the lost request names the death instead of the idle window")
+    else:
+        result.bad("kin named neither an idle window nor a death for a daemon it had just "
+                   "lost, so the reader is left with a socket error. Output: %s"
+                   % tail(out, 900))
+    return result
+
+
+def check_9(suite):
+    """FIR-2650: an enrichment nobody attested says whether a daemon was killed.
+
+    The other half of the measured report. `kin init` exited 0 over a 1.1 GB
+    store and summarized the enrichment as
+
+        present (1058 entities, 2016 relations, 6731 changes in durable
+        authority generation 1; completion not attested)
+
+    while the daemon that would have finished it lay OOM-killed. Every word of
+    that is true of a perfectly healthy store whose enrichment simply has not
+    been certified yet, so the two are byte-identical on this surface and the
+    reader has no signal at all.
+
+    The claim the fix may make is joint and not causal: this store's enrichment
+    is unattested AND a daemon serving it was killed. Whether that kill is what
+    stopped the enrichment is not something the record establishes, so the check
+    does not ask for it.
+
+    `kin status` is the surface probed because it is the durable one and it can
+    be asked again. `kin init` renders the same clause from the same function
+    and prints it once per repository, which no scripted check can re-ask; its
+    rendering is covered by unit test in `commands/init.rs` instead.
+    """
+    result = Result(
+        "9", TICKET,
+        "an unattested enrichment names the daemon kill behind it, or names none",
+    )
+
+    # The control first, so a build that named a kill unconditionally fails here
+    # rather than passing on the killed arm alone.
+    quiet = suite.fixture("attested")
+    rc, out = suite.kin_run(["status"], quiet, pressure="nominal")
+    line = enrichment_line(out)
+    if line is None:
+        result.unknown("this build's `kin status` carries no durable enrichment line: %s"
+                       % tail(out, 700))
+        return result
+    if enrichment_names_a_kill(line):
+        result.bad("a store that has lost no daemon reports one anyway: %s" % line)
+    else:
+        result.ok("a store that has lost no daemon names no kill")
+
+    repo = suite.fixture("killedenrich")
+    rc, out = suite.restart_daemon(repo, pressure="nominal")
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    pid = suite.daemon_pid(repo)
+    if pid is None:
+        result.unknown("no daemon pid was published at %s" % suite.pid_path(repo))
+        return result
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError as error:
+        result.unknown("could not kill the daemon at pid %s: %s" % (pid, error))
+        return result
+
+    rc, out = suite.kin_run(["status"], repo, pressure="nominal")
+    line = enrichment_line(out)
+    if line is None:
+        result.unknown("this build's `kin status` carries no durable enrichment line after "
+                       "the kill: %s" % tail(out, 700))
+        return result
+    if enrichment_names_a_kill(line):
+        result.ok("the enrichment line names the kill beside its counts")
+    else:
+        result.bad("the enrichment of a store whose daemon was killed reads exactly like one "
+                   "that was merely never certified: %s" % line)
+
+    # The cause and the remedy belong on the page too. A line that says a daemon
+    # was killed and stops there tells a reader something happened and nothing
+    # about what to do, which is most of the way back to the parenthetical.
+    if "To recover:" in out:
+        result.ok("the page carries the remedy beside the kill")
+    else:
+        result.bad("the page names a kill and offers no way out of it. Output: %s"
+                   % tail(out, 900))
+    return result
+
+
 CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
-          ("4", check_4), ("5", check_5), ("6", check_6), ("7", check_7)]
+          ("4", check_4), ("5", check_5), ("6", check_6), ("7", check_7),
+          ("8", check_8), ("9", check_9)]
 
 
 # ------------------------------------------------------------------ self-test
@@ -1006,6 +1253,61 @@ def self_test():
         if got != want:
             failures.append("names_memory_with_a_figure(%r) = %s, wanted %s" % (text, got, want))
 
+    idle_cases = [
+        # The measured sentence, verbatim. This grader exists to recognize it.
+        (True, "the kin daemon at http://127.0.0.1:39767 stopped answering while the lsp "
+               "sweep status request was in flight; it exits after its idle window, so "
+               "re-run the command and kin will start a fresh one"),
+        # The fixed sentence, which names the window only to say it was not the
+        # cause and offers no re-run. A grader that matched "idle window" alone
+        # would call this the defect and stay red on the fix forever.
+        (False, "the kin daemon at http://127.0.0.1:39767 stopped answering while the lsp "
+                "sweep status request was in flight, and it did not exit its idle window: "
+                "The daemon for this store was killed by the memory limit 1 time(s)"),
+        (False, "daemon graph command failed: connection refused"),
+        (False, ""),
+        (False, None),
+    ]
+    for want, text in idle_cases:
+        got = offers_the_idle_window(text)
+        if got != want:
+            failures.append("offers_the_idle_window(%r) = %s, wanted %s" % (text, got, want))
+
+    enrichment_cases = [
+        (True, "Durable semantic enrichment: present (1058 entities, 2016 relations, 6731 "
+               "changes at authority generation 1, workspace generation 1; completion not "
+               "attested, and a daemon serving this store was killed)"),
+        # The measured line, which is the one this grader must reject.
+        (False, "Durable semantic enrichment: present (1058 entities, 2016 relations, 6731 "
+                "changes at authority generation 1, workspace generation 1; completion not "
+                "attested)"),
+        # A line that dropped the caveat is not a fix either: the counts are
+        # still unattested, and a reader told only about a kill loses that.
+        (False, "Durable semantic enrichment: present (1058 entities; a daemon serving this "
+                "store was killed)"),
+        (False, ""),
+        (False, None),
+    ]
+    for want, line in enrichment_cases:
+        got = enrichment_names_a_kill(line)
+        if got != want:
+            failures.append("enrichment_names_a_kill(%r) = %s, wanted %s" % (line, got, want))
+
+    # The line extractor must find the durable line and only that line.
+    line_cases = [
+        ("Kin repository-v6 status\nDurable semantic enrichment: present (1)\nRefs: 1",
+         "Durable semantic enrichment: present (1)"),
+        # The live line names enrichment too, and picking it would grade the
+        # wrong sentence.
+        ("Live graph enrichment: see `kin graph status`", None),
+        ("", None),
+        (None, None),
+    ]
+    for text, exact in line_cases:
+        got = enrichment_line(text)
+        if got != exact:
+            failures.append("enrichment_line(%r) = %r, wanted %r" % (text, got, exact))
+
     # `tail` must keep the END of an output, which is where the error is.
     tail_cases = [
         ("short", "short"),
@@ -1038,7 +1340,8 @@ def self_test():
         print("SELFTEST FAIL %s" % failure)
     total = (len(row_cases) + len(healthy_cases) + len(status_cases)
              + len(budget_cases) + len(standing_cases) + len(death_cases)
-             + len(memory_cases) + len(tail_cases) + len(grade_cases))
+             + len(memory_cases) + len(idle_cases) + len(enrichment_cases)
+             + len(line_cases) + len(tail_cases) + len(grade_cases))
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0

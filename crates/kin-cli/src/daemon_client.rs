@@ -306,6 +306,14 @@ pub struct DaemonClient {
     /// Carries the same endpoint authority as `client`, but never follows an
     /// HTTP redirect that could redispatch a non-idempotent mutation.
     one_dispatch_client: reqwest::Client,
+    /// The store this client's daemon serves, when one was resolvable.
+    ///
+    /// Held so that a request which goes unanswered can ask the store what
+    /// happened to its daemon instead of asserting the ordinary cause. A
+    /// transport error describes a socket; the killer leaves its evidence in
+    /// the repository, and without a root there is nowhere to read it.
+    /// `None` behaves exactly as this client behaved before it had this field.
+    kin_root: Option<PathBuf>,
 }
 
 /// A mutating daemon command was dispatched, but its committed outcome could
@@ -544,11 +552,20 @@ impl DaemonClient {
 
     /// Build a client for `layout`'s daemon, resolving the bearer token from
     /// that layout rather than from the process working directory.
+    ///
+    /// The store root comes from the layout for the same reason the token
+    /// does. `kin init` takes the repository as an argument, so on a runner
+    /// whose working directory is not that repository, discovery from the
+    /// process working directory finds the wrong store or none, and the
+    /// evidence about a daemon that died is in the one the layout names.
     pub fn from_base_url_for_layout(
         base_url: impl Into<String>,
         layout: &KinLayout,
     ) -> Result<Self> {
-        Self::from_base_url_with_token(base_url, resolve_daemon_auth_token_for_layout(layout))
+        let mut client =
+            Self::from_base_url_with_token(base_url, resolve_daemon_auth_token_for_layout(layout))?;
+        client.kin_root = Some(layout.root().to_path_buf());
+        Ok(client)
     }
 
     fn from_base_url_with_token(
@@ -598,7 +615,17 @@ impl DaemonClient {
             base_url,
             client,
             one_dispatch_client,
+            // Discovery from the working directory is the fallback every
+            // constructor but the layout one gets. A caller standing outside a
+            // repository resolves nothing, which is the same reading as a store
+            // that never lost a daemon and leaves every message unchanged.
+            kin_root: crate::daemon_death::kin_root_from_cwd(),
         })
+    }
+
+    /// The store whose records explain a daemon of this endpoint that died.
+    fn kin_root(&self) -> Option<&Path> {
+        self.kin_root.as_deref()
     }
 
     async fn send(
@@ -609,7 +636,7 @@ impl DaemonClient {
         let resp = request
             .send()
             .await
-            .with_context(|| daemon_send_failure_message(&self.base_url, leaf))?;
+            .with_context(|| daemon_send_failure_message(&self.base_url, leaf, self.kin_root()))?;
         check_response_build_match(resp.headers())?;
         Ok(resp)
     }
@@ -1619,10 +1646,9 @@ impl DaemonClient {
         {
             Ok(response) => response,
             Err(error) => {
-                return AdmitDispatch::Unanswered(
-                    anyhow::Error::new(error)
-                        .context(daemon_send_failure_message(&self.base_url, "admit")),
-                )
+                return AdmitDispatch::Unanswered(anyhow::Error::new(error).context(
+                    daemon_send_failure_message(&self.base_url, "admit", self.kin_root()),
+                ))
             }
         };
         if let Err(error) = check_response_build_match(response.headers()) {
@@ -1971,7 +1997,21 @@ fn behavior_env_divergence_message(divergences: &[kin_core::behavior_env::Diverg
 /// that never lands is a daemon that retired between URL resolution and this
 /// dispatch. Naming the endpoint and the command keeps the plumbing verb out of
 /// the headline.
-fn daemon_send_failure_message(base_url: &str, leaf: &str) -> String {
+///
+/// The idle window is the ordinary cause and not the only one, and this used to
+/// assert it unconditionally, from the endpoint and the request name alone,
+/// having asked nothing about whether the daemon was alive. On the measured
+/// FIR-2650 run it named an idle window for a daemon the kernel had OOM-killed
+/// fourteen seconds earlier, and told the reader to re-run. That advice cannot
+/// terminate: an OOM at that repository size recurs on every attempt.
+///
+/// So the store is asked first. It answers only when it can prove a death, and
+/// on every host that has never lost a daemon it answers nothing and this
+/// message stays byte for byte what it was.
+fn daemon_send_failure_message(base_url: &str, leaf: &str, kin_root: Option<&Path>) -> String {
+    if let Some(record) = kin_root.and_then(crate::daemon_death::most_recent_death) {
+        return crate::daemon_death::dropped_request_sentence(base_url, leaf, &record);
+    }
     format!(
         "the kin daemon at {base_url} stopped answering while the {leaf} request was in flight; \
          it exits after its idle window, so re-run the command and kin will start a fresh one"
@@ -11343,7 +11383,10 @@ mod tests {
 
     #[test]
     fn a_dropped_request_names_the_endpoint_the_command_and_the_way_back() {
-        let message = daemon_send_failure_message("http://127.0.0.1:51234", "locate");
+        // A store this process could not resolve, which is also what a store
+        // that never lost a daemon reads as. The idle window is the ordinary
+        // cause and must still be offered here.
+        let message = daemon_send_failure_message("http://127.0.0.1:51234", "locate", None);
         assert!(
             message.contains("http://127.0.0.1:51234"),
             "the reader cannot tell which daemon went away without its endpoint: {message}"
@@ -11359,6 +11402,61 @@ mod tests {
         assert!(
             !message.starts_with("send "),
             "the dispatch verb was the defect being fixed: {message}"
+        );
+    }
+
+    /// The store's own record replaces the idle window when it can prove a
+    /// death, and leaves it alone when it cannot.
+    ///
+    /// The FIR-2650 pair, on the surface the measured sentence came from. Both
+    /// arms run against a real directory, so the difference between them is the
+    /// record and nothing else: a check that only ever saw the killed arm would
+    /// pass a build that had simply stopped offering the idle window at all,
+    /// which would be a second defect wearing the first one's fix.
+    #[test]
+    fn a_dropped_request_over_a_killed_daemon_stops_offering_the_idle_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let quiet = daemon_send_failure_message(
+            "http://127.0.0.1:39767",
+            "lsp sweep status",
+            Some(dir.path()),
+        );
+        assert!(
+            quiet.contains("idle window") && quiet.contains("re-run"),
+            "a store that has lost no daemon must read exactly as it always did: {quiet}"
+        );
+
+        // The trace a killed daemon leaves: a serving record it published at
+        // start and never reached the line to retire. The pid cannot be alive,
+        // so this is deterministic rather than a race against whatever holds
+        // that number today.
+        std::fs::write(
+            kin_daemon_spawn::serving_path(dir.path()),
+            serde_json::to_vec(&kin_daemon_spawn::ServingDaemon {
+                pid: u32::MAX,
+                oom_kills_at_start: Some(0),
+                at_unix: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let killed = daemon_send_failure_message(
+            "http://127.0.0.1:39767",
+            "lsp sweep status",
+            Some(dir.path()),
+        );
+        assert!(
+            killed.contains("killed"),
+            "the daemon died and the message has to say so: {killed}"
+        );
+        assert!(
+            !killed.contains("idle window, so re-run"),
+            "re-running is the advice that cannot terminate when the cause recurs: {killed}"
+        );
+        assert!(
+            killed.contains("http://127.0.0.1:39767") && killed.contains("lsp sweep status"),
+            "the endpoint and the request in flight are still the subject: {killed}"
         );
     }
 

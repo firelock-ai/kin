@@ -971,7 +971,15 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         let footprint = StoreFootprint::measure(&layout);
-        print!("{}", render_text(&report, None, Some(&footprint)));
+        print!(
+            "{}",
+            render_text(
+                &report,
+                None,
+                Some(&footprint),
+                crate::daemon_death::recorded_for_store(layout.root()).as_ref()
+            )
+        );
         // Which projection served the files this status describes. Appended
         // here rather than folded into the report for the same reason store
         // size is: the report is authority truth and must not move with the
@@ -1018,8 +1026,9 @@ pub fn build_command_status_response(
     json: bool,
     build: Option<BuildStatus>,
     footprint: Option<&StoreFootprint>,
+    death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<CommandStatusResponse> {
-    let text = render_text(&report, build.as_ref(), footprint);
+    let text = render_text(&report, build.as_ref(), footprint, death);
     let json = json
         .then(|| serde_json::to_string(&report))
         .transpose()
@@ -1042,10 +1051,18 @@ pub fn build_command_status_response(
 /// moves whenever the working tree does. Carrying it inside the report would
 /// have made authority status vary with the filesystem, so it rides alongside
 /// the report on the text surface instead, exactly as the build stamp does.
+///
+/// `death` rides alongside for the same reason again, and it is the reading
+/// FIR-2650 is about. A store whose daemon was killed mid-enrichment carried
+/// the words "completion not attested" and nothing else, which is what a store
+/// whose enrichment simply has not been certified yet also carries. The counts
+/// matched, the presence matched, and the caveat matched, so the two were
+/// indistinguishable on this surface.
 fn render_text(
     report: &StatusReport,
     build: Option<&BuildStatus>,
     footprint: Option<&StoreFootprint>,
+    death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> String {
     // Named as a comparison against the base change rather than as "clean" or
     // "dirty". Both bare words invite the reading "everything on disk is in the
@@ -1086,12 +1103,13 @@ fn render_text(
                 .unwrap_or_default()
         ),
         format!(
-            "Durable semantic enrichment: {enrichment} ({} entities, {} relations, {} changes at authority generation {}, workspace generation {}; completion not attested)",
+            "Durable semantic enrichment: {enrichment} ({} entities, {} relations, {} changes at authority generation {}, workspace generation {}; {})",
             report.semantic_enrichment.entity_count,
             report.semantic_enrichment.relation_count,
             report.semantic_enrichment.semantic_change_count,
             report.semantic_enrichment.authority_generation,
-            report.semantic_enrichment.workspace_generation
+            report.semantic_enrichment.workspace_generation,
+            crate::daemon_death::enrichment_clause(death)
         ),
         // The counter above is durable authority truth; `kin graph status`
         // measures the daemon's live query graph and excludes external
@@ -1129,6 +1147,13 @@ fn render_text(
             build_id(&build.cli_sha, build.cli_dirty),
             build_id(&build.daemon_sha, build.daemon_dirty)
         ));
+    }
+    // A warning of its own rather than more parenthesis. The counts above
+    // describe what was derived; this describes whether anything more was
+    // coming, and it quotes the record's own summary so this page says what
+    // `kin graph status` and `kin doctor` say about the same store.
+    if let Some(death) = death {
+        lines.push(format!("⚠ {}", death.summary()));
     }
     lines.into_iter().map(|line| format!("{line}\n")).collect()
 }
@@ -1260,7 +1285,7 @@ mod tests {
             payload.snapshot_bytes + payload.acknowledged_delta_bytes
         );
         assert!(
-            render_text(&report, None, None).contains("Authority payload read: "),
+            render_text(&report, None, None, None).contains("Authority payload read: "),
             "text status must state the payload the open read"
         );
 
@@ -1561,7 +1586,7 @@ mod tests {
             EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoVectorIndexAttached),
         )
         .unwrap();
-        let rendered = render_text(&unobserved, None, None);
+        let rendered = render_text(&unobserved, None, None, None);
         assert!(
             rendered.contains(
                 "Live embedding coverage: not observed (the live graph carries no vector index)"
@@ -1585,10 +1610,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            render_text(&observed, None, None)
+            render_text(&observed, None, None, None)
                 .contains("Live embedding coverage: 41/57 indexed, 16 pending (live query graph)"),
             "{}",
-            render_text(&observed, None, None)
+            render_text(&observed, None, None, None)
         );
     }
 
@@ -1607,14 +1632,14 @@ mod tests {
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
         let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
 
-        let without = render_text(&report, None, None);
+        let without = render_text(&report, None, None, None);
         assert!(
             !without.contains("Store size"),
             "an unmeasured status must print no store line at all: {without}"
         );
 
         let footprint = StoreFootprint::measure(&init.layout);
-        let with = render_text(&report, None, Some(&footprint));
+        let with = render_text(&report, None, Some(&footprint), None);
         assert!(
             with.contains("Store size: ") && with.contains("under .kin/"),
             "a measured status must print the store line: {with}"
