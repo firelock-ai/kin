@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.51] - 2026-08-23
+
+### Changed
+
+- Keep a scratch KIN_HOME from reading the operator's repository registry (#1088)
+- Say what the shim cannot project, now that Node is not it (#1085)
+- Publish the per-file parse observation on stores converted from Git (#1080)
+- Disclose what a context pack's token budget refused, instead of rendering the loss as absence (#1084)
+- Tell a stranger where a commit lands, how to install without root, and why a language server would not download (#1089)
+- Give the daemon a budget it can measure, counting the processes it started (#1086)
+- Ask what the operator wants before asking what the machine has (#1090)
+- Bind the two-hop receiver through a repository-wide declared-attribute table (#1077)
+- Grade which budget an elision names, not merely that it names one (#1092)
+- Let the heap probe see inside the phase that holds the peak (#1093)
+- Read the cgroup that binds this process, not the root of the mount (#1095)
+- Stop the resource-profile knob from making kin complain about the machine (#1094)
+- Stop three surfaces asserting answers their authority never produced (#1078)
+
+
 ## [0.5.50] - 2026-08-22
 
 ### Changed
