@@ -120,6 +120,22 @@ def tail(text, limit=400):
     return text if len(text) <= limit else "..." + text[-limit:]
 
 
+def _is_zombie(pid):
+    """Whether `pid` names a process that has exited and not been reaped.
+
+    Linux only, through `/proc`. Everywhere else this is False, which is
+    correct rather than a gap: the caller pairs it with `os.kill(pid, 0)`, and
+    on a host with no `/proc` an unreaped child still answers that call, so the
+    wait falls back to its timeout instead of reporting a wrong state.
+    """
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            fields = handle.read().rsplit(")", 1)[-1].split()
+        return bool(fields) and fields[0] == "Z"
+    except (IOError, OSError, IndexError):
+        return False
+
+
 def run(cmd, cwd=None, env=None, timeout=600):
     proc = subprocess.run(
         cmd, cwd=cwd, env=env, timeout=timeout,
@@ -462,6 +478,34 @@ class Suite(object):
                 return int(handle.read().strip().splitlines()[0])
         except (IOError, OSError, ValueError, IndexError):
             return None
+
+    def wait_for_exit(self, pid, seconds=30):
+        """Wait until `pid` is no longer a live process. True if it went.
+
+        `os.kill` returns before the kernel has finished tearing a process down,
+        and until it has, the pid still answers as alive. The two hosts show
+        that window differently: on macOS the killed daemon's port already
+        refuses a connection, while on a Linux runner the socket stayed open
+        long enough to accept one and reset it, `Connection reset by peer (os
+        error 104)`. A check about a request lost to a daemon that is ALREADY
+        dead has to establish that rather than assume it, or it grades a
+        different state on one host than on the other, which is exactly what
+        happened.
+
+        A zombie counts as gone. `os.kill(pid, 0)` succeeds on one, so a wait
+        that only asked that question would spin until it timed out on any host
+        whose parent had not reaped the child yet.
+        """
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            try:
+                os.kill(pid, 0)
+            except OSError:
+                return True
+            if _is_zombie(pid):
+                return True
+            time.sleep(0.2)
+        return False
 
     def daemon_endpoint(self, repo):
         """The endpoint this store's daemon published, or None.
@@ -1042,6 +1086,16 @@ def check_8(suite):
     except OSError as error:
         result.unknown("could not kill the daemon at pid %s: %s" % (pid, error))
         return result
+    # This arm is about a request lost to a daemon that is ALREADY dead, so the
+    # death is established rather than assumed. Without this wait the arm graded
+    # a different state on each host: macOS refused the connection outright,
+    # while a Linux runner accepted it and reset it with the pid still alive,
+    # which is a real product state and a different one, covered by its own
+    # unit test rather than here.
+    if not suite.wait_for_exit(pid):
+        result.unknown("pid %s was still present 30s after SIGKILL, so nothing here graded "
+                       "a request lost to a daemon that had already died" % pid)
+        return result
 
     # Pinned at the endpoint that daemon published, so the request goes where
     # the measured one went and fails the way it failed. Pinning also keeps the
@@ -1157,6 +1211,10 @@ def check_9(suite):
         os.kill(pid, signal.SIGKILL)
     except OSError as error:
         result.unknown("could not kill the daemon at pid %s: %s" % (pid, error))
+        return result
+    if not suite.wait_for_exit(pid):
+        result.unknown("pid %s was still present 30s after SIGKILL, so the store had no "
+                       "death to report yet" % pid)
         return result
 
     rc, out = suite.kin_run(["status"], repo, pressure="nominal")

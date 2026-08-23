@@ -50,6 +50,51 @@ pub fn most_recent_death(kin_root: &Path) -> Option<DaemonKillRecord> {
     kin_daemon_spawn::peek_unwatched_daemon_death(kin_root)
 }
 
+/// What this store can say about the daemon that just stopped answering.
+///
+/// Three states, because the surface this feeds had two and one of them was
+/// doing the work of both.
+pub enum DaemonNotAnswering {
+    /// The store's most recent daemon was killed.
+    Killed(Box<DaemonKillRecord>),
+    /// A daemon is recorded as serving this store and its process is still
+    /// present, so whatever is wrong, it did not take the idle-window path.
+    ///
+    /// Two situations land here and neither is the idle window. A daemon can be
+    /// wedged, present and not answering. And a daemon can be part way through
+    /// dying: `SIGKILL` returns before the kernel has finished tearing a process
+    /// down, and until it has, the pid still reads as alive. The two hosts show
+    /// that window differently, which is how it was found. On macOS the port
+    /// already refuses the connection, so the process was gone; on a Linux
+    /// runner the socket stayed open long enough to accept the connection and
+    /// then reset it, `Connection reset by peer (os error 104)`, and the pid was
+    /// still alive when the message was built.
+    ///
+    /// Reporting either as an idle-window exit is the FIR-2650 defect one step
+    /// over: the advice is to re-run, and re-running reaches the same wedged
+    /// daemon or the same ceiling. So this says what is known, which is that the
+    /// daemon is still present and has not retired, and hands over the two
+    /// commands that act on it.
+    NotRetired { pid: u32 },
+}
+
+/// Ask the store what it can prove about the daemon behind a failed request.
+///
+/// `None` means the store proves nothing, which is what a daemon that really
+/// did retire after its idle window leaves behind: it removed its serving
+/// record on the way out. That case keeps the message it always had.
+pub fn daemon_not_answering(kin_root: &Path) -> Option<DaemonNotAnswering> {
+    if let Some(record) = most_recent_death(kin_root) {
+        return Some(DaemonNotAnswering::Killed(Box::new(record)));
+    }
+    // A surviving record whose process is still present. The peek above already
+    // declined it for exactly that reason, and declining is right for a kill
+    // record and wrong for a sentence about why nothing answered.
+    let serving = kin_daemon_spawn::read_serving_daemon(kin_root)?;
+    kin_daemon_spawn::process_is_alive(serving.pid)
+        .then_some(DaemonNotAnswering::NotRetired { pid: serving.pid })
+}
+
 /// The death to quote beside a store's own state, rather than beside a request.
 ///
 /// Two readings, in the order that keeps each claim as strong as its evidence
@@ -106,12 +151,25 @@ pub fn enrichment_clause(record: Option<&DaemonKillRecord>) -> &'static str {
 /// terminate. This one leads with the fact that the daemon did not retire, and
 /// hands over the record's own remediation, every action in which is one the
 /// caller can perform.
-pub fn dropped_request_sentence(base_url: &str, leaf: &str, record: &DaemonKillRecord) -> String {
-    format!(
-        "the kin daemon at {base_url} stopped answering while the {leaf} request was in flight, \
-         and it did not exit its idle window: {}",
-        record.summary()
-    )
+pub fn dropped_request_sentence(base_url: &str, leaf: &str, state: &DaemonNotAnswering) -> String {
+    let opening = format!(
+        "the kin daemon at {base_url} stopped answering while the {leaf} request was in \
+                 flight"
+    );
+    match state {
+        DaemonNotAnswering::Killed(record) => {
+            format!(
+                "{opening}, and it did not exit its idle window: {}",
+                record.summary()
+            )
+        }
+        DaemonNotAnswering::NotRetired { pid } => format!(
+            "{opening}, and the daemon this store recorded as serving it (pid {pid}) is still \
+             present and has not retired, so the idle window is not the explanation: it is \
+             either wedged or part way through dying. Read .kin/daemon.log; `kin daemon status` \
+             reports what is running now, and `kin daemon stop` ends a wedged one."
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -156,8 +214,11 @@ mod tests {
     /// size, so its absence is asserted rather than left to a reader's eye.
     #[test]
     fn a_dropped_request_over_a_killed_daemon_never_offers_the_idle_window() {
-        let sentence =
-            dropped_request_sentence("http://127.0.0.1:39767", "lsp sweep status", &memory_kill());
+        let sentence = dropped_request_sentence(
+            "http://127.0.0.1:39767",
+            "lsp sweep status",
+            &DaemonNotAnswering::Killed(Box::new(memory_kill())),
+        );
         assert!(
             !sentence.contains("idle window, so re-run"),
             "the advice that cannot terminate was still offered: {sentence}"
@@ -178,7 +239,11 @@ mod tests {
     /// actionable, so a mention with no number would not be a fix.
     #[test]
     fn a_memory_kill_is_named_with_its_figure_and_its_remedy() {
-        let sentence = dropped_request_sentence("http://127.0.0.1:1", "locate", &memory_kill());
+        let sentence = dropped_request_sentence(
+            "http://127.0.0.1:1",
+            "locate",
+            &DaemonNotAnswering::Killed(Box::new(memory_kill())),
+        );
         assert!(sentence.contains("memory limit"), "{sentence}");
         assert!(sentence.contains("12.0 GiB"), "{sentence}");
         assert!(sentence.contains("To recover:"), "{sentence}");
@@ -191,13 +256,93 @@ mod tests {
     /// idle window.
     #[test]
     fn an_unattributed_kill_reports_the_death_without_inventing_a_cause() {
-        let sentence =
-            dropped_request_sentence("http://127.0.0.1:1", "locate", &unattributed_kill());
+        let sentence = dropped_request_sentence(
+            "http://127.0.0.1:1",
+            "locate",
+            &DaemonNotAnswering::Killed(Box::new(unattributed_kill())),
+        );
         assert!(sentence.contains("killed"), "{sentence}");
         assert!(!sentence.contains("idle window, so re-run"), "{sentence}");
         assert!(
             !sentence.contains("memory limit"),
             "a host that publishes no accounting attributed nothing: {sentence}"
+        );
+    }
+
+    /// A daemon that is present and not answering is not an idle exit either.
+    ///
+    /// Found on a Linux runner, where SIGKILL had returned but the kernel had
+    /// not finished tearing the process down: the socket stayed open long
+    /// enough to accept the connection and reset it, `Connection reset by peer
+    /// (os error 104)`, and the pid still read as alive when the message was
+    /// built. macOS refused the connection outright and never reached this
+    /// state, which is why one host passed and one failed on identical code.
+    ///
+    /// A wedged daemon lands here too. Both deserve better than "re-run": one
+    /// re-run reaches the same wedged process, the other the same ceiling.
+    #[test]
+    fn a_daemon_still_present_is_not_reported_as_an_idle_exit() {
+        let sentence = dropped_request_sentence(
+            "http://127.0.0.1:45917",
+            "graph",
+            &DaemonNotAnswering::NotRetired { pid: 4103 },
+        );
+        assert!(
+            !sentence.contains("idle window, so re-run"),
+            "the advice that cannot terminate was still offered: {sentence}"
+        );
+        assert!(
+            sentence.contains("has not retired"),
+            "the record's survival is the whole of what is known: {sentence}"
+        );
+        assert!(sentence.contains("pid 4103"), "{sentence}");
+        assert!(
+            sentence.contains("kin daemon stop"),
+            "a wedged daemon needs an action, not a diagnosis: {sentence}"
+        );
+        assert!(
+            !sentence.contains("was killed"),
+            "nothing here established a death, and claiming one would be the same \
+             overreach in the other direction: {sentence}"
+        );
+    }
+
+    /// The three states, read off one store, in the order they can be proven.
+    #[test]
+    fn a_store_reports_retired_then_present_then_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(
+            daemon_not_answering(dir.path()).is_none(),
+            "no serving record is a daemon that retired, and that message is unchanged"
+        );
+
+        // This very process is alive, so its record is the present-and-not-
+        // answering case rather than a death.
+        kin_daemon_spawn::publish_serving_daemon(dir.path(), std::process::id());
+        assert!(
+            matches!(
+                daemon_not_answering(dir.path()),
+                Some(DaemonNotAnswering::NotRetired { .. })
+            ),
+            "a record whose process is present is not a kill"
+        );
+
+        std::fs::write(
+            kin_daemon_spawn::serving_path(dir.path()),
+            serde_json::to_vec(&kin_daemon_spawn::ServingDaemon {
+                pid: u32::MAX,
+                oom_kills_at_start: Some(0),
+                at_unix: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                daemon_not_answering(dir.path()),
+                Some(DaemonNotAnswering::Killed(_))
+            ),
+            "a record whose process is gone is the death this ticket is about"
         );
     }
 

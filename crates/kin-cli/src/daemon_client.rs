@@ -2009,8 +2009,8 @@ fn behavior_env_divergence_message(divergences: &[kin_core::behavior_env::Diverg
 /// on every host that has never lost a daemon it answers nothing and this
 /// message stays byte for byte what it was.
 fn daemon_send_failure_message(base_url: &str, leaf: &str, kin_root: Option<&Path>) -> String {
-    if let Some(record) = kin_root.and_then(crate::daemon_death::most_recent_death) {
-        return crate::daemon_death::dropped_request_sentence(base_url, leaf, &record);
+    if let Some(state) = kin_root.and_then(crate::daemon_death::daemon_not_answering) {
+        return crate::daemon_death::dropped_request_sentence(base_url, leaf, &state);
     }
     format!(
         "the kin daemon at {base_url} stopped answering while the {leaf} request was in flight; \
