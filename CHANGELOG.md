@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Read the cgroup that binds this process, not the root of the mount (#1095)
 - Stop the resource-profile knob from making kin complain about the machine (#1094)
 - Stop three surfaces asserting answers their authority never produced (#1078)
+- Leave a post-mortem when a conversion is killed, and reclaim what it stranded (#1096)
 
 
 ## [0.5.50] - 2026-08-22
