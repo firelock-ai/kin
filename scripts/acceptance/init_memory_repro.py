@@ -125,6 +125,10 @@ RELEASE_LINE = re.compile(
     r"kin\.init\.release_plan_bodies gave back (\d+) bytes of the (\d+) bytes "
     r"kin\.init\.bind_historical_semantics retained, floor (\d+) percent"
 )
+BUILD_LINE = re.compile(
+    r"kin\.init\.build_bootstrap_transaction grew the peak by (\d+) bytes against "
+    r"the (\d+) bytes kin\.init\.admit_semantic_import retained, ceiling (\d+) percent"
+)
 
 
 def read_guard_output(text):
@@ -190,6 +194,43 @@ def read_release_figures(text):
     if not release:
         return (None, None, None)
     return (int(release.group(1)), int(release.group(2)), int(release.group(3)))
+
+
+def read_build_figures(text):
+    """Pull the bootstrap build's growth, one copy of the admitted history, and its ceiling.
+
+    Its own reader for the reason every reader here has one: a suite that
+    grades only the earlier figures reports them PASS over a guard that went
+    red on this one, because the guard prints every figure before any
+    assertion runs.
+    """
+    build = BUILD_LINE.search(text or "")
+    if not build:
+        return (None, None, None)
+    return (int(build.group(1)), int(build.group(2)), int(build.group(3)))
+
+
+def grade_build_ratio(grew, retained, cap_percent):
+    """PASS under the ceiling, FAIL at or over it, UNREADABLE with no denominator.
+
+    Same direction as `grade_ratio` and a separate function because it names a
+    different phase and a different denominator. A phase that admitted nothing
+    gives the ratio no denominator, so the comparison would pass on any growth
+    at all. That is UNREADABLE, not a pass.
+    """
+    if grew is None or retained is None or cap_percent is None:
+        return UNREADABLE, "the guard printed no bootstrap-build figures, so nothing was graded"
+    if retained == 0:
+        return UNREADABLE, ("the admission phase retained nothing, so the bootstrap build's "
+                            "growth had no copy of the history to be measured against and "
+                            "this graded nothing")
+    percent = grew * 100 // retained
+    detail = ("building the bootstrap transaction grew the peak by %d percent of one copy of "
+              "the admitted history (%d over %d bytes), ceiling %d percent"
+              % (percent, grew, retained, cap_percent))
+    if percent >= cap_percent:
+        return FAIL, detail
+    return PASS, detail
 
 
 def grade_floor(given_back, retained, floor_percent):
@@ -361,7 +402,21 @@ def check_3(suite):
     return result
 
 
-CHECKS = [check_0, check_1, check_2, check_3]
+def check_4(suite):
+    """Building the bootstrap transaction does not copy the history to prove or to read it."""
+    result = Result("4", "the bootstrap build holds no extra copy of the history")
+    code, out = suite.guard_output()
+    grew, retained, cap = read_build_figures(out)
+    if grew is None and code != 0:
+        result.unknown("the guard produced no bootstrap-build figures and exited %d: %s"
+                       % (code, tail(out)))
+        return result
+    status, detail = grade_build_ratio(grew, retained, cap)
+    {PASS: result.ok, FAIL: result.bad, UNREADABLE: result.unknown}[status](detail)
+    return result
+
+
+CHECKS = [check_0, check_1, check_2, check_3, check_4]
 
 
 def self_test():
@@ -426,6 +481,30 @@ def self_test():
     if read_bind_figures("") != (None, None, None):
         failures.append("parser invented binding figures from empty output")
 
+    # The bootstrap-build grader and its parser, falsified against the real
+    # figures on both sides of the fix.
+    build_cases = [
+        ("one copy passes", 113059227, 87718554, 250, PASS),
+        ("the pre-fix figure fails", 395427091, 87722946, 250, FAIL),
+        ("exactly at the ceiling fails", 250, 100, 250, FAIL),
+        ("nothing admitted is unreadable", 100, 0, 250, UNREADABLE),
+        ("nothing measured is unreadable", None, None, None, UNREADABLE),
+    ]
+    for title, grew, retained, cap, wanted in build_cases:
+        got, detail = grade_build_ratio(grew, retained, cap)
+        if got != wanted:
+            failures.append("%s: wanted %s, got %s (%s)" % (title, wanted, got, detail))
+
+    build_line = ("kin.init.build_bootstrap_transaction grew the peak by 113059227 bytes "
+                  "against the 87718554 bytes kin.init.admit_semantic_import retained, "
+                  "ceiling 250 percent\n")
+    if read_build_figures(build_line) != (113059227, 87718554, 250):
+        failures.append("parser misread the build line: %r" % (read_build_figures(build_line),))
+    if read_build_figures("error: could not compile") != (None, None, None):
+        failures.append("parser invented build figures from output that carries none")
+    if read_build_figures("") != (None, None, None):
+        failures.append("parser invented build figures from empty output")
+
     # The floor grader runs the comparison the other way round, so its own
     # inverse is the case that would pass if the direction were flipped: a
     # release that gave back nothing.
@@ -464,7 +543,8 @@ def self_test():
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     print("kin-init-memory-repro self-test: %d case(s), %d failure(s)"
-          % (len(cases) + len(ratio_cases) + len(floor_cases) + 13, len(failures)))
+          % (len(cases) + len(ratio_cases) + len(build_cases) + len(floor_cases) + 16,
+             len(failures)))
     return 1 if failures else 0
 
 

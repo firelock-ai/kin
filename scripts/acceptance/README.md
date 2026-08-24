@@ -32,6 +32,12 @@ it had, and the census must be able to see a kind that lost ground once one
 does. Check 11 raises the recorded baseline by one edge over an unchanged entity
 count rather than damaging the graph, because the loss that started the ticket
 was 0.9% of its kind and no magnitude threshold was ever going to reach it.
+Checks 18 through 20 cover what FIR-2644 adds to the same commit: the caller set
+must be unchanged including a caller composed through an override, every
+reference line a caller reports must still carry the call when read against the
+file on disk, and an answer taken over a graph short of its own census must
+disclose that rather than presenting as clean. Each of the three runs its own
+control, and they share one experiment because the experiment is destructive.
 Every check names the ticket it is about, so a failure is attributable without
 reading the code.
 
@@ -60,7 +66,12 @@ control on JavaScript import specifiers. Checks 2 through 8 cover the two real
 callers of `HTTPAdapter.send`, the `app.handle` walk in express, one verdict per
 payload, `find_references` and `graph_neighborhood` agreeing on one entity, an
 express export nothing may certify as unused, and `semantic_search` refusing to
-certify a false absence.
+certify a false absence. Check 9 kills a `kin init` mid-conversion and asserts the
+next command names the kill, the re-run says whether it resumes or restarts, and
+nothing is orphaned silently. Check 10 replays the rc0550 brown stranger's task 3
+verbatim, at that run's own budget, and requires the walk to reach the hop that
+folds `verify` into the urllib3 pool key and every external node it touches to
+name what it crosses into.
 
 The brownfield fixtures are one commit each, so its recall results are
 one-commit-shape results. The suite prints that scope on every run and records it

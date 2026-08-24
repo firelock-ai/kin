@@ -1852,6 +1852,23 @@ fn stamp_class_attribute_declaration(
     }
 }
 
+/// Whether this `call` node is the value a `raise` throws.
+///
+/// Only the DIRECT operand counts. `raise Wrapper(build())` throws the wrapper;
+/// `build()` is an ordinary call that happens to sit inside the same statement,
+/// and marking it would demote a real hop because of its neighbour's syntax.
+///
+/// A `raise` target is a call edge and stays one: it is real evidence that this
+/// function can throw that class. What it is not is a hop a value travels
+/// along, and a trace walking data flow spends its budget as if it were. On a
+/// converted `psf/requests`, nine of twelve depth-1 slots went to exception
+/// constructors and the hop governing connection reuse was left out of the
+/// answer entirely.
+fn python_call_is_raise_target(call: &tree_sitter::Node) -> bool {
+    call.parent()
+        .is_some_and(|parent| parent.kind() == "raise_statement")
+}
+
 /// Extract all function/method calls within a function/method body.
 fn extract_calls_from_context(
     node: &tree_sitter::Node,
@@ -1872,11 +1889,16 @@ fn extract_calls_from_context(
                 extract_named_callee(&function, source, class_ctx, receiver_types)
             });
             if let Some(callee) = callee {
+                let site = RelationSite {
+                    syntactic_role: python_call_is_raise_target(&child)
+                        .then_some(crate::extract::RelationSyntacticRole::RaiseTarget),
+                    ..site_from_node(&child)
+                };
                 relations.push(ExtractedRelation {
                     // The call expression itself, so a reference row can report the
                     // line the call is written on rather than the line the caller's
                     // definition starts on.
-                    site: Some(site_from_node(&child)),
+                    site: Some(site),
                     receiver: callee.receiver,
                     call_shape: Some(extract_call_arg_shape(&child, source)),
                     kind: kin_model::RelationKind::Calls,
@@ -3000,6 +3022,44 @@ class Response:
             .collect();
         edges.sort();
         edges
+    }
+
+    #[test]
+    fn a_raise_marks_the_class_it_throws_and_nothing_else() {
+        // FIR-2642. `raise SSLError(...)` is a real call edge and real evidence
+        // that this function can throw, and it is NOT a hop a value travels
+        // along. Only the DIRECT operand is marked: `raise Wrapper(build())`
+        // throws the wrapper, and demoting `build()` for its neighbour's syntax
+        // would cost the recall the marker exists to protect.
+        use crate::extract::RelationSyntacticRole;
+        let adapter = PythonAdapter;
+        let source =
+            b"def go(x):\n    if x:\n        raise Wrapper(build())\n    return SSLError()\n";
+        let tree = adapter.parse(source).unwrap();
+        let output = adapter
+            .extract(&tree, source, &FilePathId::new("m.py"))
+            .unwrap();
+        let mut marked: Vec<(&str, bool)> = output
+            .relations
+            .iter()
+            .filter(|rel| rel.kind == kin_model::RelationKind::Calls)
+            .map(|rel| {
+                (
+                    rel.dst_name.as_str(),
+                    rel.site
+                        .as_ref()
+                        .and_then(|site| site.syntactic_role)
+                        .is_some_and(|role| role == RelationSyntacticRole::RaiseTarget),
+                )
+            })
+            .collect();
+        marked.sort();
+        assert_eq!(
+            marked,
+            vec![("SSLError", false), ("Wrapper", true), ("build", false)],
+            "the raised class is marked, the call inside its arguments is not, \
+             and a constructor called outside a raise is not"
+        );
     }
 
     #[test]

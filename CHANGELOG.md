@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.52] - 2026-08-24
+
+### Changed
+
+- Pin kin-db 0.7.54 and the kin-model 0.7.18 it requires (#1114)
+
+
 ## [0.5.51] - 2026-08-23
 
 ### Changed

@@ -589,6 +589,11 @@ pub(crate) fn memory_pressure_refusal() -> Option<kin_core::memory_pressure::Pre
     kin_core::memory_pressure::PressureRefusal::read(&discover_kin_dir()?)
 }
 
+/// What this store records about being below its own relation census.
+pub(crate) fn relation_census_hold() -> Option<kin_core::relation_census::CensusHold> {
+    kin_core::relation_census::CensusHold::read(&discover_kin_dir()?)
+}
+
 /// The recorded cause and a remediation the caller can perform, ready to append
 /// to an error about a daemon that stopped answering.
 ///
