@@ -1796,7 +1796,11 @@ fn embed_batch_under_pressure(
 pub(crate) struct ProcessRow {
     pub(crate) pid: u32,
     pub(crate) parent: Option<u32>,
-    pub(crate) rss_bytes: u64,
+    /// What this process contributes to what the container is charged: a
+    /// proportional or private figure, never a resident set. See
+    /// [`kin_daemon_spawn::process_footprint_bytes`] for what each platform
+    /// publishes and why summing resident sets is the defect FIR-2653 names.
+    pub(crate) footprint_bytes: u64,
 }
 
 /// Fold a process table into the footprint of the tree rooted at `root`.
@@ -1807,6 +1811,12 @@ pub(crate) struct ProcessRow {
 /// language server that spawns a worker is still Kin's memory, charged to the
 /// same container, and stopping at depth one would reintroduce the blindness
 /// one level down.
+///
+/// Adding the rows up is only meaningful because each row is already
+/// proportional. Summing resident sets here charged every process the whole of
+/// every page it shared with its siblings, which is FIR-2653: the sum tracked
+/// how many descendants there were rather than any memory anyone held, and it
+/// reported 25.3 GiB inside a container that could hold 12.
 ///
 /// A table whose parent links form a cycle is malformed and cannot be walked,
 /// so the visited set is not an optimisation. Without it a two-process loop
@@ -1831,13 +1841,13 @@ pub(crate) fn tree_footprint_from(
             own_bytes = rows
                 .iter()
                 .find(|row| row.pid == root)
-                .map_or(0, |row| row.rss_bytes);
+                .map_or(0, |row| row.footprint_bytes);
         }
         for row in rows.iter().filter(|row| row.parent == Some(pid)) {
             if !visited.insert(row.pid) {
                 continue;
             }
-            children_bytes = children_bytes.saturating_add(row.rss_bytes);
+            children_bytes = children_bytes.saturating_add(row.footprint_bytes);
             child_count += 1;
             frontier.push(row.pid);
         }
@@ -1846,6 +1856,7 @@ pub(crate) fn tree_footprint_from(
         own_bytes,
         children_bytes,
         child_count,
+        kernel_capped: false,
     }
 }
 
@@ -1903,13 +1914,57 @@ fn walk_process_table() -> Option<kin_core::memory_pressure::TreeFootprint> {
         .map(|(pid, process)| ProcessRow {
             pid: pid.as_u32(),
             parent: process.parent().map(|parent| parent.as_u32()),
-            rss_bytes: process.memory(),
+            footprint_bytes: row_footprint_bytes(pid.as_u32(), process),
         })
         .collect::<Vec<_>>();
     if rows.is_empty() {
         return None;
     }
-    Some(tree_footprint_from(me.as_u32(), &rows))
+    // A daemon that cannot measure ITSELF has measured nothing, and reporting
+    // the descendants alone would publish a number smaller than the process
+    // publishing it. That is the same answer an unreadable process table gives,
+    // and it leaves the budget axis out of the decision rather than deciding on
+    // a figure nobody could take.
+    if !rows
+        .iter()
+        .any(|row| row.pid == me.as_u32() && row.footprint_bytes > 0)
+    {
+        return None;
+    }
+    let folded = tree_footprint_from(me.as_u32(), &rows);
+    // Held to what the kernel says this container is charged, so the figure a
+    // reader sees beside a cap can never exceed it. Off a cgroup there is no
+    // such ceiling and the reading stands as measured.
+    Some(folded.clamped_to(kin_daemon_spawn::cgroup_memory().current_bytes))
+}
+
+/// What one row of the process table contributes, in bytes.
+///
+/// Linux and macOS answer through `kin-daemon-spawn`, which reads a
+/// proportional or private figure rather than a resident set. Windows has such
+/// a figure too and `sysinfo` already carries it under a name that describes
+/// the API rather than the number: `virtual_memory()` is
+/// `PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`, private commit, which by
+/// definition shares no page with another process. Resident set, which is what
+/// `memory()` returns on every platform, is the one figure that must not be
+/// summed here.
+///
+/// A process the reader could not open contributes zero. On the platforms
+/// above that means the pid died between the walk and the read, or belongs to
+/// another user, and a daemon's own descendants are never the second; the
+/// caller separately refuses to publish anything when the ROOT is the row that
+/// could not be read.
+fn row_footprint_bytes(pid: u32, process: &sysinfo::Process) -> u64 {
+    #[cfg(windows)]
+    {
+        let _ = pid;
+        process.virtual_memory()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = process;
+        kin_daemon_spawn::process_footprint_bytes(pid).unwrap_or(0)
+    }
 }
 
 /// This daemon's standing against its own budget, when both halves are readable.
@@ -6124,6 +6179,21 @@ mod tests {
 
     #[tokio::test]
     async fn background_embed_queues_by_default_and_defers_on_opt_out() {
+        // Both of the axes this arm is not about, pinned, exactly as every arm
+        // in `memory_pressure_tests` pins them. `start_or_defer_background_embed`
+        // consults host pressure AND this daemon's own budget, so an arm about
+        // the opt-out was being decided by how large the test binary happened to
+        // be and how full the machine running it was. It failed here on a
+        // development box at load, which is the failure it exists to be immune
+        // to; FIR-2653 sharpened it on macOS, where the footprint reader counts
+        // compressed pages and a compressing host reads a process as larger than
+        // its resident set.
+        let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
+        let _forced = kin_core::test_env::EnvVarGuard::set(
+            kin_core::memory_pressure::PRESSURE_OVERRIDE_ENV,
+            "nominal",
+        );
         let repo = tempfile::tempdir().unwrap();
         let initialized = kin_core::init(repo.path()).unwrap();
         let state = DaemonState::open(initialized.layout).unwrap();
@@ -7253,12 +7323,160 @@ mod memory_pressure_tests {
         DaemonState::open(init.layout).unwrap()
     }
 
-    fn row(pid: u32, parent: Option<u32>, rss_bytes: u64) -> ProcessRow {
+    fn row(pid: u32, parent: Option<u32>, footprint_bytes: u64) -> ProcessRow {
         ProcessRow {
             pid,
             parent,
-            rss_bytes,
+            footprint_bytes,
         }
+    }
+
+    /// FIR-2653, over a synthetic process table carrying what `/proc` would
+    /// publish for each of its rows.
+    ///
+    /// The shape is the measured one: a daemon and thirteen children that all
+    /// map the same 1.75 GiB of shared image, each holding a little of its own.
+    /// Every row's body goes through the same resolver the daemon reads a live
+    /// `/proc` with, so what is exercised here is the reading and the fold
+    /// together rather than a hand-written number standing in for both.
+    ///
+    /// The resident-set column is kept in the fixture and asserted on, because
+    /// it is what makes this test able to fail: summing it is the pre-fix
+    /// arithmetic, it comes to 25.6 GiB, and a 12 GiB container cannot hold it.
+    #[test]
+    fn a_page_thirteen_children_share_is_counted_once_across_the_tree() {
+        const KB: u64 = 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // One 1.75 GiB image, mapped by all fourteen processes. 14 divides it
+        // evenly, so the per-process PSS share is exact and the test asserts
+        // figures rather than tolerances.
+        const SHARED_KB: u64 = 1_835_008;
+        const SHARE_KB: u64 = SHARED_KB / 14;
+        const DAEMON_PRIVATE_KB: u64 = 716_800;
+        const CHILD_PRIVATE_KB: u64 = 30_720;
+
+        fn rollup(private_kb: u64) -> String {
+            format!(
+                "Rss:            {} kB\nPss:            {} kB\n\
+                 Shared_Clean:   {SHARED_KB} kB\nShared_Dirty:         0 kB\n\
+                 Private_Clean:  {private_kb} kB\nPrivate_Dirty:        0 kB\n",
+                SHARED_KB + private_kb,
+                SHARE_KB + private_kb,
+            )
+        }
+
+        let bodies: Vec<(u32, Option<u32>, String)> =
+            std::iter::once((100u32, Some(1u32), rollup(DAEMON_PRIVATE_KB)))
+                .chain((0..13).map(|n| (200 + n, Some(100u32), rollup(CHILD_PRIVATE_KB))))
+                .collect();
+
+        let table = bodies
+            .iter()
+            .map(|(pid, parent, body)| ProcessRow {
+                pid: *pid,
+                parent: *parent,
+                footprint_bytes: kin_daemon_spawn::resolve_process_footprint(
+                    Some(body),
+                    None,
+                    None,
+                    4096,
+                )
+                .expect("a rollup carrying a Pss line is readable"),
+            })
+            .collect::<Vec<_>>();
+
+        // The pre-fix arithmetic, computed from the same fixture so the control
+        // and the experiment cannot drift apart.
+        let summed_resident: u64 = bodies
+            .iter()
+            .map(|(_, _, body)| {
+                body.lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Rss:")?
+                            .split_whitespace()
+                            .next()?
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .expect("every fixture row carries a resident set")
+                    * KB
+            })
+            .sum();
+        assert!(
+            summed_resident > 25 * GIB,
+            "the pre-fix reading of this fixture is {summed_resident} bytes, which is what \
+             this test exists to be able to see"
+        );
+        assert!(
+            summed_resident > 12 * GIB,
+            "and it is more than the container it was measured in could physically hold"
+        );
+
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(tree.child_count, 13);
+        assert_eq!(
+            tree.total_bytes(),
+            (SHARED_KB + DAEMON_PRIVATE_KB + 13 * CHILD_PRIVATE_KB) * KB,
+            "the shared image is counted once across the fourteen processes that map it, \
+             plus what each holds alone"
+        );
+        assert!(
+            tree.total_bytes() < 3 * GIB,
+            "roughly 2.8 GiB, against 25.6 GiB summed resident"
+        );
+
+        // What that costs is not a label on a dial. Under a 12 GiB container
+        // the derived budget is 6 GiB, and the two readings give opposite
+        // answers to "may background embedding start".
+        let bars = kin_core::memory_pressure::Thresholds::default();
+        let host = kin_core::memory_pressure::MemoryPressure::Known(
+            kin_core::memory_pressure::MemoryReading {
+                source: kin_core::memory_pressure::PressureSource::Cgroup,
+                limit_bytes: 12 * GIB,
+                used_bytes: 3 * GIB,
+                swap_used_bytes: None,
+                swap_total_bytes: None,
+                oom_kills: Some(0),
+                peak_bytes: None,
+            },
+        );
+        // Derived by hand rather than through `resolve`, which consults the
+        // process environment: a sibling test in this module pins an operator
+        // budget no test can fill, and a parallel run of this one would then
+        // grade 25.6 GiB against a terabyte and proceed. A check that another
+        // test can switch off is a check that cannot fail.
+        let budget = kin_core::memory_pressure::FootprintBudget {
+            bytes: kin_core::memory_pressure::FootprintBudget::derived_from(12 * GIB),
+            source: kin_core::memory_pressure::BudgetSource::Derived,
+        };
+        assert_eq!(budget.bytes, 6 * GIB, "half of a 12 GiB container");
+        let stand = |footprint| kin_core::memory_pressure::BudgetStanding { footprint, budget };
+        assert_eq!(
+            kin_core::memory_pressure::Verdict::decide(
+                kin_core::memory_pressure::HeavyWork::EmbedBatch,
+                &host,
+                Some(&stand(tree)),
+                &bars,
+            ),
+            kin_core::memory_pressure::Verdict::Proceed,
+            "under the cap, with room, embedding starts"
+        );
+        let pre_fix = kin_core::memory_pressure::TreeFootprint {
+            own_bytes: 0,
+            children_bytes: summed_resident,
+            child_count: 13,
+            kernel_capped: false,
+        };
+        assert!(
+            kin_core::memory_pressure::Verdict::decide(
+                kin_core::memory_pressure::HeavyWork::EmbedBatch,
+                &host,
+                Some(&stand(pre_fix)),
+                &bars,
+            )
+            .refused(),
+            "and the pre-fix reading refuses it, which is the defect this fixes"
+        );
     }
 
     /// The shape the measured failure had: a daemon, a language server it
@@ -7345,6 +7563,54 @@ mod memory_pressure_tests {
             "a running process holds more than nothing"
         );
         assert!(sampled.total_bytes() >= sampled.own_bytes);
+    }
+
+    /// FIR-2653, on the LIVE path rather than over a fixture.
+    ///
+    /// The fold test above proves the arithmetic; this proves the figure that
+    /// fills each row comes from the footprint reader and not from the resident
+    /// set sitting beside it in the same `sysinfo` process. Nothing else covers
+    /// that seam: a build that kept every corrected structure and went on
+    /// reading `Process::memory()` passes every other test in this module,
+    /// which is not a guess, it is what the falsification run reported.
+    ///
+    /// It compares distances rather than sizes, so it asserts nothing about the
+    /// machine CI runs on and needs no tolerance constant: the row has to be at
+    /// least as close to the footprint reading as to the resident one. Where a
+    /// host cannot tell the two apart that is a tie and passes, which is the
+    /// honest outcome rather than a threshold invented to break it.
+    ///
+    /// It measures the ROW rather than the finished walk, deliberately. The
+    /// first version compared `walk_process_table`'s published total against
+    /// readings taken around it, and building the whole process table allocates
+    /// megabytes into the process being measured: under parallel tests the
+    /// process grew more between the walk and the comparison than the two
+    /// figures differ by, and the mutant went undetected. Here all three
+    /// readings come from one refresh, microseconds apart.
+    #[test]
+    #[cfg(unix)]
+    fn a_row_carries_the_footprint_reading_rather_than_the_resident_set_beside_it() {
+        let me = sysinfo::get_current_pid().expect("this host names its own pid");
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[me]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_memory(),
+        );
+        let process = system
+            .process(me)
+            .expect("this host publishes its own process");
+        let row = super::row_footprint_bytes(me.as_u32(), process);
+        let footprint = kin_daemon_spawn::process_footprint_bytes(me.as_u32())
+            .expect("this platform publishes a per-process footprint");
+        let resident = process.memory();
+
+        assert!(row > 0, "a running process holds something");
+        assert!(
+            row.abs_diff(footprint) <= row.abs_diff(resident),
+            "the row carries {row} for this process, which is closer to its resident set of \
+             {resident} than to its footprint of {footprint}"
+        );
     }
 
     /// A real child, counted through the real process table.
