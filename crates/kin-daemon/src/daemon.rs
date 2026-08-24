@@ -6179,6 +6179,21 @@ mod tests {
 
     #[tokio::test]
     async fn background_embed_queues_by_default_and_defers_on_opt_out() {
+        // Both of the axes this arm is not about, pinned, exactly as every arm
+        // in `memory_pressure_tests` pins them. `start_or_defer_background_embed`
+        // consults host pressure AND this daemon's own budget, so an arm about
+        // the opt-out was being decided by how large the test binary happened to
+        // be and how full the machine running it was. It failed here on a
+        // development box at load, which is the failure it exists to be immune
+        // to; FIR-2653 sharpened it on macOS, where the footprint reader counts
+        // compressed pages and a compressing host reads a process as larger than
+        // its resident set.
+        let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
+        let _forced = kin_core::test_env::EnvVarGuard::set(
+            kin_core::memory_pressure::PRESSURE_OVERRIDE_ENV,
+            "nominal",
+        );
         let repo = tempfile::tempdir().unwrap();
         let initialized = kin_core::init(repo.path()).unwrap();
         let state = DaemonState::open(initialized.layout).unwrap();
@@ -7552,49 +7567,49 @@ mod memory_pressure_tests {
 
     /// FIR-2653, on the LIVE path rather than over a fixture.
     ///
-    /// The fold test above proves the arithmetic; this proves the figure fed
-    /// into it comes from the footprint reader and not from the resident set
-    /// beside it in the same process table. Nothing else covers that seam: a
-    /// build that kept every corrected structure and went on reading
-    /// `Process::memory()` would pass every other test in this module.
+    /// The fold test above proves the arithmetic; this proves the figure that
+    /// fills each row comes from the footprint reader and not from the resident
+    /// set sitting beside it in the same `sysinfo` process. Nothing else covers
+    /// that seam: a build that kept every corrected structure and went on
+    /// reading `Process::memory()` passes every other test in this module,
+    /// which is not a guess, it is what the falsification run reported.
     ///
-    /// It asserts a band around the reader rather than a size, so it says
-    /// nothing about the machine CI happens to run on, and it takes a reading
-    /// on each side of the walk because building the whole process table
-    /// allocates megabytes into the process being measured. The first draft
-    /// read once, before the walk, and failed on its own probe's allocation.
+    /// It compares distances rather than sizes, so it asserts nothing about the
+    /// machine CI runs on and needs no tolerance constant: the row has to be at
+    /// least as close to the footprint reading as to the resident one. Where a
+    /// host cannot tell the two apart that is a tie and passes, which is the
+    /// honest outcome rather than a threshold invented to break it.
     ///
-    /// What it does not do is compare against the resident set, and the reason
-    /// matters: a LONE process shares almost nothing, so its PSS on Linux sits
-    /// a few megabytes under its resident set and a comparison there would be
-    /// too close to be evidence. The double-count needs siblings to appear at
-    /// all. That discrimination lives in the fixture test above, where thirteen
-    /// processes map one image, and in acceptance check 10, where the daemon's
-    /// published figure is graded against the kernel's own two readings.
+    /// It measures the ROW rather than the finished walk, deliberately. The
+    /// first version compared `walk_process_table`'s published total against
+    /// readings taken around it, and building the whole process table allocates
+    /// megabytes into the process being measured: under parallel tests the
+    /// process grew more between the walk and the comparison than the two
+    /// figures differ by, and the mutant went undetected. Here all three
+    /// readings come from one refresh, microseconds apart.
     #[test]
     #[cfg(unix)]
-    fn the_live_sampler_reads_a_footprint_rather_than_the_resident_set_beside_it() {
+    fn a_row_carries_the_footprint_reading_rather_than_the_resident_set_beside_it() {
         let me = sysinfo::get_current_pid().expect("this host names its own pid");
-        // Warm the walk, so the process table's own allocation is already paid
-        // for by the time the first reading is taken.
-        let _warm = walk_process_table();
-
-        let before = kin_daemon_spawn::process_footprint_bytes(me.as_u32())
+        let mut system = sysinfo::System::new();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[me]),
+            true,
+            sysinfo::ProcessRefreshKind::nothing().with_memory(),
+        );
+        let process = system
+            .process(me)
+            .expect("this host publishes its own process");
+        let row = super::row_footprint_bytes(me.as_u32(), process);
+        let footprint = kin_daemon_spawn::process_footprint_bytes(me.as_u32())
             .expect("this platform publishes a per-process footprint");
-        let sampled = walk_process_table().expect("this host publishes a process table");
-        let after = kin_daemon_spawn::process_footprint_bytes(me.as_u32())
-            .expect("this platform publishes a per-process footprint");
+        let resident = process.memory();
 
-        let low = before.min(after);
-        let high = before.max(after);
-        let slack = (high / 8).max(4 * 1024 * 1024);
+        assert!(row > 0, "a running process holds something");
         assert!(
-            sampled.own_bytes + slack >= low && sampled.own_bytes <= high + slack,
-            "the live walk published {} for this process while the footprint reader read {} \
-             then {} either side of it, so the walk is reading something else",
-            sampled.own_bytes,
-            before,
-            after
+            row.abs_diff(footprint) <= row.abs_diff(resident),
+            "the row carries {row} for this process, which is closer to its resident set of \
+             {resident} than to its footprint of {footprint}"
         );
     }
 
