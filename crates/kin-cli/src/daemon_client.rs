@@ -2115,86 +2115,20 @@ impl ProcessLiveness {
 
 /// Whether a Linux `/proc/<pid>/stat` line describes a zombie.
 ///
-/// Split out from the probe below, and compiled under `test` on every platform,
-/// so this is not code that only ever builds on one target. Reading the wrong
-/// field is the failure mode that matters: it would answer "not a corpse"
-/// forever, which is exactly the bug being fixed, and it would do so silently.
+/// One implementation, in `kin-daemon-spawn`, which this crate already depends
+/// on. It lived here alone until 2026-08-24, and the copy that did NOT have it
+/// was the one the daemon-death path asks, so a killed-and-unreaped daemon was
+/// described to the reader as still present.
 #[cfg(any(target_os = "linux", test))]
 fn linux_stat_line_is_zombie(stat: &str) -> bool {
-    // Field 3 is the state character. `comm` (field 2) is parenthesized and may
-    // itself contain spaces and `)`, and it is the only field that can, so the
-    // state is the first whitespace-separated field after `comm`'s FINAL
-    // closing delimiter.
-    stat.rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().next())
-        .is_some_and(|state| state == "Z")
+    kin_daemon_spawn::stat_line_is_zombie(stat)
 }
 
 /// Has this PID already terminated, with only an unreaped process-table entry
-/// left behind?
-///
-/// `kill(pid, 0)` succeeds against a zombie, so a liveness probe built on the
-/// signal check alone reports a daemon that has already exited as still
-/// running — for as long as whichever process started it stays alive without
-/// waiting on it. That is the ordinary shape of an agent session: the MCP
-/// server starts a repo daemon, keeps running, and never reaps it, so `kin
-/// daemon stop` could watch the corpse for any length of time and never see it
-/// go away.
-///
-/// Reporting a zombie dead is affirmative rather than a guess, and it is
-/// strictly safer than the alternative: the process has terminated, it cannot
-/// execute, it holds no port, and its PID cannot be reused until it is reaped,
-/// so no successor can inherit a decision made here.
-///
-/// Callers must have established same-credential access first (this is only
-/// reached after `kill(pid, 0)` succeeded). Anything short of affirmative
-/// evidence of a corpse answers `false` and leaves the caller's conservative
-/// path intact.
+/// left behind? See [`kin_daemon_spawn::process_is_unreaped_corpse`].
 #[cfg(unix)]
 fn process_is_unreaped_corpse(pid: libc::pid_t) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        linux_stat_line_is_zombie(&stat)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
-        let expected = std::mem::size_of::<libc::proc_bsdinfo>();
-        let written = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                &mut info as *mut _ as *mut _,
-                expected as i32,
-            )
-        };
-        // `proc_pidinfo` reports failure as a zero return with `errno` set, so
-        // only zero is a result whose `errno` is this call's. A short non-zero
-        // return is undocumented and would leave `errno` holding whatever an
-        // earlier, unrelated call left there — and reading a stale `ESRCH` out
-        // of it would declare a LIVE daemon stopped, which is the one direction
-        // this must never fail in.
-        if written != 0 {
-            return false;
-        }
-        // Permission to inspect is already established by the caller's
-        // successful `kill(pid, 0)`, so `ESRCH` here is the kernel reporting
-        // that the process is gone rather than that this caller may not look.
-        // `EPERM` and every other failure stay indeterminate.
-        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // No affirmative corpse probe on this platform. Never guess: an
-        // unrecognised Unix keeps the conservative "signalable means alive"
-        // answer it had before.
-        let _ = pid;
-        false
-    }
+    kin_daemon_spawn::process_is_unreaped_corpse(pid)
 }
 
 /// Classify whether a process with the given PID exists.
