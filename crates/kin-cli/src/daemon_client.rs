@@ -2119,7 +2119,13 @@ impl ProcessLiveness {
 /// on. It lived here alone until 2026-08-24, and the copy that did NOT have it
 /// was the one the daemon-death path asks, so a killed-and-unreaped daemon was
 /// described to the reader as still present.
-#[cfg(any(target_os = "linux", test))]
+///
+/// `#[cfg(test)]` and not `any(target_os = "linux", test)`: this crate's own
+/// code now calls the shared implementation directly, so on a Linux non-test
+/// build the old condition admitted a function nobody calls, which `-D warnings`
+/// rejects as dead code. It compiled clean on macOS, where the same condition
+/// excluded it, so the divergence only ever appeared in CI.
+#[cfg(test)]
 fn linux_stat_line_is_zombie(stat: &str) -> bool {
     kin_daemon_spawn::stat_line_is_zombie(stat)
 }
