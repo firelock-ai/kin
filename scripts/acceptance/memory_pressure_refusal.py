@@ -720,40 +720,48 @@ class Suite(object):
         except (IOError, OSError, ValueError):
             return None
 
-    def publish_standing(self, repo, pressure="nominal", seconds=60):
+    def publish_standing(self, repo, pressure="nominal", seconds=90):
         """Make this store's daemon publish what it is holding, and return it.
 
         A standing is written by a pressure call, and those run on the daemon's
         own cadence rather than inside the request that started it. Which call
-        arrives first depends on the host: the enrichment sweep publishes at
-        start, but only where a language server exists for it to run, and the
-        ambient reconcile tick publishes when the working copy moves. A probe
-        that read the file the instant `graph status` returned therefore read an
-        absent one on a machine with no language servers, which is what real
-        0.5.51 bytes did in a container here, twice, reported as UNREADABLE.
+        arrives first depends on the host, which is why this has to do two
+        different things and be patient about both. Where a language server
+        exists the enrichment sweep publishes at daemon start, so the record is
+        already there. Where none does, as in a bare container, nothing
+        publishes until the working copy moves and the ambient reconcile tick
+        runs, so this moves it.
 
-        So this provokes the tick it can provoke: it writes a file into the
-        working copy and asks for status, then waits. The written file is
-        ordinary content in this check's own fixture and changes nothing else.
-
-        It retires the existing record first, so what comes back is a reading
-        taken just now rather than one this daemon published during `kin init`,
-        when it held two dozen short-lived children. A check that graded a stale
-        record against a live kernel would be comparing two different machines.
+        The record is required to carry the CURRENT daemon's pid, which is what
+        makes it this daemon's reading rather than its predecessor's. It is not
+        deleted first, and that is the correction rather than the shortcut: a
+        daemon republishes at most once every thirty seconds unless its rung
+        changes, so retiring the file did not make it write a new one, it made
+        the file absent for half a minute. Both checks came back UNREADABLE on a
+        hosted runner for exactly that reason, and passed in a container in the
+        same run, because there the sweep had never published and the first
+        provocation was the first call.
         """
-        try:
-            os.remove(self.footprint_path(repo))
-        except (IOError, OSError):
-            pass
-        self.kin_run(["status"], repo, pressure=pressure)
-        marker = os.path.join(repo, "pkg", "tick_%d.py" % int(time.time() * 1000 % 1000000))
-        try:
-            with open(marker, "w") as handle:
-                handle.write("def tick():\n    return None\n")
-        except (IOError, OSError):
-            pass
-        self.kin_run(["status"], repo, pressure=pressure)
-        return self.wait_for_published_footprint(repo, seconds=seconds)
+        deadline = time.time() + seconds
+        provoked = 0
+        while True:
+            pid = self.daemon_pid(repo)
+            published = self.read_published_footprint(repo)
+            if published is not None and pid is not None and published.get("pid") == pid:
+                return published
+            if time.time() >= deadline:
+                return None
+            # Move the working copy, which is what the ambient tick watches, and
+            # ask for status, which is what wakes a daemon that is idling.
+            marker = os.path.join(repo, "pkg", "tick_%d.py" % provoked)
+            try:
+                with open(marker, "w") as handle:
+                    handle.write("def tick_%d():\n    return None\n" % provoked)
+            except (IOError, OSError):
+                pass
+            self.kin_run(["status"], repo, pressure=pressure)
+            provoked += 1
+            time.sleep(2)
 
     def wait_for_record(self, repo, seconds=60):
         """The refusal this store records, waited for. None if it never appears.
