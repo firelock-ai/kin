@@ -2727,11 +2727,15 @@ fn prepare_successor<B: StorageBackend + ?Sized>(
     validate_history_replay_with(&replay, &snapshot, &transaction.changes)?;
     let history_replay_ms = timer.lap_ms();
     drop(lap);
-    // The shared decode is charged to whichever lap first forced it rather than
+    // The shared proof is charged to whichever lap first forced it rather than
     // to a lap of its own, so `replay_decode_ms` is a part of the laps above and
     // not a thirteenth alongside them.
+    //
+    // This used to `drop(replay)` here, and that drop was load-bearing: the
+    // replay owned a decoded copy of the whole snapshot and this was where it
+    // was released. It owns nothing now, so there is nothing to release and the
+    // borrow simply ends at its last read, which is the line above.
     let replay_decode_ms = replay.build_ms();
-    drop(replay);
 
     let lap = tracing::info_span!("kindb.prepare.roots").entered();
     let next_generation = current
@@ -4588,16 +4592,27 @@ fn verify_artifact_admission<B: StorageBackend + ?Sized>(
 /// only the detached authority metadata, and the single-writer permit
 /// serializes the whole preparation.
 ///
-/// The one construction that remains is itself the history-coherence proof:
-/// building the graph revalidates storage admission over the authority-free
-/// payload and derives every entity revision timeline, exactly as each
-/// discarded rebuild did. Every later use is a read-only query against that
-/// validated decode.
-/// CARRY SITE 1 of 4. See `carry_sites_stay_enumerated`.
+/// The proof that remains is the history-coherence proof itself: storage
+/// admission over the authority-free payload, and the derivation of every
+/// entity revision timeline, exactly as each discarded rebuild did. Both are
+/// fail-closed and both read the snapshot, so neither needs to own it, and
+/// neither result was ever read: the decoded graph was only ever asked to
+/// resolve trees, which reads the change map alone.
+///
+/// So this holds the borrowed snapshot rather than a decoded copy of it.
+/// Building an `InMemoryGraph` here meant cloning the whole snapshot in order
+/// to null `repository_authority` and then rebuilding every index, adjacency
+/// map and Merkle root from the clone, and keeping all of it alive until the
+/// preparation ended. On a full-history brownfield conversion that is a second
+/// copy of the entire repository, retained across the phase where the peak is
+/// reached, to answer a question the snapshot itself already answers. The field
+/// this cloned to null is, in `prepare_successor`, already `None`: the caller
+/// takes the authority out before the replay is created.
 struct SharedReplayGraph<'a> {
     snapshot: &'a GraphSnapshot,
     admitted: Option<AdmittedChangeMap<'a>>,
-    graph: std::cell::OnceCell<InMemoryGraph>,
+    proven: std::cell::OnceCell<()>,
+    proof_runs: std::cell::Cell<u32>,
     build_ms: std::cell::Cell<u128>,
 }
 
@@ -4606,7 +4621,7 @@ impl<'a> SharedReplayGraph<'a> {
         Self::new_with_admission(snapshot, None)
     }
 
-    /// Build a replay view whose decode may carry an existing admission of
+    /// Build a replay view whose proof may carry an existing admission of
     /// `snapshot`'s change map instead of repeating the pass.
     ///
     /// `None` validates exactly as `new` does, so a caller without a witness
@@ -4618,37 +4633,44 @@ impl<'a> SharedReplayGraph<'a> {
         Self {
             snapshot,
             admitted: admitted.copied(),
-            graph: std::cell::OnceCell::new(),
+            proven: std::cell::OnceCell::new(),
+            proof_runs: std::cell::Cell::new(0),
             build_ms: std::cell::Cell::new(0),
         }
     }
 
-    /// Decode the snapshot once and reuse it for every later query.
-    fn graph(&self) -> Result<&InMemoryGraph, KinDbError> {
-        if self.graph.get().is_none() {
+    /// Prove the payload decodes, once, and remember that it did.
+    ///
+    /// Every query below runs this first, so a payload that fails the proof
+    /// never answers a tree question, which is the order the decode enforced
+    /// when it owned the query surface.
+    fn prove(&self) -> Result<(), KinDbError> {
+        if self.proven.get().is_none() {
             let started = std::time::Instant::now();
-            let mut replay = self.snapshot.clone();
-            replay.repository_authority = None;
-            // CARRY SITE: `replay.changes` is the clone made on the line above,
-            // of the map `self.admitted` witnesses.
-            let graph = match self.admitted.as_ref() {
-                Some(admitted) => {
-                    InMemoryGraph::from_admitted_snapshot_without_text_index(replay, admitted)?
-                }
-                None => InMemoryGraph::from_snapshot_without_text_index(replay)?,
-            };
+            self.proof_runs.set(self.proof_runs.get() + 1);
+            // The witness, when there is one, was minted for this very map:
+            // nothing is cloned here, so the pointer identity `describes`
+            // checks holds outright instead of being carried onto a copy.
+            InMemoryGraph::prove_authority_free_snapshot_decode(
+                self.snapshot,
+                self.admitted.as_ref(),
+            )?;
             self.build_ms.set(started.elapsed().as_millis());
-            let _ = self.graph.set(graph);
+            let _ = self.proven.set(());
         }
-        Ok(self
-            .graph
-            .get()
-            .expect("shared replay graph was just built"))
+        Ok(())
     }
 
-    /// Milliseconds spent building the decode, zero when it was never needed.
+    /// Milliseconds spent proving the payload, zero when it was never needed.
     fn build_ms(&self) -> u128 {
         self.build_ms.get()
+    }
+
+    /// How many times the proof actually ran. Instrumentation for the test that
+    /// asserts the sharing works; nothing in the engine reads it.
+    #[cfg(test)]
+    fn proof_runs(&self) -> u32 {
+        self.proof_runs.get()
     }
 
     fn resolve_tree(&self, change_id: SemanticChangeId) -> Result<ResolvedTree, KinDbError> {
@@ -4668,11 +4690,21 @@ impl<'a> SharedReplayGraph<'a> {
     /// depth `D` pays `M * D` steps for a fold that is `D` steps long. One
     /// batch pays the lineage once and copies a tree only where one was asked
     /// for.
+    ///
+    /// The fold reads the change map and nothing else, which is why the graph
+    /// this used to decode was never needed. It went through the graph's own
+    /// batch resolver, whose whole body was this same call against a change map
+    /// cloned out of this same snapshot; that resolver had no other caller and
+    /// is gone with the decode.
     fn resolve_trees(
         &self,
         change_ids: &[SemanticChangeId],
     ) -> Result<BTreeMap<SemanticChangeId, ResolvedTree>, KinDbError> {
-        self.graph()?.resolve_trees_at(change_ids)
+        self.prove()?;
+        crate::storage::history_replay::resolve_first_parent_trees(
+            &self.snapshot.changes,
+            change_ids,
+        )
     }
 }
 
@@ -4732,14 +4764,15 @@ fn validate_history_replay_with(
     // replay below replaces carried no proof this does not already hold.
     topological_change_order(&snapshot.changes)?;
 
-    // Decoding the snapshot into a coherent graph is part of the proof rather
-    // than a convenience: it revalidates storage admission over the
+    // Proving the snapshot decodes into a coherent graph is part of the proof
+    // rather than a convenience: it revalidates storage admission over the
     // authority-free payload and derives every entity revision timeline, both
     // of which fail closed. It is one pass over the snapshot, not per change,
-    // and it proves graph truth rather than serving queries, so it needs no
-    // text index. The shared decode is that exact pass: an earlier preparation
-    // step may already have paid for it, and asking for it here proves it.
-    replay.graph()?;
+    // and it proves graph truth rather than serving queries, so it needs
+    // neither a text index nor a decoded copy of the payload to keep. The
+    // shared proof is that exact pass: an earlier preparation step may already
+    // have paid for it, and asking for it here proves it.
+    replay.prove()?;
 
     // New transactions validate every admitted tip directly. Reopen has no
     // trusted prior process state, so replay every DAG leaf; together their
@@ -7593,7 +7626,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_replay_graph_decodes_once_and_matches_fresh_resolution() {
+    fn shared_replay_graph_proves_once_and_matches_fresh_resolution() {
         let backend = Arc::new(MemoryBackend::default());
         let manager = initial_manager(Arc::clone(&backend));
         let (transaction, expected_change, _outer_tag) = detached_tag_import_transaction(&manager);
@@ -7601,11 +7634,20 @@ mod tests {
         let committed = manager.read_authority();
 
         let replay = SharedReplayGraph::new(committed.snapshot());
-        let first = std::ptr::from_ref(replay.graph().unwrap());
-        let second = std::ptr::from_ref(replay.graph().unwrap());
-        assert_eq!(first, second, "the decode must be built once and shared");
-
+        assert_eq!(
+            replay.proof_runs(),
+            0,
+            "the proof is lazy and must not run before it is asked for"
+        );
+        replay.prove().unwrap();
+        replay.prove().unwrap();
         let shared_tree = replay.resolve_tree(expected_change).unwrap();
+        assert_eq!(
+            replay.proof_runs(),
+            1,
+            "the proof must run once and be shared by every later caller"
+        );
+
         let mut fresh = committed.snapshot().clone();
         fresh.repository_authority = None;
         let fresh_tree = InMemoryGraph::from_snapshot_without_text_index(fresh)
@@ -7615,6 +7657,53 @@ mod tests {
         assert_eq!(
             shared_tree, fresh_tree,
             "a shared resolution must answer exactly what a fresh decode answers"
+        );
+    }
+
+    /// The proof runs before any query answers, so a payload that fails
+    /// admission never resolves a tree. The decode enforced that ordering by
+    /// owning the query surface; borrowing the snapshot means the ordering has
+    /// to be asserted instead of inherited.
+    #[test]
+    fn shared_replay_refuses_a_query_over_a_payload_that_fails_its_proof() {
+        let backend = Arc::new(MemoryBackend::default());
+        let manager = initial_manager(Arc::clone(&backend));
+        let (transaction, expected_change, _outer_tag) = detached_tag_import_transaction(&manager);
+        manager.commit_repository_transaction(transaction).unwrap();
+        let committed = manager.read_authority();
+
+        // A change whose declared id no longer matches its payload is exactly
+        // what the admission pass exists to refuse.
+        let mut corrupt = committed.snapshot().clone();
+        corrupt.repository_authority = None;
+        let victim = *corrupt
+            .changes
+            .keys()
+            .next()
+            .expect("the committed history has at least one change");
+        corrupt
+            .changes
+            .get_mut(&victim)
+            .expect("the change was just read out of this map")
+            .message
+            .push_str(" tampered");
+
+        let replay = SharedReplayGraph::new(&corrupt);
+        let error = replay
+            .resolve_tree(expected_change)
+            .expect_err("a tampered payload must not answer a tree query");
+        assert_eq!(
+            replay.proof_runs(),
+            1,
+            "the refusal must come from the proof, which must have run"
+        );
+        // The same refusal a fresh decode of the same bytes raises.
+        let fresh = InMemoryGraph::from_snapshot_without_text_index(corrupt)
+            .expect_err("a fresh decode must refuse the same payload");
+        assert_eq!(
+            error.to_string(),
+            fresh.to_string(),
+            "the borrowed proof must refuse with the message the decode refused with"
         );
     }
 

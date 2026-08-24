@@ -58,6 +58,22 @@ impl CompactionStats {
     }
 }
 
+/// Whether a snapshot's authority envelope takes part in its storage admission.
+///
+/// A stored snapshot validates its envelope against itself. A history replay
+/// deliberately does not: it proves the authority-free payload, because the
+/// envelope belongs to the caller that is publishing it and the replay is
+/// checking the payload underneath. The distinction used to be carried by
+/// cloning the whole snapshot and nulling one field, which on a full-history
+/// conversion allocated a second copy of the repository to express one bit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthorityEnvelope {
+    /// Validate the envelope against the snapshot it is stored with.
+    Validated,
+    /// Skip the envelope, exactly as a snapshot carrying none would.
+    Ignored,
+}
+
 /// The serializable snapshot of the entire graph state.
 ///
 /// This is the on-disk format. We use std::collections::HashMap here
@@ -616,10 +632,38 @@ impl GraphSnapshot {
         &self,
         replay: GitProjectionTreeReplay,
     ) -> Result<(), crate::error::KinDbError> {
+        self.validate_admission_with_envelope(replay, AuthorityEnvelope::Validated)
+    }
+
+    /// The same storage admission a snapshot carrying no authority envelope
+    /// would pass.
+    ///
+    /// A history replay proves the authority-free payload on purpose: the
+    /// envelope is the caller's to publish, and the replay is checking the
+    /// payload it would be published over. Reaching that used to mean cloning
+    /// the whole snapshot in order to null one field, which on a full-history
+    /// conversion is a second copy of the repository. Ignoring the field costs
+    /// nothing and asserts exactly what nulling it asserted.
+    pub(crate) fn validate_authority_free_storage_admission(
+        &self,
+    ) -> Result<(), crate::error::KinDbError> {
+        self.validate_admission_with_envelope(
+            GitProjectionTreeReplay::Required,
+            AuthorityEnvelope::Ignored,
+        )
+    }
+
+    fn validate_admission_with_envelope(
+        &self,
+        replay: GitProjectionTreeReplay,
+        envelope: AuthorityEnvelope,
+    ) -> Result<(), crate::error::KinDbError> {
         let mut timer = crate::storage::repository::PublicationPhaseTimer::start();
         let admitted = AdmittedChangeMap::admit(&self.changes, "snapshot")?;
         let changes_ms = timer.lap_ms();
-        self.validate_storage_admission_after_changes(replay, &admitted, changes_ms, timer)
+        self.validate_storage_admission_after_changes(
+            replay, &admitted, envelope, changes_ms, timer,
+        )
     }
 
     /// The same storage admission, minus the change-map pass `admitted`
@@ -634,19 +678,48 @@ impl GraphSnapshot {
         replay: GitProjectionTreeReplay,
         admitted: &AdmittedChangeMap<'_>,
     ) -> Result<(), crate::error::KinDbError> {
+        self.validate_admission_carrying_with_envelope(
+            replay,
+            admitted,
+            AuthorityEnvelope::Validated,
+        )
+    }
+
+    /// [`validate_authority_free_storage_admission`], minus the change-map pass
+    /// `admitted` already ran over this snapshot's own map.
+    ///
+    /// The witness is checked by pointer identity exactly as it is above, so
+    /// this carries a pass and never a trust extension.
+    ///
+    /// [`validate_authority_free_storage_admission`]: Self::validate_authority_free_storage_admission
+    pub(crate) fn validate_authority_free_storage_admission_carrying(
+        &self,
+        replay: GitProjectionTreeReplay,
+        admitted: &AdmittedChangeMap<'_>,
+    ) -> Result<(), crate::error::KinDbError> {
+        self.validate_admission_carrying_with_envelope(replay, admitted, AuthorityEnvelope::Ignored)
+    }
+
+    fn validate_admission_carrying_with_envelope(
+        &self,
+        replay: GitProjectionTreeReplay,
+        admitted: &AdmittedChangeMap<'_>,
+        envelope: AuthorityEnvelope,
+    ) -> Result<(), crate::error::KinDbError> {
         if !admitted.describes(&self.changes) {
             return Err(crate::error::KinDbError::StorageError(
                 "admitted change map does not describe this snapshot's change map".to_string(),
             ));
         }
         let timer = crate::storage::repository::PublicationPhaseTimer::start();
-        self.validate_storage_admission_after_changes(replay, admitted, 0, timer)
+        self.validate_storage_admission_after_changes(replay, admitted, envelope, 0, timer)
     }
 
     fn validate_storage_admission_after_changes(
         &self,
         replay: GitProjectionTreeReplay,
         admitted: &AdmittedChangeMap<'_>,
+        envelope: AuthorityEnvelope,
         changes_ms: u128,
         mut timer: crate::storage::repository::PublicationPhaseTimer,
     ) -> Result<(), crate::error::KinDbError> {
@@ -688,7 +761,11 @@ impl GraphSnapshot {
             }
         }
         let relation_endpoints_ms = timer.lap_ms();
-        if let Some(authority) = &self.repository_authority {
+        let envelope_to_validate = match envelope {
+            AuthorityEnvelope::Validated => self.repository_authority.as_ref(),
+            AuthorityEnvelope::Ignored => None,
+        };
+        if let Some(authority) = envelope_to_validate {
             authority.validate_against_snapshot_with(self, replay, admitted)?;
         }
         let repository_authority_ms = timer.lap_ms();
