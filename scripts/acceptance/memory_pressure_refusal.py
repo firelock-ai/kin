@@ -604,7 +604,7 @@ class Suite(object):
         return run(base + args, cwd=cwd, env=self.env)
 
     def kin_run(self, args, repo, pressure=None, budget=None, timeout=600,
-                daemon_url=None, extra_env=None):
+                daemon_url=None):
         """One `kin` command, optionally under a pinned pressure level.
 
         The level reaches the daemon only through the command that STARTS one:
@@ -617,10 +617,6 @@ class Suite(object):
         resolves an endpoint and starts a replacement daemon when it finds
         none, so a probe meant to grade a failed dispatch would race a respawn
         and usually lose.
-
-        `extra_env` reaches the daemon the same way and by the same rule: the
-        threshold bars are read by the process that starts one, so a check that
-        moves them has to move them on the command that starts the daemon.
         """
         env = dict(self.env)
         if pressure is None:
@@ -635,22 +631,16 @@ class Suite(object):
             env.pop("KIN_DAEMON_URL", None)
         else:
             env["KIN_DAEMON_URL"] = daemon_url
-        for name, value in (extra_env or {}).items():
-            if value is None:
-                env.pop(name, None)
-            else:
-                env[name] = str(value)
         return run([self.kin] + args, cwd=repo, env=env, timeout=timeout)
 
-    def restart_daemon(self, repo, pressure=None, budget=None, extra_env=None):
+    def restart_daemon(self, repo, pressure=None, budget=None):
         """Stop whatever daemon is serving `repo` and start one under `pressure`.
 
         Returns the (rc, output) of the command that started the new one, so a
         caller can report a failure to start rather than grading its absence.
         """
         run([self.kin, "daemon", "stop"], cwd=repo, env=self.env, timeout=180)
-        return self.kin_run(["graph", "status"], repo, pressure=pressure, budget=budget,
-                            extra_env=extra_env)
+        return self.kin_run(["graph", "status"], repo, pressure=pressure, budget=budget)
 
     def record_path(self, repo):
         return os.path.join(repo, ".kin", RECORD_NAME)
@@ -729,6 +719,80 @@ class Suite(object):
                 return json.load(handle)
         except (IOError, OSError, ValueError):
             return None
+
+    def publish_standing(self, repo, pressure="nominal", seconds=60):
+        """Make this store's daemon publish what it is holding, and return it.
+
+        A standing is written by a pressure call, and those run on the daemon's
+        own cadence rather than inside the request that started it. Which call
+        arrives first depends on the host: the enrichment sweep publishes at
+        start, but only where a language server exists for it to run, and the
+        ambient reconcile tick publishes when the working copy moves. A probe
+        that read the file the instant `graph status` returned therefore read an
+        absent one on a machine with no language servers, which is what real
+        0.5.51 bytes did in a container here, twice, reported as UNREADABLE.
+
+        So this provokes the tick it can provoke: it writes a file into the
+        working copy and asks for status, then waits. The written file is
+        ordinary content in this check's own fixture and changes nothing else.
+
+        It retires the existing record first, so what comes back is a reading
+        taken just now rather than one this daemon published during `kin init`,
+        when it held two dozen short-lived children. A check that graded a stale
+        record against a live kernel would be comparing two different machines.
+        """
+        try:
+            os.remove(self.footprint_path(repo))
+        except (IOError, OSError):
+            pass
+        self.kin_run(["status"], repo, pressure=pressure)
+        marker = os.path.join(repo, "pkg", "tick_%d.py" % int(time.time() * 1000 % 1000000))
+        try:
+            with open(marker, "w") as handle:
+                handle.write("def tick():\n    return None\n")
+        except (IOError, OSError):
+            pass
+        self.kin_run(["status"], repo, pressure=pressure)
+        return self.wait_for_published_footprint(repo, pid=self.daemon_pid(repo),
+                                                 seconds=seconds)
+
+    def wait_for_record(self, repo, seconds=60):
+        """The refusal this store records, waited for. None if it never appears.
+
+        Same reason as `wait_for_published_footprint`: a refusal is written by
+        the pressure call that made it, and those run on the daemon's own
+        cadence rather than in the request that started it.
+        """
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            record = self.read_record(repo)
+            if record is not None:
+                return record
+            time.sleep(0.5)
+        return None
+
+    def wait_for_published_footprint(self, repo, pid=None, seconds=60):
+        """The standing this store's daemon publishes, waited for. None if it never does.
+
+        A daemon publishes its standing on its first pressure call, and those
+        come from the reconcile tick and the sweep and embed decisions rather
+        than from answering a request, so a probe that reads the file the
+        instant `graph status` returns reads an absent one. That is not a
+        product finding and it is easy to record as one: the first version of
+        checks 10 and 11 reported UNREADABLE against real 0.5.51 bytes in a
+        container for exactly this reason.
+
+        `pid` requires the standing to be the one THIS daemon published rather
+        than its predecessor's, which is what keeps a check that restarts a
+        daemon under a new budget from grading the record the old one left.
+        """
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            published = self.read_published_footprint(repo)
+            if published is not None and (pid is None or published.get("pid") == pid):
+                return published
+            time.sleep(0.5)
+        return None
 
     def read_record(self, repo):
         """The refusal this store records, or None.
@@ -1500,15 +1564,15 @@ def check_10(suite):
     if pid is None:
         result.unknown("this store published no daemon pid at %s" % suite.pid_path(repo))
         return result
-    published = suite.read_published_footprint(repo)
+    published = suite.publish_standing(repo)
     own = _published_own_bytes(published)
     # Read immediately after the record, so the two figures are as close in time
     # as this probe can make them.
     pss = proportional_bytes(pid)
     rss = resident_bytes(pid)
     if own is None:
-        result.unknown("no standing was published at %s: %s"
-                       % (suite.footprint_path(repo), json.dumps(published)))
+        result.unknown("this daemon (pid %d) published no standing at %s: %s"
+                       % (pid, suite.footprint_path(repo), json.dumps(published)))
         return result
     if pss is None or rss is None or pss <= 0 or rss <= 0:
         result.unknown("could not read pid %d from /proc (pss=%s rss=%s)" % (pid, pss, rss))
@@ -1562,42 +1626,53 @@ def check_10(suite):
 
 
 def check_11(suite):
-    """FIR-2653: the budget is judged on the proportional reading, so a daemon
-    the pre-fix arithmetic would have refused is admitted.
+    """FIR-2653: the whole TREE is published proportionally, and a daemon inside
+    its budget is admitted.
 
-    The impossible number was not cosmetic and this is why it mattered.
-    Background embedding did not start on any of the three stranger candidate
+    Check 10 grades the daemon's own row. This grades the sum, which is where
+    the defect actually bit: the stranger's line read "of which 23.1 GiB is in
+    those child processes", thirteen processes averaging 1.8 GiB each, which is
+    what per-process resident sets summed over children that map the same pages
+    look like. Background embedding then did not start on any of the three
     stores, so every vector answer that release candidate could give came from
-    an empty index on a box that had room: psf/requests finished 0 of 2,116,
-    expressjs/express 0 of 742.
+    an empty index: psf/requests finished 0 of 2,116, expressjs/express 0 of 742.
 
-    The two readings are taken from this daemon rather than assumed. `T` is what
-    it publishes, `R` is its tree's resident set summed the way the pre-fix build
-    summed it, and the budget is set midway between them with both bars pinned at
-    one, so the two readings give opposite answers to "may heavy work start" with
-    no constant in the check that could drift away from the machine.
+    The comparison is a distance rather than a threshold, so it needs no
+    tolerance constant: the published total has to be at least as close to the
+    tree's proportional sum as to its summed resident set. A pre-fix build
+    publishes the second of those exactly.
 
-    The control is the same store under a budget below `T`, where the correct
-    reading is over too. Without it a build that had stopped refusing anything at
-    all would pass the first half, and a probe that never looked would look
-    identical to one that looked and found nothing.
+    Then the consequence, on the surface it had one. No budget is named: the
+    daemon runs under the one it derives from its own ceiling, which is what a
+    user runs under, and inside a container that ceiling is the cap. A tree read
+    proportionally sits far inside that budget and stays nominal; the same tree
+    summed resident does not, which is how three stranger stores finished with
+    nothing in their vector index.
+
+    The control is its own store under a one-byte budget, where any real daemon
+    is over, and it grades the published RUNG rather than a refusal record.
+    Which piece of heavy work reaches a consultation depends on what is
+    installed beside the daemon, since the enrichment sweep records a refusal
+    only where a language server exists for it to run, and the rung is published
+    either way. Without the control a build that had stopped grading its budget
+    at all would pass every arm above it.
 
     What it does NOT prove: that a vector was computed. The suite runs with
-    `KIN_DAEMON_AUTO_EMBED=0` and never loads a model, deliberately, so what is
-    graded is the admission decision and the rung the embed gate reads. The gate
-    itself takes its verdict from this same standing through the same
-    `pressure_verdict`, and the Rust tests in `kin_core::memory_pressure` and
+    `KIN_DAEMON_AUTO_EMBED=0` and loads no model, deliberately, so what is
+    graded is the admission decision and the rung the embed gate reads. That
+    gate takes its verdict from this same standing through the same
+    `pressure_verdict`; the Rust tests in `kin_core::memory_pressure` and
     `kin_daemon::daemon` carry the other half by name.
     """
     result = Result(
         "11", TICKET_FOOTPRINT,
-        "a tree the summed-resident reading would have refused is admitted on the proportional one",
+        "the published tree total is proportional, and a daemon inside its budget is admitted",
     )
     if not sys.platform.startswith("linux"):
         result.unknown(
-            "no /proc on %s, so the pre-fix reading this check grades against cannot be taken "
-            "here. The same opposition is asserted as a unit test over a synthetic process "
-            "table in kin_daemon::daemon" % sys.platform
+            "no /proc on %s, so the tree's two readings cannot be taken here. The same "
+            "opposition is asserted as a unit test over a synthetic process table in "
+            "kin_daemon::daemon, where thirteen children map one image" % sys.platform
         )
         return result
 
@@ -1607,79 +1682,104 @@ def check_11(suite):
         result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
         return result
     pid = suite.daemon_pid(repo)
-    published = suite.read_published_footprint(repo)
+    published = suite.publish_standing(repo) if pid else None
     own = _published_own_bytes(published)
     if pid is None or own is None:
         result.unknown("no pid or no published standing for %s: pid=%s standing=%s"
                        % (repo, pid, json.dumps(published)))
         return result
+    footprint = published.get("footprint") or {}
+    total = own + (footprint.get("children_bytes") or 0)
     tree = [pid] + descendants_of(pid)
-    summed_resident = 0
+    proportional_sum, resident_sum = 0, 0
     for member in tree:
-        member_rss = resident_bytes(member)
-        if member_rss:
-            summed_resident += member_rss
-    published_total = own + ((published.get("footprint") or {}).get("children_bytes") or 0)
-    if published_total <= 0 or summed_resident <= published_total:
-        result.unknown(
-            "this daemon's tree (%d process(es)) sums to %d bytes resident against %d "
-            "published, so the two readings do not separate and no budget can tell them "
-            "apart" % (len(tree), summed_resident, published_total)
-        )
+        proportional_sum += proportional_bytes(member) or 0
+        resident_sum += resident_bytes(member) or 0
+    if proportional_sum <= 0 or resident_sum <= 0:
+        result.unknown("could not read the %d-process tree from /proc (proportional=%d "
+                       "resident=%d)" % (len(tree), proportional_sum, resident_sum))
         return result
 
-    midpoint = (published_total + summed_resident) // 2
-    # Both bars at one, so the rung is decided by a single comparison against the
-    # budget and nothing else: under it is nominal, at or over it is critical.
-    bars = {"KIN_MEMORY_PRESSURE_ELEVATED_FRACTION": "1.0",
-            "KIN_MEMORY_PRESSURE_CRITICAL_FRACTION": "1.0"}
-    rc, out = suite.restart_daemon(repo, pressure="nominal", budget=midpoint, extra_env=bars)
-    if rc != 0:
-        result.unknown("could not restart under the midpoint budget, exit %d: %s"
-                       % (rc, tail(out)))
-        return result
-    standing = suite.read_published_footprint(repo)
-    record = suite.read_record(repo)
-    level = (standing or {}).get("level")
-    if record is not None:
-        result.bad(
-            "with a budget of %d, midway between %d published and %d summed resident, this "
-            "daemon still backed off: %s"
-            % (midpoint, published_total, summed_resident, json.dumps(record))
+    # The record names the tree it measured. A daemon holds two dozen
+    # short-lived children during `kin init` and none once it settles, so a
+    # record describing a different tree from the one this reads is two
+    # different machines being compared and grades nothing.
+    if footprint.get("child_count") != len(tree) - 1:
+        result.ok(
+            "tree arm: not run, because the daemon published a standing over %s child "
+            "process(es) and this read finds %d, so the two readings are of different trees"
+            % (footprint.get("child_count"), len(tree) - 1)
         )
-    elif level != "nominal":
+    elif abs(total - proportional_sum) > abs(total - resident_sum):
         result.bad(
-            "the published rung is %r under a budget of %d that the tree's %d bytes sit "
-            "inside, so heavy work is being judged against something other than what was "
-            "published: %s" % (level, midpoint, published_total, json.dumps(standing))
+            "the daemon publishes %d bytes for its %d-process tree, which is closer to that "
+            "tree's summed resident set of %d than to its proportional sum of %d. Summing "
+            "resident sets charges every shared page once per process, and is what read 25.3 "
+            "GiB inside a 12 GiB container"
+            % (total, len(tree), resident_sum, proportional_sum)
         )
     else:
         result.ok(
-            "under a budget of %d the tree publishes %d bytes and stays nominal, where the "
-            "pre-fix reading of %d would have been over it" % (midpoint, published_total,
-                                                               summed_resident)
+            "the published %d bytes for %d process(es) sits with the proportional sum of %d, "
+            "not the summed resident set of %d"
+            % (total, len(tree), proportional_sum, resident_sum)
+        )
+
+    # What the impossible number cost, on the surface it cost it. Nothing is
+    # named here: the budget is the one this daemon derives from its own
+    # ceiling, which is what a user runs under, and a tree read proportionally
+    # sits far inside it while the same tree summed resident does not. That is
+    # the whole finding, in one assertion: background embedding refused on all
+    # three stranger stores under exactly this shape.
+    derived_refusal = suite.read_record(repo)
+    if derived_refusal is not None:
+        result.bad(
+            "this daemon, inside its own derived budget, recorded a refusal: %s. Every "
+            "vector answer a store gives in this state comes from an index nothing is "
+            "filling" % json.dumps(derived_refusal)
+        )
+    elif (published.get("level") or "") != "nominal":
+        result.bad(
+            "this daemon publishes rung %r under its derived budget of %s bytes while holding "
+            "%d, so heavy work is judged against a figure the tree is not holding: %s"
+            % (published.get("level"), published.get("budget_bytes"), total,
+               json.dumps(published))
+        )
+    else:
+        result.ok(
+            "under its derived budget of %s bytes the daemon holds %d and stays nominal, so "
+            "background embedding is admitted"
+            % (published.get("budget_bytes"), total)
         )
 
     # Its own store, never the one above, so the control cannot pass on a record
-    # the first arm left behind or fail on one it cleared.
+    # the first arm left behind or fail on one it cleared. It grades the RUNG
+    # rather than a refusal record, because which piece of heavy work reaches a
+    # consultation depends on what is installed beside the daemon: the
+    # enrichment sweep records a refusal only where a language server exists for
+    # it to run, and the rung is published either way.
     control = suite.fixture("proportional-refused")
-    rc, out = suite.restart_daemon(control, pressure="nominal",
-                                   budget=max(1, published_total // 2), extra_env=bars)
+    rc, out = suite.restart_daemon(control, pressure="nominal", budget=1)
     if rc != 0:
         result.unknown("could not start the control daemon, exit %d: %s" % (rc, tail(out)))
         return result
-    control_record = suite.read_record(control)
-    if control_record is None:
+    control_standing = suite.publish_standing(control)
+    if control_standing is None:
+        result.unknown("the control daemon published no standing at %s"
+                       % suite.footprint_path(control))
+        return result
+    if control_standing.get("level") != "critical":
         result.bad(
-            "a daemon under a budget of half what it publishes recorded no refusal at %s, so "
-            "the arm above proves nothing: a build that refused nothing would pass it"
-            % suite.record_path(control)
+            "a daemon under a ONE-BYTE budget publishes rung %r, so the arms above prove "
+            "nothing: a build that had stopped grading its budget at all would pass them: %s"
+            % (control_standing.get("level"), json.dumps(control_standing))
         )
-    elif not reason_names_the_budget(control_record.get("reason")):
+    else:
+        result.ok("the control, at a one-byte budget, publishes critical")
+    control_record = suite.read_record(control)
+    if control_record is not None and not reason_names_the_budget(control_record.get("reason")):
         result.bad("the control's refusal blames the wrong constraint: %s"
                    % json.dumps(control_record))
-    else:
-        result.ok("the control, at half its published footprint, backs off and blames the budget")
     return result
 
 

@@ -396,6 +396,58 @@ jobs:
             echo "::error title=Memory-pressure refusal suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
+      # FIR-2653. The two footprint checks need a memory cap to grade against
+      # and a runner has none: `/sys/fs/cgroup/memory.max` reads `max` here, so
+      # check 10's cgroup arm has nothing to hold a published figure under and
+      # check 11's derived budget is gigabytes. A container gives both, and it
+      # is the shape the defect was found in: a daemon and twenty-three children
+      # published as holding 1.45 GiB inside a container the kernel charged 283
+      # MiB, with the daemon then refusing background embedding against its own
+      # derived budget. Verified against shipped 0.5.51 bytes in exactly this
+      # setup before the fix landed, where both checks FAIL.
+      #
+      # The image is the runner's own release, so the binaries built above run
+      # under the glibc they were linked against. The suite runs from /w, so the
+      # report lands in the same acceptance/ directory the gate reads.
+      - name: Memory-footprint suite inside a capped container (verdict comes from the gate step)
+        id: memoryfootprint
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          docker run --rm --memory=2g --workdir /w \
+            -v "$PWD:/w" \
+            -e KIN_ACCEPTANCE_LABEL \
+            ubuntu:24.04 /bin/bash -c '
+              set -e
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update -qq
+              apt-get install -y -qq --no-install-recommends git python3
+              git config --global user.name "Kin CI"
+              git config --global user.email "ci@kinlab.ai"
+              exec python3 scripts/acceptance/memory_pressure_refusal.py \
+                --kin target/release/kin \
+                --daemon target/release/kin-daemon \
+                --json acceptance/memory_footprint.json \
+                --label "$KIN_ACCEPTANCE_LABEL" \
+                --only 10 --only 11 --verbose
+            ' >acceptance/memory_footprint.log 2>&1 || rc=$?
+          cat acceptance/memory_footprint.log
+          {
+            echo "### Memory-footprint suite, capped container (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/memory_footprint.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Memory-footprint suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
       # FIR-2539. This suite drives the in-tree live-heap guard rather than a
       # binary: the figure that carries the class is what proof 1 adds to the
       # peak, and only the counting allocator can see it. Resident set was tried
@@ -522,6 +574,7 @@ jobs:
             --report response_budget=acceptance/response_budget.json \
             --report parsehole=acceptance/parsehole.json \
             --report memory_pressure=acceptance/memory_pressure.json \
+            --report memory_footprint=acceptance/memory_footprint.json \
             --report initmemory=acceptance/initmemory.json \
             --report registry_isolation=acceptance/registry_isolation.json \
             --report first_contact=acceptance/first_contact.json \

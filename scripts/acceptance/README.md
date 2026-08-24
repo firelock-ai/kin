@@ -153,13 +153,33 @@ three of its stores. Check 10 grades the published figure against the kernel's
 own proportional and resident readings for the same pid, taken here rather than
 asked of kin, and against what the cgroup is charged wherever a cap binds the
 daemon; where no cap does, it says so in its own line rather than reporting an
-arm it never ran. Check 11 derives a budget midway between what the daemon
-publishes and what its tree sums to resident, pins both bars at one so the two
-readings give opposite answers, and requires the daemon to stay nominal; its
-control, at half the published figure, must still back off. Both are Linux, and
-both say so off it: the macOS reader (`phys_footprint` through
-`proc_pid_rusage`) has unit coverage in `kin-daemon-spawn` and no end-to-end arm
-here, because there is no second kernel figure to grade it against without root.
+arm it never ran. Check 11 grades the whole tree the same way, since
+"of which 23.1 GiB is in those child processes" is where the defect bit, and
+then sets a budget just above the tree's summed resident set, where the pre-fix
+reading sits at the refusal bar and the proportional one sits near two thirds;
+that arm runs only where the two readings are at least 30% apart and says so
+when they are not. Its control, a store under a one-byte budget, must still back
+off, because a build that had stopped backing off at all would pass every arm
+above it. Both checks are Linux, and both say so off it: the macOS reader
+(`phys_footprint` through `proc_pid_rusage`) has unit coverage in
+`kin-daemon-spawn` and no end-to-end arm here, because there is no second kernel
+figure to grade it against without root.
+
+Those two run twice in CI, and the second run is the one that can fail. A runner
+has no memory cap, so check 10's cgroup arm has nothing to hold a published
+figure under and check 11's derived budget is gigabytes; the workflow therefore
+runs `--only 10 --only 11` again inside `docker run --memory=2g`, which is the
+shape the defect was found in. Against shipped 0.5.51 bytes in exactly that
+setup both checks FAIL, quoting a daemon and twenty-three children published as
+holding 1.45 GiB inside a container the kernel charged 283 MiB, and a rung of
+`critical` against a derived budget of 1 GiB while the tree held 62 MiB.
+
+Both also wait for a standing rather than reading one. A daemon publishes on a
+pressure call, and those arrive from the enrichment sweep, which needs a
+language server to exist, or from the ambient reconcile tick, which needs the
+working copy to move. Reading the file the instant `graph status` returns read
+an absent one and reported UNREADABLE twice against real bytes, so the suite
+retires the old record, writes a file, asks for status, and waits.
 
 `init_memory_repro.py` covers what a brownfield conversion holds while it runs.
 A full-history `psf/requests` conversion measured 11.72 GiB of resident set
