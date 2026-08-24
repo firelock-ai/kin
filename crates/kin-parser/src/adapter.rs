@@ -331,6 +331,7 @@ pub fn site_from_node(node: &Node) -> RelationSite {
         start_col: start.column as u32,
         end_line: end.row as u32,
         end_col: end.column as u32,
+        syntactic_role: None,
     }
 }
 

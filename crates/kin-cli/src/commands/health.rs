@@ -3874,27 +3874,45 @@ fn language_server_fix() -> String {
 /// Report the active retrieval quality profile and the effective lever set,
 /// so an operator can see at a glance whether they are getting full
 /// retrieval capability — and why not, when a lever is off.
-/// One commit peak measured on a real converted repository.
+/// One commit observation from a real converted repository.
+///
+/// `peak_bytes` is a WHOLE-MACHINE total taken while the commit ran, not the
+/// commit's own demand: everything else resident at the time is inside it. That
+/// distinction is FIR-2643. Keying these totals to store size and reading the
+/// result as what a commit costs put this row roughly an order of magnitude out,
+/// because the one measurement that separated the terms found a docstring-only
+/// edit on a 500 MiB store costing about 0.9 GB over a resident baseline of
+/// 8.16 GB, while the store-size reading implied a 10.6 GiB floor.
+///
+/// `observed_ceiling_bytes` is the size of the machine the total was taken
+/// inside, and it travels with the total because a total means nothing without
+/// it. 12283 MiB is comfortable in 24 GiB and is the last reading before a kill
+/// in 12288 MiB, and it was the second.
 struct MeasuredCommitPeak {
     repository: &'static str,
     store_bytes: u64,
     peak_bytes: u64,
+    observed_ceiling_bytes: u64,
 }
 
 const MIB: u64 = 1024 * 1024;
 
-/// Commit peaks measured on converted repositories, smallest store first.
+/// Commit observations from converted repositories, smallest store first.
 ///
-/// Every row is one observation, not a fitted curve, and the check below never
-/// interpolates or extrapolates between them. It quotes the largest row whose
-/// store is no larger than the store in front of it, so what a reader is told
-/// is always a repository that has actually been measured rather than a
-/// prediction about theirs. Below the smallest row nothing is claimed at all.
+/// Every row is one whole-machine total taken while a commit ran, never a fitted
+/// curve and never a commit's own demand, and the check below never interpolates
+/// or extrapolates between them. It quotes the largest row whose store is no
+/// larger than the store in front of it, so what a reader is told is always a
+/// machine that was actually measured rather than a prediction about theirs.
+/// Below the smallest row nothing is claimed at all.
 ///
-/// The two rows are why a curve would be wrong: a store less than half the size
-/// of the other peaked within 12% of it, because a commit prepares the whole
-/// repository successor in memory and the fixed part of that dominates. Both
-/// were measured in the same 5 CPU / 12 GiB container on `kin 0.5.40`, before
+/// The two rows are the table's own argument against a curve. `expressjs/express`
+/// holds a store 47% the size of `psf/requests` and its total lands within 12% of
+/// it. A quantity that barely moves when the store nearly halves is not a
+/// quantity the store predicts, which is why this check compares one ceiling
+/// against one observation and stops there.
+///
+/// Both were taken in the same 5 CPU / 12 GiB container on `kin 0.5.40`, before
 /// the workspace-graph scoping in `plan_native_commit_inner` cut what a commit
 /// holds at its peak. A build that peaks lower than a row makes this check
 /// conservative rather than wrong, which is the safe direction for a warning:
@@ -3905,25 +3923,31 @@ const MEASURED_COMMIT_PEAKS: &[MeasuredCommitPeak] = &[
         repository: "expressjs/express",
         store_bytes: 437 * MIB,
         peak_bytes: 10809 * MIB,
+        observed_ceiling_bytes: 12288 * MIB,
     },
     MeasuredCommitPeak {
         repository: "psf/requests",
         store_bytes: 922 * MIB,
         peak_bytes: 12283 * MIB,
+        observed_ceiling_bytes: 12288 * MIB,
     },
 ];
 
-/// How far above the quoted peak a ceiling has to sit, as a percentage of that
-/// peak, before this check calls it ok.
+/// How far above the quoted total a ceiling has to sit, as a percentage of that
+/// total, before this check calls it ok.
 ///
-/// The quoted row is a floor rather than a bound. The store in front of the
-/// check is at least as large as the row's store, and a larger store peaks
-/// higher: `psf/requests` holds barely more than twice `expressjs/express`'s
-/// store and peaks 13.6% above it, because a commit prepares the whole
-/// repository successor in memory and the fixed part of that dominates. So a
-/// ceiling merely level with the quoted peak is the edge rather than headroom,
-/// and calling that ok is what told an isolated stranger run its 12288 MiB
-/// container was fine six hours before a commit was killed at 12283 MiB.
+/// This is a repeatability figure, not a scaling claim. Two commits observed in
+/// the SAME 12 GiB container produced totals 13.6% apart, so a total is not
+/// reproducible closer than that even with the machine held fixed. A ceiling
+/// merely level with a quoted total therefore has no room in it, and calling
+/// that ok is what told an isolated stranger run its 12288 MiB container was
+/// fine six hours before a commit was killed at 12283 MiB.
+///
+/// FIR-2643: the margin used to be justified by "a larger store peaks higher",
+/// which the table's own two rows do not support and which put this row's
+/// forecast roughly an order of magnitude out. The band it opens is unchanged,
+/// because the kill it caught is unchanged. Only the reason it exists is stated
+/// correctly now.
 ///
 /// The number rounds the observed spread up, because the safe direction for a
 /// warning is to advise headroom nobody needs rather than to stay quiet about a
@@ -3932,21 +3956,27 @@ const MEASURED_COMMIT_PEAKS: &[MeasuredCommitPeak] = &[
 /// test instead of quietly narrowing the band this exists to open.
 const COMMIT_PEAK_COMFORT_MARGIN_PERCENT: u64 = 14;
 
-/// Report whether this machine has the memory a commit on this store has been
-/// measured to need.
+/// Report how this machine's memory ceiling compares with the totals commits on
+/// stores this size have already been observed reaching.
 ///
 /// A commit that runs out of memory is reported to the person running it as a
-/// closed socket, and the store size that decides it is knowable before any
-/// commit is attempted. This is that reading, published where a user looks
+/// closed socket, and by then the write is gone. The comparison this row makes
+/// needs no commit to have been attempted, so it is published where a user looks
 /// before they are surprised rather than after.
 ///
-/// It reports three bands. A ceiling clear of the quoted peak is healthy, one
+/// What it does not do, since FIR-2643, is predict what a commit here would
+/// cost. The observations it quotes are whole-machine totals, the commit's own
+/// share of them is not modelled, and the version of this row that derived one
+/// from store size ran roughly an order of magnitude high. It compares a ceiling
+/// against an observation, and it says that is what it is doing.
+///
+/// It reports three bands. A ceiling clear of the quoted total is healthy, one
 /// merely level with it is `Stale`, and one below it is `Degraded`. The middle
-/// band exists because the quoted peak is a floor for a store at least the
-/// quoted size, so parity with it is the edge rather than headroom.
+/// band exists because a total is not reproducible closer than the spread the
+/// table itself shows, so parity with one is the edge rather than headroom.
 ///
 /// It is advisory by construction and never blocks readiness, whichever band it
-/// lands in. A ceiling below a measured peak is a fact about a machine, not a
+/// lands in. A ceiling below an observed total is a fact about a machine, not a
 /// broken install, and a check that failed readiness on it would fail every
 /// correct install on a small host.
 fn check_commit_memory_headroom() -> HealthCheck {
@@ -3986,7 +4016,13 @@ fn check_daemon_kill_record() -> HealthCheck {
             "not in a Kin repository, so there is no store whose daemons could have been killed",
         );
     };
-    daemon_kill_record_check_for(kin_daemon_spawn::read_daemon_kill_record(layout.root()).as_ref())
+    // The store's tally OR a death it has not settled yet. The tally alone
+    // leaves a window this row exists to close: a daemon killed with nothing
+    // watching is settled by the NEXT daemon start, and a reader who runs
+    // `kin doctor` before starting one is exactly the reader who just watched a
+    // command die. This row would have told them no daemon serving this store
+    // has ever been killed.
+    daemon_kill_record_check_for(crate::daemon_death::recorded_for_store(layout.root()).as_ref())
 }
 
 /// Core of [`check_daemon_kill_record`] with the record as its input, so both
@@ -4273,6 +4309,7 @@ fn commit_memory_headroom_check_for(
         );
     };
     let available = format_health_bytes(evidence.limit_bytes);
+    let ceiling_source = evidence.limit_source.describe();
     let measured = MEASURED_COMMIT_PEAKS
         .iter()
         .rev()
@@ -4283,8 +4320,8 @@ fn commit_memory_headroom_check_for(
             LABEL,
             HealthStatus::Healthy,
             format!(
-                "{} of memory available; this {} store is smaller than any store a commit peak \
-                 has been measured on, so no headroom claim is made about it",
+                "{} of memory here ({ceiling_source}); this {} store is smaller than any store a \
+                 commit has been observed on, so no headroom claim is made about it",
                 available,
                 format_health_bytes(store.bytes)
             ),
@@ -4292,6 +4329,8 @@ fn commit_memory_headroom_check_for(
     };
     let needed = format_health_bytes(measured.peak_bytes);
     let measured_store = format_health_bytes(measured.store_bytes);
+    let measured_machine = format_health_bytes(measured.observed_ceiling_bytes);
+    let room = format_observation_room(measured.peak_bytes, measured.observed_ceiling_bytes);
     let store_size = format_health_bytes(store.bytes);
     let ratio = format_store_ratio(store.bytes, measured.store_bytes);
     let comfortable = measured.peak_bytes.saturating_add(
@@ -4306,9 +4345,10 @@ fn commit_memory_headroom_check_for(
             LABEL,
             HealthStatus::Healthy,
             format!(
-                "{available} of memory available; a commit on {} ({measured_store} store) was \
-                 measured peaking at {needed}, and this ceiling clears that peak by at least \
-                 {}%. This {store_size} store is {ratio} the measured one",
+                "{available} of memory here ({ceiling_source}); a commit on {} ({measured_store} \
+                 store) was observed driving a {measured_machine} machine to {needed} in total, \
+                 and this ceiling clears that peak by at least {}%. This {store_size} store is \
+                 {ratio} the measured one",
                 measured.repository, COMMIT_PEAK_COMFORT_MARGIN_PERCENT
             ),
         );
@@ -4317,8 +4357,9 @@ fn commit_memory_headroom_check_for(
         (
             HealthStatus::Stale,
             format!(
-                "{available} of memory available is parity with the {needed} peak a commit on {} \
-                 ({measured_store} store) was measured at, not headroom over it",
+                "{available} of memory here ({ceiling_source}) is parity with the {needed} a \
+                 commit on {} ({measured_store} store) was observed reaching inside a \
+                 {measured_machine} machine, {room}, not headroom over it",
                 measured.repository
             ),
         )
@@ -4326,28 +4367,30 @@ fn commit_memory_headroom_check_for(
         (
             HealthStatus::Degraded,
             format!(
-                "only {available} of memory is available here, below the {needed} peak a commit \
-                 on {} ({measured_store} store) was already measured at",
+                "only {available} of memory here ({ceiling_source}), under the {needed} a commit \
+                 on {} ({measured_store} store) was already observed reaching inside a \
+                 {measured_machine} machine, {room}",
                 measured.repository
             ),
         )
     };
-    // The floor clause is claimed only where it is true. On a store no larger
-    // than the measured one the row is the measurement for that size, and
-    // saying it understates would be inventing a margin the table never showed.
-    let floor_note = if store.bytes > measured.store_bytes {
-        ", and a larger store peaks higher, so that measurement is a floor here rather than a bound"
-    } else {
-        ""
-    };
+    // What the row is allowed to say, and what it is not. The band above is an
+    // observation compared against this machine's own ceiling, so it is stated.
+    // What a commit HERE would cost is not modelled, so it is not stated, and
+    // the store ratio is offered as distance from the measured case rather than
+    // as a multiplier on the total. FIR-2643 is what the multiplier reading
+    // cost: a 10.6 GiB floor quoted over a commit that took about 0.9 GB.
     HealthCheck::new(
         ID,
         LABEL,
         status,
         format!(
-            "{opening}. This {store_size} store is {ratio} the measured one{floor_note}, so a \
-             commit here can be killed mid-transaction and report a closed connection. Do this \
-             write on a smaller repository or a larger machine. {}",
+            "{opening}. That figure is a whole-machine total with everything else that was \
+             resident inside it rather than a commit's own demand, so this row compares a ceiling \
+             against an observation and forecasts nothing about this write. This {store_size} \
+             store is {ratio} the measured one, which says how far it sits from the machine that \
+             was measured, not what a commit on it would cost. Do this write on a smaller \
+             repository or a larger machine. {}",
             crate::commands::commit_progress::COMMIT_MEMORY_REMEDY,
         ),
     )
@@ -4357,11 +4400,33 @@ fn commit_memory_headroom_check_for(
     )
 }
 
+/// What the machine an observation was taken in still had when the total peaked.
+///
+/// A total is unreadable without its machine: 12283 MiB is comfortable in 24 GiB
+/// and is the last reading before a kill in 12288 MiB. This is the phrase that
+/// carries that difference into the row, and it is why the table stores the
+/// machine beside the total.
+fn format_observation_room(peak_bytes: u64, observed_ceiling_bytes: u64) -> String {
+    let Some(room) = observed_ceiling_bytes
+        .checked_sub(peak_bytes)
+        .filter(|room| *room > 0)
+    else {
+        return "with nothing left in that machine".to_string();
+    };
+    format!(
+        "{} short of that machine's own ceiling",
+        format_health_bytes(room)
+    )
+}
+
 /// How many times the measured store this store is.
 ///
-/// The ratio is what turns a quoted peak into a floor: a reader whose store is
-/// twice the measured one is being told the least their commit can cost, not
-/// the most.
+/// The ratio says how far this store sits from the repository that was actually
+/// observed, so a reader can judge whether the observation is close enough to
+/// their case to act on. It is not a multiplier on the total. FIR-2643 is what
+/// happens when a ratio is read that way, and the table's own rows are the
+/// counter-example: a store 47% the size of the other lands within 12% of its
+/// total.
 fn format_store_ratio(store_bytes: u64, measured_bytes: u64) -> String {
     if measured_bytes == 0 {
         return "an unknown multiple of".to_string();
@@ -4494,6 +4559,16 @@ mod tests {
     fn memory(limit_bytes: u64) -> crate::capability::MemoryEvidence {
         crate::capability::MemoryEvidence {
             limit_bytes,
+            limit_source: crate::capability::MemoryLimitSource::HostRam,
+            cgroup_oom_kills: None,
+        }
+    }
+
+    /// The same ceiling, read off a container cap instead of the host figure.
+    fn capped_memory(limit_bytes: u64) -> crate::capability::MemoryEvidence {
+        crate::capability::MemoryEvidence {
+            limit_bytes,
+            limit_source: crate::capability::MemoryLimitSource::ContainerLimit,
             cgroup_oom_kills: None,
         }
     }
@@ -4631,7 +4706,7 @@ mod tests {
         );
     }
 
-    /// Parity with a measured peak is the edge, and it used to round up to ok.
+    /// Parity with an observed total is the edge, and it used to round up to ok.
     ///
     /// A one-file commit on a 922 MiB store peaked at 12283 MiB against a
     /// 12288 MiB ceiling. `kin doctor` had both numbers and called it ok six
@@ -4639,6 +4714,17 @@ mod tests {
     /// 12288 clears 12283. Amber is the whole finding: it costs a reader
     /// nothing to move the write to a smaller repository, and it costs them the
     /// write not to.
+    ///
+    /// FIR-2643 changed what this test requires of the WORDS and deliberately
+    /// left what it requires of the BAND alone. It used to demand the row call
+    /// the quoted total "a floor here rather than a bound", which is the
+    /// store-size extrapolation that ran roughly an order of magnitude high;
+    /// that clause is gone, and continuing to assert it would have pinned the
+    /// defect in place. What replaces it is the claim that survives its own
+    /// evidence: the quoted number is a whole-machine total, and the row has to
+    /// say so. The band is untouched, so a commit that would exceed this ceiling
+    /// still cannot be reported as safe, which is the kill this test was bought
+    /// by.
     ///
     /// Falsify by restoring the `>=` comparison against the bare peak: both
     /// arms below go `Healthy` again and the assertions name the status.
@@ -4674,10 +4760,29 @@ mod tests {
             stranger.detail
         );
         assert!(
-            stranger.detail.contains("2.0x the measured one")
-                && stranger.detail.contains("floor here rather than a bound"),
-            "a bigger store makes the quoted peak a floor, and the reader is owed that: {}",
+            stranger.detail.contains("2.0x the measured one"),
+            "the reader cannot judge how far the observation sits from their case without the \
+             store ratio: {}",
             stranger.detail
+        );
+        assert!(
+            stranger.detail.contains("whole-machine total"),
+            "the quoted number includes everything else that was resident, and a reader who \
+             takes it for a commit's own demand is reading the defect: {}",
+            stranger.detail
+        );
+        assert!(
+            stranger
+                .detail
+                .contains("5 MiB short of that machine's own ceiling"),
+            "12283 MiB inside 12288 MiB is the whole finding, and the row that omits the gap \
+             leaves a reader nothing to weigh: {}",
+            stranger.detail
+        );
+        assert!(
+            !matches!(stranger.status, HealthStatus::Healthy),
+            "a ceiling with no room over an observed total must never be reported as safe: {:?}",
+            stranger.status
         );
         assert!(
             stranger.detail.contains("smaller repository"),
@@ -4687,6 +4792,175 @@ mod tests {
         assert!(
             stranger.manual_fix.is_some(),
             "a warning a reader cannot act on is noise"
+        );
+    }
+
+    /// The row states what it does not know instead of forecasting a kill from
+    /// a model that measures the wrong thing.
+    ///
+    /// The rc0550 stranger watched this row warn that a commit could be killed
+    /// mid-transaction, quoting a 10.6 GiB floor, before a docstring-only commit
+    /// on a 500 MiB requests store. That commit's attributable cost was about
+    /// 0.9 GB over an 8.16 GB resident baseline. The forecast was roughly an
+    /// order of magnitude out because it read whole-machine totals as commit
+    /// demand and then scaled them by store size, and a warning that far off is
+    /// ignored by the third time a reader watches the write succeed anyway.
+    ///
+    /// Both warning bands are swept, because the row is one shared tail joined
+    /// to a band-specific opening and a correction applied to one is not a
+    /// correction. The positive controls are the point of the test: an emptied
+    /// row satisfies every negative assertion here, so the row must still name
+    /// the repository, the total, the store ratio and a fix a reader can act on.
+    ///
+    /// Falsify by restoring either removed claim. The kill forecast fails the
+    /// first assertion in each band; the store-size floor fails the second.
+    #[test]
+    fn the_headroom_row_states_its_uncertainty_instead_of_forecasting_a_kill() {
+        let bands = [
+            (
+                "degraded",
+                commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(8 * 1024 * MIB)),
+            ),
+            (
+                "parity",
+                commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(12288 * MIB)),
+            ),
+        ];
+        for (band, check) in bands {
+            assert!(
+                !check.detail.contains("can be killed"),
+                "{band}: the row forecasts a kill from a cost it does not model: {}",
+                check.detail
+            );
+            assert!(
+                !check.detail.contains("floor here rather than a bound")
+                    && !check.detail.contains("larger store peaks higher"),
+                "{band}: the row is extrapolating an observed total by store size again: {}",
+                check.detail
+            );
+            assert!(
+                check
+                    .detail
+                    .contains("not yet modelled well enough to predict from the store alone"),
+                "{band}: a row that drops the forecast owes the reader what it does not know: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("whole-machine total"),
+                "{band}: the quoted number carries everything else that was resident, and \
+                 leaving that out is what let it be read as commit demand: {}",
+                check.detail
+            );
+            // Positive controls. Every assertion above passes on an empty row.
+            assert!(
+                check.detail.contains("psf/requests") && check.detail.contains("12.0 GiB"),
+                "{band}: the row still owes the reader the repository and the total: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("2.0x the measured one"),
+                "{band}: the row still owes the reader how far its store sits from that one: {}",
+                check.detail
+            );
+            assert!(
+                check.detail.contains("smaller repository"),
+                "{band}: the row exists to redirect the write before it is spent: {}",
+                check.detail
+            );
+            assert!(
+                check.manual_fix.is_some(),
+                "{band}: a warning a reader cannot act on is noise"
+            );
+        }
+    }
+
+    /// Dropping the forecast is not permission to go quiet.
+    ///
+    /// The band is the half of this row grounded in an observation rather than a
+    /// model, and it is the half that caught the 12283 MiB commit inside the
+    /// 12288 MiB container. This sweeps the whole table instead of one fixture,
+    /// so a row measured later inherits the guarantee rather than needing its own
+    /// test, and it covers exact parity, one MiB under, and half the total.
+    ///
+    /// Falsify by comparing with `>` instead of `>=`, or by returning `Healthy`
+    /// from any band: the exact-parity arm fails first and names the total it
+    /// was judged against.
+    #[test]
+    fn the_headroom_row_never_reports_a_ceiling_at_or_under_an_observed_total_as_ok() {
+        for point in MEASURED_COMMIT_PEAKS {
+            for ceiling in [
+                point.peak_bytes,
+                point.peak_bytes - MIB,
+                point.peak_bytes / 2,
+            ] {
+                let check = commit_memory_headroom_check_for(
+                    &footprint(point.store_bytes),
+                    &memory(ceiling),
+                );
+                assert!(
+                    !matches!(check.status, HealthStatus::Healthy),
+                    "{} at a {} ceiling against an observed total of {}: a ceiling with no room \
+                     over an observation must not read ok, which is what called a 12288 MiB \
+                     container fine six hours before a commit was killed at 12283 MiB",
+                    point.repository,
+                    format_health_bytes(ceiling),
+                    format_health_bytes(point.peak_bytes)
+                );
+                assert!(
+                    check.detail.contains(point.repository),
+                    "the row has to name the observation it is judging against: {}",
+                    check.detail
+                );
+                assert!(
+                    check.manual_fix.is_some(),
+                    "every warning band carries a fix the reader can act on"
+                );
+            }
+        }
+    }
+
+    /// The row says which reading its ceiling came from.
+    ///
+    /// FIR-2638 shipped a probe that answered with the host figure for a process
+    /// capped at twelve gigabytes and stayed silent through the kill. A row that
+    /// prints a byte count without its source cannot be checked by the person it
+    /// is warning, and raising a container limit is a different action from
+    /// moving to a bigger host. Every band quotes the ceiling, so every band owes
+    /// the provenance, not only the red one.
+    ///
+    /// Falsify by dropping the source from the format strings, which fails all
+    /// three arms, or by hard-coding one source, which fails the other.
+    #[test]
+    fn the_headroom_row_names_the_reading_its_ceiling_came_from() {
+        let capped = commit_memory_headroom_check_for(
+            &footprint(1844 * MIB),
+            &capped_memory(8 * 1024 * MIB),
+        );
+        assert!(
+            capped.detail.contains("this container's memory cap"),
+            "a capped process is owed the fact that the cap is the wall it hit: {}",
+            capped.detail
+        );
+        let bare =
+            commit_memory_headroom_check_for(&footprint(1844 * MIB), &memory(8 * 1024 * MIB));
+        assert!(
+            bare.detail.contains("this host's RAM"),
+            "an uncapped process must not be sent to raise a limit it does not have: {}",
+            bare.detail
+        );
+        let healthy = commit_memory_headroom_check_for(
+            &footprint(922 * MIB),
+            &capped_memory(64 * 1024 * MIB),
+        );
+        assert!(
+            matches!(healthy.status, HealthStatus::Healthy),
+            "the fixture must exercise the ok band: {:?}",
+            healthy.status
+        );
+        assert!(
+            healthy.detail.contains("this container's memory cap"),
+            "the ok band quotes the same ceiling and owes the same provenance: {}",
+            healthy.detail
         );
     }
 

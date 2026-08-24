@@ -117,6 +117,18 @@ PROOF_LINE = re.compile(
 TOTAL_LINE = re.compile(
     r"peak live heap admitting (\d+) commits: (\d+) bytes .*backstop (\d+) MiB"
 )
+BIND_LINE = re.compile(
+    r"kin\.init\.bind_historical_semantics grew the peak by (\d+) bytes "
+    r"while retaining (\d+) bytes, ceiling (\d+) percent"
+)
+RELEASE_LINE = re.compile(
+    r"kin\.init\.release_plan_bodies gave back (\d+) bytes of the (\d+) bytes "
+    r"kin\.init\.bind_historical_semantics retained, floor (\d+) percent"
+)
+BUILD_LINE = re.compile(
+    r"kin\.init\.build_bootstrap_transaction grew the peak by (\d+) bytes against "
+    r"the (\d+) bytes kin\.init\.admit_semantic_import retained, ceiling (\d+) percent"
+)
 
 
 def read_guard_output(text):
@@ -134,6 +146,113 @@ def read_guard_output(text):
         int(total.group(2)) if total else None,
         int(total.group(3)) if total else None,
     )
+
+
+def read_bind_figures(text):
+    """Pull the binding phase's growth, what it retained, and its ceiling.
+
+    Separate from `read_guard_output` because it grades a ratio rather than a
+    byte count, and because it exists so a guard that fails on THIS assertion
+    cannot be reported as a pass. Every figure the guard prints is printed
+    before any assertion runs, so a suite that grades only the first two would
+    report both of them PASS over a red guard.
+    """
+    bind = BIND_LINE.search(text or "")
+    if not bind:
+        return (None, None, None)
+    return (int(bind.group(1)), int(bind.group(2)), int(bind.group(3)))
+
+
+def grade_ratio(grew, retained, cap_percent):
+    """PASS under the ceiling, FAIL at or over it, UNREADABLE with no denominator.
+
+    A phase that retained nothing gives the ratio no denominator, so the
+    comparison would pass on any growth at all. That is UNREADABLE, not a pass.
+    """
+    if grew is None or retained is None or cap_percent is None:
+        return UNREADABLE, "the guard printed no binding-phase figures, so nothing was graded"
+    if retained == 0:
+        return UNREADABLE, ("the binding phase retained nothing, so its growth had nothing "
+                            "to be measured against and this graded nothing")
+    percent = grew * 100 // retained
+    detail = ("binding historical semantics grew the peak by %d percent of what it retained "
+              "(%d over %d bytes), ceiling %d percent" % (percent, grew, retained, cap_percent))
+    if percent >= cap_percent:
+        return FAIL, detail
+    return PASS, detail
+
+
+def read_release_figures(text):
+    """Pull what the release phase gave back, against what binding retained.
+
+    Separate from the two readers above for the same reason they are separate
+    from each other: it grades a FLOOR rather than a ceiling, and a suite that
+    graded only the earlier figures would report them PASS over a guard that
+    went red on this one.
+    """
+    release = RELEASE_LINE.search(text or "")
+    if not release:
+        return (None, None, None)
+    return (int(release.group(1)), int(release.group(2)), int(release.group(3)))
+
+
+def read_build_figures(text):
+    """Pull the bootstrap build's growth, one copy of the admitted history, and its ceiling.
+
+    Its own reader for the reason every reader here has one: a suite that
+    grades only the earlier figures reports them PASS over a guard that went
+    red on this one, because the guard prints every figure before any
+    assertion runs.
+    """
+    build = BUILD_LINE.search(text or "")
+    if not build:
+        return (None, None, None)
+    return (int(build.group(1)), int(build.group(2)), int(build.group(3)))
+
+
+def grade_build_ratio(grew, retained, cap_percent):
+    """PASS under the ceiling, FAIL at or over it, UNREADABLE with no denominator.
+
+    Same direction as `grade_ratio` and a separate function because it names a
+    different phase and a different denominator. A phase that admitted nothing
+    gives the ratio no denominator, so the comparison would pass on any growth
+    at all. That is UNREADABLE, not a pass.
+    """
+    if grew is None or retained is None or cap_percent is None:
+        return UNREADABLE, "the guard printed no bootstrap-build figures, so nothing was graded"
+    if retained == 0:
+        return UNREADABLE, ("the admission phase retained nothing, so the bootstrap build's "
+                            "growth had no copy of the history to be measured against and "
+                            "this graded nothing")
+    percent = grew * 100 // retained
+    detail = ("building the bootstrap transaction grew the peak by %d percent of one copy of "
+              "the admitted history (%d over %d bytes), ceiling %d percent"
+              % (percent, grew, retained, cap_percent))
+    if percent >= cap_percent:
+        return FAIL, detail
+    return PASS, detail
+
+
+def grade_floor(given_back, retained, floor_percent):
+    """PASS at or over the floor, FAIL under it, UNREADABLE with no denominator.
+
+    The direction is the opposite of `grade_ratio` on purpose. This one asks
+    whether enough memory came BACK, so more is better and the comparison is
+    the other way round. A phase that retained nothing gives the ratio no
+    denominator, which is UNREADABLE rather than a pass, exactly as there.
+    """
+    if given_back is None or retained is None or floor_percent is None:
+        return UNREADABLE, "the guard printed no release-phase figures, so nothing was graded"
+    if retained == 0:
+        return UNREADABLE, ("the binding phase retained nothing, so there was nothing for the "
+                            "release to give back and this graded nothing")
+    percent = given_back * 100 // retained
+    detail = ("releasing the plan's change bodies gave back %d percent of what binding "
+              "retained (%d of %d bytes), floor %d percent"
+              % (percent, given_back, retained, floor_percent))
+    if percent < floor_percent:
+        return FAIL, detail
+    return PASS, detail
 
 
 class Result(object):
@@ -255,7 +374,49 @@ def check_1(suite):
     return result
 
 
-CHECKS = [check_0, check_1]
+def check_2(suite):
+    """Binding historical semantics keeps one copy of what it derives, not two."""
+    result = Result("2", "binding historical semantics does not hold two copies")
+    code, out = suite.guard_output()
+    grew, retained, cap = read_bind_figures(out)
+    if grew is None and code != 0:
+        result.unknown("the guard produced no binding figures and exited %d: %s"
+                       % (code, tail(out)))
+        return result
+    status, detail = grade_ratio(grew, retained, cap)
+    {PASS: result.ok, FAIL: result.bad, UNREADABLE: result.unknown}[status](detail)
+    return result
+
+
+def check_3(suite):
+    """The import plan's change bodies are given back once proof 1 has read them."""
+    result = Result("3", "the plan's change bodies are released after proof 1")
+    code, out = suite.guard_output()
+    given_back, retained, floor = read_release_figures(out)
+    if given_back is None and code != 0:
+        result.unknown("the guard produced no release figures and exited %d: %s"
+                       % (code, tail(out)))
+        return result
+    status, detail = grade_floor(given_back, retained, floor)
+    {PASS: result.ok, FAIL: result.bad, UNREADABLE: result.unknown}[status](detail)
+    return result
+
+
+def check_4(suite):
+    """Building the bootstrap transaction does not copy the history to prove or to read it."""
+    result = Result("4", "the bootstrap build holds no extra copy of the history")
+    code, out = suite.guard_output()
+    grew, retained, cap = read_build_figures(out)
+    if grew is None and code != 0:
+        result.unknown("the guard produced no bootstrap-build figures and exited %d: %s"
+                       % (code, tail(out)))
+        return result
+    status, detail = grade_build_ratio(grew, retained, cap)
+    {PASS: result.ok, FAIL: result.bad, UNREADABLE: result.unknown}[status](detail)
+    return result
+
+
+CHECKS = [check_0, check_1, check_2, check_3, check_4]
 
 
 def self_test():
@@ -297,10 +458,93 @@ def self_test():
     if got != PASS:
         failures.append("the shipped proof ceiling rejects the post-fix figure")
 
+    # The ratio grader and its parser, falsified the same way. A phase that
+    # retained nothing is the case that would otherwise pass on any growth.
+    ratio_cases = [
+        ("one copy passes", 103226981, 100882320, 175, PASS),
+        ("two copies fail", 197043712, 90177536, 175, FAIL),
+        ("exactly at the ceiling fails", 175, 100, 175, FAIL),
+        ("nothing retained is unreadable", 100, 0, 175, UNREADABLE),
+        ("nothing measured is unreadable", None, None, None, UNREADABLE),
+    ]
+    for title, grew, retained, cap, wanted in ratio_cases:
+        got, detail = grade_ratio(grew, retained, cap)
+        if got != wanted:
+            failures.append("%s: wanted %s, got %s (%s)" % (title, wanted, got, detail))
+
+    bind_line = ("kin.init.bind_historical_semantics grew the peak by 103226981 bytes "
+                 "while retaining 100882320 bytes, ceiling 175 percent\n")
+    if read_bind_figures(bind_line) != (103226981, 100882320, 175):
+        failures.append("parser misread the binding line: %r" % (read_bind_figures(bind_line),))
+    if read_bind_figures("error: could not compile") != (None, None, None):
+        failures.append("parser invented binding figures from output that carries none")
+    if read_bind_figures("") != (None, None, None):
+        failures.append("parser invented binding figures from empty output")
+
+    # The bootstrap-build grader and its parser, falsified against the real
+    # figures on both sides of the fix.
+    build_cases = [
+        ("one copy passes", 113059227, 87718554, 250, PASS),
+        ("the pre-fix figure fails", 395427091, 87722946, 250, FAIL),
+        ("exactly at the ceiling fails", 250, 100, 250, FAIL),
+        ("nothing admitted is unreadable", 100, 0, 250, UNREADABLE),
+        ("nothing measured is unreadable", None, None, None, UNREADABLE),
+    ]
+    for title, grew, retained, cap, wanted in build_cases:
+        got, detail = grade_build_ratio(grew, retained, cap)
+        if got != wanted:
+            failures.append("%s: wanted %s, got %s (%s)" % (title, wanted, got, detail))
+
+    build_line = ("kin.init.build_bootstrap_transaction grew the peak by 113059227 bytes "
+                  "against the 87718554 bytes kin.init.admit_semantic_import retained, "
+                  "ceiling 250 percent\n")
+    if read_build_figures(build_line) != (113059227, 87718554, 250):
+        failures.append("parser misread the build line: %r" % (read_build_figures(build_line),))
+    if read_build_figures("error: could not compile") != (None, None, None):
+        failures.append("parser invented build figures from output that carries none")
+    if read_build_figures("") != (None, None, None):
+        failures.append("parser invented build figures from empty output")
+
+    # The floor grader runs the comparison the other way round, so its own
+    # inverse is the case that would pass if the direction were flipped: a
+    # release that gave back nothing.
+    floor_cases = [
+        ("everything given back passes", 87404386, 86996112, 50, PASS),
+        ("exactly at the floor passes", 50, 100, 50, PASS),
+        ("nothing given back fails", 0, 86996112, 50, FAIL),
+        ("under the floor fails", 40, 100, 50, FAIL),
+        ("nothing retained is unreadable", 100, 0, 50, UNREADABLE),
+        ("nothing measured is unreadable", None, None, None, UNREADABLE),
+    ]
+    for title, given_back, retained, floor, wanted in floor_cases:
+        got, detail = grade_floor(given_back, retained, floor)
+        if got != wanted:
+            failures.append("%s: wanted %s, got %s (%s)" % (title, wanted, got, detail))
+
+    release_line = ("kin.init.release_plan_bodies gave back 87404386 bytes of the 86996112 "
+                    "bytes kin.init.bind_historical_semantics retained, floor 50 percent\n")
+    if read_release_figures(release_line) != (87404386, 86996112, 50):
+        failures.append("parser misread the release line: %r"
+                        % (read_release_figures(release_line),))
+    if read_release_figures("error: could not compile") != (None, None, None):
+        failures.append("parser invented release figures from output that carries none")
+    if read_release_figures("") != (None, None, None):
+        failures.append("parser invented release figures from empty output")
+
+    # A floor that cannot reject the defect is not a floor. Drive the measured
+    # pre-fix and post-fix figures through the shipped floor.
+    got, _ = grade_floor(0, 86996112, 50)
+    if got != FAIL:
+        failures.append("the shipped release floor does not reject the pre-fix figure")
+    got, _ = grade_floor(87404386, 86996112, 50)
+    if got != PASS:
+        failures.append("the shipped release floor rejects the post-fix figure")
+
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     print("kin-init-memory-repro self-test: %d case(s), %d failure(s)"
-          % (len(cases) + 5, len(failures)))
+          % (len(cases) + len(ratio_cases) + len(build_cases) + len(floor_cases) + 16,
+             len(failures)))
     return 1 if failures else 0
 
 

@@ -70,4 +70,7 @@ pub use sealed_observation::{
     ContentExclusionReason, DeclaredContentExclusion, SealedContentCoverage,
     SealedContentObservation, SealedContentSource,
 };
-pub use semantic_import::{plan_semantic_git_import, GitWorkspaceSeed, SemanticGitImportPlan};
+pub use semantic_import::{
+    plan_semantic_git_import, GitWorkspaceSeed, HistoricalSemanticBinding, ProvedImportClosure,
+    ProvedPlanFacts, SemanticGitImportPlan,
+};

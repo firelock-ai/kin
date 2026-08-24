@@ -560,7 +560,13 @@ pub fn is_still_starting_error(message: &str) -> bool {
 /// `kin` command boots a daemon this MCP server then talks to, and a record
 /// only one of them could see would be missing exactly when it is wanted.
 pub(crate) fn recorded_daemon_kill() -> Option<kin_daemon_spawn::DaemonKillRecord> {
-    kin_daemon_spawn::read_daemon_kill_record(&discover_kin_dir()?)
+    let kin_dir = discover_kin_dir()?;
+    // A death this store has not settled yet answers first, because settlement
+    // happens at the next daemon start and the agent reading this error is
+    // being served by a session that may not start one. The tally alone would
+    // have said nothing at exactly the moment a daemon had just been killed.
+    kin_daemon_spawn::peek_unwatched_daemon_death(&kin_dir)
+        .or_else(|| kin_daemon_spawn::read_daemon_kill_record(&kin_dir))
 }
 
 /// Whether this store's enrichment sweeps are currently suspended.
@@ -581,6 +587,11 @@ pub(crate) fn suspended_sweep() -> Option<kin_daemon_spawn::SuspendedSweep> {
 /// it would keep telling agents the machine was full after it had emptied.
 pub(crate) fn memory_pressure_refusal() -> Option<kin_core::memory_pressure::PressureRefusal> {
     kin_core::memory_pressure::PressureRefusal::read(&discover_kin_dir()?)
+}
+
+/// What this store records about being below its own relation census.
+pub(crate) fn relation_census_hold() -> Option<kin_core::relation_census::CensusHold> {
+    kin_core::relation_census::CensusHold::read(&discover_kin_dir()?)
 }
 
 /// The recorded cause and a remediation the caller can perform, ready to append

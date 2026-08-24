@@ -833,6 +833,11 @@ fn remove_endpoint_components(kin_root: &Path) {
     let _ = std::fs::remove_file(kin_root.join("daemon.pid"));
     let _ = std::fs::remove_file(kin_root.join("daemon.port"));
     let _ = std::fs::remove_file(kin_root.join(ENDPOINT_OWNER_FILE));
+    // The serving record retires with the endpoint, and only here. Its whole
+    // meaning is that a copy left behind by a process that is gone marks a
+    // daemon which never reached this line, so retiring it anywhere a killed
+    // daemon could also reach would erase the evidence it exists to keep.
+    kin_daemon_spawn::retire_serving_daemon(kin_root);
 }
 
 /// Publish the daemon's complete endpoint while holding lifecycle authority.

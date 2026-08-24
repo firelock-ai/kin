@@ -349,6 +349,16 @@ pub struct Degraded {
     /// clears itself rather than needing a second event to retract it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_pressure: Option<bool>,
+    /// This store's graph currently holds fewer relations than its own last
+    /// verified-good census did, over an entity count that did not fall. The
+    /// relation census is the only surface that could see it, and on the rc0550
+    /// run it was the only surface that did: a comment-only commit deleted
+    /// twelve edges and `find_references` answered from the damaged graph with
+    /// an empty degraded list and `edge_coverage.calls: "present"` (FIR-2644).
+    /// Set from the record the census pass writes and the next advancing census
+    /// retires, so it clears itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation_census_loss: Option<bool>,
 }
 
 impl Degraded {
@@ -363,6 +373,7 @@ impl Degraded {
             self.daemon_killed_by_memory,
             self.sweep_suspended,
             self.memory_pressure,
+            self.relation_census_loss,
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
@@ -396,6 +407,9 @@ impl Degraded {
         }
         if self.memory_pressure == Some(true) {
             labels.push("memory_pressure");
+        }
+        if self.relation_census_loss == Some(true) {
+            labels.push("relation_census_loss");
         }
         labels
     }
@@ -1545,6 +1559,32 @@ impl Envelope {
     ) -> Self {
         if refusal.is_some() {
             self.degraded.memory_pressure = Some(true);
+        }
+        self
+    }
+
+    /// Stamp that this store's graph is below its own last verified-good
+    /// relation census.
+    ///
+    /// The reading it changes is the one that came back looking complete. A
+    /// caller set that lost a member, or a call site that lost its edge, is
+    /// indistinguishable from a correct answer at the response level: the rows
+    /// that survive are true, the counts agree with themselves, and
+    /// `reference_sites_complete` is about the rows that came back rather than
+    /// about the ones that should have. The census is the only thing that knows
+    /// the graph is short, so an answer taken while it is short says so instead
+    /// of presenting as clean (FIR-2644).
+    ///
+    /// Absent rather than `false` when the store records no hold, for the reason
+    /// every flag here is absent: `None` says this envelope makes no claim, and
+    /// a fabricated `false` would say the store was checked and found whole on a
+    /// call that never looked.
+    pub fn with_relation_census_loss(
+        mut self,
+        hold: Option<&kin_core::relation_census::CensusHold>,
+    ) -> Self {
+        if hold.is_some() {
+            self.degraded.relation_census_loss = Some(true);
         }
         self
     }
@@ -3217,6 +3257,46 @@ mod tests {
             serde_json::to_value(&never_killed.degraded).unwrap(),
             serde_json::json!({"daemon_unreachable": true}),
             "a store with no record serializes exactly as it did"
+        );
+    }
+
+    /// FIR-2644: a graph short of its own relation census must say so, and a
+    /// whole one must not.
+    ///
+    /// Both halves matter. The signal exists because the rows that come back
+    /// from a damaged graph are all true, so nothing in the payload separates a
+    /// halved caller set from a complete one; and a flag that fires on every
+    /// store separates nothing either.
+    #[test]
+    fn a_census_hold_becomes_a_degraded_signal_and_its_absence_does_not() {
+        // Built from the wire shape the census pass writes, so the test also
+        // pins the record this envelope reads to the one that is published.
+        let hold: kin_core::relation_census::CensusHold = serde_json::from_str(
+            r#"{"held_at":"2026-08-22T22:35:16Z","held_source":"enrichment sweep",
+                "losses":["Calls slipped 1279 to 1269, while the entity count held at 783"]}"#,
+        )
+        .expect("the published hold shape parses");
+        let flagged = Envelope::daemon().with_relation_census_loss(Some(&hold));
+        assert_eq!(flagged.degraded.relation_census_loss, Some(true));
+        assert!(flagged.degraded.any());
+        assert!(flagged
+            .degraded
+            .active_labels()
+            .contains(&"relation_census_loss"));
+
+        let whole = Envelope::daemon().with_relation_census_loss(None);
+        assert_eq!(
+            whole.degraded.relation_census_loss, None,
+            "a store recording no hold makes no claim rather than claiming health"
+        );
+        assert!(!whole
+            .degraded
+            .active_labels()
+            .contains(&"relation_census_loss"));
+        let json = serde_json::to_string(&whole.degraded).expect("degraded serializes");
+        assert!(
+            !json.contains("relation_census_loss"),
+            "an unobserved flag is absent from the wire, not false: {json}"
         );
     }
 }

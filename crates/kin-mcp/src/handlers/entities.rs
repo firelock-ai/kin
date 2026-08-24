@@ -3359,11 +3359,32 @@ struct TraceFanoutCandidate {
     role: &'static str,
     relation_kind: RelationKind,
     confidence: f32,
+    /// Where the in-repo graph ends, when this candidate sits on the boundary.
+    crossing: Option<kin_index::TraceCrossing>,
+    /// Call edges into this candidate, and how many were the operand of a
+    /// `raise`. Counted rather than folded into a bool, for the reason the CLI
+    /// arm's sibling field records: a fold made the answer depend on which edge
+    /// happened to arrive first, and on a real store that left the flag false
+    /// for every exception class it was written to demote.
+    call_edges: usize,
+    raise_call_edges: usize,
     /// Classification of the edge this candidate is currently described by.
     /// It moves with `relation_kind` and `confidence` when a stronger edge to
     /// the same neighbor replaces them, so the step reports what the edge it
     /// names actually proved.
     resolution: RelationResolution,
+}
+
+impl TraceFanoutCandidate {
+    /// Whether this candidate is only ever thrown, never called for its value.
+    ///
+    /// Only parse-authored call edges vote. An LSP call-hierarchy edge cannot
+    /// see a `raise`, so its silence is not a claim that the call was ordinary,
+    /// and counting it made this answer `false` for every candidate on any
+    /// repository with a language server installed.
+    fn is_raise_target(&self) -> bool {
+        self.call_edges > 0 && self.raise_call_edges == self.call_edges
+    }
 }
 
 /// Order one side of a node's fan-out by relevance, most relevant first, with
@@ -3376,6 +3397,7 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
             node.file.as_deref(),
             node.dir.as_deref(),
             left.confidence,
+            left.is_raise_target(),
         );
         let right_score = trace_fanout_score(
             &right.entity,
@@ -3383,6 +3405,7 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
             node.file.as_deref(),
             node.dir.as_deref(),
             right.confidence,
+            right.is_raise_target(),
         );
         right_score
             .cmp(&left_score)
@@ -3399,7 +3422,10 @@ fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFr
 /// This arm serves no bodies — it answers from a generic graph store with no
 /// repository authority to project source through — so `body` is null on every
 /// record here and `bodies_included` on the response says so.
-fn trace_entity_value(entity: &kin_model::entity::Entity) -> serde_json::Value {
+fn trace_entity_value(
+    entity: &kin_model::entity::Entity,
+    crossing: Option<&kin_index::TraceCrossing>,
+) -> serde_json::Value {
     let (start_line, end_line) = match entity.span.as_ref() {
         Some(span) => {
             let (start, end) = presentation_span_lines(span);
@@ -3419,6 +3445,7 @@ fn trace_entity_value(entity: &kin_model::entity::Entity) -> serde_json::Value {
         "signature": (!entity.signature.is_empty()).then(|| entity.signature.clone()),
         "body": serde_json::Value::Null,
         "span_coherence": serde_json::Value::Null,
+        "crossing": crossing,
     })
 }
 
@@ -3433,6 +3460,7 @@ fn trace_step_value(
     depth: usize,
     entity: &kin_model::entity::Entity,
     terminal: Option<TraceTerminal>,
+    crossing: Option<&kin_index::TraceCrossing>,
 ) -> serde_json::Value {
     let mut value = serde_json::json!({
         "step": step,
@@ -3452,7 +3480,7 @@ fn trace_step_value(
         // broke a consumer's parser twice.
         "terminal": terminal.map(TraceTerminal::as_str),
     });
-    let record = trace_entity_value(entity);
+    let record = trace_entity_value(entity, crossing);
     if let (Some(target), Some(source)) = (value.as_object_mut(), record.as_object()) {
         for (key, entry) in source {
             target.insert(key.clone(), entry.clone());
@@ -3461,8 +3489,62 @@ fn trace_step_value(
     value
 }
 
-/// Bound this arm's payload, dropping steps from the TAIL of the chain until it
-/// fits, and disclosing the cut.
+/// Push one degradation onto the response, creating the array if this is the
+/// first.
+fn append_trace_degradation(result: &mut serde_json::Value, disclosure: serde_json::Value) {
+    match result
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.push(disclosure),
+        None => result["degradations"] = serde_json::Value::Array(vec![disclosure]),
+    }
+}
+
+/// Narrow this arm's chain to fit, and report how many steps went.
+///
+/// The rule itself lives in [`crate::budget::narrow_fanout_to_fit`], written
+/// once and shared with the CLI arm the daemon route serves, because a budget
+/// rule that differed by whether a daemon was up is the two-surface divergence
+/// class this codebase keeps paying for. All this wrapper does is read the two
+/// keys off a JSON step and install the result.
+fn narrow_trace_fanout_to_fit(
+    result: &mut serde_json::Value,
+    discovered: &[serde_json::Value],
+    target: usize,
+    measure: fn(&serde_json::Value) -> usize,
+) -> usize {
+    let step_of = |value: &serde_json::Value| value["step"].as_u64().unwrap_or(0);
+    let parent_of = |value: &serde_json::Value| value["parent_step"].as_u64();
+    let narrowed = crate::budget::narrow_fanout_to_fit(
+        discovered,
+        &step_of,
+        &parent_of,
+        &mut |kept: &[serde_json::Value]| {
+            result["chain"] = serde_json::Value::Array(kept.to_vec());
+            result["total_steps"] = serde_json::Value::from(kept.len());
+            measure(result) <= target
+        },
+    );
+    match narrowed {
+        Some(kept) => {
+            let dropped = discovered.len() - kept.len();
+            result["chain"] = serde_json::Value::Array(kept);
+            result["total_steps"] = serde_json::Value::from(discovered.len() - dropped);
+            dropped
+        }
+        None => {
+            // Nothing narrow enough fits; hand the whole chain back and let the
+            // suffix cut run, which always terminates.
+            result["chain"] = serde_json::Value::Array(discovered.to_vec());
+            result["total_steps"] = serde_json::Value::from(discovered.len());
+            0
+        }
+    }
+}
+
+/// Bound this arm's payload, narrowing each node's fan-out before it will
+/// amputate depth, and disclosing the cut.
 ///
 /// This arm serves no bodies, so it has none to cut first: what it can shed is
 /// steps. It still needs the bound, because 200 steps of identity, span, and
@@ -3470,9 +3552,34 @@ fn trace_step_value(
 /// client refuses is worse than a short one — the caller gets neither the chain
 /// nor a way to ask for less.
 ///
-/// A suffix is what makes the cut safe: the chain is discovery-ordered, so
-/// children always sit after their parents and removing the end never orphans a
-/// surviving step's `parent_step`.
+/// A suffix is what makes the fallback cut safe: the chain is discovery-ordered,
+/// so children always sit after their parents and removing the end never orphans
+/// a surviving step's `parent_step`.
+///
+/// ## Why a suffix cut alone produced a wrong answer
+///
+/// The chain is discovery-ordered, which means breadth-first, which means the
+/// tail is the DEEPEST steps. A suffix cut therefore spends the whole budget on
+/// the shallow fan-out and amputates the far end of every chain, and the far end
+/// is where a trace stops being a list of neighbours and becomes an answer.
+///
+/// Measured on a converted `psf/requests` by the rc0550 stranger, at the
+/// documented cheap settings (`depth: 3`, `limit_per_step: 12`,
+/// `include_body: false`): 67 of 117 steps dropped, and the survivors did not
+/// include `_urllib3_request_context`, which is one hop past
+/// `build_connection_pool_key_attributes` and is the function that folds
+/// `verify` into the urllib3 pool key. Read alone the response said `verify`
+/// reaches TLS at `cert_verify` and stopped, missing the half that governs
+/// connection reuse. The stranger's words: "If I had trusted the Kin arm alone I
+/// would have written a wrong answer." The edge was in the graph the whole time.
+///
+/// So the cut now narrows before it amputates. A node's fan-out was already
+/// ordered by relevance ([`kin_ranking::entity_ranking::trace_fanout_score`]),
+/// so its LAST child is the one it can most afford to lose; dropping that child
+/// and its descendants keeps every remaining `parent_step` valid and costs the
+/// chain its least-relevant branch instead of its deepest reach. Only when
+/// nothing is left to narrow does the suffix cut run, so a pathological walk
+/// still fits rather than being refused.
 fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
     fn measure(value: &serde_json::Value) -> usize {
         serde_json::to_string_pretty(value).map_or(usize::MAX, |json| json.len())
@@ -3481,7 +3588,40 @@ fn bound_trace_payload(result: &mut serde_json::Value, max_chars: usize) {
         return;
     }
     let target = max_chars.saturating_sub(TRACE_DISCLOSURE_RESERVE_CHARS);
+    let discovered: Vec<serde_json::Value> =
+        result["chain"].as_array().cloned().unwrap_or_default();
+    let narrowed = narrow_trace_fanout_to_fit(result, &discovered, target, measure);
     let full: Vec<serde_json::Value> = result["chain"].as_array().cloned().unwrap_or_default();
+    // Always written, zero included. A count that appears only when it fired
+    // is the sometimes-absent key that broke a consumer's parser twice, and a
+    // reader cannot tell "narrowed nothing" from "this build cannot narrow".
+    result["fanout_narrowed"] = serde_json::Value::from(narrowed);
+    if measure(result) <= target {
+        result["total_steps"] = serde_json::Value::from(full.len());
+        let omitted = discovered.len() - full.len();
+        if omitted == 0 {
+            return;
+        }
+        result["steps_omitted"] = serde_json::Value::from(omitted);
+        crate::budget::record_elision(result, "chain", full.len(), omitted);
+        result["truncated"] = serde_json::Value::Bool(true);
+        // `steps_omitted` and not a reason of its own: the reason code names
+        // the lever a caller raises, and that lever is `max_response_chars`
+        // whichever way the cut was made. WHICH cut it was belongs in the
+        // detail and in `fanout_narrowed` beside it.
+        let disclosure = serde_json::json!({
+            "component": "response_budget",
+            "reason": "steps_omitted",
+            "detail": format!(
+                "the response exceeded its {max_chars}-character budget, so {omitted} steps were \
+                 dropped as whole branches, least relevant first, rather than from the end of the \
+                 chain; re-query a node with a smaller limit_per_step, or raise \
+                 max_response_chars to receive them"
+            ),
+        });
+        append_trace_degradation(result, disclosure);
+        return;
+    }
 
     // Bisected rather than popped one step at a time: the same answer, in a
     // handful of serializations instead of one per dropped step.
@@ -3732,6 +3872,24 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             candidate.confidence = rel.confidence;
                             candidate.resolution = RelationResolution::of(rel);
                         }
+                        // Accumulated across every edge, not moved with the
+                        // strongest one; mirrors the CLI arm exactly.
+                        candidate.call_edges +=
+                            usize::from(kin_index::is_raise_classifiable_call_edge(rel));
+                        candidate.raise_call_edges +=
+                            usize::from(kin_index::is_raise_target_edge(rel));
+                        if candidate
+                            .crossing
+                            .as_ref()
+                            .is_none_or(|crossing| crossing.specifier.is_none())
+                        {
+                            if let Some(named) =
+                                kin_index::trace_crossing_for(&candidate.entity, Some(rel))
+                                    .filter(|crossing| crossing.specifier.is_some())
+                            {
+                                candidate.crossing = Some(named);
+                            }
+                        }
                     }
                     None => {
                         let Some(entity) = store.get_entity(&next_id).map_err(McpError::graph)?
@@ -3739,12 +3897,18 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             continue;
                         };
                         candidate_index.insert((next_id, role), candidates.len());
+                        let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
                         candidates.push(TraceFanoutCandidate {
+                            call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
+                                rel,
+                            )),
+                            raise_call_edges: usize::from(kin_index::is_raise_target_edge(rel)),
                             entity,
                             role,
                             relation_kind: rel.kind,
                             confidence: rel.confidence,
                             resolution: RelationResolution::of(rel),
+                            crossing,
                         });
                     }
                 }
@@ -3839,6 +4003,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             promoted_depth,
                             &candidate.entity,
                             promoted_terminal,
+                            candidate.crossing.as_ref(),
                         );
                         chain[existing - 1] = promoted;
                         // The record that replaced the placeholder brings its
@@ -3881,6 +4046,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     next_depth,
                     &candidate.entity,
                     terminal,
+                    candidate.crossing.as_ref(),
                 ));
                 step_language.insert(step_index, candidate.entity.language);
                 if terminal.is_none() && next_depth < depth {
@@ -4004,7 +4170,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         "focal_name": focal_entity.name.clone(),
         "focal_kind": format!("{:?}", focal_entity.kind),
         "focal_file": focal_entity.file_origin.as_ref().map(|p| p.to_string()),
-        "focal_entity": trace_entity_value(&focal_entity),
+        "focal_entity": trace_entity_value(&focal_entity, None),
         "direction": direction,
         "depth": depth,
         "limit_per_step": limit_per_step,
@@ -4038,6 +4204,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
             .map(|value| value as usize),
     );
     result["max_response_chars"] = serde_json::Value::from(max_response_chars);
+    // Set before the bound so it is on every response, not only the cut ones.
+    // The bounder returns at its first line when the payload already fits, and
+    // a key that appears only after a cut cannot be read as a zero.
+    result["fanout_narrowed"] = serde_json::Value::from(0);
     bound_trace_payload(&mut result, max_response_chars);
     // Counted from the chain rather than during the walk, so the numbers
     // describe the steps this payload carries after `bound_trace_payload` has

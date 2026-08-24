@@ -82,6 +82,91 @@ const PROOF_PHASE: &str = "kin.init.source_proof_staged";
 /// backstop.
 const PROOF_PEAK_GROWTH_CEILING: usize = 16 * 1024 * 1024;
 
+/// The phase that binds every imported change's historical semantics.
+///
+/// It derives one set of entity and relation deltas per commit and writes them
+/// into the plan. Those two are the same values, so the phase legitimately ends
+/// up holding one copy; what it must not do is hold two, which is what it did
+/// while the derived set was collected into owned vectors, copied into the
+/// plan, and then dropped unread.
+const BIND_PHASE: &str = "kin.init.bind_historical_semantics";
+
+/// How far past what it retains the binding phase may push the running peak,
+/// in percent.
+///
+/// Calibrated inside the run rather than against a constant, deliberately.
+/// Both figures scale with commits multiplied by per-commit semantic churn, and
+/// a byte ceiling written for this fixture would say nothing about a repository
+/// and would have to be retuned whenever the fixture moved. The ratio is the
+/// invariant: a phase that produces one copy of a structure and keeps it should
+/// not lift the peak by two of them.
+///
+/// Measured on this fixture, release, one host: 218 percent with the derived
+/// deltas alive beside the copy, and 118 percent without. The gate sits at 175,
+/// which is below the first and above the second, and there is nothing
+/// legitimate in between: either the derived deltas exist twice at once or they
+/// do not. The 218 figure is from a build of that mutant rather than from an
+/// earlier report, because the earlier report's base carried a different
+/// dependency pin.
+const BIND_PEAK_GROWTH_PERCENT_OF_RETAINED: usize = 175;
+
+/// The phase that gives up the import plan's change bodies.
+///
+/// Proof 1 is the last reader of a change's body. Everything after it reads the
+/// plan's proved facts, so the phase below converts the plan into a closure
+/// carrying those facts and drops the bodies. It exists as a named phase
+/// precisely so this guard can watch the live heap fall across it.
+const RELEASE_PHASE: &str = "kin.init.release_plan_bodies";
+
+/// How much of what the binding phase retained must actually be given back,
+/// in percent.
+///
+/// Calibrated inside the run rather than against a constant, for the reason
+/// `BIND_PEAK_GROWTH_PERCENT_OF_RETAINED` gives: both figures scale with
+/// commits multiplied by per-commit churn, so a byte floor written for this
+/// fixture would say nothing about a repository. The binding phase produces one
+/// copy of every commit's entity, relation and tree deltas and retains it; once
+/// proof 1 has read them for the last time, that copy is what this phase hands
+/// back.
+///
+/// The floor sits at 50 percent, well under what a working release gives back
+/// and far above the zero a build that keeps the bodies produces. There is
+/// nothing legitimate in between: either the plan is consumed into a closure
+/// without the bodies or it is not.
+const RELEASE_DROP_PERCENT_OF_BIND_RETAINED: usize = 50;
+
+/// The phase that builds the bootstrap transaction.
+///
+/// It re-proves the admitted plan, moves that plan's fields into a transaction,
+/// and derives the imported workspace's semantics. Everything it allocates is
+/// transient: it retains 0.2 MiB on this fixture, so whatever it adds to the
+/// peak is memory a machine has to survive for a step that keeps nothing.
+const BUILD_PHASE: &str = "kin.init.build_bootstrap_transaction";
+
+/// The phase whose retained bytes are one copy of the admitted history.
+///
+/// The denominator, for the reason the binding ratio above gives: a byte
+/// ceiling written for this fixture would say nothing about a repository, and
+/// both figures scale with commits multiplied by per-commit churn.
+const ADMIT_PHASE: &str = "kin.init.admit_semantic_import";
+
+/// How far past one copy of the admitted history the bootstrap build may push
+/// the peak, in percent.
+///
+/// Measured on this fixture, release, one host, and quoted in the pull request
+/// that introduced this guard: 450 percent (377.0 MiB of growth against
+/// 83.7 MiB retained) while that phase re-proved the admitted plan by building
+/// a third complete import plan and staged the whole history into a second
+/// in-memory graph to derive the workspace's semantics, and 128 percent
+/// (107.8 MiB) once both were replaced by streaming and borrowed reads. The
+/// gate sits at 250, below the first and above the second.
+///
+/// A phase that proves and keeps nothing should not need several copies of
+/// what it is proving. This is the class the number carries; the total below
+/// stays a backstop and does not move when this one does, because on this
+/// fixture the run's peak is set by the commit phase after it.
+const BUILD_PEAK_GROWTH_PERCENT_OF_ADMITTED: usize = 250;
+
 /// Backstop on total peak live heap for admitting `COMMITS` commits.
 ///
 /// Deliberately loose, and deliberately NOT the headline. The total is set by
@@ -93,7 +178,15 @@ const PROOF_PEAK_GROWTH_CEILING: usize = 16 * 1024 * 1024;
 ///
 /// What this one catches is a gross regression: a new whole-history structure
 /// large enough to move even a bootstrap-dominated total.
-const PEAK_HEAP_CEILING: usize = 1400 * 1024 * 1024;
+///
+/// Tightened from 1400 MiB once two whole-history holders came out of a
+/// conversion. Measured on this fixture, release, one host: 660.9 MiB before
+/// the import plan's change bodies were released after proof 1 and 577.5 MiB
+/// after. 900 MiB stays a loose backstop rather than a discriminator, which is
+/// deliberate: the release floor below is what carries this class, and a total
+/// tuned tight enough to grade it would fail on a different allocator instead
+/// of on a defect.
+const PEAK_HEAP_CEILING: usize = 900 * 1024 * 1024;
 
 fn git(repo: &Path, args: &[&str]) {
     let status = Command::new("git")
@@ -179,6 +272,33 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
         .iter()
         .find(|(phase, _, _)| *phase == PROOF_PHASE)
         .map(|(_, grew, _)| *grew);
+    let bind = growth
+        .iter()
+        .find(|(phase, _, _)| *phase == BIND_PHASE)
+        .map(|(_, grew, retained)| (*grew, *retained));
+    let build = growth
+        .iter()
+        .find(|(phase, _, _)| *phase == BUILD_PHASE)
+        .map(|(_, grew, _)| *grew);
+    let admitted = growth
+        .iter()
+        .find(|(phase, _, _)| *phase == ADMIT_PHASE)
+        .map(|(_, _, retained)| *retained);
+    // The release phase gives memory BACK, and `peak_growth_by_phase` reports
+    // what a phase retained with a saturating subtraction, so a phase that
+    // frees reads zero there and says nothing. Read the entry and exit samples
+    // directly instead, and measure the drop.
+    let release_drop = support::samples()
+        .iter()
+        .position(|sample| sample.phase == RELEASE_PHASE && sample.entering)
+        .and_then(|entered| {
+            let samples = support::samples();
+            let entry = samples[entered];
+            samples[entered + 1..]
+                .iter()
+                .find(|sample| sample.phase == RELEASE_PHASE && !sample.entering)
+                .map(|exit| entry.live.saturating_sub(exit.live))
+        });
 
     println!(
         "peak live heap admitting {COMMITS} commits: {peak} bytes ({:.1} MiB), backstop {} MiB",
@@ -196,6 +316,34 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
             .map(|bytes| bytes.to_string())
             .unwrap_or_else(|| "NO SAMPLE".to_string()),
         PROOF_PEAK_GROWTH_CEILING / 1024 / 1024
+    );
+    println!(
+        "{BIND_PHASE} grew the peak by {} bytes while retaining {} bytes, ceiling {} percent",
+        bind.map(|(grew, _)| grew.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        bind.map(|(_, retained)| retained.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        BIND_PEAK_GROWTH_PERCENT_OF_RETAINED
+    );
+    println!(
+        "{BUILD_PHASE} grew the peak by {} bytes against the {} bytes {ADMIT_PHASE} retained, \
+         ceiling {} percent",
+        build
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        admitted
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        BUILD_PEAK_GROWTH_PERCENT_OF_ADMITTED
+    );
+    println!(
+        "{RELEASE_PHASE} gave back {} bytes of the {} bytes {BIND_PHASE} retained, floor {} percent",
+        release_drop
+            .map(|bytes| bytes.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        bind.map(|(_, retained)| retained.to_string())
+            .unwrap_or_else(|| "NO SAMPLE".to_string()),
+        RELEASE_DROP_PERCENT_OF_BIND_RETAINED
     );
 
     // An absent sample is not a pass. If the phase never opened, the guard
@@ -216,6 +364,93 @@ fn proving_deep_history_does_not_cost_another_copy_of_it() {
          and keeps nothing, so anything it adds is a second copy of history built to check \
          the first. This is the defect that put a full-history conversion at the ceiling of \
          a 12 GiB container.\n\n{}",
+        support::phase_attribution_table()
+    );
+    // Two states this refuses to grade, for the same reason the proof sample
+    // does: a phase that never opened measured nothing, and a phase that
+    // retained nothing gives the ratio no denominator, so the comparison would
+    // pass on any growth at all.
+    let (bind_growth, bind_retained) = bind.unwrap_or_else(|| {
+        panic!(
+            "no {BIND_PHASE} sample was recorded, so this run proved nothing about what \
+             binding historical semantics holds. Either the phase span was renamed or the \
+             probe was not installed before the measured call.\n\n{}",
+            support::phase_attribution_table()
+        )
+    });
+    assert!(
+        bind_retained > 0,
+        "{BIND_PHASE} retained nothing, so there is no copy to compare its peak growth \
+         against and this check graded nothing. The phase writes one set of entity and \
+         relation deltas per commit into the plan, so a fixture where it keeps zero bytes \
+         is not exercising it.\n\n{}",
+        support::phase_attribution_table()
+    );
+    let bind_percent = bind_growth.saturating_mul(100) / bind_retained;
+    assert!(
+        bind_percent < BIND_PEAK_GROWTH_PERCENT_OF_RETAINED,
+        "{BIND_PHASE} grew the peak by {bind_growth} bytes while retaining {bind_retained}, \
+         {bind_percent} percent, at or over the {BIND_PEAK_GROWTH_PERCENT_OF_RETAINED} percent \
+         ceiling. That phase derives one set of deltas per commit and keeps exactly one copy \
+         of them, so growth of about two copies means the derived set and the plan's set are \
+         alive at the same time. On a real conversion that is gigabytes.\n\n{}",
+        support::phase_attribution_table()
+    );
+    // Same two refusals as above, for the same reasons: an absent phase measured
+    // nothing, and a zero denominator would let any drop at all pass.
+    let release_drop = release_drop.unwrap_or_else(|| {
+        panic!(
+            "no {RELEASE_PHASE} sample was recorded, so this run proved nothing about \
+             whether the import plan's change bodies are given back after proof 1. Either \
+             the phase span was renamed or the conversion no longer releases them.\n\n{}",
+            support::phase_attribution_table()
+        )
+    });
+    let release_percent = release_drop.saturating_mul(100) / bind_retained;
+    assert!(
+        release_percent >= RELEASE_DROP_PERCENT_OF_BIND_RETAINED,
+        "{RELEASE_PHASE} gave back {release_drop} bytes, {release_percent} percent of the \
+         {bind_retained} bytes {BIND_PHASE} retained, under the \
+         {RELEASE_DROP_PERCENT_OF_BIND_RETAINED} percent floor. Proof 1 is the last reader \
+         of a change's body, so past that point the plan's entity, relation and tree deltas \
+         for every commit in history answer no question and must be released. Holding them \
+         to the end of a conversion is over a gigabyte live across the peak on a mid-size \
+         repository.\n\n{}",
+        support::phase_attribution_table()
+    );
+    // Same two refusals as every ratio above: an absent phase measured nothing,
+    // and a zero denominator would let any growth at all pass.
+    let build = build.unwrap_or_else(|| {
+        panic!(
+            "no {BUILD_PHASE} sample was recorded, so this run proved nothing about what \
+             building the bootstrap transaction costs. Either the phase span was renamed or \
+             the probe was not installed before the measured call.\n\n{}",
+            support::phase_attribution_table()
+        )
+    });
+    let admitted = admitted.unwrap_or_else(|| {
+        panic!(
+            "no {ADMIT_PHASE} sample was recorded, so the bootstrap build has no copy of the \
+             admitted history to be measured against.\n\n{}",
+            support::phase_attribution_table()
+        )
+    });
+    assert!(
+        admitted > 0,
+        "{ADMIT_PHASE} retained nothing, so there is no copy of the admitted history to \
+         compare the bootstrap build's peak growth against and this check graded nothing.\n\n{}",
+        support::phase_attribution_table()
+    );
+    let build_percent = build.saturating_mul(100) / admitted;
+    assert!(
+        build_percent < BUILD_PEAK_GROWTH_PERCENT_OF_ADMITTED,
+        "{BUILD_PHASE} grew the peak by {build} bytes against the {admitted} bytes \
+         {ADMIT_PHASE} retained, {build_percent} percent, at or over the \
+         {BUILD_PEAK_GROWTH_PERCENT_OF_ADMITTED} percent ceiling. That phase re-proves the \
+         admitted plan and derives the imported workspace's semantics, and it keeps almost \
+         nothing, so growth of several copies of the history means it built one to prove or \
+         to read the other. On a real conversion that is gigabytes a machine has to survive \
+         for a step that retains nothing.\n\n{}",
         support::phase_attribution_table()
     );
     assert!(
