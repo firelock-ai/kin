@@ -4890,7 +4890,7 @@ mod tests {
         for point in MEASURED_COMMIT_PEAKS {
             for ceiling in [
                 point.peak_bytes,
-                point.peak_bytes - MIB,
+                point.peak_bytes.saturating_sub(MIB),
                 point.peak_bytes / 2,
             ] {
                 let check = commit_memory_headroom_check_for(
@@ -5022,10 +5022,18 @@ mod tests {
 
     /// The comfort margin is read off the table, so it cannot fall behind it.
     ///
-    /// The margin exists because a larger store peaks higher than the row the
-    /// check quotes. The table itself measures how much higher, and a row added
-    /// later that spreads wider than the constant would silently shrink the
-    /// amber band back toward the rounding this replaced.
+    /// The margin is the spread the table itself measures between two totals
+    /// observed in the SAME machine, which is what makes it a repeatability
+    /// figure and not the store-size claim FIR-2643 removed. This docstring said
+    /// "a larger store peaks higher" until that sweep found it, three hundred
+    /// lines from the constant whose own docstring had already been corrected,
+    /// which is the shape a wrong model leaves behind: the sentence that
+    /// justifies a number outlives the number's own explanation.
+    ///
+    /// A row measured later that spreads wider than the constant would silently
+    /// shrink the amber band back toward the rounding this replaced, so the
+    /// constant is held to the table rather than to a number somebody
+    /// remembered.
     #[test]
     fn the_comfort_margin_covers_the_spread_the_table_shows() {
         let widest = MEASURED_COMMIT_PEAKS
