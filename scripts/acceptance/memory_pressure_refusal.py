@@ -30,6 +30,21 @@ daemon can be over its own footprint budget, which is Kin's. Checks 0 to 3 cover
 the host half; checks 4 and 5 cover the budget half, including that a budget
 refusal blames the budget and not the machine.
 
+A third failure, and the sharpest
+---------------------------------
+The back-off can be right about a number that is impossible. The v0.5.51
+stranger read `graph status` claiming this repository's daemon and its thirteen
+children held 25.3 GiB inside a container hard-capped at 12, and background
+embedding refused on all three of its stores, so every vector answer came from
+an empty index on a box that had room. Summing resident sets across a process
+tree charges every shared page once per process that maps it, so the total
+tracked how many descendants there were rather than any memory anyone held.
+Checks 10 and 11 cover that (FIR-2653): 10 grades the published figure against
+the kernel's own two readings for the same processes, and against what the
+cgroup is charged where a cap exists; 11 proves a tree the pre-fix arithmetic
+would have refused is admitted, with the control that a tree genuinely over its
+budget still backs off.
+
 Why both levers are pinned rather than produced
 -----------------------------------------------
 A test that has to exhaust a machine's memory to prove Kin backs off is a test
@@ -98,6 +113,9 @@ TICKET = "FIR-2614"
 # line is the whole of what a reader sees when one fails. Labelling them with
 # the suite's ticket sent that reader to the wrong issue.
 TICKET_DEATH = "FIR-2650"
+# The footprint READING is a third ticket in the same class: the back-off was
+# right and the number it read was impossible.
+TICKET_FOOTPRINT = "FIR-2653"
 
 # The doctor row and the durable record this suite is about.
 ROW_ID = "host_memory_pressure"
@@ -185,6 +203,133 @@ class Result(object):
         return "; ".join(graded) if graded else "no assertion was reached"
 
 
+# ----------------------------------------------------- the kernel's own view
+#
+# Every reader below asks the kernel directly rather than asking kin, which is
+# the whole point: a check that took its comparison figure from the product
+# could never disagree with it. They are Linux-only and each returns None off
+# Linux or when the file is not there, so a caller can say "not measurable
+# here" instead of grading a zero.
+
+def _sum_kb_field(body, name):
+    """Every `Name:  <value> kB` line in a smaps-shaped body, summed, in kB."""
+    total = None
+    for line in body.splitlines():
+        if not line.startswith(name + ":"):
+            continue
+        parts = line.split(":", 1)[1].split()
+        if not parts:
+            continue
+        try:
+            total = (total or 0) + int(parts[0])
+        except ValueError:
+            continue
+    return total
+
+
+def proportional_bytes(pid):
+    """This process's PSS, in bytes, out of `/proc/<pid>/smaps_rollup`.
+
+    PSS divides every shared page by the number of processes mapping it, so a
+    sum of PSS across a tree counts each page once. This is the figure the
+    product is supposed to be publishing.
+    """
+    try:
+        with open("/proc/%d/smaps_rollup" % pid) as handle:
+            kb = _sum_kb_field(handle.read(), "Pss")
+    except (IOError, OSError):
+        return None
+    return None if kb is None else kb * 1024
+
+
+def resident_bytes(pid):
+    """This process's resident set, in bytes, out of `/proc/<pid>/statm`.
+
+    The figure the pre-fix build summed. Kept as the comparison because it is
+    what makes the check able to fail: a published figure at or above this one
+    is a resident set wearing a footprint's name.
+    """
+    try:
+        with open("/proc/%d/statm" % pid) as handle:
+            fields = handle.read().split()
+        return int(fields[1]) * os.sysconf("SC_PAGE_SIZE")
+    except (IOError, OSError, ValueError, IndexError):
+        return None
+
+
+def descendants_of(pid):
+    """Every descendant pid of `pid`, at any depth, out of `/proc`."""
+    parents = {}
+    try:
+        entries = os.listdir("/proc")
+    except (IOError, OSError):
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry) as handle:
+                fields = handle.read().rsplit(")", 1)[-1].split()
+            parents[int(entry)] = int(fields[1])
+        except (IOError, OSError, ValueError, IndexError):
+            continue
+    found, frontier = set(), [pid]
+    while frontier:
+        current = frontier.pop()
+        for child, parent in parents.items():
+            if parent == current and child not in found:
+                found.add(child)
+                frontier.append(child)
+    return sorted(found)
+
+
+def binding_cgroup_dir(pid):
+    """The cgroup v2 directory whose `memory.max` binds `pid`, or None.
+
+    The same walk the product does, written again here on purpose: this is the
+    independent reading the product's own figure is graded against, and taking
+    it from kin would make the comparison a tautology. Leaf to root, smallest
+    finite cap wins, because a limit on an ancestor binds just as hard.
+    """
+    try:
+        with open("/proc/%d/cgroup" % pid) as handle:
+            body = handle.read()
+    except (IOError, OSError):
+        return None
+    relative = None
+    for line in body.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[0] == "0" and parts[1] == "":
+            relative = parts[2].strip().lstrip("/")
+            break
+    segments = [s for s in (relative or "").split("/") if s]
+    binding = None
+    while True:
+        directory = "/".join(["/sys/fs/cgroup"] + segments)
+        try:
+            with open(os.path.join(directory, "memory.max")) as handle:
+                raw = handle.read().strip()
+            if raw != "max":
+                limit = int(raw)
+                if binding is None or limit < binding[0]:
+                    binding = (limit, directory)
+        except (IOError, OSError, ValueError):
+            pass
+        if not segments:
+            break
+        segments.pop()
+    return binding and {"dir": binding[1], "limit_bytes": binding[0]}
+
+
+def cgroup_charge_bytes(directory):
+    """What the kernel says this cgroup is charged right now, in bytes."""
+    try:
+        with open(os.path.join(directory, "memory.current")) as handle:
+            return int(handle.read().strip())
+    except (IOError, OSError, ValueError):
+        return None
+
+
 # ------------------------------------------------------------------- graders
 
 def doctor_row(report):
@@ -245,6 +390,41 @@ def reason_names_the_budget(reason):
     """
     reason = reason or ""
     return "it is allowed" in reason and "host memory pressure" not in reason
+
+
+def reading_is_proportional(own_bytes, pss_bytes, rss_bytes):
+    """Whether a published own-figure is a proportional reading of that process.
+
+    Two ways to fail and they catch different builds. A figure at or above the
+    resident set IS the resident set, which is the pre-fix reading exactly. A
+    figure comfortably below the resident set but well above the proportional
+    one is a partial fix, or a resident set on a process that happens to share
+    little, and would slip past the first test alone.
+
+    The 25% allowance is for sampling drift between the daemon's own sample and
+    this probe's read, and for nothing else: an overcount across a process tree
+    is a factor, not a percentage.
+    """
+    if not all(isinstance(v, int) and v > 0 for v in (own_bytes, pss_bytes, rss_bytes)):
+        return False
+    return own_bytes < rss_bytes and own_bytes <= int(pss_bytes * 1.25)
+
+
+def total_fits_the_kernel_charge(total_bytes, charged_bytes, cap_bytes):
+    """Whether a published tree total is one its cgroup could actually hold.
+
+    A process tree cannot hold more than the kernel charges the cgroup it runs
+    in, and the cgroup cannot be charged more than its cap. Both are asserted,
+    because a build whose clamp read the cap instead of the charge would satisfy
+    the second and not the first.
+
+    The same 5% is drift between two instants, not room for an overcount.
+    """
+    if not all(isinstance(v, int) and v > 0 for v in (charged_bytes, cap_bytes)):
+        return False
+    if not isinstance(total_bytes, int) or total_bytes < 0:
+        return False
+    return total_bytes <= int(charged_bytes * 1.05) and total_bytes <= cap_bytes
 
 
 def status_publishes_the_standing(text):
@@ -424,7 +604,7 @@ class Suite(object):
         return run(base + args, cwd=cwd, env=self.env)
 
     def kin_run(self, args, repo, pressure=None, budget=None, timeout=600,
-                daemon_url=None):
+                daemon_url=None, extra_env=None):
         """One `kin` command, optionally under a pinned pressure level.
 
         The level reaches the daemon only through the command that STARTS one:
@@ -437,6 +617,10 @@ class Suite(object):
         resolves an endpoint and starts a replacement daemon when it finds
         none, so a probe meant to grade a failed dispatch would race a respawn
         and usually lose.
+
+        `extra_env` reaches the daemon the same way and by the same rule: the
+        threshold bars are read by the process that starts one, so a check that
+        moves them has to move them on the command that starts the daemon.
         """
         env = dict(self.env)
         if pressure is None:
@@ -451,16 +635,22 @@ class Suite(object):
             env.pop("KIN_DAEMON_URL", None)
         else:
             env["KIN_DAEMON_URL"] = daemon_url
+        for name, value in (extra_env or {}).items():
+            if value is None:
+                env.pop(name, None)
+            else:
+                env[name] = str(value)
         return run([self.kin] + args, cwd=repo, env=env, timeout=timeout)
 
-    def restart_daemon(self, repo, pressure=None, budget=None):
+    def restart_daemon(self, repo, pressure=None, budget=None, extra_env=None):
         """Stop whatever daemon is serving `repo` and start one under `pressure`.
 
         Returns the (rc, output) of the command that started the new one, so a
         caller can report a failure to start rather than grading its absence.
         """
         run([self.kin, "daemon", "stop"], cwd=repo, env=self.env, timeout=180)
-        return self.kin_run(["graph", "status"], repo, pressure=pressure, budget=budget)
+        return self.kin_run(["graph", "status"], repo, pressure=pressure, budget=budget,
+                            extra_env=extra_env)
 
     def record_path(self, repo):
         return os.path.join(repo, ".kin", RECORD_NAME)
@@ -1248,9 +1438,254 @@ def check_9(suite):
     return result
 
 
+def _published_own_bytes(published):
+    """`own_bytes` out of a published standing, or None when it carries none."""
+    footprint = (published or {}).get("footprint") or {}
+    value = footprint.get("own_bytes")
+    return value if isinstance(value, int) else None
+
+
+def check_10(suite):
+    """FIR-2653: the published footprint is a proportional reading, held under
+    what the kernel charges.
+
+    The v0.5.51 stranger read `graph status` claiming this repository's daemon
+    and its thirteen children held 25.3 GiB inside a container hard-capped at 12
+    GiB, whose own peak was 9.99 GiB and whose `memory.events` said the cap was
+    never reached. Not merely wrong: impossible. The cause was in the doc comment
+    of the type that carried it, `children_bytes` documented as "Every
+    descendant's resident set, summed", and a resident set counts every shared
+    page once per process that maps it.
+
+    So this grades the number against the kernel's own two figures for the same
+    processes, read here rather than asked of kin, because a check that took its
+    comparison from the product could never disagree with it.
+
+    Arm A runs wherever `/proc` does. A published `own_bytes` at or above the
+    daemon's resident set is the pre-fix reading by definition, and one above its
+    proportional set by more than sampling drift is the same defect in the
+    fraction that would not fire the first assertion.
+
+    Arm B is the container half and needs a memory cap to exist. It runs when
+    this process is already inside one, which is how the release stranger and
+    every hosted runner with a limit run it. Where there is no cap there is
+    nothing for a footprint to be held under, and the check says so in its own
+    detail rather than reporting an arm it never ran.
+
+    Off Linux this is UNREADABLE and says why. `phys_footprint` is what macOS
+    publishes and there is no second kernel figure to grade it against without
+    root; the macOS reader has unit coverage in `kin-daemon-spawn` instead, and
+    what that proves is narrower.
+    """
+    result = Result(
+        "10", TICKET_FOOTPRINT,
+        "the published daemon footprint is proportional, and never above what the kernel charges",
+    )
+    if not sys.platform.startswith("linux"):
+        result.unknown(
+            "no /proc on %s, so the published figure has no independent kernel reading to be "
+            "graded against here. The macOS path (phys_footprint via proc_pid_rusage) is "
+            "covered by kin-daemon-spawn's unit tests, which prove the reader answers and "
+            "that the fold counts a shared page once; they do not prove this end to end"
+            % sys.platform
+        )
+        return result
+
+    repo = suite.fixture("proportional")
+    rc, out = suite.restart_daemon(repo, pressure="nominal")
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    pid = suite.daemon_pid(repo)
+    if pid is None:
+        result.unknown("this store published no daemon pid at %s" % suite.pid_path(repo))
+        return result
+    published = suite.read_published_footprint(repo)
+    own = _published_own_bytes(published)
+    # Read immediately after the record, so the two figures are as close in time
+    # as this probe can make them.
+    pss = proportional_bytes(pid)
+    rss = resident_bytes(pid)
+    if own is None:
+        result.unknown("no standing was published at %s: %s"
+                       % (suite.footprint_path(repo), json.dumps(published)))
+        return result
+    if pss is None or rss is None or pss <= 0 or rss <= 0:
+        result.unknown("could not read pid %d from /proc (pss=%s rss=%s)" % (pid, pss, rss))
+        return result
+
+    if not reading_is_proportional(own, pss, rss):
+        result.bad(
+            "the daemon publishes %d bytes for itself, against %d proportional and %d resident "
+            "for pid %d. A figure at or above the resident set is a resident set, and summing "
+            "those across a tree is what read 25.3 GiB inside a 12 GiB container"
+            % (own, pss, rss, pid)
+        )
+    else:
+        result.ok(
+            "the daemon's own figure is %d bytes, against %d proportional and %d resident for "
+            "pid %d" % (own, pss, rss, pid)
+        )
+
+    binding = binding_cgroup_dir(pid)
+    if binding is None:
+        result.ok(
+            "cgroup arm: not run, because no memory cap binds pid %d, so there is no kernel "
+            "charge for a footprint to be held under. Run this suite inside a container with "
+            "--memory to exercise it" % pid
+        )
+        return result
+    charged = cgroup_charge_bytes(binding["dir"])
+    if charged is None:
+        result.unknown("cgroup %s carries a cap of %d and no readable memory.current"
+                       % (binding["dir"], binding["limit_bytes"]))
+        return result
+    total = own + ((published.get("footprint") or {}).get("children_bytes") or 0)
+    # Five percent, for the same reason the two figures above are read back to
+    # back: the daemon sampled its tree at one instant and this reads the cgroup
+    # at another. It is not slack for an overcount, which is a factor, not a
+    # percentage.
+    if not total_fits_the_kernel_charge(total, charged, binding["limit_bytes"]):
+        result.bad(
+            "the daemon and its %d child process(es) are published as holding %d bytes while "
+            "the kernel charges cgroup %s just %d, under a cap of %d. A process tree cannot "
+            "hold more than its container is charged"
+            % ((published.get("footprint") or {}).get("child_count", 0), total,
+               binding["dir"], charged, binding["limit_bytes"])
+        )
+    else:
+        result.ok(
+            "cgroup arm: the published tree holds %d bytes, the kernel charges %d, the cap is "
+            "%d" % (total, charged, binding["limit_bytes"])
+        )
+    return result
+
+
+def check_11(suite):
+    """FIR-2653: the budget is judged on the proportional reading, so a daemon
+    the pre-fix arithmetic would have refused is admitted.
+
+    The impossible number was not cosmetic and this is why it mattered.
+    Background embedding did not start on any of the three stranger candidate
+    stores, so every vector answer that release candidate could give came from
+    an empty index on a box that had room: psf/requests finished 0 of 2,116,
+    expressjs/express 0 of 742.
+
+    The two readings are taken from this daemon rather than assumed. `T` is what
+    it publishes, `R` is its tree's resident set summed the way the pre-fix build
+    summed it, and the budget is set midway between them with both bars pinned at
+    one, so the two readings give opposite answers to "may heavy work start" with
+    no constant in the check that could drift away from the machine.
+
+    The control is the same store under a budget below `T`, where the correct
+    reading is over too. Without it a build that had stopped refusing anything at
+    all would pass the first half, and a probe that never looked would look
+    identical to one that looked and found nothing.
+
+    What it does NOT prove: that a vector was computed. The suite runs with
+    `KIN_DAEMON_AUTO_EMBED=0` and never loads a model, deliberately, so what is
+    graded is the admission decision and the rung the embed gate reads. The gate
+    itself takes its verdict from this same standing through the same
+    `pressure_verdict`, and the Rust tests in `kin_core::memory_pressure` and
+    `kin_daemon::daemon` carry the other half by name.
+    """
+    result = Result(
+        "11", TICKET_FOOTPRINT,
+        "a tree the summed-resident reading would have refused is admitted on the proportional one",
+    )
+    if not sys.platform.startswith("linux"):
+        result.unknown(
+            "no /proc on %s, so the pre-fix reading this check grades against cannot be taken "
+            "here. The same opposition is asserted as a unit test over a synthetic process "
+            "table in kin_daemon::daemon" % sys.platform
+        )
+        return result
+
+    repo = suite.fixture("proportional-admitted")
+    rc, out = suite.restart_daemon(repo, pressure="nominal")
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    pid = suite.daemon_pid(repo)
+    published = suite.read_published_footprint(repo)
+    own = _published_own_bytes(published)
+    if pid is None or own is None:
+        result.unknown("no pid or no published standing for %s: pid=%s standing=%s"
+                       % (repo, pid, json.dumps(published)))
+        return result
+    tree = [pid] + descendants_of(pid)
+    summed_resident = 0
+    for member in tree:
+        member_rss = resident_bytes(member)
+        if member_rss:
+            summed_resident += member_rss
+    published_total = own + ((published.get("footprint") or {}).get("children_bytes") or 0)
+    if published_total <= 0 or summed_resident <= published_total:
+        result.unknown(
+            "this daemon's tree (%d process(es)) sums to %d bytes resident against %d "
+            "published, so the two readings do not separate and no budget can tell them "
+            "apart" % (len(tree), summed_resident, published_total)
+        )
+        return result
+
+    midpoint = (published_total + summed_resident) // 2
+    # Both bars at one, so the rung is decided by a single comparison against the
+    # budget and nothing else: under it is nominal, at or over it is critical.
+    bars = {"KIN_MEMORY_PRESSURE_ELEVATED_FRACTION": "1.0",
+            "KIN_MEMORY_PRESSURE_CRITICAL_FRACTION": "1.0"}
+    rc, out = suite.restart_daemon(repo, pressure="nominal", budget=midpoint, extra_env=bars)
+    if rc != 0:
+        result.unknown("could not restart under the midpoint budget, exit %d: %s"
+                       % (rc, tail(out)))
+        return result
+    standing = suite.read_published_footprint(repo)
+    record = suite.read_record(repo)
+    level = (standing or {}).get("level")
+    if record is not None:
+        result.bad(
+            "with a budget of %d, midway between %d published and %d summed resident, this "
+            "daemon still backed off: %s"
+            % (midpoint, published_total, summed_resident, json.dumps(record))
+        )
+    elif level != "nominal":
+        result.bad(
+            "the published rung is %r under a budget of %d that the tree's %d bytes sit "
+            "inside, so heavy work is being judged against something other than what was "
+            "published: %s" % (level, midpoint, published_total, json.dumps(standing))
+        )
+    else:
+        result.ok(
+            "under a budget of %d the tree publishes %d bytes and stays nominal, where the "
+            "pre-fix reading of %d would have been over it" % (midpoint, published_total,
+                                                               summed_resident)
+        )
+
+    # Its own store, never the one above, so the control cannot pass on a record
+    # the first arm left behind or fail on one it cleared.
+    control = suite.fixture("proportional-refused")
+    rc, out = suite.restart_daemon(control, pressure="nominal",
+                                   budget=max(1, published_total // 2), extra_env=bars)
+    if rc != 0:
+        result.unknown("could not start the control daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    control_record = suite.read_record(control)
+    if control_record is None:
+        result.bad(
+            "a daemon under a budget of half what it publishes recorded no refusal at %s, so "
+            "the arm above proves nothing: a build that refused nothing would pass it"
+            % suite.record_path(control)
+        )
+    elif not reason_names_the_budget(control_record.get("reason")):
+        result.bad("the control's refusal blames the wrong constraint: %s"
+                   % json.dumps(control_record))
+    else:
+        result.ok("the control, at half its published footprint, backs off and blames the budget")
+    return result
+
+
 CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
           ("4", check_4), ("5", check_5), ("6", check_6), ("7", check_7),
-          ("8", check_8), ("9", check_9)]
+          ("8", check_8), ("9", check_9), ("10", check_10), ("11", check_11)]
 
 
 # ------------------------------------------------------------------ self-test
@@ -1492,6 +1927,52 @@ def self_test():
             failures.append("tail dropped the end of the output: %r" % got)
 
     # Result.status must never grade a FAIL or an ungraded run as a pass.
+    # FIR-2653. The two figures the footprint checks decide on, each paired with
+    # the reading that must produce the opposite verdict. The pre-fix build's
+    # own numbers are in here as cases, so a grader that cannot see them fails
+    # in seconds rather than passing a build that publishes 25.3 GiB.
+    proportional_cases = [
+        # own well under both: a proportional reading.
+        (True, (700 * 1024 * 1024, 720 * 1024 * 1024, 980 * 1024 * 1024)),
+        # own EQUAL to the resident set: the pre-fix reading exactly.
+        (False, (980 * 1024 * 1024, 720 * 1024 * 1024, 980 * 1024 * 1024)),
+        # own above the resident set: worse still.
+        (False, (1200 * 1024 * 1024, 720 * 1024 * 1024, 980 * 1024 * 1024)),
+        # under the resident set but far above PSS: a partial fix the first
+        # comparison alone would pass.
+        (False, (900 * 1024 * 1024, 300 * 1024 * 1024, 980 * 1024 * 1024)),
+        # just inside the drift allowance, which must still pass.
+        (True, (int(300 * 1024 * 1024 * 1.2), 300 * 1024 * 1024, 980 * 1024 * 1024)),
+        # an unread figure is not a passing one.
+        (False, (None, 720 * 1024 * 1024, 980 * 1024 * 1024)),
+        (False, (0, 720 * 1024 * 1024, 980 * 1024 * 1024)),
+    ]
+    for want, (own, pss, rss) in proportional_cases:
+        if reading_is_proportional(own, pss, rss) != want:
+            failures.append("reading_is_proportional(%s, %s, %s) != %s" % (own, pss, rss, want))
+
+    charge_cases = [
+        # the measured healthy shape: 754 MB across a tree in a container
+        # charged 2.15 GiB under a 12 GiB cap.
+        (True, (754 * 1024 * 1024, 2313310208, 12884901888)),
+        # the measured defect: 25.3 GiB published against the same container.
+        (False, (int(25.3 * 1024 * 1024 * 1024), 2313310208, 12884901888)),
+        # and the greenfield one, 14.6 GiB against a container that peaked at
+        # 2.15 GiB, which is under the cap and still impossible.
+        (False, (int(14.6 * 1024 * 1024 * 1024), 2313310208, 12884901888)),
+        # a build whose clamp read the CAP rather than the charge: inside the
+        # cap, above what the kernel is charged, and it must still fail.
+        (False, (11 * 1024 * 1024 * 1024, 2313310208, 12884901888)),
+        # equal to the charge is inside it.
+        (True, (2313310208, 2313310208, 12884901888)),
+        # an unreadable charge is not a passing comparison.
+        (False, (754 * 1024 * 1024, None, 12884901888)),
+    ]
+    for want, (total, charged, cap) in charge_cases:
+        if total_fits_the_kernel_charge(total, charged, cap) != want:
+            failures.append("total_fits_the_kernel_charge(%s, %s, %s) != %s"
+                            % (total, charged, cap, want))
+
     grade_cases = [
         (PASS, [(PASS, "a")]),
         (FAIL, [(PASS, "a"), (FAIL, "b")]),
@@ -1513,7 +1994,8 @@ def self_test():
              + len(budget_cases) + len(standing_cases) + len(death_cases)
              + len(memory_cases) + len(idle_cases) + len(enrichment_cases)
              + len(kill_row_cases) + len(warning_cases) + len(line_cases)
-             + len(tail_cases) + len(grade_cases))
+             + len(tail_cases) + len(grade_cases)
+             + len(proportional_cases) + len(charge_cases))
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0

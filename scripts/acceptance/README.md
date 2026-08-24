@@ -145,6 +145,22 @@ daemon really did retire. Check 9 grades the store's own enrichment line, which
 read "completion not attested" over a killed daemon and was byte-identical to a
 healthy store whose enrichment was merely uncertified.
 
+Checks 10 and 11 cover the reading the back-off decides on (FIR-2653). Summing
+resident sets across a process tree charges every shared page once per process,
+so the v0.5.51 stranger read a daemon and thirteen children holding 25.3 GiB
+inside a container hard-capped at 12, and background embedding refused on all
+three of its stores. Check 10 grades the published figure against the kernel's
+own proportional and resident readings for the same pid, taken here rather than
+asked of kin, and against what the cgroup is charged wherever a cap binds the
+daemon; where no cap does, it says so in its own line rather than reporting an
+arm it never ran. Check 11 derives a budget midway between what the daemon
+publishes and what its tree sums to resident, pins both bars at one so the two
+readings give opposite answers, and requires the daemon to stay nominal; its
+control, at half the published figure, must still back off. Both are Linux, and
+both say so off it: the macOS reader (`phys_footprint` through
+`proc_pid_rusage`) has unit coverage in `kin-daemon-spawn` and no end-to-end arm
+here, because there is no second kernel figure to grade it against without root.
+
 `init_memory_repro.py` covers what a brownfield conversion holds while it runs.
 A full-history `psf/requests` conversion measured 11.72 GiB of resident set
 inside a 12 GiB container, because proving an import plan rebuilt the whole plan

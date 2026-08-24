@@ -9920,6 +9920,7 @@ mod tests {
                 own_bytes: 2 * 1024 * 1024 * 1024,
                 children_bytes: 512 * 1024 * 1024,
                 child_count: 1,
+                kernel_capped: false,
             },
             budget_bytes: 8 * 1024 * 1024 * 1024,
             budget_is_derived: true,
