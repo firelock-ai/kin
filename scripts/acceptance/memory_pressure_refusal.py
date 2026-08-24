@@ -753,8 +753,7 @@ class Suite(object):
         except (IOError, OSError):
             pass
         self.kin_run(["status"], repo, pressure=pressure)
-        return self.wait_for_published_footprint(repo, pid=self.daemon_pid(repo),
-                                                 seconds=seconds)
+        return self.wait_for_published_footprint(repo, seconds=seconds)
 
     def wait_for_record(self, repo, seconds=60):
         """The refusal this store records, waited for. None if it never appears.
@@ -771,7 +770,7 @@ class Suite(object):
             time.sleep(0.5)
         return None
 
-    def wait_for_published_footprint(self, repo, pid=None, seconds=60):
+    def wait_for_published_footprint(self, repo, seconds=60):
         """The standing this store's daemon publishes, waited for. None if it never does.
 
         A daemon publishes its standing on its first pressure call, and those
@@ -782,14 +781,15 @@ class Suite(object):
         checks 10 and 11 reported UNREADABLE against real 0.5.51 bytes in a
         container for exactly this reason.
 
-        `pid` requires the standing to be the one THIS daemon published rather
-        than its predecessor's, which is what keeps a check that restarts a
-        daemon under a new budget from grading the record the old one left.
+        Freshness comes from `publish_standing` retiring the old record before
+        provoking a new one, not from matching a pid: a daemon can be replaced
+        between a probe reading its pid and reading its record, and a wait keyed
+        on the pid would then time out over a record that is perfectly current.
         """
         deadline = time.time() + seconds
         while time.time() < deadline:
             published = self.read_published_footprint(repo)
-            if published is not None and (pid is None or published.get("pid") == pid):
+            if published is not None:
                 return published
             time.sleep(0.5)
         return None
@@ -1525,16 +1525,24 @@ def check_10(suite):
     processes, read here rather than asked of kin, because a check that took its
     comparison from the product could never disagree with it.
 
-    Arm A runs wherever `/proc` does. A published `own_bytes` at or above the
-    daemon's resident set is the pre-fix reading by definition, and one above its
-    proportional set by more than sampling drift is the same defect in the
-    fraction that would not fire the first assertion.
+    Arm A runs wherever `/proc` does and grades the daemon's own row. It is the
+    weaker of the two on purpose, and worth saying why: a LONE process shares
+    almost nothing, so its proportional set sits within a percent of its
+    resident set and no comparison between them can be evidence. Against
+    shipped 0.5.51 bytes in a container this arm passed, at 60,432,384 published
+    against 60,014,592 proportional and 63,598,592 resident. It fires where a
+    daemon does share, which is every machine with a supervisor beside it.
 
-    Arm B is the container half and needs a memory cap to exist. It runs when
-    this process is already inside one, which is how the release stranger and
-    every hosted runner with a limit run it. Where there is no cap there is
-    nothing for a footprint to be held under, and the check says so in its own
-    detail rather than reporting an arm it never ran.
+    Arm B is the container half, it needs a memory cap to exist, and it is what
+    caught the shipped defect: the same run published 1,450,377,216 bytes for
+    the daemon and twenty-three children while the kernel charged that container
+    283,222,016. The double-count needs siblings to appear at all, which is why
+    the arm that sees it is the one that compares against a whole-cgroup figure.
+    It runs when this process is already inside a cap, which is how the release
+    stranger runs and how `acceptance.yml` runs these two checks a second time.
+    Where there is no cap there is nothing for a footprint to be held under, and
+    the check says so in its own detail rather than reporting an arm it never
+    ran.
 
     Off Linux this is UNREADABLE and says why. `phys_footprint` is what macOS
     publishes and there is no second kernel figure to grade it against without
@@ -1560,11 +1568,14 @@ def check_10(suite):
     if rc != 0:
         result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
         return result
+    published = suite.publish_standing(repo)
+    # After the provocation, because it takes two commands and a daemon can be
+    # replaced between them; the pid this reads is the one the readings below
+    # are about.
     pid = suite.daemon_pid(repo)
     if pid is None:
         result.unknown("this store published no daemon pid at %s" % suite.pid_path(repo))
         return result
-    published = suite.publish_standing(repo)
     own = _published_own_bytes(published)
     # Read immediately after the record, so the two figures are as close in time
     # as this probe can make them.
@@ -1681,8 +1692,8 @@ def check_11(suite):
     if rc != 0:
         result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
         return result
+    published = suite.publish_standing(repo)
     pid = suite.daemon_pid(repo)
-    published = suite.publish_standing(repo) if pid else None
     own = _published_own_bytes(published)
     if pid is None or own is None:
         result.unknown("no pid or no published standing for %s: pid=%s standing=%s"
