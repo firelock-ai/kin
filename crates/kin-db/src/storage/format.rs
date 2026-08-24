@@ -58,6 +58,97 @@ impl CompactionStats {
     }
 }
 
+/// A writer that counts bytes and keeps none of them.
+///
+/// The snapshot frame carries its body's length in a header that sits ahead of
+/// the body, so the length has to be known before the first body byte is
+/// written. Serializing into a throwaway `Vec` to learn it costs one whole copy
+/// of the repository; counting costs nothing.
+#[derive(Default)]
+pub(crate) struct CountingWriter {
+    written: usize,
+}
+
+impl CountingWriter {
+    /// Bytes this writer was handed.
+    pub(crate) fn written(&self) -> usize {
+        self.written
+    }
+}
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.written += buf.len();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Assemble one `KNDB` frame around a serializable snapshot body, in one buffer.
+///
+/// This used to serialize the body into its own `Vec` and then copy it into a
+/// second, exactly-sized frame buffer, so both existed at once. The body of a
+/// converted repository IS the repository: on psf/requests at full history it
+/// is about a gigabyte, and that copy is what made
+/// `kindb.commit.persist_successor` the moment a conversion reaches its
+/// whole-run peak.
+///
+/// The body's length goes in the header, which sits AHEAD of the body, so one
+/// streaming pass cannot know what to write there. It is counted first, over
+/// the same walk that produces the bytes second, by a writer that allocates
+/// nothing. Two passes of CPU buys one copy of the repository, and the buffer
+/// is then exactly sized, so the writing pass never reallocates and never holds
+/// a half-grown copy beside a growing one.
+fn assemble_snapshot_frame<T: Serialize + ?Sized>(
+    body: &T,
+    persisted_root_hash: Option<[u8; 32]>,
+    trailer_len: usize,
+) -> Result<Vec<u8>, crate::error::KinDbError> {
+    let mut counter = CountingWriter::default();
+    write_snapshot_body(&mut counter, body)?;
+    let body_len = counter.written();
+
+    let mut buf = Vec::with_capacity(16 + body_len + GraphSnapshot::CHECKSUM_LEN + trailer_len);
+    buf.extend_from_slice(&GraphSnapshot::MAGIC);
+    buf.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(body_len as u64).to_le_bytes());
+    write_snapshot_body(&mut buf, body)?;
+
+    // The two passes have to agree. A writing pass that produced a different
+    // number of bytes than the counting pass declared would mint a well-formed
+    // header describing a body nobody wrote, and every reader would slice the
+    // frame at the wrong offset. It fails loud instead.
+    let written = buf.len() - 16;
+    if written != body_len {
+        return Err(crate::error::KinDbError::StorageError(format!(
+            "snapshot body length pass counted {body_len} bytes and the writing pass produced \
+             {written}; refusing to frame a body the header does not describe"
+        )));
+    }
+
+    let body_checksum: [u8; 32] = Sha256::digest(&buf[16..]).into();
+    buf.extend_from_slice(&body_checksum);
+    if let Some(root_hash) = persisted_root_hash {
+        GraphSnapshot::append_root_hash_trailer(&mut buf, body_checksum, root_hash);
+    }
+
+    Ok(buf)
+}
+
+/// One definition of the MessagePack body, used by the counting pass and the
+/// writing pass, so the length in the header and the bytes it describes can
+/// never come from two different encoders.
+fn write_snapshot_body<W: std::io::Write, T: Serialize + ?Sized>(
+    out: &mut W,
+    body: &T,
+) -> Result<(), crate::error::KinDbError> {
+    rmp_serde::encode::write(out, body)
+        .map_err(|e| crate::error::KinDbError::StorageError(format!("serialization failed: {e}")))
+}
+
 /// Whether a snapshot's authority envelope takes part in its storage admission.
 ///
 /// A stored snapshot validates its envelope against itself. A history replay
@@ -440,28 +531,29 @@ impl GraphSnapshot {
         if validate_admission {
             self.validate_storage_admission()?;
         }
-        let body = rmp_serde::to_vec(self).map_err(|e| {
-            crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
-        })?;
-
         let trailer_len = persisted_root_hash
             .map(|_| Self::ROOT_HASH_TRAILER_LEN)
             .unwrap_or(0);
-        // Pre-allocate: header (16B) + body + checksum (32B) + optional trailer
-        let mut buf = Vec::with_capacity(16 + body.len() + Self::CHECKSUM_LEN + trailer_len);
-        buf.extend_from_slice(&Self::MAGIC);
-        buf.extend_from_slice(&Self::CURRENT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        buf.extend(&body);
 
-        // Append checksum of the body.
-        let body_checksum: [u8; 32] = Sha256::digest(&body).into();
-        buf.extend_from_slice(&body_checksum);
-        if let Some(root_hash) = persisted_root_hash {
-            Self::append_root_hash_trailer(&mut buf, body_checksum, root_hash);
-        }
-
-        Ok(buf)
+        // The frame is assembled in ONE buffer, and that is the whole point of
+        // the two passes below.
+        //
+        // This used to serialize the body into its own `Vec` and then copy it
+        // into a second, exactly-sized frame buffer, so both existed at once.
+        // The body of a converted repository IS the repository: on psf/requests
+        // at full history it is about a gigabyte, and the copy made
+        // `kindb.commit.persist_successor` the moment a conversion reaches its
+        // whole-run peak. Every other cut in that phase was rearranging memory
+        // underneath this one.
+        //
+        // The body's length has to be in the header, which sits AHEAD of the
+        // body, so a single streaming pass cannot know what to write there. It
+        // is counted first over the same walk that produces the bytes second,
+        // by a writer that allocates nothing. Two passes of CPU buys one copy
+        // of the repository, and the buffer is then exactly sized, so the write
+        // pass never reallocates and never holds a half-grown copy beside a
+        // growing one.
+        assemble_snapshot_frame(self, persisted_root_hash, trailer_len)
     }
 
     /// Deserialize a snapshot from bytes (with header validation).
@@ -1447,27 +1539,13 @@ impl<'a> BorrowedGraphSnapshot<'a> {
         persisted_root_hash: Option<[u8; 32]>,
     ) -> Result<Vec<u8>, crate::error::KinDbError> {
         self.validate_storage_admission()?;
-        let body = rmp_serde::to_vec(self).map_err(|e| {
-            crate::error::KinDbError::StorageError(format!("serialization failed: {e}"))
-        })?;
-
         let trailer_len = persisted_root_hash
             .map(|_| GraphSnapshot::ROOT_HASH_TRAILER_LEN)
             .unwrap_or(0);
-        let mut buf =
-            Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN + trailer_len);
-        buf.extend_from_slice(&GraphSnapshot::MAGIC);
-        buf.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
-        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
-        buf.extend(&body);
-
-        let body_checksum: [u8; 32] = Sha256::digest(&body).into();
-        buf.extend_from_slice(&body_checksum);
-        if let Some(root_hash) = persisted_root_hash {
-            GraphSnapshot::append_root_hash_trailer(&mut buf, body_checksum, root_hash);
-        }
-
-        Ok(buf)
+        // The same one-buffer assembly the owned snapshot uses, for the same
+        // reason: this is the daemon's own save path over a live graph, and it
+        // held two whole encodings of the store at once.
+        assemble_snapshot_frame(self, persisted_root_hash, trailer_len)
     }
 
     fn validate_storage_admission(&self) -> Result<(), crate::error::KinDbError> {
@@ -2058,6 +2136,159 @@ mod tests {
         let stats = snap.compact();
         assert!(stats.total_removed() >= 2);
         assert!(!stats.is_clean());
+    }
+
+    /// The frame the two-buffer assembly produced, kept as a reference.
+    ///
+    /// This is the code that wrote every snapshot on disk today: serialize the
+    /// body into its own `Vec`, then copy it into an exactly-sized frame
+    /// buffer. It is retained here and nowhere else, so the one-buffer
+    /// assembly is compared against the implementation the stores were written
+    /// under rather than against itself.
+    fn reference_two_buffer_frame(
+        snapshot: &GraphSnapshot,
+        persisted_root_hash: Option<[u8; 32]>,
+    ) -> Vec<u8> {
+        let body = rmp_serde::to_vec(snapshot).expect("reference body serializes");
+        let trailer_len = persisted_root_hash
+            .map(|_| GraphSnapshot::ROOT_HASH_TRAILER_LEN)
+            .unwrap_or(0);
+        let mut buf =
+            Vec::with_capacity(16 + body.len() + GraphSnapshot::CHECKSUM_LEN + trailer_len);
+        buf.extend_from_slice(&GraphSnapshot::MAGIC);
+        buf.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        buf.extend(&body);
+        let body_checksum: [u8; 32] = Sha256::digest(&body).into();
+        buf.extend_from_slice(&body_checksum);
+        if let Some(root_hash) = persisted_root_hash {
+            GraphSnapshot::append_root_hash_trailer(&mut buf, body_checksum, root_hash);
+        }
+        buf
+    }
+
+    /// Snapshot shapes that exercise every branch the frame assembly takes.
+    fn frame_corpus() -> Vec<(&'static str, GraphSnapshot)> {
+        let empty = GraphSnapshot::empty();
+
+        let mut one_entity = GraphSnapshot::empty();
+        let solo = test_entity("solo");
+        one_entity.entities.insert(solo.id, solo);
+
+        let mut related = GraphSnapshot::empty();
+        let left = test_entity("left");
+        let right = test_entity("right");
+        let edge = test_relation(left.id, right.id);
+        related.entities.insert(left.id, left.clone());
+        related.entities.insert(right.id, right.clone());
+        related.relations.insert(edge.id, edge.clone());
+        related.outgoing.insert(left.id, vec![edge.id]);
+        related.incoming.insert(right.id, vec![edge.id]);
+
+        // Large enough that the writing pass crosses whatever buffer boundary
+        // an encoder might choose, which is the case a small fixture cannot
+        // reach and the one a real repository always does.
+        let mut many = GraphSnapshot::empty();
+        for index in 0..512 {
+            let entity = test_entity(&format!("bulk_{index}"));
+            many.entities.insert(entity.id, entity);
+        }
+
+        // Non-ASCII text through the encoder: combining marks, an
+        // astral-plane character and a bidi mark.
+        let mut unicode = GraphSnapshot::empty();
+        let mut marked = test_entity("uni");
+        marked.signature = "fn e\u{0301}\u{1F4A1}\u{200F}()".to_string();
+        unicode.entities.insert(marked.id, marked);
+
+        vec![
+            ("empty", empty),
+            ("one_entity", one_entity),
+            ("related", related),
+            ("five_hundred_entities", many),
+            ("unicode_signature", unicode),
+        ]
+    }
+
+    /// The frame assembled in one buffer must be byte-identical to the frame
+    /// assembled in two, for every shape.
+    ///
+    /// A changed snapshot frame makes every store on disk unreadable, so this
+    /// is the bar the one-buffer assembly has to clear, and it is compared
+    /// against the retained original rather than against itself.
+    #[test]
+    fn the_one_buffer_frame_is_the_two_buffer_frame_for_every_corpus_shape() {
+        let root_hash = [7u8; 32];
+        for (name, snapshot) in frame_corpus() {
+            let reference = reference_two_buffer_frame(&snapshot, None);
+            let shipped = snapshot.to_bytes().expect("shipped assembly serializes");
+            assert_eq!(
+                reference,
+                shipped,
+                "`{name}` frames differently in one buffer than in two, over its {} byte frame",
+                reference.len()
+            );
+            assert_eq!(
+                reference,
+                snapshot
+                    .to_bytes_pre_validated()
+                    .expect("pre-validated assembly serializes"),
+                "`{name}` frames differently on the pre-validated path"
+            );
+
+            let reference_with_trailer = reference_two_buffer_frame(&snapshot, Some(root_hash));
+            let shipped_with_trailer = snapshot
+                .to_bytes_with_persisted_root_hash(root_hash)
+                .expect("trailer assembly serializes");
+            assert_eq!(
+                reference_with_trailer, shipped_with_trailer,
+                "`{name}` frames differently with a persisted root-hash trailer"
+            );
+
+            // The frame still decodes to the snapshot it was made from, which
+            // is the property a byte comparison alone would not catch if BOTH
+            // implementations were wrong in the same way.
+            let decoded = GraphSnapshot::from_bytes(&shipped).expect("frame decodes");
+            assert_eq!(
+                decoded.entities.len(),
+                snapshot.entities.len(),
+                "`{name}` decoded to a different entity count"
+            );
+            assert_eq!(
+                decoded.relations.len(),
+                snapshot.relations.len(),
+                "`{name}` decoded to a different relation count"
+            );
+        }
+    }
+
+    /// The header must describe the body it is stapled to.
+    ///
+    /// Every assertion above proves sameness, and an assembly that emitted a
+    /// constant frame would satisfy all of them. This reads the declared body
+    /// length out of the header and checks it against where the checksum
+    /// actually starts, per shape.
+    #[test]
+    fn the_frame_header_declares_the_body_length_it_actually_wrote() {
+        for (name, snapshot) in frame_corpus() {
+            let frame = snapshot.to_bytes().expect("frame serializes");
+            let declared = u64::from_le_bytes(
+                frame[8..16]
+                    .try_into()
+                    .expect("the header carries eight length bytes"),
+            ) as usize;
+            assert_eq!(
+                declared,
+                frame.len() - 16 - GraphSnapshot::CHECKSUM_LEN,
+                "`{name}` declares a body length its frame does not carry"
+            );
+            let checksum: [u8; 32] = Sha256::digest(&frame[16..16 + declared]).into();
+            assert_eq!(
+                &checksum[..],
+                &frame[16 + declared..16 + declared + GraphSnapshot::CHECKSUM_LEN],
+                "`{name}` carries a checksum of bytes other than its own body"
+            );
+        }
     }
 
     #[test]
