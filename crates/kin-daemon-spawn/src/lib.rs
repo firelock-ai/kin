@@ -457,6 +457,200 @@ fn parse_v1_memory_limit(raw: u64) -> Option<u64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// What one process holds, counted so a shared page is counted once
+// ---------------------------------------------------------------------------
+
+/// What one process contributes to what its container is charged, in bytes, or
+/// `None` when this process cannot ask.
+///
+/// Resident set is the obvious number and it is the wrong one to add up. RSS
+/// counts every resident page a process maps, including the pages it shares, so
+/// a daemon and thirteen children mapping the same binary, the same dynamic
+/// libraries and the same copy-on-write heap are each charged the whole of it.
+/// Summing that across a tree produces a figure the kernel's own accounting
+/// cannot reach: the v0.5.51 stranger measured `graph status` claiming 25.3 GiB
+/// inside a cgroup hard-capped at 12 GiB whose true peak was 9.99 GiB, and the
+/// overcount tracked how many descendants there were rather than any memory
+/// anyone held. Background embedding then refused on every store, so every
+/// vector answer came from an empty index on a box that had room (FIR-2653).
+///
+/// Every reading below is proportional or private, so adding them across a tree
+/// is meaningful by construction. Counting the children is not the defect and
+/// is kept: a language server holding 1.93 GiB in a process of its own is Kin's
+/// memory and is charged to the same container.
+///
+/// **Linux** answers with PSS out of `/proc/<pid>/smaps_rollup`, where each
+/// shared page is divided by the number of processes mapping it, so a page
+/// shared thirteen ways is counted once across the thirteen. Kernels before
+/// 4.14 publish no rollup, so the first fallback subtracts `Shared_Clean` and
+/// `Shared_Dirty` from `Rss` over `/proc/<pid>/smaps`, which is the private set:
+/// it undercounts a genuinely shared page rather than multiplying it. The last
+/// is `/proc/<pid>/statm`, whose resident-minus-shared pair is that same private
+/// figure at page resolution, and which is readable when the other two are not,
+/// since they need `PTRACE_MODE_READ` and it does not.
+///
+/// **macOS** answers with `ri_phys_footprint` from `proc_pid_rusage`, which is
+/// this platform's own footprint number: what Activity Monitor's Memory column
+/// shows and what the jetsam ledger kills on. It counts a process's private and
+/// compressed pages and its IOKit mappings, and leaves out the clean
+/// file-backed pages every copy of a binary shares, which is the double-count
+/// this exists to remove. There is no PSS here and no per-page sharing count to
+/// build one from, so this is the deliberate equivalent rather than a
+/// translation, and what it proves is narrower: it removes the shared-image
+/// double-count, and it does not divide a shared anonymous page between the
+/// processes mapping it the way PSS does.
+///
+/// **Elsewhere** there is no reading here and the caller gets `None`, which is
+/// the same answer an unreadable `/proc` gives. A caller with a private figure
+/// of its own may use it; inventing one here would be the one number in this
+/// module a reader could not check.
+pub fn process_footprint_bytes(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let read = |name: &str| fs::read_to_string(format!("/proc/{pid}/{name}")).ok();
+        return resolve_process_footprint(
+            read("smaps_rollup").as_deref(),
+            read("smaps").as_deref(),
+            read("statm").as_deref(),
+            host_page_size(),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return macos_phys_footprint(pid);
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// This host's page size, for the `statm` fallback, which counts in pages.
+#[cfg(target_os = "linux")]
+fn host_page_size() -> u64 {
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 {
+        size as u64
+    } else {
+        4096
+    }
+}
+
+/// The first readable proportional or private figure out of the three bodies
+/// Linux publishes, in bytes.
+///
+/// Pure over the three bodies so every layout is testable on any host,
+/// including the two a modern kernel never produces. The order is the order of
+/// accuracy: PSS divides a shared page between its mappers, the private set
+/// drops it entirely, and `statm` is the private set rounded to whole pages.
+///
+/// Public, and compiled on every platform, so the fold that consumes it can be
+/// exercised over a synthetic process table on a host with no `/proc` at all.
+pub fn resolve_process_footprint(
+    rollup: Option<&str>,
+    smaps: Option<&str>,
+    statm: Option<&str>,
+    page_size: u64,
+) -> Option<u64> {
+    rollup
+        .and_then(parse_smaps_pss)
+        .or_else(|| smaps.and_then(parse_smaps_private))
+        .or_else(|| statm.and_then(|body| parse_statm_private(body, page_size)))
+}
+
+/// Total PSS in bytes out of a `smaps_rollup` or `smaps` body.
+///
+/// Every `Pss:` line is summed rather than only the first, so the same parser
+/// answers for a rollup (one line) and for a per-mapping `smaps` (one line per
+/// mapping). `Pss_Anon`, `Pss_File` and `Pss_Shmem` are deliberately not
+/// matched: they are a breakdown of the same total, and adding them to it would
+/// double what this function exists to stop doubling.
+fn parse_smaps_pss(contents: &str) -> Option<u64> {
+    let mut total_kb = 0u64;
+    let mut seen = false;
+    for line in contents.lines() {
+        if let Some(value) = smaps_field(line, "Pss") {
+            total_kb = total_kb.saturating_add(value);
+            seen = true;
+        }
+    }
+    seen.then(|| total_kb.saturating_mul(1024))
+}
+
+/// Resident set less every shared page, in bytes, out of a `smaps` body.
+///
+/// The fallback for a kernel with no rollup. It undercounts by whatever the
+/// process genuinely shares, which is the safe direction: a footprint that is
+/// too small holds work back later than it should, while one that is too large
+/// refuses work on a machine with room, which is the failure being fixed.
+fn parse_smaps_private(contents: &str) -> Option<u64> {
+    let mut rss_kb = 0u64;
+    let mut shared_kb = 0u64;
+    let mut seen = false;
+    for line in contents.lines() {
+        if let Some(value) = smaps_field(line, "Rss") {
+            rss_kb = rss_kb.saturating_add(value);
+            seen = true;
+        }
+        for name in ["Shared_Clean", "Shared_Dirty"] {
+            if let Some(value) = smaps_field(line, name) {
+                shared_kb = shared_kb.saturating_add(value);
+            }
+        }
+    }
+    seen.then(|| rss_kb.saturating_sub(shared_kb).saturating_mul(1024))
+}
+
+/// One `Name:  <value> kB` field out of a smaps line, in kB.
+///
+/// The name has to match exactly up to the colon, so `Rss` does not also match
+/// `RssShmem` and `Pss` does not also match `Pss_Anon`.
+fn smaps_field(line: &str, name: &str) -> Option<u64> {
+    let rest = line.strip_prefix(name)?.strip_prefix(':')?;
+    rest.split_whitespace().next()?.parse::<u64>().ok()
+}
+
+/// Resident pages less shared pages, in bytes, out of a `statm` body.
+///
+/// `statm` is seven whitespace-separated page counts; the second is resident
+/// and the third is the resident pages backed by a file or shared with another
+/// process. Their difference is this process's private resident set.
+fn parse_statm_private(contents: &str, page_size: u64) -> Option<u64> {
+    let mut fields = contents.split_whitespace().skip(1);
+    let resident: u64 = fields.next()?.parse().ok()?;
+    let shared: u64 = fields.next()?.parse().ok()?;
+    Some(resident.saturating_sub(shared).saturating_mul(page_size))
+}
+
+/// This process's `ri_phys_footprint`, in bytes.
+///
+/// `RUSAGE_INFO_V2` rather than a later flavour because the footprint field
+/// arrived in v2 and every macOS this ships on carries it; asking for a flavour
+/// the kernel does not know returns an error rather than a short struct, so
+/// pinning the oldest sufficient one is what keeps the reading available.
+///
+/// A failure is `None` and never a substituted resident set. `proc_pid_rusage`
+/// refuses a process this one may not inspect, and a daemon's own descendants
+/// are never that, so a refusal here means the pid is gone or the platform
+/// changed under us, and both are cases where a number would be invented.
+#[cfg(target_os = "macos")]
+fn macos_phys_footprint(pid: u32) -> Option<u64> {
+    let mut info = unsafe { std::mem::zeroed::<libc::rusage_info_v2>() };
+    let status = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            std::ptr::addr_of_mut!(info).cast::<libc::rusage_info_t>(),
+        )
+    };
+    if status != 0 {
+        return None;
+    }
+    Some(info.ri_phys_footprint)
+}
+
 /// How a daemon died, as far as the process watching it could tell.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -7938,6 +8132,135 @@ mod tests {
         assert_eq!(parse_oom_kill_count("low 0\nhigh 0\nmax 0\noom 0\n"), None);
         assert_eq!(parse_oom_kill_count("oom_kill 0\n"), Some(0));
         assert_eq!(parse_oom_kill_count("oom_kill notanumber\n"), None);
+    }
+
+    /// FIR-2653. One process's reading never carries a shared page whole.
+    ///
+    /// The body is the shape a daemon and its language server both produce: a
+    /// large mapping they share, and a small one each holds alone. Resident set
+    /// reports the whole shared mapping to every process that maps it, which is
+    /// what turned roughly 2 GiB across fourteen processes into 25.3 GiB.
+    #[test]
+    fn a_shared_mapping_is_divided_between_its_mappers_rather_than_repeated() {
+        // Two mappers, so PSS is half of the 2 GiB they share plus the 64 MiB
+        // this one holds alone. RSS would say 2 GiB + 64 MiB for each of them.
+        let rollup = "Rss:             2162688 kB\nPss:             1114112 kB\n\
+                      Shared_Clean:    1048576 kB\nShared_Dirty:    1048576 kB\n\
+                      Private_Clean:     65536 kB\nPrivate_Dirty:         0 kB\n";
+        assert_eq!(
+            parse_smaps_pss(rollup),
+            Some(1_114_112 * 1024),
+            "PSS is the reading, and it is well under the resident set"
+        );
+        assert!(
+            parse_smaps_pss(rollup).unwrap() < 2_162_688 * 1024,
+            "a reading at or above the resident set has not divided anything"
+        );
+    }
+
+    /// The rollup parser sums, so the same code answers for a per-mapping body.
+    #[test]
+    fn pss_is_summed_across_mappings_and_the_breakdown_lines_are_not_added_in() {
+        let smaps = "\
+7f0000000000-7f0080000000 r-xp 00000000 08:01 1 /usr/bin/kin\n\
+Rss:              524288 kB\n\
+Pss:              262144 kB\n\
+Pss_File:         262144 kB\n\
+7f0100000000-7f0110000000 rw-p 00000000 00:00 0 \n\
+Rss:               65536 kB\n\
+Pss:               65536 kB\n\
+Pss_Anon:          65536 kB\n";
+        assert_eq!(
+            parse_smaps_pss(smaps),
+            Some((262_144 + 65_536) * 1024),
+            "Pss_File and Pss_Anon are a breakdown of Pss, never an addition to it"
+        );
+    }
+
+    /// The pre-4.14 fallback drops a shared page rather than repeating it.
+    #[test]
+    fn without_a_rollup_the_shared_pages_are_subtracted_from_the_resident_set() {
+        let smaps = "\
+7f0000000000-7f0080000000 r-xp 00000000 08:01 1 /usr/bin/kin\n\
+Rss:             2097152 kB\n\
+Shared_Clean:    2097152 kB\n\
+Shared_Dirty:          0 kB\n\
+7f0100000000-7f0110000000 rw-p 00000000 00:00 0 \n\
+Rss:               65536 kB\n\
+Shared_Clean:          0 kB\n\
+Shared_Dirty:          0 kB\n";
+        assert_eq!(
+            parse_smaps_private(smaps),
+            Some(65_536 * 1024),
+            "only what this process holds alone"
+        );
+    }
+
+    /// `statm` is the last resort and answers in pages.
+    #[test]
+    fn statm_reports_resident_pages_less_the_shared_ones() {
+        // size resident shared text lib data dt
+        let statm = "600000 550000 540000 1000 0 8000 0\n";
+        assert_eq!(
+            parse_statm_private(statm, 4096),
+            Some((550_000 - 540_000) * 4096)
+        );
+        assert_eq!(parse_statm_private("", 4096), None);
+        assert_eq!(parse_statm_private("600000", 4096), None);
+    }
+
+    /// The three sources are consulted in order of accuracy, and a body that is
+    /// absent falls through rather than deciding.
+    #[test]
+    fn the_footprint_resolver_prefers_pss_then_private_then_statm() {
+        let rollup = "Rss: 2097152 kB\nPss: 131072 kB\n";
+        let smaps = "Rss: 2097152 kB\nShared_Clean: 1048576 kB\nShared_Dirty: 0 kB\n";
+        let statm = "600000 550000 540000 1000 0 8000 0\n";
+        assert_eq!(
+            resolve_process_footprint(Some(rollup), Some(smaps), Some(statm), 4096),
+            Some(131_072 * 1024),
+            "the rollup wins when it is there"
+        );
+        assert_eq!(
+            resolve_process_footprint(None, Some(smaps), Some(statm), 4096),
+            Some(1_048_576 * 1024),
+            "then the private set out of smaps"
+        );
+        assert_eq!(
+            resolve_process_footprint(None, None, Some(statm), 4096),
+            Some(10_000 * 4096),
+            "then statm"
+        );
+        assert_eq!(
+            resolve_process_footprint(None, None, None, 4096),
+            None,
+            "a process nobody could read is not a process holding nothing"
+        );
+        // An unparsable body is the same answer as an absent one, and must not
+        // stop the fallback beneath it.
+        assert_eq!(
+            resolve_process_footprint(Some("Rss: 12 kB\n"), None, Some(statm), 4096),
+            Some(10_000 * 4096),
+            "a rollup with no Pss line falls through"
+        );
+    }
+
+    /// This process can measure itself on the platform it is running on.
+    ///
+    /// The parsers above are pure over bodies this test never produces, so
+    /// without this one nothing proves the reader opens anything real. It
+    /// asserts a range rather than a figure: a live process holds more than a
+    /// page and less than a terabyte, and anything outside that is a reading
+    /// that did not come from this machine.
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn a_live_process_can_read_its_own_footprint() {
+        let mine = process_footprint_bytes(std::process::id())
+            .expect("this process must be able to measure itself");
+        assert!(
+            mine > 4096 && mine < (1 << 40),
+            "own footprint read as {mine} bytes, which is not a running process"
+        );
     }
 
     /// A daemon that outlived its spawner and was then killed leaves a record

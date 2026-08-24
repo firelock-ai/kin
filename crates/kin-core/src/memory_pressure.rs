@@ -416,21 +416,79 @@ pub enum Verdict {
 /// the daemon, lives as long as the sweep does, and is charged to the same
 /// container; a budget that cannot see it is a budget that is wrong by
 /// whatever the servers happen to hold.
+/// Every figure here is proportional or private rather than resident, and that
+/// is the second thing this type is for. Summing resident sets across a tree
+/// counts every shared page once per process, so a daemon and thirteen children
+/// mapping the same binary and the same libraries are charged for all of it
+/// thirteen times. The v0.5.51 stranger measured the result: `graph status`
+/// claiming 25.3 GiB inside a cgroup hard-capped at 12 GiB whose true peak was
+/// 9.99 GiB, and background embedding refused on every store, so every vector
+/// answer came from an empty index on a box that had room (FIR-2653).
+/// `kin_daemon_spawn::process_footprint_bytes` is where each figure comes from
+/// and what each platform can say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct TreeFootprint {
-    /// The daemon process's own resident set.
+    /// The daemon process's own proportional footprint.
     pub own_bytes: u64,
-    /// Every descendant's resident set, summed.
+    /// Every descendant's proportional footprint, summed. A page two of them
+    /// share is counted once across the two, never once each.
     pub children_bytes: u64,
     /// How many descendants were counted, so a reading of zero children can be
     /// told from a reading that found them and they were small.
     pub child_count: usize,
+    /// Whether [`Self::clamped_to`] held this reading down to what the kernel
+    /// charges the cgroup this process runs in.
+    ///
+    /// Defaulted on read so a standing published by an older daemon still
+    /// parses, and reported rather than kept, because a number the kernel
+    /// overrode is a different fact from one this process measured outright.
+    #[serde(default)]
+    pub kernel_capped: bool,
 }
 
 impl TreeFootprint {
     /// What the whole tree holds.
     pub fn total_bytes(&self) -> u64 {
         self.own_bytes.saturating_add(self.children_bytes)
+    }
+
+    /// This reading, held down to what the kernel says the whole cgroup is
+    /// charged.
+    ///
+    /// A process tree inside a cgroup cannot be holding more than the cgroup is
+    /// charged, so a total above `charged_bytes` is this process's arithmetic
+    /// disagreeing with the kernel's, and the kernel wins. That is the
+    /// invariant a reader needs: the footprint printed beside a container's cap
+    /// can never exceed it, so a figure like 25.3 GiB against a 12 GiB cap is
+    /// unreachable by construction rather than merely unlikely.
+    ///
+    /// It is a ceiling and not the measurement. The per-process readings this
+    /// folds are already proportional, so the clamp is expected never to bite;
+    /// when it does, it says so through [`Self::kernel_capped`] rather than
+    /// quietly presenting the kernel's figure as its own. Both halves are
+    /// scaled by the same factor so the child figure keeps its share and the
+    /// two still add up to the total.
+    ///
+    /// `None` is a host with no cgroup accounting, where there is no such
+    /// ceiling to hold anything to and the reading stands as measured.
+    pub fn clamped_to(self, charged_bytes: Option<u64>) -> Self {
+        let Some(charged) = charged_bytes else {
+            return self;
+        };
+        let total = self.total_bytes();
+        if total <= charged {
+            return self;
+        }
+        let scale = |part: u64| -> u64 {
+            ((u128::from(part) * u128::from(charged)) / u128::from(total)) as u64
+        };
+        let own_bytes = scale(self.own_bytes);
+        Self {
+            own_bytes,
+            children_bytes: charged.saturating_sub(own_bytes),
+            child_count: self.child_count,
+            kernel_capped: true,
+        }
     }
 }
 
@@ -567,12 +625,17 @@ impl BudgetStanding {
     pub fn sentence(&self) -> String {
         format!(
             "this repository's daemon and the {} process(es) it started hold {} of the {} it is \
-             allowed ({}), of which {} is in those child processes",
+             allowed ({}), of which {} is in those child processes{}",
             self.footprint.child_count,
             human_bytes(self.footprint.total_bytes()),
             human_bytes(self.budget.bytes),
             self.budget.source.as_str(),
             human_bytes(self.footprint.children_bytes),
+            if self.footprint.kernel_capped {
+                ", held at what the kernel charges this container"
+            } else {
+                ""
+            },
         )
     }
 }
@@ -1561,12 +1624,87 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
+    /// FIR-2653. A tree cannot hold more than its cgroup is charged.
+    ///
+    /// The measured numbers, so the assertion is about the run that produced
+    /// the ticket rather than about a shape: 25.3 GiB claimed inside a 12 GiB
+    /// container whose kernel charge at the time was roughly 2 GiB.
+    #[test]
+    fn a_reading_above_what_the_kernel_charges_the_container_is_held_to_it() {
+        const CHARGED: u64 = 2 * GIB + GIB / 8;
+        let impossible = TreeFootprint {
+            own_bytes: 2 * GIB + GIB / 5,
+            children_bytes: 23 * GIB + GIB / 10,
+            child_count: 13,
+            kernel_capped: false,
+        };
+        assert!(
+            impossible.total_bytes() > 25 * GIB,
+            "the pre-fix reading is the input to this test"
+        );
+        let held = impossible.clamped_to(Some(CHARGED));
+        assert_eq!(held.total_bytes(), CHARGED);
+        assert!(
+            held.kernel_capped,
+            "a reading the kernel overrode has to say so"
+        );
+        assert_eq!(held.child_count, 13, "the children were still counted");
+        assert!(
+            held.children_bytes > held.own_bytes,
+            "both halves are scaled by the same factor, so the children keep their share"
+        );
+        assert!(
+            held.total_bytes() <= 12 * GIB,
+            "and the figure printed beside a 12 GiB cap can never exceed it"
+        );
+    }
+
+    /// The clamp is a ceiling, not the measurement.
+    #[test]
+    fn a_reading_inside_what_the_kernel_charges_is_left_exactly_as_measured() {
+        let measured = TreeFootprint {
+            own_bytes: 700 * 1024 * 1024,
+            children_bytes: 54 * 1024 * 1024,
+            child_count: 13,
+            kernel_capped: false,
+        };
+        assert_eq!(measured.clamped_to(Some(2 * GIB)), measured);
+        assert_eq!(
+            measured.clamped_to(Some(measured.total_bytes())),
+            measured,
+            "equal is inside, so the ceiling does not fire on its own boundary"
+        );
+        // A host with no cgroup accounting has no such ceiling, and the reading
+        // stands as measured rather than collapsing to zero.
+        assert_eq!(measured.clamped_to(None), measured);
+    }
+
+    /// A clamped standing says so where a reader is already looking.
+    #[test]
+    fn the_standing_sentence_names_a_reading_the_kernel_held_down() {
+        let mut held = standing(2 * GIB, 23 * GIB, 13, 6 * GIB);
+        held.footprint = held.footprint.clamped_to(Some(2 * GIB));
+        let sentence = held.sentence();
+        assert!(
+            sentence.contains("what the kernel charges this container"),
+            "a clamped reading has to name itself: {sentence}"
+        );
+        // And an unclamped one carries no such clause, so the phrase means
+        // something when it appears.
+        let plain = standing(GIB, GIB, 2, 6 * GIB).sentence();
+        assert!(
+            !plain.contains("what the kernel charges"),
+            "an unclamped standing must not claim a ceiling bit it: {plain}"
+        );
+    }
+
     fn standing(own: u64, children: u64, child_count: usize, budget: u64) -> BudgetStanding {
         BudgetStanding {
             footprint: TreeFootprint {
                 own_bytes: own,
                 children_bytes: children,
                 child_count,
+                kernel_capped: false,
             },
             budget: FootprintBudget {
                 bytes: budget,
