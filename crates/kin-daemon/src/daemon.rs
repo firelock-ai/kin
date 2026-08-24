@@ -7550,6 +7550,54 @@ mod memory_pressure_tests {
         assert!(sampled.total_bytes() >= sampled.own_bytes);
     }
 
+    /// FIR-2653, on the LIVE path rather than over a fixture.
+    ///
+    /// The fold test above proves the arithmetic; this proves the figure fed
+    /// into it comes from the footprint reader and not from the resident set
+    /// beside it in the same process table. Nothing else covers that seam: a
+    /// build that kept every corrected structure and went on reading
+    /// `Process::memory()` would pass every other test in this module.
+    ///
+    /// It asserts a band around the reader rather than a size, so it says
+    /// nothing about the machine CI happens to run on, and it takes a reading
+    /// on each side of the walk because building the whole process table
+    /// allocates megabytes into the process being measured. The first draft
+    /// read once, before the walk, and failed on its own probe's allocation.
+    ///
+    /// What it does not do is compare against the resident set, and the reason
+    /// matters: a LONE process shares almost nothing, so its PSS on Linux sits
+    /// a few megabytes under its resident set and a comparison there would be
+    /// too close to be evidence. The double-count needs siblings to appear at
+    /// all. That discrimination lives in the fixture test above, where thirteen
+    /// processes map one image, and in acceptance check 10, where the daemon's
+    /// published figure is graded against the kernel's own two readings.
+    #[test]
+    #[cfg(unix)]
+    fn the_live_sampler_reads_a_footprint_rather_than_the_resident_set_beside_it() {
+        let me = sysinfo::get_current_pid().expect("this host names its own pid");
+        // Warm the walk, so the process table's own allocation is already paid
+        // for by the time the first reading is taken.
+        let _warm = walk_process_table();
+
+        let before = kin_daemon_spawn::process_footprint_bytes(me.as_u32())
+            .expect("this platform publishes a per-process footprint");
+        let sampled = walk_process_table().expect("this host publishes a process table");
+        let after = kin_daemon_spawn::process_footprint_bytes(me.as_u32())
+            .expect("this platform publishes a per-process footprint");
+
+        let low = before.min(after);
+        let high = before.max(after);
+        let slack = (high / 8).max(4 * 1024 * 1024);
+        assert!(
+            sampled.own_bytes + slack >= low && sampled.own_bytes <= high + slack,
+            "the live walk published {} for this process while the footprint reader read {} \
+             then {} either side of it, so the walk is reading something else",
+            sampled.own_bytes,
+            before,
+            after
+        );
+    }
+
     /// A real child, counted through the real process table.
     ///
     /// Every test above folds a table this file wrote. This one spawns an
