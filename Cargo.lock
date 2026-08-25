@@ -3285,9 +3285,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.57"
+version = "0.7.59"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "0f948650fcc4782b952d257b4853c9c3548d1a0abe3c3eb1d0dd2f05cdfd0f8e"
+checksum = "2a9608b37408e991813bedec15e99f034ba9a8f0db93e6d9fb6d068db5f804da"
 dependencies = [
  "bincode",
  "bstr",
@@ -3503,9 +3503,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.18"
+version = "0.7.19"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "a83554b6983fb415d95edbf261542fc1a5e3ad5026e694a9c3306cc66f1b0b8c"
+checksum = "bafee6c5697e85ce6fe4bc84bace8e7669bf7436853b5b5b90b92133e787b9f1"
 dependencies = [
  "chrono",
  "gix-hash",
