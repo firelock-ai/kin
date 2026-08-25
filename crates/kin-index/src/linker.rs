@@ -1559,21 +1559,26 @@ fn merge_resolved(
             .map(|file| {
                 let mut out: Vec<Relation> = Vec::new();
                 for imp in &file.imports {
-                    // Resolved once, used by both builders.
-                    let Some(target) =
+                    // Resolved once, and the kind decided once, for both builders.
+                    let Some((target, kind)) =
                         resolve_import_target(&file.file_path, imp, &ctx.known_files)
                     else {
                         continue;
                     };
-                    if let Some(rel) =
-                        make_artifact_import_relation(&file.file_path, imp, &target, artifact_ids)
-                    {
+                    if let Some(rel) = make_artifact_import_relation(
+                        &file.file_path,
+                        imp,
+                        &target,
+                        kind,
+                        artifact_ids,
+                    ) {
                         out.push(rel);
                     }
                     out.extend(make_entity_import_relations(
                         &file.file_path,
                         imp,
                         &target,
+                        kind,
                         &|path| module_entities.get(path).copied(),
                         &|path, name| ctx.entity_by_file_name.get(&(path, name)).copied(),
                     ));
@@ -1668,11 +1673,13 @@ fn merge_resolved_serial(
     let module_entities = module_entity_by_file(&file_refs);
     for file in files {
         for imp in &file.imports {
-            let Some(target) = resolve_import_target(&file.file_path, imp, &ctx.known_files) else {
+            let Some((target, kind)) =
+                resolve_import_target(&file.file_path, imp, &ctx.known_files)
+            else {
                 continue;
             };
             if let Some(rel) =
-                make_artifact_import_relation(&file.file_path, imp, &target, artifact_ids)
+                make_artifact_import_relation(&file.file_path, imp, &target, kind, artifact_ids)
             {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
@@ -1683,6 +1690,7 @@ fn merge_resolved_serial(
                 &file.file_path,
                 imp,
                 &target,
+                kind,
                 &|path| module_entities.get(path).copied(),
                 &|path, name| ctx.entity_by_file_name.get(&(path, name)).copied(),
             ) {
@@ -4367,29 +4375,38 @@ where
 /// the importer. A module does not import itself, and a self-loop would be
 /// counted as a resolved import by every surface that reads these edges, so
 /// that rule is applied here, once, for both builders.
+///
+/// It returns the relation kind alongside the path so the two edge builders
+/// cannot disagree about it. A C or C++ `#include` is an `Includes` edge, not
+/// an `Imports` one, and having each builder decide that for itself is how one
+/// site would come to carry two different kinds.
 fn resolve_import_target<S>(
     importer_file: &str,
     import: &FileImport,
     known_files: &HashSet<S>,
-) -> Option<String>
+) -> Option<(String, RelationKind)>
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
     let resolved = resolve_module_path(importer_file, &import.module_path, known_files)?;
-    (resolved != importer_file).then_some(resolved)
+    if resolved == importer_file {
+        return None;
+    }
+    let kind = if is_header_like_module_path(&import.module_path) {
+        RelationKind::Includes
+    } else {
+        RelationKind::Imports
+    };
+    Some((resolved, kind))
 }
 
 fn make_artifact_import_relation(
     importer_file: &str,
     import: &FileImport,
     resolved_path: &str,
+    kind: RelationKind,
     artifact_ids: &ArtifactIdentityMap,
 ) -> Option<Relation> {
-    let kind = if is_header_like_module_path(&import.module_path) {
-        RelationKind::Includes
-    } else {
-        RelationKind::Imports
-    };
     let src = GraphNodeId::Artifact(*artifact_ids.get(importer_file)?);
     let dst = GraphNodeId::Artifact(*artifact_ids.get(resolved_path)?);
     let evidence = RelationEvidence {
@@ -4475,6 +4492,7 @@ fn make_entity_import_relations(
     importer_file: &str,
     import: &FileImport,
     resolved_path: &str,
+    kind: RelationKind,
     module_of: &dyn Fn(&str) -> Option<EntityId>,
     entity_of: &dyn Fn(&str, &str) -> Option<EntityId>,
 ) -> Vec<Relation> {
@@ -4510,8 +4528,8 @@ fn make_entity_import_relations(
         let src = GraphNodeId::Entity(src_id);
         let dst = GraphNodeId::Entity(dst_id);
         out.push(Relation {
-            id: stable_relation_node_id(&src, &dst, &RelationKind::Imports),
-            kind: RelationKind::Imports,
+            id: stable_relation_node_id(&src, &dst, &kind),
+            kind,
             src,
             dst,
             // The specifier resolved to a file this repository holds and the
@@ -6771,21 +6789,31 @@ fn merge_incremental_resolved(
     };
     for file in files {
         for imp in &file.imports {
-            let Some(target) = resolve_import_target(&file.file_path, imp, &linker.known_files)
+            let Some((target, kind)) =
+                resolve_import_target(&file.file_path, imp, &linker.known_files)
             else {
                 continue;
             };
-            if let Some(rel) =
-                make_artifact_import_relation(&file.file_path, imp, &target, &linker.artifact_ids)
-            {
+            if let Some(rel) = make_artifact_import_relation(
+                &file.file_path,
+                imp,
+                &target,
+                kind,
+                &linker.artifact_ids,
+            ) {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
                     resolved.push(rel);
                 }
             }
-            for rel in
-                make_entity_import_relations(&file.file_path, imp, &target, &module_of, &entity_of)
-            {
+            for rel in make_entity_import_relations(
+                &file.file_path,
+                imp,
+                &target,
+                kind,
+                &module_of,
+                &entity_of,
+            ) {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
                     resolved.push(rel);
@@ -9378,6 +9406,64 @@ void f();
     }
 
     #[test]
+    /// The relation kind for an import site is decided once, by
+    /// `resolve_import_target`, and handed to both edge builders.
+    ///
+    /// This is a unit test rather than an end-to-end one on purpose. The C and
+    /// C++ adapters emit no module entity, so an entity-level edge cannot
+    /// currently be built for a header include at all, and an integration test
+    /// asserting "no Imports kind on a header fixture" passes whether the kind
+    /// is shared or hardcoded. It was written that way first and a mutant
+    /// survived it. This asserts the decision itself, which is the thing that
+    /// would otherwise drift the day those adapters do emit module entities.
+    #[test]
+    fn import_target_resolution_decides_includes_for_headers_and_imports_otherwise() {
+        let known: HashSet<&str> = ["src/helper.h", "app/routing.py", "src/main.c"]
+            .into_iter()
+            .collect();
+
+        let header = FileImport {
+            module_path: "helper.h".to_string(),
+            specifiers: vec![],
+        };
+        let (path, kind) = resolve_import_target("src/main.c", &header, &known)
+            .expect("a repo-local header resolves");
+        assert_eq!(path, "src/helper.h");
+        assert_eq!(
+            kind,
+            RelationKind::Includes,
+            "a header specifier must resolve to an Includes kind"
+        );
+
+        let module = FileImport {
+            module_path: "app.routing".to_string(),
+            specifiers: vec![],
+        };
+        let (path, kind) = resolve_import_target("app/main.py", &module, &known)
+            .expect("a repo-local python module resolves");
+        assert_eq!(path, "app/routing.py");
+        assert_eq!(
+            kind,
+            RelationKind::Imports,
+            "a non-header specifier must resolve to an Imports kind"
+        );
+    }
+
+    /// A specifier resolving back to its own file yields nothing, so the rule is
+    /// applied once for both builders rather than twice with a chance to differ.
+    #[test]
+    fn import_target_resolution_refuses_a_self_import() {
+        let known: HashSet<&str> = ["lib/index.js"].into_iter().collect();
+        let selfref = FileImport {
+            module_path: ".".to_string(),
+            specifiers: vec![],
+        };
+        assert!(
+            resolve_import_target("lib/index.js", &selfref, &known).is_none(),
+            "a module resolving to itself must produce no import target"
+        );
+    }
+
     fn resolve_module_path_with_extension() {
         let known: HashSet<&str> = ["src/utils/tools.ts"].into_iter().collect();
         let result = resolve_module_path("src/routes/api.ts", "../utils/tools", &known);
