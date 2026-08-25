@@ -658,7 +658,13 @@ metadata and the pre-eject repository-local `.git` entry are retained in a
 private sibling archive as `kin/` and `previous-git/`. Credential-free remote
 URLs, refspecs, branch tracking, and push defaults sealed during Git import are
 restored; credentials and ambient Git configuration are never copied. The
-command prints the exact archive path. Kin intentionally leaves irreversible
+command prints the exact archive path. A finished eject leaves no journal in
+the archived `kin/`, so copying that directory back to `.kin` re-attaches the
+store and the next `kin commit` records what changed in the working tree
+since. An archive an older Kin wrote still carries its eject journal; a copy
+made from it is accepted the same way once the archive proves the eject
+finished, and a journal Kin cannot verify is refused with the file and the
+remedy named. Kin intentionally leaves irreversible
 archive deletion to the operator after an independent backup; the eject
 transaction never follows an ambient path to recursively delete detached
 authority. The capability-anchored transaction is currently supported on Unix

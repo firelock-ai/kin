@@ -39,6 +39,17 @@ pub enum KinError {
     #[error("repository projection conflict: {0}")]
     ProjectionConflict(String),
 
+    /// The working projection will not open until a person acts on the file
+    /// the message names.
+    ///
+    /// Neither a conflict nor an internal failure: the store is intact and the
+    /// sentence carries the remedy. A daemon answers it as a refusal in words
+    /// rather than as HTTP 500, because sending a reader to the daemon for a
+    /// file they can see is how a stale eject journal cost a stranger the whole
+    /// write path on 0.5.52 (FIR-2664).
+    #[error("{0}")]
+    ProjectionBlocked(String),
+
     #[error("repository authority commit outcome is indeterminate: {0}")]
     RepositoryCommitIndeterminate(String),
 

@@ -194,9 +194,16 @@ fn build_commit_client(deadline: Option<std::time::Duration>) -> reqwest::Result
 /// A refusal the daemon states in words is worth exactly those words. Wrapping
 /// it in `daemon native commit failed (HTTP 409): {"error":...}` buries the
 /// sentence a person needs inside a serialized envelope they have to read past.
+///
+/// Two refusals are worded: a successor that would record nothing, and a
+/// working projection blocked on a file a person has to act on, such as the
+/// eject journal a copied `.kin` carries in. The second reached a stranger as
+/// `HTTP 500 Internal Server Error: Core error: ...` on 0.5.52, and the only
+/// exit that read found was deleting the store (FIR-2664).
 fn commit_refusal_message(body: &str) -> Option<String> {
     let parsed: serde_json::Value = serde_json::from_str(body).ok()?;
-    if parsed.get("error")? != "nothing_to_commit" {
+    let kind = parsed.get("error")?.as_str()?;
+    if !matches!(kind, "nothing_to_commit" | "projection_blocked") {
         return None;
     }
     Some(parsed.get("message")?.as_str()?.to_string())
@@ -741,6 +748,19 @@ mod tests {
     }
 
     /// A refusal the daemon states in words reaches the caller as those words.
+    #[test]
+    fn a_blocked_projection_refusal_is_reported_as_its_own_sentence() {
+        let body = serde_json::json!({
+            "error": "projection_blocked",
+            "message": "exact eject journal /r/.kin/reconciliation/exact-eject-journal.json is \
+                        bound elsewhere; remove the file and rerun",
+        })
+        .to_string();
+        let refusal = commit_refusal_message(&body).expect("a worded refusal");
+        assert!(refusal.starts_with("exact eject journal /r/"), "{refusal}");
+        assert!(!refusal.contains("HTTP"), "{refusal}");
+    }
+
     #[test]
     fn a_nothing_to_commit_refusal_is_reported_as_its_own_sentence() {
         let body = serde_json::json!({

@@ -238,6 +238,27 @@ dies of something that is not the network, the check reports UNREADABLE and says
 which reason it got, because a classifier that was never asked the question has
 not answered it.
 
+`eject_journal_repro.py` covers the eject archive round trip the rc0552n green
+stranger lost on 0.5.52 (FIR-2664). A finished `kin eject` left its journal in
+the archived `kin/` at the detach phase, `cp -r` of that archive back to `.kin`
+carried the journal along under fresh inodes, and every `kin commit` after that
+answered `HTTP 500 ... invalid identity-bound descriptor` until the store was
+deleted. Check `archive` asserts a finished eject leaves no journal beside the
+archived authority key. Check `copyback` copies the archived `kin/` back with
+`cp -R` and requires the next commit to land. Check `carried` plants a journal
+in the exact shape 0.5.52 wrote, keyed to the fixture's own authority key and
+bound to the archived `kin/`, lets the copy carry it back, and requires the
+commit to land and the carried copy to be retired while the archive's own is
+untouched. Check `refusal` plants a journal bound to nothing the store can
+verify and requires the refusal to name the file and the remedy in words, with
+no `HTTP 500`, `Internal Server Error` or `Core error` in it, then removes the
+file as the message says and requires the same store to commit. Check `hook`
+covers the second half of the same run: `kin eject` builds its replacement Git
+with gitoxide, whose template writes `.git/hooks/docs.url`, a URL Git never
+runs, and `kin init` refused the ejected repository over it; the check requires
+`kin init` to re-admit past it and, as its control, still to refuse an
+executable `pre-commit` by name. Eject is Unix-only, and so is the suite.
+
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no
 corpus. Each case is paired with its inverse, so a grader that cannot tell its
@@ -271,6 +292,10 @@ python3 scripts/acceptance/registry_home_isolation.py \
 python3 scripts/acceptance/first_contact_honesty.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/first_contact.json --verbose
+
+python3 scripts/acceptance/eject_journal_repro.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/eject_journal.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer
