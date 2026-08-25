@@ -239,6 +239,89 @@ fn javascript_non_index_file_still_sources_no_entity_import_edge() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// The artifact edge is unchanged. Asserted, not assumed.
+// ---------------------------------------------------------------------------
+
+/// The artifact-to-artifact import edge must survive the entity-level one
+/// exactly as it was: same endpoints, same confidence, same parser rule.
+///
+/// Every consumer reading artifact import edges today, including the coverage
+/// line and the include graph, reads them unchanged. This is an assertion
+/// rather than an assumption because "I only added something" is precisely the
+/// claim that is cheap to make and expensive to be wrong about.
+#[test]
+fn the_artifact_import_edge_is_unchanged_by_the_entity_edge() {
+    let files = vec![
+        py("app/routing.py", "class APIRouter:\n    pass\n"),
+        py("app/main.py", "from .routing import APIRouter\n"),
+    ];
+    let artifact_ids: HashMap<String, ArtifactId> = files
+        .iter()
+        .map(|f| (f.file_path.clone(), ArtifactId::new()))
+        .collect();
+    let relations = link_cross_file(&files, &artifact_ids).expect("fixture links");
+
+    let src = GraphNodeId::Artifact(artifact_ids["app/main.py"]);
+    let dst = GraphNodeId::Artifact(artifact_ids["app/routing.py"]);
+    let artifact_edges: Vec<_> = relations
+        .iter()
+        .filter(|r| r.kind == RelationKind::Imports && r.src == src && r.dst == dst)
+        .collect();
+
+    assert_eq!(
+        artifact_edges.len(),
+        1,
+        "expected exactly one artifact import edge from main.py to routing.py, got {}",
+        artifact_edges.len()
+    );
+    let edge = artifact_edges[0];
+    assert_eq!(edge.confidence, 1.0, "artifact edge confidence changed");
+    assert_eq!(
+        edge.evidence.first().and_then(|e| e.parser_rule.as_deref()),
+        Some("import_declaration"),
+        "artifact edge parser rule changed"
+    );
+    assert_eq!(
+        edge.evidence.first().and_then(|e| e.resolved_path.as_deref()),
+        Some("app/routing.py"),
+        "artifact edge resolved path changed"
+    );
+
+    // And the entity edge sits beside it rather than replacing it.
+    assert!(
+        !entity_import_pairs(&files).is_empty(),
+        "the entity edge should exist alongside the artifact edge, not instead of it"
+    );
+}
+
+/// The two edges must carry different relation ids, or the caller's dedup would
+/// drop one of them and which one it dropped would depend on iteration order.
+#[test]
+fn the_artifact_and_entity_import_edges_have_distinct_ids() {
+    let files = vec![
+        py("app/routing.py", "class APIRouter:\n    pass\n"),
+        py("app/main.py", "from .routing import APIRouter\n"),
+    ];
+    let relations = link(&files);
+    let import_ids: Vec<_> = relations
+        .iter()
+        .filter(|r| r.kind == RelationKind::Imports)
+        .map(|r| r.id)
+        .collect();
+    let unique: std::collections::HashSet<_> = import_ids.iter().collect();
+    assert_eq!(
+        import_ids.len(),
+        unique.len(),
+        "two import edges collided on one relation id: {import_ids:?}"
+    );
+    assert!(
+        import_ids.len() >= 2,
+        "expected both an artifact and an entity import edge, got {}",
+        import_ids.len()
+    );
+}
+
 /// An `index.js` in an ordinary directory DOES carry a module entity, so its
 /// whole-module require has both endpoints available. This is the shape behind
 /// the census's 29-of-141 reading on express, where every one of the 29 is an
