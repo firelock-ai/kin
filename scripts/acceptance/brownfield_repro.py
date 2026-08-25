@@ -907,6 +907,16 @@ def verdict_surfaces(payload):
             gaps.append("scan=%r" % scan)
         if coverage.get("budget_exhausted") is True:
             gaps.append("budget_exhausted=True")
+        # FIR-2463. The one verdict stamps the inputs that stop this block
+        # licensing a certification on its own, in the same vocabulary
+        # completeness.limits already uses. Reading it as a gap is what keeps the
+        # grading rule symmetric: a block that names a limit is qualifying
+        # itself, whichever block it is. Every class can be present and the
+        # answer still not be whole, and only one of those two facts used to
+        # reach a reader holding this block alone.
+        cov_limits = coverage.get("limits")
+        if isinstance(cov_limits, list) and cov_limits:
+            gaps.append("limits: %s" % ", ".join(str(x) for x in cov_limits))
         if gaps:
             out["edge_coverage"] = ("refuse", "; ".join(gaps))
         elif classes or enrichment:

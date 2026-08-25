@@ -1885,7 +1885,7 @@ impl Envelope {
 ///
 /// `is_error` and any non-text content blocks are preserved unchanged.
 pub fn annotate(result: ToolCallResult, envelope: &Envelope) -> ToolCallResult {
-    annotate_inner(result, envelope, None, "", &ResponseBudget::default())
+    annotate_inner(result, envelope, None, "", &ResponseBudget::default(), &[])
 }
 
 /// Like [`annotate`], but also attaches a confidence-qualified `negative` object
@@ -1898,12 +1898,22 @@ fn annotate_inner(
     negative: Option<&Value>,
     tool_name: &str,
     budget: &ResponseBudget,
+    edge_coverage_limits: &[String],
 ) -> ToolCallResult {
     let envelope_value = envelope.to_value();
     let content = result
         .content
         .into_iter()
-        .map(|block| annotate_block(block, &envelope_value, negative, tool_name, budget))
+        .map(|block| {
+            annotate_block(
+                block,
+                &envelope_value,
+                negative,
+                tool_name,
+                budget,
+                edge_coverage_limits,
+            )
+        })
         .collect();
     ToolCallResult {
         content,
@@ -1993,15 +2003,58 @@ pub fn finalize_bounded(
     // answer the same question differently. Projection only ever downgrades: the
     // completeness signal is itself an input, so a certified verdict is one it
     // already agreed with.
+    let mut edge_coverage_limits: Vec<String> = Vec::new();
     if let Some(payload) = &payload {
         if let Some(verdict) =
             crate::verdict::Verdict::compute(tool_name, payload, &envelope, negative.as_ref())
         {
             verdict.project_onto_completeness(&mut envelope.completeness);
+            edge_coverage_limits = verdict.edge_coverage_limits();
             envelope.verdict = Some(verdict.to_value());
         }
     }
-    annotate_inner(result, &envelope, negative.as_ref(), tool_name, budget)
+    annotate_inner(
+        result,
+        &envelope,
+        negative.as_ref(),
+        tool_name,
+        budget,
+        &edge_coverage_limits,
+    )
+}
+
+/// Write the verdict's qualifiers onto the `edge_coverage` block.
+///
+/// The block reports what a coverage scan observed. It cannot report whether
+/// the answer around it is trustworthy, and a reader holding only the block
+/// cannot tell those two apart: "every requested class is present" and "this
+/// answer's completeness is unknown" are both true at once, and the block
+/// renders only the first. That is how one response came to carry two verdicts,
+/// with `edge_coverage` reading as a certification beside a completeness that
+/// refused.
+///
+/// `limits` is the same vocabulary `completeness.limits` already uses in the
+/// other direction, so a reader grades both blocks by one rule instead of a
+/// special case. An empty list is omitted: a block that licenses on its own
+/// says nothing, rather than saying so with an empty array.
+///
+/// The list is computed by the one verdict and only copied here. Nothing in
+/// this function reads another block's state, because two places deriving one
+/// answer is how they come to disagree.
+fn stamp_edge_coverage_limits(map: &mut serde_json::Map<String, Value>, limits: &[String]) {
+    if limits.is_empty() {
+        return;
+    }
+    let Some(coverage) = map
+        .get_mut(crate::edge_coverage::EDGE_COVERAGE_KEY)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    coverage.insert(
+        "limits".to_string(),
+        Value::Array(limits.iter().map(|l| Value::String(l.clone())).collect()),
+    );
 }
 
 fn annotate_block(
@@ -2010,10 +2063,12 @@ fn annotate_block(
     negative: Option<&Value>,
     tool_name: &str,
     budget: &ResponseBudget,
+    edge_coverage_limits: &[String],
 ) -> ContentBlock {
     let ContentBlock::Text { text } = block;
     let annotated = match serde_json::from_str::<Value>(&text) {
         Ok(Value::Object(mut map)) => {
+            stamp_edge_coverage_limits(&mut map, edge_coverage_limits);
             map.entry(ENVELOPE_KEY.to_string())
                 .or_insert_with(|| envelope_value.clone());
             if let Some(negative) = negative {

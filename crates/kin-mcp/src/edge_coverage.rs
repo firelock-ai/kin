@@ -31,9 +31,18 @@
 //!   "cross_file_classes": ["calls", "imports"],
 //!   "reference_enrichment": "unknown",
 //!   "budget_exhausted": false,
-//!   "entities_examined": 3
+//!   "entities_examined": 3,
+//!   "limits": ["completeness:inconclusive"]
 //! }
 //! ```
+//!
+//! `limits` names the inputs that stop this block licensing a certification on
+//! its own, in the same vocabulary `_kin.completeness.limits` uses, and is
+//! absent when it licenses on its own. A block can report every requested class
+//! as present while the answer around it is not whole, and reading the classes
+//! without the limits is how one response comes to carry two verdicts. The list
+//! is stamped by the one verdict computation, which is the only place holding
+//! every input, so this block and the verdict cannot drift.
 //!
 //! `classes` is the load-bearing field: `present` means a cross-file edge of
 //! that class was observed for the focal's language, `absent` means the scan

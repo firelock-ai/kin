@@ -234,6 +234,44 @@ impl Verdict {
     /// reader acts on, so they follow the one verdict; `status`, `classes`,
     /// `decided_by` and `limits` are the observation the verdict was computed
     /// from and stay exactly as measured.
+    /// The qualifiers that stop the `edge_coverage` block licensing a
+    /// certification on its own, named by the input that limits it.
+    ///
+    /// The block reports what a scan observed. It does not, and must not, report
+    /// whether the answer around it can be trusted as whole, and a reader with
+    /// only the block in hand cannot tell those apart: "every requested class is
+    /// present" and "this answer's completeness is unknown" are both true at
+    /// once, and the block renders only the first. A suite reading it alone
+    /// therefore graded it as certifying beside a completeness that refused, and
+    /// that is one response with two verdicts.
+    ///
+    /// This never re-derives another block's state. It reads the states this
+    /// verdict already computed, which is why it lives here: `compute` is the
+    /// one place holding every input, so the block's self-presentation and the
+    /// verdict cannot drift. An empty list means the block licenses on its own.
+    ///
+    /// The class states themselves are left alone. A class that is present IS
+    /// present, and reporting it otherwise to settle a disagreement would make a
+    /// true fact read false, which is the failure this envelope exists to stop.
+    pub fn edge_coverage_limits(&self) -> Vec<String> {
+        let mut limits = Vec::new();
+        if self.inputs.get("edge_coverage").and_then(Value::as_str) != Some(CERTIFIED) {
+            // The block already qualifies itself; nothing to add.
+            return limits;
+        }
+        for input in [
+            "completeness",
+            "absence_gate",
+            "withheld_candidates",
+            "degradations",
+        ] {
+            if self.inputs.get(input).and_then(Value::as_str) == Some(INCONCLUSIVE) {
+                limits.push(format!("{input}:inconclusive"));
+            }
+        }
+        limits
+    }
+
     pub fn project_onto_completeness(
         &self,
         completeness: &mut Option<crate::envelope::Completeness>,
@@ -709,6 +747,40 @@ pub fn disagreements(response: &Value) -> Vec<String> {
                      _kin.verdict"
                         .to_string(),
                 );
+            }
+        }
+    }
+
+    // The five arms above all read one direction: a surface claiming
+    // certification under an inconclusive verdict. Nothing read the other way,
+    // which is why a shipped envelope could carry a CERTIFIED verdict over a
+    // completeness that refused and still grade clean. A contradiction does not
+    // care which side is the optimistic one.
+    if certified {
+        if let Some(completeness) = response
+            .get(crate::envelope::ENVELOPE_KEY)
+            .and_then(|envelope| envelope.get("completeness"))
+        {
+            let bound = completeness.get("bound").and_then(Value::as_str);
+            if matches!(bound, Some("at_least")) {
+                found.push(
+                    "_kin.completeness.bound reads at_least under a certified _kin.verdict"
+                        .to_string(),
+                );
+            }
+            if completeness.get("status").and_then(Value::as_str) == Some("unknown") {
+                found.push(
+                    "_kin.completeness.status reads unknown under a certified _kin.verdict"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(negative) = response.get(crate::negative::NEGATIVE_KEY) {
+            if matches!(
+                negative.get("trust").and_then(Value::as_str),
+                Some("inconclusive") | Some("unreliable")
+            ) {
+                found.push("negative.trust refuses under a certified _kin.verdict".to_string());
             }
         }
     }
