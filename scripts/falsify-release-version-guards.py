@@ -199,6 +199,21 @@ PROBES: tuple[tuple[str, str, str, Callable[[Path], None]], ...] = (
         ),
     ),
     (
+        "the version gate's entry point goes back to unresolved paths",
+        VERSION_SUITE,
+        "the gate runs from a copy reached through a symlinked directory",
+        lambda tree: poison(
+            tree,
+            VERSION,
+            "  try {\n"
+            "    return realpathSync(entry) === realpathSync(self);\n"
+            "  } catch {\n"
+            "    return true;\n"
+            "  }",
+            "  return false;",
+        ),
+    ),
+    (
         "the version gate starts demanding a bump for documentation",
         VERSION_SUITE,
         "a documentation-only release pull request needs no bump",

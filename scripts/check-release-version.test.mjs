@@ -194,3 +194,38 @@ test('a bump that skips a version is refused end to end', () => {
   assert.equal(run.code, 1);
   assert.match(run.stdout, /requires 1\.2\.4/);
 });
+
+test('the gate runs from a copy reached through a symlinked directory', () => {
+  // release-train.yml runs this file from a copy in $RUNNER_TEMP/release-policy.
+  // The entry-point test used to compare `import.meta.url` against
+  // `pathToFileURL(process.argv[1])`, and Node resolves symlinks for the first
+  // and not the second, so a copy invoked through one made the gate print
+  // nothing and exit 0. Measured against the real release pull request that
+  // took 0.5.52 to 0.5.53: 0 bytes through `/tmp`, the full report through
+  // `/private/tmp`, same commit and same arguments.
+  const { root, base } = releaseBase();
+  write(root, 'crates/kin-cli/src/main.rs', 'fn main() { println!("fix"); }\n');
+  git(root, ['add', '-A']);
+  git(root, ['commit', '--quiet', '-m', 'fix whose bump was dropped']);
+
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-version-policy-'));
+  const link = `${real}-link`;
+  fs.symlinkSync(real, link, 'dir');
+  const policy = path.join(link, 'check-release-version.mjs');
+  fs.copyFileSync(GATE, policy);
+
+  let code = 0;
+  let stdout = '';
+  try {
+    stdout = execFileSync(process.execPath, [policy], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, BASE_SHA: base, PR_LABELS: 'release:automated' },
+    });
+  } catch (error) {
+    code = error.status;
+    stdout = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+  }
+  assert.notEqual(stdout, '', 'the gate produced no output, so it judged nothing');
+  assert.equal(code, 1, 'the gate did not refuse a release-affecting diff with no bump');
+});

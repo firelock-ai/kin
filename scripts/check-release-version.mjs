@@ -3,8 +3,9 @@
 // Copyright 2026 Firelock, LLC
 
 import fs from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { execFile } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
@@ -191,7 +192,33 @@ async function main() {
   if (result.failures.length > 0) process.exitCode = 1;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Run only when this file IS the entry point, comparing REAL paths.
+//
+// The usual idiom compares `import.meta.url` against
+// `pathToFileURL(process.argv[1])`. Node resolves symlinks for the first and
+// not the second, so invoking this file through a symlinked directory makes
+// the two disagree and the gate prints nothing and exits 0. Measured: the same
+// invocation against the same commit produced 0 bytes through `/tmp` and the
+// full report through `/private/tmp`. release-train.yml runs it from a copy in
+// `$RUNNER_TEMP/release-policy`, which is not a symlink today and is the only
+// reason the naive form has held.
+//
+// Unresolvable paths fall to running, not skipping. A gate that silently
+// declines to judge is worse than one that fails; a test that runs `main()` by
+// mistake fails loudly on the spot.
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const self = fileURLToPath(import.meta.url);
+  if (entry === self) return true;
+  try {
+    return realpathSync(entry) === realpathSync(self);
+  } catch {
+    return true;
+  }
+}
+
+if (isDirectRun()) {
   main().catch((error) => {
     console.error(error.message);
     process.exitCode = 1;
