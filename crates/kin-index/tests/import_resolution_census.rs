@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use kin_index::{link_cross_file, FileParseData};
-use kin_model::{ArtifactId, Entity, FilePathId, GraphNodeId, RelationKind};
+use kin_model::{ArtifactId, Entity, EntityKind, FilePathId, GraphNodeId, RelationKind};
 use kin_parser::{JavaScriptAdapter, LanguageAdapter, PythonAdapter, TypeScriptAdapter};
 
 fn adapter_for(path: &Path) -> Option<Box<dyn LanguageAdapter>> {
@@ -148,7 +148,7 @@ fn files_with_module_entity(corpus: &Corpus) -> usize {
         .filter(|f| {
             f.entities
                 .iter()
-                .any(|e| format!("{:?}", e.kind).eq_ignore_ascii_case("module"))
+                .any(|e| e.kind == EntityKind::Module)
         })
         .count()
 }
@@ -185,6 +185,15 @@ struct Yield {
     unmatched_reexported: usize,
     /// Unmatched specifiers no file in the repository defines at all.
     unmatched_unknown: usize,
+    /// Matched specifiers whose IMPORTING file also carries a module entity, so
+    /// an entity-to-entity edge has both endpoints available. `find_references`
+    /// skips any relation whose src is not an entity, so a file with no module
+    /// entity cannot source one however well its specifier resolved.
+    buildable_member_edges: usize,
+    /// Whole-module binds where BOTH files carry a module entity.
+    buildable_module_edges: usize,
+    /// Specifiers that matched but whose importer has no module entity.
+    blocked_no_importer_module: usize,
     sample_whole_module: Vec<String>,
     sample_submodule: Vec<String>,
     sample_reexported: Vec<String>,
@@ -238,6 +247,16 @@ fn nameable_specifier_yield(corpus: &Corpus) -> Yield {
         })
         .collect();
     let resolved = resolution_by_site(corpus);
+    let has_module: HashSet<&str> = corpus
+        .files
+        .iter()
+        .filter(|f| {
+            f.entities
+                .iter()
+                .any(|e| e.kind == EntityKind::Module)
+        })
+        .map(|f| f.file_path.as_str())
+        .collect();
 
     let mut out = Yield::default();
     for file in &corpus.files {
@@ -257,6 +276,11 @@ fn nameable_specifier_yield(corpus: &Corpus) -> Yield {
                     .unwrap_or(spec.local_name.as_str());
                 if names.is_some_and(|n| n.contains(wanted)) {
                     out.matched += 1;
+                    if has_module.contains(file.file_path.as_str()) {
+                        out.buildable_member_edges += 1;
+                    } else {
+                        out.blocked_no_importer_module += 1;
+                    }
                     continue;
                 }
                 out.unmatched += 1;
@@ -274,6 +298,11 @@ fn nameable_specifier_yield(corpus: &Corpus) -> Yield {
                 // that never named a symbol, so this arm comes first.
                 if spec.is_default {
                     out.unmatched_whole_module += 1;
+                    if has_module.contains(file.file_path.as_str())
+                        && has_module.contains(target.as_str())
+                    {
+                        out.buildable_module_edges += 1;
+                    }
                     if out.sample_whole_module.len() < 8 {
                         out.sample_whole_module.push(site);
                     }
@@ -356,6 +385,12 @@ fn census_reports_import_resolution_over_a_corpus() {
     println!("CENSUS_UNMATCHED_IS_SUBMODULE {}", y.unmatched_is_submodule);
     println!("CENSUS_UNMATCHED_REEXPORTED {}", y.unmatched_reexported);
     println!("CENSUS_UNMATCHED_UNKNOWN {}", y.unmatched_unknown);
+    println!("CENSUS_BUILDABLE_MEMBER_EDGES {}", y.buildable_member_edges);
+    println!("CENSUS_BUILDABLE_MODULE_EDGES {}", y.buildable_module_edges);
+    println!(
+        "CENSUS_BLOCKED_NO_IMPORTER_MODULE {}",
+        y.blocked_no_importer_module
+    );
     for s in &y.sample_whole_module {
         println!("SAMPLE_WHOLE_MODULE\t{s}");
     }
