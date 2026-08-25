@@ -1559,18 +1559,21 @@ fn merge_resolved(
             .map(|file| {
                 let mut out: Vec<Relation> = Vec::new();
                 for imp in &file.imports {
-                    if let Some(rel) = make_artifact_import_relation(
-                        &file.file_path,
-                        imp,
-                        &ctx.known_files,
-                        artifact_ids,
-                    ) {
+                    // Resolved once, used by both builders.
+                    let Some(target) =
+                        resolve_import_target(&file.file_path, imp, &ctx.known_files)
+                    else {
+                        continue;
+                    };
+                    if let Some(rel) =
+                        make_artifact_import_relation(&file.file_path, imp, &target, artifact_ids)
+                    {
                         out.push(rel);
                     }
                     out.extend(make_entity_import_relations(
                         &file.file_path,
                         imp,
-                        &ctx.known_files,
+                        &target,
                         &|path| module_entities.get(path).copied(),
                         &|path, name| ctx.entity_by_file_name.get(&(path, name)).copied(),
                     ));
@@ -1665,8 +1668,11 @@ fn merge_resolved_serial(
     let module_entities = module_entity_by_file(&file_refs);
     for file in files {
         for imp in &file.imports {
+            let Some(target) = resolve_import_target(&file.file_path, imp, &ctx.known_files) else {
+                continue;
+            };
             if let Some(rel) =
-                make_artifact_import_relation(&file.file_path, imp, &ctx.known_files, artifact_ids)
+                make_artifact_import_relation(&file.file_path, imp, &target, artifact_ids)
             {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
@@ -1676,7 +1682,7 @@ fn merge_resolved_serial(
             for rel in make_entity_import_relations(
                 &file.file_path,
                 imp,
-                &ctx.known_files,
+                &target,
                 &|path| module_entities.get(path).copied(),
                 &|path, name| ctx.entity_by_file_name.get(&(path, name)).copied(),
             ) {
@@ -4350,32 +4356,45 @@ where
     })
 }
 
-fn make_artifact_import_relation<S>(
+/// Resolve an import specifier to the repository file it names.
+///
+/// Both edge builders below need this one answer, and `resolve_module_path`
+/// scans the whole `known_files` set and probes extensions and index files, so
+/// it is the most expensive step in the import path. Resolving once per import
+/// site rather than once per builder is why this exists as its own function.
+///
+/// `require('.')` from a file that IS its directory's index resolves back to
+/// the importer. A module does not import itself, and a self-loop would be
+/// counted as a resolved import by every surface that reads these edges, so
+/// that rule is applied here, once, for both builders.
+fn resolve_import_target<S>(
     importer_file: &str,
     import: &FileImport,
     known_files: &HashSet<S>,
-    artifact_ids: &ArtifactIdentityMap,
-) -> Option<Relation>
+) -> Option<String>
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
-    let resolved_path = resolve_module_path(importer_file, &import.module_path, known_files)?;
-    // `require('.')` from a file that IS its directory's index resolves back to
-    // the importer. A module does not import itself, and a self-loop would be
-    // counted as a resolved import by every surface that reads these edges.
-    if resolved_path == importer_file {
-        return None;
-    }
+    let resolved = resolve_module_path(importer_file, &import.module_path, known_files)?;
+    (resolved != importer_file).then_some(resolved)
+}
+
+fn make_artifact_import_relation(
+    importer_file: &str,
+    import: &FileImport,
+    resolved_path: &str,
+    artifact_ids: &ArtifactIdentityMap,
+) -> Option<Relation> {
     let kind = if is_header_like_module_path(&import.module_path) {
         RelationKind::Includes
     } else {
         RelationKind::Imports
     };
     let src = GraphNodeId::Artifact(*artifact_ids.get(importer_file)?);
-    let dst = GraphNodeId::Artifact(*artifact_ids.get(&resolved_path)?);
+    let dst = GraphNodeId::Artifact(*artifact_ids.get(resolved_path)?);
     let evidence = RelationEvidence {
         source_path: Some(import.module_path.clone()),
-        resolved_path: Some(resolved_path.clone()),
+        resolved_path: Some(resolved_path.to_string()),
         parser_rule: Some(
             match kind {
                 RelationKind::Includes => "include_directive",
@@ -4452,26 +4471,13 @@ fn module_entity_by_file<'a>(files: &[&'a FileParseData]) -> HashMap<&'a str, En
 /// lookup instead of the container is what lets both paths run this one
 /// function, so an incrementally relinked file cannot quietly disagree with a
 /// fully relinked one.
-fn make_entity_import_relations<S>(
+fn make_entity_import_relations(
     importer_file: &str,
     import: &FileImport,
-    known_files: &HashSet<S>,
+    resolved_path: &str,
     module_of: &dyn Fn(&str) -> Option<EntityId>,
     entity_of: &dyn Fn(&str, &str) -> Option<EntityId>,
-) -> Vec<Relation>
-where
-    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
-{
-    let Some(resolved_path) = resolve_module_path(importer_file, &import.module_path, known_files)
-    else {
-        return Vec::new();
-    };
-    // A module does not import itself. `require('.')` from a directory's own
-    // index resolves back to the importer, and a self-loop would be counted as
-    // a resolved import by every surface that reads these edges.
-    if resolved_path == importer_file {
-        return Vec::new();
-    }
+) -> Vec<Relation> {
     let Some(src_id) = module_of(importer_file) else {
         return Vec::new();
     };
@@ -4484,7 +4490,7 @@ where
         // symbols would report a miss for an import that made no such claim.
         // The entity it reaches is the target's own module entity.
         let dst_id = if spec.is_default {
-            module_of(&resolved_path)
+            module_of(resolved_path)
         } else {
             // Bind the ORIGINAL name wherever the import renamed it, because
             // that is the name the target defines. Binding the local alias
@@ -4493,7 +4499,7 @@ where
                 .original_name
                 .as_deref()
                 .unwrap_or(spec.local_name.as_str());
-            entity_of(&resolved_path, wanted)
+            entity_of(resolved_path, wanted)
         };
         let Some(dst_id) = dst_id else {
             continue;
@@ -4518,7 +4524,7 @@ where
             evidence: vec![RelationEvidence {
                 token: Some(spec.local_name.clone()),
                 source_path: Some(import.module_path.clone()),
-                resolved_path: Some(resolved_path.clone()),
+                resolved_path: Some(resolved_path.to_string()),
                 parser_rule: Some(IMPORT_SPECIFIER_BINDING_RULE.to_string()),
                 occurrence_count: 1,
                 ..RelationEvidence::default()
@@ -6765,24 +6771,21 @@ fn merge_incremental_resolved(
     };
     for file in files {
         for imp in &file.imports {
-            if let Some(rel) = make_artifact_import_relation(
-                &file.file_path,
-                imp,
-                &linker.known_files,
-                &linker.artifact_ids,
-            ) {
+            let Some(target) = resolve_import_target(&file.file_path, imp, &linker.known_files)
+            else {
+                continue;
+            };
+            if let Some(rel) =
+                make_artifact_import_relation(&file.file_path, imp, &target, &linker.artifact_ids)
+            {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
                     resolved.push(rel);
                 }
             }
-            for rel in make_entity_import_relations(
-                &file.file_path,
-                imp,
-                &linker.known_files,
-                &module_of,
-                &entity_of,
-            ) {
+            for rel in
+                make_entity_import_relations(&file.file_path, imp, &target, &module_of, &entity_of)
+            {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
                     resolved.push(rel);
