@@ -38,8 +38,14 @@
 //! `classes` is the load-bearing field: `present` means a cross-file edge of
 //! that class was observed for the focal's language, `absent` means the scan
 //! completed and found none, `unknown` means the scan stopped on its budget
-//! before it could say. A consumer that cannot find this object must treat
-//! coverage as unknown rather than assuming either verdict.
+//! before it could say, and `unproduced` means the scan completed, observed no
+//! entity-rooted edge of that class at all, and the language's own parse side
+//! shows sites of the class the linker resolved into no entity-level edge, so
+//! the gap is in the build rather than in the code. Every state but `present`
+//! makes the response's one verdict inconclusive (FIR-2672): a class the answer
+//! could not have read is a class its counts cannot be whole over, whatever the
+//! reason. A consumer that cannot find this object must treat coverage as
+//! unknown rather than assuming either verdict.
 //!
 //! `reference_enrichment` carries the one fact the scan cannot observe from the
 //! graph: whether this BUILD can produce reference edges for the language at
@@ -103,6 +109,18 @@ enum ClassState {
     Absent,
     /// The scan stopped on its budget before it could observe one.
     Unknown,
+    /// The scan completed, observed no entity-rooted edge of this class at all,
+    /// and the language's parse side shows sites of the class that the linker
+    /// resolved into no entity-level edge.
+    ///
+    /// Not `Absent`, because `Absent` reads as a completed observation about the
+    /// code, and this is a completed observation about the build: the sites are
+    /// in the source, the linker saw them (an import it resolved at the artifact
+    /// level, a call site it counted), and no entity-level edge came out. The
+    /// rc0552s stranger's account of FIR-2672 rests on Kin having called that
+    /// `absent` for import sites no build had ever emitted an edge for. Not
+    /// `Unknown` either, because nothing was left unread; the scan finished.
+    Unproduced,
 }
 
 impl ClassState {
@@ -111,6 +129,7 @@ impl ClassState {
             ClassState::Present => "present",
             ClassState::Absent => "absent",
             ClassState::Unknown => "unknown",
+            ClassState::Unproduced => "unproduced",
         }
     }
 }
@@ -260,19 +279,21 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
     // `absent`, and certified on a class nothing had measured. A gate that only
     // fires when a scan happened to run is not a gate.
     let scan_needed = !deciding_classes_all_present(&merged, references_producible);
+    let mut unproduced_evidence = Map::new();
     if scan_needed {
+        let mut scans: Vec<LanguageScan> = Vec::new();
         for (index, language) in observed_languages.iter().enumerate() {
-            let (states, examined, budget_exhausted) =
-                observe_language(store, *language, &requested);
-            examined_total += examined;
-            any_budget_exhausted |= budget_exhausted;
-            for (slot, (_, state)) in merged.iter_mut().zip(states.iter()) {
+            let scan = observe_language(store, *language, &requested);
+            examined_total += scan.examined;
+            any_budget_exhausted |= scan.budget_exhausted;
+            for (slot, (_, state)) in merged.iter_mut().zip(scan.states.iter()) {
                 slot.1 = if index == 0 {
                     *state
                 } else {
                     weakest(slot.1, *state)
                 };
             }
+            scans.push(scan);
         }
         // A witness raises `unknown` to `present` and stops there. A scan that
         // ran to completion and observed a class absent is a stronger statement
@@ -282,6 +303,20 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
         for (kind, state) in merged.iter_mut() {
             if *state == ClassState::Unknown && witnessed.contains(kind) {
                 *state = ClassState::Present;
+            }
+        }
+        // A class every scan completed empty on, with no entity-rooted edge of
+        // it seen anywhere, is `unproduced` rather than `absent` when the parse
+        // side shows the linker had sites of that class to resolve. The two must
+        // not share a word: `absent` is a statement about the code and this is
+        // a statement about the build (FIR-2672).
+        for (kind, state) in merged.iter_mut() {
+            if *state != ClassState::Absent {
+                continue;
+            }
+            if let Some(evidence) = unproduced_evidence_for(*kind, &scans) {
+                *state = ClassState::Unproduced;
+                unproduced_evidence.insert(class_name(*kind).to_string(), evidence);
             }
         }
     }
@@ -333,7 +368,80 @@ pub fn observe_cross_file_reference_coverage_for_languages_witnessed<S: EntitySt
         } else {
             "skipped_answer_witnessed"
         },
+        // Why a class reads `unproduced`: the parse-side and artifact-level
+        // counts that separate a build gap from an unused feature of the code.
+        // Absent when no class was raised, so a reader never sees evidence for a
+        // verdict that was not reached.
+        "unproduced_evidence": if unproduced_evidence.is_empty() {
+            Value::Null
+        } else {
+            Value::Object(unproduced_evidence)
+        },
     })
+}
+
+/// The evidence that raises one class every language's scan completed empty on
+/// from `absent` to `unproduced`, or `None` when the code simply carries no such
+/// sites.
+///
+/// `imports`: no entity-rooted `Imports` relation was seen in any scan, and the
+/// linker demonstrably had import statements to resolve, either because it
+/// resolved some at the artifact level (the only level the linker emitted at
+/// before the entity-level emitter existed) or because the parse side counted
+/// statements naming modules inside this repository. A language whose specifier
+/// syntax cannot settle externality counts only the first, so a repository that
+/// imports nothing but its standard library is not called a build gap.
+///
+/// `calls`: no entity-rooted `Calls` relation was seen in any scan, and every
+/// file of the language recorded a call-site count whose sum is above zero. A
+/// partial measurement is not evidence, for the reason
+/// [`kin_core::reference_coverage::CallSiteMeasurement`] spells out.
+///
+/// `references` is never raised here: whether this build can produce that class
+/// is a fact about the language server, and `reference_enrichment` already
+/// carries it.
+fn unproduced_evidence_for(kind: RelationKind, scans: &[LanguageScan]) -> Option<Value> {
+    if scans.is_empty()
+        || scans
+            .iter()
+            .any(|scan| scan.budget_exhausted || scan.seen_any(kind))
+    {
+        return None;
+    }
+    match kind {
+        RelationKind::Imports => {
+            let artifact_edges: u64 = scans.iter().map(|scan| scan.artifact_import_edges).sum();
+            let parsed: u64 = scans
+                .iter()
+                .filter_map(|scan| scan.parsed_import_statements)
+                .sum();
+            let internal: u64 = scans
+                .iter()
+                .filter_map(|scan| scan.parsed_internal_import_statements())
+                .sum();
+            if artifact_edges == 0 && internal == 0 {
+                return None;
+            }
+            Some(json!({
+                "parsed_import_statements": parsed,
+                "parsed_internal_import_statements": internal,
+                "artifact_level_import_edges": artifact_edges,
+                "entity_level_import_edges": 0,
+            }))
+        }
+        RelationKind::Calls => {
+            let complete = scans.iter().all(|scan| scan.call_sites_complete);
+            let parsed: u64 = scans.iter().filter_map(|scan| scan.parsed_call_sites).sum();
+            if !complete || parsed == 0 {
+                return None;
+            }
+            Some(json!({
+                "parsed_call_sites": parsed,
+                "entity_level_call_edges": 0,
+            }))
+        }
+        _ => None,
+    }
 }
 
 /// Observe the language scope an absence claim covers, for a tool that
@@ -435,10 +543,13 @@ pub fn languages_of(entities: &[Entity]) -> Vec<LanguageId> {
 
 /// Whether every class the absence verdict rests on is already `present`.
 ///
-/// Narrowed by [`crate::negative::load_bearing_classes`] rather than by a rule
-/// of its own: Kin mints no entity-level `Imports` edge, so a rule that waited
-/// for every requested class would never skip a scan and would report every
-/// answer on every healthy graph as short of coverage.
+/// Every requested class, through [`crate::negative::deciding_classes`]. This
+/// used to be narrowed to `calls` on the grounds that Kin minted no entity-level
+/// `Imports` edge and a rule waiting for every class would never skip a scan.
+/// That narrowing is what let the verdict certify over `imports: absent`
+/// (FIR-2672); a scan that runs whenever a requested class is unwitnessed is
+/// the price of a verdict that means what it says, and it is bounded by
+/// [`WITNESS_BUDGET`].
 /// [`deciding_classes_all_present`], asked of a PUBLISHED observation.
 ///
 /// The private form above reads the scan's own working state and decides
@@ -520,9 +631,12 @@ fn deciding_classes_all_present(
 /// and a language-scoped list does not carry targets in other languages, which
 /// would report a cross-language edge as external.
 ///
-/// Attached only when a deciding class is short, so a healthy answer pays
+/// Attached only when `calls` or `references` is short, so a healthy answer pays
 /// nothing for a ratio it does not need, and a shortfall gets the number that
-/// says how big it is.
+/// says how big it is. An `imports` shortfall alone does not trigger the whole
+/// language walk this costs: the scan already published the import counts that
+/// decided it under `unproduced_evidence`, and until the entity-level import
+/// emitter lands that shortfall is every populated answer on every language.
 fn attach_reference_resolution<S: EntityStore>(
     store: &S,
     language: LanguageId,
@@ -532,12 +646,10 @@ fn attach_reference_resolution<S: EntityStore>(
         .get("classes")
         .and_then(Value::as_object)
         .map(|classes| {
-            let requested: Vec<String> = classes.keys().cloned().collect();
-            let deciding = crate::negative::load_bearing_classes(&requested);
-            !deciding.is_empty()
-                && deciding.iter().all(|class| {
-                    classes.get(class).and_then(Value::as_str) == Some(ClassState::Present.as_str())
-                })
+            classes
+                .iter()
+                .filter(|(class, _)| class.as_str() != "imports")
+                .all(|(_, state)| state.as_str() == Some(ClassState::Present.as_str()))
         })
         .unwrap_or(false);
     if already_covered {
@@ -808,23 +920,69 @@ fn requested_classes(kinds: &[RelationKind]) -> Vec<RelationKind> {
 }
 
 /// The less-authoritative of two observations. `present` only survives when both
-/// agree, and `absent` outranks `unknown` because a completed scan that found
-/// nothing is a stronger statement than one that never finished.
+/// agree; `unproduced` outranks `absent`, which outranks `unknown`, because each
+/// is a stronger statement than the next: a completed scan with parse-side
+/// evidence of sites, then a completed scan that found nothing, then a scan that
+/// never finished.
 fn weakest(left: ClassState, right: ClassState) -> ClassState {
     match (left, right) {
+        (ClassState::Unproduced, _) | (_, ClassState::Unproduced) => ClassState::Unproduced,
         (ClassState::Absent, _) | (_, ClassState::Absent) => ClassState::Absent,
         (ClassState::Unknown, _) | (_, ClassState::Unknown) => ClassState::Unknown,
         _ => ClassState::Present,
     }
 }
 
+/// What one language's witness search established, beyond the class states:
+/// the evidence [`unproduced_evidence_for`] reads to tell a build gap from an
+/// unused feature of the code.
+struct LanguageScan {
+    states: Vec<(RelationKind, ClassState)>,
+    examined: usize,
+    budget_exhausted: bool,
+    /// Classes an entity-rooted relation was seen for at all, cross-file or not.
+    /// A class seen intra-file only is producible and merely unused across
+    /// files, which is `absent` and not a build gap.
+    seen_any: Vec<RelationKind>,
+    /// Import statements the parser counted across the language's files, or
+    /// `None` when no file carries the count.
+    parsed_import_statements: Option<u64>,
+    /// Of those, how many name a module outside the repository, when the
+    /// language's specifier syntax settles it.
+    external_module_imports: Option<u64>,
+    /// Call sites the parser counted, or `None` when no file carries the count.
+    parsed_call_sites: Option<u64>,
+    /// Whether every file with entities carried a call-site count, so the sum
+    /// above is a measurement rather than a partial one.
+    call_sites_complete: bool,
+    /// `Imports` and `Includes` edges rooted at the language's files' artifacts,
+    /// counted only when the scan saw no entity-rooted import edge, because that
+    /// is the one case the count decides anything.
+    artifact_import_edges: u64,
+}
+
+impl LanguageScan {
+    fn seen_any(&self, kind: RelationKind) -> bool {
+        self.seen_any.contains(&kind)
+    }
+
+    /// Parsed import statements that name a module this repository could hold,
+    /// or `None` when the language cannot settle which ones those are.
+    fn parsed_internal_import_statements(&self) -> Option<u64> {
+        let parsed = self.parsed_import_statements?;
+        let external = self.external_module_imports?;
+        Some(parsed.saturating_sub(external))
+    }
+}
+
 /// Witness-search one language, returning each requested class's state, how many
-/// entities were examined, and whether the search stopped on its budget.
+/// entities were examined, whether the search stopped on its budget, and the
+/// parse-side and artifact-level facts a completed empty scan is read against.
 fn observe_language<S: EntityStore>(
     store: &S,
     language: kin_model::ids::LanguageId,
     requested: &[RelationKind],
-) -> (Vec<(RelationKind, ClassState)>, usize, bool) {
+) -> LanguageScan {
     let mut states: Vec<(RelationKind, ClassState)> = requested
         .iter()
         .copied()
@@ -833,6 +991,13 @@ fn observe_language<S: EntityStore>(
 
     let mut examined = 0usize;
     let mut budget_exhausted = false;
+    let mut seen_any: Vec<RelationKind> = Vec::new();
+    let mut parsed_import_statements: Option<u64> = None;
+    let mut external_module_imports: Option<u64> = None;
+    let mut parsed_call_sites: Option<u64> = None;
+    let mut files_with_entities = 0usize;
+    let mut files_with_call_counts = 0usize;
+    let mut artifact_import_edges = 0u64;
 
     if !states.is_empty() {
         match store.query_entities(&EntityFilter {
@@ -844,6 +1009,37 @@ fn observe_language<S: EntityStore>(
                     .iter()
                     .map(|entity| (entity.id, entity.file_origin.clone()))
                     .collect();
+                // The parse side, one entity per file: the extractor stamps the
+                // same per-file counts on every entity of the file.
+                let mut counted_files: std::collections::HashSet<&FilePathId> =
+                    std::collections::HashSet::new();
+                for entity in &candidates {
+                    let Some(file) = entity.file_origin.as_ref() else {
+                        continue;
+                    };
+                    if !counted_files.insert(file) {
+                        continue;
+                    }
+                    files_with_entities += 1;
+                    if let Some(count) =
+                        parsed_count(entity, kin_parser::FILE_PARSED_CALL_SITES_KEY)
+                    {
+                        parsed_call_sites = Some(parsed_call_sites.unwrap_or(0) + count);
+                        files_with_call_counts += 1;
+                    }
+                    if let Some(count) =
+                        parsed_count(entity, kin_parser::FILE_PARSED_IMPORT_STATEMENTS_KEY)
+                    {
+                        parsed_import_statements =
+                            Some(parsed_import_statements.unwrap_or(0) + count);
+                    }
+                    if let Some(count) =
+                        parsed_count(entity, kin_parser::FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY)
+                    {
+                        external_module_imports =
+                            Some(external_module_imports.unwrap_or(0) + count);
+                    }
+                }
                 for entity in &candidates {
                     if states
                         .iter()
@@ -876,6 +1072,9 @@ fn observe_language<S: EntityStore>(
                         let Some(destination) = relation.dst.as_entity() else {
                             continue;
                         };
+                        if !seen_any.contains(&relation.kind) {
+                            seen_any.push(relation.kind);
+                        }
                         let source_file = endpoint_file(store, &files, &source);
                         let destination_file = endpoint_file(store, &files, &destination);
                         if let (Some(source_file), Some(destination_file)) =
@@ -894,6 +1093,21 @@ fn observe_language<S: EntityStore>(
                         }
                     }
                 }
+                // Artifact-level import edges, counted only when the scan
+                // finished without seeing an entity-rooted import, which is the
+                // one case the count decides anything: the linker resolved
+                // these files' imports and emitted no entity-level edge for
+                // them.
+                let imports_requested = states
+                    .iter()
+                    .any(|(kind, _)| *kind == RelationKind::Imports);
+                if imports_requested
+                    && !budget_exhausted
+                    && !seen_any.contains(&RelationKind::Imports)
+                {
+                    artifact_import_edges =
+                        artifact_import_edge_count(store, counted_files.into_iter());
+                }
             }
             // The store could not enumerate the language at all, so every class
             // stays unknown rather than being reported absent from a scan that
@@ -902,7 +1116,56 @@ fn observe_language<S: EntityStore>(
         }
     }
 
-    (states, examined, budget_exhausted)
+    LanguageScan {
+        states,
+        examined,
+        budget_exhausted,
+        seen_any,
+        parsed_import_statements,
+        external_module_imports,
+        parsed_call_sites,
+        call_sites_complete: files_with_entities > 0
+            && files_with_call_counts == files_with_entities,
+        artifact_import_edges,
+    }
+}
+
+/// A per-file count the extractor stamped on the entity, when it did.
+fn parsed_count(entity: &Entity, key: &str) -> Option<u64> {
+    entity.metadata.extra.get(key).and_then(Value::as_u64)
+}
+
+/// `Imports` and `Includes` edges rooted at the artifacts of `files`, the level
+/// the linker emitted import edges at before it emitted entity-level ones.
+///
+/// One bounded traversal per file. A file the store cannot map to an artifact
+/// contributes nothing, which errs towards `absent` rather than `unproduced`.
+fn artifact_import_edge_count<'a, S: EntityStore>(
+    store: &S,
+    files: impl Iterator<Item = &'a FilePathId>,
+) -> u64 {
+    const ARTIFACT_IMPORT_KINDS: [RelationKind; 2] =
+        [RelationKind::Imports, RelationKind::Includes];
+    let mut counted: std::collections::HashSet<kin_model::RelationId> =
+        std::collections::HashSet::new();
+    for file in files {
+        let Ok(path) = kin_model::RepoPath::from_bytes(file.0.as_bytes().to_vec()) else {
+            continue;
+        };
+        let Some(artifact) = store.artifact_id_at_path(&path) else {
+            continue;
+        };
+        let node = kin_model::GraphNodeId::Artifact(artifact);
+        let Ok(neighborhood) = store.traverse(&node, &ARTIFACT_IMPORT_KINDS, 1) else {
+            continue;
+        };
+        for relation in neighborhood.relations {
+            if relation.src == node && ARTIFACT_IMPORT_KINDS.contains(&relation.kind) {
+                counted.insert(relation.id);
+            }
+        }
+    }
+    counted.len() as u64
 }
 
 /// The file an endpoint belongs to, preferring the language-scoped entities
@@ -1028,6 +1291,187 @@ mod tests {
         assert_eq!(coverage["classes"]["calls"], json!("present"));
         assert_eq!(coverage["classes"]["imports"], json!("absent"));
         assert_eq!(coverage["cross_file_classes"], json!(["calls"]));
+    }
+
+    /// Stamp the per-file counts the extractor writes, on every entity of a file.
+    fn with_parse_counts(
+        mut entity: Entity,
+        imports: u64,
+        external: Option<u64>,
+        calls: Option<u64>,
+    ) -> Entity {
+        entity.metadata.extra.insert(
+            kin_parser::FILE_PARSED_IMPORT_STATEMENTS_KEY.to_string(),
+            json!(imports),
+        );
+        if let Some(external) = external {
+            entity.metadata.extra.insert(
+                kin_parser::FILE_PARSED_EXTERNAL_MODULE_IMPORTS_KEY.to_string(),
+                json!(external),
+            );
+        }
+        if let Some(calls) = calls {
+            entity.metadata.extra.insert(
+                kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+                json!(calls),
+            );
+        }
+        entity
+    }
+
+    /// FIR-2672. A class the linker had sites for and produced no entity-level
+    /// edge of is `unproduced`, not `absent`: the parse side counted import
+    /// statements naming modules inside the repository, no entity-rooted import
+    /// edge exists anywhere in the language, and the scan finished. `absent`
+    /// would say the code has no such site, which is what 0.5.52 said about
+    /// import sites no build had ever emitted an edge for.
+    #[test]
+    fn an_import_class_the_linker_produced_nothing_for_reads_unproduced() {
+        let store = InMemoryGraph::new();
+        let caller = with_parse_counts(
+            entity("index_note", "pkg/search.py", LanguageId::Python),
+            2,
+            Some(1),
+            None,
+        );
+        let target = with_parse_counts(
+            entity("blank_code", "pkg/parsing.py", LanguageId::Python),
+            1,
+            Some(1),
+            None,
+        );
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let coverage = observe_cross_file_reference_coverage(
+            &store,
+            &target,
+            &[RelationKind::Calls, RelationKind::Imports],
+        );
+        assert_eq!(coverage["classes"]["calls"], json!("present"), "{coverage}");
+        assert_eq!(
+            coverage["classes"]["imports"],
+            json!("unproduced"),
+            "{coverage}"
+        );
+        let evidence = &coverage["unproduced_evidence"]["imports"];
+        assert_eq!(evidence["parsed_import_statements"], json!(3), "{coverage}");
+        assert_eq!(
+            evidence["parsed_internal_import_statements"],
+            json!(1),
+            "{coverage}"
+        );
+        assert_eq!(
+            evidence["entity_level_import_edges"],
+            json!(0),
+            "{coverage}"
+        );
+        assert_eq!(coverage["cross_file_classes"], json!(["calls"]));
+    }
+
+    /// The same graph with nothing to resolve stays `absent`. No file carries an
+    /// import count, so the code has no import site the build could have
+    /// missed, and calling that a build gap would make every leaf module read
+    /// as one.
+    #[test]
+    fn an_import_class_with_no_sites_to_resolve_stays_absent() {
+        let store = InMemoryGraph::new();
+        let caller = entity("index_note", "pkg/search.py", LanguageId::Python);
+        let target = entity("blank_code", "pkg/parsing.py", LanguageId::Python);
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let coverage = observe_cross_file_reference_coverage(
+            &store,
+            &target,
+            &[RelationKind::Calls, RelationKind::Imports],
+        );
+        assert_eq!(
+            coverage["classes"]["imports"],
+            json!("absent"),
+            "{coverage}"
+        );
+        assert_eq!(coverage["unproduced_evidence"], Value::Null, "{coverage}");
+    }
+
+    /// A class seen intra-file is one the build produces, so a graph that merely
+    /// uses no cross-file import stays `absent`, whatever the parse side counted.
+    #[test]
+    fn a_class_seen_intra_file_is_producible_and_stays_absent() {
+        let store = InMemoryGraph::new();
+        let caller = with_parse_counts(
+            entity("index_note", "pkg/search.py", LanguageId::Python),
+            2,
+            Some(0),
+            None,
+        );
+        let sibling = with_parse_counts(
+            entity("helper", "pkg/search.py", LanguageId::Python),
+            2,
+            Some(0),
+            None,
+        );
+        let target = entity("blank_code", "pkg/parsing.py", LanguageId::Python);
+        store.upsert_entity(&caller).unwrap();
+        store.upsert_entity(&sibling).unwrap();
+        store.upsert_entity(&target).unwrap();
+        store
+            .upsert_relation(&relation(caller.id, sibling.id, RelationKind::Imports))
+            .unwrap();
+        store
+            .upsert_relation(&relation(caller.id, target.id, RelationKind::Calls))
+            .unwrap();
+
+        let coverage = observe_cross_file_reference_coverage(
+            &store,
+            &target,
+            &[RelationKind::Calls, RelationKind::Imports],
+        );
+        assert_eq!(
+            coverage["classes"]["imports"],
+            json!("absent"),
+            "{coverage}"
+        );
+        assert_eq!(coverage["unproduced_evidence"], Value::Null, "{coverage}");
+    }
+
+    /// The call class reads the same way off a complete call-site measurement:
+    /// every file counted its sites, the sum is above zero, and no entity-rooted
+    /// call edge exists at all. A partial measurement is not evidence and stays
+    /// `absent`.
+    #[test]
+    fn a_call_class_with_counted_sites_and_no_edge_reads_unproduced_only_off_a_complete_count() {
+        for (complete, expected) in [(true, "unproduced"), (false, "absent")] {
+            let store = InMemoryGraph::new();
+            let first = with_parse_counts(
+                entity("index_note", "pkg/search.py", LanguageId::Python),
+                0,
+                None,
+                Some(3),
+            );
+            let second = with_parse_counts(
+                entity("blank_code", "pkg/parsing.py", LanguageId::Python),
+                0,
+                None,
+                if complete { Some(1) } else { None },
+            );
+            store.upsert_entity(&first).unwrap();
+            store.upsert_entity(&second).unwrap();
+
+            let coverage =
+                observe_cross_file_reference_coverage(&store, &second, &[RelationKind::Calls]);
+            assert_eq!(
+                coverage["classes"]["calls"],
+                json!(expected),
+                "complete={complete}: {coverage}"
+            );
+        }
     }
 
     /// Coverage is language-scoped: a store that links one language's calls
@@ -1237,10 +1681,11 @@ mod tests {
             );
         });
 
-        // The control that keeps this narrow, and the one that proves the host
-        // fact is what moved the decision rather than the change simply forcing
-        // a scan on everything: with no server installed the class was never
-        // producible, it is not load-bearing, and the witnessed skip stands.
+        // With no server installed the reference class was never producible
+        // and `reference_enrichment` refuses by name. The scan still runs,
+        // because since FIR-2672 every requested class decides and `imports`
+        // was not witnessed by the answer; it is bounded by `WITNESS_BUDGET`,
+        // and what it finds is published rather than guessed.
         test_support::with_language_servers(&[], || {
             let coverage = observe_cross_file_reference_coverage_witnessed(
                 &store,
@@ -1252,9 +1697,12 @@ mod tests {
                 coverage["reference_enrichment"],
                 json!("no_language_server")
             );
+            assert_eq!(coverage["scan"], "ran", "{coverage}");
+            assert_eq!(coverage["classes"]["calls"], json!("present"), "{coverage}");
             assert_eq!(
-                coverage["scan"], "skipped_answer_witnessed",
-                "an unproducible class must not cost a language-wide walk: {coverage}"
+                coverage["classes"]["imports"],
+                json!("absent"),
+                "{coverage}"
             );
         });
     }
@@ -1327,9 +1775,18 @@ mod tests {
         let callee = entity("inner", "nk/b.py", LanguageId::Python);
         store.upsert_entity(&caller).unwrap();
         store.upsert_entity(&callee).unwrap();
-        store
-            .upsert_relation(&relation(caller.id, callee.id, RelationKind::Calls))
-            .unwrap();
+        // Every requested class, across files. Since FIR-2672 every requested
+        // class decides, so a graph that links only its calls cannot certify a
+        // hop absent; this fixture links all three.
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ] {
+            store
+                .upsert_relation(&relation(caller.id, callee.id, kind))
+                .unwrap();
+        }
 
         let linked = observe_cross_file_reference_coverage(
             &store,
@@ -1341,14 +1798,10 @@ mod tests {
             ],
         );
         assert_eq!(linked["classes"]["calls"], json!("present"));
-        assert_eq!(
-            linked["classes"]["imports"],
-            json!("absent"),
-            "the fixture holds no import edge, and the deciding rule must not need one"
-        );
+        assert_eq!(linked["classes"]["imports"], json!("present"));
         assert!(
             deciding_classes_observed_present(&linked),
-            "cross-file calls decide a trace absence: {linked}"
+            "every requested class present decides a trace absence: {linked}"
         );
 
         let unlinked = InMemoryGraph::new();

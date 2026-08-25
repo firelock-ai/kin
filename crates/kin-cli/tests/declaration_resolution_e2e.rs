@@ -17,6 +17,7 @@
 //! tests pin the honest answer instead, and pin that a genuinely unreferenced
 //! entity still gets the plain empty one.
 
+use kin_cli::commands::absence_qualifier::{without_qualifiers, QUALIFIER_MARK};
 use kin_cli::commands::impact::{build_impact_response, ImpactRequest};
 use kin_cli::commands::refs::{build_refs_response, RefsRequest};
 use kin_db::InMemoryGraph;
@@ -341,7 +342,10 @@ fn refs_on_a_declaration_names_the_other_identities_sharing_the_name() {
 /// parse into a graph holding cross-file `Calls` and nothing else, so
 /// `imports` and `references` read absent, and a verdict that certified this
 /// absence would be certifying on coverage the graph does not have. The
-/// qualifier is therefore CORRECT here and is asserted rather than tolerated:
+/// qualifier is therefore CORRECT here and is asserted rather than tolerated,
+/// and it is cut as a block by the marker every qualifying line carries rather
+/// than by matching one phrase, since the block can hold more than one line
+/// once more than one input refuses (FIR-2672):
 /// the guard this test carries is about `empty_result_context`, the members and
 /// same-name note, which must stay conditional. A coverage-complete store with a
 /// genuinely dead focal is the other half of the control and lives in
@@ -354,17 +358,14 @@ fn genuinely_unreferenced_entity_still_gets_the_plain_empty_answer() {
         joined.contains("No incoming"),
         "must report the empty result: {joined}"
     );
-    let content: Vec<&str> = joined
-        .lines()
-        .filter(|line| !line.contains("Kin cannot rule out"))
-        .collect();
+    let content = without_qualifiers(&joined);
     assert_eq!(
         content.len(),
         2,
         "an entity with nothing further to report gets exactly the header and the empty line: {joined}"
     );
     assert!(
-        joined.contains("Kin cannot rule out references it did not see"),
+        joined.contains(&format!("{QUALIFIER_MARK} references it did not see")),
         "this fixture holds no cross-file imports or references edges, so the absence may not \
          be certified and the answer has to say so: {joined}"
     );

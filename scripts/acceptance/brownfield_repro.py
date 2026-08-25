@@ -798,6 +798,44 @@ def find_row(rows, wanted):
     return None
 
 
+# The words a class state can carry, closed. `present` is the one state that
+# counts as coverage. The other three are the ways a class can be short:
+# `absent` (the scan completed and observed none), `unknown` (the scan could not
+# complete) and, since FIR-2672, `unproduced` (the build had sites for the class
+# and emitted no edge of it). A word outside the set is sorted into neither
+# bucket. The grader that read "everything but absent and unknown" as present
+# took `unproduced` for coverage and flagged the one honest refusal beside it as
+# the contradiction, which is the verdict's own trap one level up: a classifier
+# with an everything-else arm admits any new value into the wrong bucket without
+# a sound. The next word anyone adds lands in UnknownClassState instead.
+CLASS_PRESENT = frozenset(["present"])
+CLASS_SHORT = frozenset(["absent", "unknown", "unproduced"])
+
+
+class UnknownClassState(Exception):
+    """A class state outside the closed set. The payload cannot be graded."""
+
+
+def class_shortfall(classes, surface):
+    """The classes under `classes` that are short, sorted, or UnknownClassState.
+
+    A word the grader does not know is never sorted into either bucket; the
+    caller reports the payload UNREADABLE and names the word.
+    """
+    short = []
+    for name in sorted(classes):
+        state = classes[name]
+        if state in CLASS_PRESENT:
+            continue
+        if state in CLASS_SHORT:
+            short.append(name)
+            continue
+        raise UnknownClassState(
+            "%s carries a class state this grader does not know: %s=%r (known: %s)"
+            % (surface, name, state, ", ".join(sorted(CLASS_PRESENT | CLASS_SHORT))))
+    return short
+
+
 def verdict_surfaces(payload):
     """The verdict blocks one payload carries, normalized to certify or refuse.
 
@@ -809,7 +847,8 @@ def verdict_surfaces(payload):
 
     Under FIR-2463's fix shape the most pessimistic input wins, so a surface that
     admits it did not look, or that reports a class as unknown, counts as refusing
-    rather than as saying nothing.
+    rather than as saying nothing. Raises UnknownClassState on a class state
+    outside the closed set, so a caller grades that payload UNREADABLE.
     """
     out = {}
     negative = payload.get("negative")
@@ -842,8 +881,7 @@ def verdict_surfaces(payload):
             out["completeness"] = ("refuse", "status=%r bound=%r" % (status, bound))
         classes = completeness.get("classes")
         if isinstance(classes, dict):
-            absent = sorted(k for k, v in classes.items()
-                            if v in ("absent", "unknown"))
+            absent = class_shortfall(classes, "completeness.classes")
             if absent:
                 out["completeness.classes"] = (
                     "refuse", "classes not present: %s" % ", ".join(absent))
@@ -858,8 +896,7 @@ def verdict_surfaces(payload):
         classes = coverage.get("classes")
         gaps = []
         if isinstance(classes, dict):
-            missing = sorted(k for k, v in classes.items()
-                             if v in ("absent", "unknown"))
+            missing = class_shortfall(classes, "edge_coverage.classes")
             if missing:
                 gaps.append("classes not present: %s" % ", ".join(missing))
         enrichment = coverage.get("reference_enrichment")
@@ -1285,7 +1322,11 @@ def check_5(suite):
         except ProbeError as exc:
             res.unknown("%s unreadable: %s" % (label, exc))
             continue
-        surfaces = verdict_surfaces(payload)
+        try:
+            surfaces = verdict_surfaces(payload)
+        except UnknownClassState as exc:
+            res.unknown("%s unreadable: %s" % (label, exc))
+            continue
         if not surfaces:
             res.unknown("%s carries no readable verdict surface; keys are %s"
                         % (label, sorted(payload.keys())))
@@ -1344,8 +1385,12 @@ def check_6(suite):
         res.unknown("graph_neighborhood returned an error payload: %s"
                     % str(hood.get("message"))[:200])
         return res
-    ref_surfaces = verdict_surfaces(refs)
-    hood_surfaces = verdict_surfaces(hood)
+    try:
+        ref_surfaces = verdict_surfaces(refs)
+        hood_surfaces = verdict_surfaces(hood)
+    except UnknownClassState as exc:
+        res.unknown("verdict surfaces unreadable: %s" % exc)
+        return res
     if not ref_surfaces:
         res.unknown("find_references payload carries no readable verdict surface")
         return res
@@ -2000,6 +2045,54 @@ def self_test():
     }
     certifying, _refusing = surface_conflict(verdict_surfaces(agreed))
     expect("agreed payload reports no conflict", certifying, None)
+
+    # FIR-2672's shape on a build whose linker emits no entity-level import
+    # edge: the class reads `unproduced`, every surface refuses, and the grader
+    # must read that as agreement. The version that knew only `absent` and
+    # `unknown` read `unproduced` as present and reported the one honest
+    # payload as a three-way contradiction.
+    unproduced = {
+        "negative": {"safe_to_conclude_absent": False, "trust": "inconclusive"},
+        "_kin": {"completeness": {
+            "bound": "at_least", "status": "partial",
+            "classes": {"calls": "present", "imports": "unproduced",
+                        "references": "present"},
+            "limits": ["edge_coverage:imports_unproduced", "verdict_inconclusive"]}},
+        "edge_coverage": {"classes": {"calls": "present", "imports": "unproduced",
+                                      "references": "present"},
+                          "reference_enrichment": "available", "scan": "ran"},
+    }
+    certifying, _refusing = surface_conflict(verdict_surfaces(unproduced))
+    expect("an unproduced class is read as a refusal everywhere", certifying, None)
+    expect("edge_coverage refuses on an unproduced class",
+           verdict_surfaces(unproduced)["edge_coverage"][0], "refuse")
+    expect("completeness.classes names the unproduced class",
+           verdict_surfaces(unproduced)["completeness.classes"][1],
+           "classes not present: imports")
+
+    # A state outside the closed set is sorted into neither bucket. The next
+    # word anyone adds must land here, as UnknownClassState naming the word and
+    # the surface, never as coverage and never as a silent refusal.
+    for surface, foreign in (
+        ("completeness.classes", {
+            "_kin": {"completeness": {
+                "bound": "at_least", "status": "partial",
+                "classes": {"calls": "present", "imports": "projected"}}}}),
+        ("edge_coverage.classes", {
+            "edge_coverage": {"classes": {"calls": "present", "imports": "projected"},
+                              "reference_enrichment": "available", "scan": "ran"}}),
+    ):
+        try:
+            verdict_surfaces(foreign)
+            outcome = "graded"
+        except UnknownClassState as exc:
+            outcome = str(exc)
+        expect("a foreign class state on %s is not graded" % surface,
+               outcome.startswith("%s carries a class state this grader does not know: "
+                                  "imports='projected'" % surface), True)
+    expect("the closed set is the four words the product publishes",
+           sorted(CLASS_PRESENT | CLASS_SHORT),
+           ["absent", "present", "unknown", "unproduced"])
 
     # A payload carrying no verdict block at all yields no surfaces, so a check
     # reports UNREADABLE rather than inventing agreement out of silence.

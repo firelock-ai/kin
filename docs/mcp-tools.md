@@ -48,6 +48,23 @@ graph-relation readers) report `structural_authoritative` only with the graph
 initialized and loaded. Treat every other verdict as "ask again when the graph is
 ready" rather than as evidence of absence.
 
+Every retrieval answer, empty or not, also carries `_kin.verdict`, the one verdict
+for the response. It is computed from every block that qualifies the answer and the
+most pessimistic input wins: a requested edge class that `_kin.completeness.classes`
+records as anything but `present` makes the verdict `inconclusive`, with
+`limiting_factor` naming the class and its state. `absent` means the scan completed
+and found no such cross-file edge, `unknown` means the scan stopped on its budget,
+and `unproduced` means the scan completed, saw no entity-level edge of the class at
+all, and the source carries sites of it that the linker resolved, so the gap is in
+the build rather than in the code. A verdict that certifies over a recorded limit
+was the shipped 0.5.52 behaviour (FIR-2672) and is now a contract violation the
+tests scan for. `limiting_factor` is one sentence of `label: text` clauses, one per
+input that refused, in the order the verdict weighs them (the absence gate's own
+composition, then the coverage observation, withheld rows, the run's own
+degradations and the completeness signal), each label once. The first clause is
+what decided the state and the rest are the other things wrong with the same
+answer, so a class gap never hides a dead embedding worker.
+
 ---
 
 ## Configuring the server

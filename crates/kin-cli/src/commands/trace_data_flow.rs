@@ -2109,10 +2109,35 @@ mod tests {
         assert!(response.truncated, "truncated flag must be set when capped");
     }
 
+    /// Two entities in different files joined by every reference class the
+    /// verdict reads, off to the side of whatever chain a fixture walks.
+    ///
+    /// This is what makes a fixture "a graph that links this language across
+    /// files": since FIR-2672 every requested class decides, so a graph that
+    /// links only its calls reads a chain end as a coverage gap rather than a
+    /// leaf, and honestly so. The witness pair is reached by no walk, so it
+    /// changes no chain, only what the graph is known to be able to hold.
+    fn seed_cross_file_witness(graph: &InMemoryGraph, extension: &str) {
+        let caller = make_entity("witness_caller", &format!("src/witness_caller.{extension}"));
+        let callee = make_entity("witness_callee", &format!("src/witness_callee.{extension}"));
+        graph.upsert_entity(&caller).unwrap();
+        graph.upsert_entity(&callee).unwrap();
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ] {
+            graph
+                .upsert_relation(&make_relation(caller.id, callee.id, kind))
+                .unwrap();
+        }
+    }
+
     /// A hub whose fan-out is far wider than any per-step limit, so a walk over
     /// it examines many more relations than it can ever turn into steps.
     fn hub_graph(fan_out: usize) -> (InMemoryGraph, EntityId) {
         let graph = InMemoryGraph::new();
+        seed_cross_file_witness(&graph, "rs");
         let focal = make_entity("hub", "src/hub.rs");
         let focal_id = focal.id;
         graph.upsert_entity(&focal).unwrap();
@@ -3509,10 +3534,16 @@ mod tests {
     }
 
     /// Three entities in the given files, each calling the next, and the id of
-    /// the first. The files decide whether the graph holds cross-file call
-    /// edges, which is the fact a leaf terminal rests on.
+    /// the first. A chain that crosses files is a linked graph and carries the
+    /// witness pair that proves every class links across files, which is the
+    /// fact a leaf terminal rests on; a chain inside one file, or a lone
+    /// entity, is a graph that never linked anything.
     fn call_chain(nodes: &[(&str, &str)]) -> (InMemoryGraph, EntityId) {
         let graph = InMemoryGraph::new();
+        let distinct_files: BTreeSet<&str> = nodes.iter().map(|(_, file)| *file).collect();
+        if distinct_files.len() >= 2 {
+            seed_cross_file_witness(&graph, "py");
+        }
         let entities: Vec<Entity> = nodes
             .iter()
             .map(|(name, file)| make_entity(name, file))

@@ -12937,15 +12937,17 @@ mod tests {
         // than asserting on the JSON we just wrote.
         // Coverage healthy, so the degraded flag is the ONLY variable. Without
         // this the gate refuses both arms for `edge_coverage_unreported`, which
-        // is the gate working correctly and a test proving nothing.
+        // is the gate working correctly and a test proving nothing. Healthy
+        // means every requested class present: each one decides (FIR-2672), so
+        // an absent import class refused the control arm on its own.
         let payload = serde_json::json!({
             "entity_impacts": [],
             kin_mcp::EDGE_COVERAGE_KEY: {
                 "scope": "language",
                 "language": "Rust",
                 "requested_classes": ["calls", "imports", "references"],
-                "classes": { "calls": "present", "imports": "absent", "references": "present" },
-                "cross_file_classes": ["calls", "references"],
+                "classes": { "calls": "present", "imports": "present", "references": "present" },
+                "cross_file_classes": ["calls", "imports", "references"],
                 "reference_enrichment": "available",
                 "budget_exhausted": false,
                 "entities_examined": 3,
@@ -16924,6 +16926,93 @@ mod tests {
         );
     }
 
+    /// One parsed relation of `kind` from `src` to `dst`.
+    fn link(state: &Arc<DaemonState>, src: &Entity, dst: &Entity, kind: kin_model::RelationKind) {
+        state
+            .graph
+            .upsert_relation(&kin_model::Relation {
+                id: kin_model::RelationId::new(),
+                kind,
+                src: kin_model::GraphNodeId::Entity(src.id),
+                dst: kin_model::GraphNodeId::Entity(dst.id),
+                confidence: 1.0,
+                origin: kin_model::RelationOrigin::Parsed,
+                created_in: None,
+                import_source: None,
+                evidence: Vec::new(),
+            })
+            .unwrap();
+    }
+
+    /// Link `src` to `dst` by every cross-file class the verdict weighs, which
+    /// is what a fixture that calls its coverage healthy has to hold. Every
+    /// requested class decides (FIR-2672), so calls alone leave the import and
+    /// reference classes short, the refusal over-determined, and a test that
+    /// meant to isolate a degradation passing for the wrong cause.
+    fn link_every_class(state: &Arc<DaemonState>, src: &Entity, dst: &Entity) {
+        for kind in [
+            kin_model::RelationKind::Calls,
+            kin_model::RelationKind::Imports,
+            kin_model::RelationKind::References,
+        ] {
+            link(state, src, dst, kind);
+        }
+    }
+
+    /// FIR-2672, second finding: two independent reasons, both named. The graph
+    /// links only its calls, so the import and reference classes are short and
+    /// decide the state, and the embedding worker has died as well. The line
+    /// that named only the winner sent a reader to fix the edge gap and never
+    /// told them about the worker, a second thing wrong with the same answer.
+    /// Drop either sentence from the rendering and this goes red.
+    #[tokio::test]
+    async fn a_degraded_daemon_with_short_coverage_renders_both_reasons() {
+        let state = test_state();
+        let caller = test_entity("caller", "src/a.py");
+        let callee = test_entity("callee", "src/b.py");
+        let orphan = test_entity("orphan", "src/orphan.py");
+        for entity in [&caller, &callee, &orphan] {
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        link(&state, &caller, &callee, kin_model::RelationKind::Calls);
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/impact")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "entity": "orphan", "depth": 3 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::impact::ImpactResponse =
+            serde_json::from_slice(&body).unwrap();
+        let rendered = result.lines.join("\n");
+
+        let class_gap = rendered
+            .find("holds no cross-file import or reference edges")
+            .unwrap_or_else(|| panic!("the short classes decide and must be named: {rendered}"));
+        let worker = rendered.find("embed_worker_failed").unwrap_or_else(|| {
+            panic!("the failed worker must stay named beside the class gap: {rendered}")
+        });
+        assert!(
+            class_gap < worker,
+            "the structural gap leads and the run degradation follows: {rendered}"
+        );
+    }
+
     fn test_entity(name: &str, path: &str) -> Entity {
         Entity {
             id: EntityId::new(),
@@ -16959,29 +17048,20 @@ mod tests {
         }
     }
 
-    /// Two entities in different files joined by a `Calls` edge: the evidence
-    /// that this graph links references across files for the language, which is
-    /// what an absence claim over reference edges depends on. Without it an empty
-    /// reference answer is a fact about the graph rather than about the target.
+    /// Two entities in different files joined by every reference class: the
+    /// evidence that this graph links references across files for the language,
+    /// which is what an absence claim over reference edges depends on. Without it
+    /// an empty reference answer is a fact about the graph rather than about the
+    /// target. It used to link calls alone, which was the whole witness while
+    /// calls alone decided; every requested class decides now (FIR-2672), so a
+    /// calls-only witness leaves the import and reference classes short and the
+    /// absence refused for a reason the test never meant to exercise.
     fn seed_cross_file_call_witness(state: &Arc<DaemonState>) {
         let caller = test_entity("witness_caller", "src/witness_caller.py");
         let callee = test_entity("witness_callee", "src/witness_callee.py");
         state.graph.upsert_entity(&caller).unwrap();
         state.graph.upsert_entity(&callee).unwrap();
-        state
-            .graph
-            .upsert_relation(&kin_model::relation::Relation {
-                id: kin_model::ids::RelationId::new(),
-                kind: kin_model::relation::RelationKind::Calls,
-                src: kin_model::relation::GraphNodeId::Entity(caller.id),
-                dst: kin_model::relation::GraphNodeId::Entity(callee.id),
-                confidence: 1.0,
-                origin: kin_model::relation::RelationOrigin::Parsed,
-                created_in: None,
-                import_source: None,
-                evidence: Vec::new(),
-            })
-            .unwrap();
+        link_every_class(state, &caller, &callee);
     }
 
     fn install_repository_file(
@@ -26171,20 +26251,7 @@ mod tests {
             install_trace_fixture_file(&state, entity);
             state.graph.upsert_entity(entity).unwrap();
         }
-        state
-            .graph
-            .upsert_relation(&kin_model::Relation {
-                id: kin_model::RelationId::new(),
-                kind: kin_model::RelationKind::Calls,
-                src: kin_model::GraphNodeId::Entity(caller.id),
-                dst: kin_model::GraphNodeId::Entity(callee.id),
-                confidence: 1.0,
-                origin: kin_model::RelationOrigin::Parsed,
-                created_in: None,
-                import_source: None,
-                evidence: Vec::new(),
-            })
-            .unwrap();
+        link_every_class(&state, &caller, &callee);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -26234,20 +26301,7 @@ mod tests {
             install_trace_fixture_file(&state, entity);
             state.graph.upsert_entity(entity).unwrap();
         }
-        state
-            .graph
-            .upsert_relation(&kin_model::Relation {
-                id: kin_model::RelationId::new(),
-                kind: kin_model::RelationKind::Calls,
-                src: kin_model::GraphNodeId::Entity(caller.id),
-                dst: kin_model::GraphNodeId::Entity(callee.id),
-                confidence: 1.0,
-                origin: kin_model::RelationOrigin::Parsed,
-                created_in: None,
-                import_source: None,
-                evidence: Vec::new(),
-            })
-            .unwrap();
+        link_every_class(&state, &caller, &callee);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -26361,20 +26415,7 @@ mod tests {
         for entity in [&caller, &callee, &orphan] {
             state.graph.upsert_entity(entity).unwrap();
         }
-        state
-            .graph
-            .upsert_relation(&kin_model::Relation {
-                id: kin_model::RelationId::new(),
-                kind: kin_model::RelationKind::Calls,
-                src: kin_model::GraphNodeId::Entity(caller.id),
-                dst: kin_model::GraphNodeId::Entity(callee.id),
-                confidence: 1.0,
-                origin: kin_model::RelationOrigin::Parsed,
-                created_in: None,
-                import_source: None,
-                evidence: Vec::new(),
-            })
-            .unwrap();
+        link_every_class(&state, &caller, &callee);
         state
             .is_initialized
             .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -31874,6 +31915,18 @@ mod tests {
         const BUDGET: usize = 6_000;
         let state = test_state();
         let ids = install_trace_chain(&state, 6);
+        // The chain links only its calls. Every requested class decides
+        // (FIR-2672), so a graph holding no import or reference edge carries the
+        // class-gap disclosure in the verdict, both notes and the absence object,
+        // and spends the budget under test on it: measured, the ladder then cut
+        // an edge where it used to cut only bodies. The witness pair, off to the
+        // side of the chain, keeps this a test of the ladder rather than of the
+        // disclosure.
+        let witness_a = test_entity("witness_a", "src/witness_a.py");
+        let witness_b = test_entity("witness_b", "src/witness_b.py");
+        state.graph.upsert_entity(&witness_a).unwrap();
+        state.graph.upsert_entity(&witness_b).unwrap();
+        link_every_class(&state, &witness_a, &witness_b);
         let app = router(Arc::clone(&state));
 
         let unbounded = call_mcp_tool_text(

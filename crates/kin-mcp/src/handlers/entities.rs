@@ -7099,10 +7099,17 @@ mod tests {
             .upsert_relation(&make_relation(caller.id, target.id, RelationKind::Calls))
             .unwrap();
 
-        let args = HashMap::from([(
-            "entity_id".to_string(),
-            serde_json::json!(target.id.to_string()),
-        )]);
+        // Asked over the one class the row proves, so the answer witnesses every
+        // requested class and the scan is skipped. Asked over the default three,
+        // `imports` and `references` are unwitnessed and the scan runs, which
+        // since FIR-2672 is the honest reading of a graph holding one call edge.
+        let args = HashMap::from([
+            (
+                "entity_id".to_string(),
+                serde_json::json!(target.id.to_string()),
+            ),
+            ("relation_kinds".to_string(), serde_json::json!(["calls"])),
+        ]);
         let response = parsed_response(&crate::finalize_with_envelope(
             handle_find_references(&args, &store, None).await.unwrap(),
             structurally_ready_envelope(),
@@ -7207,7 +7214,10 @@ mod tests {
             "so the 1 is a floor rather than a fact: {completeness}"
         );
         assert_eq!(completeness["classes"]["calls"], "absent");
-        assert_eq!(completeness["decided_by"], serde_json::json!(["calls"]));
+        assert_eq!(
+            completeness["decided_by"],
+            serde_json::json!(["calls", "imports", "references"])
+        );
         assert!(
             completeness["limits"]
                 .as_array()
@@ -7303,11 +7313,14 @@ mod tests {
         assert!(response["references"].as_array().unwrap().is_empty());
         assert_eq!(
             response["edge_coverage"]["cross_file_classes"],
-            serde_json::json!(["calls"])
+            serde_json::json!(["calls", "imports", "references"]),
+            "every requested class is linked across files, which since FIR-2672 is what an \
+             earned absence needs: {}",
+            response["edge_coverage"]
         );
         assert_eq!(
             response["negative"]["safe_to_conclude_absent"], true,
-            "a graph that links calls across files still earns absence: {}",
+            "a graph that links every class across files still earns absence: {}",
             response["negative"]
         );
         assert_eq!(response["negative"]["trust"], "authoritative");
@@ -7380,6 +7393,9 @@ mod tests {
             ..RelationEvidence::default()
         }];
         store.upsert_relation(&relation).unwrap();
+        // The language links every class across files, so the verdict below is
+        // about the one proven caller and not about coverage (FIR-2672).
+        seed_cross_file_call_witness(&store);
         let registered_root = graph_root(&store);
 
         let spine = kin_spine::InMemorySpineBackend::new();
@@ -7635,12 +7651,13 @@ mod tests {
         );
 
         // FIR-2463, and the exact three-verdict shape a stranger quoted off
-        // shipped v0.5.42 bytes. `decided_by` here is `calls` alone, which IS
-        // present, so the completeness signal reached `complete` and `exact`
+        // shipped v0.5.42 bytes. `decided_by` used to be `calls` alone, which
+        // IS present, so the completeness signal reached `complete` and `exact`
         // over the same zero the negative beside it refused to certify, and its
-        // note called that zero the whole set. The substrate reading stays as
-        // measured, because it is the evidence; what a reader acts on follows
-        // the one verdict.
+        // note called that zero the whole set. Since FIR-2672 every requested
+        // class decides, so the two absent classes are on the record of what
+        // decided. The substrate reading stays as measured, because it is the
+        // evidence; what a reader acts on follows the one verdict.
         assert_eq!(
             response["_kin"]["verdict"]["state"], "inconclusive",
             "{}",
@@ -7659,7 +7676,7 @@ mod tests {
         );
         assert_eq!(
             response["_kin"]["completeness"]["decided_by"],
-            serde_json::json!(["calls"]),
+            serde_json::json!(["calls", "imports", "references"]),
             "{}",
             response["_kin"]["completeness"]
         );
@@ -8339,23 +8356,33 @@ mod tests {
             .to_string()
     }
 
-    /// A pair of entities in different files joined by a `Calls` edge: the
-    /// witness that this graph does link references across files for the
-    /// language, without which an empty walk is a fact about the graph rather
-    /// than about the focal.
+    /// A pair of entities in different files joined by every reference class
+    /// the verdict reads: the witness that this graph does link references
+    /// across files for the language, without which an empty walk is a fact
+    /// about the graph rather than about the focal.
     ///
-    /// A `Calls` edge is the whole witness on purpose. Kin resolves a cross-file
-    /// use into exactly this edge, plus an artifact-level import edge entity
-    /// queries never reach, so a fixture seeding an entity-level `Imports` edge
-    /// would assert authority on a shape no real graph produces.
+    /// This used to seed a `Calls` edge alone, on the reasoning that Kin
+    /// resolved a cross-file use into exactly that edge plus an artifact-level
+    /// import edge entity queries never reach, so an entity-level `Imports`
+    /// edge was "a shape no real graph produces". That sentence was the
+    /// codebase's own record of FIR-2672: since every requested class decides,
+    /// a graph that links only its calls is honestly short of imports and
+    /// references and cannot certify an absence, so a fixture standing for a
+    /// linked graph links all three.
     fn seed_cross_file_call_witness(store: &InMemoryGraph) {
         let caller = make_entity("witness_caller", "src/witness_caller.rs");
         let callee = make_entity("witness_callee", "src/witness_callee.rs");
         store.upsert_entity(&caller).unwrap();
         store.upsert_entity(&callee).unwrap();
-        store
-            .upsert_relation(&make_relation(caller.id, callee.id, RelationKind::Calls))
-            .unwrap();
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ] {
+            store
+                .upsert_relation(&make_relation(caller.id, callee.id, kind))
+                .unwrap();
+        }
     }
 
     /// `trace_data_flow` on this arm, with whatever arguments a test needs, and
