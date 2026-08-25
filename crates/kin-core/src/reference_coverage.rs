@@ -711,6 +711,17 @@ struct LanguageTally {
     import_statement_files: usize,
     resolved_call_edges: u64,
     resolved_import_edges: u64,
+    /// Import SITES, keyed `(importer file, target file)`.
+    ///
+    /// One resolved import produces an edge at BOTH levels: an
+    /// artifact-to-artifact edge, and, where the importing file carries a module
+    /// entity and the specifier names something the target defines, an
+    /// entity-to-entity edge beside it. Two passes below read those two levels,
+    /// and counting each pass into one total scores a single import twice, which
+    /// drives the ratio above its own denominator and caps out at a reported
+    /// 100 percent. Keying on the file pair collapses the two levels back to the
+    /// one site they describe.
+    import_sites: HashSet<(String, String)>,
     external_module_imports: u64,
     external_module_import_files: usize,
     cross_file: u64,
@@ -809,7 +820,19 @@ where
             let tally = tallies.entry(language.to_string()).or_default();
             match relation.kind {
                 RelationKind::Calls => tally.resolved_call_edges += 1,
-                RelationKind::Imports => tally.resolved_import_edges += 1,
+                RelationKind::Imports => {
+                    // An endpoint the graph holds no file for still has to stay
+                    // distinct from every other one, or two unrelated external
+                    // imports would collapse into a single site.
+                    let src_key = src_file
+                        .clone()
+                        .unwrap_or_else(|| format!("entity:{src}"));
+                    let dst_key = by_id
+                        .get(&dst)
+                        .and_then(|(_, file)| file.clone())
+                        .unwrap_or_else(|| format!("entity:{dst}"));
+                    tally.import_sites.insert((src_key, dst_key));
+                }
                 _ => {}
             }
             match by_id.get(&dst).and_then(|(_, file)| file.as_ref()) {
@@ -831,6 +854,21 @@ where
     // had all resolved still reported `imports 0/220 (0%)`. Ask the graph for
     // them by artifact instead, attributed to the language of the file that
     // wrote the import.
+    // The artifact pass needs a target's PATH to key its site the same way the
+    // entity pass does, and the store maps path to id rather than the reverse.
+    // Build the inverse once over every file any language contributed.
+    let mut path_of_artifact: HashMap<kin_model::ArtifactId, String> = HashMap::new();
+    for tally in tallies.values() {
+        for file in &tally.files {
+            let Ok(repo_path) = kin_model::RepoPath::from_bytes(file.as_bytes()) else {
+                continue;
+            };
+            if let Some(artifact_id) = store.artifact_id_at_path(&repo_path) {
+                path_of_artifact.insert(artifact_id, file.clone());
+            }
+        }
+    }
+
     let mut counted_artifact_relations: HashSet<kin_model::RelationId> = HashSet::new();
     for tally in tallies.values_mut() {
         let mut files: Vec<&String> = tally.files.iter().collect();
@@ -854,9 +892,22 @@ where
                 {
                     continue;
                 }
-                tally.resolved_import_edges += 1;
+                let dst_key = match relation.dst {
+                    GraphNodeId::Artifact(dst) => path_of_artifact
+                        .get(&dst)
+                        .cloned()
+                        .unwrap_or_else(|| format!("artifact:{dst:?}")),
+                    other => format!("node:{other:?}"),
+                };
+                tally.import_sites.insert((file.clone(), dst_key));
             }
         }
+    }
+
+    // Both passes have contributed their sites; the resolved count is how many
+    // distinct import sites the graph holds, not how many edges describe them.
+    for tally in tallies.values_mut() {
+        tally.resolved_import_edges = tally.import_sites.len() as u64;
     }
 
     let languages = tallies
@@ -1396,6 +1447,56 @@ mod tests {
     /// The rendered line names the external share, so a low ratio reads as a
     /// repository with more dependencies than modules rather than as a defect.
     #[test]
+    /// One import site must not be counted twice because it now produces an
+    /// edge at both levels.
+    ///
+    /// The artifact pass below the entity pass exists because entity queries
+    /// could not see artifact import edges, and it was written when the entity
+    /// pass contributed zero imports for every language. Emitting an
+    /// entity-level `Imports` edge beside the artifact one makes both passes
+    /// fire for the same site, and both add to `resolved_import_edges`.
+    ///
+    /// This fixture is one file importing one symbol from another: one import
+    /// statement, one artifact edge, one entity edge. The resolved count must
+    /// be 1.
+    #[test]
+    fn one_import_site_counted_at_both_levels_is_still_one_resolved_import() {
+        let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
+        let exported = js_entity("createApplication", "lib/express.js", 0, 0);
+        let importer = js_entity("moduleExports", "index.js", 1, 0);
+        graph.upsert_entity(&exported).unwrap();
+        graph.upsert_entity(&importer).unwrap();
+        // The artifact edge, exactly as the linker has always emitted it.
+        graph.upsert_relation(&artifact_import(ids[0], ids[1])).unwrap();
+        // The entity edge the linker now emits beside it.
+        graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Imports,
+                src: GraphNodeId::Entity(importer.id),
+                dst: GraphNodeId::Entity(exported.id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some("./express".to_string()),
+                evidence: vec![],
+            })
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let js = coverage
+            .languages
+            .iter()
+            .find(|l| l.language == "javascript")
+            .expect("javascript row");
+        assert_eq!(
+            js.resolved_import_edges, 1,
+            "one import site produced {} resolved imports; the entity pass and the artifact \
+             pass are both counting it, which drives the ratio above its own denominator",
+            js.resolved_import_edges
+        );
+    }
+
     fn the_summary_line_discloses_imports_that_name_a_module_outside_the_repository() {
         let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
         graph
