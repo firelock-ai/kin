@@ -2442,6 +2442,136 @@ async fn xref_graph_read_is_still_current(
     }
 }
 
+/// The `degradations[]` identity a reference answer carries when it was read
+/// while a graph-authority writer was mutating the graph.
+///
+/// `component:reason` is the label `kin_mcp`'s `negative_for` reads off the
+/// payload's own `degradations[]`, so this pair is what turns the answer's one
+/// verdict `inconclusive` and names the limit. The strings are constants here
+/// because a check asserts on exactly them.
+const GRAPH_AUTHORITY_COMPONENT: &str = "graph_authority";
+const MUTATION_IN_FLIGHT_REASON: &str = "mutation_in_flight";
+
+/// Which writer this daemon can actually name as the one that was moving.
+///
+/// The sweep flag is the only writer identity the daemon holds at read time.
+/// Everything else that takes graph authority (a reconcile step, an MCP tool
+/// that mutates, a commit) publishes no such flag, so naming the sweep for
+/// those would be a cause invented to make a sentence read better. An orphaned
+/// session scope reaches the same exhaustion path and is not an enrichment
+/// sweep at all.
+fn graph_authority_writer_sentence(state: &DaemonState) -> &'static str {
+    if state
+        .lsp_sweep_running
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        "a language-server enrichment sweep was installing relations while this read ran"
+    } else {
+        "a graph-authority writer was mutating the graph while this read ran"
+    }
+}
+
+/// The refusal a reference read owes its caller when no answer could be served.
+///
+/// It has to name the in-flight write, because the alternative an agent reads
+/// it against is "this symbol does not exist". Those are different facts and a
+/// message that does not separate them is how a transient window got recorded
+/// as an unresolved symbol (FIR-2468).
+fn xref_authority_unsettled_message(state: &DaemonState, surface: &str) -> String {
+    format!(
+        "graph authority changed repeatedly during {surface}: {}, and none of the \
+         {XREF_STABLE_READ_ATTEMPTS} attempts could be certified against a settled graph. This is \
+         an in-flight write window, not an absent or unresolved symbol, and nothing here says \
+         whether the queried entity exists. Retry once the writer settles.",
+        graph_authority_writer_sentence(state),
+    )
+}
+
+/// Attach the mutation-in-flight disclosure to an answer that was read from a
+/// coherent snapshot the graph then moved past.
+///
+/// The snapshot itself is not suspect: [`prepare_xref_graph_read`] certified
+/// that no writer spanned its capture, so the rows in it are rows that were
+/// really there. What expired is currency, and a writer installing relations
+/// can only have added edges this answer does not list, so the honest statement
+/// is "possibly short", never "possibly wrong".
+///
+/// Returns `None` rather than the untouched result whenever the disclosure
+/// could not be attached: an error result, or a payload that is not a JSON
+/// object, has nowhere to carry it, and serving one of those unlabelled is
+/// exactly the silent flap this exists to end. The caller refuses instead.
+fn disclose_mutation_in_flight(
+    result: kin_mcp::ToolCallResult,
+    state: &DaemonState,
+) -> Option<kin_mcp::ToolCallResult> {
+    // An error result is not an answer to qualify. `find_references` reports a
+    // focal that did not resolve exactly this way, and publishing that under a
+    // disclosure would still publish "Entity not found" for an entity the same
+    // store resolves a moment later.
+    if result.is_error == Some(true) {
+        return None;
+    }
+    let kin_mcp::ContentBlock::Text { text } = result.content.first()?;
+    let mut payload = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if !payload.is_object() {
+        return None;
+    }
+    let entry = serde_json::json!({
+        "component": GRAPH_AUTHORITY_COMPONENT,
+        "reason": MUTATION_IN_FLIGHT_REASON,
+        "detail": format!(
+            "{}, so this answer was read from the last snapshot that was coherent rather than \
+             from a settled graph. A relation installed after that snapshot is not counted here, \
+             so treat these counts as a lower bound and re-run once the write settles.",
+            graph_authority_writer_sentence(state),
+        ),
+    });
+    match payload
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.push(entry),
+        None => payload["degradations"] = serde_json::Value::Array(vec![entry]),
+    }
+    let rendered = serde_json::to_string_pretty(&payload).ok()?;
+    Some(kin_mcp::ToolCallResult {
+        content: vec![kin_mcp::ContentBlock::Text { text: rendered }],
+        is_error: result.is_error,
+    })
+}
+
+/// What an MCP reference read returns once every attempt has been superseded.
+///
+/// Three outcomes, kept apart because collapsing them is how the window got
+/// reported as an absence:
+///
+/// - A superseded answer that can carry the disclosure is served with it, so an
+///   agent gets the rows and the one verdict reads `inconclusive`.
+/// - A superseded handler error is the handler's own error and is returned
+///   unchanged; replacing it with an authority message would hide a real fault.
+/// - Everything else refuses with a message naming the in-flight write. That
+///   includes the case where no attempt ever detached a snapshot, and the case
+///   where the last answer was a focal miss, which must never be published as
+///   settled.
+fn serve_superseded_xref_answer(
+    superseded: Option<kin_mcp::Result<kin_mcp::ToolCallResult>>,
+    state: &DaemonState,
+    surface: &str,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+    match superseded {
+        Some(Err(error)) => Err(error),
+        Some(Ok(result)) => match disclose_mutation_in_flight(result, state) {
+            Some(disclosed) => Ok(disclosed),
+            None => Err(kin_mcp::McpError::Other(xref_authority_unsettled_message(
+                state, surface,
+            ))),
+        },
+        None => Err(kin_mcp::McpError::Other(xref_authority_unsettled_message(
+            state, surface,
+        ))),
+    }
+}
+
 async fn command_xref_with_stable_authority<F>(
     state: &DaemonState,
     session_id: Option<&SessionId>,
@@ -2458,6 +2588,7 @@ where
     let spine = state.ensure_spine();
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
             continue;
         };
         after_root(attempt_number);
@@ -2478,10 +2609,20 @@ where
             attempt = attempt_number + 1,
             "graph authority changed during command xref; retrying"
         );
+        settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
     }
+    // This surface refuses where the MCP twins serve. `XrefResponse` carries
+    // `lines` and a spine body and no disclosure channel, so a labelled answer
+    // here would have to be a sentence pushed into a human rendering, which the
+    // `negative`/verdict machinery the acceptance bar is written against cannot
+    // read. Deciding from out here whether the response resolved its focal
+    // would mean restating `build_xref_response`'s own resolution rule in a
+    // second place, and a proxy that can drift from the thing it stands for is
+    // how a check comes to pass while the behavior is broken. So it refuses,
+    // and the refusal names the write.
     Err((
         StatusCode::SERVICE_UNAVAILABLE,
-        "graph authority changed repeatedly during command xref; retry".to_string(),
+        xref_authority_unsettled_message(state, "command xref"),
     ))
 }
 
@@ -2509,8 +2650,10 @@ where
     }
     let spine = state.ensure_spine();
     let repository_authority = mcp_repository_authority_source(state)?;
+    let mut superseded = None;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
             continue;
         };
         after_root(attempt_number);
@@ -2534,10 +2677,10 @@ where
             attempt = attempt_number + 1,
             "graph authority changed during MCP find_references; retrying"
         );
+        superseded = Some(result);
+        settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
     }
-    Err(kin_mcp::McpError::Other(
-        "graph authority changed repeatedly during find_references; retry".to_string(),
-    ))
+    serve_superseded_xref_answer(superseded, state, "find_references")
 }
 
 /// Whether this `find_references` request names something the graph cannot
@@ -2657,8 +2800,10 @@ where
     F: FnMut(usize),
 {
     let spine = state.ensure_spine();
+    let mut superseded = None;
     for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
+            settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
             continue;
         };
         after_root(attempt_number);
@@ -2680,10 +2825,10 @@ where
             attempt = attempt_number + 1,
             "graph authority changed during MCP bulk_check_references; retrying"
         );
+        superseded = Some(result);
+        settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
     }
-    Err(kin_mcp::McpError::Other(
-        "graph authority changed repeatedly during bulk_check_references; retry".to_string(),
-    ))
+    serve_superseded_xref_answer(superseded, state, "bulk_check_references")
 }
 
 /// What an attached client asks this daemon to hold its idle window open for.
@@ -3384,7 +3529,7 @@ async fn live_embedding_coverage(
 
     for attempt in 0..GRAPH_STATUS_STABLE_READ_ATTEMPTS {
         let Some(authority_epoch) = state.stable_graph_authority_epoch() else {
-            settle_graph_authority_writer(attempt).await;
+            settle_graph_authority_writer(attempt, GRAPH_STATUS_STABLE_READ_ATTEMPTS).await;
             continue;
         };
         let coverage = match sample_embedding_coverage(Arc::clone(state)).await {
@@ -3392,7 +3537,7 @@ async fn live_embedding_coverage(
             Err(reason) => return EmbeddingCoverage::unobserved(reason),
         };
         if !state.graph_authority_epoch_is_current(authority_epoch) {
-            settle_graph_authority_writer(attempt).await;
+            settle_graph_authority_writer(attempt, GRAPH_STATUS_STABLE_READ_ATTEMPTS).await;
             continue;
         }
         return coverage;
@@ -3415,10 +3560,16 @@ async fn live_embedding_coverage(
 /// This widens the observation window; it does not soften the verdict. A writer
 /// that never drains still exhausts every attempt and is still published as a
 /// mutation in flight.
-async fn settle_graph_authority_writer(attempt: usize) {
+///
+/// `attempts` is the caller's own budget rather than one constant, because two
+/// families share this wait and their budgets are free to diverge. Reading the
+/// status budget here while an xref loop counted to a different one would nap
+/// after an xref loop's real last attempt, or skip the nap before one, and both
+/// are silent: the loop still returns an answer either way.
+async fn settle_graph_authority_writer(attempt: usize, attempts: usize) {
     // The last attempt has no resample left to protect, so it does not pay for
     // a nap whose result nobody reads.
-    if attempt + 1 >= GRAPH_STATUS_STABLE_READ_ATTEMPTS {
+    if attempt + 1 >= attempts {
         return;
     }
     tokio::time::sleep(GRAPH_STATUS_WRITER_SETTLE_FLOOR.saturating_mul(1 << attempt)).await;
@@ -29730,6 +29881,391 @@ mod tests {
         .expect_err("an orphaned session graph must never be certified");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.1.contains("changed repeatedly"));
+        // The refusal names the write and refuses to be read as an absence.
+        // An orphaned session scope is not an enrichment sweep, so the sentence
+        // must stay at "a graph-authority writer" here: naming the sweep on a
+        // path that has none is a cause invented to make the message read well.
+        assert!(
+            error
+                .1
+                .contains("a graph-authority writer was mutating the graph"),
+            "refusal must name the writer it can actually name: {}",
+            error.1
+        );
+        assert!(
+            error.1.contains("not an absent or unresolved symbol"),
+            "refusal must separate a write window from an absence: {}",
+            error.1
+        );
+    }
+
+    // ── FIR-2468: a reference read taken during an enrichment sweep ──────────
+    //
+    // The sweep takes a graph-authority guard per batch and installs relations
+    // under it. A reference read that straddles one is not wrong, it is merely
+    // no longer current, and until this the three xref loops spent their whole
+    // three-attempt budget inside one instant with no wait at all, then returned
+    // a bare error an agent could not tell from "this symbol does not exist".
+    //
+    // Every test below drives the loop to exhaustion through the `after_root`
+    // hook, which fires once the attempt has already detached its snapshot, so
+    // the answer each attempt produces is a real answer read from a graph state
+    // that was coherent when it was captured. That is exactly the shape the
+    // disclosure describes.
+
+    /// The `after_root` hook that supersedes every attempt.
+    ///
+    /// `bump_version` alone moves the monotonic HEAD version without touching a
+    /// single entity or relation, so the rows the handler read stay exactly the
+    /// rows a settled read returns. That separation is the point: it proves the
+    /// disclosure fires on lost currency, not on a damaged answer.
+    fn supersede_every_attempt(state: &Arc<DaemonState>) -> impl FnMut(usize) {
+        let state = Arc::clone(state);
+        move |_| state.bump_version()
+    }
+
+    /// The `component:reason` labels a payload's own `degradations[]` publishes,
+    /// read the way `kin_mcp`'s `negative_for` reads them.
+    fn degradation_labels(payload: &serde_json::Value) -> Vec<String> {
+        payload["degradations"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|entry| {
+                        Some(format!(
+                            "{}:{}",
+                            entry["component"].as_str()?,
+                            entry["reason"].as_str()?
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Run the daemon's answer through the same annotation chokepoint the MCP
+    /// server uses on the delegated result (`server.rs`), so what this asserts
+    /// is the verdict an agent actually receives rather than a reconstruction
+    /// of it.
+    ///
+    /// The graph state is filled in because a bare `Envelope::daemon()` reports
+    /// a graph that has not finished first reconciliation, and every verdict
+    /// taken against one is `inconclusive` on that ground alone. Asserting
+    /// `inconclusive` under it would be a check that cannot fail: the settled
+    /// control reads exactly the same, so nothing the disclosure does could move
+    /// it. The server fills this from `/health` on the live path.
+    fn finalized_payload(result: kin_mcp::ToolCallResult, tool: &str) -> serde_json::Value {
+        let mut envelope = kin_mcp::Envelope::daemon();
+        envelope.graph_state = kin_mcp::envelope::GraphState {
+            reconciliation_status: Some("clean".to_string()),
+            entity_count: Some(2),
+            entity_count_scope: None,
+            loaded: Some(true),
+            initialized: Some(true),
+        };
+        let enveloped = kin_mcp::envelope::finalize_bounded(
+            result,
+            envelope,
+            tool,
+            &kin_mcp::budget::ResponseBudget::default(),
+        );
+        serde_json::from_str(&mcp_result_text(&enveloped)).expect("finalized payload is JSON")
+    }
+
+    /// A graph holding one target with one caller linked by every cross-file
+    /// class the verdict weighs, so nothing here is degraded for a reason other
+    /// than the one under test.
+    ///
+    /// Both entities are installed as real repository files. A row read charges
+    /// the request's deferred repository-authority resolver, and a workspace
+    /// with an unborn head answers that with an authority gap, so a fixture that
+    /// only upserted entities would fail on the fixture rather than on the
+    /// behavior.
+    fn reference_fixture() -> (Arc<DaemonState>, Entity) {
+        let state = test_state();
+        let mut target = test_entity("sweep_target", "src/target.py");
+        let mut caller = test_entity("sweep_caller", "src/caller.py");
+        for entity in [&mut target, &mut caller] {
+            install_trace_fixture_file(&state, entity);
+            state.graph.upsert_entity(entity).unwrap();
+        }
+        link_every_class(&state, &caller, &target);
+        (state, target)
+    }
+
+    fn find_references_arguments(target: &Entity) -> HashMap<String, serde_json::Value> {
+        serde_json::from_value(json!({ "entity_id": target.id.to_string() })).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_superseded_find_references_answer_is_served_with_the_mutation_in_flight_disclosure()
+    {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+
+        // The settled answer, taken first, is the thing the contended answer has
+        // to match. Without it "served with a disclosure" could be satisfied by
+        // an empty page carrying a label.
+        let settled = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("an uncontended reference read is served");
+        let settled_body: serde_json::Value =
+            serde_json::from_str(&mcp_result_text(&settled)).unwrap();
+        assert_eq!(
+            settled_body["total_upstream"], 1,
+            "fixture must hold one caller for the disclosure test to mean anything"
+        );
+
+        let contended = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            supersede_every_attempt(&state),
+        )
+        .await
+        .expect("a superseded reference read is served, never refused, when it has rows");
+        let contended_body: serde_json::Value =
+            serde_json::from_str(&mcp_result_text(&contended)).unwrap();
+
+        // The ticket's first clause: it resolves exactly what it resolves before
+        // and after.
+        assert_eq!(contended_body["focal_entity"], settled_body["focal_entity"]);
+        assert_eq!(contended_body["references"], settled_body["references"]);
+        assert_eq!(
+            contended_body["total_upstream"],
+            settled_body["total_upstream"]
+        );
+
+        // And it says so.
+        assert!(
+            degradation_labels(&contended_body)
+                .contains(&"graph_authority:mutation_in_flight".to_string()),
+            "a superseded answer must disclose the write: {}",
+            contended_body["degradations"]
+        );
+
+        // Through the real annotation chokepoint, that disclosure is what turns
+        // the response's one verdict. A degradation nothing consumes would be
+        // decoration.
+        let finalized = finalized_payload(contended, "find_references");
+        assert_eq!(
+            finalized["negative"]["trust"], "inconclusive",
+            "the disclosure must reach the verdict: {}",
+            finalized["negative"]
+        );
+        assert!(
+            finalized["negative"]["degraded_signals"]
+                .as_array()
+                .is_some_and(|signals| signals
+                    .iter()
+                    .any(|signal| signal == "graph_authority:mutation_in_flight")),
+            "the verdict must name the write among its signals: {}",
+            finalized["negative"]
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncontended_find_references_answer_carries_no_mutation_disclosure() {
+        // The control for the test above. A disclosure emitted unconditionally
+        // would pass every assertion there and would make every settled answer
+        // inconclusive, which is the failure mode that costs the most: an agent
+        // learns the label means nothing.
+        let (state, target) = reference_fixture();
+        let settled = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &find_references_arguments(&target),
+            |_| {},
+        )
+        .await
+        .expect("an uncontended reference read is served");
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&settled)).unwrap();
+        assert!(
+            !degradation_labels(&body).contains(&"graph_authority:mutation_in_flight".to_string()),
+            "a settled answer must not claim a write was in flight: {}",
+            body["degradations"]
+        );
+
+        // The verdict itself, not only the reason. If a settled answer already
+        // read `inconclusive` here, the paired assertion in the test above would
+        // hold no matter what this change did, and neither test could fail.
+        let finalized = finalized_payload(settled, "find_references");
+        assert_eq!(
+            finalized["negative"]["trust"], "authoritative",
+            "a settled answer over a healthy fixture must be authoritative, or the contended \
+             assertion is not a discriminator: {}",
+            finalized["negative"]
+        );
+        assert!(
+            !finalized["negative"]["degraded_signals"]
+                .as_array()
+                .is_some_and(|signals| signals
+                    .iter()
+                    .any(|signal| signal == "graph_authority:mutation_in_flight")),
+            "a settled verdict must not name a write that never happened: {}",
+            finalized["negative"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_bulk_check_references_answer_carries_the_same_disclosure() {
+        let (state, target) = reference_fixture();
+        let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "entity_ids": [target.id.to_string()],
+            "relation_kind": "Any",
+        }))
+        .unwrap();
+
+        let contended = mcp_bulk_check_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            supersede_every_attempt(&state),
+        )
+        .await
+        .expect("a superseded bulk read is served, never refused, when it has rows");
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&contended)).unwrap();
+        assert!(
+            degradation_labels(&body).contains(&"graph_authority:mutation_in_flight".to_string()),
+            "the batched twin discloses the same write: {}",
+            body["degradations"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reference_read_that_never_detaches_a_snapshot_refuses_naming_the_write() {
+        // A writer holding authority for the whole call means no attempt ever
+        // detaches a snapshot, so there is no answer to serve. The refusal is
+        // correct here; what it may never do is read as an absence.
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+        let held = state.begin_graph_authority_mutation();
+
+        let error = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect_err("no snapshot was ever detached, so nothing may be served");
+        let message = error.to_string();
+        assert!(
+            message.contains("not an absent or unresolved symbol"),
+            "the refusal must separate a write window from an absence: {message}"
+        );
+        assert!(
+            message.contains("a graph-authority writer was mutating the graph"),
+            "the refusal must name the writer: {message}"
+        );
+
+        // With the sweep flag set, the same refusal names the sweep instead,
+        // because that is the one writer identity the daemon holds at read time.
+        state
+            .lsp_sweep_running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let swept = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect_err("no snapshot was ever detached, so nothing may be served")
+        .to_string();
+        assert!(
+            swept.contains("a language-server enrichment sweep was installing relations"),
+            "the refusal must name the sweep when a sweep is what is running: {swept}"
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_superseded_focal_miss_refuses_rather_than_publishing_entity_not_found() {
+        // The ticket's sharpest clause. An unresolved focal and a symbol with no
+        // references are different facts, and a focal miss taken while a writer
+        // was moving is neither: it is a read that could not be certified.
+        // Serving it would put "Entity not found" in front of an agent for an
+        // entity the same store may resolve a moment later.
+        //
+        // Addressed by `entity_id` deliberately: the name-index early-out ahead
+        // of the loop answers a ruled-out NAME before any attempt runs, so an
+        // absent id is the only way to reach exhaustion holding a focal miss.
+        let (state, _target) = reference_fixture();
+        let arguments = serde_json::from_value::<HashMap<String, serde_json::Value>>(json!({
+            "entity_id": EntityId::new().to_string(),
+        }))
+        .unwrap();
+
+        let message = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            supersede_every_attempt(&state),
+        )
+        .await
+        .expect_err("a superseded focal miss is never published as settled")
+        .to_string();
+        assert!(
+            !message.contains(kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS),
+            "a write window must never be reported as an unresolved symbol: {message}"
+        );
+        assert!(
+            message.contains("not an absent or unresolved symbol"),
+            "the refusal must say what it is not: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn contended_reference_reads_spread_their_attempts_across_real_time() {
+        // The retry budget was three attempts inside one instant. `yield_now`
+        // would not have fixed it either: it reorders ready tasks without the
+        // clock advancing, and the sweep's writers do filesystem and
+        // content-address work on blocking threads that no async yield waits
+        // for. So the wait has to be a real sleep, and the floor is what proves
+        // it happened.
+        //
+        // Three attempts, and the last one does not nap because nothing reads
+        // its result. That leaves 50 ms then 100 ms.
+        let expected = GRAPH_STATUS_WRITER_SETTLE_FLOOR + GRAPH_STATUS_WRITER_SETTLE_FLOOR * 2;
+        let (state, target) = reference_fixture();
+        let started = std::time::Instant::now();
+        mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &find_references_arguments(&target),
+            supersede_every_attempt(&state),
+        )
+        .await
+        .expect("a superseded reference read is served");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= expected,
+            "a fully contended read must outlast a brief writer, not spend its budget in one \
+             instant: {elapsed:?} elapsed, {expected:?} required"
+        );
     }
 
     /// Fail-loud contract: when a spine endpoint IS configured but the daemon
