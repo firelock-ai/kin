@@ -233,6 +233,10 @@ fn tracking_tier<G: GraphStore>(store: &G, file_id: &FilePathId) -> Result<&'sta
 /// admitted, zero entities" as a parser defect and files it as one, which is the
 /// honesty failure this names rather than a coverage failure this fixes.
 ///
+/// The registry decides, not the tier. A file an adapter parsed can never reach
+/// this, because a parsed file's extension is one the registry claims by
+/// definition, so the two conditions agree wherever they overlap.
+///
 /// The adapter registry IS the supported set, and its own
 /// [`supported_languages_with_extensions`](kin_parser::languages::AdapterRegistry::supported_languages_with_extensions)
 /// documents that anything reporting Kin's supported languages must read it
@@ -241,11 +245,21 @@ fn tracking_tier<G: GraphStore>(store: &G, file_id: &FilePathId) -> Result<&'sta
 /// static table and reads no file, and it goes quiet on its own the day an
 /// adapter claims the extension.
 fn opaque_reason(path: &str, tier: &str) -> Option<String> {
-    // The tier is the gate. An empty `.py` file also holds zero entities, and
-    // deriving this flag from the entity count instead would report it as
-    // opaque, which is a confident wrong answer about a file an adapter read
-    // perfectly well.
-    if tier != "opaque_artifact" {
+    // Two tiers, because the store reaches this state by two routes and only one
+    // of them was visible from reading the ingest code. A converted repository
+    // serves `docs/notes.md` as `tracked_in_graph: true, tier: "none"`: the
+    // repository tree admits the path and no facet was ever written for it. The
+    // `opaque_artifact` row the ingest path builds is the other route. Gating on
+    // that row alone made this disclosure a no-op on exactly the store it exists
+    // for, which the acceptance fixture caught and the unit fixtures could not,
+    // because they build the row by hand.
+    //
+    // Every other tier is excluded because something DID read the file.
+    // `entity_source` means an adapter parsed it, so a `.py` file holding
+    // nothing is an empty file rather than an unreadable one, and
+    // `structured_artifact` means Kin understood the file structurally, which is
+    // the opposite of opaque even though it yields no entities.
+    if !matches!(tier, "opaque_artifact" | "none") {
         return None;
     }
     let Some(extension) = std::path::Path::new(path)
@@ -786,25 +800,38 @@ mod tests {
         store
             .upsert_file_layout(&layout_for("src/empty.py", ParseCompleteness::Full, 0))
             .unwrap();
+        // The shape a converted repository actually serves, which is not the one
+        // the ingest code reads like it produces: the repository tree admits the
+        // path and no facet was ever written, so the tier is `none` rather than
+        // `opaque_artifact`. Gating on the artifact row alone made this
+        // disclosure a no-op on every real store, and only the acceptance
+        // fixture could see it, because these fixtures build the row by hand.
+        admit(&store, "NOTES.md");
+        // Its control, and the reason the tier cannot decide this on its own: a
+        // Python file in the same no-facet state has an adapter that claims it,
+        // so nothing about its TYPE explains an empty enumeration.
+        admit(&store, "src/unparsed.py");
 
-        let markdown = call(&store, &[("path", serde_json::json!("README.md"))]).unwrap();
-        assert_eq!(
-            markdown[FILE_COVERAGE_KEY]["content_opaque"],
-            serde_json::json!(true),
-            "{markdown}"
-        );
-        assert_eq!(
-            markdown[FILE_COVERAGE_KEY]["opaque_reason"],
-            serde_json::json!("no_adapter_for_extension:md"),
-            "the disclosure names the extension nothing claims: {markdown}"
-        );
+        for path in ["README.md", "NOTES.md"] {
+            let payload = call(&store, &[("path", serde_json::json!(path))]).unwrap();
+            assert_eq!(
+                payload[FILE_COVERAGE_KEY]["content_opaque"],
+                serde_json::json!(true),
+                "{path}: {payload}"
+            );
+            assert_eq!(
+                payload[FILE_COVERAGE_KEY]["opaque_reason"],
+                serde_json::json!("no_adapter_for_extension:md"),
+                "{path} names the extension nothing claims: {payload}"
+            );
+        }
 
-        for path in ["src/thing.py", "src/empty.py"] {
+        for path in ["src/thing.py", "src/empty.py", "src/unparsed.py"] {
             let payload = call(&store, &[("path", serde_json::json!(path))]).unwrap();
             assert_eq!(
                 payload[FILE_COVERAGE_KEY]["content_opaque"],
                 serde_json::json!(false),
-                "{path} was read by an adapter: {payload}"
+                "{path} has an adapter that claims it, whatever its tier: {payload}"
             );
             assert_eq!(
                 payload[FILE_COVERAGE_KEY]["opaque_reason"],

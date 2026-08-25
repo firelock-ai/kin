@@ -2847,8 +2847,8 @@ def check_21(suite):
         if cov.get("content_opaque") is not True:
             res.bad("%s has no language adapter and its enumeration is empty, yet the answer "
                     "reports content_opaque=%r. The reader is left with parsed=%r, which is "
-                    "the same word a failed parse earns"
-                    % (NO_ADAPTER_FILE, cov.get("content_opaque"), cov.get("parsed")))
+                    "the same word a failed parse earns. Whole file_coverage: %r"
+                    % (NO_ADAPTER_FILE, cov.get("content_opaque"), cov.get("parsed"), cov))
         elif not isinstance(reason, str) or extension not in reason:
             res.bad("%s is disclosed as opaque but the reason does not name its extension "
                     "%r: opaque_reason=%r. A cause that names the wrong type is not a cause"
