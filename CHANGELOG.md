@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Retire the eject journal when an eject finishes, and stop counting docs.url as a hook (#1121)
+- Bind the compose daemon where its published port actually forwards, and let GCS storage reach an emulator (#1122)
 
 
 ## [0.5.52] - 2026-08-24
