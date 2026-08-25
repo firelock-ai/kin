@@ -165,7 +165,7 @@ fn reject_file_directory_collisions(artifacts: &[WorkspaceTreeArtifact]) -> Resu
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::{
         AdmissionPolicyStamp, AuthorityRoot, EffectiveAdmissionPolicyStamp, GitObjectId,
@@ -228,6 +228,28 @@ mod tests {
             size,
             mtime: 1_700_000_000 + id as u64,
         }
+    }
+
+    /// One snapshot carrying real artifacts, for callers outside this module.
+    ///
+    /// `WorkspaceTreeSnapshot::identity` hashes through the shared canonical
+    /// encoder, so the byte differential in `crate::repository` needs a real one
+    /// and the fixture that builds it lives here (FIR-2551).
+    pub(crate) fn sample_snapshot() -> WorkspaceTreeSnapshot {
+        snapshot(vec![
+            artifact(
+                1,
+                b"src/lib.rs",
+                TreeEntry::blob(Hash256::from_bytes([0x21; 32]), false),
+                128,
+            ),
+            artifact(
+                2,
+                b"README.md",
+                TreeEntry::blob(Hash256::from_bytes([0x22; 32]), false),
+                64,
+            ),
+        ])
     }
 
     fn snapshot(artifacts: Vec<WorkspaceTreeArtifact>) -> WorkspaceTreeSnapshot {

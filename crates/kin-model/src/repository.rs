@@ -2051,6 +2051,40 @@ mod tests {
         transaction
     }
 
+    /// One operation record carrying every optional field this crate can put in
+    /// one.
+    ///
+    /// `RepositoryOperationRecord::identity_hash` hashes `identity_payload()`
+    /// through the shared canonical encoder, and no transaction fixture reaches
+    /// it, so the byte differential needs a record built directly. The Git
+    /// authority delta is set here for the same reason it is set in the preimage
+    /// corpus: it is the payload the encoder rewrite was about (FIR-2551).
+    fn sample_operation_record() -> RepositoryOperationRecord {
+        let transaction = canonicalizable_transaction();
+        let mut roots_after = roots();
+        roots_after.generation += 1;
+        RepositoryOperationRecord {
+            operation_id: transaction.operation_id,
+            repository_id: transaction.repository_id.clone(),
+            transaction_hash: transaction.transaction_hash().unwrap(),
+            actor: transaction.actor.clone(),
+            committed_at: crate::Timestamp::from(
+                chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            ),
+            git_authority_delta: Some(GitExternalAuthorityDelta::initialize(blob_git_authority(
+                RepositoryId::new("repo").unwrap(),
+                b"services:\n  api:\n    build: .\n",
+            ))),
+            ref_mutations: transaction.ref_mutations.clone(),
+            default_ref_mutation: transaction.default_ref_mutation.clone(),
+            workspace_mutation: transaction.workspace_mutation.clone(),
+            local_overlay_delta: transaction.local_overlay_delta.clone(),
+            merge_transaction_delta: None,
+            roots_before: roots(),
+            roots_after,
+        }
+    }
+
     #[test]
     fn replicated_truth_equality_excludes_generation_and_local_state_only() {
         let expected = roots();
@@ -4075,6 +4109,21 @@ mod tests {
             transaction
         };
 
+        // The Git authority delta is the payload the encoder rewrite was
+        // entirely about: on a bootstrap it is one element carrying the whole
+        // Git object closure, and its `serde_json::Value` tree measured
+        // 60,495,152 bytes on a 400-commit conversion. Until this shape existed
+        // it was also the one payload class with no pinned digest, because
+        // every other shape here derives from a fixture whose
+        // `git_authority_delta` is `None`. The follow-on work is a hand-written
+        // incremental preimage writer for exactly this delta, and without an
+        // anchor nothing would notice it emitting different bytes (FIR-2551).
+        let git_authority =
+            authority_only_transaction(GitExternalAuthorityDelta::initialize(blob_git_authority(
+                RepositoryId::new("repo").unwrap(),
+                b"services:\n  api:\n    build: .\n",
+            )));
+
         vec![
             ("workspace_only", workspace_transaction()),
             ("canonicalizable", canonicalizable_transaction()),
@@ -4085,6 +4134,7 @@ mod tests {
             ("merge_only", with_tails(true, false)),
             ("sealed_only", with_tails(false, true)),
             ("merge_and_sealed", with_tails(true, true)),
+            ("git_authority", git_authority),
         ]
     }
 
@@ -4094,7 +4144,7 @@ mod tests {
     /// here is a change to what a transaction identity commits to, which every
     /// store already on disk depends on. It is a decision to make and version,
     /// never a value to regenerate.
-    const PINNED_PREIMAGE_DIGESTS: [(&str, &str); 9] = [
+    const PINNED_PREIMAGE_DIGESTS: [(&str, &str); 10] = [
         (
             "workspace_only",
             "87c06b3a2f89a7f7ca9cf1e45207a9b425b1e40c07d6d78ab43ea8625acb69a8",
@@ -4131,7 +4181,32 @@ mod tests {
             "merge_and_sealed",
             "ba3d8e459829fcdf514938d327a5540677544d0ae6ba4fbfdae99730f3a65d3c",
         ),
+        (
+            "git_authority",
+            "68de6409c40b6f6bda61d7631206043d99bcfaa3d049f38680c471d341a8900f",
+        ),
     ];
+
+    /// The same digest, taken through the retained tree walk.
+    ///
+    /// Only used to prove a pin is anchored to the oracle rather than to the
+    /// encoder that produced it. Pinning a value measured solely by the new
+    /// encoder would anchor it to itself.
+    #[cfg(test)]
+    fn preimage_digest_via_tree(transaction: &RepositoryTransaction) -> String {
+        let bytes =
+            crate::identity::canonical_json_bytes_via_tree(&CanonicalTransaction::new(transaction))
+                .unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let digest = hasher.finalize();
+        let mut out = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(out, "{byte:02x}").unwrap();
+        }
+        out
+    }
 
     fn preimage_digest(transaction: &RepositoryTransaction) -> String {
         let bytes =
@@ -4545,6 +4620,30 @@ mod tests {
             println!("PREIMAGE {name} {digest}");
         }
 
+        // Each pin is anchored to the retained tree walk as well as to the
+        // encoder that produces it. Without this the corpus would pin whatever
+        // the new encoder emits, which is a check that cannot fail: the encoder
+        // would always agree with a value it produced.
+        let via_tree: Vec<(&str, String)> = corpus
+            .iter()
+            .map(|(name, transaction)| (*name, preimage_digest_via_tree(transaction)))
+            .collect();
+        let diverged: Vec<String> = measured
+            .iter()
+            .zip(via_tree.iter())
+            .filter(|((_, streamed), (_, walked))| streamed != walked)
+            .map(|((name, streamed), (_, walked))| {
+                format!("{name}: streamed {streamed}, tree walk {walked}")
+            })
+            .collect();
+        assert!(
+            diverged.is_empty(),
+            "the streaming encoder and the retained tree walk disagree on {} shapes, so \
+             the pins below anchor the encoder to itself rather than to the encoding:\n  {}",
+            diverged.len(),
+            diverged.join("\n  ")
+        );
+
         let moved: Vec<String> = measured
             .iter()
             .zip(PINNED_PREIMAGE_DIGESTS.iter())
@@ -4714,11 +4813,28 @@ mod tests {
     /// Both sides must not go through the new encoder, or the differential
     /// proves nothing, which is why `canonical_json_bytes_via_tree` is kept.
     ///
-    /// Coverage is stated rather than implied. The transaction fixtures below
-    /// carry changes, aliases, external objects, ref mutations, a workspace
-    /// mutation, a local overlay and a Git authority delta, so the nested types
-    /// those contain are covered through them. Each change is also compared on
-    /// its own, because `compute_semantic_change_id` hashes one directly.
+    /// Coverage is stated rather than implied, and an earlier version of this
+    /// comment overstated it. It claimed the fixtures carried a Git authority
+    /// delta. They did not: all three set it to `None`, so the arm that compared
+    /// it never executed, and the one payload class the encoder rewrite was
+    /// entirely about had no byte-level protection against that rewrite. That is
+    /// the "check that grades nothing and exits 0" class from `docs/traps.md`,
+    /// and an independent review caught it (FIR-2551).
+    ///
+    /// Two things follow. A fixture that carries the Git authority delta is in
+    /// the list below, and the optional arms are now fail-closed: every optional
+    /// field is recorded when it is reached and the test asserts at the end that
+    /// the fixture set collectively reached all of them. A skipped arm is a
+    /// missing anchor, and a missing anchor must fail rather than pass quietly.
+    ///
+    /// Not covered here, deliberately and named so it does not drop out of the
+    /// ticket: `compute_semantic_change_id` does not route through this encoder
+    /// at all. It still clones its change and builds a `serde_json::Value` tree,
+    /// because it must REMOVE the self-referential `id` field before hashing and
+    /// a streaming serializer cannot mutate an object it is emitting. The fix
+    /// shape exists in this crate already, a borrowed view in the manner of
+    /// `CanonicalTransaction`, and it is FIR-2692 rather than part of this
+    /// change.
     #[test]
     fn every_canonical_payload_encodes_to_the_same_bytes_as_the_tree_walk() {
         fn agree<T: serde::Serialize>(what: &str, value: &T) {
@@ -4740,10 +4856,39 @@ mod tests {
             );
         }
 
+        // Every optional field this test compares, recorded when an arm runs.
+        // The assertion at the end is what makes a skipped arm a failure.
+        let mut reached: BTreeSet<&'static str> = BTreeSet::new();
+
+        let authority_fixture =
+            authority_only_transaction(GitExternalAuthorityDelta::initialize(blob_git_authority(
+                RepositoryId::new("repo").unwrap(),
+                b"services:\n  api:\n    build: .\n",
+            )));
+
+        // The merge delta and the sealed observation are the other two arms no
+        // fixture reached. The assertion at the end of this test is what found
+        // them, on its first run, which is the argument for writing it that way.
+        let tails_fixture = {
+            let mut transaction = canonicalizable_transaction();
+            let workspace_id = transaction
+                .workspace_mutation
+                .as_ref()
+                .unwrap()
+                .workspace_id;
+            transaction.merge_transaction_delta = Some(MergeTransactionDelta::open(
+                crate::merge::tests::sample_record(transaction.repository_id.clone(), workspace_id),
+            ));
+            transaction.sealed_observation = Some(sealed_observation());
+            transaction
+        };
+
         for (name, transaction) in [
             ("canonicalizable transaction", canonicalizable_transaction()),
             ("workspace transaction", workspace_transaction()),
             ("large transaction", large_transaction(25)),
+            ("git authority transaction", authority_fixture),
+            ("merge and sealed transaction", tails_fixture),
         ] {
             agree(name, &transaction);
             agree(
@@ -4752,6 +4897,25 @@ mod tests {
             );
             for (index, change) in transaction.changes.iter().enumerate() {
                 agree(&format!("{name}, change {index}"), change);
+                // `MergeSideValue::entity` and `::relation` hash these standalone
+                // rather than nested, and a `MergeSideValue` stores only the
+                // resulting hash, so anchoring a merge record does not anchor
+                // what it hashed. These do.
+                for (d, delta) in change.entity_deltas.iter().enumerate() {
+                    agree(&format!("{name}, change {index}, entity delta {d}"), delta);
+                    reached.insert("entity_delta");
+                }
+                for (d, delta) in change.relation_deltas.iter().enumerate() {
+                    agree(
+                        &format!("{name}, change {index}, relation delta {d}"),
+                        delta,
+                    );
+                    reached.insert("relation_delta");
+                }
+                for (d, delta) in change.tree_deltas.iter().enumerate() {
+                    agree(&format!("{name}, change {index}, tree delta {d}"), delta);
+                    reached.insert("tree_delta");
+                }
             }
             for (index, alias) in transaction.aliases.iter().enumerate() {
                 agree(&format!("{name}, alias {index}"), alias);
@@ -4761,6 +4925,7 @@ mod tests {
             }
             if let Some(delta) = &transaction.git_authority_delta {
                 agree(&format!("{name}, Git authority delta"), delta);
+                reached.insert("git_authority_delta");
             }
             if let Some(mutation) = &transaction.workspace_mutation {
                 agree(&format!("{name}, workspace mutation"), mutation);
@@ -4768,14 +4933,101 @@ mod tests {
                     &format!("{name}, workspace semantic delta"),
                     &mutation.semantic_delta,
                 );
+                agree(
+                    &format!("{name}, workspace semantic delta as a transaction delta"),
+                    &mutation.semantic_delta.transaction_delta(),
+                );
+                let tree = ResolvedTree::default()
+                    .apply(&mutation.tree_deltas)
+                    .unwrap();
+                agree(&format!("{name}, resolved tree"), &tree);
+                // `MergeSideValue::artifact` hashes one of these on its own.
+                for (a, artifact) in tree.artifacts().enumerate() {
+                    agree(&format!("{name}, resolved artifact {a}"), &artifact);
+                    reached.insert("resolved_artifact");
+                }
+                reached.insert("workspace_mutation");
             }
             if let Some(overlay) = &transaction.local_overlay_delta {
                 agree(&format!("{name}, local overlay delta"), overlay);
+                reached.insert("local_overlay_delta");
             }
             if let Some(merge) = &transaction.merge_transaction_delta {
                 agree(&format!("{name}, merge transaction delta"), merge);
+                reached.insert("merge_transaction_delta");
+            }
+            if let Some(sealed) = &transaction.sealed_observation {
+                agree(&format!("{name}, sealed observation"), sealed);
+                reached.insert("sealed_observation");
             }
         }
+
+        // The identities that hash through this encoder without appearing in
+        // any transaction, so nothing above reaches them.
+        agree(
+            "operation record identity payload",
+            &sample_operation_record().identity_payload(),
+        );
+        agree(
+            "workspace tree snapshot",
+            &crate::workspace_tree::tests::sample_snapshot(),
+        );
+
+        // A relation delta reaches no fixture transaction, and
+        // `MergeSideValue::relation` hashes a `Relation` standalone, so anchor
+        // both the delta and the relation it carries. Built here rather than
+        // pushed onto a fixture change, because a change's id is derived from
+        // its own contents and appending a delta to one would leave a fixture
+        // whose id no longer matches what it holds.
+        let anchored_entity = semantic_entity(0x51, "encode");
+        let anchored_relation = crate::Relation {
+            id: crate::RelationId(Uuid::from_u128(0x52)),
+            kind: crate::RelationKind::Calls,
+            src: crate::GraphNodeId::Entity(anchored_entity.id),
+            dst: crate::GraphNodeId::Entity(EntityId(Uuid::from_u128(0x53))),
+            confidence: 1.0,
+            origin: crate::RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        agree("relation", &anchored_relation);
+        agree(
+            "relation delta",
+            &RelationDelta::Added {
+                new: anchored_relation,
+            },
+        );
+        agree("entity", &anchored_entity);
+        agree(
+            "external reference delta",
+            &ExternalReferenceDelta::Added {
+                new: ExternalReference::new_resolved("npm-package-v1", "@mui/utils", "merge")
+                    .unwrap(),
+            },
+        );
+        reached.insert("relation_delta");
+
+        let expected: BTreeSet<&'static str> = [
+            "git_authority_delta",
+            "workspace_mutation",
+            "local_overlay_delta",
+            "merge_transaction_delta",
+            "sealed_observation",
+            "entity_delta",
+            "relation_delta",
+            "tree_delta",
+            "resolved_artifact",
+        ]
+        .into_iter()
+        .collect();
+        let missed: Vec<&&'static str> = expected.difference(&reached).collect();
+        assert!(
+            missed.is_empty(),
+            "no fixture reached {missed:?}, so those arms compared nothing and this test \
+             graded them as passing. Add a fixture that sets them, or remove the arm; a \
+             skipped comparison is a missing anchor, not a green one."
+        );
     }
 
     /// Transaction identity must not depend on the order a caller built its
