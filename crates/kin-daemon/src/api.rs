@@ -30146,6 +30146,53 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_mutation_disclosure_survives_the_route_budget() {
+        // `mcp_tools_call` bounds every retrieval response after
+        // `mcp_tools_call_inner` has built it, so the budget runs downstream of
+        // this disclosure and could drop it without anything failing: the
+        // answer would still be served, still carry rows, and simply no longer
+        // say it was read under a write. The over-budget arm is the one that
+        // touches this array, appending its own entry and withdrawing a
+        // residual one, so an oversized payload is what has to be checked.
+        let oversized = json!({
+            "focal_entity": { "name": "resolve_redirects" },
+            "total_upstream": 400,
+            "references": (0..400).map(|index| json!({
+                "name": format!("caller_{index}"),
+                "file_path": format!("requests/module_{index}/handler.py"),
+                "line": index,
+                "relation_kind": "calls",
+                "snippet": "def send(self, request, **kwargs):\n    return self.adapter.send(request)\n".repeat(6),
+            })).collect::<Vec<_>>(),
+        });
+        let state = test_state();
+        let built = kin_mcp::ToolCallResult::text(
+            serde_json::to_string_pretty(&oversized).expect("fixture serializes"),
+        );
+        assert!(
+            mcp_result_text(&built).len() > kin_mcp::budget::RESPONSE_DEFAULT_MAX_CHARS,
+            "the fixture must overflow, or the arm that edits degradations never runs"
+        );
+        let disclosed =
+            disclose_mutation_in_flight(built, &state).expect("an object payload discloses");
+        let budget = kin_mcp::budget::ResponseBudget::default().less_envelope_reserve();
+        let bounded = bound_mcp_tool_result(disclosed, "find_references", &budget);
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&bounded)).unwrap();
+        let labels = degradation_labels(&body);
+        assert!(
+            labels.contains(&"graph_authority:mutation_in_flight".to_string()),
+            "the budget must not take the write disclosure with the bytes it cut: {}",
+            body["degradations"]
+        );
+        assert!(
+            labels.len() > 1,
+            "the budget's own cut must also be disclosed here, or this fixture did not reach the \
+             arm under test: {}",
+            body["degradations"]
+        );
+    }
+
     #[tokio::test]
     async fn a_reference_read_that_never_detaches_a_snapshot_refuses_naming_the_write() {
         // A writer holding authority for the whole call means no attempt ever
