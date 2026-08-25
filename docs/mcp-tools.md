@@ -58,7 +58,12 @@ and `unproduced` means the scan completed, saw no entity-level edge of the class
 all, and the source carries sites of it that the linker resolved, so the gap is in
 the build rather than in the code. A verdict that certifies over a recorded limit
 was the shipped 0.5.52 behaviour (FIR-2672) and is now a contract violation the
-tests scan for.
+tests scan for. `limiting_factor` is one sentence of `label: text` clauses, one per
+input that refused, in the order the verdict weighs them (the absence gate's own
+composition, then the coverage observation, withheld rows, the run's own
+degradations and the completeness signal), each label once. The first clause is
+what decided the state and the rest are the other things wrong with the same
+answer, so a class gap never hides a dead embedding worker.
 
 ---
 

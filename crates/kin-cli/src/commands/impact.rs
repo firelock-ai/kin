@@ -1232,6 +1232,59 @@ mod tests {
         assert!(response.lines[0].contains("'resolve_binary'"));
     }
 
+    /// FIR-2672, second finding, at the surface a person reads. Coverage short
+    /// on purpose (calls only) beside a failed embedding worker: the class gap
+    /// decides the state and the worker's death stays in the rendering, after
+    /// it. Drop either sentence from the qualifier and this goes red.
+    #[tokio::test]
+    async fn a_short_graph_on_a_degraded_daemon_renders_both_reasons() {
+        let graph = kin_db::InMemoryGraph::new();
+        let target = entity("orphan", "src/orphan.rs");
+        let caller = entity("caller", "src/a.rs");
+        let callee = entity("callee", "src/b.rs");
+        for e in [&target, &caller, &callee] {
+            graph.upsert_entity(e).unwrap();
+        }
+        calls(&graph, &caller, &callee);
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+            "embed_worker_failed": true,
+        }));
+
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "orphan".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: false,
+            },
+            &degraded,
+        )
+        .await
+        .expect("impact response");
+        let rendered = response.lines.join("\n");
+
+        let class_gap = rendered
+            .find("holds no cross-file import or reference edges")
+            .unwrap_or_else(|| panic!("the short classes decide and must be named: {rendered}"));
+        let worker = rendered.find("embed_worker_failed").unwrap_or_else(|| {
+            panic!("the failed worker must stay named beside the class gap: {rendered}")
+        });
+        assert!(
+            class_gap < worker,
+            "the structural gap leads and the run degradation follows: {rendered}"
+        );
+    }
+
     fn calls(graph: &kin_db::InMemoryGraph, src: &Entity, dst: &Entity) {
         links(graph, src, dst, RelationKind::Calls);
     }

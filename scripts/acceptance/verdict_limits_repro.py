@@ -42,6 +42,15 @@ winning. These checks hold the envelope to it on a live store:
               linker emits no entity-level import edge, and `present` on one
               whose linker does. `absent` on this source is the 0.5.52 wording
               this ticket is about.
+  two_reasons the same query under the server's smallest response budget,
+              which withholds rows and refuses on its own. Every input the
+              verdict records as inconclusive keeps its clause in
+              `limiting_factor`, each label once: the budget's clause beside
+              the class gap on a build that cannot produce the import class,
+              the budget's clause alone on one that can. The shape this guards
+              against kept one clause and dropped the rest, which one level up
+              is a CLI line naming the edge gap and not the dead embedding
+              worker beside it.
 
     CHECK <id> <ticket> PASS|FAIL|UNREADABLE <detail>
 
@@ -209,9 +218,65 @@ def import_class_never_absent_on_importing_source(payload):
     return classes["imports"] in ("unproduced", "present"), classes["imports"]
 
 
+# Which clause of `limiting_factor` each verdict input is entitled to, by the
+# label its reading writes. The absence gate composes its own clauses out of
+# every gap it pushed and is not held to one label.
+INPUT_CLAUSE_LABELS = {
+    "edge_coverage": ("cross_file_edges_", "edge_coverage_unknown"),
+    "withheld_candidates": ("withheld_candidates",),
+    "degradations": ("retrieval_degraded",),
+    "completeness": ("substrate_", "counts_are_a_floor"),
+    "response_budget": ("response_bounded",),
+}
+
+# The smallest response budget the server serves (`RESPONSE_MIN_MAX_CHARS`).
+# Asking for it on a populated answer withholds rows, which is the one refusal
+# an acceptance run can add to an answer on purpose.
+BUDGET_FLOOR_CHARS = 2000
+
+
+def factor_clauses(factor):
+    """The `label: text` clauses of one limiting factor, in order."""
+    clauses = [c.strip() for c in (factor or "").split("; ") if c.strip()]
+    return [(c.split(":", 1)[0].strip(), c) for c in clauses]
+
+
+def factor_carries_every_refusing_input(payload):
+    """Every input the verdict records as inconclusive has its clause in
+    `limiting_factor`, each label once, and a verdict no input refuses carries
+    no clause at all.
+
+    Returns (labels, problems). `labels` is None when the payload carries no
+    verdict inputs, which is UNREADABLE rather than a finding.
+    """
+    verdict = ((payload.get("_kin") or {}).get("verdict") or {})
+    inputs = verdict.get("inputs")
+    if not isinstance(inputs, dict) or verdict.get("state") not in ("certified", "inconclusive"):
+        return None, ["no verdict inputs"]
+    labels = [label for label, _ in factor_clauses(verdict.get("limiting_factor"))]
+    refusing = [name for name, state in inputs.items() if state == "inconclusive"]
+    problems = []
+    if refusing and verdict.get("state") != "inconclusive":
+        problems.append("inputs %s refuse while the verdict is %r" % (refusing, verdict.get("state")))
+    if refusing and not labels:
+        problems.append("inputs %s refuse and limiting_factor is empty" % refusing)
+    for name in refusing:
+        prefixes = INPUT_CLAUSE_LABELS.get(name)
+        if prefixes and not any(label.startswith(prefixes) for label in labels):
+            problems.append("input %s refuses and no clause of the factor is its (labels %s)"
+                            % (name, labels))
+    dupes = sorted({label for label in labels if labels.count(label) > 1})
+    if dupes:
+        problems.append("a label is said twice: %s" % dupes)
+    if not refusing and labels:
+        problems.append("no input refuses yet the factor reads %r" % labels)
+    return labels, problems
+
+
 GRADERS = {
     "verdict_honours_classes": verdict_honours_classes,
     "import_class_never_absent_on_importing_source": import_class_never_absent_on_importing_source,
+    "factor_carries_every_refusing_input": factor_carries_every_refusing_input,
 }
 
 
@@ -369,17 +434,19 @@ class Suite(object):
         self.repo = repo
         return repo
 
-    def references(self, kinds=None, attempts=10):
+    def references(self, kinds=None, attempts=10, extra=None):
         """find_references(blank_code), retried while the reference sweep
         settles, because `references` reads short until the language server has
-        run and that is a fact about timing rather than about the verdict."""
+        run and that is a fact about timing rather than about the verdict.
+        `extra` adds arguments to the call, such as a response budget."""
         repo = self.fixture()
-        key = tuple(kinds or ())
+        key = (tuple(kinds or ()), tuple(sorted((extra or {}).items())))
         if key in self.payloads:
             return self.payloads[key]
         args = {"query": "blank_code"}
         if kinds:
             args["relation_kinds"] = list(kinds)
+        args.update(extra or {})
         payload = None
         for attempt in range(attempts):
             self.kin_run(["graph", "status"], repo)
@@ -488,8 +555,45 @@ def check_unproduced(suite):
     return result
 
 
-CHECKS = [check_invariant, check_inverse, check_unproduced]
-DECLARED = ("invariant", "inverse", "unproduced")
+def check_two_reasons(suite):
+    result = Result("two_reasons", "a verdict with more than one reason to refuse names every "
+                                   "one of them in its limiting factor, each once")
+    # The response budget at the server's floor withholds rows from the
+    # populated answer, which downgrades the verdict independently of what the
+    # graph holds. Beside an import class this build cannot produce that is two
+    # reasons; on a build whose linker produces the class it is one, and the
+    # check says which world it graded. Either way every refusing input must
+    # keep its clause: the shape this guards against kept the budget's clause
+    # and dropped the rest, and one level up the CLI kept the class gap and
+    # dropped a dead embedding worker.
+    try:
+        payload = suite.references(extra={"max_chars": BUDGET_FLOOR_CHARS})
+    except Exception as error:  # noqa: BLE001
+        result.unknown("find_references(blank_code, max_chars=%d) unreadable: %s"
+                       % (BUDGET_FLOOR_CHARS, error))
+        return result
+    inputs = (((payload.get("_kin") or {}).get("verdict") or {}).get("inputs") or {})
+    if inputs.get("response_budget") != "inconclusive":
+        result.unknown("the response budget did not withhold rows at max_chars=%d (inputs %s), "
+                       "so no second reason was added and nothing was graded"
+                       % (BUDGET_FLOOR_CHARS, inputs))
+        return result
+    labels, problems = factor_carries_every_refusing_input(payload)
+    if labels is None:
+        result.unknown("the bounded answer carries no verdict inputs")
+        return result
+    refusing = sorted(name for name, state in inputs.items() if state == "inconclusive")
+    if problems:
+        result.bad("%s (refusing inputs %s, factor labels %s)"
+                   % ("; ".join(problems), refusing, labels))
+    else:
+        result.ok("%d refusing input(s) %s and the factor carries %s"
+                  % (len(refusing), refusing, labels))
+    return result
+
+
+CHECKS = [check_invariant, check_inverse, check_unproduced, check_two_reasons]
+DECLARED = ("invariant", "inverse", "unproduced", "two_reasons")
 
 
 # ------------------------------------------------------------------ self-test
@@ -555,6 +659,39 @@ def self_test():
            import_class_never_absent_on_importing_source(SHIPPED_0552), (False, "absent"))
     expect("no imports class is unreadable",
            import_class_never_absent_on_importing_source({"_kin": {}}), None)
+
+    def bounded(inputs, factor):
+        return {"_kin": {"verdict": {"state": "inconclusive", "limiting_factor": factor,
+                                     "inputs": inputs}}}
+    two = {"absence_gate": "inconclusive", "edge_coverage": "inconclusive",
+           "withheld_candidates": "certified", "degradations": "certified",
+           "completeness": "inconclusive", "response_budget": "inconclusive"}
+    full = ("response_bounded: the response budget withheld part of this answer; "
+            "cross_file_edges_unproduced: this build produced no entity-level imports edge for "
+            "Python; substrate_partial: the coverage classes this answer depended on were not "
+            "all observed present (calls, imports, references)")
+    expect("every refusing input has its clause",
+           factor_carries_every_refusing_input(bounded(two, full))[1], [])
+    expect("the factor a budget cut used to replace outright fails twice",
+           len(factor_carries_every_refusing_input(bounded(
+               two, "response_bounded: the response budget withheld part of this answer"))[1]), 2)
+    expect("a factor that kept only the first reading fails on the completeness clause",
+           factor_carries_every_refusing_input(bounded(
+               two, "response_bounded: x; cross_file_edges_unproduced: y"))[1],
+           ["input completeness refuses and no clause of the factor is its (labels "
+            "['response_bounded', 'cross_file_edges_unproduced'])"])
+    expect("a label said twice fails",
+           len(factor_carries_every_refusing_input(bounded(two, full + "; substrate_partial: again"))[1]),
+           1)
+    expect("a certified verdict with no clause passes",
+           factor_carries_every_refusing_input({"_kin": {"verdict": {
+               "state": "certified", "limiting_factor": None,
+               "inputs": {"edge_coverage": "certified"}}}})[1], [])
+    expect("a certified verdict carrying a clause fails",
+           len(factor_carries_every_refusing_input({"_kin": {"verdict": {
+               "state": "certified", "limiting_factor": "retrieval_degraded: x",
+               "inputs": {"edge_coverage": "certified"}}}})[1]), 1)
+    expect("no verdict inputs is unreadable", factor_carries_every_refusing_input({})[0], None)
 
     expect("every declared id has a check",
            tuple(c.__name__.replace("check_", "") for c in CHECKS), DECLARED)

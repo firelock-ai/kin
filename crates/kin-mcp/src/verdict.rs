@@ -65,6 +65,46 @@ const RESPONSE_BOUNDED_FACTOR: &str = "response_bounded: the response budget wit
                                        this answer, so its counts are a lower bound and its \
                                        absence claims are not authoritative";
 
+/// The one sentence a reader acts on, carrying every reason the inputs gave.
+///
+/// The most pessimistic input decides the STATE; it does not make the other
+/// inputs vanish. When the coverage reading and the run's own degradations both
+/// refused, a factor that kept only the first sent a reader to fix the edge gap
+/// and never told them the embedding worker had died, which is a second thing
+/// wrong with the same answer (FIR-2672). So the factor is one sentence of
+/// clauses, one per reason, in the readings' order: the absence gate's own
+/// composition first, then the coverage observation, withheld rows, the run's
+/// degradations and the completeness signal. Each clause is `label: text` and a
+/// label appears once, because the absence gate already composes the class gap
+/// and the degradations that the later readings repeat as named inputs.
+fn compose_limiting_factor(readings: &[(&str, Reading)]) -> Option<String> {
+    let mut labels: Vec<String> = Vec::new();
+    let mut clauses: Vec<String> = Vec::new();
+    for (_, reading) in readings {
+        let Reading::Inconclusive(reason) = reading else {
+            continue;
+        };
+        for clause in reason
+            .split("; ")
+            .map(str::trim)
+            .filter(|clause| !clause.is_empty())
+        {
+            let label = clause
+                .split(':')
+                .next()
+                .unwrap_or(clause)
+                .trim()
+                .to_string();
+            if labels.contains(&label) {
+                continue;
+            }
+            labels.push(label);
+            clauses.push(clause.to_string());
+        }
+    }
+    (!clauses.is_empty()).then(|| clauses.join("; "))
+}
+
 /// One input's reading of the same answer.
 enum Reading {
     /// The input observed nothing that stops this answer being acted on.
@@ -138,10 +178,7 @@ impl Verdict {
             return None;
         }
 
-        let limiting_factor = readings.iter().find_map(|(_, reading)| match reading {
-            Reading::Inconclusive(reason) => Some(reason.clone()),
-            _ => None,
-        });
+        let limiting_factor = compose_limiting_factor(&readings);
         let certified = limiting_factor.is_none();
         let inputs = readings
             .iter()
@@ -413,7 +450,7 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         return Reading::Inconclusive(format!(
             "cross_file_edges_unproduced: this build produced no entity-level {missing} edge for \
              {language} although the source carries {missing} sites the linker resolved, so a \
-             use that reaches the target through {missing} could not have been found; the gap \
+             use that reaches the target through {missing} could not have been found, and the gap \
              is in the linker, not in the code"
         ));
     }
@@ -421,7 +458,7 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     if !absent.is_empty() {
         let missing = absent.join(", ");
         return Reading::Inconclusive(format!(
-            "cross_file_edges_not_present: the graph was not observed to hold cross-file \
+            "cross_file_edges_absent: the graph was not observed to hold cross-file \
              {missing} edges for {language}, so a use that reaches the target through {missing} \
              could not have been found"
         ));
@@ -547,15 +584,21 @@ pub fn mark_response_bounded(annotated: &mut Value) {
     {
         verdict.insert("state".to_string(), json!(INCONCLUSIVE));
         verdict.insert("safe_to_conclude_absent".to_string(), json!(false));
-        verdict.insert(
-            "limiting_factor".to_string(),
-            json!(RESPONSE_BOUNDED_FACTOR),
-        );
+        // The budget cut leads the sentence and the reasons already in it
+        // follow, the same way the absence object below keeps its own; a factor
+        // that was replaced outright lost every other reason the answer had.
+        let factor = match verdict.get("limiting_factor").and_then(Value::as_str) {
+            Some(existing) if !existing.is_empty() => {
+                format!("{RESPONSE_BOUNDED_FACTOR}; {existing}")
+            }
+            _ => RESPONSE_BOUNDED_FACTOR.to_string(),
+        };
+        verdict.insert("limiting_factor".to_string(), json!(factor.clone()));
         verdict.insert(
             "note".to_string(),
             json!(format!(
                 "Treat this answer as a lower bound and do not act on an absence in it. Limiting \
-                 factor: {RESPONSE_BOUNDED_FACTOR}."
+                 factor: {factor}."
             )),
         );
         if let Some(inputs) = verdict.get_mut("inputs").and_then(Value::as_object_mut) {
@@ -736,6 +779,95 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FIR-2672, second finding. A verdict with two independent reasons names
+    /// both: the class gap decided the state and the failed embedding worker
+    /// stayed in the sentence after it, and the gap the absence gate and the
+    /// coverage reading both carry is said once. Remove a clause and the
+    /// reader loses one of the two things wrong with the answer.
+    #[test]
+    fn every_refusing_input_keeps_its_clause_in_the_factor() {
+        let readings = [
+            (
+                "absence_gate",
+                Reading::Inconclusive(
+                    "cross_file_edges_absent: the graph holds no cross-file imports edges for \
+                     python"
+                        .to_string(),
+                ),
+            ),
+            (
+                "edge_coverage",
+                Reading::Inconclusive(
+                    "cross_file_edges_absent: the graph was not observed to hold imports edges"
+                        .to_string(),
+                ),
+            ),
+            ("withheld_candidates", Reading::Certified),
+            (
+                "degradations",
+                Reading::Inconclusive(
+                    "retrieval_degraded: this query reported degradations [embed_worker_failed], \
+                     so it did not run at full capability"
+                        .to_string(),
+                ),
+            ),
+            ("completeness", Reading::Silent),
+        ];
+        let factor = compose_limiting_factor(&readings).expect("two inputs refused");
+        assert_eq!(
+            factor,
+            "cross_file_edges_absent: the graph holds no cross-file imports edges for python; \
+             retrieval_degraded: this query reported degradations [embed_worker_failed], so it \
+             did not run at full capability"
+        );
+        assert!(
+            compose_limiting_factor(&[
+                ("absence_gate", Reading::Certified),
+                ("degradations", Reading::Silent),
+            ])
+            .is_none(),
+            "no refusing input, no factor"
+        );
+    }
+
+    /// The same two reasons through `Verdict::compute` itself: a short class
+    /// and a run degradation on one populated answer. The class gap decides
+    /// and leads, the degradation follows in the same sentence, and the class
+    /// gap the absence gate and the coverage reading both carry is said once.
+    #[test]
+    fn a_verdict_with_two_refusing_inputs_names_both_in_order() {
+        let mut payload = populated_reference_payload("absent");
+        payload["degradations"] = json!([{"component": "embed_worker", "reason": "failed"}]);
+        let verdict = Verdict::compute("find_references", &payload, &Envelope::daemon(), None)
+            .expect("a retrieval payload carries a verdict")
+            .to_value();
+        assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{verdict}");
+        assert_eq!(
+            verdict["inputs"]["edge_coverage"],
+            json!(INCONCLUSIVE),
+            "{verdict}"
+        );
+        assert_eq!(
+            verdict["inputs"]["degradations"],
+            json!(INCONCLUSIVE),
+            "{verdict}"
+        );
+        let factor = verdict["limiting_factor"].as_str().expect("named");
+        let class_gap = factor
+            .find("cross_file_edges_absent:")
+            .unwrap_or_else(|| panic!("the class gap is named: {factor}"));
+        let degraded = factor
+            .find("retrieval_degraded:")
+            .unwrap_or_else(|| panic!("the degradation stays named beside it: {factor}"));
+        assert!(class_gap < degraded, "the structural gap leads: {factor}");
+        assert_eq!(
+            factor.matches("cross_file_edges_absent:").count(),
+            1,
+            "one fact, one clause: {factor}"
+        );
+        assert!(factor.contains("embed_worker:failed"), "{factor}");
+    }
 
     /// A response whose blocks all agree with a certified verdict.
     fn agreeing_response() -> Value {

@@ -282,10 +282,16 @@ exact count; on a build whose linker does not, it falls back to the same focal
 over `calls` alone, a class the fixture proves present, and names which arm ran.
 Check `unproduced` requires the import class to read `unproduced` (a build whose
 linker emits no entity-level import edge) or `present` (one whose linker does),
-never `absent`, on a source whose files import one another. The self-test feeds
-the graders the exact 0.5.52 envelope, which must fail, beside the fixed shape
-and the all-present shape, which must pass. Both worlds pass, and the shipped
-shape fails in both.
+never `absent`, on a source whose files import one another. Check `two_reasons`
+runs the same query under the server's smallest response budget, which withholds
+rows and refuses on its own, and requires every input the verdict records as
+inconclusive to keep its clause in `limiting_factor`, each label once: the
+budget's clause beside the class gap on a build that cannot produce the import
+class, the budget's clause alone on one that can. The self-test feeds the
+graders the exact 0.5.52 envelope, which must fail, beside the fixed shape and
+the all-present shape, which must pass, and a factor that kept one clause and
+dropped the rest, which must fail. Both worlds pass, and the shipped shape fails
+in both.
 
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no

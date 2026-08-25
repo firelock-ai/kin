@@ -631,7 +631,7 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
                 "cross_file_edges_unproduced: this build produced no entity-level {missing} edge \
                  for {language} although the source carries {missing} sites the linker \
                  resolved, so a use that reaches the target through {missing} could not have \
-                 been found; the gap is in the linker, not in the code"
+                 been found, and the gap is in the linker, not in the code"
             ));
         }
         if !absent.is_empty() {

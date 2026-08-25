@@ -41,6 +41,24 @@
 //! refuses on the MCP side, and `kin init` ships one today that misattributes a
 //! disabled sweep to a missing server (FIR-2531). One of those is enough.
 
+/// The marker every line of the qualifier block carries.
+///
+/// The block is one line per reason the verdict refused, each beginning with
+/// this phrase and the noun the absence is of, so "the answer minus its
+/// qualifiers" is a structural cut rather than a phrase match. The first time
+/// a second reason was rendered beside the first, a clarifying sentence went
+/// out without the phrase, and a test counting the answer's own lines counted
+/// it as the answer (FIR-2672).
+pub const QUALIFIER_MARK: &str = "Kin cannot rule out";
+
+/// `text` with the qualifier block removed: every line carrying
+/// [`QUALIFIER_MARK`], wherever it sits.
+pub fn without_qualifiers(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter(|line| !line.contains(QUALIFIER_MARK))
+        .collect()
+}
+
 /// Render the qualifier for `tool`'s empty answer, or nothing when the verdict
 /// certifies.
 ///
@@ -120,7 +138,7 @@ pub fn qualify(
             .filter(|disclosed| !disclosed.is_empty());
         return vec![match disclosed {
             Some(disclosed) => format!(
-                "{indent}Kin cannot rule out {subject}: this answer carries [{disclosed}], so it \
+                "{indent}{QUALIFIER_MARK} {subject}: this answer carries [{disclosed}], so it \
                  may not reflect current truth."
             ),
             // No degraded signal and no absent class, so the reason the verdict
@@ -137,44 +155,90 @@ pub fn qualify(
             // An unconfigured spine, alone, is not a gap in THIS repository.
             None if only_unconfigured_federation(&negative) => return Vec::new(),
             None => match limiting_factor(&negative) {
-                Some(factor) => format!("{indent}Kin cannot rule out {subject}: {factor}."),
+                Some(factor) => format!("{indent}{QUALIFIER_MARK} {subject}: {factor}."),
                 None => format!(
-                    "{indent}Kin cannot rule out {subject}: this answer's coverage could not be \
+                    "{indent}{QUALIFIER_MARK} {subject}: this answer's coverage could not be \
                      established."
                 ),
             },
         }];
     }
 
+    // One marked line per reason, in the order the verdict weighs them: the
+    // class the build could not produce, the class the graph holds none of,
+    // then the signals below. The present classes are named on the last class
+    // line rather than on a line of their own, because a line without the
+    // marker is not part of the block a reader or a test can cut.
+    let subject = absence_subject(tool);
+    let stand_in = |short: &[&str]| -> String {
+        if present.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Cross-file {} edges exist but do not stand in for {} edges.",
+                present.join(" and "),
+                short.join(" or ")
+            )
+        }
+    };
+    let short_all: Vec<&str> = unproduced.iter().chain(missing.iter()).copied().collect();
     let mut said = Vec::new();
     if !unproduced.is_empty() {
+        let tail = if missing.is_empty() {
+            stand_in(&short_all)
+        } else {
+            String::new()
+        };
         said.push(format!(
-            "{indent}Kin cannot rule out {}: this build produced no entity-level {} edge for \
+            "{indent}{QUALIFIER_MARK} {subject}: this build produced no entity-level {} edge for \
              {language} although the source carries {} sites, {}. The gap is in the linker, \
-             not in the code.",
-            absence_subject(tool),
+             not in the code.{tail}",
             unproduced.join(" or "),
             unproduced.join(" or "),
             absence_direction(tool)
         ));
     }
     if !missing.is_empty() {
+        let tail = stand_in(&short_all);
         said.push(format!(
-            "{indent}Kin cannot rule out {}: this graph holds no cross-file {} edges for \
-             {language}, {}.",
-            absence_subject(tool),
+            "{indent}{QUALIFIER_MARK} {subject}: this graph holds no cross-file {} edges for \
+             {language}, {}.{tail}",
             missing.join(" or "),
             absence_direction(tool)
         ));
     }
-    if !present.is_empty() {
-        let short: Vec<&str> = unproduced.iter().chain(missing.iter()).copied().collect();
+    // A second, independent reason does not vanish because the class gap won
+    // the state. On a daemon whose embedding worker had died beside a graph
+    // that linked only its calls, the sentences above named the edge gap and
+    // the worker's death went unsaid, so a reader learned one of the two
+    // things wrong with the answer (FIR-2672). The signals the verdict
+    // disclosed that are not the class facts already spoken follow, in the
+    // order the verdict weighs them: the structural gap first, then the run's
+    // own degradations.
+    let independent: Vec<&str> = negative
+        .get("degraded_signals")
+        .and_then(serde_json::Value::as_array)
+        .map(|signals| {
+            signals
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|label| {
+                    !label.starts_with("edge_coverage:") && !label.starts_with("absence_coverage:")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !independent.is_empty() {
         said.push(format!(
-            "{indent}Cross-file {} edges exist but do not stand in for {} edges.",
-            present.join(" and "),
-            short.join(" or ")
+            "{indent}{QUALIFIER_MARK} {subject}: this answer also carries [{}], so it may not \
+             reflect current truth.",
+            independent.join(", ")
         ));
     }
+    debug_assert!(
+        said.iter().all(|line| line.contains(QUALIFIER_MARK)),
+        "every qualifying line carries the marker: {said:?}"
+    );
     said
 }
 
