@@ -7906,6 +7906,17 @@ mod tests {
         );
         assert_eq!(unfiltered["total_upstream"], 1);
         assert_eq!(unfiltered["references"][0]["name"], "caller");
+        // A federated row has no local entity, so it has no role to read. Null
+        // rather than the `EntityRole` default, which would label every
+        // cross-repo caller product code on no evidence (FIR-1940). Asserted on
+        // the row the spine path actually built, because a hand-made row proves
+        // the serializer and not this constructor.
+        assert_eq!(
+            unfiltered["references"][0]["role"],
+            serde_json::Value::Null,
+            "{}",
+            unfiltered["references"][0]
+        );
     }
 
     #[tokio::test]
