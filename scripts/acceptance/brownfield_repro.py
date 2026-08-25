@@ -842,8 +842,12 @@ def verdict_surfaces(payload):
             out["completeness"] = ("refuse", "status=%r bound=%r" % (status, bound))
         classes = completeness.get("classes")
         if isinstance(classes, dict):
-            absent = sorted(k for k, v in classes.items()
-                            if v in ("absent", "unknown"))
+            # Any state but `present` is a class the answer could not read:
+            # `absent`, `unknown`, and since FIR-2672 `unproduced`, the class
+            # the build had sites for and emitted no edge of. A grader that
+            # listed the words it knew read the new one as healthy and flagged
+            # the correct refusal beside it as the contradiction.
+            absent = sorted(k for k, v in classes.items() if v != "present")
             if absent:
                 out["completeness.classes"] = (
                     "refuse", "classes not present: %s" % ", ".join(absent))
@@ -858,8 +862,7 @@ def verdict_surfaces(payload):
         classes = coverage.get("classes")
         gaps = []
         if isinstance(classes, dict):
-            missing = sorted(k for k, v in classes.items()
-                             if v in ("absent", "unknown"))
+            missing = sorted(k for k, v in classes.items() if v != "present")
             if missing:
                 gaps.append("classes not present: %s" % ", ".join(missing))
         enrichment = coverage.get("reference_enrichment")
@@ -2000,6 +2003,30 @@ def self_test():
     }
     certifying, _refusing = surface_conflict(verdict_surfaces(agreed))
     expect("agreed payload reports no conflict", certifying, None)
+
+    # FIR-2672's shape on a build whose linker emits no entity-level import
+    # edge: the class reads `unproduced`, every surface refuses, and the grader
+    # must read that as agreement. The version that knew only `absent` and
+    # `unknown` read `unproduced` as present and reported the one honest
+    # payload as a three-way contradiction.
+    unproduced = {
+        "negative": {"safe_to_conclude_absent": False, "trust": "inconclusive"},
+        "_kin": {"completeness": {
+            "bound": "at_least", "status": "partial",
+            "classes": {"calls": "present", "imports": "unproduced",
+                        "references": "present"},
+            "limits": ["edge_coverage:imports_unproduced", "verdict_inconclusive"]}},
+        "edge_coverage": {"classes": {"calls": "present", "imports": "unproduced",
+                                      "references": "present"},
+                          "reference_enrichment": "available", "scan": "ran"},
+    }
+    certifying, _refusing = surface_conflict(verdict_surfaces(unproduced))
+    expect("an unproduced class is read as a refusal everywhere", certifying, None)
+    expect("edge_coverage refuses on an unproduced class",
+           verdict_surfaces(unproduced)["edge_coverage"][0], "refuse")
+    expect("completeness.classes names the unproduced class",
+           verdict_surfaces(unproduced)["completeness.classes"][1],
+           "classes not present: imports")
 
     # A payload carrying no verdict block at all yields no surfaces, so a check
     # reports UNREADABLE rather than inventing agreement out of silence.

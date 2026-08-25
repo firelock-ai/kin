@@ -222,7 +222,7 @@ impl Verdict {
         completeness.status = if completeness
             .classes
             .values()
-            .any(|state| state.as_str() == Some("absent"))
+            .any(|state| matches!(state.as_str(), Some("absent") | Some("unproduced")))
         {
             "partial".to_string()
         } else {
@@ -389,26 +389,56 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         }
         return Reading::Certified;
     }
+    // Every requested class, and the most specific reason first (FIR-2672). A
+    // class this answer could not have read is a class its counts cannot be
+    // whole over, whatever kept it from being read, so the reading refuses on
+    // any state but `present` and says which state it was.
     let deciding = crate::negative::load_bearing_classes(&requested);
+    let state_of = |class: &String| {
+        states
+            .and_then(|states| states.get(class.as_str()))
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+    };
+    let in_state = |wanted: &str| -> Vec<&str> {
+        deciding
+            .iter()
+            .filter(|class| state_of(class) == wanted)
+            .map(String::as_str)
+            .collect()
+    };
+    let unproduced = in_state("unproduced");
+    if !unproduced.is_empty() {
+        let missing = unproduced.join(", ");
+        return Reading::Inconclusive(format!(
+            "cross_file_edges_unproduced: this build produced no entity-level {missing} edge for \
+             {language} although the source carries {missing} sites the linker resolved, so a \
+             use that reaches the target through {missing} could not have been found; the gap \
+             is in the linker, not in the code"
+        ));
+    }
+    let absent = in_state("absent");
+    if !absent.is_empty() {
+        let missing = absent.join(", ");
+        return Reading::Inconclusive(format!(
+            "cross_file_edges_not_present: the graph was not observed to hold cross-file \
+             {missing} edges for {language}, so a use that reaches the target through {missing} \
+             could not have been found"
+        ));
+    }
     let unhealthy: Vec<&str> = deciding
         .iter()
-        .filter(|class| {
-            states
-                .and_then(|states| states.get(class.as_str()))
-                .and_then(Value::as_str)
-                != Some("present")
-        })
+        .filter(|class| state_of(class) != "present")
         .map(String::as_str)
         .collect();
     if unhealthy.is_empty() {
         Reading::Certified
     } else {
+        let missing = unhealthy.join(", ");
         Reading::Inconclusive(format!(
-            "cross_file_edges_not_present: the graph was not observed to hold cross-file {} \
-             edges for {language}, so a use that reaches the target through {} could not have \
-             been found",
-            unhealthy.join(", "),
-            unhealthy.join(", ")
+            "edge_coverage_unknown: whether the graph holds cross-file {missing} edges for \
+             {language} could not be established, so a use that reaches the target through \
+             {missing} may not have been found"
         ))
     }
 }
@@ -982,6 +1012,101 @@ mod tests {
             "the coverage input says nothing about an answer with no language: {}",
             verdict.to_value()
         );
+    }
+
+    /// A populated reference answer whose every other input is clean, with one
+    /// requested class in the state given.
+    fn populated_reference_payload(imports: &str) -> Value {
+        json!({
+            "references": [{"name": "index_note"}, {"name": "test_blank_code_masks_fences"}],
+            "total_upstream": 2,
+            "relation_kinds": ["calls", "imports", "references"],
+            "counts": {"receiver_name_candidates": 0},
+            "degradations": [],
+            "cross_repo": {
+                "status": "available",
+                "authority_complete": true,
+                "authority_revision": "sha256:complete",
+                "authority_roots": {"local": "local-root"},
+            },
+            "focal_resolution": {
+                "addressed_by": "entity_id",
+                "same_name_candidates": 1,
+                "matched": "exact_focal_name",
+                "other_candidates": [],
+            },
+            "edge_coverage": {
+                "scope": "language",
+                "language": "Python",
+                "requested_classes": ["calls", "imports", "references"],
+                "classes": {"calls": "present", "imports": imports, "references": "present"},
+                "reference_enrichment": "available",
+                "budget_exhausted": false,
+            },
+        })
+    }
+
+    /// FIR-2672, the sole-cause case. Every input is clean except one requested
+    /// class the answer could not read, and that alone makes the verdict
+    /// inconclusive and names the class, for each of the three states a class
+    /// can be short in. The shipped 0.5.52 verdict certified this exact shape
+    /// with `imports: absent`, because the reading weighed `calls` alone.
+    #[test]
+    fn a_requested_class_the_answer_could_not_read_is_the_sole_cause_of_an_inconclusive_verdict() {
+        for (state, leading) in [
+            ("absent", "cross_file_edges_absent"),
+            ("unproduced", "cross_file_edges_unproduced"),
+            ("unknown", "edge_coverage_unknown"),
+        ] {
+            let verdict = Verdict::compute(
+                "find_references",
+                &populated_reference_payload(state),
+                &Envelope::daemon(),
+                None,
+            )
+            .expect("a retrieval payload carries a verdict")
+            .to_value();
+            assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{state}: {verdict}");
+            assert_eq!(
+                verdict["inputs"]["edge_coverage"],
+                json!(INCONCLUSIVE),
+                "{state}: the coverage input itself refuses: {verdict}"
+            );
+            let factor = verdict["limiting_factor"]
+                .as_str()
+                .expect("an inconclusive verdict names its limiting factor");
+            assert!(
+                factor.starts_with(leading) && factor.contains("imports"),
+                "{state}: the factor leads with the class's own state and names the class: \
+                 {factor}"
+            );
+            for input in ["withheld_candidates", "degradations"] {
+                assert_ne!(
+                    verdict["inputs"][input],
+                    json!(INCONCLUSIVE),
+                    "{state}: {input} was clean and must not be what refused: {verdict}"
+                );
+            }
+        }
+    }
+
+    /// The inverse of the case above, and the half that keeps the fix from
+    /// trading a false certification for a false refusal: the same answer with
+    /// every requested class present certifies, with no limiting factor.
+    #[test]
+    fn the_same_answer_with_every_class_present_still_certifies() {
+        let verdict = Verdict::compute(
+            "find_references",
+            &populated_reference_payload("present"),
+            &Envelope::daemon(),
+            None,
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+        assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+        assert_eq!(verdict["limiting_factor"], Value::Null, "{verdict}");
+        assert_eq!(verdict["inputs"]["edge_coverage"], json!(CERTIFIED));
+        assert_eq!(verdict["inputs"]["absence_gate"], json!(CERTIFIED));
     }
 
     /// The budget path downgrades every verdict surface together. Leaving

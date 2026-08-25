@@ -259,6 +259,34 @@ runs, and `kin init` refused the ejected repository over it; the check requires
 `kin init` to re-admit past it and, as its control, still to refuse an
 executable `pre-commit` by name. Eject is Unix-only, and so is the suite.
 
+`verdict_limits_repro.py` covers the one-verdict contract the rc0552s green
+stranger caught 0.5.52 breaking (FIR-2672): `find_references` on a Python
+function answered `verdict.state: certified`, `completeness.status: complete`,
+`bound: exact` and "the counts here are the whole set" in the same `_kin` block
+that recorded `classes.imports: absent` and `limits: [edge_coverage:imports_absent]`,
+and the rename the stranger made on the certified sites broke on the import
+sites Kin could never read. Every release since the one verdict existed (0.5.43)
+certified that way, because the verdict weighed `calls` alone. Check `invariant`
+queries a three-file Python package whose files reach one another through every
+class the verdict reads (imports, calls, and a class used as an annotation and
+read through its attributes, which a language server resolves into references)
+with the default classes, and requires that no requested class read anything but
+`present` while the verdict certifies: a short class must make the verdict
+inconclusive, be named in the limiting factor and in `limits`, and turn
+`status`, `bound` and `counted.exact` into a floor; with every class present the
+verdict must certify. Check `inverse` is the control that keeps that from being
+satisfied by refusing everything, and it prefers the genuine arm: on a build
+whose linker produces entity-level import edges, the default query has every
+requested class present and must certify with `limiting_factor: null` and an
+exact count; on a build whose linker does not, it falls back to the same focal
+over `calls` alone, a class the fixture proves present, and names which arm ran.
+Check `unproduced` requires the import class to read `unproduced` (a build whose
+linker emits no entity-level import edge) or `present` (one whose linker does),
+never `absent`, on a source whose files import one another. The self-test feeds
+the graders the exact 0.5.52 envelope, which must fail, beside the fixed shape
+and the all-present shape, which must pass. Both worlds pass, and the shipped
+shape fails in both.
+
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no
 corpus. Each case is paired with its inverse, so a grader that cannot tell its
@@ -296,6 +324,10 @@ python3 scripts/acceptance/first_contact_honesty.py \
 python3 scripts/acceptance/eject_journal_repro.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/eject_journal.json --verbose
+
+python3 scripts/acceptance/verdict_limits_repro.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/verdict_limits.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer

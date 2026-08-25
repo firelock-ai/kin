@@ -449,20 +449,19 @@ fn reference_classes() -> Vec<String> {
 /// classes are still disclosed through [`edge_coverage_degradation_labels`], so a
 /// reader sees what the verdict rests on either way.
 ///
-/// A query that asked for no load-bearing class falls back to the classes it did
-/// ask for, so an `imports`-only or `references`-only query is still gated on
-/// what it actually read rather than on nothing.
+/// Every class the query asked for. This used to narrow to `calls`, on the
+/// reasoning above, and the narrowing is what FIR-2672 is: the verdict rested on
+/// `calls` alone, published `imports: absent` beside it as a limit nobody
+/// weighed, and certified an answer as the whole set while its own completeness
+/// block recorded the class it could not have read. A class the answer could not
+/// have read is a class its counts cannot be whole over, whatever the reason,
+/// so every requested class decides. What the narrowing was protecting against,
+/// every Python answer reading inconclusive because Kin minted no entity-level
+/// `Imports` edge, is now said in those words: the scan reports such a class
+/// `unproduced` rather than `absent`, and the verdict names the build gap as its
+/// limiting factor instead of hiding it.
 pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
-    let load_bearing: Vec<String> = requested
-        .iter()
-        .filter(|class| class.as_str() == "calls")
-        .cloned()
-        .collect();
-    if load_bearing.is_empty() {
-        requested.to_vec()
-    } else {
-        load_bearing
-    }
+    requested.to_vec()
 }
 
 /// Whether this answer's own observation says cross-file reference edges were
@@ -508,14 +507,13 @@ pub(crate) fn references_producible(payload: &Value) -> bool {
 /// absence is a finding rather than the ordinary silence of a language server
 /// that never ran.
 pub(crate) fn deciding_classes(requested: &[String], references_producible: bool) -> Vec<String> {
-    let mut deciding = load_bearing_classes(requested);
-    if references_producible
-        && requested.iter().any(|class| class == "references")
-        && !deciding.iter().any(|class| class == "references")
-    {
-        deciding.push("references".to_string());
-    }
-    deciding
+    // Every requested class decides (FIR-2672). `references` no longer joins
+    // conditionally: when this host cannot produce it, `reference_enrichment`
+    // refuses by name before any class is read, and when nobody established
+    // whether it can, an unread class is the unknown case the whole module
+    // refuses on rather than the healthy one.
+    let _ = references_producible;
+    load_bearing_classes(requested)
 }
 
 /// Why the graph cannot certify this absence, or `None` when every substrate the
@@ -618,10 +616,24 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
 
     if !requested.is_empty() {
         let required = deciding_classes(&requested, references_producible(payload));
+        let unproduced = classes_in_state(&required, states, "unproduced");
         let absent = classes_in_state(&required, states, "absent");
         let unknown = classes_in_state(&required, states, "unknown");
         let present = classes_in_state(&requested, states, "present");
 
+        if !unproduced.is_empty() {
+            // The build, not the code. The scan completed, saw no entity-rooted
+            // edge of the class at all, and the parse side shows sites the
+            // linker had to resolve, so no scan of this graph could have found a
+            // use that reaches the target through it (FIR-2672).
+            let missing = unproduced.join(", ");
+            gaps.push(format!(
+                "cross_file_edges_unproduced: this build produced no entity-level {missing} edge \
+                 for {language} although the source carries {missing} sites the linker \
+                 resolved, so a use that reaches the target through {missing} could not have \
+                 been found; the gap is in the linker, not in the code"
+            ));
+        }
         if !absent.is_empty() {
             let missing = absent.join(", ");
             // Naming what IS present matters as much as naming what is missing. The
@@ -786,19 +798,27 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
         _ => None,
     };
     if let Some(cause) = cause {
-        gaps.push(if requested.is_empty() {
-            format!(
-                "entity_index_unresolved: {cause}, so nothing resolves the program behind its \
+        // At the head of the list, not the tail. Since FIR-2672 every requested
+        // class refuses on its own, so a language whose reference edges could
+        // never exist reports the class gap and this one, and this is the
+        // sharper of the two: nothing a reader does about coverage moves a
+        // class the build or the host cannot produce.
+        gaps.insert(
+            0,
+            if requested.is_empty() {
+                format!(
+                    "entity_index_unresolved: {cause}, so nothing resolves the program behind its \
                  parsed declarations, and an empty name/kind filter cannot separate a declaration \
                  the repository does not have from one the extractor did not admit as an entity \
                  of that kind"
-            )
-        } else {
-            format!(
+                )
+            } else {
+                format!(
                 "reference_enrichment_unsupported: {cause}, so an empty result cannot separate a \
                  symbol nothing uses from one this graph could never have linked"
             )
-        });
+            },
+        );
     }
 
     // FIR-2496, and the gate every other one in this function was standing in
@@ -2572,12 +2592,16 @@ mod tests {
     /// `imports` stays absent because Kin's linker mints no entity-level
     /// `Imports` relation on any language, healthy or not.
     fn cross_file_edges_observed() -> Value {
+        // Every requested class present. This fixture used to read `imports:
+        // absent` and still stand for a healthy graph, because the verdict
+        // weighed `calls` alone; since FIR-2672 every requested class decides,
+        // so "healthy" means what it says.
         json!({
             "scope": "language",
             "language": "Rust",
             "requested_classes": ["calls", "imports", "references"],
-            "classes": { "calls": "present", "imports": "absent", "references": "present" },
-            "cross_file_classes": ["calls", "references"],
+            "classes": { "calls": "present", "imports": "present", "references": "present" },
+            "cross_file_classes": ["calls", "imports", "references"],
             "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 2,
@@ -4157,8 +4181,15 @@ mod tests {
     /// cross-file. This fixture claimed the resolution and denied the edges
     /// until FIR-2505, which is the same contradiction the express payload
     /// shipped, and it is why nothing here failed while a deletion was certified.
+    /// FIR-2672. This case used to assert that the shape certified, under the
+    /// reasoning that Kin minted no entity-level `Imports` edge and a gate on
+    /// the class would refuse every Python answer. It is the shape the rc0552s
+    /// stranger received, verbatim in every field that decides: `calls` and
+    /// `references` present, a language server available, `imports: absent`
+    /// disclosed one field away, and a certification over it. The rename it
+    /// made on the certified sites broke on the import sites Kin never read.
     #[test]
-    fn a_python_graph_that_resolves_its_imports_still_certifies_an_unused_symbol() {
+    fn a_python_graph_whose_import_edges_were_never_produced_does_not_certify_an_unused_symbol() {
         let mut payload = authoritative_empty_references("function");
         payload["focal_entity"]["name"] = json!("never_used_anywhere");
         payload["focal_entity"]["file_path"] = json!("pkg/parsing.py");
@@ -4177,36 +4208,35 @@ mod tests {
 
         assert_eq!(
             negative["safe_to_conclude_absent"],
-            json!(true),
-            "a language this build can enrich, whose cross-file uses resolve, still \
-             earns absence: {}",
-            negative
+            json!(false),
+            "a class the answer could not read is a class its absence cannot be certified \
+             over: {negative}"
         );
-        assert_eq!(negative["trust"], json!("authoritative"));
-        assert!(negative["advice"]
-            .as_str()
-            .unwrap()
-            .contains("Absence is authoritative"));
-        // Certified, and still honest about the class it did not observe. The
-        // verdict rests on the resolved calls and references; saying that no
-        // entity-level import edge was seen is what keeps the next reader from
-        // mistaking it for full coverage.
-        assert_eq!(
-            negative["degraded_signals"],
-            json!(["edge_coverage:imports_absent"])
-        );
-        // And FIR-2505's second half on the shape where it bites: an
-        // authoritative verdict that publishes a signal must recite it rather
-        // than claim the response carried none.
+        assert_eq!(negative["trust"], json!("inconclusive"));
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(
-            !reason.contains("no degraded signals"),
-            "a verdict disclosing imports_absent must not claim there were none: {reason}"
+            reason.starts_with("cross_file_edges_absent") && reason.contains("imports"),
+            "the reason leads with the class and its state: {reason}"
         );
-        assert!(
-            reason.contains("edge_coverage:imports_absent"),
-            "the reason recites what it disclosed: {reason}"
+        assert_eq!(
+            negative["degraded_signals"],
+            json!(["edge_coverage:imports_absent"]),
+            "and the class is still disclosed as the signal it always was"
         );
+
+        // The inverse: the same answer over a graph whose import edges exist
+        // certifies, so the refusal is the class and nothing else.
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
+        payload["edge_coverage"]["cross_file_classes"] = json!(["calls", "imports", "references"]);
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "{negative}"
+        );
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert_eq!(negative["degraded_signals"], json!([]));
     }
 
     /// The one gate reads two independent declarations, and a tool that
@@ -4278,11 +4308,15 @@ mod tests {
     /// repository and `express.static` 26 times.
     #[test]
     fn a_producible_reference_class_that_produced_nothing_blocks_the_deletion_verdict() {
-        let payload = json!({
+        let mut payload = json!({
             "entity_impacts": [],
             "dependents": [],
             "edge_coverage": express_deletion_coverage("absent", "available")
         });
+        // Isolate the class under test. The express shape carries `imports:
+        // absent` too, and since FIR-2672 that refuses on its own, so it would
+        // lead the sentence this case reads for `references`.
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
         for tool in ["impact_analysis", "get_context_pack"] {
             let gap = absence_coverage_gap(tool, &payload)
                 .unwrap_or_else(|| panic!("{tool} must not certify the express deletion shape"));
@@ -4321,31 +4355,38 @@ mod tests {
 
     /// The control FIR-2404's descendants exist to protect: the gate must not
     /// answer "uncertain" to everything. The identical question on a graph whose
-    /// enrichment actually delivered still certifies, so a genuinely dead entity
-    /// stays deletable and the verdict keeps its ability to say yes.
+    /// enrichment actually delivered, and whose every requested class is
+    /// present, still certifies, so a genuinely dead entity stays deletable and
+    /// the verdict keeps its ability to say yes. This is also FIR-2672's
+    /// inverse: the fix must not trade a false certification for a false
+    /// refusal.
     #[test]
     fn an_enriched_graph_still_certifies_the_same_deletion_question() {
-        let payload = json!({
+        let mut payload = json!({
             "entity_impacts": [],
             "dependents": [],
             "edge_coverage": express_deletion_coverage("present", "available")
         });
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
         for tool in ["impact_analysis", "get_context_pack"] {
             assert_eq!(
                 absence_coverage_gap(tool, &payload),
                 None,
-                "{tool} must still certify when the reference class is present"
+                "{tool} must still certify when every requested class is present"
             );
         }
     }
 
-    /// The boundary that keeps the gate narrow. Kin's linker mints no
-    /// entity-level `Imports` relation on any language, so `imports: absent` is
-    /// the reading on every real graph including the healthy ones, and gating on
-    /// it would report every answer everywhere as inconclusive. The express
-    /// payload named it as a limit and it is disclosed, not load-bearing.
+    /// FIR-2672. This used to assert the opposite, under the reasoning that Kin
+    /// minted no entity-level `Imports` edge on any language, so gating on the
+    /// class would report every answer everywhere as inconclusive. That is
+    /// exactly what happened to the rc0552s stranger: the express payload named
+    /// `imports_absent` as a limit, the verdict weighed `calls` alone, and a
+    /// deletion was certified over a class the answer could never have read.
+    /// A class the answer could not read is a class its counts cannot be whole
+    /// over, whatever the reason, and the gap says which reason it was.
     #[test]
-    fn imports_absent_alone_is_never_what_blocks_a_verdict() {
+    fn imports_absent_alone_blocks_a_verdict_and_names_itself() {
         let payload = json!({
             "entity_impacts": [],
             "edge_coverage": express_deletion_coverage("present", "available")
@@ -4354,7 +4395,30 @@ mod tests {
             payload["edge_coverage"]["classes"]["imports"],
             json!("absent")
         );
-        assert_eq!(absence_coverage_gap("impact_analysis", &payload), None);
+        let gap = absence_coverage_gap("impact_analysis", &payload)
+            .expect("an absent requested class refuses on its own");
+        assert!(
+            gap.starts_with("cross_file_edges_absent"),
+            "the gap leads with the class's state: {gap}"
+        );
+        assert!(
+            gap.contains("no cross-file imports edges for JavaScript"),
+            "and names the class and the language: {gap}"
+        );
+
+        // The build-gap reading of the same class, when the scan could say so.
+        let mut unproduced = payload.clone();
+        unproduced["edge_coverage"]["classes"]["imports"] = json!("unproduced");
+        let gap = absence_coverage_gap("impact_analysis", &unproduced)
+            .expect("an unproduced requested class refuses on its own");
+        assert!(
+            gap.starts_with("cross_file_edges_unproduced"),
+            "the gap leads with the class's state: {gap}"
+        );
+        assert!(
+            gap.contains("the gap is in the linker, not in the code"),
+            "and says where the gap is: {gap}"
+        );
     }
 
     /// A host that could never have produced the class keeps its own reason. The
@@ -4390,17 +4454,40 @@ mod tests {
     /// makes no claim about silence.
     #[test]
     fn a_certified_verdict_recites_its_disclosed_signals_instead_of_denying_them() {
-        let payload = json!({
+        // FIR-2672 closed the shape this case was written on: a coverage signal
+        // disclosed beside an authoritative verdict. Every disclosed coverage
+        // shortfall now refuses, so the invariant this case guards, that the
+        // reason sentence agrees with the `degraded_signals` beside it, is
+        // asserted on both arms it can still take: a verdict with nothing
+        // disclosed says so, and a verdict with a class disclosed short recites
+        // that class in its refusal rather than claiming there was nothing.
+        let mut payload = json!({
             "entity_impacts": [],
             "edge_coverage": express_deletion_coverage("present", "available")
         });
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
         let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
             .expect("impact_analysis always qualifies");
-        assert_eq!(negative["trust"], json!("authoritative"));
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        assert_eq!(negative["degraded_signals"], json!([]), "{negative}");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("no degraded signals"),
+            "a verdict with nothing disclosed says so: {reason}"
+        );
+        assert!(
+            reason.contains("structural_authoritative"),
+            "the substrate verdict is kept, not replaced: {reason}"
+        );
+
+        payload["edge_coverage"]["classes"]["imports"] = json!("absent");
+        let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
+            .expect("impact_analysis always qualifies");
+        assert_eq!(negative["trust"], json!("inconclusive"), "{negative}");
         let signals = negative["degraded_signals"].as_array().unwrap().clone();
         assert!(
-            !signals.is_empty(),
-            "this shape discloses imports_absent, or the test is asserting nothing"
+            signals.contains(&json!("edge_coverage:imports_absent")),
+            "the short class is disclosed as a signal: {negative}"
         );
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(
@@ -4408,12 +4495,8 @@ mod tests {
             "a verdict publishing {signals:?} must not claim there were none: {reason}"
         );
         assert!(
-            reason.contains("edge_coverage:imports_absent"),
-            "the reason recites what it disclosed: {reason}"
-        );
-        assert!(
-            reason.contains("structural_authoritative"),
-            "the substrate verdict is kept, not replaced: {reason}"
+            reason.contains("imports"),
+            "the reason recites the class it disclosed: {reason}"
         );
     }
 
@@ -4586,7 +4669,11 @@ mod tests {
             embed_worker_failed: Some(true),
             ..Degraded::default()
         };
-        let payload = authoritative_empty_references("function");
+        // One coverage shortfall on purpose, so the second half of the
+        // assertion below has something to keep: the healthy fixture carries
+        // none since FIR-2672 made every class decide.
+        let mut payload = authoritative_empty_references("function");
+        payload["edge_coverage"]["classes"]["imports"] = json!("absent");
         let negative = negative_for("find_references", &payload, &env).unwrap();
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
         assert!(negative["trust_reason"]
@@ -5877,7 +5964,7 @@ mod tests {
             "scope": "language",
             "language": "Python",
             "requested_classes": ["calls", "imports", "references"],
-            "classes": {"calls": "present", "imports": "absent", "references": "absent"},
+            "classes": {"calls": "present", "imports": "present", "references": "present"},
             "reference_enrichment": "unknown",
             "budget_exhausted": false,
         });

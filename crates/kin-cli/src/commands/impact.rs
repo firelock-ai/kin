@@ -861,7 +861,7 @@ mod tests {
         let callee = entity("callee", "src/b.rs");
         graph.upsert_entity(&caller).unwrap();
         graph.upsert_entity(&callee).unwrap();
-        calls(&graph, &caller, &callee);
+        healthy_cross_file_coverage(&graph, &caller, &callee);
         let dir = tempfile::tempdir().unwrap();
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
 
@@ -1233,10 +1233,31 @@ mod tests {
     }
 
     fn calls(graph: &kin_db::InMemoryGraph, src: &Entity, dst: &Entity) {
+        links(graph, src, dst, RelationKind::Calls);
+    }
+
+    /// Every reference class the verdict reads, across one file boundary.
+    ///
+    /// A fixture whose coverage is meant to be healthy has to hold all three
+    /// since FIR-2672, because every requested class decides; one that links
+    /// its calls alone is honestly short of imports and references, and the
+    /// verdict says so.
+    fn healthy_cross_file_coverage(graph: &kin_db::InMemoryGraph, src: &Entity, dst: &Entity) {
+        for kind in [
+            RelationKind::Calls,
+            RelationKind::Imports,
+            RelationKind::References,
+        ] {
+            links(graph, src, dst, kind);
+        }
+    }
+
+    fn links(graph: &kin_db::InMemoryGraph, src: &Entity, dst: &Entity, kind: RelationKind) {
+        let label = format!("{kind:?}").to_ascii_lowercase();
         graph
             .upsert_relation(&Relation {
-                id: RelationId::from_content(&src.id.to_string(), &dst.id.to_string(), "calls"),
-                kind: RelationKind::Calls,
+                id: RelationId::from_content(&src.id.to_string(), &dst.id.to_string(), &label),
+                kind,
                 src: GraphNodeId::Entity(src.id),
                 dst: GraphNodeId::Entity(dst.id),
                 confidence: 1.0,
@@ -2203,7 +2224,7 @@ mod tests {
         }
         // Healthy cross-file coverage, so the only thing separating the two arms
         // below is the daemon's own health.
-        calls(&graph, &caller, &callee);
+        healthy_cross_file_coverage(&graph, &caller, &callee);
 
         let dir = tempfile::tempdir().unwrap();
         let layout = kin_core::KinLayout::new(dir.path().join(".kin"));

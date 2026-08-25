@@ -79,13 +79,19 @@ pub fn qualify(
     };
 
     // Only the classes the gate rested on may be named, read off the record the
-    // verdict publishes rather than recomputed. Listing every absent class would
-    // tell a reader their import edges were the problem on a store where imports
-    // never mattered: Kin's linker mints no entity-level `Imports` relation on
-    // any language, so that class reads absent on healthy graphs too.
-    let missing: Vec<&'static str> = decided_by(tool, payload, envelope)
+    // verdict publishes rather than recomputed, so this renderer cannot name a
+    // class the decision did not use. Every requested class decides now
+    // (FIR-2672), and a class the build could not produce reads `unproduced`
+    // rather than `absent`, so the sentence below can say which it was.
+    let decided = decided_by(tool, payload, envelope);
+    let unproduced: Vec<&'static str> = decided
         .iter()
-        .filter(|class| state_of(class) == Some("absent"))
+        .filter(|class| state_of(class) == Some("unproduced"))
+        .map(|class| edge_class_noun(class))
+        .collect();
+    let missing: Vec<&'static str> = decided
+        .iter()
+        .filter(|class| matches!(state_of(class), Some("absent") | Some("unknown")))
         .map(|class| edge_class_noun(class))
         .collect();
     let present: Vec<&'static str> = ["calls", "imports", "references"]
@@ -99,7 +105,7 @@ pub fn qualify(
     // is whatever the verdict actually disclosed. This is also the whole of the
     // language-scoped path: `semantic_search` reads no edge class, so its
     // qualifier always renders from the disclosed signals.
-    if missing.is_empty() {
+    if missing.is_empty() && unproduced.is_empty() {
         let subject = absence_subject(tool);
         let disclosed = negative
             .get("degraded_signals")
@@ -140,18 +146,33 @@ pub fn qualify(
         }];
     }
 
-    let mut said = vec![format!(
-        "{indent}Kin cannot rule out {}: this graph holds no cross-file {} edges for {language}, \
-         {}.",
-        absence_subject(tool),
-        missing.join(" or "),
-        absence_direction(tool)
-    )];
+    let mut said = Vec::new();
+    if !unproduced.is_empty() {
+        said.push(format!(
+            "{indent}Kin cannot rule out {}: this build produced no entity-level {} edge for \
+             {language} although the source carries {} sites, {}. The gap is in the linker, \
+             not in the code.",
+            absence_subject(tool),
+            unproduced.join(" or "),
+            unproduced.join(" or "),
+            absence_direction(tool)
+        ));
+    }
+    if !missing.is_empty() {
+        said.push(format!(
+            "{indent}Kin cannot rule out {}: this graph holds no cross-file {} edges for \
+             {language}, {}.",
+            absence_subject(tool),
+            missing.join(" or "),
+            absence_direction(tool)
+        ));
+    }
     if !present.is_empty() {
+        let short: Vec<&str> = unproduced.iter().chain(missing.iter()).copied().collect();
         said.push(format!(
             "{indent}Cross-file {} edges exist but do not stand in for {} edges.",
             present.join(" and "),
-            missing.join(" or ")
+            short.join(" or ")
         ));
     }
     said
