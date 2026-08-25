@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.53] - 2026-08-25
+
+### Changed
+
+- Retire the eject journal when an eject finishes, and stop counting docs.url as a hook (#1121)
+
+
 ## [0.5.52] - 2026-08-24
 
 ### Changed
