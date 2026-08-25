@@ -6733,9 +6733,20 @@ impl LocalFileBackend {
         // from a state that already passed the semantic admission gate, so
         // repeating that pass here would re-walk every Git projection tree the
         // gate just walked.
-        let _snapshot = match history_validator_version {
-            Some(_) => GraphSnapshot::decode_pre_validated(data)?,
-            None => GraphSnapshot::from_bytes(data)?,
+        match history_validator_version {
+            // Pre-validated bytes only owe a round-trip proof here, and this
+            // proves it without assembling the graph it proves. Decoding into an
+            // owned GraphSnapshot and dropping it on the next line was a
+            // conversion's single largest allocation, about 855 MiB, and it set
+            // the whole run's peak because it happens last, while every retained
+            // byte underneath it is still live (FIR-2654).
+            Some(_) => GraphSnapshot::prove_pre_validated_round_trip(data)?,
+            // Unvalidated bytes still owe the semantic admission pass, which
+            // walks the assembled snapshot. That obligation needs the value, so
+            // this arm keeps the full decode.
+            None => {
+                let _snapshot = GraphSnapshot::from_bytes(data)?;
+            }
         };
         let new_gen = checked_next_generation(current_gen, "local snapshot")?;
         let snapshots = namespace

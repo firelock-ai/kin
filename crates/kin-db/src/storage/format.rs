@@ -165,6 +165,154 @@ pub(crate) enum AuthorityEnvelope {
     Ignored,
 }
 
+/// Deserialize every entry of a map with its real key and value types, and keep
+/// none of them.
+///
+/// The write path proves a snapshot round-trips before it writes the bytes, and
+/// on a converted repository that proof was the single largest allocation a
+/// conversion made: `rmp_serde::from_slice::<GraphSnapshot>` materialized the
+/// whole graph, about 855 MiB, purely to drop it (FIR-2654). What the proof
+/// needs is that every element PARSES as the type it was written from, not that
+/// the collections are assembled.
+///
+/// `serde::de::IgnoredAny` would be far cheaper and would prove nothing: it
+/// accepts any well-formed MessagePack, so a map of the wrong element type
+/// passes. This visits each entry with the declared `K` and `V`, so custom
+/// `Deserialize` impls and `deserialize_with` hooks still run, and the entry is
+/// dropped as soon as it has been proved.
+pub(crate) struct DrainMap<K, V> {
+    pub(crate) len: usize,
+    _marker: std::marker::PhantomData<(K, V)>,
+}
+
+impl<'de, K, V> serde::Deserialize<'de> for DrainMap<K, V>
+where
+    K: serde::Deserialize<'de>,
+    V: serde::Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<K, V>(std::marker::PhantomData<(K, V)>);
+        impl<'de, K, V> serde::de::Visitor<'de> for Visitor<K, V>
+        where
+            K: serde::Deserialize<'de>,
+            V: serde::Deserialize<'de>,
+        {
+            type Value = DrainMap<K, V>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a map whose entries parse as their declared types")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut len = 0usize;
+                // The entry is bound and dropped inside the loop: peak is one
+                // entry, not the whole map.
+                while access.next_entry::<K, V>()?.is_some() {
+                    len += 1;
+                }
+                Ok(DrainMap {
+                    len,
+                    _marker: std::marker::PhantomData,
+                })
+            }
+        }
+        deserializer.deserialize_map(Visitor(std::marker::PhantomData))
+    }
+}
+
+/// The sequence form of [`DrainMap`], with the same contract.
+pub(crate) struct DrainSeq<T> {
+    pub(crate) len: usize,
+    _marker: std::marker::PhantomData<T>,
+}
+
+impl<'de, T> serde::Deserialize<'de> for DrainSeq<T>
+where
+    T: serde::Deserialize<'de>,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor<T>(std::marker::PhantomData<T>);
+        impl<'de, T> serde::de::Visitor<'de> for Visitor<T>
+        where
+            T: serde::Deserialize<'de>,
+        {
+            type Value = DrainSeq<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a sequence whose elements parse as their declared type")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut len = 0usize;
+                while access.next_element::<T>()?.is_some() {
+                    len += 1;
+                }
+                Ok(DrainSeq {
+                    len,
+                    _marker: std::marker::PhantomData,
+                })
+            }
+        }
+        deserializer.deserialize_seq(Visitor(std::marker::PhantomData))
+    }
+}
+
+/// [`GraphSnapshot`]'s shape, for proving bytes round-trip without keeping them.
+///
+/// Every field appears here, in `GraphSnapshot`'s order, because the on-disk
+/// body is compact MessagePack: a struct is a positional ARRAY, so this type's
+/// field count is part of the format it decodes. A field added to
+/// `GraphSnapshot` and not to this mirror therefore fails LOUDLY, with
+/// `array had incorrect length`, rather than silently proving less than it
+/// claims. That property is what makes a hand-maintained mirror safe, and
+/// `round_trip_proof_notices_a_field_added_to_the_snapshot` holds it.
+///
+/// The large collections are drained; everything else keeps its real type, so
+/// the authority envelope's `deserialize_with` hook still runs here exactly as
+/// it does in a full decode.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+#[allow(dead_code)]
+pub(crate) struct GraphSnapshotRoundTripProof {
+    pub(crate) version: u32,
+    pub(crate) entities: DrainMap<EntityId, Entity>,
+    pub(crate) relations: DrainMap<RelationId, Relation>,
+    pub(crate) outgoing: DrainMap<EntityId, Vec<RelationId>>,
+    pub(crate) incoming: DrainMap<EntityId, Vec<RelationId>>,
+    pub(crate) changes: DrainMap<SemanticChangeId, SemanticChange>,
+    pub(crate) change_children: DrainMap<SemanticChangeId, Vec<SemanticChangeId>>,
+    pub(crate) work_items: DrainMap<WorkId, WorkItem>,
+    pub(crate) annotations: DrainMap<AnnotationId, Annotation>,
+    pub(crate) work_links: DrainSeq<WorkLink>,
+    pub(crate) reviews: DrainMap<ReviewId, Review>,
+    pub(crate) review_decisions: DrainMap<ReviewId, Vec<ReviewDecision>>,
+    pub(crate) review_notes: DrainSeq<ReviewNote>,
+    pub(crate) review_discussions: DrainSeq<ReviewDiscussion>,
+    pub(crate) review_assignments: DrainMap<ReviewId, Vec<ReviewAssignment>>,
+    pub(crate) test_cases: DrainMap<TestId, TestCase>,
+    pub(crate) assertions: DrainMap<AssertionId, Assertion>,
+    pub(crate) verification_runs: DrainMap<VerificationRunId, VerificationRun>,
+    pub(crate) mock_hints: DrainSeq<MockHint>,
+    pub(crate) contracts: DrainMap<ContractId, Contract>,
+    pub(crate) actors: DrainMap<ActorId, Actor>,
+    pub(crate) delegations: DrainSeq<Delegation>,
+    pub(crate) approvals: DrainSeq<Approval>,
+    pub(crate) audit_events: DrainSeq<AuditEvent>,
+    pub(crate) shallow_files: DrainSeq<ShallowTrackedFile>,
+    pub(crate) file_layouts: DrainSeq<FileLayout>,
+    pub(crate) structured_artifacts: DrainSeq<StructuredArtifact>,
+    pub(crate) opaque_artifacts: DrainSeq<OpaqueArtifact>,
+    pub(crate) resolved_tree: ResolvedTree,
+    pub(crate) sessions: DrainMap<SessionId, AgentSession>,
+    pub(crate) intents: DrainMap<IntentId, Intent>,
+    pub(crate) downstream_warnings: DrainSeq<(IntentId, EntityId, String)>,
+    pub(crate) entity_revisions: DrainMap<EntityId, Vec<EntityRevision>>,
+    pub(crate) repository_authority: Option<PersistedRepositoryAuthority>,
+    pub(crate) external_references: DrainMap<ExternalReferenceId, ExternalReference>,
+}
+
 /// The serializable snapshot of the entire graph state.
 ///
 /// This is the on-disk format. We use std::collections::HashMap here
@@ -606,9 +754,62 @@ impl GraphSnapshot {
     /// caller may enter this boundary only for bytes serialized from a state
     /// that passed the admission gate and could not change between that gate and
     /// this decode.
+    ///
+    /// Retained under `cfg(test)` only. `prove_pre_validated_round_trip`
+    /// replaced its one caller on the write path, and it stays as the reference
+    /// decoder that path is checked against: a cheap proof is only trustworthy
+    /// while something asserts it accepts exactly what the full decode accepts.
+    #[cfg(test)]
     pub(crate) fn decode_pre_validated(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
         Self::from_bytes_with_persisted_root_hash_inner(data, true, false)
             .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Prove pre-validated bytes round-trip, without keeping what they decode to.
+    ///
+    /// Exactly the obligations [`Self::decode_pre_validated`] discharges, in the
+    /// same order: the frame and its checksum, every element parsed as its
+    /// declared type, and the root-hash trailer. It differs only in what it
+    /// retains, which is nothing.
+    ///
+    /// The write path called `decode_pre_validated` and dropped the result on
+    /// the next line. On a converted repository that discarded value was about
+    /// 855 MiB, allocated while the caller still held the encoded frame and the
+    /// whole retained import ladder, which made it the ceiling of a conversion's
+    /// peak (FIR-2654).
+    ///
+    /// Deliberately NOT used for the admission-validating path: that one needs
+    /// the assembled snapshot to walk, and it is a different obligation than
+    /// round-tripping.
+    pub fn prove_pre_validated_round_trip(data: &[u8]) -> Result<(), crate::error::KinDbError> {
+        let _span = tracing::info_span!("kindb.snapshot.prove_round_trip").entered();
+        let frame = Self::decode_frame(data, true)?;
+        match frame.version {
+            Self::CURRENT_VERSION => {
+                let _span = tracing::info_span!("kindb.snapshot.decode_round_trip_proof").entered();
+                let proof: GraphSnapshotRoundTripProof = rmp_serde::from_slice(frame.body)
+                    .map_err(|e| {
+                        crate::error::KinDbError::StorageError(format!(
+                            "deserialization failed: {e}"
+                        ))
+                    })?;
+                // Report what was actually proved. Without this the counts are
+                // dead weight and the log says only that a proof ran, which is
+                // the same thing a proof that walked nothing would say.
+                tracing::debug!(
+                    entities = proof.entities.len,
+                    relations = proof.relations.len,
+                    changes = proof.changes.len,
+                    entity_revisions = proof.entity_revisions.len,
+                    audit_events = proof.audit_events.len,
+                    "snapshot round-trip proved without retaining the snapshot"
+                );
+                drop(proof);
+            }
+            _ => unreachable!("decode_frame validates supported versions"),
+        }
+        Self::decode_root_hash_trailer(data, &frame)?;
+        Ok(())
     }
 
     fn from_bytes_with_persisted_root_hash_inner(
@@ -1887,6 +2088,105 @@ mod tests {
         assert_eq!(stats.total_removed(), 0);
         assert_eq!(stats.entities_before, 0);
         assert_eq!(stats.relations_before, 0);
+    }
+
+    // ── FIR-2654: the write path's round-trip proof stopped keeping the graph ──
+
+    /// The number of fields the on-disk body carries, read off the MessagePack
+    /// array header. Compact MessagePack encodes a struct positionally, so this
+    /// is the format's own field count rather than a restatement of the source.
+    fn encoded_field_count(body: &[u8]) -> usize {
+        match body[0] {
+            b @ 0x90..=0x9f => (b & 0x0f) as usize,
+            0xdc => u16::from_be_bytes([body[1], body[2]]) as usize,
+            0xdd => u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize,
+            other => panic!("snapshot body is not a MessagePack array: first byte {other:#x}"),
+        }
+    }
+
+    #[test]
+    fn round_trip_proof_lists_every_field_the_snapshot_encodes() {
+        // The tripwire that makes a hand-maintained mirror safe. A field added
+        // to GraphSnapshot changes the encoded array's arity, and the proof
+        // type then refuses the bytes with `array had incorrect length` rather
+        // than proving less than it claims. This test names the drift directly
+        // so the next reader does not have to decode that error first.
+        let snapshot = GraphSnapshot::empty();
+        let body = rmp_serde::to_vec(&snapshot).expect("empty snapshot serializes");
+        let encoded = encoded_field_count(&body);
+        let proof: GraphSnapshotRoundTripProof = rmp_serde::from_slice(&body).unwrap_or_else(|e| {
+            panic!(
+                "GraphSnapshotRoundTripProof no longer matches GraphSnapshot's {encoded} encoded \
+                 fields: {e}. Add the new field to the mirror, in the same position."
+            )
+        });
+        assert_eq!(proof.version, snapshot.version);
+    }
+
+    #[test]
+    fn drain_map_parses_every_entry_with_its_declared_type() {
+        // The control that makes the proof worth running, and it has to test the
+        // wrapper directly. Routing it through the whole snapshot did not work:
+        // a short body fails on the array's ARITY before any element type is
+        // examined, so that version of this test passed with the wrappers
+        // swapped for `serde::de::IgnoredAny`, which proves nothing.
+        let body = rmp_serde::to_vec(&HashMap::from([("k".to_string(), 7u32)]))
+            .expect("a map of integers serializes");
+
+        let matching: DrainMap<String, u32> =
+            rmp_serde::from_slice(&body).expect("the declared types match these bytes");
+        assert_eq!(
+            matching.len, 1,
+            "the entry must be counted as it is drained"
+        );
+
+        // An Entity is not a u32. `IgnoredAny` would accept this.
+        assert!(
+            rmp_serde::from_slice::<DrainMap<String, Entity>>(&body).is_err(),
+            "a map whose values are integers is not a map of Entity"
+        );
+    }
+
+    #[test]
+    fn drain_seq_parses_every_element_with_its_declared_type() {
+        let body = rmp_serde::to_vec(&vec![1u32, 2, 3]).expect("serializes");
+        let matching: DrainSeq<u32> = rmp_serde::from_slice(&body).expect("types match");
+        assert_eq!(matching.len, 3);
+        assert!(
+            rmp_serde::from_slice::<DrainSeq<Entity>>(&body).is_err(),
+            "a sequence of integers is not a sequence of Entity"
+        );
+    }
+
+    #[test]
+    fn prove_pre_validated_round_trip_accepts_what_decode_pre_validated_accepts() {
+        // Same bytes, same verdict: the cheap proof must not be more permissive
+        // than the decode it replaces.
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes_pre_validated().expect("serializes");
+        GraphSnapshot::decode_pre_validated(&bytes).expect("the full decode accepts these bytes");
+        GraphSnapshot::prove_pre_validated_round_trip(&bytes)
+            .expect("the non-retaining proof must accept them too");
+    }
+
+    #[test]
+    fn prove_pre_validated_round_trip_still_verifies_the_checksum() {
+        // Naming the checksum is the point. Asserting only `is_err()` passed
+        // with checksum verification switched OFF, because a corrupted body also
+        // breaks the decode: the test could not tell the two apart and so did
+        // not hold the obligation it claimed.
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes_pre_validated().expect("serializes");
+        let mut corrupt = bytes.clone();
+        let body_start = 16;
+        assert!(corrupt.len() > body_start, "body must exist to corrupt");
+        corrupt[body_start] ^= 0xff;
+        let error = GraphSnapshot::prove_pre_validated_round_trip(&corrupt)
+            .expect_err("a corrupted body must be refused");
+        assert!(
+            error.to_string().contains("checksum mismatch"),
+            "the checksum must be what refuses a corrupted body, not the decode: {error}"
+        );
     }
 
     #[test]
