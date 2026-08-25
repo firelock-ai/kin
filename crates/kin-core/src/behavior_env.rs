@@ -49,7 +49,9 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_MEMORY_PRESSURE",
     "KIN_DAEMON_MEMORY_BUDGET_BYTES",
     "KIN_COCHANGE_MAX_FAN_OUT",
+    "KIN_GCS_ENDPOINT",
     "EMBED_MAX_SEQ_LEN",
+    "STORAGE_EMULATOR_HOST",
 ];
 
 /// A snapshot of the behavior-env surface: variable name → `Some(value)` when
@@ -217,6 +219,26 @@ mod tests {
             assert!(
                 BEHAVIOR_ENV_VARS.contains(&name),
                 "daemon health must report resume-identity knob {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_storage_endpoint_levers_are_reported() {
+        // The daemon resolves its storage endpoint once, at process start, from
+        // whichever of these two is set, so the value is baked into the worker
+        // exactly like every other member here.
+        //
+        // They travel together on purpose. Either one alone can supply the
+        // endpoint, so a report carrying only KIN_GCS_ENDPOINT would show it
+        // unset while STORAGE_EMULATOR_HOST silently pointed the daemon at an
+        // emulator. That is worse than saying nothing: it is a health payload
+        // answering "where does this daemon's storage live" with the wrong
+        // answer, which is the question the surface exists to answer honestly.
+        for name in ["KIN_GCS_ENDPOINT", "STORAGE_EMULATOR_HOST"] {
+            assert!(
+                BEHAVIOR_ENV_VARS.contains(&name),
+                "daemon health must report the storage endpoint lever {name}"
             );
         }
     }

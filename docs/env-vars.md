@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (494 total, 338 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (495 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -241,6 +241,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_GCS_BUCKET` | string | *(unset)* | operational | GCS bucket for remote storage |
+| `KIN_GCS_ENDPOINT` | url | *(unset)* | correctness | custom GCS endpoint for the daemon's graph-snapshot storage, e.g. a local fake-gcs-server; takes precedence over STORAGE_EMULATOR_HOST, sends unsigned requests, and fails daemon startup when unreachable rather than falling back to real Google Cloud Storage |
 | `KIN_GCS_PREFIX` | string | *(unset)* | operational | GCS key prefix for remote storage |
 
 ## Session & projection

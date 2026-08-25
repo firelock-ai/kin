@@ -264,6 +264,15 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_STORAGE", kind: Kind::Str, default: "local", sensitivity: Sensitivity::Operational, summary: "daemon storage backend selector (e.g. local, gcs)" },
     EnvVarSpec { name: "KIN_GCS_BUCKET", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "GCS bucket for remote storage" },
     EnvVarSpec { name: "KIN_GCS_PREFIX", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "GCS key prefix for remote storage" },
+    // Correctness rather than Operational, unlike the bucket and prefix beside
+    // it: this one redirects every storage request to a different server, so a
+    // wrong value serves and persists graph truth somewhere other than where the
+    // operator believes. Marking it correctness-relevant is what makes a
+    // non-default value log loudly, which is the whole question an operator has
+    // ("emulator or production?"). Kind::Url never hard-errors on a value, so the
+    // stricter sensitivity costs no startup refusal; the daemon does its own
+    // parsing and refuses a malformed or unreachable endpoint itself.
+    EnvVarSpec { name: "KIN_GCS_ENDPOINT", kind: Kind::Url, default: "", sensitivity: Sensitivity::Correctness, summary: "custom GCS endpoint for the daemon's graph-snapshot storage, e.g. a local fake-gcs-server; takes precedence over STORAGE_EMULATOR_HOST, sends unsigned requests, and fails daemon startup when unreachable rather than falling back to real Google Cloud Storage" },
 
     // ---- identity / session / projection -------------------------------------
     EnvVarSpec { name: "KIN_ACTOR", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "actor identity recorded in provenance" },

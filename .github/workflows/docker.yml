@@ -189,3 +189,20 @@ jobs:
       # through it, and that it still re-initializes when nothing is at risk.
       - name: Entrypoint contract with a volume mounted inside .kin
         run: bash scripts/test-entrypoint-workspace-mount.sh kin:ci
+
+      # Every probe above runs inside the container's own network namespace, so
+      # none of them can see whether the port compose publishes actually reaches
+      # the daemon. This one curls the published mapping from the runner, with
+      # the unset-bind-host arm first as a negative control.
+      - name: Published port reachable from outside the container namespace
+        run: bash scripts/test-compose-published-port.sh kin:ci
+
+      # FIR-2668's acceptance, against a real fake-gcs-server. The image this
+      # job just built carries `--features gcs`, so the emulator round trip runs
+      # against the same bytes an operator would run and needs no Rust toolchain
+      # here. It also runs the ticket's own falsification: with the emulator
+      # stopped the daemon must exit loud rather than reach for real Google
+      # Cloud Storage, which is the arm that stops the happy path from passing
+      # for a lever that is being ignored.
+      - name: GCS emulator endpoint acceptance
+        run: bash scripts/test-gcs-emulator-endpoint.sh kin:ci
