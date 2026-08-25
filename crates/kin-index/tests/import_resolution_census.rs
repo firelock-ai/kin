@@ -409,6 +409,17 @@ fn census_reports_import_resolution_over_a_corpus() {
     let y = nameable_specifier_yield(&corpus);
     println!("CENSUS_SITES_RESOLVED_IN_REPO {}", y.sites_resolved_in_repo);
     println!("CENSUS_SITES_EXTERNAL {}", y.sites_external);
+    // The unit the coverage line's denominator is in: one FileImport per import
+    // STATEMENT. Reported beside the site counts so the two are never read as
+    // one, which is the confusion that made an edge-derived numerator look
+    // comparable to a statement denominator in the first place.
+    let statements: usize = corpus.files.iter().map(|f| f.imports.len()).sum();
+    println!("CENSUS_STATEMENTS {statements}");
+    println!("CENSUS_STATEMENTS_RESOLVED {}", y.sites_resolved_in_repo);
+    println!(
+        "CENSUS_STATEMENTS_EXTERNAL {}",
+        statements.saturating_sub(y.sites_resolved_in_repo)
+    );
     println!("CENSUS_NAMED_SPECIFIERS_IN_REPO {}", y.named_specifiers);
     println!("CENSUS_SPECIFIERS_MATCHING_TARGET_ENTITY {}", y.matched);
     println!("CENSUS_SPECIFIERS_WITH_NO_TARGET_ENTITY {}", y.unmatched);
