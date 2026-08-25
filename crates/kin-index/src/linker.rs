@@ -77,6 +77,20 @@ pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1: &str =
 /// Ref-scoped review requires this positive evidence because old graph history
 /// has no way to distinguish a full parse from a recovered parse that omitted
 /// every relevant call.
+/// Marks the import half of a file's coverage certificate.
+///
+/// Carried as its own evidence entry beside the call-coverage one rather than as
+/// its own relation, because a per-file certificate is an artifact self-loop and
+/// `stable_relation_node_id` hashes `(src, dst, kind)`, so a sibling self-loop of
+/// the same kind would collide with it.
+///
+/// `occurrence_count` holds the import STATEMENTS the parser read, and `token`
+/// holds how many of them resolved to a file this repository holds, rendered as
+/// a decimal string. Both are in the `FileImport` unit, which is the unit
+/// `parsed_import_statements` counts in and the only unit in which the ratio
+/// means what its label says.
+pub const IMPORT_RESOLUTION_COVERAGE_V1: &str = "import_resolution_coverage_v1";
+
 pub const CALL_SHAPE_PARSE_COVERAGE_FULL_V1: &str = "call_shape_parse_coverage_full_v1";
 
 /// File-level marker that call-site coverage is incomplete or unknown.
@@ -1596,7 +1610,13 @@ fn merge_resolved(
         }
     }
 
-    append_parse_coverage_relations(&mut resolved, files, artifact_ids, completeness);
+    append_parse_coverage_relations(
+        &mut resolved,
+        files,
+        artifact_ids,
+        completeness,
+        &ctx.known_files,
+    );
 
     resolved
 }
@@ -4462,7 +4482,7 @@ fn import_resolution_counts<S>(
     file_path: &str,
     imports: &[FileImport],
     known_files: &HashSet<S>,
-) -> (usize, usize)
+) -> ImportResolutionCounts
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
@@ -4470,7 +4490,20 @@ where
         .iter()
         .filter(|import| resolve_import_target(file_path, import, known_files).is_some())
         .count();
-    (imports.len(), resolved)
+    ImportResolutionCounts {
+        statements: imports.len(),
+        resolved,
+    }
+}
+
+/// A file's import statements and how many of them reached this repository.
+///
+/// `statements - resolved` is the count that names a module outside the
+/// repository, decided against `known_files` rather than by specifier syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ImportResolutionCounts {
+    statements: usize,
+    resolved: usize,
 }
 
 /// Index each file's module entity, the endpoint an entity-level import edge
@@ -4602,6 +4635,7 @@ fn make_parse_coverage_relation(
     artifact_id: ArtifactId,
     completeness: Option<&ParseCompleteness>,
     call_extraction_complete: bool,
+    imports: ImportResolutionCounts,
 ) -> Relation {
     let is_full = call_extraction_complete && matches!(completeness, Some(ParseCompleteness::Full));
     let (parser_rule, token) = if !call_extraction_complete {
@@ -4634,22 +4668,50 @@ fn make_parse_coverage_relation(
         origin: RelationOrigin::Parsed,
         created_in: None,
         import_source: None,
-        evidence: vec![RelationEvidence {
-            token: Some(token.to_string()),
-            source_path: Some(file_path.to_string()),
-            parser_rule: Some(parser_rule.to_string()),
-            occurrence_count: 1,
-            ..RelationEvidence::default()
-        }],
+        evidence: vec![
+            RelationEvidence {
+                token: Some(token.to_string()),
+                source_path: Some(file_path.to_string()),
+                parser_rule: Some(parser_rule.to_string()),
+                occurrence_count: 1,
+                ..RelationEvidence::default()
+            },
+            RelationEvidence {
+                token: Some(imports.resolved.to_string()),
+                source_path: Some(file_path.to_string()),
+                parser_rule: Some(IMPORT_RESOLUTION_COVERAGE_V1.to_string()),
+                occurrence_count: imports.statements as u32,
+                ..RelationEvidence::default()
+            },
+        ],
     }
 }
 
-fn append_parse_coverage_relations(
+/// Emit each file's coverage certificate.
+///
+/// Emitted only where the caller supplied a completeness map, which is where it
+/// has always been emitted.
+///
+/// Making it unconditional so the import half reached the three callers that
+/// link without completeness (`kin-cli` graph, `kin-daemon` api, `kin-index`
+/// pipeline) put a certificate on paths that never carried one, and 18 tests
+/// counting relations saw the extra edge. Those tests are right: adding a
+/// relation to every file on paths that had none is a change to the graph, not
+/// a change to a report.
+///
+/// So the gate stays, and a file with no certificate reports its import counts
+/// as UNMEASURED rather than as zero, exactly as the call side already does for
+/// a file whose extraction was incomplete. A bucket nobody measured is not a
+/// bucket that reads zero, and that rule is what keeps the absence honest.
+fn append_parse_coverage_relations<S>(
     resolved: &mut Vec<Relation>,
     files: &[&FileParseData],
     artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
-) {
+    known_files: &HashSet<S>,
+) where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
     let Some(completeness) = completeness else {
         return;
     };
@@ -4668,6 +4730,7 @@ fn append_parse_coverage_relations(
                 artifact_id,
                 completeness.get(&file.file_path),
                 call_extraction_complete,
+                import_resolution_counts(&file.file_path, &file.imports, known_files),
             ));
         }
     }
@@ -6866,6 +6929,7 @@ fn merge_incremental_resolved(
         &file_refs,
         &linker.artifact_ids,
         completeness,
+        &linker.known_files,
     );
 
     resolved
@@ -9529,7 +9593,10 @@ void f();
         }];
         assert_eq!(
             import_resolution_counts("app/main.py", &one_statement, &known),
-            (1, 1),
+            ImportResolutionCounts {
+                statements: 1,
+                resolved: 1
+            },
             "one statement with two specifiers is one statement, resolved once"
         );
 
@@ -9554,7 +9621,10 @@ void f();
         ];
         assert_eq!(
             import_resolution_counts("app/main.py", &two_statements, &known),
-            (2, 2),
+            ImportResolutionCounts {
+                statements: 2,
+                resolved: 2
+            },
             "two statements naming one module are two statements, both resolved"
         );
     }
@@ -9574,7 +9644,10 @@ void f();
                 specifiers: vec![],
             },
         ];
-        let (statements, resolved) = import_resolution_counts("app/main.py", &mixed, &known);
+        let ImportResolutionCounts {
+            statements,
+            resolved,
+        } = import_resolution_counts("app/main.py", &mixed, &known);
         assert_eq!(statements, 2, "both lines are statements");
         assert_eq!(
             resolved, 1,
