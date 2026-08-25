@@ -5026,7 +5026,7 @@ async fn command_commit(
         crate::loop_runner::sync_filesystem_with_graph_deferring_tree_publication(&state),
     )
     .await
-    .map_err(internal_error)?;
+    .map_err(commit_admission_error)?;
 
     match command_commit_after_admission(&state, request, deferred_tree.as_ref()) {
         Ok(response) => {
@@ -5270,7 +5270,40 @@ fn refuse_a_successor_that_records_nothing(
     Some((StatusCode::CONFLICT, body.to_string()))
 }
 
+/// The response for a commit's admission that could not open the working
+/// projection.
+///
+/// A projection blocked on a file a person has to act on, such as the eject
+/// journal a copied `.kin` carries in, is a refusal in words rather than a
+/// daemon failure: the store is intact and the sentence names the file and the
+/// remedy. It is answered as 409 with that sentence in the body, which the CLI
+/// prints as its own line, so a reader is not sent to the daemon for a file
+/// they can see. On 0.5.52 it reached them as `HTTP 500 Internal Server Error:
+/// Core error: ...` (FIR-2664). Everything else stays an internal error.
+fn commit_admission_error(error: crate::error::DaemonError) -> (StatusCode, String) {
+    match projection_blocked_refusal(&error) {
+        Some(refusal) => refusal,
+        None => internal_error(error),
+    }
+}
+
+/// The worded refusal for a blocked projection, when `error` is one.
+fn projection_blocked_refusal(error: &crate::error::DaemonError) -> Option<(StatusCode, String)> {
+    let crate::error::DaemonError::Core(kin_core::KinError::ProjectionBlocked(message)) = error
+    else {
+        return None;
+    };
+    let body = serde_json::json!({
+        "error": "projection_blocked",
+        "message": message,
+    });
+    Some((StatusCode::CONFLICT, body.to_string()))
+}
+
 fn repository_commit_error(error: crate::error::DaemonError) -> (StatusCode, String) {
+    if let Some(refusal) = projection_blocked_refusal(&error) {
+        return refusal;
+    }
     let status = match &error {
         crate::error::DaemonError::Graph(kin_db::KinDbError::Model(
             kin_model::ModelError::Conflict(_),
@@ -13472,6 +13505,37 @@ mod tests {
         .unwrap_err();
         assert_eq!(conflict.0, StatusCode::INTERNAL_SERVER_ERROR);
         assert!(conflict.1.contains("conflicting"));
+    }
+
+    /// A projection blocked on a file a person has to act on is answered in
+    /// words, as 409 with the sentence in the body, on both commit paths. Any
+    /// other core error keeps its internal-error shape.
+    #[test]
+    fn a_blocked_projection_is_a_worded_refusal_rather_than_a_daemon_failure() {
+        let sentence = "exact eject journal /r/.kin/reconciliation/exact-eject-journal.json is \
+                        bound to a different .kin directory; remove the file and rerun";
+        let blocked = || {
+            crate::error::DaemonError::Core(kin_core::KinError::ProjectionBlocked(
+                sentence.to_string(),
+            ))
+        };
+
+        let (status, body) = commit_admission_error(blocked());
+        assert_eq!(status, StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["error"], "projection_blocked");
+        assert_eq!(body["message"], sentence);
+
+        let (status, body) = repository_commit_error(blocked());
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body.contains("projection_blocked"), "{body}");
+
+        let (status, body) = commit_admission_error(crate::error::DaemonError::Core(
+            kin_core::KinError::Other("something else entirely".to_string()),
+        ));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(body.contains("something else entirely"), "{body}");
+        assert!(!body.contains("projection_blocked"), "{body}");
     }
 
     #[test]

@@ -1678,11 +1678,15 @@ pub struct ExactProjectionGitStage {
 }
 
 /// Result of one capability-anchored exact projection eject transaction.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExactProjectionEjectOutcome {
     /// Whether an existing regular-file or directory `.git` entry was retained
     /// and archived before the staged repository was installed.
     pub had_previous_git: bool,
+    /// Set when the eject completed but its journal could not be retired from
+    /// the archived `.kin`, naming the file and what to do about it. `None` is
+    /// the normal case: a finished transaction leaves no journal behind.
+    pub retained_journal: Option<String>,
 }
 
 impl std::fmt::Debug for ExactProjectionFreeze {
@@ -2928,7 +2932,13 @@ impl ExactProjectionFreeze {
                 previous_git_archived,
             );
             if rollback_complete {
-                if let Err(cleanup) = self.projection.remove_exact_eject_journal(&eject_journal) {
+                if let Err(cleanup) = self.projection.remove_exact_eject_journal(
+                    &eject_journal,
+                    &self
+                        .projection
+                        .reconciliation_control_path()
+                        .join(EXACT_EJECT_JOURNAL_FILE),
+                ) {
                     error = KinError::Other(format!(
                         "{error}; exact eject rollback completed but durable journal cleanup failed: {cleanup}"
                     ));
@@ -2937,8 +2947,36 @@ impl ExactProjectionFreeze {
             return Err(error);
         }
 
+        // The transaction is complete: the staged Git is installed at the root,
+        // the previous Git is archived, and `.kin` is detached into the archive
+        // with this handle still open on its reconciliation directory. The
+        // journal exists to recover a transaction that dies part way, and a
+        // finished one has nothing to recover, so it is retired here rather
+        // than left in the archive. Left there it made the archive a trap: a
+        // `.kin` copied back out of it carried a journal bound to inodes the
+        // copy did not have, every projection open after that refused, and the
+        // only exit a stranger found on 0.5.52 was deleting the store
+        // (FIR-2664).
+        let archived_journal = target
+            .display_path
+            .join(archived_kin_name)
+            .join(RECONCILIATION_CONTROL_DIRECTORY)
+            .join(EXACT_EJECT_JOURNAL_FILE);
+        let retained_journal = self
+            .projection
+            .remove_exact_eject_journal(&eject_journal, &archived_journal)
+            .err()
+            .map(|error| {
+                format!(
+                    "the eject completed, but its journal could not be retired and remains at {}: \
+                     {error}. Remove that file before reusing the archived kin/ directory",
+                    archived_journal.display()
+                )
+            });
+
         Ok(ExactProjectionEjectOutcome {
             had_previous_git: previous_git.is_some(),
+            retained_journal,
         })
     }
 
@@ -5451,6 +5489,29 @@ fn exact_relative_directory_components(relative: &Path, label: &str) -> Result<V
         .collect()
 }
 
+/// The refusal for an eject journal Kin will not act on.
+///
+/// Names the file, what is wrong with it, the archive the eject it records
+/// used when the journal could say, and the way out in both states that
+/// archive can be in. A refusal without those sent a stranger from `HTTP 500`
+/// to `rm -rf .kin/` on 0.5.52 (FIR-2664).
+#[cfg(unix)]
+fn exact_eject_journal_blocked(journal: &Path, archive: Option<&Path>, what: &str) -> KinError {
+    let archive = match archive {
+        Some(archive) => archive.display().to_string(),
+        None => "the .kin-ejected-* archive beside the repository".to_string(),
+    };
+    KinError::ProjectionBlocked(format!(
+        "exact eject journal {} {what}, so Kin will not replay the eject it records here. If that \
+         eject completed, the repository root holds an ordinary .git and {archive} holds kin/ and \
+         previous-git/, and this journal is a leftover: remove the file and rerun. If it did not, \
+         {archive} holds whatever the eject had moved when it stopped and the journal is the \
+         record of it; put those entries back by hand before removing it. To rebuild Kin from Git \
+         history instead, remove .kin/ and run `kin init`.",
+        journal.display()
+    ))
+}
+
 #[cfg(unix)]
 fn exact_eject_journal_name(bytes: &[u8], label: &str) -> Result<OsString> {
     use std::os::unix::ffi::OsStringExt as _;
@@ -6687,26 +6748,33 @@ impl ProjectionRoot {
         }
         let authenticated: AuthenticatedExactEjectJournal = serde_json::from_slice(&bytes)
             .map_err(|error| {
-                KinError::Other(format!(
-                    "decode exact eject journal {}: {error}",
-                    display.display()
-                ))
+                exact_eject_journal_blocked(
+                    &display,
+                    None,
+                    &format!("could not be decoded: {error}"),
+                )
             })?;
         let expected = self.authenticate_exact_eject_journal(&authenticated.journal)?;
         if !constant_time_bytes_equal(&authenticated.authentication, &expected) {
-            return Err(KinError::Other(format!(
-                "exact eject journal {} failed authentication",
-                display.display()
-            )));
+            return Err(exact_eject_journal_blocked(
+                &display,
+                None,
+                "failed authentication against this store's authority key",
+            ));
         }
         Ok(Some(authenticated.journal))
     }
 
+    /// Retire one journal through the open control handle.
+    ///
+    /// `display` is where that handle's directory lives now, which after a
+    /// finished eject is inside the archive rather than under the root.
     #[cfg(unix)]
-    fn remove_exact_eject_journal(&self, expected: &ExactEjectJournal) -> Result<()> {
-        let display = self
-            .reconciliation_control_path()
-            .join(EXACT_EJECT_JOURNAL_FILE);
+    fn remove_exact_eject_journal(
+        &self,
+        expected: &ExactEjectJournal,
+        display: &Path,
+    ) -> Result<()> {
         let actual = self.load_exact_eject_journal()?.ok_or_else(|| {
             KinError::Other(format!(
                 "exact eject journal disappeared before cleanup: {}",
@@ -6721,33 +6789,147 @@ impl ProjectionRoot {
         }
         self.control
             .remove_file(std::ffi::OsStr::new(EXACT_EJECT_JOURNAL_FILE))
-            .map_err(|error| KinError::io(&display, error))?;
-        sync_directory_capability(&self.control, &display)
+            .map_err(|error| KinError::io(display, error))?;
+        sync_directory_capability(&self.control, display)
+    }
+
+    /// Where the archive an eject journal names would be, for a message.
+    #[cfg(unix)]
+    fn exact_eject_journal_archive_display(&self, journal: &ExactEjectJournal) -> Option<PathBuf> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        self.display_root
+            .parent()
+            .map(|parent| parent.join(std::ffi::OsStr::from_bytes(&journal.archive_name)))
+    }
+
+    /// Whether `journal` was written for a `.kin` that now lives detached in
+    /// the archive it names, so the copy of it found here is a leftover of a
+    /// finished eject rather than a transaction to recover.
+    ///
+    /// Every step binds by identity. The repository root, its parent, the
+    /// archive directory, the archived `.kin` and that `.kin`'s reconciliation
+    /// directory all have to be the inodes the journal recorded, and the
+    /// journal has to be at the detach phase, the only phase that moves
+    /// `.kin`. A `.kin` copied out of the archive carries the journal along
+    /// under fresh inodes of its own, which is the exact shape an identity
+    /// check alone reported as an invalid descriptor. Anything that cannot be
+    /// opened or does not match answers `false`, and the caller refuses with
+    /// the file and the way out named.
+    #[cfg(unix)]
+    fn exact_eject_journal_names_a_detached_kin(
+        &self,
+        journal: &ExactEjectJournal,
+        root_identity: TrackedEntryIdentity,
+    ) -> Result<bool> {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        if journal.phase != ExactEjectJournalPhase::DetachPending
+            || journal.root_identity != root_identity
+        {
+            return Ok(false);
+        }
+        let (namespace_parent, root_name) =
+            self.locate_open_directory(&self.root, root_identity, &self.display_root)?;
+        let namespace_parent_identity = tracked_open_directory_identity(&namespace_parent)
+            .map_err(|error| KinError::io(&self.display_root, error))?;
+        if namespace_parent_identity != journal.namespace_parent_identity
+            || root_name.as_bytes() != journal.root_name
+        {
+            return Ok(false);
+        }
+        let archive_name = exact_eject_journal_name(&journal.archive_name, "archive directory")?;
+        let archived_kin_name =
+            exact_eject_journal_name(&journal.archived_kin_name, "archived Kin")?;
+        let mut directory = namespace_parent;
+        for (name, expected) in [
+            (archive_name.as_os_str(), journal.archive_identity),
+            (archived_kin_name.as_os_str(), journal.kin_control_identity),
+            (
+                std::ffi::OsStr::new(RECONCILIATION_CONTROL_DIRECTORY),
+                journal.control_identity,
+            ),
+        ] {
+            let Ok(next) = open_directory_nofollow(&directory, name) else {
+                return Ok(false);
+            };
+            let Ok(identity) = tracked_open_directory_identity(&next) else {
+                return Ok(false);
+            };
+            if identity != expected {
+                return Ok(false);
+            }
+            directory = next;
+        }
+        Ok(true)
     }
 
     #[cfg(unix)]
     fn recover_exact_eject(&self) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt as _;
-
         let Some(journal) = self.load_exact_eject_journal()? else {
             return Ok(());
         };
+        let journal_path = self
+            .reconciliation_control_path()
+            .join(EXACT_EJECT_JOURNAL_FILE);
+        let archive = self.exact_eject_journal_archive_display(&journal);
         self.revalidate_projection_lock()?;
         let root_identity = tracked_open_directory_identity(&self.root)
             .map_err(|error| KinError::io(&self.display_root, error))?;
         if journal.schema != EXACT_EJECT_JOURNAL_SCHEMA
             || uuid::Uuid::parse_str(&journal.transaction_id).is_err()
-            || journal.root_identity != root_identity
+        {
+            return Err(exact_eject_journal_blocked(
+                &journal_path,
+                archive.as_deref(),
+                "carries a schema or transaction id this build does not recognize",
+            ));
+        }
+        if journal.root_identity != root_identity
             || journal.kin_control_identity != self.kin_control_identity
             || journal.control_identity != self.control_identity
         {
-            return Err(KinError::Other(format!(
-                "exact eject journal {} has an invalid identity-bound descriptor",
-                self.reconciliation_control_path()
-                    .join(EXACT_EJECT_JOURNAL_FILE)
-                    .display()
-            )));
+            // The journal names a `.kin` other than the one it was found in.
+            // One shape of that is benign and common: a `.kin` copied back out
+            // of an eject archive carries the journal of the eject that
+            // detached the original, under inodes of its own. When the archive
+            // still holds that original, inode for inode, the eject it records
+            // finished and the copy has nothing to recover, so the journal is
+            // retired here and nothing in the namespace is touched. Every other
+            // mismatch is refused with the file and the way out named, because
+            // a descriptor that matches nothing could as easily be a forged
+            // one, and a forged one must never drive a namespace move.
+            if self.exact_eject_journal_names_a_detached_kin(&journal, root_identity)? {
+                return self.remove_exact_eject_journal(&journal, &journal_path);
+            }
+            return Err(exact_eject_journal_blocked(
+                &journal_path,
+                archive.as_deref(),
+                "is bound to a different repository or .kin directory than the one it was found \
+                 in, the shape a .kin copied out of an eject archive has",
+            ));
         }
+        self.replay_exact_eject_journal(&journal, root_identity, &journal_path)
+            .map_err(|error| match error {
+                KinError::ProjectionBlocked(_) => error,
+                error => exact_eject_journal_blocked(
+                    &journal_path,
+                    archive.as_deref(),
+                    &format!("could not be replayed: {error}"),
+                ),
+            })
+    }
+
+    /// Replay one journal whose identities all match this projection: finish
+    /// or roll back the namespace moves it records, then retire it.
+    #[cfg(unix)]
+    fn replay_exact_eject_journal(
+        &self,
+        journal: &ExactEjectJournal,
+        root_identity: TrackedEntryIdentity,
+        journal_path: &Path,
+    ) -> Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
 
         let (namespace_parent, root_name) =
             self.locate_open_directory(&self.root, root_identity, &self.display_root)?;
@@ -6990,7 +7172,7 @@ impl ProjectionRoot {
                 ensure_named_entry_absent(&self.root, git_name, &self.display_root.join(".git"))?
             }
         }
-        self.remove_exact_eject_journal(&journal)
+        self.remove_exact_eject_journal(journal, journal_path)
     }
 
     #[cfg(unix)]
@@ -14532,8 +14714,16 @@ mod tests {
         assert_eq!(
             outcome,
             ExactProjectionEjectOutcome {
-                had_previous_git: true
+                had_previous_git: true,
+                retained_journal: None,
             }
+        );
+        assert!(
+            !fixture
+                .archive
+                .join("kin/reconciliation/exact-eject-journal.json")
+                .exists(),
+            "a finished eject retires its journal from the archived .kin"
         );
         assert_eq!(
             std::fs::read(fixture.root.join(".git/stage-marker")).unwrap(),
@@ -14579,6 +14769,7 @@ mod tests {
             .unwrap();
 
         assert!(outcome.had_previous_git);
+        assert!(outcome.retained_journal.is_none());
         assert_eq!(
             std::fs::read(fixture.archive.join("previous-git/legacy-marker")).unwrap(),
             b"legacy Git"
@@ -14586,6 +14777,13 @@ mod tests {
         assert_eq!(
             std::fs::read(fixture.root.join(".git/stage-marker")).unwrap(),
             b"prepared Git"
+        );
+        assert!(
+            !fixture
+                .archive
+                .join("kin/reconciliation/exact-eject-journal.json")
+                .exists(),
+            "a finished eject retires its journal from the archived .kin"
         );
     }
 
@@ -14614,7 +14812,156 @@ mod tests {
             .unwrap();
 
         assert!(!outcome.had_previous_git);
+        assert!(outcome.retained_journal.is_none());
         assert!(!fixture.archive.join("previous-git").exists());
+        assert!(
+            !fixture
+                .archive
+                .join("kin/reconciliation/exact-eject-journal.json")
+                .exists(),
+            "a finished eject retires its journal from the archived .kin"
+        );
+    }
+
+    /// Copy a directory tree the way `cp -r` does: every entry gets an inode of
+    /// its own.
+    #[cfg(unix)]
+    fn copy_directory_recursively(source: &Path, destination: &Path) {
+        std::fs::create_dir(destination).unwrap();
+        for entry in std::fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = destination.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_directory_recursively(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+    }
+
+    /// Eject, put the journal back into the archive the way a 0.5.52 eject
+    /// left it, then copy the archived `.kin` back to the root the way the
+    /// rc0552n stranger did with `cp -r`.
+    ///
+    /// Returns the fixture, the carried journal's path under the root, and the
+    /// archived journal's path. The journal bytes are the real ones: they are
+    /// captured at the detach hook point, after `.kin` has moved and before a
+    /// finished transaction retires them.
+    #[cfg(unix)]
+    fn eject_then_copy_back_a_journal_carrying_kin() -> (ExactEjectFixture, PathBuf, PathBuf) {
+        let fixture = exact_eject_fixture(ExistingGitFixture::Directory);
+        let freeze = ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap();
+        let verification = freeze
+            .verify_resolved_tree_from_blobs(&fixture.tree, &fixture.blobs)
+            .unwrap();
+        let target = ExactProjectionDetachTarget::open_existing(&fixture.archive).unwrap();
+        let stage = ExactProjectionGitStage::open_existing_unverified_for_test(&fixture.staged_git)
+            .unwrap();
+        let archived_journal = fixture
+            .archive
+            .join("kin/reconciliation/exact-eject-journal.json");
+        let mut leftover = Vec::new();
+        freeze
+            .replace_git_and_detach_verified_to_from_blobs_with_hook(
+                &verification,
+                &fixture.tree,
+                &fixture.blobs,
+                stage,
+                &target,
+                std::ffi::OsStr::new("kin"),
+                std::ffi::OsStr::new("previous-git"),
+                |point| {
+                    if point == ExactProjectionEjectHookPoint::AfterKinDetached {
+                        leftover = std::fs::read(&archived_journal).unwrap();
+                    }
+                },
+            )
+            .unwrap();
+        assert!(
+            !leftover.is_empty(),
+            "the detach hook point must see the journal in the archived .kin"
+        );
+        assert!(
+            !archived_journal.exists(),
+            "a finished eject retires its journal"
+        );
+        std::fs::write(&archived_journal, &leftover).unwrap();
+
+        copy_directory_recursively(&fixture.archive.join("kin"), &fixture.root.join(".kin"));
+        let carried = fixture
+            .root
+            .join(".kin/reconciliation/exact-eject-journal.json");
+        assert!(carried.is_file(), "the copy carries the journal along");
+        (fixture, carried, archived_journal)
+    }
+
+    /// A `.kin` copied back out of an eject archive carries the journal of the
+    /// eject that detached the original, and every projection open refused it
+    /// as an invalid identity-bound descriptor: after
+    /// `cp -r .kin-ejected-*/kin .kin`, every `kin commit` answered HTTP 500
+    /// on 0.5.52 and the store was deleted to get out (FIR-2664). The archive
+    /// still holds the original inode for inode, which proves the eject
+    /// finished, so the copy's journal is retired on open and nothing in the
+    /// namespace moves.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_carried_by_a_copied_kin_is_retired_when_the_archive_proves_the_eject_finished() {
+        let (fixture, carried, archived_journal) = eject_then_copy_back_a_journal_carrying_kin();
+
+        drop(ExactProjectionFreeze::acquire_existing(&fixture.root).unwrap());
+
+        assert!(!carried.exists(), "the carried journal is retired on open");
+        assert!(archived_journal.is_file(), "the archive is left as it was");
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git/stage-marker")).unwrap(),
+            b"prepared Git",
+            "the installed Git stays installed"
+        );
+        assert!(fixture.archive.join("previous-git").is_dir());
+        assert!(fixture.archive.join("kin").is_dir());
+        assert!(fixture.root.join(".kin").is_dir());
+    }
+
+    /// The same carried journal with no archived `.kin` to prove anything
+    /// against is refused, and the refusal names the file, the archive it
+    /// expected and the way out, in a variant a daemon answers in words.
+    #[cfg(unix)]
+    #[test]
+    fn a_journal_bound_elsewhere_is_refused_with_the_file_and_the_remedy_named() {
+        let (fixture, carried, _archived_journal) = eject_then_copy_back_a_journal_carrying_kin();
+        std::fs::remove_dir_all(fixture.archive.join("kin")).unwrap();
+
+        let error = ExactProjectionFreeze::acquire_existing(&fixture.root)
+            .expect_err("a journal that matches nothing must be refused");
+
+        assert!(
+            matches!(error, KinError::ProjectionBlocked(_)),
+            "a person has to act on this, so it is a blocked projection: {error:?}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains(&carried.display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&fixture.archive.display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("remove the file and rerun"), "{message}");
+        assert!(message.contains("kin init"), "{message}");
+        assert!(
+            !message.contains("invalid identity-bound descriptor"),
+            "{message}"
+        );
+        assert!(
+            carried.is_file(),
+            "a refused journal is left for the person to act on"
+        );
+        assert_eq!(
+            std::fs::read(fixture.root.join(".git/stage-marker")).unwrap(),
+            b"prepared Git",
+            "a refusal moves nothing"
+        );
     }
 
     #[cfg(unix)]
