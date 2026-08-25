@@ -103,8 +103,7 @@ fn parse_corpus(root: &Path) -> Corpus {
 /// Every `(importer, target)` pair the linker produced as an artifact-level
 /// `Imports` edge, keyed by repo-relative path.
 fn resolved_import_pairs(corpus: &Corpus) -> HashSet<(String, String)> {
-    let relations =
-        link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
+    let relations = link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
     let by_id: HashMap<&ArtifactId, &String> = corpus
         .artifact_ids
         .iter()
@@ -126,12 +125,13 @@ fn resolved_import_pairs(corpus: &Corpus) -> HashSet<(String, String)> {
 /// Count entity-rooted `Imports` edges, the class that answers "who imports
 /// this export" at entity level.
 fn entity_rooted_import_edges(corpus: &Corpus) -> usize {
-    let relations =
-        link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
+    let relations = link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
     relations
         .iter()
         .filter(|r| r.kind == RelationKind::Imports)
-        .filter(|r| matches!(r.src, GraphNodeId::Entity(_)) || matches!(r.dst, GraphNodeId::Entity(_)))
+        .filter(|r| {
+            matches!(r.src, GraphNodeId::Entity(_)) || matches!(r.dst, GraphNodeId::Entity(_))
+        })
         .count()
 }
 
@@ -145,11 +145,7 @@ fn files_with_module_entity(corpus: &Corpus) -> usize {
     corpus
         .files
         .iter()
-        .filter(|f| {
-            f.entities
-                .iter()
-                .any(|e| e.kind == EntityKind::Module)
-        })
+        .filter(|f| f.entities.iter().any(|e| e.kind == EntityKind::Module))
         .count()
 }
 
@@ -206,8 +202,7 @@ struct Yield {
 /// (`source_path`) alongside the file it reached (`resolved_path`), so this
 /// reads the linker's real decision per site rather than re-deriving one.
 fn resolution_by_site(corpus: &Corpus) -> HashMap<(String, String), String> {
-    let relations =
-        link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
+    let relations = link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
     let by_id: HashMap<&ArtifactId, &String> = corpus
         .artifact_ids
         .iter()
@@ -223,10 +218,7 @@ fn resolution_by_site(corpus: &Corpus) -> HashMap<(String, String), String> {
         };
         for ev in &rel.evidence {
             if let (Some(specifier), Some(resolved)) = (&ev.source_path, &ev.resolved_path) {
-                out.insert(
-                    ((*importer).clone(), specifier.clone()),
-                    resolved.clone(),
-                );
+                out.insert(((*importer).clone(), specifier.clone()), resolved.clone());
             }
         }
     }
@@ -250,11 +242,7 @@ fn nameable_specifier_yield(corpus: &Corpus) -> Yield {
     let has_module: HashSet<&str> = corpus
         .files
         .iter()
-        .filter(|f| {
-            f.entities
-                .iter()
-                .any(|e| e.kind == EntityKind::Module)
-        })
+        .filter(|f| f.entities.iter().any(|e| e.kind == EntityKind::Module))
         .map(|f| f.file_path.as_str())
         .collect();
 
@@ -335,9 +323,7 @@ fn nameable_specifier_yield(corpus: &Corpus) -> Yield {
                     }
                     continue;
                 }
-                let defined_elsewhere = entities_by_file
-                    .values()
-                    .any(|n| n.contains(wanted));
+                let defined_elsewhere = entities_by_file.values().any(|n| n.contains(wanted));
                 if defined_elsewhere {
                     out.unmatched_reexported += 1;
                     if out.sample_reexported.len() < 8 {
