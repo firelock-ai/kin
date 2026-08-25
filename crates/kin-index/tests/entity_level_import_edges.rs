@@ -283,7 +283,9 @@ fn the_artifact_import_edge_is_unchanged_by_the_entity_edge() {
         "artifact edge parser rule changed"
     );
     assert_eq!(
-        edge.evidence.first().and_then(|e| e.resolved_path.as_deref()),
+        edge.evidence
+            .first()
+            .and_then(|e| e.resolved_path.as_deref()),
         Some("app/routing.py"),
         "artifact edge resolved path changed"
     );

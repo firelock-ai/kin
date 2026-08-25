@@ -126,8 +126,7 @@ fn resolved_import_pairs(corpus: &Corpus) -> HashSet<(String, String)> {
 /// that overshoots the prediction can be attributed to an arm rather than
 /// guessed at.
 fn entity_import_edge_breakdown(corpus: &Corpus) -> (usize, usize, usize) {
-    let relations =
-        link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
+    let relations = link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
     let kind_of: HashMap<_, _> = corpus
         .files
         .iter()
