@@ -691,19 +691,25 @@ fn language_summary(coverage: &LanguageReferenceCoverage) -> String {
         // A parse side that read no import statements has no denominator, so
         // stating a fraction would be a ratio against nothing.
         (Some(_), Some(resolved), None) => {
-            format!("imports {resolved} resolved, parse side counted no import statements")
+            format!("imports {resolved} resolved, parse side counted no import statements{external}")
         }
         (None, Some(resolved), _) => {
-            format!("imports {resolved} resolved, parse side unmeasured")
+            format!("imports {resolved} resolved, parse side unmeasured{external}")
         }
         // No file of this language carried a coverage certificate, so how many
         // of its imports resolved was never measured. Printing a count here
         // would report an absence as a zero, which is the whole failure this
         // surface exists to avoid.
+        //
+        // The external share still prints. It is measured on its own path, off
+        // specifier syntax for JavaScript and off the certificate elsewhere, so
+        // an unmeasured RESOLUTION says nothing about it. Dropping it here cost
+        // a JavaScript repository the one line that explains why its import
+        // ratio is low, which is the disclosure this surface exists for.
         (Some(parsed), None, _) => {
-            format!("imports resolution unmeasured, parse side read {parsed} statements")
+            format!("imports resolution unmeasured, parse side read {parsed} statements{external}")
         }
-        (None, None, _) => "imports unmeasured".to_string(),
+        (None, None, _) => format!("imports unmeasured{external}"),
     };
     format!(
         "{}: {} files, {calls}, {imports}, cross-file {}, intra-file {} [{}]",
@@ -1393,7 +1399,7 @@ mod tests {
     /// reported `imports 0/220 (0%)` for a repository whose relative specifiers
     /// had all resolved, and a reader took that for a broken graph.
     #[test]
-    fn a_resolved_module_import_counts_even_though_it_joins_two_artifacts() {
+    fn an_artifact_import_edge_is_not_a_resolved_statement_count() {
         let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
         graph
             .upsert_entity(&js_entity("createApplication", "lib/express.js", 3, 3))
@@ -1414,11 +1420,24 @@ mod tests {
 
         assert_eq!(js.parsed_import_statements, Some(4));
         assert_eq!(
-            js.resolved_import_statements, Some(1),
-            "the artifact-level import edge is the resolution, and must be counted"
+            js.resolved_import_statements, None,
+            "this graph holds an artifact import edge and no coverage certificate. \
+             An edge is not a statement count: one statement naming two symbols and \
+             two statements naming one each produce byte-identical graph content, so \
+             deriving the numerator from edges states a ratio against a denominator \
+             drawn from a different population. Unmeasured is the honest reading"
         );
-        assert_eq!(js.import_percent(), Some(25));
-        assert_eq!(js.external_module_imports, Some(3));
+        assert_eq!(
+            js.import_percent(),
+            None,
+            "and no percentage can be stated without a numerator"
+        );
+        assert_eq!(
+            js.external_module_imports,
+            Some(3),
+            "the external share is measured off specifier syntax, so it survives an \
+             unmeasured resolution"
+        );
     }
 
     /// The importing file's language owns the edge. `traverse` walks both
@@ -1449,10 +1468,22 @@ mod tests {
             .iter()
             .find(|row| row.language == LanguageId::Python.to_string())
             .expect("python row");
-        assert_eq!(js.resolved_import_statements, Some(1));
         assert_eq!(
-            python.resolved_import_statements, Some(0),
-            "the imported file did not write the import statement"
+            js.parsed_import_statements,
+            Some(1),
+            "the importing file's language owns the statement"
+        );
+        assert_eq!(
+            python.parsed_import_statements,
+            Some(0),
+            "and `traverse` walks both directions from a node, so the edge INTO \
+             helper.py must not credit Python with app.js's import statement"
+        );
+        assert_eq!(js.resolved_import_statements, None);
+        assert_eq!(
+            python.resolved_import_statements, None,
+            "neither language carried a coverage certificate, so how many of their \
+             imports resolved was never measured on this path"
         );
     }
 
@@ -1478,8 +1509,12 @@ mod tests {
             .find(|line| line.contains("javascript:"))
             .expect("javascript row is rendered");
         assert!(
-            line.contains("imports 1/4 (25%), 3 name a module outside this repository"),
-            "{line}"
+            line.contains(
+                "imports resolution unmeasured, parse side read 4 statements, \
+                 3 name a module outside this repository"
+            ),
+            "the external share is what this line exists to disclose, and an \
+             unmeasured resolution must not take it down with it: {line}"
         );
     }
 
@@ -1604,7 +1639,10 @@ mod tests {
 
         assert_eq!(python.files, 2);
         assert_eq!(python.parsed_import_statements, Some(3));
-        assert_eq!(python.resolved_import_statements, Some(0));
+        assert_eq!(
+            python.resolved_import_statements, None,
+            "unmeasured rather than zero: this graph carries no coverage certificate"
+        );
         assert_eq!(python.cross_file_reference_edges, 0);
         assert_eq!(python.intra_file_reference_edges, 1);
         assert!(!coverage.absence_is_supportable());
