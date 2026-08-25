@@ -6777,6 +6777,77 @@ mod tests {
         assert!(body["references"].as_array().unwrap().is_empty());
     }
 
+    /// The single-repo case FIR-2633 is really about, driven through the real
+    /// producer rather than a hand-written payload.
+    ///
+    /// A store with no spine at all is the ordinary install, and every absent
+    /// `find_references` on one used to come back qualified by a limit about
+    /// other repositories. The producer's own word for the state is checked here
+    /// too: a fixture that guessed it would prove the gate against a status
+    /// nothing emits, which is how the sibling disclosure in this PR was a no-op
+    /// on every real store until an acceptance fixture caught it.
+    #[tokio::test]
+    async fn an_install_with_no_spine_is_not_limited_by_cross_repo_authority() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("orphan", "src/orphan.rs");
+        store.upsert_entity(&target).unwrap();
+        // An empty answer is evidence about the target only once the graph can
+        // hold a cross-file reference at all.
+        seed_cross_file_call_witness(&store);
+
+        let live_root = graph_root(&store);
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        // The daemon authority with no spine backend, which is what a repository
+        // that has an id and no cross-repo topology actually is. The ambient
+        // path with no `KIN_REPO_ID` at all reports a different state, and that
+        // one is deliberately untouched here.
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &store,
+                FindReferencesAuthority {
+                    repo_id: "nk",
+                    graph_root: &live_root,
+                    spine: None,
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(
+            response["references"].as_array().unwrap().is_empty(),
+            "the absence path is the one under test: {response:#}"
+        );
+        assert_eq!(
+            response["cross_repo"]["status"], "not_configured",
+            "the producer's own word for a store with no spine: {}",
+            response["cross_repo"]
+        );
+        let trust_reason = response["negative"]["trust_reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !trust_reason.contains("cross_repo"),
+            "a spine that does not exist limited nothing: {trust_reason}"
+        );
+        let notes = response["negative"]["notes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the state is still reported: {}", response["negative"]));
+        assert!(
+            notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.starts_with("cross_repo_not_configured"))),
+            "in the channel that limits nothing: {notes:?}"
+        );
+    }
+
     #[tokio::test]
     async fn daemon_find_references_requires_exact_live_graph_root() {
         let graph = InMemoryGraph::new();
