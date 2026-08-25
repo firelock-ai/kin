@@ -3853,14 +3853,15 @@ fn process_has_exited(pid: libc::pid_t) -> std::io::Result<bool> {
 /// splitting the whole line on whitespace mis-parses any process whose name
 /// contains one. Everything after the final `)` is fixed-width and safe to
 /// split, which is what `proc(5)` documents and what every correct reader does.
-#[cfg(target_os = "linux")]
+///
+/// Not gated on the target: it parses a string rather than reading `/proc`, and
+/// a consumer's test binary compiles it on every host.
 fn proc_stat_fields_after_name(stat: &str) -> Option<Vec<&str>> {
     let tail = &stat[stat.rfind(')')? + 1..];
     Some(tail.split_whitespace().collect())
 }
 
 /// The single-character run state: field 3 overall, first after the name.
-#[cfg(target_os = "linux")]
 fn parse_proc_stat_state(stat: &str) -> Option<char> {
     proc_stat_fields_after_name(stat)?.first()?.chars().next()
 }
@@ -4784,6 +4785,80 @@ enum Liveness {
     Unknown,
 }
 
+/// Whether a Linux `/proc/<pid>/stat` line describes a zombie.
+///
+/// Reads the state through [`parse_proc_stat_state`], the parser this crate
+/// already uses for the same field, so there is one implementation of the
+/// "everything after the final `)`" rule rather than one per caller.
+pub fn stat_line_is_zombie(stat: &str) -> bool {
+    parse_proc_stat_state(stat) == Some('Z')
+}
+
+/// Has this PID already terminated, with only an unreaped process-table entry
+/// left behind?
+///
+/// `kill(pid, 0)` succeeds against a zombie, so a liveness probe built on the
+/// signal check alone reports a daemon that has already exited as still
+/// running, for as long as whichever process started it stays alive without
+/// waiting on it. That is the ordinary shape of an agent session, and of a
+/// container whose pid 1 does not reap what it adopts.
+///
+/// Reporting a zombie dead is affirmative rather than a guess, and it is
+/// strictly safer than the alternative: the process has terminated, it cannot
+/// execute, it holds no port, and its PID cannot be reused until it is reaped,
+/// so no successor can inherit a decision made here.
+///
+/// Only an affirmative corpse reading answers `true`. Anything short of that
+/// leaves the caller's conservative path intact.
+#[cfg(unix)]
+pub fn process_is_unreaped_corpse(pid: libc::pid_t) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // `process_has_exited` is this crate's existing reader for exactly this
+        // question, errno handling included: an entry that is already gone
+        // answers the open with ENOENT and one collected mid-read answers with
+        // ESRCH, and both mean no task remains behind the pid. Only an
+        // affirmative reading answers `true`; an unreadable entry stays
+        // indeterminate and leaves the caller conservative.
+        process_has_exited(pid).unwrap_or(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+        let expected = std::mem::size_of::<libc::proc_bsdinfo>();
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut _,
+                expected as i32,
+            )
+        };
+        // `proc_pidinfo` reports failure as a zero return with `errno` set, so
+        // only zero is a result whose `errno` is this call's. A short non-zero
+        // return is undocumented and would leave `errno` holding whatever an
+        // earlier, unrelated call left there, and reading a stale `ESRCH` out of
+        // it would declare a LIVE daemon stopped, which is the one direction
+        // this must never fail in.
+        if written != 0 {
+            return false;
+        }
+        // Permission to inspect is already established by the caller's
+        // successful `kill(pid, 0)`, so `ESRCH` here is the kernel reporting
+        // that the process is gone rather than that this caller may not look.
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // No affirmative corpse probe on this platform. Never guess: an
+        // unrecognised Unix keeps the conservative "signalable means alive"
+        // answer it had before.
+        let _ = pid;
+        false
+    }
+}
+
 fn process_liveness(pid: u32) -> Liveness {
     #[cfg(unix)]
     {
@@ -4791,7 +4866,22 @@ fn process_liveness(pid: u32) -> Liveness {
             return Liveness::Dead;
         };
         if unsafe { libc::kill(pid, 0) } == 0 {
-            return Liveness::Alive;
+            // Signalable is not the same as running. A daemon that was killed
+            // and not yet reaped still answers this call, and reading it as
+            // alive is how a store with an unretired serving record beside a
+            // dead pid stopped being graded as a death: the reader was told the
+            // daemon was "still present, either wedged or part way through
+            // dying" about a process the kernel had already torn down, and
+            // `kin daemon stop` cannot act on a corpse.
+            //
+            // kin-cli's own liveness probe has answered this correctly since
+            // FIR-2650; this one had not, and it is the one the death path
+            // asks.
+            return if process_is_unreaped_corpse(pid) {
+                Liveness::Dead
+            } else {
+                Liveness::Alive
+            };
         }
         match std::io::Error::last_os_error().raw_os_error() {
             Some(libc::ESRCH) => Liveness::Dead,
@@ -8861,6 +8951,79 @@ Shared_Dirty:          0 kB\n";
             watch.last_published_rss(42),
             None,
             "a marker naming another pid is not this daemon's memory"
+        );
+    }
+
+    // ── An unreaped corpse is not a live daemon (FIR-2650, second half) ──
+
+    #[test]
+    fn a_zombie_stat_line_reads_as_a_corpse() {
+        assert!(stat_line_is_zombie("4242 (kin-daemon) Z 1 4242 4242 0 -1"));
+        assert!(!stat_line_is_zombie("4242 (kin-daemon) S 1 4242 4242 0 -1"));
+        assert!(!stat_line_is_zombie("4242 (kin-daemon) R 1 4242 4242 0 -1"));
+        // `comm` may contain spaces and parentheses, and it is the only field
+        // that can, so the state is read after its FINAL closing delimiter.
+        assert!(stat_line_is_zombie("4242 (kin daemon (probe)) Z 1 4242"));
+        assert!(!stat_line_is_zombie("4242 (kin daemon (probe)) S 1 4242"));
+        assert!(!stat_line_is_zombie("4242 (kin-daemon)"));
+        assert!(!stat_line_is_zombie(""));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    // The zombie is the subject, not an accident. `clippy::zombie_processes`
+    // warns about exactly the state this test has to create, and calling
+    // `.wait()` would reap the corpse and leave nothing to probe. It is reaped
+    // when the test binary exits.
+    #[allow(clippy::zombie_processes)]
+    fn a_killed_and_unreaped_daemon_is_not_alive() {
+        // A real corpse rather than a synthetic one: `kill(pid, 0)` succeeds
+        // against it, which is exactly the reading that used to answer "alive".
+        // Deliberately never waited on, so the entry stays in the process table
+        // for the length of this test.
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a short-lived child");
+        let pid = child.id();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let mut became_a_corpse = false;
+        while std::time::Instant::now() < deadline {
+            if process_is_unreaped_corpse(pid as libc::pid_t) {
+                became_a_corpse = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            became_a_corpse,
+            "the child never became an unreaped corpse, so this test graded nothing"
+        );
+
+        // The control that makes the assertion mean something: the corpse is
+        // still signalable, so a probe built on `kill(pid, 0)` alone would call
+        // it alive.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "the corpse must still answer kill(pid, 0), or this proves nothing"
+        );
+        assert!(
+            !process_is_alive(pid),
+            "a process that has exited is not alive, however unreaped it is"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_process_is_still_alive() {
+        // The other direction, so a probe that answered "dead" for everything
+        // would fail here rather than pass both tests.
+        assert!(
+            process_is_alive(std::process::id()),
+            "this very process is running"
         );
     }
 }
