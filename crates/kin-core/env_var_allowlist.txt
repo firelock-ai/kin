@@ -18,6 +18,11 @@
 # pass. Nothing an operator sets, and no runtime behaviour keys on it.
 KIN_CI_LANGUAGE_SERVERS_INSTALLED
 KIN_AGENT_TEST_KIN_BIN
+# Names the bucket an already-running fake-gcs-server holds, for the #[ignore]d
+# GCS endpoint round-trip in kin-daemon. Nothing runs without it, no runtime
+# behaviour keys on it, and the operator-facing lever it exercises is
+# KIN_GCS_ENDPOINT, which is registered.
+KIN_GCS_TEST_BUCKET
 KIN_GIT_TEST_NO_SYMLINK_PRIVILEGE
 # Read only by the admission memory tests' shared probe, to print a per-phase
 # live-heap line during a passing run. Recording is unconditional; this only

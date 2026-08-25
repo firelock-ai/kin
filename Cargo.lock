@@ -3245,6 +3245,7 @@ dependencies = [
  "kin-spine",
  "libc",
  "mimalloc",
+ "object_store",
  "pretty_assertions",
  "reqwest 0.12.28",
  "serde",
