@@ -2473,16 +2473,28 @@ fn graph_authority_writer_sentence(state: &DaemonState) -> &'static str {
 
 /// The refusal a reference read owes its caller when no answer could be served.
 ///
+/// Two rules, from two tickets, and both are about what the sentence may not be.
+///
 /// It has to name the in-flight write, because the alternative an agent reads
 /// it against is "this symbol does not exist". Those are different facts and a
 /// message that does not separate them is how a transient window got recorded
 /// as an unresolved symbol (FIR-2468).
+///
+/// And it may never end on a bare instruction to retry, because it is reached
+/// only after the handler has spent its own retry budget, so retrying is the
+/// thing that just failed (FIR-2633). What it owes instead is what was tried,
+/// what state blocked it, and the condition that changes the outcome. The
+/// shape is the one `GraphStatusBlocked::what_would_change_it` already uses one
+/// surface over.
 fn xref_authority_unsettled_message(state: &DaemonState, surface: &str) -> String {
     format!(
-        "graph authority changed repeatedly during {surface}: {}, and none of the \
-         {XREF_STABLE_READ_ATTEMPTS} attempts could be certified against a settled graph. This is \
-         an in-flight write window, not an absent or unresolved symbol, and nothing here says \
-         whether the queried entity exists. Retry once the writer settles.",
+        "no settled graph authority for {surface}: {}. All {XREF_STABLE_READ_ATTEMPTS} attempts \
+         were spent, each waiting longer than the last, and none could be certified against a \
+         graph that held still. This says nothing about whether the queried entity exists: it is \
+         an in-flight write window, not an absent or unresolved symbol. What changes the outcome \
+         is the writer draining, not another immediate call, which is what these attempts already \
+         were. GET /lsp/sweep/status reports whether an enrichment sweep is running and how many \
+         files it has left.",
         graph_authority_writer_sentence(state),
     )
 }
@@ -2490,11 +2502,19 @@ fn xref_authority_unsettled_message(state: &DaemonState, surface: &str) -> Strin
 /// Attach the mutation-in-flight disclosure to an answer that was read from a
 /// coherent snapshot the graph then moved past.
 ///
-/// The snapshot itself is not suspect: [`prepare_xref_graph_read`] certified
-/// that no writer spanned its capture, so the rows in it are rows that were
-/// really there. What expired is currency, and a writer installing relations
-/// can only have added edges this answer does not list, so the honest statement
-/// is "possibly short", never "possibly wrong".
+/// What the snapshot guarantees and what it does not are different, and the
+/// sentence has to keep them apart. [`prepare_xref_graph_read`] certified that
+/// no writer spanned its capture, so the answer is not a torn read: every row
+/// in it was really there at one instant. What expired is currency.
+///
+/// The disclosure deliberately does NOT say the counts are a lower bound. That
+/// would be true if the only writer were the enrichment sweep, which calls
+/// `upsert_relation` and nothing else, but the sweep flag being set does not
+/// make it the only writer: a reconcile applying a tree delta removes entities
+/// and moves file origins, and it can run beside one. FIR-2633 names this
+/// exactly, that a stale reference set "can be actively wrong about code that
+/// just moved", so the honest statement names both directions and promises
+/// neither.
 ///
 /// Returns `None` rather than the untouched result whenever the disclosure
 /// could not be attached: an error result, or a payload that is not a JSON
@@ -2520,9 +2540,12 @@ fn disclose_mutation_in_flight(
         "component": GRAPH_AUTHORITY_COMPONENT,
         "reason": MUTATION_IN_FLIGHT_REASON,
         "detail": format!(
-            "{}, so this answer was read from the last snapshot that was coherent rather than \
-             from a settled graph. A relation installed after that snapshot is not counted here, \
-             so treat these counts as a lower bound and re-run once the write settles.",
+            "{}, so this answer describes an earlier instant rather than a settled graph. No \
+             writer spanned the snapshot it was read from, so nothing here is a torn read and \
+             every row was really there at that instant. Currency is what is missing: the graph \
+             moved afterwards, so a row may name code that has since changed and an edge written \
+             since is not counted. Re-run once the writer drains for an answer this daemon can \
+             certify; GET /lsp/sweep/status reports whether an enrichment sweep is running.",
             graph_authority_writer_sentence(state),
         ),
     });
@@ -29880,7 +29903,6 @@ mod tests {
         .await
         .expect_err("an orphaned session graph must never be certified");
         assert_eq!(error.0, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(error.1.contains("changed repeatedly"));
         // The refusal names the write and refuses to be read as an absence.
         // An orphaned session scope is not an enrichment sweep, so the sentence
         // must stay at "a graph-authority writer" here: naming the sweep on a
@@ -29896,6 +29918,36 @@ mod tests {
             error.1.contains("not an absent or unresolved symbol"),
             "refusal must separate a write window from an absence: {}",
             error.1
+        );
+        assert_names_what_would_change_it(&error.1);
+    }
+
+    /// FIR-2633's bar, applied to every refusal these surfaces can produce.
+    ///
+    /// The ticket quotes the shipped string, "graph authority changed
+    /// repeatedly during find_references; retry", and the defect is not its
+    /// wording. It is reached only after the handler has spent its own retry
+    /// budget, so the one action it names is the action that just failed eight
+    /// times out of eight on dg-baseline. What it owes instead is what was
+    /// tried, what blocked it, and the condition that changes the outcome.
+    fn assert_names_what_would_change_it(message: &str) {
+        assert!(
+            !message.contains("; retry"),
+            "this is reached only after the retry budget is spent, so a bare retry instruction \
+             is the one thing it may not end on (FIR-2633): {message}"
+        );
+        assert!(
+            message.contains("attempts were spent"),
+            "the refusal must say what was already tried: {message}"
+        );
+        assert!(
+            message.contains("What changes the outcome is the writer draining"),
+            "the refusal must name the condition that clears the block, not repeat the \
+             instruction that failed: {message}"
+        );
+        assert!(
+            message.contains("/lsp/sweep/status"),
+            "the refusal must name a surface the caller can read that condition off: {message}"
         );
     }
 
@@ -30221,6 +30273,7 @@ mod tests {
             message.contains("a graph-authority writer was mutating the graph"),
             "the refusal must name the writer: {message}"
         );
+        assert_names_what_would_change_it(&message);
 
         // With the sweep flag set, the same refusal names the sweep instead,
         // because that is the one writer identity the daemon holds at read time.
@@ -30242,6 +30295,7 @@ mod tests {
             swept.contains("a language-server enrichment sweep was installing relations"),
             "the refusal must name the sweep when a sweep is what is running: {swept}"
         );
+        assert_names_what_would_change_it(&swept);
         drop(held);
     }
 
@@ -30281,6 +30335,7 @@ mod tests {
             message.contains("not an absent or unresolved symbol"),
             "the refusal must say what it is not: {message}"
         );
+        assert_names_what_would_change_it(&message);
     }
 
     #[tokio::test]
