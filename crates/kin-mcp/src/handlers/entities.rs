@@ -6723,7 +6723,10 @@ mod tests {
     #[tokio::test]
     async fn find_references_excludes_a_self_edge() {
         let store = InMemoryGraph::new();
-        let caller = make_entity("caller", "src/a.rs");
+        let mut caller = make_entity("caller", "src/a.rs");
+        // A role the graph did not default to, so the assertion below proves the
+        // VALUE reached the wire and not merely the key (FIR-1940).
+        caller.role = EntityRole::Test;
         let target = make_entity("recurse", "src/b.rs");
         store.upsert_entity(&caller).unwrap();
         store.upsert_entity(&target).unwrap();
@@ -6748,6 +6751,11 @@ mod tests {
             body["references"][0]["entity_id"],
             caller.id.to_string(),
             "the one row must be the external caller: {body:#}"
+        );
+        assert_eq!(
+            body["references"][0]["role"],
+            serde_json::json!("test"),
+            "a local row carries the caller's own role through the whole handler: {body:#}"
         );
     }
 
