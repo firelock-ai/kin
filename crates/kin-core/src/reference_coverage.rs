@@ -341,7 +341,10 @@ impl LanguageReferenceCoverage {
     }
 
     pub fn import_percent(&self) -> Option<u32> {
-        percent(self.parsed_import_statements, self.resolved_import_statements?)
+        percent(
+            self.parsed_import_statements,
+            self.resolved_import_statements?,
+        )
     }
 
     /// Whether an absence answered from this language's edges can be trusted.
@@ -691,7 +694,9 @@ fn language_summary(coverage: &LanguageReferenceCoverage) -> String {
         // A parse side that read no import statements has no denominator, so
         // stating a fraction would be a ratio against nothing.
         (Some(_), Some(resolved), None) => {
-            format!("imports {resolved} resolved, parse side counted no import statements{external}")
+            format!(
+                "imports {resolved} resolved, parse side counted no import statements{external}"
+            )
         }
         (None, Some(resolved), _) => {
             format!("imports {resolved} resolved, parse side unmeasured{external}")
