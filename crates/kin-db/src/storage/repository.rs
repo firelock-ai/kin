@@ -50,6 +50,7 @@ use crate::storage::backend::{
     SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend, VerifiedSourceBlobBatch,
     MAX_SOURCE_BLOB_BYTES,
 };
+use crate::storage::canonical_hash::canonical_hash_into;
 use crate::storage::change_validation::AdmittedChangeMap;
 use crate::storage::format::{GraphSnapshot, WorkspaceGraphFacts};
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
@@ -6603,27 +6604,43 @@ fn compute_roots(
     authority: &PersistedRepositoryAuthority,
     generation: u64,
 ) -> Result<RootBundle, KinDbError> {
+    // One span per root, for the reason `prepare_successor`'s laps carry one:
+    // a root that costs a conversion real memory must be nameable by whatever
+    // reads spans, and `kindb.roots.replication` is what the memory guard in
+    // `tests/git_bootstrap_root_hash_memory.rs` reads.
+    let history = {
+        let _s = tracing::info_span!("kindb.roots.history").entered();
+        history_root(snapshot, authority)?
+    };
+    let ref_state = {
+        let _s = tracing::info_span!("kindb.roots.ref_state").entered();
+        ref_state_root(authority)?
+    };
+    let ref_log = {
+        let _s = tracing::info_span!("kindb.roots.ref_log").entered();
+        ref_log_root(authority)?
+    };
+    let collaboration = {
+        let _s = tracing::info_span!("kindb.roots.collaboration").entered();
+        collaboration_root(snapshot)?
+    };
+    let replication = {
+        let _s = tracing::info_span!("kindb.roots.replication").entered();
+        replication_root(authority)?
+    };
+    let local_state = {
+        let _s = tracing::info_span!("kindb.roots.local_state").entered();
+        local_state_root(snapshot, authority)?
+    };
     Ok(RootBundle {
         version: REPOSITORY_ROOT_SCHEMA_VERSION,
         generation,
-        history: AuthorityRoot::new(
-            REPOSITORY_ROOT_SCHEMA_VERSION,
-            history_root(snapshot, authority)?,
-        ),
-        ref_state: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, ref_state_root(authority)?),
-        ref_log: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, ref_log_root(authority)?),
-        collaboration: AuthorityRoot::new(
-            REPOSITORY_ROOT_SCHEMA_VERSION,
-            collaboration_root(snapshot)?,
-        ),
-        replication: AuthorityRoot::new(
-            REPOSITORY_ROOT_SCHEMA_VERSION,
-            replication_root(authority)?,
-        ),
-        local_state: AuthorityRoot::new(
-            REPOSITORY_ROOT_SCHEMA_VERSION,
-            local_state_root(snapshot, authority)?,
-        ),
+        history: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, history),
+        ref_state: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, ref_state),
+        ref_log: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, ref_log),
+        collaboration: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, collaboration),
+        replication: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, replication),
+        local_state: AuthorityRoot::new(REPOSITORY_ROOT_SCHEMA_VERSION, local_state),
     })
 }
 
@@ -6735,6 +6752,9 @@ fn collaboration_root(snapshot: &GraphSnapshot) -> Result<Hash256, KinDbError> {
 fn replication_root(authority: &PersistedRepositoryAuthority) -> Result<Hash256, KinDbError> {
     let mut root = DomainRoot::new(b"kin-repository-replication-root-v2\0");
     root.ordered("external_objects", &authority.external_objects)?;
+    // One leaf carrying the entire Git object closure. This is the largest
+    // single value the roots hash, and the reason `canonical_leaf_hash` may not
+    // build a tree of what it hashes (FIR-2665).
     root.ordered(
         "git_external_authority",
         &authority.git_external_authority.iter().collect::<Vec<_>>(),
@@ -6817,51 +6837,22 @@ impl DomainRoot {
     }
 }
 
+/// Hash one leaf of a repository root.
+///
+/// The encoding is unchanged and may not change: these digests are persisted
+/// authority roots. What changed is that it is written straight out of
+/// `Serialize` rather than out of a `serde_json::Value` tree built for the
+/// purpose. On a whole-repository leaf the tree cost fifteen times the bytes it
+/// produced, and a bootstrap hands this function the entire Git object closure
+/// as a single leaf (FIR-2665).
 fn canonical_leaf_hash<T: Serialize>(domain: &str, value: &T) -> Result<[u8; 32], KinDbError> {
-    let value = serde_json::to_value(value)?;
     let mut hasher = Sha256::new();
     hasher.update(b"kin-repository-root-leaf-v1\0");
     hasher.update((domain.len() as u64).to_le_bytes());
     hasher.update(domain.as_bytes());
-    hash_canonical_json(&mut hasher, &value);
+    canonical_hash_into(&mut hasher, value)
+        .map_err(|error| storage(format!("canonical root leaf {domain} refused: {error}")))?;
     Ok(hasher.finalize().into())
-}
-
-fn hash_canonical_json(hasher: &mut Sha256, value: &serde_json::Value) {
-    match value {
-        serde_json::Value::Null => hasher.update([0]),
-        serde_json::Value::Bool(value) => hasher.update([1, u8::from(*value)]),
-        serde_json::Value::Number(value) => {
-            hasher.update([2]);
-            hash_bytes(hasher, value.to_string().as_bytes());
-        }
-        serde_json::Value::String(value) => {
-            hasher.update([3]);
-            hash_bytes(hasher, value.as_bytes());
-        }
-        serde_json::Value::Array(values) => {
-            hasher.update([4]);
-            hasher.update((values.len() as u64).to_le_bytes());
-            for value in values {
-                hash_canonical_json(hasher, value);
-            }
-        }
-        serde_json::Value::Object(values) => {
-            hasher.update([5]);
-            hasher.update((values.len() as u64).to_le_bytes());
-            let mut keys: Vec<_> = values.keys().collect();
-            keys.sort_unstable();
-            for key in keys {
-                hash_bytes(hasher, key.as_bytes());
-                hash_canonical_json(hasher, &values[key]);
-            }
-        }
-    }
-}
-
-fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u64).to_le_bytes());
-    hasher.update(bytes);
 }
 
 fn storage(message: String) -> KinDbError {

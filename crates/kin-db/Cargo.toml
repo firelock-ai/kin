@@ -88,3 +88,6 @@ async-trait = "0.1"
 futures-util = "0.3"
 kin-vector = { version = "=0.1.12", registry = "kin" }
 rand = "0.10"
+# Real Git object ids for the synthetic conversion the root-hash memory guard
+# commits; `ExternalObjectRecord` recomputes an oid and refuses a made-up one.
+sha1 = "0.11"

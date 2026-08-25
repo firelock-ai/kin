@@ -4,6 +4,7 @@
 pub mod authority;
 pub mod authority_frame;
 pub mod backend;
+pub(crate) mod canonical_hash;
 pub(crate) mod change_validation;
 pub mod delta;
 pub mod format;
