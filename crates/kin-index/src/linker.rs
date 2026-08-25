@@ -4435,6 +4435,44 @@ fn make_artifact_import_relation(
     })
 }
 
+/// How many of a file's import STATEMENTS resolved to a file this repository
+/// holds, and how many did not.
+///
+/// Returned as `(statements, resolved)`. The unit is the `FileImport`, one per
+/// import statement, which is exactly the unit `parsed_import_statements`
+/// counts in.
+///
+/// It has to be taken HERE, because it cannot be recovered downstream. Measured
+/// with the real adapter: `from storage import Store, open_db` is one
+/// `FileImport` with two specifiers, and the same two names on separate lines
+/// are two `FileImport`s with one each. Those two shapes produce byte-identical
+/// graph content, one artifact edge (the linker dedupes on `(src, dst, kind)`)
+/// and two entity edges (one per specifier), while differing here, 1 against 2.
+/// So no key derived from edges can tell them apart, and a collector counting
+/// edges against a denominator of statements reports a ratio between two
+/// different populations.
+///
+/// The unresolved remainder is also the honest external count for a language
+/// whose specifier syntax cannot settle externality on its own. A Python
+/// `import re` names a module outside the repository exactly when no file the
+/// repository holds answers to it, which is what `known_files` decides here,
+/// and which is strictly better evidence than the syntactic bare-specifier
+/// proxy JavaScript uses.
+fn import_resolution_counts<S>(
+    file_path: &str,
+    imports: &[FileImport],
+    known_files: &HashSet<S>,
+) -> (usize, usize)
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let resolved = imports
+        .iter()
+        .filter(|import| resolve_import_target(file_path, import, known_files).is_some())
+        .count();
+    (imports.len(), resolved)
+}
+
 /// Index each file's module entity, the endpoint an entity-level import edge
 /// sources from.
 ///
@@ -9460,6 +9498,92 @@ void f();
         assert!(
             resolve_import_target("lib/index.js", &selfref, &known).is_none(),
             "a module resolving to itself must produce no import target"
+        );
+    }
+
+    /// The two shapes that prove the unit, with the `FileImport` counts the real
+    /// adapter produces for them.
+    ///
+    /// These assert on the LINKER's own per-file count, before anything reaches
+    /// a collector, because the collector cannot distinguish them: both produce
+    /// one artifact edge and two entity edges.
+    #[test]
+    fn import_resolution_counts_statements_not_edges() {
+        let known: HashSet<&str> = ["app/main.py", "app/storage.py"].into_iter().collect();
+
+        // `from .storage import Store, open_db`: ONE statement, two specifiers.
+        let one_statement = vec![FileImport {
+            module_path: ".storage".to_string(),
+            specifiers: vec![
+                ImportedName {
+                    local_name: "Store".to_string(),
+                    original_name: None,
+                    is_default: false,
+                },
+                ImportedName {
+                    local_name: "open_db".to_string(),
+                    original_name: None,
+                    is_default: false,
+                },
+            ],
+        }];
+        assert_eq!(
+            import_resolution_counts("app/main.py", &one_statement, &known),
+            (1, 1),
+            "one statement with two specifiers is one statement, resolved once"
+        );
+
+        // The same two names on separate lines: TWO statements.
+        let two_statements = vec![
+            FileImport {
+                module_path: ".storage".to_string(),
+                specifiers: vec![ImportedName {
+                    local_name: "Store".to_string(),
+                    original_name: None,
+                    is_default: false,
+                }],
+            },
+            FileImport {
+                module_path: ".storage".to_string(),
+                specifiers: vec![ImportedName {
+                    local_name: "open_db".to_string(),
+                    original_name: None,
+                    is_default: false,
+                }],
+            },
+        ];
+        assert_eq!(
+            import_resolution_counts("app/main.py", &two_statements, &known),
+            (2, 2),
+            "two statements naming one module are two statements, both resolved"
+        );
+    }
+
+    /// A statement naming something the repository does not hold counts as a
+    /// statement and not as a resolution, which is the external count.
+    #[test]
+    fn import_resolution_counts_an_unresolved_statement_as_external() {
+        let known: HashSet<&str> = ["app/main.py", "app/storage.py"].into_iter().collect();
+        let mixed = vec![
+            FileImport {
+                module_path: "re".to_string(),
+                specifiers: vec![],
+            },
+            FileImport {
+                module_path: ".storage".to_string(),
+                specifiers: vec![],
+            },
+        ];
+        let (statements, resolved) = import_resolution_counts("app/main.py", &mixed, &known);
+        assert_eq!(statements, 2, "both lines are statements");
+        assert_eq!(
+            resolved, 1,
+            "the stdlib module resolves to no file this repository holds"
+        );
+        assert_eq!(
+            statements - resolved,
+            1,
+            "the unresolved remainder is the external count"
         );
     }
 
