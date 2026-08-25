@@ -1444,7 +1444,6 @@ mod tests {
 
     /// The rendered line names the external share, so a low ratio reads as a
     /// repository with more dependencies than modules rather than as a defect.
-    #[test]
     /// One import site must not be counted twice because it now produces an
     /// edge at both levels.
     ///
@@ -1497,6 +1496,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn the_summary_line_discloses_imports_that_name_a_module_outside_the_repository() {
         let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
         graph
