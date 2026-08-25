@@ -250,9 +250,7 @@ impl LanguageAdapter for PythonAdapter {
             // bind names for annotations.
             match child.kind() {
                 "import_statement" => {
-                    if let Some(import) = extract_py_import(&child, source) {
-                        imports.push(import);
-                    }
+                    imports.extend(extract_py_imports(&child, source));
                 }
                 "import_from_statement" => {
                     if let Some(import) = extract_py_from_import(&child, source) {
@@ -1516,9 +1514,7 @@ fn collect_python_guarded_imports(
 ) {
     match node.kind() {
         "import_statement" => {
-            if let Some(import) = extract_py_import(node, source) {
-                out.push(import);
-            }
+            out.extend(extract_py_imports(node, source));
         }
         "import_from_statement" => {
             if let Some(import) = extract_py_from_import(node, source) {
@@ -1978,27 +1974,69 @@ fn is_valid_callee_name(name: &str) -> bool {
         && !name.chars().all(|c| c.is_numeric())
 }
 
-/// Extract import from `import foo` or `import foo.bar`.
-fn extract_py_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport> {
-    let mut specifiers = Vec::new();
+/// Extract imports from `import foo`, `import foo.bar`, `import foo as f` and
+/// `import alpha, beta`.
+///
+/// One statement can bind several modules and each names a different module
+/// path, so each becomes its own [`FileImport`]. Two defects lived in the
+/// single-import version this replaces, and both were silent.
+///
+/// An early return after the first `dotted_name` meant `import alpha, beta`
+/// recorded only `alpha`, so every module after a comma was invisible to
+/// resolution.
+///
+/// Worse, `import foo as f` produced no import at all. The aliased form nests
+/// its `dotted_name` one level down inside an `aliased_import` node, so a scan
+/// for a direct `dotted_name` child matched nothing and the function returned
+/// `None`. An import that produces no declaration produces no edge at any
+/// level, so aliased imports were absent from the graph entirely rather than
+/// merely unresolved.
+fn extract_py_imports(node: &tree_sitter::Node, source: &[u8]) -> Vec<FileImport> {
+    let mut out = Vec::new();
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        if child.kind() == "dotted_name" {
-            let module_path = child.utf8_text(source).unwrap_or("").to_string();
-            if !module_path.is_empty() {
-                specifiers.push(ImportedName {
-                    local_name: module_path.clone(),
-                    original_name: None,
-                    is_default: false,
-                });
-                return Some(FileImport {
-                    module_path,
-                    specifiers,
-                });
+        // `import a` puts a bare `dotted_name` under the statement; `import a as b`
+        // wraps it in an `aliased_import` whose `name` field holds it.
+        let (module_node, alias) = match child.kind() {
+            "dotted_name" => (child, None),
+            "aliased_import" => {
+                let Some(name) = child.child_by_field_name("name") else {
+                    continue;
+                };
+                let alias = child
+                    .child_by_field_name("alias")
+                    .and_then(|n| n.utf8_text(source).ok())
+                    .map(str::to_string)
+                    .filter(|alias| !alias.is_empty());
+                (name, alias)
             }
+            _ => continue,
+        };
+        let module_path = module_node.utf8_text(source).unwrap_or("").to_string();
+        if module_path.is_empty() {
+            continue;
         }
+        // An aliased module carries the alias as the local binding and the
+        // module path as the original, which is the same shape
+        // `extract_py_from_import` records for `from x import y as z`. A plain
+        // import leaves `original_name` unset, exactly as before, because the
+        // per-file import map that backs call resolution reads this field and
+        // an unnecessary change there would move behaviour this fix does not
+        // mean to touch.
+        let (local_name, original_name) = match alias {
+            Some(alias) => (alias, Some(module_path.clone())),
+            None => (module_path.clone(), None),
+        };
+        out.push(FileImport {
+            module_path,
+            specifiers: vec![ImportedName {
+                local_name,
+                original_name,
+                is_default: false,
+            }],
+        });
     }
-    None
+    out
 }
 
 /// Extract import from `from foo import bar, baz as qux`.
