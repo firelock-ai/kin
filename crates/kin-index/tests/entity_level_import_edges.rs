@@ -239,13 +239,40 @@ fn javascript_non_index_file_still_sources_no_entity_import_edge() {
     );
 }
 
-/// An `index.js` DOES carry a module entity, so its whole-module require has
-/// both endpoints available.
+/// An `index.js` in an ordinary directory DOES carry a module entity, so its
+/// whole-module require has both endpoints available. This is the shape behind
+/// the census's 29-of-141 reading on express, where every one of the 29 is an
+/// `examples/<name>/index.js`.
 #[test]
-fn javascript_index_file_carries_a_module_entity() {
-    let file = js("lib/index.js", "module.exports = require('./router');\n");
+fn javascript_index_file_in_a_named_directory_carries_a_module_entity() {
+    let file = js(
+        "examples/auth/index.js",
+        "module.exports = require('./router');\n",
+    );
     assert!(
         has_module_entity(&file),
-        "an index.js carried no module entity; the census's 29-of-141 reading rests on this"
+        "an index.js in a named directory carried no module entity"
     );
+}
+
+/// An `index.js` sitting directly in `lib/` or `src/` carries NO module entity,
+/// because `extract_module_name_from_path` refuses those two directory names
+/// outright.
+///
+/// This is the sharper half of the JavaScript gap and it is worth pinning
+/// separately: the exclusion lands on exactly the directories a real library
+/// keeps its code in, so express's own `lib/` is unreachable at entity level
+/// twice over, once for not being an index file and once for the directory
+/// name. Asserted as the current limitation, and written to fail the day the
+/// rule changes.
+#[test]
+fn javascript_index_file_directly_under_lib_or_src_carries_no_module_entity() {
+    for path in ["lib/index.js", "src/index.js"] {
+        let file = js(path, "module.exports = require('./router');\n");
+        assert!(
+            !has_module_entity(&file),
+            "{path} now carries a module entity; the JavaScript adapter's src/lib \
+             exclusion changed and this limitation test should become a positive one"
+        );
+    }
 }
