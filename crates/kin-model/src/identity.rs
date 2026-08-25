@@ -387,6 +387,19 @@ impl CanonicalSink for HashingSink {
 }
 
 pub(crate) fn canonical_json_bytes(value: &impl serde::Serialize) -> Result<Vec<u8>> {
+    crate::canonical_ser::canonical_streamed_bytes(value)
+}
+
+/// The same bytes, produced by walking a `serde_json::Value` tree of the whole
+/// value.
+///
+/// This is what every identity in this crate was built from before
+/// [`crate::canonical_ser`] existed, so it defines the encoding rather than
+/// merely agreeing with it, and it is kept as the oracle the streaming encoder
+/// is checked against. Keeping it is the point: a differential in which both
+/// sides go through the same new code proves nothing.
+#[cfg(test)]
+pub(crate) fn canonical_json_bytes_via_tree(value: &impl serde::Serialize) -> Result<Vec<u8>> {
     let value = serde_json::to_value(value).map_err(serialization)?;
     let mut encoded = Vec::new();
     append_canonical_json(&mut encoded, &value)?;
@@ -404,8 +417,7 @@ pub(crate) fn append_canonical_value<S: CanonicalSink>(
     output: &mut S,
     value: &impl serde::Serialize,
 ) -> Result<()> {
-    let value = serde_json::to_value(value).map_err(serialization)?;
-    append_canonical_json(output, &value)
+    crate::canonical_ser::append_canonical_streamed(output, value)
 }
 
 /// The canonical encoding of an array, materializing one element at a time.

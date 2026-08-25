@@ -36,6 +36,7 @@
 
 pub mod admission;
 pub mod branch;
+pub(crate) mod canonical_ser;
 pub mod change;
 pub mod conflict;
 pub mod context;

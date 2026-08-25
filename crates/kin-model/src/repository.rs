@@ -4599,30 +4599,30 @@ mod tests {
     /// Which of the two whole-transaction materializations inside the hash is
     /// the one worth removing.
     ///
-    /// `canonical_json_bytes` builds a `serde_json::Value` tree of the whole
-    /// transaction and then encodes that whole tree into a `Vec<u8>`, and both
-    /// are live when the encode returns. A fix can remove either. This prices
-    /// them separately so the choice is made by measurement rather than by
-    /// which one is easier to write.
+    /// `canonical_json_bytes` used to build a `serde_json::Value` tree of the
+    /// whole value and then encode that whole tree into a `Vec<u8>`, with both
+    /// live when the encode returned. FIR-2551 priced the tree at eleven times
+    /// the transaction it encoded and named it as the fix.
     ///
-    /// Measured 6_667_601 for the tree, 8_765_641 for tree and encoding
-    /// together, and 1_619_602 for the encoding itself on a 200-change
-    /// transaction. The tree was 76 percent of the peak and eleven times the
-    /// transaction it encoded, which is what chose the fix.
+    /// Both materializations are gone now. `canonical_hash` builds its preimage
+    /// a field at a time, and the encoder underneath it writes canonical bytes
+    /// straight out of `Serialize` instead of out of a tree, so what is held is
+    /// the payload rather than a picture of it. Measured on this fixture:
+    /// 6_667_601 for the tree alone, 8_765_641 for the tree-and-encoding path
+    /// that `canonical_json_bytes_via_tree` still walks, and 3_747_729 for the
+    /// streaming encoder that replaced it.
     ///
-    /// `whole_hash` no longer matches `tree_and_encoding`, and that gap IS the
-    /// fix: `canonical_hash` now builds its preimage a field at a time and holds
-    /// one array element's tree rather than the whole transaction's, so it
-    /// measures about 2_161_152 where the whole-tree path still measures
-    /// 8_765_641. The two whole-tree figures stay here because they are what the
-    /// saving is against.
+    /// The tree walk is kept and measured here on purpose. It is the oracle the
+    /// streaming encoder is checked against elsewhere, and it is what the saving
+    /// below is against; a differential in which both sides go through the new
+    /// code would prove nothing.
     ///
     /// Reported, never asserted as a ceiling, for the reason the test above
     /// gives: a ceiling here pins the encoder and drifts with any serde change.
-    /// The assertions are shape only, and they are the ones that would break if
-    /// this test stopped measuring what it claims to.
+    /// Every assertion is a comparison between two figures measured in the same
+    /// run, so none of them can drift.
     #[test]
-    fn the_hash_holds_two_whole_transaction_materializations_and_prices_both() {
+    fn hashing_a_transaction_costs_less_than_the_tree_it_used_to_build() {
         let transaction = large_transaction(200);
         transaction.canonical_hash().unwrap();
 
@@ -4630,7 +4630,14 @@ mod tests {
             let tree = serde_json::to_value(CanonicalTransaction::new(&transaction)).unwrap();
             std::hint::black_box(&tree);
         });
-        let tree_and_encoding = measure_peak_live_bytes(|| {
+        let tree_path = measure_peak_live_bytes(|| {
+            let encoded = crate::identity::canonical_json_bytes_via_tree(
+                &CanonicalTransaction::new(&transaction),
+            )
+            .unwrap();
+            std::hint::black_box(&encoded);
+        });
+        let streamed = measure_peak_live_bytes(|| {
             let encoded =
                 crate::identity::canonical_json_bytes(&CanonicalTransaction::new(&transaction))
                     .unwrap();
@@ -4645,21 +4652,21 @@ mod tests {
         });
 
         println!(
-            "tree {view_and_tree} tree+encoding {tree_and_encoding} \
+            "tree {view_and_tree} tree_path {tree_path} streamed {streamed} \
              encoded_len {encoded_len} whole_hash {whole_hash}"
         );
 
         assert!(
-            view_and_tree > 0 && tree_and_encoding > 0 && encoded_len > 0 && whole_hash > 0,
+            view_and_tree > 0 && tree_path > 0 && streamed > 0 && encoded_len > 0 && whole_hash > 0,
             "the probe measured nothing, so it cannot fail: tree {view_and_tree}, \
-             tree+encoding {tree_and_encoding}, encoded_len {encoded_len}, \
+             tree_path {tree_path}, streamed {streamed}, encoded_len {encoded_len}, \
              whole_hash {whole_hash}"
         );
         assert!(
-            tree_and_encoding > view_and_tree,
-            "encoding on top of the tree must cost more than the tree alone, \
-             or the two materializations are not both live ({tree_and_encoding} \
-             against {view_and_tree})"
+            tree_path > view_and_tree,
+            "the tree path must cost more than the tree alone, or it is no longer \
+             holding both the tree and the encoding and this test is measuring the \
+             wrong thing ({tree_path} against {view_and_tree})"
         );
         // The tree is the larger of the two. If this ever inverts, the fix that
         // is worth writing has changed, and it should be re-chosen rather than
@@ -4671,24 +4678,104 @@ mod tests {
         );
         // The improvement itself, asserted rather than only reported.
         //
-        // Without this the three assertions above all pass with the fix undone:
-        // they price the whole-tree path, which this file still measures on
-        // purpose, and say nothing about which path `canonical_hash` takes. A
-        // revert to `hash_serialized` over the whole view would put `whole_hash`
-        // back at `tree_and_encoding` and leave the test green.
-        //
-        // Calibrated against the whole-tree figure measured in the SAME run
-        // rather than against a constant, so it cannot drift with serde and
-        // cannot be satisfied by the encoder getting cheaper for other reasons.
-        // Measured 2_161_152 against 8_765_641, a factor of four; the factor of
-        // two here is the margin, and a revert makes the two figures equal.
+        // Against the tree ALONE rather than against the tree-and-encoding path,
+        // because the tree is the term that was removed and comparing to it says
+        // exactly that: encoding a transaction now costs less than merely
+        // building the picture it used to be encoded from. Reverting the encoder
+        // puts `streamed` back at `tree_path`, which is larger than
+        // `view_and_tree`, and this fails.
         assert!(
-            whole_hash * 2 < tree_and_encoding,
-            "hashing a transaction cost {whole_hash} bytes against {tree_and_encoding} \
+            streamed < view_and_tree,
+            "encoding a transaction cost {streamed} bytes against {view_and_tree} for \
+             the `serde_json::Value` tree it is supposed to no longer build. The \
+             canonical encoder is materializing a tree again."
+        );
+        // Calibrated against a figure measured in the SAME run rather than
+        // against a constant, so it cannot drift with serde and cannot be
+        // satisfied by the encoder getting cheaper for other reasons.
+        assert!(
+            whole_hash * 2 < tree_path,
+            "hashing a transaction cost {whole_hash} bytes against {tree_path} \
              for the whole-tree path it is supposed to avoid. `canonical_hash` is \
              building the document's `serde_json::Value` tree again rather than one \
              array element's at a time."
         );
+    }
+
+    /// Every real payload that hashes through the canonical encoder must encode
+    /// to exactly the bytes the tree walk emits.
+    ///
+    /// BYTES, not hashes, and that is the whole point. FIR-2549 exists because
+    /// the transaction identity differential cannot catch a field reorder: the
+    /// encoding sorts object keys, so a hash comparison normalizes away the one
+    /// difference most likely to appear. Comparing emitted bytes is the only
+    /// comparison that can see it.
+    ///
+    /// Both sides must not go through the new encoder, or the differential
+    /// proves nothing, which is why `canonical_json_bytes_via_tree` is kept.
+    ///
+    /// Coverage is stated rather than implied. The transaction fixtures below
+    /// carry changes, aliases, external objects, ref mutations, a workspace
+    /// mutation, a local overlay and a Git authority delta, so the nested types
+    /// those contain are covered through them. Each change is also compared on
+    /// its own, because `compute_semantic_change_id` hashes one directly.
+    #[test]
+    fn every_canonical_payload_encodes_to_the_same_bytes_as_the_tree_walk() {
+        fn agree<T: serde::Serialize>(what: &str, value: &T) {
+            let streamed = crate::identity::canonical_json_bytes(value)
+                .unwrap_or_else(|error| panic!("{what}: streaming encoder refused: {error}"));
+            let walked = crate::identity::canonical_json_bytes_via_tree(value)
+                .unwrap_or_else(|error| panic!("{what}: tree walk refused: {error}"));
+            assert_eq!(
+                streamed,
+                walked,
+                "{what}: the streaming encoder emits {} bytes and the tree walk emits {}; \
+                 every durable identity derived from this payload would move",
+                streamed.len(),
+                walked.len()
+            );
+            assert!(
+                !streamed.is_empty(),
+                "{what}: encoded to nothing, so this comparison cannot fail"
+            );
+        }
+
+        for (name, transaction) in [
+            ("canonicalizable transaction", canonicalizable_transaction()),
+            ("workspace transaction", workspace_transaction()),
+            ("large transaction", large_transaction(25)),
+        ] {
+            agree(name, &transaction);
+            agree(
+                &format!("{name}, canonical view"),
+                &CanonicalTransaction::new(&transaction),
+            );
+            for (index, change) in transaction.changes.iter().enumerate() {
+                agree(&format!("{name}, change {index}"), change);
+            }
+            for (index, alias) in transaction.aliases.iter().enumerate() {
+                agree(&format!("{name}, alias {index}"), alias);
+            }
+            for (index, record) in transaction.external_objects.iter().enumerate() {
+                agree(&format!("{name}, external object {index}"), record);
+            }
+            if let Some(delta) = &transaction.git_authority_delta {
+                agree(&format!("{name}, Git authority delta"), delta);
+            }
+            if let Some(mutation) = &transaction.workspace_mutation {
+                agree(&format!("{name}, workspace mutation"), mutation);
+                agree(
+                    &format!("{name}, workspace semantic delta"),
+                    &mutation.semantic_delta,
+                );
+            }
+            if let Some(overlay) = &transaction.local_overlay_delta {
+                agree(&format!("{name}, local overlay delta"), overlay);
+            }
+            if let Some(merge) = &transaction.merge_transaction_delta {
+                agree(&format!("{name}, merge transaction delta"), merge);
+            }
+        }
     }
 
     /// Transaction identity must not depend on the order a caller built its
