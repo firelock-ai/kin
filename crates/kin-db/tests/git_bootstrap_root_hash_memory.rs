@@ -292,17 +292,18 @@ fn print_phase_table() {
         }
     }
     println!(
-        "\n{:<46} {:>14} {:>14} {:>14}",
-        "phase", "peak growth", "retained", "live at enter"
+        "\n{:<44} {:>13} {:>13} {:>13} {:>13}",
+        "phase", "peak growth", "ABS PEAK", "retained", "live at enter"
     );
     for (depth, phase, peak_growth, retained, live_in) in &rows {
         if *peak_growth == 0 && *retained == 0 {
             continue;
         }
         println!(
-            "{:<46} {:>14} {:>14} {:>14}",
+            "{:<44} {:>13} {:>13} {:>13} {:>13}",
             format!("{}{}", "  ".repeat(*depth), phase),
             peak_growth,
+            live_in + peak_growth,
             retained,
             live_in
         );
@@ -631,6 +632,20 @@ fn hashing_the_replication_root_does_not_materialize_the_authority() {
         sealed_observation: None,
     };
     drop(lease);
+
+    // Split the two ceiling terms so the next rewrite is aimed rather than
+    // guessed. Both take &self, so nothing is cloned to measure them.
+    let (_, validate_peak) = peak_of(|| transaction.validate().expect("the fixture validates"));
+    let (_, hash_peak) = peak_of(|| {
+        transaction
+            .transaction_hash()
+            .expect("the fixture transaction hashes")
+    });
+    println!(
+        "transaction terms:\n  \
+         validate() alone:        {validate_peak} bytes of peak above entry\n  \
+         transaction_hash():      {hash_peak} bytes (validate + canonical_hash)"
+    );
 
     let before_commit = live_bytes();
     println!("live heap before commit: {before_commit} bytes");
