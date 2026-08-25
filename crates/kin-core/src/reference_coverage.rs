@@ -824,9 +824,7 @@ where
                     // An endpoint the graph holds no file for still has to stay
                     // distinct from every other one, or two unrelated external
                     // imports would collapse into a single site.
-                    let src_key = src_file
-                        .clone()
-                        .unwrap_or_else(|| format!("entity:{src}"));
+                    let src_key = src_file.clone().unwrap_or_else(|| format!("entity:{src}"));
                     let dst_key = by_id
                         .get(&dst)
                         .and_then(|(_, file)| file.clone())
@@ -1467,7 +1465,9 @@ mod tests {
         graph.upsert_entity(&exported).unwrap();
         graph.upsert_entity(&importer).unwrap();
         // The artifact edge, exactly as the linker has always emitted it.
-        graph.upsert_relation(&artifact_import(ids[0], ids[1])).unwrap();
+        graph
+            .upsert_relation(&artifact_import(ids[0], ids[1]))
+            .unwrap();
         // The entity edge the linker now emits beside it.
         graph
             .upsert_relation(&Relation {
