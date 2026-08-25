@@ -179,15 +179,6 @@ impl GraphRelationTotals {
 /// The same set `find_references` defaults to. Dead-code, coverage, and
 /// references must not each carry their own list: the four-entity contradiction
 /// FIR-2356 records is what two lists produce.
-/// The two artifact-level edge kinds an import statement can resolve to.
-///
-/// `Includes` is here because a C or C++ `#include` of a repo-local header
-/// resolves through the same import path and lands on the same artifact-level
-/// edge; counting only `Imports` would under-report those languages the same
-/// way `Imports` alone under-reported JavaScript.
-const ARTIFACT_IMPORT_RELATION_KINDS: [RelationKind; 2] =
-    [RelationKind::Imports, RelationKind::Includes];
-
 pub const REFERENCE_RELATION_KINDS: [RelationKind; 3] = [
     RelationKind::Calls,
     RelationKind::Imports,
@@ -1423,7 +1414,7 @@ mod tests {
 
         assert_eq!(js.parsed_import_statements, Some(4));
         assert_eq!(
-            js.resolved_import_edges, 1,
+            js.resolved_import_statements, Some(1),
             "the artifact-level import edge is the resolution, and must be counted"
         );
         assert_eq!(js.import_percent(), Some(25));
@@ -1458,9 +1449,9 @@ mod tests {
             .iter()
             .find(|row| row.language == LanguageId::Python.to_string())
             .expect("python row");
-        assert_eq!(js.resolved_import_edges, 1);
+        assert_eq!(js.resolved_import_statements, Some(1));
         assert_eq!(
-            python.resolved_import_edges, 0,
+            python.resolved_import_statements, Some(0),
             "the imported file did not write the import statement"
         );
     }
@@ -1613,7 +1604,7 @@ mod tests {
 
         assert_eq!(python.files, 2);
         assert_eq!(python.parsed_import_statements, Some(3));
-        assert_eq!(python.resolved_import_edges, 0);
+        assert_eq!(python.resolved_import_statements, Some(0));
         assert_eq!(python.cross_file_reference_edges, 0);
         assert_eq!(python.intra_file_reference_edges, 1);
         assert!(!coverage.absence_is_supportable());
@@ -1688,7 +1679,7 @@ mod tests {
                 call_sites_measured_files: 12,
                 parsed_import_statements: Some(16),
                 resolved_call_edges: 16,
-                resolved_import_edges: 0,
+                resolved_import_statements: Some(0),
                 external_module_imports: None,
                 cross_file_reference_edges: 0,
                 intra_file_reference_edges: 16,
@@ -1803,7 +1794,7 @@ mod tests {
             call_sites_measured_files: 2,
             parsed_import_statements: Some(2),
             resolved_call_edges: 4,
-            resolved_import_edges: 2,
+            resolved_import_statements: Some(2),
             external_module_imports: None,
             cross_file_reference_edges: 2,
             intra_file_reference_edges: 2,
@@ -1843,7 +1834,7 @@ mod tests {
         row.parsed_call_sites = Some(10);
         row.resolved_call_edges = 3;
         row.parsed_import_statements = Some(8);
-        row.resolved_import_edges = 2;
+        row.resolved_import_statements = Some(2);
         let coverage = ReferenceEdgeCoverage {
             parse: None,
             languages: vec![row],
