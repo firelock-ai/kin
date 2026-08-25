@@ -8,7 +8,7 @@
 //! directory as an explicit ingestion input boundary, exactly as admission
 //! does, and reports which import specifiers produced an artifact-level
 //! `Imports` edge and which produced nothing. Point it at a corpus with
-//! `KIN_IMPORT_CENSUS_ROOT`; with the variable unset every test here is inert,
+//! `IMPORT_EDGE_CENSUS_ROOT`; with the variable unset every test here is inert,
 //! so the default suite never depends on a corpus being present.
 
 use std::collections::{HashMap, HashSet};
@@ -162,8 +162,18 @@ fn entity_rooted_import_edges(corpus: &Corpus) -> usize {
         .count()
 }
 
+/// Deliberately NOT named `KIN_*`.
+///
+/// `kin-core`'s `every_kin_env_read_in_workspace_is_registered` scans the whole
+/// workspace, tests included, for `env::var("KIN_` reads and requires each one
+/// to be a registered product lever. This is not a product lever: it is a
+/// corpus pointer that only this measurement harness reads, and no runtime path
+/// consults it. Registering it would document a knob the product does not have,
+/// and allow-listing it would spend a deliberate exception on a test fixture.
+/// Naming it outside the `KIN_` namespace says what it is. Do not "tidy" it
+/// back to a `KIN_` prefix without adding a registry entry in the same change.
 fn census_root() -> Option<PathBuf> {
-    std::env::var_os("KIN_IMPORT_CENSUS_ROOT").map(PathBuf::from)
+    std::env::var_os("IMPORT_EDGE_CENSUS_ROOT").map(PathBuf::from)
 }
 
 /// How many files carry a `module`-kind entity, the endpoint an entity-level
@@ -375,7 +385,7 @@ fn nameable_specifier_yield(corpus: &Corpus) -> Yield {
 #[test]
 fn census_reports_import_resolution_over_a_corpus() {
     let Some(root) = census_root() else {
-        eprintln!("KIN_IMPORT_CENSUS_ROOT unset; census inert");
+        eprintln!("IMPORT_EDGE_CENSUS_ROOT unset; census inert");
         return;
     };
     let corpus = parse_corpus(&root);
