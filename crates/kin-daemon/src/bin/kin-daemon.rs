@@ -211,13 +211,51 @@ fn create_state(
             let bucket = env::var("KIN_GCS_BUCKET")
                 .map_err(|_| "KIN_GCS_BUCKET env var required for --storage gcs")?;
             let prefix = env::var("KIN_GCS_PREFIX").unwrap_or_default();
-            let backend = kin_db::GcsBackend::new(&bucket, prefix)?;
+            let backend = open_gcs_backend(&bucket, prefix)?;
             Ok(DaemonState::open_with_backend(
                 layout,
                 Box::new(backend),
                 repo_id,
                 allowed_repo_ids,
             )?)
+        }
+    }
+}
+
+/// Open the GCS backend, honoring an emulator endpoint override when one is set.
+///
+/// With neither `KIN_GCS_ENDPOINT` nor `STORAGE_EMULATOR_HOST` set this is the
+/// unchanged real-GCP path. With one set, the daemon refuses to start unless
+/// that endpoint is reachable, because the alternative is a daemon that
+/// advertises itself as serving and then reaches for real Google Cloud Storage,
+/// or serves nothing, on its first snapshot read. An operator who asked for an
+/// emulator and got the real service back would have no signal at all, so this
+/// path never falls back: it starts against the endpoint or it stops.
+#[cfg(feature = "gcs")]
+fn open_gcs_backend(
+    bucket: &str,
+    prefix: String,
+) -> std::result::Result<kin_db::GcsBackend, Box<dyn std::error::Error>> {
+    use kin_daemon::gcs_endpoint;
+
+    let endpoint = gcs_endpoint::resolve(
+        env::var(gcs_endpoint::KIN_ENDPOINT_VAR).ok().as_deref(),
+        env::var(gcs_endpoint::EMULATOR_HOST_VAR).ok().as_deref(),
+    )?;
+
+    match endpoint {
+        None => Ok(kin_db::GcsBackend::new(bucket, prefix)?),
+        Some(endpoint) => {
+            endpoint.probe_reachable(gcs_endpoint::DEFAULT_PROBE_TIMEOUT)?;
+            // Which storage this daemon actually talks to is the one thing an
+            // operator cannot infer from anywhere else, and stderr is where the
+            // daemon's diagnostics go (stdout carries the --compat-json
+            // protocol).
+            eprintln!(
+                "kin-daemon: GCS storage redirected to {} (from {}); no real Google Cloud Storage traffic",
+                endpoint.url, endpoint.source
+            );
+            Ok(gcs_endpoint::backend_for(&endpoint, bucket, prefix)?)
         }
     }
 }
