@@ -9405,7 +9405,6 @@ void f();
         assert!(targets.contains(&GraphNodeId::Entity(bar_new.id)));
     }
 
-    #[test]
     /// The relation kind for an import site is decided once, by
     /// `resolve_import_target`, and handed to both edge builders.
     ///
@@ -9464,6 +9463,7 @@ void f();
         );
     }
 
+    #[test]
     fn resolve_module_path_with_extension() {
         let known: HashSet<&str> = ["src/utils/tools.ts"].into_iter().collect();
         let result = resolve_module_path("src/routes/api.ts", "../utils/tools", &known);
