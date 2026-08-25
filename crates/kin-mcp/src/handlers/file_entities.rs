@@ -77,7 +77,10 @@ carries the `id` every other tool here takes (`get_entity_source`, `get_context_
 `visibility`, `signature`, and the defining span as both lines and bytes. \
 `file_coverage` says what the graph knows about the file itself: `parsed` is `full` when a \
 language adapter parsed it completely, `partial` or `failed` when it did not, and `absent` \
-when no adapter parsed it at all. Only a `full` parse licenses reading this list as the file's \
+when no adapter parsed it at all. When `absent` is because no adapter claims the file's type \
+at all -- Kin admits such a file, hashes it and stores a preview, and extracts nothing -- \
+`content_opaque` is true and `opaque_reason` names the extension, so a file that produced \
+zero entities by design is never read as one whose parse failed. Only a `full` parse licenses reading this list as the file's \
 whole surface, and `_kin.completeness` and `negative.safe_to_conclude_absent` are computed \
 from that fact rather than from store-wide health. A path the graph does not track is refused \
 by name instead of answered with an empty list, because those two answers are \
@@ -216,6 +219,56 @@ fn tracking_tier<G: GraphStore>(store: &G, file_id: &FilePathId) -> Result<&'sta
         return Ok("opaque_artifact");
     }
     Ok("none")
+}
+
+/// Why a file the graph admitted holds no entities, when the reason is its TYPE
+/// rather than anything about its content. `None` when the file's type is not
+/// the reason.
+///
+/// Kin admits every file it is given. One whose extension no language adapter
+/// claims is content-addressed, previewed and stored as an opaque artifact, and
+/// it then reports `parsed: absent` in exactly the words a file whose adapter
+/// fell over reports. Those are opposite facts, and only the second is evidence
+/// about the code. A reader who cannot separate them reads "seven markdown files
+/// admitted, zero entities" as a parser defect and files it as one, which is the
+/// honesty failure this names rather than a coverage failure this fixes.
+///
+/// The adapter registry IS the supported set, and its own
+/// [`supported_languages_with_extensions`](kin_parser::languages::AdapterRegistry::supported_languages_with_extensions)
+/// documents that anything reporting Kin's supported languages must read it
+/// rather than keep a second list, because two lists of one fact can only come
+/// to disagree. So this asks the registry. It is a path-string check against a
+/// static table and reads no file, and it goes quiet on its own the day an
+/// adapter claims the extension.
+fn opaque_reason(path: &str, tier: &str) -> Option<String> {
+    // The tier is the gate. An empty `.py` file also holds zero entities, and
+    // deriving this flag from the entity count instead would report it as
+    // opaque, which is a confident wrong answer about a file an adapter read
+    // perfectly well.
+    if tier != "opaque_artifact" {
+        return None;
+    }
+    let Some(extension) = std::path::Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+    else {
+        return Some("no_adapter_for_path".to_string());
+    };
+    let claimed = kin_parser::languages::AdapterRegistry::new()
+        .supported_languages_with_extensions()
+        .into_iter()
+        .any(|(_, extensions)| {
+            extensions
+                .iter()
+                .any(|claimed| claimed.eq_ignore_ascii_case(&extension))
+        });
+    // An adapter does claim this extension, so whatever made the file opaque, it
+    // was not its type. Naming the type would be a guess dressed as a cause.
+    if claimed {
+        return None;
+    }
+    Some(format!("no_adapter_for_extension:{extension}"))
 }
 
 /// Whether the graph holds language-server-derived edges for this file's
@@ -436,6 +489,7 @@ pub fn handle_list_file_entities<G: GraphStore>(
     });
 
     let tier = tracking_tier(store, &file_id)?;
+    let opaque_reason = opaque_reason(&path, tier);
     // Admission identity, resolved through the repository tree rather than
     // through a path-keyed facet. This is the ordering `kin-context` documents:
     // a path the tree does not admit is a graph gap, and answering it from
@@ -503,6 +557,16 @@ pub fn handle_list_file_entities<G: GraphStore>(
             "path": path,
             "tracked_in_graph": tracked_in_graph,
             "tier": tier,
+            // Whether this file holds no entities because its TYPE is one no
+            // language adapter claims, as opposed to a parse that was attempted
+            // and fell short. `parsed: absent` alone cannot separate those, and
+            // reading the first as the second is how an admitted-and-unclaimed
+            // file gets filed as a parser defect. Always present, so "checked
+            // and no" is distinguishable from "not reported".
+            "content_opaque": opaque_reason.is_some(),
+            // The cause, naming the extension nothing claims. Null when
+            // `content_opaque` is false.
+            "opaque_reason": opaque_reason,
             "parsed": parsed.wire(),
             "parse_detail": parse_detail,
             "layout_entity_regions": layout_entity_regions,
@@ -678,6 +742,160 @@ mod tests {
         envelope.graph_state.entity_count = Some(42);
         envelope.graph_as_of = Some(serde_json::json!("change:deadbeef"));
         envelope
+    }
+
+    /// Put `path` in the store as an opaque artifact: admitted, hashed, and
+    /// holding no entities because nothing ever tried to extract any.
+    fn admit_opaque(store: &InMemoryGraph, path: &str) {
+        admit(store, path);
+        store
+            .upsert_opaque_artifact(&kin_model::layout::OpaqueArtifact {
+                file_id: FilePathId::new(path),
+                content_hash: Hash256::from_bytes([3; 32]),
+                mime_type: Some("text/md".to_string()),
+                text_preview: None,
+            })
+            .unwrap();
+    }
+
+    /// A file whose type no adapter claims says so, and a file an adapter read
+    /// says nothing of the kind.
+    ///
+    /// Kin admits every file it is given. Seven markdown files went into a graph,
+    /// produced zero entities, and every surface reported that the way it reports
+    /// a parse that failed. Those are opposite facts and only one is evidence
+    /// about the code, so a reader with no way to tell them apart files the first
+    /// as a parser defect.
+    ///
+    /// Three fixtures, and the second and third are the ones that make this able
+    /// to fail. A flag hardcoded true fails on the Python file; a flag derived
+    /// from "this file has zero entities" fails on the EMPTY Python file, which
+    /// an adapter read perfectly well and which correctly holds nothing.
+    #[test]
+    fn a_file_no_adapter_claims_discloses_its_type_and_a_parsed_file_does_not() {
+        let store = InMemoryGraph::new();
+        admit_opaque(&store, "README.md");
+        admit(&store, "src/thing.py");
+        store
+            .upsert_entity(&entity_at("thing", "src/thing.py", 0))
+            .unwrap();
+        store
+            .upsert_file_layout(&layout_for("src/thing.py", ParseCompleteness::Full, 1))
+            .unwrap();
+        admit(&store, "src/empty.py");
+        store
+            .upsert_file_layout(&layout_for("src/empty.py", ParseCompleteness::Full, 0))
+            .unwrap();
+
+        let markdown = call(&store, &[("path", serde_json::json!("README.md"))]).unwrap();
+        assert_eq!(
+            markdown[FILE_COVERAGE_KEY]["content_opaque"],
+            serde_json::json!(true),
+            "{markdown}"
+        );
+        assert_eq!(
+            markdown[FILE_COVERAGE_KEY]["opaque_reason"],
+            serde_json::json!("no_adapter_for_extension:md"),
+            "the disclosure names the extension nothing claims: {markdown}"
+        );
+
+        for path in ["src/thing.py", "src/empty.py"] {
+            let payload = call(&store, &[("path", serde_json::json!(path))]).unwrap();
+            assert_eq!(
+                payload[FILE_COVERAGE_KEY]["content_opaque"],
+                serde_json::json!(false),
+                "{path} was read by an adapter: {payload}"
+            );
+            assert_eq!(
+                payload[FILE_COVERAGE_KEY]["opaque_reason"],
+                serde_json::Value::Null,
+                "{path} has no opaque cause to name: {payload}"
+            );
+        }
+        assert_eq!(
+            call(&store, &[("path", serde_json::json!("src/empty.py"))]).unwrap()["total_in_file"],
+            serde_json::json!(0),
+            "and the empty control really is empty, or it proves nothing"
+        );
+    }
+
+    /// The reason is computed from the adapter registry rather than written down
+    /// here, so it names whatever extension it was actually given.
+    ///
+    /// A hardcoded `md` passes every assertion above. This is what fails it.
+    #[test]
+    fn the_opaque_reason_names_the_extension_it_was_given() {
+        let store = InMemoryGraph::new();
+        admit_opaque(&store, "docs/diagram.png");
+        let payload = call(&store, &[("path", serde_json::json!("docs/diagram.png"))]).unwrap();
+        assert_eq!(
+            payload[FILE_COVERAGE_KEY]["opaque_reason"],
+            serde_json::json!("no_adapter_for_extension:png"),
+            "{payload}"
+        );
+    }
+
+    /// The envelope's limit word carries the cause, so the one verdict a reader
+    /// acts on says why rather than only that.
+    ///
+    /// `file_parsed_absent` is true of a file nothing tried to parse and of a
+    /// file whose adapter fell over, and a reader acting on it cannot tell which
+    /// they have.
+    #[test]
+    fn the_limit_word_names_the_cause_when_the_answer_carries_one() {
+        let store = InMemoryGraph::new();
+        admit_opaque(&store, "README.md");
+        let limits = finalized_limits(&store, "README.md");
+        assert!(
+            limits.contains("file_content_opaque_no_adapter_for_extension:md"),
+            "the limit names the cause: {limits}"
+        );
+        assert!(
+            !limits.contains("file_parsed_absent"),
+            "and does not also state the symptom it replaces: {limits}"
+        );
+
+        // The control: a file an adapter tried and failed on keeps the generic
+        // word, because its type is not the reason and naming one would be a
+        // guess dressed as a cause.
+        let failed = InMemoryGraph::new();
+        admit(&failed, FILE);
+        failed
+            .upsert_file_layout(&layout_for(
+                FILE,
+                ParseCompleteness::Failed("syntax error".into()),
+                0,
+            ))
+            .unwrap();
+        let limits = finalized_limits(&failed, FILE);
+        assert!(
+            limits.contains("file_parsed_"),
+            "a failed parse keeps the parse word: {limits}"
+        );
+        assert!(
+            !limits.contains("content_opaque"),
+            "and never borrows the opaque cause: {limits}"
+        );
+    }
+
+    /// `_kin.completeness.limits` as the wire carries it, through the same
+    /// finalize the server runs.
+    fn finalized_limits(store: &InMemoryGraph, path: &str) -> String {
+        let args = HashMap::from([("path".to_string(), serde_json::json!(path))]);
+        let finalized = crate::finalize_with_envelope(
+            handle_list_file_entities(&args, store).expect("the tool answers"),
+            structural_authoritative_envelope(),
+            TOOL_NAME,
+        );
+        let crate::types::ContentBlock::Text { text } = &finalized.content[0];
+        let response: serde_json::Value = serde_json::from_str(text).expect("payload is JSON");
+        response[crate::ENVELOPE_KEY]["completeness"]["limits"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the envelope reports limits: {response}"))
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",")
     }
 
     #[test]
