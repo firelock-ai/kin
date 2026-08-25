@@ -175,6 +175,52 @@ pub(crate) struct EffectiveHookSurface {
     pub(crate) hooks: Vec<LocalGitHookFact>,
     /// Legacy links an older Kin left under the resolved hook directory.
     pub(crate) kin_legacy: Vec<PathBuf>,
+    /// Entries under the resolved hook directory whose names Git never runs.
+    pub(crate) not_hooks: Vec<PathBuf>,
+}
+
+/// The hook names Git runs, from githooks(5).
+///
+/// Git looks a hook up by exactly these names under the hook directory, and
+/// any other entry there is inert however it is named or moded. gitoxide's
+/// init template writes `docs.url` beside the samples, and `kin eject` builds
+/// its replacement Git with gitoxide, so a count blind to names refused every
+/// repository Kin had just ejected and called a 34-byte URL a hook that runs
+/// (FIR-2664).
+const GIT_HOOK_NAMES: &[&[u8]] = &[
+    b"applypatch-msg",
+    b"pre-applypatch",
+    b"post-applypatch",
+    b"pre-commit",
+    b"pre-merge-commit",
+    b"prepare-commit-msg",
+    b"commit-msg",
+    b"post-commit",
+    b"pre-rebase",
+    b"post-checkout",
+    b"post-merge",
+    b"pre-push",
+    b"pre-receive",
+    b"update",
+    b"proc-receive",
+    b"post-receive",
+    b"post-update",
+    b"reference-transaction",
+    b"push-to-checkout",
+    b"pre-auto-gc",
+    b"post-rewrite",
+    b"sendemail-validate",
+    b"fsmonitor-watchman",
+    b"p4-changelist",
+    b"p4-prepare-changelist",
+    b"p4-post-changelist",
+    b"p4-pre-submit",
+    b"post-index-change",
+];
+
+/// Whether Git would ever look for a hook under this name.
+fn is_git_hook_name(name: &[u8]) -> bool {
+    GIT_HOOK_NAMES.contains(&name)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +267,19 @@ impl EffectiveHookSurface {
                 )
             ));
         }
+        if !self.not_hooks.is_empty() {
+            notes.push(format!(
+                "{} file(s) under {} carry no name Git runs as a hook and were not counted: {}",
+                self.not_hooks.len(),
+                self.directory.display(),
+                render_paths(
+                    self.not_hooks
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect()
+                )
+            ));
+        }
         notes
     }
 }
@@ -257,6 +316,7 @@ pub(crate) fn effective_hook_surface(
             configured,
             hooks: Vec::new(),
             kin_legacy: Vec::new(),
+            not_hooks: Vec::new(),
         });
     }
     let entries = match fs::read_dir(&directory) {
@@ -267,6 +327,7 @@ pub(crate) fn effective_hook_surface(
                 configured,
                 hooks: Vec::new(),
                 kin_legacy: Vec::new(),
+                not_hooks: Vec::new(),
             });
         }
         Err(error) => return Err(GitError::io(&directory, error)),
@@ -278,6 +339,7 @@ pub(crate) fn effective_hook_surface(
 
     let mut hooks = Vec::new();
     let mut kin_legacy = Vec::new();
+    let mut not_hooks = Vec::new();
     for (name, entry) in entries {
         if name.ends_with(b".sample") {
             continue;
@@ -287,6 +349,10 @@ pub(crate) fn effective_hook_surface(
             fs::symlink_metadata(&path).map_err(|error| GitError::io(entry.path(), error))?;
         if is_legacy_kin_hook_link(&directory, &path, &metadata)? {
             kin_legacy.push(path);
+            continue;
+        }
+        if !is_git_hook_name(&name) {
+            not_hooks.push(path);
             continue;
         }
         hooks.push(LocalGitHookFact {
@@ -299,11 +365,13 @@ pub(crate) fn effective_hook_surface(
     }
     hooks.sort_by(|left, right| left.name.cmp(&right.name));
     kin_legacy.sort();
+    not_hooks.sort();
     Ok(EffectiveHookSurface {
         directory,
         configured,
         hooks,
         kin_legacy,
+        not_hooks,
     })
 }
 
@@ -884,6 +952,7 @@ mod tests {
             }),
             hooks: Vec::new(),
             kin_legacy: Vec::new(),
+            not_hooks: Vec::new(),
         };
         assert!(!surface.repository_scoped_hooks_path());
         let notes = surface.notes();
@@ -962,6 +1031,69 @@ mod tests {
 
         let report = fixture.report();
         assert!(report.is_clear(), "{report:?}");
+    }
+
+    /// `kin eject` builds its replacement Git with gitoxide, whose init
+    /// template writes `hooks/docs.url` beside the samples: a 34-byte URL, not
+    /// executable, and not a name Git ever runs. Counting it refused `kin init`
+    /// on every repository Kin had just ejected, and the refusal called it a
+    /// hook that runs (FIR-2664).
+    #[test]
+    fn a_docs_url_beside_the_samples_is_not_a_hook_and_is_named_as_uncounted() {
+        let fixture = Fixture::clean();
+        git(&fixture.repo, &["config", "core.hooksPath", ""]);
+        fs::write(
+            fixture.repo.join(".git/hooks/docs.url"),
+            b"https://git-scm.com/docs/githooks\n",
+        )
+        .expect("docs.url");
+
+        let report = fixture.report();
+        assert!(report.is_clear(), "{report:?}");
+        assert!(
+            report
+                .notes
+                .iter()
+                .any(|note| note.contains("docs.url") && note.contains("not counted")),
+            "the uncounted entry is named rather than hidden: {report:?}"
+        );
+        let surface = surface_for(&fixture);
+        assert!(surface.hooks.is_empty(), "{surface:?}");
+        assert_eq!(surface.not_hooks.len(), 1, "{surface:?}");
+        assert!(surface.not_hooks[0].ends_with("docs.url"), "{surface:?}");
+    }
+
+    /// The name is the rule, not the mode: an executable Git would never look
+    /// for is still not a hook, and a hook-named file still blocks.
+    #[test]
+    fn only_names_git_runs_count_as_hooks() {
+        let fixture = Fixture::clean();
+        git(&fixture.repo, &["config", "core.hooksPath", ""]);
+        write_executable(
+            &fixture.repo.join(".git/hooks/README"),
+            b"#!/bin/sh\nexit 0\n",
+        );
+        let report = fixture.report();
+        assert!(report.is_clear(), "{report:?}");
+
+        let hook = fixture.repo.join(".git/hooks/pre-commit");
+        write_executable(&hook, b"#!/bin/sh\nexit 0\n");
+        // The refusal prints the canonical path, which on macOS differs from
+        // the fixture's `/var` spelling.
+        let hook = fs::canonicalize(&hook).expect("canonical hook path");
+        let refusal = fixture.refusal();
+        assert!(
+            refusal.contains(&format!("{} runs for this repository", hook.display())),
+            "the hook Git runs is named as one: {refusal}"
+        );
+        assert!(
+            !refusal.contains("README runs for this repository"),
+            "the executable Git never looks for is not called a hook: {refusal}"
+        );
+        assert!(
+            refusal.contains("README") && refusal.contains("not counted"),
+            "and it is named as uncounted rather than hidden: {refusal}"
+        );
     }
 
     /// Only a link that keeps its own name under `.kin/hooks` is Kin's.

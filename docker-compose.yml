@@ -11,7 +11,16 @@ services:
       context: ../kin
       dockerfile: Dockerfile
     ports:
-      - "4219:4219"
+      # Loopback only. A bare "4219:4219" publishes on every host interface, and
+      # the bind host below turns the daemon's Host allowlist off rather than
+      # widening it, so the port would answer any peer on the network. /health,
+      # /ready and /readiness are exempt from bearer auth by design, and /health
+      # returns repo_root, the build sha and every behavior-env value, so on a
+      # coworking or hotel network that is a real read for anyone on the subnet.
+      # Sibling containers reach the daemon at kin-daemon:4219 over the compose
+      # network whether or not this is published, so scoping to loopback removes
+      # only the LAN. This also matches how the probe script publishes it.
+      - "127.0.0.1:4219:4219"
     volumes:
       # Persist the daemon's on-disk repo. The mount target must match the
       # workspace the entrypoint resolves (KIN_WORKSPACE_DIR, default
@@ -20,6 +29,20 @@ services:
       - workspace-data:/tmp/kin-workspace
     environment:
       - RUST_LOG=${RUST_LOG:-info}
+      # Bind the container's external interface, not its loopback. Docker
+      # publishes a port by forwarding to the container's external address, so a
+      # daemon on the default 127.0.0.1 (api.rs::resolve_bind_host) is unreachable
+      # through the mapping above from the host and from sibling containers alike.
+      # Binding non-loopback requires an auth token, and that is already
+      # satisfied: api.rs::resolve_serve_auth_token auto-provisions and persists
+      # one at .kin/daemon.token the first time the daemon serves this repo.
+      - KIN_DAEMON_BIND_HOST=0.0.0.0
+    # This probe runs inside the container's own network namespace, so it reaches
+    # a loopback-bound daemon just as well as an externally-bound one. It cannot
+    # catch a bind-host regression, and it is not meant to: it answers "is the
+    # daemon alive", not "is the published port reachable". The check that can
+    # fail for that bug class probes 4219 from outside the namespace, and lives in
+    # scripts/test-compose-published-port.sh.
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4219/readiness"]
       interval: 10s

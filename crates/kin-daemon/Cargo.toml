@@ -20,7 +20,11 @@ embeddings = ["kin-db/embeddings", "kin-cli/embeddings"]
 # It intentionally does NOT pull `kin-db/metal`; the real macOS-only activation lives in the
 # `[target.'cfg(target_os = "macos")'.dependencies]` block below so Linux never compiles it.
 metal = ["embeddings", "kin-cli/metal"]
-gcs = ["kin-db/gcs"]
+# `object_store` is kin-db's own GCS client crate, pulled in here at the same
+# version so `GcsBackend::from_store` accepts a store this crate built. That is
+# what lets a custom endpoint (see `gcs_endpoint`) redirect the backend at an
+# emulator without a kin-db change.
+gcs = ["kin-db/gcs", "dep:object_store", "object_store/gcp"]
 firestore = ["kin-spine/firestore"]
 
 [dependencies]
@@ -62,6 +66,7 @@ zip = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
 which = "8"
+object_store = { version = "0.14", optional = true }
 fs2 = { workspace = true }
 sysinfo = "0.39"
 

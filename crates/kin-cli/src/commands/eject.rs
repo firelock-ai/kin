@@ -137,6 +137,9 @@ pub async fn run(yes: bool) -> Result<()> {
              independently backed up."
         );
     }
+    if let Some(note) = eject_outcome.retained_journal.as_deref() {
+        eprintln!("warning: {note}");
+    }
     Ok(())
 }
 
