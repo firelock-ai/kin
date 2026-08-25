@@ -1298,6 +1298,7 @@ mod tests {
         Visibility,
     };
     use kin_model::ids::{FilePathId, Hash256, RelationId};
+    use kin_model::relation::RelationEvidence;
     use kin_model::relation::{Relation, RelationOrigin};
 
     fn entity(name: &str, file: &str, calls: Option<u64>, imports: Option<u64>) -> Entity {
@@ -1383,6 +1384,40 @@ mod tests {
             serde_json::Value::from(external),
         );
         entity
+    }
+
+    /// A file's coverage certificate, in the shape the linker emits.
+    ///
+    /// An artifact self-loop of kind `DependsOn` whose evidence carries the
+    /// import counts: `occurrence_count` the statements the parser read, `token`
+    /// how many of them resolved to a file this repository holds. This is the
+    /// only channel those numbers travel on, because they cannot be recovered
+    /// from edges, so a fixture that omits it is a fixture where import
+    /// resolution is genuinely unmeasured.
+    fn import_certificate(
+        artifact_id: kin_model::ArtifactId,
+        path: &str,
+        statements: u32,
+        resolved: u64,
+    ) -> Relation {
+        let node = GraphNodeId::Artifact(artifact_id);
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::DependsOn,
+            src: node,
+            dst: node,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![RelationEvidence {
+                token: Some(resolved.to_string()),
+                source_path: Some(path.to_string()),
+                parser_rule: Some(kin_index::IMPORT_RESOLUTION_COVERAGE_V1.to_string()),
+                occurrence_count: statements,
+                ..RelationEvidence::default()
+            }],
+        }
     }
 
     fn artifact_import(src: kin_model::ArtifactId, dst: kin_model::ArtifactId) -> Relation {
@@ -1494,6 +1529,154 @@ mod tests {
 
     /// The rendered line names the external share, so a low ratio reads as a
     /// repository with more dependencies than modules rather than as a defect.
+    /// The rendered line names the external share, so a low ratio reads as a
+    /// repository with more dependencies than modules rather than as a defect.
+    /// The four-file Python project the v0.5.52 stranger wrote, at the numbers
+    /// this lane measured on it, rendering the line it should always have.
+    ///
+    /// Kin reported `imports 1/10 (10%)` on that project with no external
+    /// clause, and it was handed to this lane as evidence that Python import
+    /// resolution was broken. It was not. An independent count with CPython's
+    /// own `ast` module found 9 statements, 4 naming a module in the repository
+    /// and 5 naming `re`, `typing`, `json`, `pathlib` and `pytest`. The linker
+    /// resolves all 4.
+    ///
+    /// What was broken was the reporting: `specifier_syntax_settles_externality`
+    /// is true only for JavaScript and TypeScript, so a Python row printed no
+    /// external clause and its ratio read as a 90 percent failure against a
+    /// denominator nine tenths of which could never have resolved.
+    #[test]
+    fn the_four_file_python_project_line_discloses_its_external_imports() {
+        let (graph, ids) = graph_with_artifacts(&["notekeeper/parsing.py"]);
+        // 9 statements read across the project, 4 of them resolving in-repo.
+        graph
+            .upsert_entity(&entity(
+                "parsing",
+                "notekeeper/parsing.py",
+                Some(0),
+                Some(9),
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&import_certificate(ids[0], "notekeeper/parsing.py", 9, 4))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let line = coverage
+            .summary_lines()
+            .into_iter()
+            .find(|line| line.contains("python:"))
+            .expect("python row is rendered");
+
+        assert!(
+            line.contains("imports 4/9 (44%), 5 name a module outside this repository"),
+            "the python line must read its resolved statements against its parsed ones AND \
+             disclose the external count; got: {line}"
+        );
+    }
+
+    /// The certificate's statement count and the parser's must agree, because
+    /// they are two independent counts of one population.
+    ///
+    /// The parser stamps `parsed_import_statements` per file at extraction; the
+    /// linker counts the same `FileImport`s again when it writes the
+    /// certificate. Computing both and comparing neither would leave a
+    /// disagreement invisible, and a disagreement is the tell that the two are
+    /// counting different populations, which is the failure this change exists
+    /// to remove.
+    ///
+    /// They can legitimately differ when only SOME files of a language carry a
+    /// certificate, because three link paths supply no completeness map and emit
+    /// none. That partition gap is FIR-2686. This fixture gives every file a
+    /// certificate, so the two counts must match exactly.
+    #[test]
+    fn the_certificate_and_the_parser_count_the_same_statements() {
+        let (graph, ids) = graph_with_artifacts(&["app/main.py", "app/storage.py"]);
+        graph
+            .upsert_entity(&entity("main", "app/main.py", Some(0), Some(3)))
+            .unwrap();
+        graph
+            .upsert_entity(&entity("Store", "app/storage.py", Some(0), Some(0)))
+            .unwrap();
+        graph
+            .upsert_relation(&import_certificate(ids[0], "app/main.py", 3, 1))
+            .unwrap();
+        graph
+            .upsert_relation(&import_certificate(ids[1], "app/storage.py", 0, 0))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let python = coverage
+            .languages
+            .iter()
+            .find(|row| row.language == LanguageId::Python.to_string())
+            .expect("python row");
+
+        let parsed = python
+            .parsed_import_statements
+            .expect("the parser counted statements");
+        let resolved = python
+            .resolved_import_statements
+            .expect("every file carried a certificate");
+        let external = python
+            .external_module_imports
+            .expect("the certificate settles externality here");
+
+        assert_eq!(
+            resolved + external,
+            parsed,
+            "resolved plus external must partition the parsed statements exactly"
+        );
+    }
+
+    /// Python's external count comes from the certificate, not from specifier
+    /// syntax, and the line says so.
+    ///
+    /// `specifier_syntax_settles_externality` is true only for JavaScript and
+    /// TypeScript, because a Python `import re` could name a local `re.py`. So
+    /// Python printed no external clause at all, and `imports 1/10` read as a 90
+    /// percent failure when nine of the ten were stdlib and could never have
+    /// resolved. The linker knows the answer, because `known_files` decides it,
+    /// and the certificate carries it here.
+    #[test]
+    fn a_python_row_reports_its_external_imports_from_the_certificate() {
+        let (graph, ids) = graph_with_artifacts(&["app/main.py", "app/storage.py"]);
+        graph
+            .upsert_entity(&entity("main", "app/main.py", Some(0), Some(3)))
+            .unwrap();
+        graph
+            .upsert_entity(&entity("Store", "app/storage.py", Some(0), Some(0)))
+            .unwrap();
+        // Three statements read, one reached a file this repository holds. The
+        // other two are `re` and `typing`.
+        graph
+            .upsert_relation(&import_certificate(ids[0], "app/main.py", 3, 1))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let python = coverage
+            .languages
+            .iter()
+            .find(|row| row.language == LanguageId::Python.to_string())
+            .expect("python row");
+        assert_eq!(python.resolved_import_statements, Some(1));
+        assert_eq!(
+            python.external_module_imports,
+            Some(2),
+            "two statements named a module outside the repository"
+        );
+
+        let line = coverage
+            .summary_lines()
+            .into_iter()
+            .find(|line| line.contains("python:"))
+            .expect("python row is rendered");
+        assert!(
+            line.contains("name a module outside this repository"),
+            "a python line must disclose its external imports, got: {line}"
+        );
+    }
+
     #[test]
     fn the_summary_line_discloses_imports_that_name_a_module_outside_the_repository() {
         let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
