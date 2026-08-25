@@ -1553,20 +1553,29 @@ fn merge_resolved(
             files = files.len()
         )
         .entered();
+        let module_entities = module_entity_by_file(files);
         let per_file_artifact: Vec<Vec<Relation>> = files
             .par_iter()
             .map(|file| {
-                file.imports
-                    .iter()
-                    .filter_map(|imp| {
-                        make_artifact_import_relation(
-                            &file.file_path,
-                            imp,
-                            &ctx.known_files,
-                            artifact_ids,
-                        )
-                    })
-                    .collect()
+                let mut out: Vec<Relation> = Vec::new();
+                for imp in &file.imports {
+                    if let Some(rel) = make_artifact_import_relation(
+                        &file.file_path,
+                        imp,
+                        &ctx.known_files,
+                        artifact_ids,
+                    ) {
+                        out.push(rel);
+                    }
+                    out.extend(make_entity_import_relations(
+                        &file.file_path,
+                        imp,
+                        &ctx.known_files,
+                        &|path| module_entities.get(path).copied(),
+                        &|path, name| ctx.entity_by_file_name.get(&(path, name)).copied(),
+                    ));
+                }
+                out
             })
             .collect();
         for file_relations in per_file_artifact {
@@ -1652,11 +1661,25 @@ fn merge_resolved_serial(
         }
     }
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let file_refs: Vec<&FileParseData> = files.iter().collect();
+    let module_entities = module_entity_by_file(&file_refs);
     for file in files {
         for imp in &file.imports {
             if let Some(rel) =
                 make_artifact_import_relation(&file.file_path, imp, &ctx.known_files, artifact_ids)
             {
+                let key = (rel.src, rel.dst, rel.kind);
+                if seen_artifact.insert(key) {
+                    resolved.push(rel);
+                }
+            }
+            for rel in make_entity_import_relations(
+                &file.file_path,
+                imp,
+                &ctx.known_files,
+                &|path| module_entities.get(path).copied(),
+                &|path, name| ctx.entity_by_file_name.get(&(path, name)).copied(),
+            ) {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
                     resolved.push(rel);
@@ -4376,6 +4399,139 @@ where
     })
 }
 
+/// Index each file's module entity, the endpoint an entity-level import edge
+/// sources from.
+///
+/// A file carrying no module entity is absent from the map rather than mapped
+/// to something else, because there is no second-best answer: anchoring to
+/// another entity in the file is exactly the claim [`merge_resolved`]'s call
+/// site refuses to make.
+fn module_entity_by_file<'a>(files: &[&'a FileParseData]) -> HashMap<&'a str, EntityId> {
+    let mut out = HashMap::new();
+    for file in files {
+        if let Some(entity) = file
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::Module)
+        {
+            // First in parse order wins. The caller's file list is ordered, so
+            // a file that somehow carried two module entities still resolves
+            // the same way on every run.
+            out.entry(file.file_path.as_str()).or_insert(entity.id);
+        }
+    }
+    out
+}
+
+/// Entity-level import edges for the names an import actually binds.
+///
+/// [`make_artifact_import_relation`] answers "which file imports which file".
+/// It cannot answer "who imports this export", because the reference walk in
+/// the MCP layer skips any relation whose `src` is not an entity, so an
+/// artifact-rooted edge is invisible to `find_references` however exactly its
+/// specifier resolved. Every named specifier that resolves to an entity the
+/// target actually defines therefore gets a second edge here, from the
+/// importing file's MODULE entity to that entity.
+///
+/// The module entity is the importer's file surface, which is what owns a
+/// file-level dependency. It is deliberately not "the first entity in the
+/// file": anchoring there would claim one particular symbol owns the
+/// dependency, which is the shape [`merge_resolved`]'s call site refuses, and
+/// that refusal is right. This satisfies it rather than working around it.
+///
+/// An importer carrying no module entity yields nothing rather than falling
+/// back to some other entity. That is a real gap for JavaScript and TypeScript,
+/// whose adapters emit a module entity only for index files, and it is left
+/// visible as a gap rather than papered over with a guess.
+///
+/// The artifact edge is unaffected. Both are emitted, they carry different node
+/// ids so they cannot collide in the caller's dedup, and every consumer reading
+/// artifact import edges today keeps reading exactly what it read before.
+/// The two lookups are closures rather than maps because the batch linker and
+/// the incremental linker hold their indexes in different shapes. Passing the
+/// lookup instead of the container is what lets both paths run this one
+/// function, so an incrementally relinked file cannot quietly disagree with a
+/// fully relinked one.
+fn make_entity_import_relations<S>(
+    importer_file: &str,
+    import: &FileImport,
+    known_files: &HashSet<S>,
+    module_of: &dyn Fn(&str) -> Option<EntityId>,
+    entity_of: &dyn Fn(&str, &str) -> Option<EntityId>,
+) -> Vec<Relation>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let Some(resolved_path) = resolve_module_path(importer_file, &import.module_path, known_files)
+    else {
+        return Vec::new();
+    };
+    // A module does not import itself. `require('.')` from a directory's own
+    // index resolves back to the importer, and a self-loop would be counted as
+    // a resolved import by every surface that reads these edges.
+    if resolved_path == importer_file {
+        return Vec::new();
+    }
+    let Some(src_id) = module_of(importer_file) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for spec in &import.specifiers {
+        // A default specifier binds the module object itself, which is what a
+        // CommonJS `require` produces. Its local name is the importer's choice
+        // and names no symbol in the target, so scoring it against the target's
+        // symbols would report a miss for an import that made no such claim.
+        // The entity it reaches is the target's own module entity.
+        let dst_id = if spec.is_default {
+            module_of(&resolved_path)
+        } else {
+            // Bind the ORIGINAL name wherever the import renamed it, because
+            // that is the name the target defines. Binding the local alias
+            // would point the edge at a name no file declares.
+            let wanted = spec
+                .original_name
+                .as_deref()
+                .unwrap_or(spec.local_name.as_str());
+            entity_of(&resolved_path, wanted)
+        };
+        let Some(dst_id) = dst_id else {
+            continue;
+        };
+        if dst_id == src_id {
+            continue;
+        }
+        let src = GraphNodeId::Entity(src_id);
+        let dst = GraphNodeId::Entity(dst_id);
+        out.push(Relation {
+            id: stable_relation_node_id(&src, &dst, &RelationKind::Imports),
+            kind: RelationKind::Imports,
+            src,
+            dst,
+            // The specifier resolved to a file this repository holds and the
+            // name matched an entity that file declares. Both halves are exact,
+            // so this is as certain as the artifact edge beside it.
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: Some(import.module_path.clone()),
+            evidence: vec![RelationEvidence {
+                token: Some(spec.local_name.clone()),
+                source_path: Some(import.module_path.clone()),
+                resolved_path: Some(resolved_path.clone()),
+                parser_rule: Some(IMPORT_SPECIFIER_BINDING_RULE.to_string()),
+                occurrence_count: 1,
+                ..RelationEvidence::default()
+            }],
+        });
+    }
+    out
+}
+
+/// Parser rule recorded on an entity-level import edge, so a consumer can tell
+/// one apart from the artifact edge that shares its import.
+const IMPORT_SPECIFIER_BINDING_RULE: &str = "import_specifier_binding";
+
 /// Build the graph-owned file-level call-coverage certificate used by
 /// ref-scoped review. Coverage state lives in relation evidence; history paths
 /// compare the complete relation payload and replace changed evidence.
@@ -6586,8 +6742,27 @@ fn merge_incremental_resolved(
         }
     }
 
-    // Step 4: Create artifact-level import/include edges from import declarations.
+    // Step 4: Create import/include edges from import declarations, at both the
+    // artifact level and the entity level.
+    //
+    // The entity-level lookups read the linker's own repository-wide indexes
+    // rather than the changed-file slice, because an incremental relink of one
+    // file still imports from files it did not touch. Building them from
+    // `files` would silently drop every edge whose target sat outside the
+    // change, and a partially relinked graph would disagree with a fully
+    // relinked one for as long as nobody rebuilt from scratch.
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let module_of = |path: &str| -> Option<EntityId> {
+        linker
+            .entities_by_file
+            .get(path)?
+            .iter()
+            .find(|(id, _)| linker.entity_kind_by_id.get(id) == Some(&EntityKind::Module))
+            .map(|(id, _)| *id)
+    };
+    let entity_of = |path: &str, name: &str| -> Option<EntityId> {
+        linker.entity_by_file_name.get(path)?.get(name).copied()
+    };
     for file in files {
         for imp in &file.imports {
             if let Some(rel) = make_artifact_import_relation(
@@ -6595,6 +6770,18 @@ fn merge_incremental_resolved(
                 imp,
                 &linker.known_files,
                 &linker.artifact_ids,
+            ) {
+                let key = (rel.src, rel.dst, rel.kind);
+                if seen_artifact.insert(key) {
+                    resolved.push(rel);
+                }
+            }
+            for rel in make_entity_import_relations(
+                &file.file_path,
+                imp,
+                &linker.known_files,
+                &module_of,
+                &entity_of,
             ) {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {

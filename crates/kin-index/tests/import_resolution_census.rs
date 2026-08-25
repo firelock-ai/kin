@@ -122,6 +122,34 @@ fn resolved_import_pairs(corpus: &Corpus) -> HashSet<(String, String)> {
         .collect()
 }
 
+/// Entity-rooted `Imports` edges split by what the destination is, so a count
+/// that overshoots the prediction can be attributed to an arm rather than
+/// guessed at.
+fn entity_import_edge_breakdown(corpus: &Corpus) -> (usize, usize, usize) {
+    let relations =
+        link_cross_file(&corpus.files, &corpus.artifact_ids).expect("corpus links");
+    let kind_of: HashMap<_, _> = corpus
+        .files
+        .iter()
+        .flat_map(|f| f.entities.iter())
+        .map(|e| (e.id, e.kind))
+        .collect();
+    let mut to_module = 0usize;
+    let mut to_member = 0usize;
+    let mut unknown_dst = 0usize;
+    for rel in relations.iter().filter(|r| r.kind == RelationKind::Imports) {
+        let (GraphNodeId::Entity(_), GraphNodeId::Entity(dst)) = (rel.src, rel.dst) else {
+            continue;
+        };
+        match kind_of.get(&dst) {
+            Some(EntityKind::Module) => to_module += 1,
+            Some(_) => to_member += 1,
+            None => unknown_dst += 1,
+        }
+    }
+    (to_module, to_member, unknown_dst)
+}
+
 /// Count entity-rooted `Imports` edges, the class that answers "who imports
 /// this export" at entity level.
 fn entity_rooted_import_edges(corpus: &Corpus) -> usize {
@@ -262,29 +290,20 @@ fn nameable_specifier_yield(corpus: &Corpus) -> Yield {
                     .original_name
                     .as_deref()
                     .unwrap_or(spec.local_name.as_str());
-                if names.is_some_and(|n| n.contains(wanted)) {
-                    out.matched += 1;
-                    if has_module.contains(file.file_path.as_str()) {
-                        out.buildable_member_edges += 1;
-                    } else {
-                        out.blocked_no_importer_module += 1;
-                    }
-                    continue;
-                }
-                out.unmatched += 1;
                 let site = format!(
                     "{} :: {} :: name={wanted} -> {target}",
                     file.file_path, import.module_path
                 );
-                // A name the target does not define is one of four things, and
-                // they want different fixes, so the census separates them
-                // rather than reporting one undifferentiated miss.
-                //
-                // A default specifier binds the module object itself, which is
-                // what CommonJS `require` produces. Classifying it by name
-                // against the target's symbols reports a miss for an import
-                // that never named a symbol, so this arm comes first.
+                // Mirror the linker's precedence exactly. A default specifier
+                // binds the module object, so the linker resolves it against
+                // the target's MODULE entity and never against the target's
+                // symbol list. Scoring it by name first, as this census did at
+                // first, credits a default whose local name happens to collide
+                // with a symbol in the target and predicts an edge the linker
+                // will not build. That is how express predicted 2 and produced
+                // 0: both were defaults whose target carries no module entity.
                 if spec.is_default {
+                    out.unmatched += 1;
                     out.unmatched_whole_module += 1;
                     if has_module.contains(file.file_path.as_str())
                         && has_module.contains(target.as_str())
@@ -296,6 +315,19 @@ fn nameable_specifier_yield(corpus: &Corpus) -> Yield {
                     }
                     continue;
                 }
+                if names.is_some_and(|n| n.contains(wanted)) {
+                    out.matched += 1;
+                    if has_module.contains(file.file_path.as_str()) {
+                        out.buildable_member_edges += 1;
+                    } else {
+                        out.blocked_no_importer_module += 1;
+                    }
+                    continue;
+                }
+                out.unmatched += 1;
+                // A non-default name the target does not define is one of
+                // three things, and they want different fixes, so the census
+                // separates them rather than reporting one undifferentiated miss.
                 // A submodule is a sibling FILE inside the resolved target's own
                 // package directory, which only makes sense when the target is
                 // that package's `__init__` or index.
@@ -361,6 +393,10 @@ fn census_reports_import_resolution_over_a_corpus() {
         "CENSUS_FILES_WITH_MODULE_ENTITY {}",
         files_with_module_entity(&corpus)
     );
+    let (to_module, to_member, unknown_dst) = entity_import_edge_breakdown(&corpus);
+    println!("CENSUS_EDGE_DST_MODULE {to_module}");
+    println!("CENSUS_EDGE_DST_MEMBER {to_member}");
+    println!("CENSUS_EDGE_DST_UNKNOWN {unknown_dst}");
     let y = nameable_specifier_yield(&corpus);
     println!("CENSUS_SITES_RESOLVED_IN_REPO {}", y.sites_resolved_in_repo);
     println!("CENSUS_SITES_EXTERNAL {}", y.sites_external);
