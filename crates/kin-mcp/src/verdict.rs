@@ -731,12 +731,10 @@ fn withheld_candidates_reading(payload: &Value) -> Reading {
 /// and a populated answer asserts no such thing.
 fn cross_repo_reading(tool: &str, payload: &Value) -> Reading {
     use crate::negative::CrossRepoQualifier;
-    let unbound_caller = payload
-        .get("cross_repo")
-        .is_some_and(|cross_repo| {
-            cross_repo.get("status").and_then(Value::as_str) == Some("unavailable")
-                && cross_repo.get("code").and_then(Value::as_str).is_none()
-        });
+    let unbound_caller = payload.get("cross_repo").is_some_and(|cross_repo| {
+        cross_repo.get("status").and_then(Value::as_str) == Some("unavailable")
+            && cross_repo.get("code").and_then(Value::as_str).is_none()
+    });
     if unbound_caller {
         return Reading::Silent;
     }
@@ -1886,7 +1884,6 @@ mod tests {
         })
     }
 
-
     /// FIR-2764. A populated answer whose configured spine answered incompletely
     /// is a lower bound, and the verdict has to say so.
     ///
@@ -1915,7 +1912,11 @@ mod tests {
             json!(INCONCLUSIVE),
             "a set presented as whole while the spine could not answer: {verdict}"
         );
-        assert_eq!(verdict["inputs"]["cross_repo"], json!(INCONCLUSIVE), "{verdict}");
+        assert_eq!(
+            verdict["inputs"]["cross_repo"],
+            json!(INCONCLUSIVE),
+            "{verdict}"
+        );
         let factor = verdict["limiting_factor"].as_str().expect("a factor");
         assert!(
             factor.contains("cross_repo_authority_incomplete"),
@@ -1963,10 +1964,7 @@ mod tests {
     fn the_ordinary_states_of_a_healthy_install_limit_nothing() {
         let mut broken: Vec<String> = Vec::new();
         for (case, cross_repo) in [
-            (
-                "no spine configured",
-                json!({ "status": "not_configured" }),
-            ),
+            ("no spine configured", json!({ "status": "not_configured" })),
             (
                 "a repository the spine has not registered",
                 json!({
@@ -2039,7 +2037,11 @@ mod tests {
         .to_value();
 
         assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
-        assert_eq!(verdict["inputs"]["cross_repo"], json!(CERTIFIED), "{verdict}");
+        assert_eq!(
+            verdict["inputs"]["cross_repo"],
+            json!(CERTIFIED),
+            "{verdict}"
+        );
         assert_eq!(verdict["limiting_factor"], Value::Null, "{verdict}");
     }
 
