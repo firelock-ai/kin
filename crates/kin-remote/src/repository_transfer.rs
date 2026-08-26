@@ -1110,6 +1110,17 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     // negotiation. That is what decides a race between two publishers: the
     // second one finds a non-empty replica here and is refused, whatever it
     // declared.
+    // These two are a BACKSTOP, not the reachable guard, and the difference is
+    // worth writing down because an unreachable check that looks load-bearing
+    // is how a guard stops being evidence.
+    //
+    // A replica holding authority is past generation zero, since installing any
+    // authority advances the generation. So an honest publisher declares the
+    // live non-zero generation and `validate_pack` refuses it before this point,
+    // and a publisher declaring stale generation-zero roots is refused by the
+    // roots compare-and-swap above. Neither reaches here. What these two buy is
+    // failing closed if that ordering ever changes, and they are deliberately
+    // not the thing any test asserts, because a test cannot reach them either.
     if pack.git_authority_bootstrap.is_some() {
         if current_git_hash.is_some() {
             return Err(RepositoryTransferError::Conflict(
@@ -2551,8 +2562,18 @@ mod tests {
     /// The control that makes the test above mean something: a replica that
     /// already holds authority refuses a second publisher, so a bootstrap is
     /// a first publication and never a rebinding.
+    ///
+    /// Which guard answers is asserted rather than left to whichever fires
+    /// first, because five of them can refuse this and they are not
+    /// interchangeable. A publisher negotiating honestly against a replica that
+    /// has moved reads its live roots, so it declares a non-zero generation and
+    /// meets the generation-zero rule in `validate_pack` before any lease is
+    /// consulted. A publisher declaring stale generation-zero roots gets past
+    /// that and meets the roots compare-and-swap in
+    /// `apply_repository_transfer_pack` instead. Both are refusals and only one
+    /// of them is this test's.
     #[test]
-    fn a_replica_that_already_holds_git_authority_refuses_a_second_bootstrap() {
+    fn an_honest_second_publisher_is_refused_by_the_generation_zero_rule() {
         let fixture = fixture();
         let empty_dir = tempfile::tempdir().unwrap();
         let empty = manager(&empty_dir, &fixture.repository_id);
@@ -2579,6 +2600,53 @@ mod tests {
         assert!(
             matches!(error, RepositoryTransferError::Conflict(_)),
             "rebinding is a conflict, not a validation error: {error}"
+        );
+        assert!(
+            error.to_string().contains("admitted only at generation zero"),
+            "this test is about the generation-zero rule; another guard answering \
+             means the layering moved and the test now proves something else: {error}"
+        );
+    }
+
+    /// The other reachable layer: a publisher that LIES about the destination
+    /// being empty.
+    ///
+    /// An honest publisher reads the destination's live roots and so declares a
+    /// non-zero generation once the replica has moved. One that declares stale
+    /// generation-zero roots gets past the generation rule and is refused by the
+    /// compare-and-swap against the lease instead, which is the guard that does
+    /// not depend on the sender telling the truth. Together the two cover the
+    /// honest case and the dishonest one, and neither alone does.
+    #[test]
+    fn a_publisher_declaring_a_stale_empty_lease_is_refused_by_the_compare_and_swap() {
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+
+        // Capture the genuinely-empty lease BEFORE the first bootstrap, which
+        // is what a stale publisher would still be holding.
+        let stale = bootstrap_pack_from(&fixture, &empty, 95);
+        apply_repository_transfer_pack(
+            &empty,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("first-publisher"),
+            &bootstrap_pack_from(&fixture, &empty, 96),
+        )
+        .expect("the first bootstrap is admitted");
+
+        let error = apply_repository_transfer_pack(
+            &empty,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("stale-publisher"),
+            &stale,
+        )
+        .expect_err("a stale empty-lease declaration is refused");
+        assert!(
+            error.to_string().contains("moved from the pack lease"),
+            "the refusal must come from the lease compare-and-swap, not from the \
+             sender's own declaration: {error}"
         );
     }
 
