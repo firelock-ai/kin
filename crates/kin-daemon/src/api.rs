@@ -30310,6 +30310,150 @@ mod tests {
         move |_| state.bump_version()
     }
 
+    /// The `after_root` hook that supersedes the first `attempts` reads and then
+    /// lets the graph hold still.
+    ///
+    /// The writer that drains while the loop is still willing to look.
+    /// [`supersede_every_attempt`] proves the disclosure fires when nothing
+    /// settles; this proves the loop now waits long enough to stop needing it.
+    fn supersede_until(state: &Arc<DaemonState>, attempts: usize) -> impl FnMut(usize) {
+        let state = Arc::clone(state);
+        move |attempt| {
+            if attempt < attempts {
+                state.bump_version();
+            }
+        }
+    }
+
+    /// A writer that drains before the last attempt is answered CURRENT, not
+    /// served a labelled stale answer.
+    ///
+    /// This is the currency upgrade. Before it the loop spent its whole budget
+    /// on reads and skipped the wait after the final one, so its last act was a
+    /// read taken without ever letting the writer drain, and that answer was
+    /// published superseded. One attempt past the resample budget turns the
+    /// skipped wait into a real one and gives the answer it protects a reader.
+    ///
+    /// The two assertions are separate claims and both are needed. The retry
+    /// label says the loop contended and recovered. The ABSENCE of the
+    /// mutation-in-flight label says it recovered into currency rather than
+    /// giving up, and without it a test asserting only the retry label would
+    /// pass on an answer that was still stale.
+    #[tokio::test]
+    async fn a_writer_that_drains_before_the_last_attempt_is_answered_current() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+
+        let settled = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("an uncontended reference read is served");
+        let settled_body: serde_json::Value =
+            serde_json::from_str(&mcp_result_text(&settled)).unwrap();
+
+        // Supersede every attempt the resample budget pays for, and let the one
+        // the currency upgrade added read a graph that holds still.
+        let recovered = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            supersede_until(&state, XREF_CURRENCY_ATTEMPTS - 1),
+        )
+        .await
+        .expect("a read whose writer drains is served");
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&recovered)).unwrap();
+
+        assert_eq!(body["focal_entity"], settled_body["focal_entity"]);
+        assert_eq!(body["references"], settled_body["references"]);
+
+        let labels = degradation_labels(&body);
+        assert!(
+            labels.contains(&"graph_authority:retry".to_string()),
+            "a read that only became current after retries must say so: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"graph_authority:mutation_in_flight".to_string()),
+            "this answer is CURRENT; publishing it as superseded is the thing the extra \
+             attempt exists to stop: {:?}",
+            labels
+        );
+    }
+
+    /// A writer that never drains still gets the superseded answer, unchanged.
+    ///
+    /// The cap arm. The currency upgrade widens the window; it must not soften
+    /// the verdict, and a store under continuous churn must still be told its
+    /// answer lost currency rather than being made to wait forever for one that
+    /// did not.
+    #[tokio::test]
+    async fn a_writer_that_never_drains_still_serves_the_superseded_answer() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+
+        let contended = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            supersede_every_attempt(&state),
+        )
+        .await
+        .expect("a superseded read with rows is served, never refused");
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&contended)).unwrap();
+
+        assert!(
+            degradation_labels(&body).contains(&"graph_authority:mutation_in_flight".to_string()),
+            "continuous churn must still be published as a mutation in flight: {:?}",
+            degradation_labels(&body)
+        );
+    }
+
+    /// The healthy-path tripwire: the labelled paths are exercised ZERO times on
+    /// a graph nothing is writing.
+    ///
+    /// Without this, both disclosures could become the steady state and every
+    /// assertion above would still pass. A label that is always present says
+    /// nothing, and an agent reading it would learn to ignore it, which is worse
+    /// than not having it.
+    #[tokio::test]
+    async fn an_uncontended_read_carries_neither_the_retry_nor_the_superseded_label() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+
+        let quiet = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("an uncontended reference read is served");
+        let labels = degradation_labels(&serde_json::from_str(&mcp_result_text(&quiet)).unwrap());
+
+        assert!(
+            !labels.contains(&"graph_authority:retry".to_string()),
+            "nothing retried, so nothing may claim it did: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"graph_authority:mutation_in_flight".to_string()),
+            "nothing was written, so nothing may claim a write was in flight: {:?}",
+            labels
+        );
+    }
+
     /// The `component:reason` labels a payload's own `degradations[]` publishes,
     /// read the way `kin_mcp`'s `negative_for` reads them.
     fn degradation_labels(payload: &serde_json::Value) -> Vec<String> {
