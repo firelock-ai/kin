@@ -63,7 +63,7 @@ const TRANSFER_ENVELOPE_HEADROOM: usize = 8 * 1024 * 1024;
 /// moves with it.
 #[must_use]
 pub const fn http_body_limit_for(decoded_ceiling: u64) -> usize {
-    let encoded = ((decoded_ceiling + 2) / 3) * 4;
+    let encoded = decoded_ceiling.div_ceil(3) * 4;
     (encoded as usize) + TRANSFER_ENVELOPE_HEADROOM
 }
 
@@ -445,7 +445,7 @@ mod tests {
             16 * 1024 * 1024,
             256 * 1024 * 1024,
         ] {
-            let encoded = ((decoded + 2) / 3) * 4;
+            let encoded = decoded.div_ceil(3) * 4;
             let cap = http_body_limit_for(decoded) as u64;
             assert!(
                 cap > encoded,
@@ -456,7 +456,7 @@ mod tests {
         }
         assert!(
             REPOSITORY_TRANSFER_HTTP_BODY_LIMIT as u64
-                > ((crate::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES + 2) / 3) * 4,
+                > crate::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES.div_ceil(3) * 4,
             "the shipped wire cap must clear the shipped decoded ceiling once encoded"
         );
     }

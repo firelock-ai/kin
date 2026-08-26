@@ -35124,7 +35124,7 @@ mod transfer_wire_cap_tests {
 
     /// The size a decoded closure becomes on the wire, base64 included.
     fn encoded(decoded: u64) -> usize {
-        (((decoded + 2) / 3) * 4) as usize
+        (decoded.div_ceil(3) * 4) as usize
     }
 
     /// A real server carrying the SAME body limit the transfer routes carry,
