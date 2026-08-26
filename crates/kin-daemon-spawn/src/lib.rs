@@ -193,10 +193,21 @@ pub struct CgroupMemory {
     /// Kernel OOM kills accounted to this cgroup, or `None` when no accounting
     /// is readable.
     pub oom_kills: Option<u64>,
+    /// How many times this cgroup's charge was held at its own ceiling, or
+    /// `None` when the kernel publishes no such count.
+    ///
+    /// This is the `max` key of cgroup v2's `memory.events`, and it answers a
+    /// question no other field here can. A run that spends its life pinned
+    /// against the cap, reclaimed hard on every allocation and never killed,
+    /// leaves `oom_kills` at zero and `peak_bytes` merely equal to the cap,
+    /// which is also what a run that touched the ceiling once looks like. This
+    /// counter separates them. v1 publishes nothing equivalent, so it is `None`
+    /// there, and `Some(0)` is the kernel saying the ceiling was never reached.
+    pub ceiling_hits: Option<u64>,
     /// Bytes charged to this cgroup right now, or `None` when no accounting is
     /// readable. This is the only field that answers "how close is this
-    /// container to its cap at this instant"; the two above answer what the cap
-    /// is and what has already been killed under it.
+    /// container to its cap at this instant"; the others answer what the cap
+    /// is, what has already been killed under it, and how often it was reached.
     pub current_bytes: Option<u64>,
     /// The high-water mark this cgroup has reached, or `None` when the kernel
     /// publishes none (cgroup v2 only, and only on kernels carrying
@@ -206,9 +217,11 @@ pub struct CgroupMemory {
 
 /// Read what this host will say about memory pressure right now.
 pub fn cgroup_memory() -> CgroupMemory {
+    let events = cgroup_memory_events();
     CgroupMemory {
         limit_bytes: cgroup_memory_limit_bytes(),
-        oom_kills: cgroup_oom_kill_count(),
+        oom_kills: events.oom_kills,
+        ceiling_hits: events.ceiling_hits,
         current_bytes: cgroup_memory_current_bytes(),
         peak_bytes: cgroup_memory_peak_bytes(),
     }
@@ -389,45 +402,70 @@ fn cgroup_memory_peak_bytes() -> Option<u64> {
     None
 }
 
-/// How many times the kernel OOM-killed a process accounted to this cgroup, or
-/// `None` when no accounting is readable (off Linux, or neither hierarchy's
+/// The event counters one cgroup block publishes about its own ceiling.
+///
+/// Read together, out of one file, because they are only comparable when they
+/// describe the same cgroup. Taking the kill count from a container's own
+/// `memory.events` and the ceiling count from the hierarchy root would produce
+/// two numbers about two different scopes and no way for a reader to tell.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CgroupEventCounts {
+    /// The `oom_kill` key: kills the kernel accounted to this cgroup.
+    oom_kills: Option<u64>,
+    /// The `max` key: times the charge was held at this cgroup's own ceiling.
+    ceiling_hits: Option<u64>,
+}
+
+/// What this process's cgroup says about kills and ceiling hits, or an empty
+/// reading when no accounting is readable (off Linux, or neither hierarchy's
 /// file is present).
 ///
-/// Both hierarchies publish the counter under the same key, in different files:
-/// cgroup v2 in `memory.events`, v1 in `memory.oom_control`. Searched from this
-/// process's own cgroup upwards for the reason the limit is: at the root there
-/// is nothing to count.
+/// Both hierarchies publish the kill counter under the same key, in different
+/// files: cgroup v2 in `memory.events`, v1 in `memory.oom_control`. Searched
+/// from this process's own cgroup upwards for the reason the limit is: at the
+/// root there is nothing to count. The first block carrying `oom_kill` is the
+/// answer, and the ceiling count is taken from that same block, which is why
+/// v1 reads `None` for it: `memory.oom_control` publishes no `max` key and
+/// there is nothing to fall through to that would describe the same scope.
+///
+/// Both counters are cumulative for the cgroup's lifetime. A caller asking
+/// whether THIS run hit either of them must compare two readings; a single
+/// reading answers "ever", never "just now". That is FIR-1823.
 #[cfg(target_os = "linux")]
-fn cgroup_oom_kill_count() -> Option<u64> {
+fn cgroup_memory_events() -> CgroupEventCounts {
     let relative =
         read_cgroup_file("/proc/self/cgroup").and_then(|body| parse_proc_self_cgroup(&body));
     for mount in ["/sys/fs/cgroup", "/sys/fs/cgroup/memory"] {
         for dir in cgroup_search_dirs(mount, relative.as_deref()) {
             for name in ["memory.events", "memory.oom_control"] {
-                if let Some(count) = read_cgroup_file(&format!("{dir}/{name}"))
-                    .and_then(|raw| parse_oom_kill_count(&raw))
-                {
-                    return Some(count);
+                let Some(raw) = read_cgroup_file(&format!("{dir}/{name}")) else {
+                    continue;
+                };
+                if let Some(oom_kills) = parse_cgroup_counter(&raw, "oom_kill") {
+                    return CgroupEventCounts {
+                        oom_kills: Some(oom_kills),
+                        ceiling_hits: parse_cgroup_counter(&raw, "max"),
+                    };
                 }
             }
         }
     }
-    None
+    CgroupEventCounts::default()
 }
 
 #[cfg(not(target_os = "linux"))]
-fn cgroup_oom_kill_count() -> Option<u64> {
-    None
+fn cgroup_memory_events() -> CgroupEventCounts {
+    CgroupEventCounts::default()
 }
 
-/// The `oom_kill` counter out of a cgroup key/value block, or `None` when the
-/// block carries no such key.
+/// One named counter out of a cgroup key/value block, or `None` when the block
+/// carries no such key.
 #[cfg(any(target_os = "linux", test))]
-fn parse_oom_kill_count(contents: &str) -> Option<u64> {
+fn parse_cgroup_counter(contents: &str, key: &str) -> Option<u64> {
     contents.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
         match (fields.next(), fields.next()) {
-            (Some("oom_kill"), Some(value)) => value.parse().ok(),
+            (Some(name), Some(value)) if name == key => value.parse().ok(),
             _ => None,
         }
     })
@@ -8209,19 +8247,55 @@ mod tests {
         // cgroup v2 `memory.events`, which is where a container's evidence
         // comes from.
         assert_eq!(
-            parse_oom_kill_count("low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\n"),
+            parse_cgroup_counter("low 0\nhigh 0\nmax 3\noom 1\noom_kill 1\n", "oom_kill"),
             Some(1)
         );
         // cgroup v1 `memory.oom_control`, same key, different file.
         assert_eq!(
-            parse_oom_kill_count("oom_kill_disable 0\nunder_oom 0\noom_kill 2\n"),
+            parse_cgroup_counter("oom_kill_disable 0\nunder_oom 0\noom_kill 2\n", "oom_kill"),
             Some(2)
         );
         // A group that was never killed says so, which is not the same answer
         // as a host that cannot be asked.
-        assert_eq!(parse_oom_kill_count("low 0\nhigh 0\nmax 0\noom 0\n"), None);
-        assert_eq!(parse_oom_kill_count("oom_kill 0\n"), Some(0));
-        assert_eq!(parse_oom_kill_count("oom_kill notanumber\n"), None);
+        assert_eq!(
+            parse_cgroup_counter("low 0\nhigh 0\nmax 0\noom 0\n", "oom_kill"),
+            None
+        );
+        assert_eq!(parse_cgroup_counter("oom_kill 0\n", "oom_kill"), Some(0));
+        assert_eq!(
+            parse_cgroup_counter("oom_kill notanumber\n", "oom_kill"),
+            None
+        );
+    }
+
+    /// The ceiling-hit counter is a real key with a real value, and it is not
+    /// the kill counter.
+    ///
+    /// `max` is what a run pinned against its cap leaves behind when nothing is
+    /// killed, and reading only `oom_kill` made those runs indistinguishable
+    /// from runs that never approached the ceiling. The 4 GiB container arm on
+    /// 2026-08-25 recorded `max 6344` beside `oom_kill 1`: the two keys count
+    /// different things and neither substitutes for the other.
+    #[test]
+    fn ceiling_hits_are_read_from_the_max_key_and_are_not_the_kill_count() {
+        const PINNED: &str = "low 0\nhigh 0\nmax 6344\noom 9\noom_kill 1\n";
+        assert_eq!(parse_cgroup_counter(PINNED, "max"), Some(6344));
+        assert_eq!(
+            parse_cgroup_counter(PINNED, "oom_kill"),
+            Some(1),
+            "the two keys are read independently out of one block"
+        );
+        // A ceiling never reached says so, which is not the same answer as a
+        // hierarchy that publishes no such key at all.
+        assert_eq!(
+            parse_cgroup_counter("low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n", "max"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_cgroup_counter("oom_kill_disable 0\nunder_oom 0\noom_kill 2\n", "max"),
+            None,
+            "cgroup v1 publishes no ceiling-hit counter"
+        );
     }
 
     /// FIR-2653. One process's reading never carries a shared page whole.
