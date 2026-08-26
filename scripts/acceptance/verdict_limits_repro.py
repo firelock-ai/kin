@@ -71,6 +71,7 @@ installs; without one, `references` reads short and the checks say so.
 
 import argparse
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -227,7 +228,51 @@ INPUT_CLAUSE_LABELS = {
     "degradations": ("retrieval_degraded",),
     "completeness": ("substrate_", "counts_are_a_floor"),
     "response_budget": ("response_bounded",),
+    # absence_gate was missing, and it is the FIRST reading in the array and the
+    # one whose clause survives the dedupe when it and edge_coverage both notice
+    # the same gap, so the grader was blind on the input that decides what the
+    # reader sees. The check is guarded by `if prefixes`, so an absent entry is
+    # never verified at all.
+    #
+    # This is its FULL label set, not the six it alone produces, and the
+    # difference is the honest part. Six of these twelve are shared with
+    # edge_coverage by design (the FIR-2672 pairing, where both readings notice
+    # one gap and the factor says it once). Listing only the unique six would
+    # report a finding every time absence_gate legitimately refused with a
+    # shared label, since edge_coverage refuses on the same condition and the
+    # deduped factor carries one clause.
+    #
+    # So the limit is stated rather than hidden: on a SHARED label this check is
+    # satisfied by edge_coverage's clause and proves nothing extra. It
+    # discriminates on the six unique labels, and the fixture below uses one, so
+    # the check has a case in which it can fail.
+    "absence_gate": (
+        "absence_coverage_unreported",
+        "answer_coverage_unmeasured",
+        "answer_coverage_unreported",
+        "edge_coverage_unreported",
+        "entity_index_unresolved",
+        "name_filter_narrowed_to_zero",
+        "absence_coverage_unmeasured",
+        "absence_scope_empty",
+        "cross_file_edges_",
+        "edge_coverage_unknown",
+        "reference_enrichment_",
+        "focal_resolution_",
+    ),
 }
+
+# Labels only `absence_gate` produces. The subset on which its entry above can
+# actually fail, kept separate so a fixture can pick one deliberately rather
+# than a reader having to work out which of the twelve discriminate.
+ABSENCE_GATE_ONLY_LABELS = (
+    "absence_coverage_unreported",
+    "answer_coverage_unmeasured",
+    "answer_coverage_unreported",
+    "edge_coverage_unreported",
+    "entity_index_unresolved",
+    "name_filter_narrowed_to_zero",
+)
 
 # The smallest response budget the server serves (`RESPONSE_MIN_MAX_CHARS`).
 # Asking for it on a populated answer withholds rows, which is the one refusal
@@ -235,10 +280,32 @@ INPUT_CLAUSE_LABELS = {
 BUDGET_FLOOR_CHARS = 2000
 
 
-def factor_clauses(factor):
-    """The `label: text` clauses of one limiting factor, in order."""
-    clauses = [c.strip() for c in (factor or "").split("; ") if c.strip()]
-    return [(c.split(":", 1)[0].strip(), c) for c in clauses]
+def factor_labels(factor):
+    """Every clause label the factor names, in order.
+
+    Splitting on the separator is CORRECT here, and it was not always. The
+    server used to emit a clause whose own prose contained "; ", so this split
+    cut one gap into a labelled clause plus an unlabelled fragment and then
+    graded the fragment as though it were a label. That is fixed at the source:
+    clauses are carried as a list to a single join, and
+    `no_clause_carries_the_separator_that_divides_clauses` in `verdict.rs`
+    asserts no clause contains the separator, driving the real producer over
+    five payload shapes rather than restating its strings.
+
+    So this parser is a second copy, and that coupling is real, but replacing it
+    is worse than keeping it. The obvious replacement, a regex for `word:` at a
+    clause start, finds a THIRD label in today's real factor: the absence gate's
+    clause contains the parenthetical "...do not stand in for imports: an entity
+    other files reach only through imports...", and a mid-sentence colon is
+    indistinguishable from a label start without knowing where clauses end.
+    Splitting on the separator knows exactly that, and now it is true.
+
+    The dependency is therefore stated rather than removed: this function is
+    correct only while the server's invariant holds, and that invariant has its
+    own falsified check on the other side.
+    """
+    clauses = [clause.strip() for clause in (factor or "").split("; ") if clause.strip()]
+    return [clause.split(":", 1)[0].strip() for clause in clauses]
 
 
 def factor_carries_every_refusing_input(payload):
@@ -253,7 +320,8 @@ def factor_carries_every_refusing_input(payload):
     inputs = verdict.get("inputs")
     if not isinstance(inputs, dict) or verdict.get("state") not in ("certified", "inconclusive"):
         return None, ["no verdict inputs"]
-    labels = [label for label, _ in factor_clauses(verdict.get("limiting_factor"))]
+    factor = verdict.get("limiting_factor") or ""
+    labels = factor_labels(factor)
     refusing = [name for name, state in inputs.items() if state == "inconclusive"]
     problems = []
     if refusing and verdict.get("state") != "inconclusive":
@@ -262,7 +330,10 @@ def factor_carries_every_refusing_input(payload):
         problems.append("inputs %s refuse and limiting_factor is empty" % refusing)
     for name in refusing:
         prefixes = INPUT_CLAUSE_LABELS.get(name)
-        if prefixes and not any(label.startswith(prefixes) for label in labels):
+        # Substring against the whole factor, not against parsed boundaries.
+        # A refusing input's clause is present or it is not, and answering that
+        # needs no opinion about where the clause ends.
+        if prefixes and not any(("%s" % pre) in factor for pre in prefixes):
             problems.append("input %s refuses and no clause of the factor is its (labels %s)"
                             % (name, labels))
     dupes = sorted({label for label in labels if labels.count(label) > 1})
@@ -672,9 +743,68 @@ def self_test():
             "all observed present (calls, imports, references)")
     expect("every refusing input has its clause",
            factor_carries_every_refusing_input(bounded(two, full))[1], [])
-    expect("the factor a budget cut used to replace outright fails twice",
+    # THREE, not two, and the third is the point of adding `absence_gate` to the
+    # map. This fixture has absence_gate, edge_coverage, completeness and
+    # response_budget all refusing while the factor names only the budget's
+    # clause. Before absence_gate had an entry, the `if prefixes` guard skipped
+    # it and the grader reported two inputs whose clause was missing while a
+    # third was equally missing and unmentioned. The count changing is the
+    # evidence the entry does something.
+    expect("the factor a budget cut used to replace outright loses three clauses",
            len(factor_carries_every_refusing_input(bounded(
-               two, "response_bounded: the response budget withheld part of this answer"))[1]), 2)
+               two, "response_bounded: the response budget withheld part of this answer"))[1]), 3)
+    expect("and absence_gate is one of the three it now names",
+           any("input absence_gate refuses" in problem
+               for problem in factor_carries_every_refusing_input(bounded(
+                   two, "response_bounded: the response budget withheld part of this answer"))[1]),
+           True)
+    # The real factor, verbatim from the shipped producer, so the grader's
+    # dependency on the server's no-separator-in-a-clause invariant is proven
+    # rather than asserted in a docstring. Two labels, not three: an earlier
+    # attempt to replace this split with a regex for `word:` found a third,
+    # `imports`, from the mid-sentence colon in "do not stand in for imports:".
+    real_factor = (
+        "cross_file_edges_absent: the graph holds no cross-file imports edges for Python "
+        "(cross-file calls, references edges are present and do not stand in for imports: an "
+        "entity other files reach only through imports is invisible to a graph holding none), "
+        "so a use that reaches the target through imports could not have been found and an "
+        "empty result says nothing about whether the target is used, and the gap is in "
+        "extraction/enrichment for that language rather than in the code; "
+        "retrieval_degraded: this query reported degradations [embed_worker:failed], so it "
+        "did not run at full capability")
+    expect("the real factor yields exactly its two labels",
+           factor_labels(real_factor),
+           ["cross_file_edges_absent", "retrieval_degraded"])
+    # And the shape that used to break it, kept as the regression it is: a
+    # clause whose own prose carries the separator produces a fragment with no
+    # label. The server no longer emits this, and if it ever does again this
+    # case says so here rather than the grader silently scoring the fragment.
+    expect("a clause carrying the separator would produce an unlabelled fragment",
+           "the gap is in extraction/enrichment for that language, not in the code" in
+           factor_labels(real_factor.replace(
+               "used, and the gap is in extraction/enrichment for that language rather than "
+               "in the code",
+               "used; the gap is in extraction/enrichment for that language, not in the code")),
+           True)
+
+    # The documented limit, asserted rather than left implicit: on a label
+    # absence_gate SHARES with edge_coverage, its entry is satisfied by
+    # edge_coverage's clause and proves nothing extra. A reader who thinks this
+    # check discriminates everywhere should see it stated here.
+    expect("a shared label satisfies absence_gate without discriminating",
+           any("input absence_gate refuses" in problem
+               for problem in factor_carries_every_refusing_input(bounded(
+                   two, "response_bounded: x; cross_file_edges_unproduced: y; "
+                        "substrate_partial: z"))[1]),
+           False)
+    # And the case where it DOES discriminate: a label only absence_gate
+    # produces, missing while it refuses.
+    expect("a factor missing absence_gate's own label names it",
+           any("input absence_gate refuses" in problem
+               for problem in factor_carries_every_refusing_input(bounded(
+                   {"absence_gate": "inconclusive"},
+                   "retrieval_degraded: something else entirely"))[1]),
+           True)
     expect("a factor that kept only the first reading fails on the completeness clause",
            factor_carries_every_refusing_input(bounded(
                two, "response_bounded: x; cross_file_edges_unproduced: y"))[1],
