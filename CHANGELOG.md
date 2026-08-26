@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-26
+
+### Changed
+
+- Quote the embed memory floor only to a machine that is under it (#1162)
+- Land an in-place edit as a commit, and stamp the daemon-loss shape a kill produces (#1161)
+- Report a daemon that can no longer sample itself live (#1163)
+- Exclude a declaring parent from its own member's impact, whatever edge joins them (#1165)
+- Tell the model when its staged edit was not published (#1166)
+- Pin the module-sourced reference line in the acceptance suite (#1169)
+- Probe the segmented bootstrap and measure what its planning costs at repository scale (#1167)
+
+
 ## [0.6.0] - 2026-08-25
 
 ### Changed
