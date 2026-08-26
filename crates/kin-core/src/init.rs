@@ -3310,6 +3310,14 @@ mod tests {
     /// The minted stage beside it is the control. Both are built the same way
     /// and only the identity differs, so a pass that reclaims one and not the
     /// other is measuring the identity and nothing else.
+    ///
+    /// Unix-only because the thing under test is: `recover_orphaned_repository_stages`
+    /// returns `Ok(0)` unconditionally off Unix, so on Windows nothing is ever
+    /// reclaimed and a reclaim count would measure the platform rather than the
+    /// identity. `orphan_recovery_retains_non_private_or_hard_linked_owner_records`
+    /// is gated for the same reason; the recovery tests that stay ungated are the
+    /// ones asserting a count of zero, which is true on both.
+    #[cfg(unix)]
     #[test]
     fn orphan_recovery_reclaims_a_stage_whose_repository_identity_was_adopted() {
         for (label, manifest, origin) in [
