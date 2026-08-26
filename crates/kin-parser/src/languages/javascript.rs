@@ -1547,6 +1547,7 @@ fn extract_js_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
     }
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers,
     })
@@ -1583,6 +1584,7 @@ fn extract_js_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<F
     }
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers,
     })
@@ -1804,6 +1806,7 @@ pub(super) fn collect_js_require_imports(
                 let specifiers = js_require_specifiers(&name, member.as_deref(), source);
                 if !specifiers.is_empty() {
                     imports.push(FileImport {
+                        site: crate::adapter::site_from_node(&declarator),
                         module_path,
                         specifiers,
                     });
@@ -1830,6 +1833,7 @@ pub(super) fn collect_js_require_imports(
                             continue;
                         }
                         imports.push(FileImport {
+                            site: crate::adapter::site_from_node(&child),
                             module_path,
                             specifiers: vec![ImportedName {
                                 local_name,
@@ -1843,6 +1847,7 @@ pub(super) fn collect_js_require_imports(
                     "call_expression" => {
                         if let Some((module_path, _)) = js_require_target(&child, source) {
                             imports.push(FileImport {
+                                site: crate::adapter::site_from_node(&child),
                                 module_path,
                                 specifiers: Vec::new(),
                             });

@@ -320,6 +320,29 @@ pub struct FileImport {
     pub module_path: String,
     /// Individual names imported from this module.
     pub specifiers: Vec<ImportedName>,
+    /// Where the import statement sits in the file that wrote it.
+    ///
+    /// Required, not `Option`, and that is the whole design. An entity-level
+    /// import edge is sourced at the importing file's MODULE entity, whose span
+    /// is the entire file, so a rename planner searching the source entity's
+    /// span finds every mention of the name rather than the import site. Without
+    /// a span on the evidence, `kin rename` cannot edit an imported symbol at
+    /// all and refuses (`rename.rs`, "graph import evidence has no exact source
+    /// span").
+    ///
+    /// Thirteen language adapters build `FileImport`. An `Option` here would let
+    /// any one of them omit a span silently, and the symptom would be that
+    /// rename works for some languages and refuses for others with nothing in
+    /// any log. A required field moves that from a test someone has to remember
+    /// to write into a compile error nobody can skip: every adapter supplies a
+    /// site or the crate does not build. `adapter.rs::site_from_node` turns the
+    /// tree-sitter node each adapter already matched into one.
+    ///
+    /// A required field can still be satisfied with a lie, `(0, 0)` or a span
+    /// over the wrong bytes, so `import_span_coverage.rs` asserts every
+    /// language's span is real: non-empty, inside the file, and naming bytes
+    /// that actually contain the module path.
+    pub site: RelationSite,
 }
 
 /// A single imported name within an import declaration.
@@ -639,6 +662,22 @@ pub struct ParseOutput {
 
 #[cfg(test)]
 mod tests {
+
+    /// A well-formed but synthetic import site, for fixtures whose subject is
+    /// not the span. Tests whose subject IS the span parse real source; see
+    /// `tests/import_span_coverage.rs`.
+    fn synthetic_import_site() -> RelationSite {
+        RelationSite {
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: 1,
+            syntactic_role: None,
+        }
+    }
+
     use super::*;
 
     fn preview_for(text: &str) -> String {
@@ -728,6 +767,7 @@ mod tests {
         let file_id = FilePathId::new("packages/runtime-dom/src/index.ts");
         let mut entities = vec![test_entity(&file_id.to_string())];
         let imports = vec![FileImport {
+            site: synthetic_import_site(),
             module_path: "@vue/runtime-core".into(),
             specifiers: vec![ImportedName {
                 local_name: "createHydrationRenderer".into(),
@@ -756,6 +796,7 @@ mod tests {
 
     fn import(module_path: &str) -> FileImport {
         FileImport {
+            site: synthetic_import_site(),
             module_path: module_path.to_string(),
             specifiers: Vec::new(),
         }

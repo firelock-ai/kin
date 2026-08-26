@@ -734,6 +734,7 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
 
     if is_wildcard {
         return Some(FileImport {
+            site: crate::adapter::site_from_node(node),
             module_path: full_path,
             specifiers: vec![ImportedName {
                 local_name: "*".to_string(),
@@ -750,6 +751,7 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
         let has_alias = alias.is_some();
         let local_name = alias.unwrap_or_else(|| original_name.clone());
         Some(FileImport {
+            site: crate::adapter::site_from_node(node),
             module_path,
             specifiers: vec![ImportedName {
                 local_name,
@@ -760,6 +762,7 @@ fn extract_kotlin_import(node: &tree_sitter::Node, source: &[u8]) -> Option<File
     } else {
         let local_name = alias.unwrap_or_else(|| full_path.clone());
         Some(FileImport {
+            site: crate::adapter::site_from_node(node),
             module_path: String::new(),
             specifiers: vec![ImportedName {
                 local_name,

@@ -1308,6 +1308,7 @@ fn extract_include(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImport
                 }
                 let local_name = path.rsplit('/').next().unwrap_or(&path).to_string();
                 return Some(FileImport {
+                    site: crate::adapter::site_from_node(node),
                     module_path: path,
                     specifiers: vec![ImportedName {
                         local_name,

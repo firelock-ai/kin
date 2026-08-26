@@ -6989,6 +6989,29 @@ mod tests {
         GraphNodeId, Hash256, LanguageId, SemanticFingerprint, SourceSpan, Visibility,
     };
     use kin_parser::ImportedName;
+
+    /// A well-formed but synthetic import site, for fixtures whose subject is
+    /// not the span.
+    ///
+    /// These fixtures hand-build `FileImport` to exercise resolution, so they
+    /// need the field to be present and shaped correctly and nothing more.
+    /// Every test whose subject IS the span parses real source and reads the
+    /// parser's own site; see `crates/kin-parser/tests/import_span_coverage.rs`.
+    /// Naming this "synthetic" rather than "default" is deliberate: a helper
+    /// called `default_site()` reads like something a production path could
+    /// reasonably reach for, and nothing in production may invent a span.
+    fn synthetic_import_site() -> kin_parser::RelationSite {
+        kin_parser::RelationSite {
+            start_byte: 0,
+            end_byte: 1,
+            start_line: 1,
+            start_col: 0,
+            end_line: 1,
+            end_col: 1,
+            syntactic_role: None,
+        }
+    }
+
     use std::sync::{Mutex, OnceLock};
 
     #[test]
@@ -7844,6 +7867,7 @@ mod tests {
                     entities: vec![caller.clone()],
                     relations,
                     imports: vec![FileImport {
+                        site: synthetic_import_site(),
                         module_path: "crate::model".to_string(),
                         specifiers: vec![],
                     }],
@@ -7921,6 +7945,7 @@ mod tests {
                     import_source: None,
                 }],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "../utils/tools".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "executeTool".to_string(),
@@ -7980,6 +8005,7 @@ mod tests {
                 import_source: None,
             }],
             imports: vec![FileImport {
+                site: synthetic_import_site(),
                 module_path: "../utils/tools".to_string(),
                 specifiers: vec![kin_parser::ImportedName {
                     local_name: "executeTool".to_string(),
@@ -8069,6 +8095,7 @@ mod tests {
             import_source: None,
         };
         let import = |module: &str, name: &str| FileImport {
+            site: synthetic_import_site(),
             module_path: module.to_string(),
             specifiers: vec![kin_parser::ImportedName {
                 local_name: name.to_string(),
@@ -8162,6 +8189,7 @@ mod tests {
             imports: vec![],
         };
         let header_import = |module: &str| FileImport {
+            site: synthetic_import_site(),
             module_path: module.to_string(),
             specifiers: vec![],
         };
@@ -8206,6 +8234,7 @@ mod tests {
     #[test]
     fn artifact_import_edges_parallel_match_serial() {
         let import = |module: &str, name: &str| FileImport {
+            site: synthetic_import_site(),
             module_path: module.to_string(),
             specifiers: vec![kin_parser::ImportedName {
                 local_name: name.to_string(),
@@ -8441,6 +8470,7 @@ mod tests {
                     import_source: None,
                 }],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "../utils/worker".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "execute".to_string(),
@@ -8495,6 +8525,7 @@ mod tests {
                     import_source: None,
                 }],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "json/macros.hpp".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "macros.hpp".to_string(),
@@ -8668,6 +8699,7 @@ void f();
                     import_source: None,
                 }],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "./util".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "util".to_string(),
@@ -8905,6 +8937,7 @@ void f();
 
     fn python_import(module_path: &str, names: &[&str]) -> FileImport {
         FileImport {
+            site: synthetic_import_site(),
             module_path: module_path.to_string(),
             specifiers: names
                 .iter()
@@ -9183,6 +9216,7 @@ void f();
                 entities: vec![caller.clone()],
                 relations: vec![bare_call("parse_file", "open")],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "notekeeper.compat".to_string(),
                     specifiers: Vec::new(),
                 }],
@@ -9524,6 +9558,7 @@ void f();
             .collect();
 
         let header = FileImport {
+            site: synthetic_import_site(),
             module_path: "helper.h".to_string(),
             specifiers: vec![],
         };
@@ -9537,6 +9572,7 @@ void f();
         );
 
         let module = FileImport {
+            site: synthetic_import_site(),
             module_path: "app.routing".to_string(),
             specifiers: vec![],
         };
@@ -9556,6 +9592,7 @@ void f();
     fn import_target_resolution_refuses_a_self_import() {
         let known: HashSet<&str> = ["lib/index.js"].into_iter().collect();
         let selfref = FileImport {
+            site: synthetic_import_site(),
             module_path: ".".to_string(),
             specifiers: vec![],
         };
@@ -9577,6 +9614,7 @@ void f();
 
         // `from .storage import Store, open_db`: ONE statement, two specifiers.
         let one_statement = vec![FileImport {
+            site: synthetic_import_site(),
             module_path: ".storage".to_string(),
             specifiers: vec![
                 ImportedName {
@@ -9603,6 +9641,7 @@ void f();
         // The same two names on separate lines: TWO statements.
         let two_statements = vec![
             FileImport {
+                site: synthetic_import_site(),
                 module_path: ".storage".to_string(),
                 specifiers: vec![ImportedName {
                     local_name: "Store".to_string(),
@@ -9611,6 +9650,7 @@ void f();
                 }],
             },
             FileImport {
+                site: synthetic_import_site(),
                 module_path: ".storage".to_string(),
                 specifiers: vec![ImportedName {
                     local_name: "open_db".to_string(),
@@ -9636,10 +9676,12 @@ void f();
         let known: HashSet<&str> = ["app/main.py", "app/storage.py"].into_iter().collect();
         let mixed = vec![
             FileImport {
+                site: synthetic_import_site(),
                 module_path: "re".to_string(),
                 specifiers: vec![],
             },
             FileImport {
+                site: synthetic_import_site(),
                 module_path: ".storage".to_string(),
                 specifiers: vec![],
             },
@@ -9860,6 +9902,7 @@ void f();
                     import_source: None,
                 }],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "./utils".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "myWork".to_string(),
@@ -9912,6 +9955,7 @@ void f();
                 entities: vec![importer.clone()],
                 relations: vec![],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "../utils/tools".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "executeTool".to_string(),
@@ -9956,6 +10000,7 @@ void f();
                 entities: vec![_importer.clone()],
                 relations: vec![],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "nlohmann/detail/input/binary_reader.hpp".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "binary_reader.hpp".to_string(),
@@ -10011,6 +10056,7 @@ void f();
                     import_source: None,
                 }],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "../utils/tools".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "executeTool".to_string(),
@@ -10048,6 +10094,7 @@ void f();
                 entities: vec![importer.clone()],
                 relations: vec![],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "./util".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "util".to_string(),
@@ -10384,6 +10431,7 @@ void f();
                     import_source: Some("../utils/tools".to_string()),
                 }],
                 imports: vec![FileImport {
+                    site: synthetic_import_site(),
                     module_path: "../utils/tools".to_string(),
                     specifiers: vec![kin_parser::ImportedName {
                         local_name: "executeTool".to_string(),
@@ -11545,6 +11593,7 @@ void f();
 
     fn include_import(module_path: &str) -> FileImport {
         FileImport {
+            site: synthetic_import_site(),
             module_path: module_path.to_string(),
             specifiers: vec![],
         }
@@ -12038,6 +12087,7 @@ void f();
 
     fn import_of(module_path: &str, local_name: &str) -> FileImport {
         FileImport {
+            site: synthetic_import_site(),
             module_path: module_path.to_string(),
             specifiers: vec![kin_parser::ImportedName {
                 local_name: local_name.to_string(),

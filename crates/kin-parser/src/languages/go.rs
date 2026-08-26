@@ -1180,6 +1180,7 @@ fn extract_go_import_spec(node: &tree_sitter::Node, source: &[u8]) -> Option<Fil
     };
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers: vec![ImportedName {
             local_name,
