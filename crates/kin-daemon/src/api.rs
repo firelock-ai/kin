@@ -10068,6 +10068,42 @@ struct RepositoryTransferReceiveRequest {
     pack: kin_remote::repository_transfer::RepositoryTransferPack,
 }
 
+/// The decoded-closure ceiling this deployment will accept on a receive.
+///
+/// The library takes limits and this layer decides them, because a deployment
+/// knob belongs where configuration already lives rather than inside a
+/// protocol crate that reads no environment at all today.
+///
+/// Unset, malformed or zero means the compiled default, which is the safe
+/// value. A raised ceiling costs memory rather than correctness: the decoded
+/// closure is held in one map while a pack is validated, so this number IS the
+/// peak allocation of a receive and a host pays it per concurrent receive.
+///
+/// It never overrides a peer. The effective bound is the smaller of this and
+/// whatever the sender advertised, which `validate_pack` enforces after the
+/// caller has taken the minimum.
+fn configured_transfer_limits() -> kin_remote::repository_transfer::RepositoryTransferLimits {
+    let compiled = kin_remote::repository_transfer::RepositoryTransferLimits::default();
+    let Ok(raw) = std::env::var(kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV) else {
+        return compiled;
+    };
+    // A malformed value keeps the default rather than refusing to start. An
+    // operator who mistypes a ceiling gets the safe number and a warning, not a
+    // daemon that will not boot, because the failure mode of the second is
+    // worse than the failure mode of the first.
+    match raw.trim().parse::<u64>() {
+        Ok(bytes) if bytes > 0 => compiled.with_decoded_body_ceiling(bytes),
+        _ => {
+            tracing::warn!(
+                var = kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV,
+                value = %raw,
+                "ignoring an unparseable transfer body ceiling; using the compiled default"
+            );
+            compiled
+        }
+    }
+}
+
 pub(crate) fn repository_transfer_authority(
     state: &DaemonState,
     repo_id: &str,
@@ -10250,6 +10286,7 @@ async fn repo_transfer_receive(
         &request.destination_ref,
         kin_model::AuthorId::new("kin-daemon:repository-transfer-receiver"),
         &request.pack,
+        &configured_transfer_limits(),
     )
     .map_err(repository_transfer_error)?;
 
@@ -10480,6 +10517,7 @@ pub(crate) async fn pull_into_replica(
                         &destination_ref,
                         kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
                         pack,
+                        &configured_transfer_limits(),
                     )?;
                     admitted_packs += 1;
                     if local_derived_views && !refresh.is_stale() {

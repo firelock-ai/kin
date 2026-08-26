@@ -90,7 +90,36 @@ pub const MAX_TRANSFER_TREES: usize = MAX_TRANSFER_CHANGES;
 pub const MAX_TRANSFER_BODIES: usize = 4096;
 pub const MAX_TRANSFER_EXTERNAL_OBJECTS: usize = 4096;
 pub const MAX_TRANSFER_ALIASES: usize = 512;
-pub const MAX_TRANSFER_DECODED_BODY_BYTES: u64 = 16 * 1024 * 1024;
+/// The decoded-closure ceiling a receiver enforces unless its deployment says
+/// otherwise.
+///
+/// It is a TRANSPORT bound and never the product's answer to repository size.
+/// A repository larger than one envelope is segmentation's problem; this number
+/// only decides how much a single envelope may carry, and raising it does not
+/// make a large repository publishable, it makes a slightly larger one fit.
+///
+/// 64 MiB rather than the 16 MiB it replaces. `kin`'s own tip closure is 982
+/// objects and 27.77 MiB, so 16 MiB refused the repository this product is
+/// built in, and 32 MiB would have cleared it by about 15 percent, which is no
+/// margin for something that grows. The cost of the number is memory: the
+/// decoded closure is held in one map while a pack is validated, so this
+/// ceiling IS the peak allocation of a receive and a host pays it per
+/// concurrent receive.
+///
+/// A deployment with more headroom raises it without a release. See
+/// [`RepositoryTransferLimits::bounded_by`], and note that a raised local
+/// ceiling never overrides a peer that advertised less.
+pub const MAX_TRANSFER_DECODED_BODY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The environment variable a deployment raises the decoded-closure ceiling
+/// with, named here so the refusal message and the reader cannot drift apart.
+///
+/// kin-remote does not read it. The library takes limits and the deployment
+/// decides them, so the read lives in the daemon, which is the layer that
+/// already owns configuration. What lives here is the NAME, because a refusal
+/// that names a knob and a knob that lives elsewhere is exactly the pair that
+/// goes stale.
+pub const DECODED_BODY_CEILING_ENV: &str = "KIN_TRANSFER_MAX_DECODED_BODY_BYTES";
 pub const MAX_TRANSFER_BODY_BYTES: u64 = 8 * 1024 * 1024;
 
 const REQUIRED_FEATURES: [&str; 4] = [
@@ -148,17 +177,46 @@ impl RepositoryTransferLimits {
     /// request from making this process assemble a pack its own receiver would
     /// reject, or from turning one bounded transfer step into unbounded work.
     fn bounded_by_local(self) -> Self {
-        let local = Self::default();
+        self.bounded_by(&Self::default())
+    }
+
+    /// The same rule against an arbitrary other ceiling rather than the
+    /// compiled-in one.
+    ///
+    /// A deployment may raise its own decoded-closure ceiling above the
+    /// default, so "bound by local" can no longer mean "bound by the constant":
+    /// that would clamp a deliberately raised host straight back down. The
+    /// receiver computes its effective bound as its CONFIGURED limits bounded
+    /// by whatever the peer advertised, which keeps both halves honest. A host
+    /// with headroom can accept more without a release, and a peer that cannot
+    /// take it still wins, because the minimum of the two is what either side
+    /// can actually construct and validate.
+    #[must_use]
+    pub fn bounded_by(self, other: &Self) -> Self {
         Self {
-            max_changes: self.max_changes.min(local.max_changes),
-            max_trees: self.max_trees.min(local.max_trees),
-            max_bodies: self.max_bodies.min(local.max_bodies),
-            max_external_objects: self.max_external_objects.min(local.max_external_objects),
-            max_aliases: self.max_aliases.min(local.max_aliases),
+            max_changes: self.max_changes.min(other.max_changes),
+            max_trees: self.max_trees.min(other.max_trees),
+            max_bodies: self.max_bodies.min(other.max_bodies),
+            max_external_objects: self.max_external_objects.min(other.max_external_objects),
+            max_aliases: self.max_aliases.min(other.max_aliases),
             max_decoded_body_bytes: self
                 .max_decoded_body_bytes
-                .min(local.max_decoded_body_bytes),
-            max_single_body_bytes: self.max_single_body_bytes.min(local.max_single_body_bytes),
+                .min(other.max_decoded_body_bytes),
+            max_single_body_bytes: self.max_single_body_bytes.min(other.max_single_body_bytes),
+        }
+    }
+
+    /// This process's limits with the decoded-closure ceiling replaced.
+    ///
+    /// The one knob a deployment turns. Everything else stays at the compiled
+    /// value, because the ruling that produced this is about the byte ceiling
+    /// and nothing else, and moving five unrelated bounds while passing through
+    /// would be a change nobody asked for.
+    #[must_use]
+    pub fn with_decoded_body_ceiling(self, max_decoded_body_bytes: u64) -> Self {
+        Self {
+            max_decoded_body_bytes,
+            ..self
         }
     }
 }
@@ -1068,7 +1126,11 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         bodies,
     };
     pack.transfer_id = compute_transfer_id(&pack)?;
-    validate_pack(&pack)?;
+    // The sender checks its own work against the ceilings it ASSEMBLED under,
+    // not against the constants. Those are the negotiated limits already
+    // bounded by this process's own, so a pack that passes here is one the
+    // peer said it would take.
+    validate_pack(&pack, &expectation.limits)?;
     Ok(Assembled::Pack(Box::new(pack)))
 }
 
@@ -1088,14 +1150,21 @@ fn resolved_tree_body_identities(tree: &kin_model::ResolvedTree) -> Result<BTree
     Ok(identities)
 }
 
+/// Apply a received pack under the ceilings this receiver actually enforces.
+///
+/// `limits` is the receiver's EFFECTIVE bound: its configured limits bounded by
+/// whatever the peer advertised. Passing `RepositoryTransferLimits::default()`
+/// is the compiled behaviour and is what a caller with no deployment
+/// configuration should send.
 pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     expected_repository_id: &RepositoryId,
     expected_destination_ref: &RefName,
     actor: AuthorId,
     pack: &RepositoryTransferPack,
+    limits: &RepositoryTransferLimits,
 ) -> Result<RepositoryTransferReceipt> {
-    validate_pack(pack)?;
+    validate_pack(pack, limits)?;
     if &pack.repository_id != expected_repository_id {
         return Err(invalid(format!(
             "pack repository {} does not match receiver repository {}",
@@ -1203,7 +1272,7 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
 
     let required_source_bodies =
         validate_change_and_tree_closure(lease.snapshot().changes.values(), pack)?;
-    let decoded = decode_and_validate_bodies(pack)?;
+    let decoded = decode_and_validate_bodies(pack, authority)?;
     validate_body_coverage(authority, &required_source_bodies, &decoded)?;
     drop(lease);
 
@@ -1225,7 +1294,18 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     Ok(transfer_receipt(pack, receipt, outcome))
 }
 
-pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
+/// Validate a pack against the ceilings the RECEIVER is willing to enforce.
+///
+/// The limits are a parameter rather than the compiled constants, and that is
+/// the whole point of the change that introduced it. Enforcement used to read
+/// `MAX_TRANSFER_*` directly, so a deployment could advertise a raised ceiling
+/// during negotiation and then refuse the pack it had just invited. The caller
+/// computes the effective bound as its configured limits bounded by whatever
+/// the peer advertised, and this function enforces exactly that.
+pub fn validate_pack(
+    pack: &RepositoryTransferPack,
+    limits: &RepositoryTransferLimits,
+) -> Result<()> {
     if pack.schema_version != REPOSITORY_TRANSFER_SCHEMA_VERSION {
         return Err(invalid(format!(
             "unsupported schema version {}; expected {}",
@@ -1244,7 +1324,7 @@ pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
     enforce_count(
         "external objects",
         pack.external_objects.len(),
-        MAX_TRANSFER_EXTERNAL_OBJECTS as u32,
+        limits.max_external_objects,
     )?;
     enforce_count("aliases", pack.aliases.len(), MAX_TRANSFER_ALIASES as u32)?;
 
@@ -1347,10 +1427,18 @@ pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
         total = total
             .checked_add(body.byte_len)
             .ok_or_else(|| invalid("decoded body byte total overflow"))?;
-        if total > MAX_TRANSFER_DECODED_BODY_BYTES {
+        if total > limits.max_decoded_body_bytes {
+            // The message names the bound that actually applied and the knob
+            // that moves it. A refusal quoting a compiled constant sent an
+            // operator looking for a release when a restart would have done,
+            // and one quoting no number at all left them guessing which of
+            // seven ceilings refused. It promises nothing beyond the knob: the
+            // transport bound is not the product's answer to repository size.
             return Err(invalid(format!(
-                "decoded body closure exceeds {} bytes",
-                MAX_TRANSFER_DECODED_BODY_BYTES
+                "decoded body closure is {total} bytes and exceeds the effective ceiling of {} \
+                 bytes; a receiver raises its own with {DECODED_BODY_CEILING_ENV}, and the \
+                 effective bound is the smaller of that and what the peer advertised",
+                limits.max_decoded_body_bytes
             )));
         }
         drop(bytes);
@@ -1364,12 +1452,16 @@ pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
                 record.object.oid
             )));
         }
-        if !body_hashes.contains(&record.body_hash) {
-            return Err(invalid(format!(
-                "external object {} body {} is absent from the pack",
-                record.object.oid, record.body_hash
-            )));
-        }
+        // Deliberately NOT requiring the body here any more. This function has
+        // no authority handle, so it cannot tell "absent" from "already in the
+        // destination's CAS", and refusing on the first meaning made a sender
+        // unable to omit a body the receiver already holds.
+        //
+        // The requirement did not disappear, it moved to where it can be
+        // answered: `decode_and_validate_bodies` takes the authority, resolves
+        // each external body from the pack OR from CAS, and runs the full
+        // `validate_raw` against whichever bytes it got. Nothing is trusted
+        // that was not verified; what changed is where the bytes may come from.
     }
     let mut alias_oids = BTreeSet::new();
     for alias in &pack.aliases {
@@ -1698,19 +1790,47 @@ fn validate_change_and_tree_closure<'a>(
     Ok(required_source_bodies)
 }
 
-fn decode_and_validate_bodies(pack: &RepositoryTransferPack) -> Result<BTreeMap<Hash256, Vec<u8>>> {
+/// Decode the pack's bodies and prove every external object against real bytes.
+///
+/// An external body may be satisfied from the destination's own CAS rather than
+/// carried in the pack, the way a tree body already may. The bytes are LOADED
+/// and validated, never assumed: `validate_raw` runs against whichever copy was
+/// resolved, so a receiver that skips the transfer of a body it already has
+/// still verifies it.
+///
+/// That distinction is the whole design. `validate_raw` checks three things,
+/// and only two of them are about Kin's own address: the declared length, the
+/// sha256 the CAS is keyed by, and a recomputation of the GIT object id from
+/// the bytes. The sha256 is tautological on a CAS read, since a
+/// content-addressed store returns bytes with the key it was asked for. The
+/// Git-object recomputation is not, and it is the check a receiver would lose
+/// by skipping validation for a CAS-satisfied body instead of loading it. A
+/// corrupted or substituted CAS entry fails it.
+fn decode_and_validate_bodies<B: StorageBackend + ?Sized + 'static>(
+    pack: &RepositoryTransferPack,
+    authority: &RepositoryAuthorityManager<B>,
+) -> Result<BTreeMap<Hash256, Vec<u8>>> {
     let mut decoded = BTreeMap::new();
     for body in &pack.bodies {
         decoded.insert(body.hash, body.decode()?);
     }
     for record in &pack.external_objects {
-        let bytes = decoded.get(&record.body_hash).ok_or_else(|| {
-            invalid(format!(
-                "external object {} body {} is absent",
-                record.object.oid, record.body_hash
-            ))
-        })?;
-        record.validate_raw(bytes).map_err(model)?;
+        match decoded.get(&record.body_hash) {
+            Some(bytes) => record.validate_raw(bytes).map_err(model)?,
+            None => {
+                let bytes = authority
+                    .load_source_blob(record.body_hash)
+                    .map_err(storage)?
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "external object {} body {} is absent from the pack and from the \
+                             destination CAS",
+                            record.object.oid, record.body_hash
+                        ))
+                    })?;
+                record.validate_raw(&bytes).map_err(model)?;
+            }
+        }
     }
     Ok(decoded)
 }
@@ -1999,6 +2119,13 @@ mod tests {
         pack: RepositoryTransferPack,
         body_hashes: Vec<Hash256>,
         gitlink_target: GitObjectId,
+        /// The external objects committed into BOTH replicas' baseline.
+        ///
+        /// The advance pack is a native fast-forward and carries none, so a
+        /// test about external-object validation has to build its own pack from
+        /// these. Their bodies are already in the destination's CAS, which is
+        /// exactly the state a CAS-satisfied body arrives in.
+        baseline_external_objects: Vec<ExternalObjectRecord>,
     }
 
     fn digest(bytes: &[u8]) -> Hash256 {
@@ -2500,6 +2627,7 @@ mod tests {
             pack,
             body_hashes,
             gitlink_target,
+            baseline_external_objects: external_objects,
         }
     }
 
@@ -2632,6 +2760,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("bootstrap-test"),
             &pack,
+            &RepositoryTransferLimits::default(),
         )
         .expect("an empty replica admits a bootstrap");
         assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
@@ -2684,6 +2813,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("bootstrap-test"),
             &bootstrap_pack_from(&fixture, &empty, 92),
+            &RepositoryTransferLimits::default(),
         )
         .expect("the first bootstrap is admitted");
 
@@ -2695,6 +2825,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("second-publisher"),
             &bootstrap_pack_from(&fixture, &empty, 93),
+            &RepositoryTransferLimits::default(),
         )
         .expect_err("a replica that already holds authority is not bootstrappable");
         assert!(
@@ -2807,6 +2938,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("bootstrap-sender-test"),
             &pack,
+            &RepositoryTransferLimits::default(),
         )
         .expect_err("native history over a gitlink cannot bootstrap");
         assert!(
@@ -2887,6 +3019,7 @@ mod tests {
                 destination_ref,
                 AuthorId::new("peer"),
                 pack,
+                &RepositoryTransferLimits::default(),
             )
         }
     }
@@ -2960,6 +3093,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("first-publisher"),
             &bootstrap_pack_from(&fixture, &empty, 96),
+            &RepositoryTransferLimits::default(),
         )
         .expect("the first bootstrap is admitted");
 
@@ -2969,6 +3103,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("stale-publisher"),
             &stale,
+            &RepositoryTransferLimits::default(),
         )
         .expect_err("a stale empty-lease declaration is refused");
         assert!(
@@ -2990,13 +3125,205 @@ mod tests {
         pack.source_git_authority_hash = Some(Hash256::from_bytes([0x11; 32]));
         pack.transfer_id = compute_transfer_id(&pack).unwrap();
 
-        let error = validate_pack(&pack).expect_err("a mismatched bootstrap hash is refused");
+        let error = validate_pack(&pack, &RepositoryTransferLimits::default())
+            .expect_err("a mismatched bootstrap hash is refused");
         assert!(
             error
                 .to_string()
                 .contains("does not hash to the source Git authority"),
             "the refusal must name the mismatch: {error}"
         );
+    }
+
+    /// A pack over the effective ceiling refuses, and the refusal is useful.
+    ///
+    /// The message names the bound that actually applied and the knob that
+    /// moves it. A refusal quoting a compiled constant sends an operator
+    /// looking for a release when a restart would do; one quoting no number
+    /// leaves them guessing which of seven ceilings refused.
+    #[test]
+    fn an_oversized_closure_refuses_by_naming_the_effective_bound_and_the_knob() {
+        let fixture = fixture();
+        // The default is pinned here so the arms below, which use small
+        // ceilings to stay cheap, cannot drift away from what ships.
+        assert_eq!(
+            MAX_TRANSFER_DECODED_BODY_BYTES,
+            64 * 1024 * 1024,
+            "the shipped default ceiling"
+        );
+
+        let tiny = RepositoryTransferLimits::default().with_decoded_body_ceiling(1);
+        let error = validate_pack(&fixture.pack, &tiny).unwrap_err();
+        let text = error.to_string();
+        assert!(
+            text.contains("exceeds the effective ceiling of 1 bytes"),
+            "the refusal names the bound that applied, not a constant: {text}"
+        );
+        assert!(
+            text.contains(DECODED_BODY_CEILING_ENV),
+            "and the knob that moves it: {text}"
+        );
+    }
+
+    /// The config arm. A raised ceiling admits a pack the smaller one refuses.
+    ///
+    /// This is what falsifies the THREADING rather than the arithmetic: the
+    /// limits have to reach `validate_pack` for the two verdicts to differ. A
+    /// version that kept reading the constant gives the same answer twice.
+    #[test]
+    fn a_raised_ceiling_admits_the_pack_a_smaller_one_refuses() {
+        let fixture = fixture();
+        let decoded: u64 = fixture.pack.bodies.iter().map(|body| body.byte_len).sum();
+        assert!(
+            decoded > 0,
+            "the fixture must carry bodies or this proves nothing"
+        );
+
+        let under = RepositoryTransferLimits::default().with_decoded_body_ceiling(decoded - 1);
+        let over = RepositoryTransferLimits::default().with_decoded_body_ceiling(decoded);
+
+        assert!(
+            validate_pack(&fixture.pack, &under).is_err(),
+            "a ceiling below the closure refuses"
+        );
+        validate_pack(&fixture.pack, &over)
+            .expect("the same pack passes once the ceiling reaches the closure");
+    }
+
+    /// The negotiation arm. A peer advertising less wins over a raised local
+    /// ceiling, because the effective bound is the smaller of the two.
+    ///
+    /// A host with headroom may raise what it accepts. It may not raise what
+    /// the other side can build or validate, and `bounded_by` is what keeps
+    /// those two facts from being confused.
+    #[test]
+    fn a_peer_advertising_less_beats_a_raised_local_ceiling() {
+        let fixture = fixture();
+        let decoded: u64 = fixture.pack.bodies.iter().map(|body| body.byte_len).sum();
+
+        let raised_local =
+            RepositoryTransferLimits::default().with_decoded_body_ceiling(decoded * 16);
+        let cautious_peer =
+            RepositoryTransferLimits::default().with_decoded_body_ceiling(decoded - 1);
+
+        let effective = raised_local.clone().bounded_by(&cautious_peer);
+        assert_eq!(
+            effective.max_decoded_body_bytes,
+            decoded - 1,
+            "the smaller of the two is what applies"
+        );
+        assert!(
+            validate_pack(&fixture.pack, &effective).is_err(),
+            "so the pack refuses even though this host would have taken it"
+        );
+        // And the control in the other direction: the local ceiling still binds
+        // when the peer is the generous one, or "minimum" would mean "peer".
+        let generous_peer =
+            RepositoryTransferLimits::default().with_decoded_body_ceiling(decoded * 64);
+        let cautious_local =
+            RepositoryTransferLimits::default().with_decoded_body_ceiling(decoded - 1);
+        assert_eq!(
+            cautious_local
+                .bounded_by(&generous_peer)
+                .max_decoded_body_bytes,
+            decoded - 1
+        );
+    }
+
+    /// The poisoned-CAS arm, which is 3b's reason to exist.
+    ///
+    /// An external body may be satisfied from the destination's own CAS rather
+    /// than carried in the pack. The bytes are LOADED and validated, so a CAS
+    /// entry that is not the object it claims to be is caught. A design that
+    /// skipped validation for a CAS-satisfied body would admit every failing
+    /// case below, which is why that design was refused.
+    #[test]
+    fn a_cas_satisfied_external_body_is_validated_not_trusted() {
+        let fixture = fixture();
+        let record = fixture.baseline_external_objects[0].clone();
+        let other = fixture
+            .baseline_external_objects
+            .iter()
+            .find(|candidate| candidate.body_hash != record.body_hash)
+            .expect("the baseline carries more than one external object")
+            .clone();
+
+        // A pack naming one external object and carrying NO body for it. The
+        // destination already holds that body from the shared baseline, which
+        // is the state this whole option exists to exploit.
+        let cas_satisfied = |external: Vec<ExternalObjectRecord>| {
+            let mut pack = fixture.pack.clone();
+            pack.external_objects = external;
+            pack.bodies = Vec::new();
+            pack.transfer_id = compute_transfer_id(&pack).unwrap();
+            pack
+        };
+
+        // The healthy CAS-satisfied path, first, or the failures below could be
+        // satisfied by a validator that refuses every absent body.
+        decode_and_validate_bodies(&cas_satisfied(vec![record.clone()]), &fixture.destination)
+            .expect("a body the destination already holds resolves and validates");
+
+        // The store will not let a substituted body in. Writing bytes that do
+        // not hash to the key is refused at the CAS itself:
+        //
+        //   immutable source blob digest mismatch for repo ...: requested <a>, found <b>
+        //
+        // So "a poisoned CAS entry" is not reachable through this API at all,
+        // and an arm that tried to build one would be testing the store rather
+        // than the receiver. Asserted here rather than dropped, because the
+        // fact that this is impossible is load-bearing for the design: it is
+        // why the remaining risk is a MISFILED record rather than a corrupted
+        // store, and the case below is that risk.
+        let refused = fixture
+            .destination
+            .save_source_blob(record.body_hash, b"not the object this claims to be")
+            .expect_err("the CAS verifies its own key on write");
+        assert!(
+            refused.to_string().contains("digest mismatch"),
+            "and says so: {refused}"
+        );
+
+        // The real risk, then. Claim the FIRST object's Git identity over
+        // the SECOND object's bytes. The declared length and the sha256 both
+        // agree with what the CAS holds, so only the Git-object recomputation
+        // can see it, and that is precisely the check a skip-validation design
+        // would have given up.
+        let mut mismatched = record.clone();
+        mismatched.body_hash = other.body_hash;
+        mismatched.body_len = other.body_len;
+        let error =
+            decode_and_validate_bodies(&cas_satisfied(vec![mismatched]), &fixture.destination)
+                .expect_err("a body filed under a Git identity that is not its own");
+        assert!(
+            error.to_string().contains("recomputes to"),
+            "the Git-object recomputation is what catches this: {error}"
+        );
+
+        // And a body in neither place still refuses, naming both.
+        let mut absent = record.clone();
+        absent.body_hash = digest(b"a body no store anywhere has ever held");
+        let error = decode_and_validate_bodies(&cas_satisfied(vec![absent]), &fixture.destination)
+            .expect_err("a body in neither the pack nor the CAS");
+        assert!(
+            error
+                .to_string()
+                .contains("absent from the pack and from the destination CAS"),
+            "and the refusal says it looked in both: {error}"
+        );
+    }
+
+    /// The healthy path, at zero refusals.
+    ///
+    /// Without this the four arms above are satisfied by a validator that
+    /// refuses everything.
+    #[test]
+    fn a_healthy_pack_passes_at_the_shipped_default_with_no_refusals() {
+        let fixture = fixture();
+        validate_pack(&fixture.pack, &RepositoryTransferLimits::default())
+            .expect("the fixture pack is valid at the shipped ceiling");
+        decode_and_validate_bodies(&fixture.pack, &fixture.destination)
+            .expect("and every external object validates against real bytes");
     }
 
     #[test]
@@ -3027,6 +3354,7 @@ mod tests {
             &fixture.main,
             actor.clone(),
             &fixture.pack,
+            &RepositoryTransferLimits::default(),
         )
         .unwrap();
         assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
@@ -3063,6 +3391,7 @@ mod tests {
             &fixture.main,
             actor,
             &fixture.pack,
+            &RepositoryTransferLimits::default(),
         )
         .unwrap();
         assert_eq!(
@@ -3080,6 +3409,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("different-authenticated-user"),
             &fixture.pack,
+            &RepositoryTransferLimits::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("different exact transaction"));
@@ -3121,7 +3451,8 @@ mod tests {
         let segment =
             build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
                 .unwrap();
-        validate_pack(&segment.pack).expect("the locally bounded exporter must build a valid pack");
+        validate_pack(&segment.pack, &RepositoryTransferLimits::default())
+            .expect("the locally bounded exporter must build a valid pack");
     }
 
     #[test]
@@ -3152,6 +3483,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("receiver"),
             &fixture.pack,
+            &RepositoryTransferLimits::default(),
         )
         .unwrap_err();
         assert!(
@@ -3317,7 +3649,7 @@ mod tests {
             .bodies
             .windows(2)
             .all(|pair| pair[0].hash < pair[1].hash));
-        validate_pack(&pack).unwrap();
+        validate_pack(&pack, &RepositoryTransferLimits::default()).unwrap();
 
         // Reordering bodies preserves every byte of transferred content but
         // changes the serialized pack, and with it the recomputed transfer
@@ -3327,7 +3659,7 @@ mod tests {
         permuted.bodies.reverse();
         permuted.transfer_id = compute_transfer_id(&permuted).unwrap();
         assert_ne!(permuted.transfer_id, pack.transfer_id);
-        let error = validate_pack(&permuted).unwrap_err();
+        let error = validate_pack(&permuted, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(
             error.to_string().contains("ascending"),
             "unexpected error: {error}"
@@ -3336,7 +3668,7 @@ mod tests {
         let mut duplicate = pack.clone();
         duplicate.bodies.push(pack.bodies[0].clone());
         duplicate.transfer_id = compute_transfer_id(&duplicate).unwrap();
-        let error = validate_pack(&duplicate).unwrap_err();
+        let error = validate_pack(&duplicate, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("duplicate source body"));
     }
 
@@ -3348,7 +3680,7 @@ mod tests {
         body_tamper.bodies[0].bytes_base64 = BASE64.encode(b"tampered");
         body_tamper.bodies[0].byte_len = 8;
         body_tamper.transfer_id = compute_transfer_id(&body_tamper).unwrap();
-        let error = validate_pack(&body_tamper).unwrap_err();
+        let error = validate_pack(&body_tamper, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("source body identity"));
 
         let mut tree_tamper = fixture.pack.clone();
@@ -3360,6 +3692,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("authenticated-user"),
             &tree_tamper,
+            &RepositoryTransferLimits::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("tree identity"));
@@ -3377,13 +3710,14 @@ mod tests {
         missing_parent.changes.remove(0);
         missing_parent.trees.remove(0);
         missing_parent.transfer_id = compute_transfer_id(&missing_parent).unwrap();
-        let error = validate_pack(&missing_parent).unwrap_err();
+        let error =
+            validate_pack(&missing_parent, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("before or without parent"));
 
         let mut duplicate = fixture.pack.clone();
         duplicate.changes.push(duplicate.changes[0].clone());
         duplicate.transfer_id = compute_transfer_id(&duplicate).unwrap();
-        let error = validate_pack(&duplicate).unwrap_err();
+        let error = validate_pack(&duplicate, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("duplicate semantic change"));
 
         let mut unknown_feature = fixture.pack.clone();
@@ -3391,7 +3725,8 @@ mod tests {
             .required_features
             .push("filesystem-fallback-v1".to_string());
         unknown_feature.transfer_id = compute_transfer_id(&unknown_feature).unwrap();
-        let error = validate_pack(&unknown_feature).unwrap_err();
+        let error =
+            validate_pack(&unknown_feature, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("unknown required"));
 
         let mut unknown_field = serde_json::to_value(&fixture.pack).unwrap();
@@ -3403,14 +3738,15 @@ mod tests {
 
         let mut unsupported_version = fixture.pack.clone();
         unsupported_version.schema_version += 1;
-        let error = validate_pack(&unsupported_version).unwrap_err();
+        let error =
+            validate_pack(&unsupported_version, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("unsupported schema version"));
 
         let mut oversized = fixture.pack.clone();
         oversized.changes = (0..=MAX_TRANSFER_CHANGES)
             .map(|_| fixture.pack.changes[0].clone())
             .collect();
-        let error = validate_pack(&oversized).unwrap_err();
+        let error = validate_pack(&oversized, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("exceeds limit"));
     }
 
@@ -3424,6 +3760,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("authenticated-user"),
             &fixture.pack,
+            &RepositoryTransferLimits::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("does not match receiver"));
@@ -3435,6 +3772,7 @@ mod tests {
             &wrong_ref,
             AuthorId::new("authenticated-user"),
             &fixture.pack,
+            &RepositoryTransferLimits::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("does not match route ref"));
@@ -3508,6 +3846,7 @@ mod tests {
             &fixture.main,
             AuthorId::new("authenticated-user"),
             &fixture.pack,
+            &RepositoryTransferLimits::default(),
         )
         .unwrap_err();
         assert!(error.to_string().contains("roots/generation moved"));

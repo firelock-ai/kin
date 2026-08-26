@@ -32,8 +32,8 @@ use crate::repository_transfer::{
     count_repository_transfer_packs, model, repository_transfer_status,
     require_negotiated_features, validate_limits, verify_transfer_source_readiness,
     RepositoryAuthorityMetadata, RepositoryRefAdvertisement, RepositoryTransferError,
-    RepositoryTransferExpectation, RepositoryTransferPack, RepositoryTransferReceipt,
-    RepositoryTransferStatus, Result, REPOSITORY_TRANSFER_PROTOCOL,
+    RepositoryTransferExpectation, RepositoryTransferLimits, RepositoryTransferPack,
+    RepositoryTransferReceipt, RepositoryTransferStatus, Result, REPOSITORY_TRANSFER_PROTOCOL,
     REPOSITORY_TRANSFER_SCHEMA_VERSION,
 };
 
@@ -863,12 +863,19 @@ where
         source_ref,
         destination_ref,
         |pack| {
+            // The compiled ceilings, deliberately. This convenience wrapper has
+            // no deployment configuration to consult and no production caller;
+            // the hosted receiver is the daemon's own route, which reads the
+            // configured value and passes it. A caller that wants a raised
+            // ceiling uses `pull_from_remote_with` and supplies an admit
+            // closure carrying its own limits.
             apply_repository_transfer_pack(
                 local,
                 repository_id,
                 destination_ref,
                 actor.clone(),
                 pack,
+                &RepositoryTransferLimits::default(),
             )
         },
     )
@@ -1264,6 +1271,7 @@ mod tests {
                 destination_ref,
                 self.actor.clone(),
                 pack,
+                &RepositoryTransferLimits::default(),
             )?;
             if self.forge_receipt {
                 receipt.transfer_id = Hash256::from_bytes([0xab; 32]);
