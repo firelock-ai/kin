@@ -1444,35 +1444,58 @@ mod tests {
     /// language-server sweep ran, and none in the eleven minutes after it was
     /// disabled.
     ///
-    /// Two arms, because below the floor the floor is still the right advice. A
-    /// fix that simply deleted the sentence would pass the first arm alone.
+    /// Five checks, and every one reports independently rather than aborting
+    /// the test at the first that fires. An `assert!` chain hides every later
+    /// arm behind the first failure, so a falsification grid built on one reads
+    /// whole rows as green that were never reached. Collecting the failures is
+    /// what makes each arm's status its own fact.
+    ///
+    /// The cramped arms are the control: below the floor the floor is still
+    /// exactly the right advice, so a fix that simply deleted the sentence
+    /// fails here rather than passing everything.
     #[test]
     fn a_machine_above_the_model_floor_is_not_told_to_reach_it() {
         let roomy = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(12 << 30, Some(27)))
             .expect("a kill during the pass is a memory diagnosis");
-        assert!(
-            !roomy.contains("give this machine at least"),
-            "a 12 GiB machine must not be told to reach 2.0 GiB: {roomy}"
-        );
-        assert!(
-            roomy.contains("KIN_DAEMON_DISABLE_LSP=1"),
-            "a machine above the floor is pointed at the other heavy resident: {roomy}"
-        );
-        assert!(
-            !roomy.contains("so the embed ran out of memory"),
-            "a container-wide kill counter does not say the embed was the consumer: {roomy}"
-        );
-
         let cramped = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(512 << 20, Some(1)))
             .expect("a kill under the floor is a memory diagnosis too");
-        assert!(
+
+        let mut failed: Vec<String> = Vec::new();
+        let mut check = |ok: bool, arm: &str, why: String| {
+            if !ok {
+                failed.push(format!("[{arm}] {why}"));
+            }
+        };
+
+        check(
+            !roomy.contains("give this machine at least"),
+            "roomy-no-floor",
+            format!("a 12 GiB machine must not be told to reach 2.0 GiB: {roomy}"),
+        );
+        check(
+            roomy.contains("KIN_DAEMON_DISABLE_LSP=1"),
+            "roomy-names-sweep",
+            format!("a machine above the floor is pointed at the other heavy resident: {roomy}"),
+        );
+        check(
+            !roomy.contains("so the embed ran out of memory"),
+            "cause-not-the-embed",
+            format!("a container-wide kill counter does not name the embed: {roomy}"),
+        );
+        check(
             cramped.contains("give this machine at least 2.0 GiB"),
-            "below the floor the floor is exactly the right advice: {cramped}"
+            "cramped-keeps-floor",
+            format!("below the floor the floor is exactly the right advice: {cramped}"),
         );
-        assert!(
+        check(
             !cramped.contains("KIN_DAEMON_DISABLE_LSP=1"),
-            "a machine that cannot hold the model at all is not a sweep problem: {cramped}"
+            "cramped-not-a-sweep-problem",
+            format!(
+                "a machine that cannot hold the model at all is not a sweep problem: {cramped}"
+            ),
         );
+
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 
     #[test]
