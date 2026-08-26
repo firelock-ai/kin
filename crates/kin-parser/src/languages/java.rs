@@ -474,6 +474,7 @@ fn extract_java_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileIm
                 let module_path = full_path[..dot_pos].to_string();
                 let local_name = full_path[dot_pos + 1..].to_string();
                 return Some(FileImport {
+                    site: crate::adapter::site_from_node(node),
                     module_path,
                     specifiers: vec![ImportedName {
                         local_name,
@@ -484,6 +485,7 @@ fn extract_java_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileIm
             } else {
                 // No dot — entire path is the name
                 return Some(FileImport {
+                    site: crate::adapter::site_from_node(node),
                     module_path: String::new(),
                     specifiers: vec![ImportedName {
                         local_name: full_path,

@@ -202,6 +202,7 @@ fn extract_hcl_block(
                 // Extract source attribute as an import
                 if let Some(source_val) = extract_block_attr(node, source, "source") {
                     imports.push(FileImport {
+                        site: crate::adapter::site_from_node(node),
                         module_path: source_val.clone(),
                         specifiers: vec![ImportedName {
                             local_name: mod_name.clone(),

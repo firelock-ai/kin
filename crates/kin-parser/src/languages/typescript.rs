@@ -778,6 +778,7 @@ fn extract_ts_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpo
     }
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers,
     })
@@ -814,6 +815,7 @@ fn extract_ts_export_source(node: &tree_sitter::Node, source: &[u8]) -> Option<F
     }
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers,
     })

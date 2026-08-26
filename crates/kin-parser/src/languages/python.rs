@@ -2028,6 +2028,7 @@ fn extract_py_imports(node: &tree_sitter::Node, source: &[u8]) -> Vec<FileImport
             None => (module_path.clone(), None),
         };
         out.push(FileImport {
+            site: crate::adapter::site_from_node(node),
             module_path,
             specifiers: vec![ImportedName {
                 local_name,
@@ -2088,6 +2089,7 @@ fn extract_py_from_import(node: &tree_sitter::Node, source: &[u8]) -> Option<Fil
     }
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers,
     })

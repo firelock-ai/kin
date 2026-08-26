@@ -791,6 +791,7 @@ fn extract_rust_use(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpor
                     .map(|node| node.utf8_text(source).unwrap_or("").to_string())
                     .unwrap_or_default();
                 return Some(FileImport {
+                    site: crate::adapter::site_from_node(node),
                     module_path,
                     specifiers: Vec::new(),
                 });
@@ -800,6 +801,7 @@ fn extract_rust_use(node: &tree_sitter::Node, source: &[u8]) -> Option<FileImpor
                 let name = child.utf8_text(source).unwrap_or("").to_string();
                 if !name.is_empty() {
                     return Some(FileImport {
+                        site: crate::adapter::site_from_node(node),
                         module_path: String::new(),
                         specifiers: vec![ImportedName {
                             local_name: name,
@@ -825,6 +827,7 @@ fn extract_scoped_identifier_import(node: &tree_sitter::Node, source: &[u8]) -> 
         return None;
     }
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers: vec![ImportedName {
             local_name,
@@ -857,6 +860,7 @@ fn extract_use_as_clause_import(node: &tree_sitter::Node, source: &[u8]) -> Opti
     }
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers: vec![ImportedName {
             local_name: alias,
@@ -922,6 +926,7 @@ fn extract_scoped_use_list_import(node: &tree_sitter::Node, source: &[u8]) -> Op
     }
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers,
     })
