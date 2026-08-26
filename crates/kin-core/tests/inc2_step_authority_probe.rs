@@ -992,3 +992,255 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
     );
     eprintln!("INC2 MERGE-STEP RESULT: a merge-headed step COMMITS over a step that never saw the side line");
 }
+
+/// Every object reachable from `root`, over an index built ONCE by the caller.
+///
+/// The same walk as [`reachable_from`], with the whole-closure `HashMap` lifted
+/// out. A planner derives one authority per step, so where that index is built
+/// decides whether the per-step cost is the step's own subset or the entire
+/// history. Measuring both is the only way to say which term dominates at a
+/// real repository's size, and the difference is a planner design decision
+/// rather than a micro-optimization.
+fn reachable_from_index<'a>(
+    by_id: &std::collections::HashMap<
+        kin_model::ExternalObjectId,
+        &'a kin_model::GitObjectClosureEntry,
+    >,
+    root: kin_model::ExternalObjectId,
+) -> Vec<kin_model::ExternalObjectRecord> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    let mut out = Vec::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let Some(entry) = by_id.get(&id) else {
+            continue;
+        };
+        out.push(entry.record.clone());
+        for dependency in &entry.dependencies {
+            stack.push(dependency.target);
+        }
+    }
+    out
+}
+
+/// What does a segmented bootstrap's PLANNING cost at a real repository's size?
+///
+/// The design names this unmeasured and names the risk precisely: a planner
+/// that walks the manifest once per step is quadratic in steps if each walk is
+/// linear in the whole closure. Everything measured before this ran on twelve
+/// synthetic commits, where every term is too small to separate.
+///
+/// This times the two things a planner does per step, the manifest walk and
+/// `from_raw_parts`, across a whole segmented plan, and prints the subset sizes
+/// beside them so a row can be read against the work it describes. The control
+/// is the single whole-history derivation increment 1 already does, which is
+/// what the segmented total has to be compared against rather than against
+/// zero.
+///
+/// `KIN_INC2_SCALE_REPO` points it at a real Git worktree, which is the only
+/// arm whose numbers say anything about a real repository's shape.
+/// `KIN_INC2_SCALE_COMMITS` and `KIN_INC2_SCALE_STEPS` size the synthetic arm.
+#[test]
+#[ignore = "scale measurement, not a guard: builds or imports a large history"]
+fn scale_of_the_manifest_walk_and_step_derivation() {
+    let steps: usize = std::env::var("KIN_INC2_SCALE_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    assert!(steps >= 2, "a segmented plan needs at least two steps");
+
+    let repository_id = hosted_shaped_id();
+    let source_root = tempfile::tempdir().unwrap();
+    let (working, fixture) = match std::env::var("KIN_INC2_SCALE_REPO") {
+        Ok(path) => {
+            let target = source_root.path().join("work");
+            git(
+                source_root.path(),
+                &[
+                    "clone",
+                    "--quiet",
+                    "--single-branch",
+                    &path,
+                    target.to_str().unwrap(),
+                ],
+            );
+            (target, format!("real repository at {path}"))
+        }
+        Err(_) => {
+            let commits: usize = std::env::var("KIN_INC2_SCALE_COMMITS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(400);
+            (
+                build_publisher(source_root.path(), commits),
+                format!("synthetic publisher of {commits} commits"),
+            )
+        }
+    };
+
+    let import_started = std::time::Instant::now();
+    let init = kin_core::init_from_git_adopting(&working, &repository_id).unwrap();
+    let import_seconds = import_started.elapsed().as_secs_f64();
+    let source = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+        .unwrap()
+        .open_manager()
+        .unwrap();
+
+    let (full, aliases, changes, default_ref) = {
+        let lease = source.read_authority();
+        let metadata = lease.metadata();
+        (
+            metadata
+                .git_external_authority
+                .clone()
+                .expect("Git-admitted"),
+            metadata.aliases.clone(),
+            lease
+                .snapshot()
+                .changes
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
+            metadata.ref_state.default_ref.clone().expect("default ref"),
+        )
+    };
+    let ordered = topological(&changes);
+    let closure_objects = full.closure.objects.len();
+    eprintln!(
+        "INC2 SCALE fixture: {fixture}\n\
+         INC2 SCALE imported: {} changes, {} closure objects, {} aliases in {:.1}s",
+        ordered.len(),
+        closure_objects,
+        aliases.len(),
+        import_seconds
+    );
+    assert!(
+        ordered.len() >= steps,
+        "a {steps}-step plan needs at least that many changes, got {}",
+        ordered.len()
+    );
+
+    let by_oid: std::collections::HashMap<_, _> = aliases
+        .iter()
+        .map(|alias| (alias.change_id, alias.oid))
+        .collect();
+    let by_id: std::collections::HashMap<_, _> = full
+        .closure
+        .objects
+        .iter()
+        .map(|entry| (entry.record.object, entry))
+        .collect();
+    let mut loader = ManagerBodyLoader(&source);
+
+    // The control the segmented total is compared against: one whole-history
+    // derivation, which is exactly what increment 1 does today.
+    let whole_started = std::time::Instant::now();
+    let whole = kin_model::GitExternalAuthority::from_raw_parts(
+        repository_id.clone(),
+        full.object_format,
+        full.raw_refs.clone(),
+        full.raw_head.clone(),
+        full.closure
+            .objects
+            .iter()
+            .map(|entry| entry.record.clone())
+            .collect(),
+        &mut loader,
+    )
+    .expect("the whole history derives");
+    let whole_ms = whole_started.elapsed().as_secs_f64() * 1000.0;
+    assert_eq!(
+        whole.closure.objects.len(),
+        closure_objects,
+        "the control must derive the same closure it was handed"
+    );
+
+    eprintln!("INC2 SCALE  step |   upto |  subset | walk ms | hoisted ms | derive ms");
+    let mut walk_total = 0.0_f64;
+    let mut hoisted_total = 0.0_f64;
+    let mut derive_total = 0.0_f64;
+    let mut subset_total = 0_usize;
+    let mut previous_subset = 0_usize;
+    let mut last_subset = 0_usize;
+    for step in 1..=steps {
+        let upto = ordered.len() * step / steps;
+        let head_oid = *by_oid
+            .get(&ordered[upto - 1].id)
+            .expect("every Git-origin change has an alias");
+        let head_object =
+            kin_model::ExternalObjectId::new(kin_model::ExternalObjectKind::Commit, head_oid);
+
+        let walk_started = std::time::Instant::now();
+        let subset = reachable_from(&full, head_object);
+        let walk_ms = walk_started.elapsed().as_secs_f64() * 1000.0;
+
+        let hoisted_started = std::time::Instant::now();
+        let hoisted = reachable_from_index(&by_id, head_object);
+        let hoisted_ms = hoisted_started.elapsed().as_secs_f64() * 1000.0;
+        assert_eq!(
+            hoisted.len(),
+            subset.len(),
+            "the hoisted index must walk to the same subset, or it measures a different thing"
+        );
+
+        let derive_started = std::time::Instant::now();
+        kin_model::GitExternalAuthority::from_raw_parts(
+            repository_id.clone(),
+            full.object_format,
+            vec![kin_model::GitRawRef {
+                name: default_ref.clone(),
+                target: kin_model::GitRawTarget::Direct {
+                    object: head_object,
+                },
+            }],
+            kin_model::GitRawTarget::Symbolic {
+                target: default_ref.clone(),
+            },
+            subset.clone(),
+            &mut loader,
+        )
+        .expect("a step authority derives from the manifest walk");
+        let derive_ms = derive_started.elapsed().as_secs_f64() * 1000.0;
+
+        eprintln!(
+            "INC2 SCALE  {step:>4} | {upto:>6} | {:>7} | {walk_ms:>7.1} | {hoisted_ms:>10.1} | {derive_ms:>9.1}",
+            subset.len()
+        );
+        assert!(
+            subset.len() > previous_subset,
+            "step {step} must reach more objects than step {}, or the plan is not advancing",
+            step - 1
+        );
+        previous_subset = subset.len();
+        last_subset = subset.len();
+        walk_total += walk_ms;
+        hoisted_total += hoisted_ms;
+        derive_total += derive_ms;
+        subset_total += subset.len();
+    }
+
+    assert_eq!(
+        last_subset, closure_objects,
+        "the last step must reach the whole closure, or the plan does not cover the history"
+    );
+
+    // Read the sum against the term it is supposed to describe before reading
+    // any row: a per-step table whose total does not reconcile is decoration.
+    let mean_subset = subset_total as f64 / steps as f64;
+    eprintln!(
+        "INC2 SCALE totals: walk {walk_total:.1} ms, hoisted {hoisted_total:.1} ms, \
+         derive {derive_total:.1} ms over {steps} steps\n\
+         INC2 SCALE control: one whole-history derivation {whole_ms:.1} ms over \
+         {closure_objects} objects\n\
+         INC2 SCALE shape: mean subset {mean_subset:.0} objects ({:.2} of the closure), \
+         segmented derive is {:.1}x the whole-history control\n\
+         INC2 SCALE per-object: whole {:.1} us/object, segmented derive {:.1} us/object-visited",
+        mean_subset / closure_objects as f64,
+        derive_total / whole_ms,
+        whole_ms * 1000.0 / closure_objects as f64,
+        derive_total * 1000.0 / subset_total as f64,
+    );
+}
