@@ -38,8 +38,8 @@ use crate::config::{
 };
 use crate::error::{KinError, Result};
 use crate::init::{
-    prepare_repository_layout_at, publish_repository_layout_linearized, GraphOwnedContent,
-    InitResult,
+    prepare_repository_layout_with_origin, publish_repository_layout_linearized, GraphOwnedContent,
+    InitResult, RepositoryIdentityOrigin,
 };
 use crate::init_progress::{PhaseProgress, GIT_ADMISSION_PHASES};
 use crate::layout::KinLayout;
@@ -177,18 +177,44 @@ impl AdmittedContentClosure for DivergedClosure {
 /// [`KinError::RepositoryPublishedButUncertain`] with the published repository
 /// left in place for recovery.
 pub fn init_from_git(working_dir: &Path) -> Result<InitResult> {
-    init_from_git_with_hook(working_dir, || {})
+    init_from_git_with_hook(working_dir, None, || {})
+}
+
+/// Admit one clean materialized Git worktree as a replica of a repository that
+/// already exists, adopting its identity instead of minting one.
+///
+/// Same admission as [`init_from_git`] in every other respect. It exists
+/// because every exact-transfer surface is identity-exact and none of them can
+/// be retargeted after the fact: `build_repository_transfer_segment` refuses a
+/// source authority whose repository differs from the destination's, and pack
+/// validation refuses a pack whose external-change aliases name a repository
+/// other than the pack header. Those aliases are stamped with this repository's
+/// identity as the Git history is imported, so a store meant to publish into an
+/// existing repository has to carry that repository's identity from the moment
+/// it is created.
+///
+/// # Errors
+///
+/// Every refusal [`init_from_git`] raises, plus an identity the local store
+/// cannot be keyed by. See [`crate::RepositoryIdentityOrigin::Adopted`].
+pub fn init_from_git_adopting(
+    working_dir: &Path,
+    repository_id: &RepositoryId,
+) -> Result<InitResult> {
+    init_from_git_with_hook(working_dir, Some(repository_id.clone()), || {})
 }
 
 fn init_from_git_with_hook(
     working_dir: &Path,
+    adopted: Option<RepositoryId>,
     before_final_source_proof: impl FnOnce(),
 ) -> Result<InitResult> {
-    init_from_git_with_hooks(working_dir, before_final_source_proof, || {})
+    init_from_git_with_hooks(working_dir, adopted, before_final_source_proof, || {})
 }
 
 fn init_from_git_with_hooks(
     working_dir: &Path,
+    adopted: Option<RepositoryId>,
     before_final_source_proof: impl FnOnce(),
     after_repository_publication: impl FnOnce(),
 ) -> Result<InitResult> {
@@ -222,7 +248,13 @@ fn init_from_git_with_hooks(
             .map_err(|error| git_boundary_error("admit this Git repository", error))?;
     }
 
-    let manifest = KinManifest::new();
+    let (manifest, identity_origin) = match &adopted {
+        Some(adopted) => (
+            KinManifest::adopting(adopted.as_str()),
+            RepositoryIdentityOrigin::Adopted,
+        ),
+        None => (KinManifest::new(), RepositoryIdentityOrigin::Minted),
+    };
     let repository_id = RepositoryId::new(manifest.repo_id.clone())
         .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
     // Claiming reaps every abandoned capture directory beside this one. The
@@ -360,7 +392,13 @@ fn init_from_git_with_hooks(
     progress.begin("stage repository layout");
     let mut prepared = {
         let _span = info_span!("kin.init.prepare_layout").entered();
-        prepare_repository_layout_at(&staging_dir, &final_kin_dir, config, manifest)?
+        prepare_repository_layout_with_origin(
+            &staging_dir,
+            &final_kin_dir,
+            config,
+            manifest,
+            identity_origin,
+        )?
     };
 
     progress.begin("copy Git objects");
@@ -1894,7 +1932,7 @@ mod tests {
         );
 
         let source_for_hook = source.clone();
-        let error = init_from_git_with_hook(&source, move || {
+        let error = init_from_git_with_hook(&source, None, move || {
             git(
                 &source_for_hook,
                 [
@@ -1945,7 +1983,7 @@ mod tests {
         std::fs::write(&global_config, "").unwrap();
 
         let mut ambient = None;
-        let result = init_from_git_with_hook(&source, || {
+        let result = init_from_git_with_hook(&source, None, || {
             ambient = Some(
                 crate::test_env::EnvVarGuard::new()
                     .with("GIT_CONFIG_NOSYSTEM", "1")
@@ -1980,6 +2018,7 @@ mod tests {
         let source_for_hook = source.clone();
         let error = init_from_git_with_hooks(
             &source,
+            None,
             || {},
             move || {
                 std::fs::write(source_for_hook.join("README.md"), b"raced source\n").unwrap();
@@ -2216,7 +2255,7 @@ mod tests {
         git(&source, ["commit", "-m", "private history"]);
 
         let staging_parent = root.path().to_path_buf();
-        let result = init_from_git_with_hook(&source, move || {
+        let result = init_from_git_with_hook(&source, None, move || {
             let staging = std::fs::read_dir(&staging_parent)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -2554,6 +2593,7 @@ mod tests {
         let published_kin_dir = source.join(".kin");
         let error = init_from_git_with_hooks(
             &source,
+            None,
             || {},
             move || remove_published_body(&published_kin_dir, opaque),
         )

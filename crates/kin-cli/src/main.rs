@@ -118,6 +118,17 @@ enum Command {
         /// that starts on it rather than left thin forever.
         #[arg(long = "no-enrich", default_value_t = false)]
         no_enrich: bool,
+        /// Adopt an existing repository's identity instead of minting a new one
+        ///
+        /// Use this when the store being created has to publish into a
+        /// repository that already exists, such as a hosted one that serves
+        /// transfer under an identity it already holds. Every exact-transfer
+        /// surface is identity-exact and none of them can be retargeted after
+        /// the fact, so a store that minted its own identity can never push
+        /// into that repository. Without this flag `kin init` mints a fresh
+        /// identity, which is right for a repository nothing else holds.
+        #[arg(long = "adopt-repository-id", value_name = "ID")]
+        adopt_repository_id: Option<String>,
     },
     /// Show coherent repository-v6 workspace status
     Status {
@@ -2625,7 +2636,8 @@ fn main() -> Result<()> {
                     path,
                     json,
                     no_enrich,
-                } => commands::init::run(path, json, no_enrich).await,
+                    adopt_repository_id,
+                } => commands::init::run(path, json, no_enrich, adopt_repository_id).await,
                 Command::Status { json, wait_quiesce } => {
                     commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await
                 }

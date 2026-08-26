@@ -1429,7 +1429,18 @@ fn fallback_shell() -> &'static str {
 }
 
 pub(crate) fn shell_rc(shell: &str) -> Result<PathBuf> {
-    let home = home_dir()?;
+    shell_rc_in(&home_dir()?, shell)
+}
+
+/// [`shell_rc`] against a home the caller already resolved.
+///
+/// The home is a parameter so that one plan cannot straddle two of them. Every
+/// path in an rc plan has to describe the same home, and the only way to
+/// guarantee that is to resolve it once and pass it down; resolving it again
+/// per path makes the plan's shape depend on whether anything moved `HOME` in
+/// between.
+pub(crate) fn shell_rc_in(home: &Path, shell: &str) -> Result<PathBuf> {
+    let home = home.to_path_buf();
     match shell {
         "zsh" => Ok(home.join(".zshrc")),
         "bash" => Ok(home.join(".bashrc")),
@@ -1525,10 +1536,15 @@ fn bash_login_rc_in(home: &Path) -> PathBuf {
 /// them, and the arms below mirror that function's exactly, including its
 /// treatment of an unrecognized shell as zsh.
 pub(crate) fn shell_path_rcs(shell: &str) -> Result<Vec<PathBuf>> {
-    let home = home_dir()?;
+    shell_path_rcs_in(&home_dir()?, shell)
+}
+
+/// [`shell_path_rcs`] against a home the caller already resolved. Same reason as
+/// [`shell_rc_in`].
+pub(crate) fn shell_path_rcs_in(home: &Path, shell: &str) -> Result<Vec<PathBuf>> {
     Ok(match shell {
-        "bash" => vec![home.join(".bashrc"), bash_login_rc_in(&home)],
-        "fish" | "powershell" => vec![shell_rc(shell)?],
+        "bash" => vec![home.join(".bashrc"), bash_login_rc_in(home)],
+        "fish" | "powershell" => vec![shell_rc_in(home, shell)?],
         _ => vec![home.join(".zshenv")],
     })
 }
@@ -2529,13 +2545,30 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
 /// PATH line a second time, because bash reads one or the other and never both
 /// unless the login file says so.
 fn rc_write_plan(shell_name: &str) -> Result<Vec<RcTarget>> {
-    let hook_rc = shell_rc(shell_name)?;
+    rc_write_plan_in(&home_dir()?, shell_name)
+}
+
+/// [`rc_write_plan`] against a home the caller already resolved.
+///
+/// The home is a PARAMETER, and that is the fix rather than a convenience. This
+/// function decides whether one file carries both blocks by comparing the hook
+/// path against each PATH path, and it used to resolve the home separately for
+/// each side. For fish and PowerShell those are the same expression, so they
+/// agreed and the plan was one target, until something moved `HOME` between the
+/// two reads: then the sides described different homes, the comparison failed,
+/// and the plan grew a second target pointing at a home the caller never asked
+/// about.
+///
+/// Taking the home as an argument makes that straddle unrepresentable rather
+/// than unlikely. A plan describes one home because it cannot describe two.
+fn rc_write_plan_in(home: &Path, shell_name: &str) -> Result<Vec<RcTarget>> {
+    let hook_rc = shell_rc_in(home, shell_name)?;
     let mut plan = vec![RcTarget {
         path: hook_rc.clone(),
         blocks: RcBlocks::HookOnly,
         seed_when_absent: None,
     }];
-    for path_rc in shell_path_rcs(shell_name)? {
+    for path_rc in shell_path_rcs_in(home, shell_name)? {
         if path_rc == hook_rc {
             plan[0].blocks = RcBlocks::HookAndPath;
             continue;
@@ -17911,10 +17944,27 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     /// interactive, so the two blocks go to two files: the PATH line where a
     /// script, a Makefile or an agent shelling out will read it, and the hook
     /// where it will not be injected into one.
+    /// Isolated and serial for the same reason as the fish case below it: this
+    /// resolves the home through `rc_write_plan`, which reads it twice, and a
+    /// sibling mutating `HOME` in between changes what the plan is about. zsh's
+    /// count survives that race because its two files differ by name whatever
+    /// the home is, so this was not the test that ejected anything; it is the
+    /// same read and it gets the same isolation rather than waiting to become
+    /// the next one.
     #[test]
+    #[serial]
     fn zsh_writes_its_path_line_where_a_non_interactive_shell_reads_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
         let plan = rc_write_plan("zsh").unwrap();
         assert_eq!(plan.len(), 2, "{plan:?}");
+        assert!(
+            plan.iter().all(|target| target.path.starts_with(&home)),
+            "every target must be about the home under test: {plan:?}"
+        );
 
         let hook = plan
             .iter()
@@ -17943,16 +17993,176 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
         );
     }
 
+    /// The defect, stated without a thread: two homes produce two targets.
+    ///
+    /// This is the shape `rc_write_plan` had. It resolved the home once for the
+    /// hook path and once for the PATH path, then folded them together when they
+    /// matched. For fish both sides were the same expression, so they matched,
+    /// unless the two reads saw different homes. Here the two homes are handed
+    /// in deliberately, so the failure is arithmetic rather than timing: the
+    /// paths differ, the fold does not happen, and a plan built that way carries
+    /// two entries for a shell that reads one file.
+    ///
+    /// Written this way on hostedauth's argument, and it replaced a ten-iteration
+    /// race loop at `--test-threads=16`. That loop could pass on a quiet machine
+    /// while the defect was fully present, which makes it a falsification that
+    /// cannot fail. This one cannot pass while the defect is present, and cannot
+    /// be constructed once it is gone, because `rc_write_plan_in` takes one home.
+    ///
+    /// `PROFILE` is unset and the test is serial because the home is not the
+    /// only input to the PowerShell arm: `shell_rc_in` prefers `PROFILE` over
+    /// the home it is handed, so on a runner that sets it both homes would
+    /// answer the same path and the assertion below would fail for a reason
+    /// that is not the defect. Pinning it is what makes this a statement about
+    /// the home rather than about the machine.
+    #[test]
+    #[serial]
+    fn two_homes_would_have_produced_two_targets_for_a_one_file_shell() {
+        let _profile = EnvVarGuard::unset("PROFILE");
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("home-a");
+        let second = tmp.path().join("home-b");
+
+        for shell in ["fish", "powershell"] {
+            let hook = shell_rc_in(&first, shell).unwrap();
+            let path = shell_rc_in(&second, shell).unwrap();
+            assert_ne!(
+                hook, path,
+                "{shell}: two homes must give two paths, or this proves nothing"
+            );
+            // The fold in `rc_write_plan_in` is exactly `path_rc == hook_rc`.
+            // With two homes it is false, so the second path becomes a second
+            // target: the plan the queue saw.
+            assert_eq!(
+                usize::from(hook != path) + 1,
+                2,
+                "{shell}: this is the count the merge-group runners reported"
+            );
+        }
+    }
+
+    /// The property the defect rested on: a home read is a read, every time.
+    ///
+    /// `home_dir` calls `resolve_home_dir` with a live `env::var_os` closure and
+    /// a freshly built `BaseDirs`, so it caches nothing and answers from the
+    /// environment as it stands at the call. Two reads can therefore see two
+    /// homes, which is what made the fold above fail. Asserted directly, because
+    /// the whole argument rests on it and a cached read would quietly make the
+    /// defect impossible for a reason nobody wrote down.
+    #[test]
+    #[serial]
+    fn a_home_read_answers_from_the_environment_at_the_time_of_the_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("first");
+        let second = tmp.path().join("second");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+
+        let seen_first = {
+            let _home = EnvVarGuard::set("HOME", &first);
+            home_dir().unwrap()
+        };
+        let seen_second = {
+            let _home = EnvVarGuard::set("HOME", &second);
+            home_dir().unwrap()
+        };
+        assert_ne!(
+            seen_first, seen_second,
+            "two reads across a moved HOME must differ, or the straddle this \
+             ticket is about could never have happened"
+        );
+        assert!(seen_first.starts_with(&first) && seen_second.starts_with(&second));
+    }
+
+    /// And the fix: one home in, one home throughout.
+    ///
+    /// The counterpart to the two-homes case above. Whatever home this is given,
+    /// a one-file shell gets exactly one target and it is under that home. There
+    /// is no second home to disagree with, which is the difference between a
+    /// defect made unlikely and one made unrepresentable.
+    ///
+    /// `PROFILE` is unset for the same reason as its counterpart above: with it
+    /// set, the PowerShell arm correctly answers a path outside the home, and
+    /// "every path is under the home given" would be the wrong assertion rather
+    /// than a flaky one.
+    #[test]
+    #[serial]
+    fn a_plan_describes_the_one_home_it_was_given() {
+        let _profile = EnvVarGuard::unset("PROFILE");
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["home-a", "home-b"] {
+            let home = tmp.path().join(name);
+            fs::create_dir_all(home.join(".config/fish")).unwrap();
+            fs::write(home.join(".config/fish/config.fish"), "# existing\n").unwrap();
+            for shell in ["fish", "powershell"] {
+                let plan = rc_write_plan_in(&home, shell).unwrap();
+                assert_eq!(plan.len(), 1, "{shell} in {name}: {plan:?}");
+                assert!(
+                    plan.iter().all(|target| target.path.starts_with(&home)),
+                    "{shell} in {name}: every path is about the home given: {plan:?}"
+                );
+            }
+            let zsh = rc_write_plan_in(&home, "zsh").unwrap();
+            assert_eq!(zsh.len(), 2, "zsh in {name}: {zsh:?}");
+            assert!(
+                zsh.iter().all(|target| target.path.starts_with(&home)),
+                "zsh in {name}: both files are about the home given: {zsh:?}"
+            );
+        }
+    }
+
     /// fish and PowerShell read one file for both, and splitting them there
     /// would write a second block nothing reads.
+    ///
+    /// Isolated from the machine's real home, and `#[serial]`, because both
+    /// mattered and neither was here. `rc_write_plan` resolves the home TWICE,
+    /// once for the hook file and once inside `shell_path_rcs`, and compares the
+    /// two paths to decide whether one file carries both blocks. So a sibling
+    /// test mutating `HOME` between those two reads makes the paths differ and
+    /// the plan grow to two, and on a runner whose real home already holds
+    /// `~/.config/fish/config.fish` the extra entry is that real file sitting
+    /// beside a temporary one. The count then depended on which runner image the
+    /// job landed on and on which tests happened to interleave, so this passed or
+    /// failed by environment rather than by the code, and it ejected two entries
+    /// from the merge queue before anyone read the merge-group log.
+    ///
+    /// `PROFILE` is unset because `shell_rc("powershell")` prefers it over the
+    /// home, and a runner that sets it would put the plan outside the home under
+    /// test.
     #[test]
+    #[serial]
     fn a_shell_that_reads_one_file_still_gets_one_plan() {
-        for shell in ["fish", "powershell"] {
-            let plan = rc_write_plan(shell).unwrap();
-            assert_eq!(plan.len(), 1, "{shell}: {plan:?}");
-            assert_eq!(plan[0].blocks, RcBlocks::HookAndPath, "{shell}");
-            assert_eq!(plan[0].path, shell_rc(shell).unwrap(), "{shell}");
-            assert!(plan[0].seed_when_absent.is_none(), "{shell}");
+        // Both arms, because the file's existence is the thing the runner
+        // differs on: a home that already carries the fish rc, and one that does
+        // not. Neither may change the count, and both must stay inside the home
+        // under test.
+        for rc_exists in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            if rc_exists {
+                fs::create_dir_all(home.join(".config/fish")).unwrap();
+                fs::write(home.join(".config/fish/config.fish"), "# existing\n").unwrap();
+            }
+            let _home = EnvVarGuard::set("HOME", &home);
+            let _xdg = EnvVarGuard::unset("XDG_CONFIG_HOME");
+            let _profile = EnvVarGuard::unset("PROFILE");
+
+            for shell in ["fish", "powershell"] {
+                let plan = rc_write_plan(shell).unwrap();
+                assert_eq!(plan.len(), 1, "{shell} (rc_exists={rc_exists}): {plan:?}");
+                assert_eq!(plan[0].blocks, RcBlocks::HookAndPath, "{shell}");
+                assert_eq!(plan[0].path, shell_rc(shell).unwrap(), "{shell}");
+                assert!(plan[0].seed_when_absent.is_none(), "{shell}");
+                // The assertion that makes this runner-independent. Without it
+                // the three above hold against the machine's real home just as
+                // well as against this one.
+                assert!(
+                    plan[0].path.starts_with(&home),
+                    "{shell}: the plan must be about the home under test rather \
+                     than the machine's: {plan:?}"
+                );
+            }
         }
     }
 

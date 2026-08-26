@@ -41,6 +41,12 @@ ARG KIN_DB_REF=main
 ARG KIN_BUILD_GIT_SHA=""
 ARG KIN_BUILD_DIRTY=""
 ARG KIN_BUILD_BRANCH=""
+# The hosted image links its release profile with the LTO mode the build passes in,
+# because the fat link of kin-daemon exceeds the 8 GB the trigger's machine carries and
+# the only larger Cloud Build machine type is quota-blocked for this project. The
+# default stays fat so every other consumer of this Dockerfile is unchanged.
+ARG KIN_LTO=fat
+ENV CARGO_PROFILE_RELEASE_LTO=$KIN_LTO
 
 # Cargo will fetch the pinned kin-db dependency from Cargo.lock.
 WORKDIR /build
