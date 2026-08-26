@@ -1281,6 +1281,12 @@ async fn handle_tools_call_daemon(
     // and a set that is not whole, and nothing in the payload can tell the two
     // apart.
     base_env = base_env.with_relation_census_loss(daemon_delegate::relation_census_hold().as_ref());
+    // Stamped on every answer for the same reason as the three above, and it
+    // qualifies the same kind of answer the census-loss flag does: one that came
+    // back looking complete. A sweep that offered relations the graph does not
+    // hold leaves an absence an agent may certify, and nothing in the payload
+    // distinguishes it from an absence that is simply true.
+    base_env = base_env.with_enrichment_shortfall(daemon_delegate::enrichment_shortfall().as_ref());
 
     // `kin_graph_status` already reports the exact graph view selected by the
     // daemon, including temporal-session scope. Generic `/health` is HEAD-only:
@@ -1322,7 +1328,7 @@ fn envelope_for_delegate_error(
     error: &str,
     record: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Envelope {
-    if daemon_delegate::is_daemon_exited_error(error) {
+    if daemon_delegate::is_daemon_loss_error(error) {
         Envelope::daemon_unreachable().with_recorded_daemon_kill(record)
     } else {
         Envelope::daemon()
@@ -3037,6 +3043,71 @@ mod tests {
             calls.lock().unwrap().is_empty(),
             "the binder must not run while the startup binding already bound"
         );
+    }
+
+    /// Every daemon-loss message the delegate mints must go out stamped unreachable.
+    ///
+    /// The endpoints were each guarded and the join between them was not. The delegate
+    /// mints three messages for a daemon that stopped answering; the classifier keyed on
+    /// one prefix; and the third, a connection that broke while it was carrying the
+    /// request, went out with an empty `degraded` object, which a client reads as a live
+    /// daemon. That shape is what an OOM kill mid-answer looks like from here and it is
+    /// the first error a caller meets.
+    ///
+    /// So the cases are BUILT from the delegate's own constructors rather than written out
+    /// again as strings. A fourth shape, or a reworded prefix, has to be handled here
+    /// rather than merely matched, which is the whole difference between this test and two
+    /// correct tests that jointly guard nothing.
+    #[test]
+    fn every_daemon_loss_message_the_delegate_mints_is_stamped_unreachable() {
+        let record = kin_daemon_spawn::DaemonKillRecord {
+            kills: 4,
+            memory_kills: 4,
+            first_unix: 4_320,
+            last_unix: 4_800,
+            last_pid: Some(41),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(12 * 1024 * 1024 * 1024),
+            last_rss_bytes: None,
+        };
+        for record in [None, Some(&record)] {
+            let minted = [
+                daemon_delegate::revival_failed_message(
+                    "tool semantic_locate",
+                    "http://127.0.0.1:42231",
+                    "error sending request",
+                    "daemon exited during startup with status signal: 9 (SIGKILL)",
+                    record,
+                ),
+                daemon_delegate::revived_retry_failed_message(
+                    "tool semantic_locate",
+                    "http://127.0.0.1:42232",
+                    "timed out",
+                    record,
+                ),
+                daemon_delegate::transport_dropped_message(
+                    "MCP tool call",
+                    "error sending request for url (http://127.0.0.1:42231/mcp/tools/call)",
+                    record,
+                ),
+            ];
+            for message in minted {
+                assert_eq!(
+                    envelope_for_delegate_error(&message, record)
+                        .degraded
+                        .daemon_unreachable,
+                    Some(true),
+                    "a daemon-loss message went out reading as a live daemon: {message}"
+                );
+            }
+        }
+
+        // The control that has to stay silent. A live daemon refusing a call has not
+        // become unreachable, and a flag set on everything says nothing.
+        let ordinary = envelope_for_delegate_error("no entity named `HTTPAdapter.send`", None);
+        assert_eq!(ordinary.degraded.daemon_unreachable, None);
     }
 
     /// The dead-daemon error is the shape that never set a degraded flag, and a

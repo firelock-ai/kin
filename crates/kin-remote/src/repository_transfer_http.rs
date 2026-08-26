@@ -33,7 +33,39 @@ use crate::repository_transfer_negotiation::RepositoryTransferTransport;
 /// much. Leaving the read side on the HTTP client's implicit 10 MiB default
 /// would cap a pull well below the packs a peer is willing to export, and
 /// would report a body this replica declined to read as a remote failure.
-pub const REPOSITORY_TRANSFER_HTTP_BODY_LIMIT: usize = 24 * 1024 * 1024;
+pub const REPOSITORY_TRANSFER_HTTP_BODY_LIMIT: usize =
+    http_body_limit_for(crate::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES);
+
+/// Room for everything in a pack envelope that is not a body.
+///
+/// Changes, trees, external-object records, aliases, refs, roots and the JSON
+/// scaffolding around all of it. Generous on purpose: the wire cap is an outer
+/// backstop and the refusal a client should actually see is `validate_pack`
+/// naming the decoded ceiling, so this only has to be large enough that the 413
+/// never fires first.
+const TRANSFER_ENVELOPE_HEADROOM: usize = 8 * 1024 * 1024;
+
+/// The wire cap that lets a pack at `decoded_ceiling` actually arrive.
+///
+/// **Bodies travel base64.** `SourceBody` stores `bytes_base64`, so a decoded
+/// closure of N bytes is ceil(N/3)*4 on the wire before the envelope around it.
+/// Raising the decoded ceiling without raising this is invisible: the pack never
+/// reaches `validate_pack`, so every client sees a bare 413 instead of the named
+/// refusal that says which bound applied and which knob moves it.
+///
+/// That was live in this change's own first draft. The decoded ceiling moved to
+/// 64 MiB, about 86 MiB encoded, against a wire cap of 24 MiB, so the raise
+/// could not be reached from any client at all.
+///
+/// The derivation IS the fix rather than a second constant, because two numbers
+/// that must agree and are written down separately are two numbers that will
+/// disagree. A deployment that raises the decoded ceiling gets a wire cap that
+/// moves with it.
+#[must_use]
+pub const fn http_body_limit_for(decoded_ceiling: u64) -> usize {
+    let encoded = decoded_ceiling.div_ceil(3) * 4;
+    (encoded as usize) + TRANSFER_ENVELOPE_HEADROOM
+}
 
 /// Where a peer replica serves its transfer seam.
 #[derive(Clone)]
@@ -402,6 +434,31 @@ mod tests {
         let value: serde_json::Value =
             read_json(json_response(payload), "transfer export").expect("a body under the bound");
         assert_eq!(value["value"].as_str().unwrap().len(), 11 * 1024 * 1024);
+    }
+
+    /// The wire cap has to sit above the ENCODED size of the decoded ceiling,
+    /// or the raise is invisible and every client sees a bare 413.
+    #[test]
+    fn the_wire_cap_sits_above_the_encoded_size_of_the_decoded_ceiling() {
+        for decoded in [
+            crate::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES,
+            16 * 1024 * 1024,
+            256 * 1024 * 1024,
+        ] {
+            let encoded = decoded.div_ceil(3) * 4;
+            let cap = http_body_limit_for(decoded) as u64;
+            assert!(
+                cap > encoded,
+                "a {decoded}-byte decoded ceiling encodes to {encoded} and the wire cap is \
+                 {cap}, so validate_pack would never see the pack and the client would get a \
+                 bare 413 instead of the named refusal"
+            );
+        }
+        assert!(
+            REPOSITORY_TRANSFER_HTTP_BODY_LIMIT as u64
+                > crate::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES.div_ceil(3) * 4,
+            "the shipped wire cap must clear the shipped decoded ceiling once encoded"
+        );
     }
 
     #[test]

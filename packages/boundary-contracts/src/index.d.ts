@@ -499,7 +499,7 @@ export interface RepositoryTransferLimits {
 }
 
 export interface RepositoryTransferStatus {
-  schema_version: 2;
+  schema_version: 3;
   protocol: "kin-repository-v6-fast-forward";
   repository_id: string;
   destination_ref: RepositoryTransferRefName;
@@ -523,7 +523,7 @@ export interface RepositoryTransferBody {
 }
 
 export interface RepositoryTransferPack {
-  schema_version: 2;
+  schema_version: 3;
   protocol: "kin-repository-v6-fast-forward";
   transfer_id: string;
   operation_id: string;
@@ -545,6 +545,13 @@ export interface RepositoryTransferPack {
   expected_destination_default_ref: RepositoryTransferRefName | null;
   source_git_authority_hash: string | null;
   expected_destination_git_authority_hash: string | null;
+  /**
+   * The imported-Git authority this pack ESTABLISHES on a destination that has
+   * none. Present only for a bootstrap, which is the one case where the two
+   * replicas' Git authority may differ; `null` on every ordinary fast-forward,
+   * where the two hashes above must already be equal.
+   */
+  git_authority_bootstrap: Record<string, unknown> | null;
   required_features: string[];
   changes: Record<string, unknown>[];
   trees: Array<{ change_id: string; tree_hash: string }>;
@@ -554,7 +561,7 @@ export interface RepositoryTransferPack {
 }
 
 export interface RepositoryTransferReceipt {
-  schema_version: 2;
+  schema_version: 3;
   protocol: "kin-repository-v6-fast-forward";
   transfer_id: string;
   repository_id: string;

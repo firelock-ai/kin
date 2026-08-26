@@ -1187,6 +1187,25 @@ pub struct DaemonState {
     /// `None` = local repository-v6 authority.
     /// `Some` = hosted StorageBackend (GCS or an isolated backend fixture).
     pub storage_backend: Option<Arc<dyn StorageBackend>>,
+    /// Whether the backend this daemon opened against already holds a
+    /// repository-authority envelope.
+    ///
+    /// Captured at open from the loaded snapshot, because it cannot be read
+    /// back cheaply later: `load_snapshot_authority` defaults to pulling the
+    /// whole object, and the periodic flush is not a place to download the
+    /// graph. Captured rather than recomputed is also correct rather than
+    /// merely cheap: nothing this daemon can do creates an envelope, since
+    /// `record_repository_authority_commit` refuses a storage-backend daemon
+    /// outright, so the only way one appears is a transfer, and a transfer
+    /// advances the generation the daemon's CAS is pinned to.
+    hosted_authority_envelope: bool,
+    /// How many flushes have been refused the backend authority write.
+    ///
+    /// Exists so the healthy path can assert zero rather than merely not
+    /// asserting anything: a guard that fires where it should not is invisible
+    /// from the outside, because a refused flush and a flush with nothing to do
+    /// both return `Ok` and both leave the object alone.
+    hosted_authority_flush_refusals: AtomicU64,
     /// Startup-opened local storage capability. Reusing this exact backend
     /// preserves KinDB's device/inode root pin across every local authority
     /// request; constructing a new backend from the mutable path would bless a
@@ -2537,6 +2556,8 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
+            hosted_authority_envelope: false,
+            hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: Some(local_repository_backend),
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
@@ -2668,11 +2689,19 @@ impl DaemonState {
         allowed_repo_ids: Option<HashSet<String>>,
     ) -> Result<Self> {
         let text_index_path = layout.text_index_dir();
-        let (graph, generation, loaded_snapshot) =
+        let (graph, generation, loaded_snapshot, hosted_authority_envelope) =
             match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
                 .map_err(DaemonError::from)?
             {
                 Some(recovered) => {
+                    // Read before the move: `from_snapshot_with_text_index`
+                    // discards this field by design, because the envelope is
+                    // owned by the publication manager and never by the
+                    // in-place mutable graph. This is the last point at which
+                    // the daemon can see whether the object it opened is one
+                    // an envelope-free write would erase.
+                    let hosted_authority_envelope =
+                        recovered.snapshot.repository_authority.is_some();
                     let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
                         recovered.snapshot,
                         text_index_path.clone(),
@@ -2682,9 +2711,15 @@ impl DaemonState {
                         repo_id,
                         generation = recovered.generation,
                         deltas_replayed = recovered.deltas_applied,
+                        hosted_authority_envelope,
                         "loaded graph from storage backend"
                     );
-                    (Arc::new(g), recovered.generation, true)
+                    (
+                        Arc::new(g),
+                        recovered.generation,
+                        true,
+                        hosted_authority_envelope,
+                    )
                 }
                 None => {
                     info!(repo_id, "no snapshot found, starting with empty graph");
@@ -2696,6 +2731,7 @@ impl DaemonState {
                         )),
                         0,
                         true,
+                        false,
                     )
                 }
             };
@@ -2773,6 +2809,8 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
+            hosted_authority_envelope,
+            hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: None,
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
@@ -4212,6 +4250,13 @@ impl DaemonState {
         self.save_snapshot_impl(SnapshotSaveMode::Incremental)
     }
 
+    /// How many flushes this daemon has refused the backend authority write.
+    ///
+    /// Zero is the assertion that matters on a healthy path.
+    pub fn hosted_authority_flush_refusals(&self) -> u64 {
+        self.hosted_authority_flush_refusals.load(Ordering::SeqCst)
+    }
+
     pub fn save_snapshot_full(&self) -> Result<()> {
         self.save_snapshot_impl(SnapshotSaveMode::Full)
     }
@@ -4750,7 +4795,55 @@ impl DaemonState {
         let mut committed = false;
 
         let new_gen = if let Some(backend) = &self.storage_backend {
-            if force_full
+            if self.hosted_authority_envelope {
+                // The derived flush must never write this backend's authority
+                // object, and this is the one place all four callers reach:
+                // the periodic loop, the shutdown flush, the pre-idle flush and
+                // the LSP sweep. Guarding the wall-clock trigger instead would
+                // leave the other three writing.
+                //
+                // Both backend writes are barred here, for two different
+                // reasons that happen to land on the same branch. A full
+                // snapshot is serialized from the in-place mutable graph, which
+                // does not own the authority envelope and writes an explicit
+                // null in its place, so committing one erases refs, receipts,
+                // workspaces, aliases and admission state. An incremental delta
+                // is barred by the format's own rule: once the envelope is
+                // present, every root moves only through a full repository
+                // transaction, and a storage-backend daemon cannot run one
+                // because `record_repository_authority_commit` refuses it.
+                //
+                // So there is nothing here this daemon is entitled to commit,
+                // and the honest flush is the local half. The text index is
+                // derived from the live graph and rebuildable from it, which is
+                // why it can be made durable without an authority commit
+                // behind it.
+                //
+                // Deliberately not a graph-persistence epoch. Detaching a batch
+                // and completing it would acknowledge work no durable object
+                // holds, and the next open would come back without it. That is
+                // the exact failure the local arm below documents having made
+                // once already, and it is worse than not flushing, because it
+                // is silent.
+                self.graph.flush_text_index().map_err(DaemonError::from)?;
+                let refusals = self
+                    .hosted_authority_flush_refusals
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1;
+                debug!(
+                    repo_id,
+                    generation = expected_gen,
+                    refusals,
+                    "flushed derived text index only; the backend authority envelope is not this daemon's to rewrite"
+                );
+                // Deliberately `Ok`, not an error. The periodic loop marks the
+                // state clean on success and only then stops flushing until the
+                // next mutation; an error would instead climb
+                // `consecutive_failures`, back off, and log "persistence
+                // unhealthy" on a daemon behaving exactly as designed. A
+                // refusal that is normal must not be reported as a fault.
+                expected_gen
+            } else if force_full
                 || expected_gen == kin_db::GENERATION_INIT
                 || self.graph.full_snapshot_required()
                 || !backend.supports_incremental_deltas()

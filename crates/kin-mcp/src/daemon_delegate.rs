@@ -535,6 +535,14 @@ fn mcp_spawn_plan(
 /// needs a corrected call.
 pub const DAEMON_EXITED_RESTART_REQUIRED: &str = "repo daemon exited; restart required";
 
+/// The prefix for a daemon that stopped answering in the middle of a call.
+///
+/// It exists for the same reason the one above does: the envelope boundary has only the
+/// message to go on, and it has to be able to tell daemon loss from a live daemon refusing
+/// a call. The text it replaces opened `daemon <operation> failed:` and then handed the
+/// caller a bare transport URL, which named neither the daemon nor the cause.
+pub const DAEMON_STOPPED_MID_REQUEST: &str = "repo daemon stopped answering mid-request";
+
 /// Marker inside a revival error meaning the replacement daemon is alive and
 /// still loading, rather than dead.
 ///
@@ -594,6 +602,16 @@ pub(crate) fn relation_census_hold() -> Option<kin_core::relation_census::Census
     kin_core::relation_census::CensusHold::read(&discover_kin_dir()?)
 }
 
+/// What this store's last enrichment sweep could not publish.
+///
+/// Read fresh on every call for the reason the others are: the record is
+/// retired by the next sweep that comes out clean, and a server that cached it
+/// would keep telling agents the graph was short of edges after a later pass
+/// had filled them.
+pub(crate) fn enrichment_shortfall() -> Option<kin_daemon_spawn::RefusedEnrichment> {
+    kin_daemon_spawn::RefusedEnrichment::read(&discover_kin_dir()?)
+}
+
 /// The recorded cause and a remediation the caller can perform, ready to append
 /// to an error about a daemon that stopped answering.
 ///
@@ -625,7 +643,7 @@ fn daemon_gone_advice(record: Option<&kin_daemon_spawn::DaemonKillRecord>) -> St
 }
 
 /// The message for a daemon that stopped answering and could not be replaced.
-fn revival_failed_message(
+pub(crate) fn revival_failed_message(
     operation: &str,
     daemon_url: &str,
     first_err: &str,
@@ -640,7 +658,7 @@ fn revival_failed_message(
 }
 
 /// The message for a replacement daemon that started and still could not answer.
-fn revived_retry_failed_message(
+pub(crate) fn revived_retry_failed_message(
     operation: &str,
     new_url: &str,
     detail: &str,
@@ -654,13 +672,13 @@ fn revived_retry_failed_message(
 }
 
 /// The message for a connection that broke while it was carrying a request.
-fn transport_dropped_message(
+pub(crate) fn transport_dropped_message(
     operation: &str,
     error: &str,
     record: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> String {
     format!(
-        "daemon {operation} failed: {error}{}",
+        "{DAEMON_STOPPED_MID_REQUEST}: {operation}: {error}{}",
         recorded_kill_detail(record)
     )
 }
@@ -673,6 +691,19 @@ fn transport_dropped_message(
 /// over an ordinary tool error is wasted work.
 pub fn is_daemon_exited_error(message: &str) -> bool {
     message.starts_with(DAEMON_EXITED_RESTART_REQUIRED)
+}
+
+/// Did this delegate error mean the daemon stopped answering, by any of the routes?
+///
+/// [`is_daemon_exited_error`] answers a narrower question, the one a caller deciding
+/// whether to restart wants: the revival was attempted and is spent. The envelope wants
+/// the wider one, because `daemon_unreachable` absent reads to a client as a live daemon,
+/// and a connection that broke while it was carrying the request is not a live daemon. It
+/// is what a daemon killed mid-answer looks like from here, it is the first error a caller
+/// meets when the kernel takes the daemon out, and keying the flag on the narrow predicate
+/// sent exactly that shape out looking healthy.
+pub fn is_daemon_loss_error(message: &str) -> bool {
+    is_daemon_exited_error(message) || message.starts_with(DAEMON_STOPPED_MID_REQUEST)
 }
 
 /// Bearer token the daemon expects on non-public routes.
@@ -4541,8 +4572,8 @@ mod tests {
                 "error sending request for url (http://127.0.0.1:42231/mcp/tools/call)",
                 None,
             ),
-            "daemon MCP tool call failed: error sending request for url \
-             (http://127.0.0.1:42231/mcp/tools/call)"
+            "repo daemon stopped answering mid-request: MCP tool call: error sending \
+             request for url (http://127.0.0.1:42231/mcp/tools/call)"
         );
     }
 

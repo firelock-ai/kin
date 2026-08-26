@@ -650,7 +650,12 @@ const DEFERRED_CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(300);
 /// Runs under the persistence task's own shutdown budget
 /// (`KIN_DAEMON_SHUTDOWN_FLUSH_SECS`, five minutes by default), which exists
 /// because the graph flush here can need minutes on a real store.
-async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
+/// Visible to the crate so the authority-envelope guard can be exercised
+/// through this caller as well as the periodic one. The invariant it protects
+/// is stated regardless of caller, and four callers reach the same write, so a
+/// test that only ever drives the periodic path proves the guard is positioned
+/// correctly by inspection rather than by behaviour.
+pub(crate) async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
     if state.is_dirty() {
         if state.shutdown_flush_would_wipe_graph() {
             // The in-memory graph collapsed to a small fraction of the last
@@ -2297,8 +2302,22 @@ fn decide_sweep_on_start(state: &DaemonState) -> SweepStartDecision {
 /// to publish: a file that yielded no relations has nothing that can be lost, so
 /// re-sweeping it forever would be waste rather than safety. Everything else
 /// stays unmarked and is swept again.
-fn sweep_marker_is_durable(total_relations: usize, published: bool) -> bool {
-    total_relations == 0 || published
+///
+/// Losing a relation is the third case, and it used to be invisible here.
+/// `published` says the snapshot reached disk, not that every relation the
+/// sweep offered reached the graph, and marking a file enriched is what stops
+/// it ever being swept again: `file_already_enriched` skips it from then on. So
+/// a pass that offered a relation the graph does not hold and then saved
+/// cleanly would have written off the loss permanently, with the marker
+/// asserting the file was done.
+///
+/// This is the repair. There is nothing to fix in place, because the pass
+/// cannot know why the graph declined; what it can do is decline to say the
+/// file is finished, so the next sweep offers those relations again. A sweep
+/// that lost nothing marks and moves on, and one that lost something leaves the
+/// work where the next pass will find it.
+fn sweep_marker_is_durable(written: EnrichmentWrite, published: bool) -> bool {
+    written.lost() == 0 && (written.published == 0 || published)
 }
 
 /// How long a cold sweep waits for the embedding backfill before starting
@@ -2956,6 +2975,61 @@ const ENRICHMENT_WRITE_BATCH: usize = 256;
 /// accumulated a whole file, or a whole sweep, would hold a structure whose
 /// size is a property of the repository being swept rather than of this code,
 /// which is the shape this type exists to refuse.
+/// What an enrichment write actually did, as opposed to what it attempted.
+///
+/// The count this replaces was the write call's own return, and that cannot be
+/// trusted for this question. `upsert_relation` inserts the relation into the
+/// graph BEFORE its embedding invalidation can fail, so a call that returns
+/// `Err` may have published the relation anyway. Counting that as a loss
+/// over-reports, and a zero-loss gate built on it would hard-fail a sweep that
+/// dropped nothing.
+///
+/// So `published` is read from the graph rather than inferred from the call:
+/// the graph is the truth being written to, and it is the only surface that can
+/// separate "never written" from "written, then a later step failed".
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EnrichmentWrite {
+    /// Relations the graph holds afterwards, counted from the graph.
+    published: usize,
+    /// Relations this write was asked to publish.
+    offered: usize,
+    /// Relations the graph holds whose write still reported an error, which on
+    /// this path means embedding invalidation failed after the insert. The
+    /// relation is not lost; the endpoints' vectors may be stale. Disclosed
+    /// separately because folding it into a green would trade one swallowed
+    /// degradation for another.
+    vector_stale: usize,
+}
+
+impl EnrichmentWrite {
+    /// Relations offered that the graph does not hold. The zero-loss number.
+    fn lost(&self) -> usize {
+        self.offered.saturating_sub(self.published)
+    }
+
+    /// A write that published everything it was offered and lost nothing.
+    ///
+    /// For the buffer test, whose subject is batching rather than outcome: it
+    /// asks whether every relation reached the writer, and a writer that always
+    /// succeeds is the right stand-in for that question.
+    #[cfg(test)]
+    fn all_published(count: usize) -> Self {
+        Self {
+            published: count,
+            offered: count,
+            vector_stale: 0,
+        }
+    }
+}
+
+impl std::ops::AddAssign for EnrichmentWrite {
+    fn add_assign(&mut self, other: Self) {
+        self.published += other.published;
+        self.offered += other.offered;
+        self.vector_stale += other.vector_stale;
+    }
+}
+
 #[derive(Default)]
 struct PendingEnrichment {
     relations: Vec<kin_model::Relation>,
@@ -2971,12 +3045,12 @@ impl PendingEnrichment {
     ///
     /// Returns what `write` reported installing, which is what the graph took
     /// rather than what was offered it.
-    fn absorb<F>(&mut self, derived: Vec<kin_model::Relation>, mut write: F) -> usize
+    fn absorb<F>(&mut self, derived: Vec<kin_model::Relation>, mut write: F) -> EnrichmentWrite
     where
-        F: FnMut(&[kin_model::Relation]) -> usize,
+        F: FnMut(&[kin_model::Relation]) -> EnrichmentWrite,
     {
         self.relations.extend(derived);
-        let mut installed = 0usize;
+        let mut installed = EnrichmentWrite::default();
         while self.relations.len() >= ENRICHMENT_WRITE_BATCH {
             let batch: Vec<kin_model::Relation> =
                 self.relations.drain(..ENRICHMENT_WRITE_BATCH).collect();
@@ -2990,12 +3064,12 @@ impl PendingEnrichment {
     /// Called at the end of every file rather than at the end of the sweep, so
     /// the relations a file produced reach the graph before the next file is
     /// opened, and a sweep stopped between files has already written them.
-    fn flush<F>(&mut self, mut write: F) -> usize
+    fn flush<F>(&mut self, mut write: F) -> EnrichmentWrite
     where
-        F: FnMut(&[kin_model::Relation]) -> usize,
+        F: FnMut(&[kin_model::Relation]) -> EnrichmentWrite,
     {
         if self.relations.is_empty() {
-            return 0;
+            return EnrichmentWrite::default();
         }
         debug!(
             tail = self.len(),
@@ -3062,26 +3136,60 @@ fn unheld_lsp_relations(
         .collect()
 }
 
-fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation]) -> usize {
+/// The ids, among `relations`, that the graph actually holds right now.
+///
+/// Read per distinct source entity, the same way [`unheld_lsp_relations`] reads
+/// them. An unreadable neighbourhood yields nothing for that source, which
+/// makes those relations count as unpublished: reconciliation must fail toward
+/// reporting a loss it cannot rule out, never toward a green it cannot support.
+fn held_relation_ids(
+    state: &DaemonState,
+    relations: &[kin_model::Relation],
+) -> std::collections::HashSet<kin_model::RelationId> {
+    use kin_model::EntityStore;
+    let mut held = std::collections::HashSet::new();
+    let mut fetched = std::collections::HashSet::new();
+    for relation in relations {
+        let kin_model::GraphNodeId::Entity(source) = relation.src else {
+            continue;
+        };
+        if !fetched.insert(source) {
+            continue;
+        }
+        let Ok(existing) = state.graph.get_all_relations_for_entity(&source) else {
+            continue;
+        };
+        for existing in existing {
+            held.insert(existing.id);
+        }
+    }
+    held
+}
+
+fn install_lsp_relations(
+    state: &DaemonState,
+    relations: &[kin_model::Relation],
+) -> EnrichmentWrite {
     if relations.is_empty() {
-        return 0;
+        return EnrichmentWrite::default();
     }
 
     let relations = unheld_lsp_relations(state, relations);
     if relations.is_empty() {
         debug!("every enrichment relation offered is already held in this form; nothing written");
-        return 0;
+        return EnrichmentWrite::default();
     }
 
     use kin_model::EntityStore;
     let graph_mutation = state.begin_graph_authority_mutation();
-    let mut installed = 0usize;
-    let mut refused = 0usize;
+    let offered = relations.len();
+    let mut errored: std::collections::HashSet<kin_model::RelationId> =
+        std::collections::HashSet::new();
     for relation in &relations {
         match state.graph.upsert_relation(relation) {
-            Ok(_) => installed += 1,
+            Ok(_) => {}
             Err(error) => {
-                refused += 1;
+                errored.insert(relation.id);
                 // Was `let _ =`. A write the graph refused was indistinguishable
                 // from one it took, and the count returned was the number of
                 // relations ATTEMPTED, so a pass that installed nothing reported
@@ -3099,15 +3207,40 @@ fn install_lsp_relations(state: &DaemonState, relations: &[kin_model::Relation])
             }
         }
     }
-    if refused > 0 {
+    // Reconcile against the GRAPH, not against the calls. `upsert_relation`
+    // inserts before its embedding invalidation can fail, so an `Err` does not
+    // prove the relation is absent, and counting errors as losses reports a
+    // sweep that dropped nothing as one that dropped hundreds.
+    let held = held_relation_ids(state, &relations);
+    let published = relations
+        .iter()
+        .filter(|relation| held.contains(&relation.id))
+        .count();
+    let vector_stale = errored.iter().filter(|id| held.contains(id)).count();
+    let written = EnrichmentWrite {
+        published,
+        offered,
+        vector_stale,
+    };
+
+    if written.lost() > 0 {
         warn!(
-            installed,
-            refused, "graph refused enrichment relations; the enriched count reports what it took"
+            offered,
+            published,
+            lost = written.lost(),
+            "enrichment relations were offered and the graph does not hold them"
+        );
+    }
+    if vector_stale > 0 {
+        warn!(
+            vector_stale,
+            "enrichment relations were published but their endpoints' embedding invalidation \
+             failed, so those vectors may be stale"
         );
     }
     state.bump_version();
     drop(graph_mutation);
-    installed
+    written
 }
 
 /// Enrich a single entity with all available LSP relation types (calls, overrides,
@@ -4684,7 +4817,7 @@ pub async fn run_with_authority_on(
                             .collect();
 
                         let mut pending = PendingEnrichment::default();
-                        let mut total_relations = 0usize;
+                        let mut total_relations = EnrichmentWrite::default();
                         for entity_ref in &file_entities {
                             info!(entity = %entity_ref.name, "querying LSP for entity");
                             let derived = enrich_single_entity(
@@ -4697,10 +4830,10 @@ pub async fn run_with_authority_on(
                         total_relations +=
                             pending.flush(|batch| install_lsp_relations(&lsp_state, batch));
 
-                        if total_relations > 0 {
+                        if total_relations.published > 0 {
                             info!(
                                 path = %rel_path,
-                                relations = total_relations,
+                                relations = total_relations.published,
                                 "LSP enrichment added relations"
                             );
                             lsp_state.mark_dirty();
@@ -4709,7 +4842,7 @@ pub async fn run_with_authority_on(
                             // about. Querying an LSP server and finding nothing is
                             // not progress, and crediting it would let a worker
                             // that answers "no relations" forever look healthy.
-                            lsp_pass.advanced(total_relations as u64, Instant::now());
+                            lsp_pass.advanced(total_relations.published as u64, Instant::now());
                         } else {
                             info!(
                                 path = %rel_path,
@@ -4769,7 +4902,7 @@ pub async fn run_with_authority_on(
                         let mut tally = SweepTally::default();
                         let mut enriched_this_sweep: Vec<String> = Vec::new();
                         let file_definitions_budget = lsp_file_definitions_budget();
-                        let mut total_relations = 0usize;
+                        let mut total_relations = EnrichmentWrite::default();
                         // Languages whose server refused to start, remembered for
                         // the rest of this sweep. Without it the loop retries the
                         // start once per FILE: express logged 66 spawn attempts
@@ -5054,14 +5187,14 @@ pub async fn run_with_authority_on(
                             // reported nothing until it finished would look
                             // stalled for the entire run and be stopped part
                             // way through exactly the work a user asked for.
-                            if file_relations > 0 {
-                                lsp_pass.advanced(file_relations as u64, Instant::now());
+                            if file_relations.published > 0 {
+                                lsp_pass.advanced(file_relations.published as u64, Instant::now());
                             }
 
-                            if file_relations > 0 {
+                            if file_relations.published > 0 {
                                 info!(
                                     file = %file_id,
-                                    relations = file_relations,
+                                    relations = file_relations.published,
                                     progress = format!("{}/{}", tally.files_processed(), total_files),
                                     "sweep enriched file"
                                 );
@@ -5099,7 +5232,7 @@ pub async fn run_with_authority_on(
                             }
                         }
 
-                        if total_relations > 0 {
+                        if total_relations.published > 0 {
                             lsp_state.mark_dirty();
                         }
 
@@ -5150,7 +5283,7 @@ pub async fn run_with_authority_on(
                         // durable what it actually completed, and the crash
                         // window narrows to a hard kill, which the resume marker
                         // already recovers by re-sweeping.
-                        let published = if total_relations > 0 {
+                        let published = if total_relations.published > 0 {
                             match save_snapshot_blocking(Arc::clone(&lsp_state)).await {
                                 Ok(()) => {
                                     lsp_state.mark_clean();
@@ -5165,7 +5298,7 @@ pub async fn run_with_authority_on(
                                     // defect being closed.
                                     warn!(
                                         %error,
-                                        relations = total_relations,
+                                        relations = total_relations.published,
                                         "could not publish this sweep's enrichment; the \
                                          relations stay live and the next sweep re-derives them"
                                     );
@@ -5203,7 +5336,7 @@ pub async fn run_with_authority_on(
                         } else {
                             warn!(
                                 files = enriched_this_sweep.len(),
-                                relations = total_relations,
+                                relations = total_relations.published,
                                 "not recording these files as enriched: their relations were \
                                  not published, so the next sweep must redo them"
                             );
@@ -5227,10 +5360,39 @@ pub async fn run_with_authority_on(
                             .store(tally.blocked() as u64, std::sync::atomic::Ordering::SeqCst);
                         let unaccounted = tally.unaccounted(total_files);
                         let not_visited = tally.not_visited(total_files);
+
+                        // The sweep's own zero-loss verdict, written where a
+                        // later process can read it. A pass that published
+                        // everything it offered with nothing left stale retires
+                        // the record; anything else writes it, because a
+                        // shortfall that reaches only a log line reaches nobody.
+                        //
+                        // Recorded here rather than inside the per-batch write:
+                        // the claim is about the sweep, and a per-batch record
+                        // under last-writer-wins would report whatever the final
+                        // batch happened to do.
+                        if total_relations.lost() > 0 || total_relations.vector_stale > 0 {
+                            warn!(
+                                offered = total_relations.offered,
+                                published = total_relations.published,
+                                lost = total_relations.lost(),
+                                vector_stale = total_relations.vector_stale,
+                                "this sweep did not publish everything it offered"
+                            );
+                            kin_daemon_spawn::RefusedEnrichment::record(
+                                lsp_state.layout.root(),
+                                total_relations.lost() as u32,
+                                total_relations.offered as u32,
+                                total_relations.vector_stale as u32,
+                            );
+                        } else {
+                            kin_daemon_spawn::RefusedEnrichment::clear(lsp_state.layout.root());
+                        }
+
                         info!(
                             files = tally.files_processed(),
                             total_files,
-                            relations = total_relations,
+                            relations = total_relations.published,
                             enriched = tally.enriched,
                             already_enriched = tally.already_enriched,
                             unsupported_language = tally.unsupported_language,
@@ -7051,7 +7213,7 @@ mod tests {
 mod enrichment_marker_tests {
     use super::{
         file_already_enriched, install_lsp_relations, load_lsp_enriched_marker,
-        lsp_enriched_marker_path, PendingEnrichment, ENRICHMENT_WRITE_BATCH,
+        lsp_enriched_marker_path, EnrichmentWrite, PendingEnrichment, ENRICHMENT_WRITE_BATCH,
     };
     use crate::state::DaemonState;
     use kin_model::EntityStore;
@@ -7263,12 +7425,14 @@ mod enrichment_marker_tests {
     fn an_enrichment_buffer_never_holds_more_than_one_write_batch() {
         let source = kin_model::EntityId::new();
         let mut pending = PendingEnrichment::default();
-        let mut written = 0usize;
+        let mut written = EnrichmentWrite::default();
         // A file's shape: several entities, one of them answering with far more
         // than a batch, and a remainder left over at the end.
         let arms = [400usize, 900, 7, 1, 300];
         for count in arms {
-            written += pending.absorb(derived_relations(source, count), |batch| batch.len());
+            written += pending.absorb(derived_relations(source, count), |batch| {
+                EnrichmentWrite::all_published(batch.len())
+            });
             assert!(
                 pending.len() < ENRICHMENT_WRITE_BATCH,
                 "after absorbing {count} relations the buffer still holds {}, which is a whole \
@@ -7276,14 +7440,14 @@ mod enrichment_marker_tests {
                 pending.len()
             );
         }
-        written += pending.flush(|batch| batch.len());
+        written += pending.flush(|batch| EnrichmentWrite::all_published(batch.len()));
         assert_eq!(
             pending.len(),
             0,
             "the flush must leave nothing behind, or a file's tail never reaches the graph"
         );
         assert_eq!(
-            written,
+            written.published,
             arms.iter().sum::<usize>(),
             "every relation offered to the buffer must reach the writer exactly once"
         );
@@ -7314,7 +7478,7 @@ mod enrichment_marker_tests {
 
         // The unbounded path: every relation offered on its own, which is what
         // one language-server query arm used to do.
-        let mut unbounded_installed = 0usize;
+        let mut unbounded_installed = EnrichmentWrite::default();
         for relation in &relations {
             unbounded_installed +=
                 install_lsp_relations(&unbounded, std::slice::from_ref(relation));
@@ -7328,7 +7492,7 @@ mod enrichment_marker_tests {
         bounded_installed += pending.flush(|batch| install_lsp_relations(&bounded, batch));
 
         assert_eq!(
-            bounded_installed, unbounded_installed,
+            bounded_installed.published, unbounded_installed.published,
             "the bounded path must install exactly what the unbounded one installed"
         );
         let held = |state: &DaemonState| -> std::collections::BTreeSet<kin_model::RelationId> {
@@ -7359,7 +7523,7 @@ mod enrichment_marker_tests {
         });
         rewritten += again.flush(|batch| install_lsp_relations(&bounded, batch));
         assert_eq!(
-            rewritten, 0,
+            rewritten.published, 0,
             "a re-derivation of relations the graph already holds must write nothing, or every \
              killed sweep discards the embeddings of every entity it touches"
         );
@@ -8321,7 +8485,7 @@ mod lsp_query_column_tests {
 mod sweep_tally_tests {
     use super::{
         file_definitions_within_budget, next_interruption_count, sweep_circuit_open,
-        sweep_marker_is_durable, SweepTally, SWEEP_INTERRUPTION_LIMIT,
+        sweep_marker_is_durable, EnrichmentWrite, SweepTally, SWEEP_INTERRUPTION_LIMIT,
     };
     use std::time::Duration;
 
@@ -8497,13 +8661,45 @@ mod sweep_tally_tests {
     #[test]
     fn a_sweep_that_did_not_publish_records_nothing() {
         assert!(
-            !sweep_marker_is_durable(4231, false),
+            !sweep_marker_is_durable(EnrichmentWrite::all_published(4231), false),
             "a sweep with relations that failed to publish must leave its files unmarked, \
              so the next sweep redoes them instead of skipping them forever"
         );
         assert!(
-            sweep_marker_is_durable(4231, true),
+            sweep_marker_is_durable(EnrichmentWrite::all_published(4231), true),
             "a sweep that published records what it enriched"
+        );
+    }
+
+    /// A sweep that published its snapshot but lost relations records nothing.
+    ///
+    /// The case the durability check could not see before. `published` says the
+    /// snapshot reached disk; it says nothing about whether every relation the
+    /// sweep offered reached the graph. A pass that offered 600 and got 588 in
+    /// used to mark its files enriched on the strength of that clean save, and
+    /// `file_already_enriched` would skip them from then on, so the twelve were
+    /// written off permanently under a marker asserting the file was done.
+    ///
+    /// Leaving them unmarked is the repair: the pass cannot fix what the graph
+    /// declined, but it can decline to call the file finished, and the next
+    /// sweep offers those relations again.
+    #[test]
+    fn a_sweep_that_published_but_lost_relations_records_nothing() {
+        let lossy = EnrichmentWrite {
+            published: 588,
+            offered: 600,
+            vector_stale: 0,
+        };
+        assert_eq!(lossy.lost(), 12);
+        assert!(
+            !sweep_marker_is_durable(lossy, true),
+            "a snapshot that saved cleanly does not make a lost relation durable, and marking \
+             these files would skip them forever"
+        );
+        assert!(
+            sweep_marker_is_durable(EnrichmentWrite::all_published(600), true),
+            "a pass that lost nothing still marks, or the fix trades a permanent skip for a \
+             permanent re-sweep"
         );
     }
 
@@ -8515,7 +8711,7 @@ mod sweep_tally_tests {
     #[test]
     fn a_sweep_with_nothing_to_publish_still_records_its_files() {
         assert!(
-            sweep_marker_is_durable(0, false),
+            sweep_marker_is_durable(EnrichmentWrite::all_published(0), false),
             "no relations means nothing could be lost, so the visit is worth recording"
         );
     }

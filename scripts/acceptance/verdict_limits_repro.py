@@ -71,6 +71,7 @@ installs; without one, `references` reads short and the checks say so.
 
 import argparse
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -227,18 +228,89 @@ INPUT_CLAUSE_LABELS = {
     "degradations": ("retrieval_degraded",),
     "completeness": ("substrate_", "counts_are_a_floor"),
     "response_budget": ("response_bounded",),
-}
-
-# The smallest response budget the server serves (`RESPONSE_MIN_MAX_CHARS`).
+    # absence_gate is deliberately NOT here, and the reason took three attempts
+    # to get right, so it is written out.
+    #
+    # Its clause set is not its own. It has TWO sources. With no negative block
+    # it emits `absence_coverage_clauses`, whose twelve labels look like a
+    # sensible entry. With a negative block it emits `negative.trust_reason`,
+    # which `push_gap` composes from whatever refused anywhere: on the live
+    # payload this suite grades, that was `response_bounded`, `answer_truncated`
+    # and `retrieval_degraded`, and NONE of the twelve appeared.
+    #
+    # So a prefix list for this input is either incomplete, which reports a
+    # finding every time it refuses through the negative path, or broad enough
+    # to be satisfied by any clause at all, which is a check that cannot fail.
+    # Both were tried. `factor_carries_the_absence_gates_own_clauses` below
+    # checks the mechanism instead: it reads the trust_reason the payload
+    # actually carries and requires each of ITS labels in the factor, which
+    # needs no vocabulary guess.
+}# The smallest response budget the server serves (`RESPONSE_MIN_MAX_CHARS`).
 # Asking for it on a populated answer withholds rows, which is the one refusal
 # an acceptance run can add to an answer on purpose.
 BUDGET_FLOOR_CHARS = 2000
 
 
-def factor_clauses(factor):
-    """The `label: text` clauses of one limiting factor, in order."""
-    clauses = [c.strip() for c in (factor or "").split("; ") if c.strip()]
-    return [(c.split(":", 1)[0].strip(), c) for c in clauses]
+def factor_labels(factor):
+    """Every clause label the factor names, in order.
+
+    Splitting on the separator is CORRECT here, and it was not always. The
+    server used to emit a clause whose own prose contained "; ", so this split
+    cut one gap into a labelled clause plus an unlabelled fragment and then
+    graded the fragment as though it were a label. That is fixed at the source:
+    clauses are carried as a list to a single join, and
+    `no_clause_carries_the_separator_that_divides_clauses` in `verdict.rs`
+    asserts no clause contains the separator, driving the real producer over
+    five payload shapes rather than restating its strings.
+
+    So this parser is a second copy, and that coupling is real, but replacing it
+    is worse than keeping it. The obvious replacement, a regex for `word:` at a
+    clause start, finds a THIRD label in today's real factor: the absence gate's
+    clause contains the parenthetical "...do not stand in for imports: an entity
+    other files reach only through imports...", and a mid-sentence colon is
+    indistinguishable from a label start without knowing where clauses end.
+    Splitting on the separator knows exactly that, and now it is true.
+
+    The dependency is therefore stated rather than removed: this function is
+    correct only while the server's invariant holds, and that invariant has its
+    own falsified check on the other side.
+    """
+    clauses = [clause.strip() for clause in (factor or "").split("; ") if clause.strip()]
+    return [clause.split(":", 1)[0].strip() for clause in clauses]
+
+
+def factor_carries_the_absence_gates_own_clauses(payload):
+    """The absence gate's clauses reach the factor, checked at the mechanism.
+
+    A prefix list cannot do this. The gate's vocabulary is not its own: with a
+    negative block it emits `negative.trust_reason`, which the negative block
+    composes from whatever refused anywhere, so its labels are other inputs'
+    labels. Reading the trust_reason the payload actually carries needs no guess.
+
+    Returns (checked, problems). `checked` is False when there is nothing to
+    check, which is UNREADABLE rather than a pass.
+    """
+    verdict = ((payload.get("_kin") or {}).get("verdict") or {})
+    inputs = verdict.get("inputs")
+    negative = payload.get("negative") or {}
+    reason = negative.get("trust_reason")
+    if not isinstance(inputs, dict) or inputs.get("absence_gate") != "inconclusive":
+        return False, []
+    if not isinstance(reason, str) or not reason.strip():
+        return False, []
+    factor = verdict.get("limiting_factor") or ""
+    problems = []
+    if not factor:
+        return True, ["absence_gate refuses with a trust_reason and the factor is empty"]
+    for label in factor_labels(reason):
+        # A clause the gate carried that another input also carried is
+        # deduplicated to one, which still leaves its label in the factor. So a
+        # MISSING label is a dropped clause rather than a deduplicated one.
+        if ("%s:" % label) not in factor:
+            problems.append(
+                "absence_gate's trust_reason names %r and the factor does not carry it "
+                "(factor labels %s)" % (label, factor_labels(factor)))
+    return True, problems
 
 
 def factor_carries_every_refusing_input(payload):
@@ -253,7 +325,8 @@ def factor_carries_every_refusing_input(payload):
     inputs = verdict.get("inputs")
     if not isinstance(inputs, dict) or verdict.get("state") not in ("certified", "inconclusive"):
         return None, ["no verdict inputs"]
-    labels = [label for label, _ in factor_clauses(verdict.get("limiting_factor"))]
+    factor = verdict.get("limiting_factor") or ""
+    labels = factor_labels(factor)
     refusing = [name for name, state in inputs.items() if state == "inconclusive"]
     problems = []
     if refusing and verdict.get("state") != "inconclusive":
@@ -262,7 +335,10 @@ def factor_carries_every_refusing_input(payload):
         problems.append("inputs %s refuse and limiting_factor is empty" % refusing)
     for name in refusing:
         prefixes = INPUT_CLAUSE_LABELS.get(name)
-        if prefixes and not any(label.startswith(prefixes) for label in labels):
+        # Substring against the whole factor, not against parsed boundaries.
+        # A refusing input's clause is present or it is not, and answering that
+        # needs no opinion about where the clause ends.
+        if prefixes and not any(("%s" % pre) in factor for pre in prefixes):
             problems.append("input %s refuses and no clause of the factor is its (labels %s)"
                             % (name, labels))
     dupes = sorted({label for label in labels if labels.count(label) > 1})
@@ -583,12 +659,20 @@ def check_two_reasons(suite):
         result.unknown("the bounded answer carries no verdict inputs")
         return result
     refusing = sorted(name for name, state in inputs.items() if state == "inconclusive")
+    # The absence gate is checked at its mechanism rather than through the label
+    # map, because its clauses are `trust_reason`'s and therefore other inputs'
+    # labels. See the note above INPUT_CLAUSE_LABELS.
+    gate_checked, gate_problems = factor_carries_the_absence_gates_own_clauses(payload)
+    problems = list(problems) + list(gate_problems)
     if problems:
         result.bad("%s (refusing inputs %s, factor labels %s)"
                    % ("; ".join(problems), refusing, labels))
     else:
-        result.ok("%d refusing input(s) %s and the factor carries %s"
-                  % (len(refusing), refusing, labels))
+        result.ok("%d refusing input(s) %s and the factor carries %s%s"
+                  % (len(refusing), refusing, labels,
+                     "" if gate_checked
+                     else "; the absence gate carried no trust_reason, so its clauses were not "
+                          "checked"))
     return result
 
 
@@ -672,14 +756,50 @@ def self_test():
             "all observed present (calls, imports, references)")
     expect("every refusing input has its clause",
            factor_carries_every_refusing_input(bounded(two, full))[1], [])
+    # Two, not three: `absence_gate` is deliberately absent from the map, for
+    # the reason written above it. Its clauses come from `trust_reason` on the
+    # live path and are other inputs' labels, so a prefix entry is either
+    # incomplete or unfailable. The mechanism check below covers it instead.
     expect("the factor a budget cut used to replace outright fails twice",
            len(factor_carries_every_refusing_input(bounded(
                two, "response_bounded: the response budget withheld part of this answer"))[1]), 2)
-    expect("a factor that kept only the first reading fails on the completeness clause",
-           factor_carries_every_refusing_input(bounded(
-               two, "response_bounded: x; cross_file_edges_unproduced: y"))[1],
-           ["input completeness refuses and no clause of the factor is its (labels "
-            "['response_bounded', 'cross_file_edges_unproduced'])"])
+
+    # The absence gate, checked at its mechanism rather than by a vocabulary
+    # guess. This is the shape the live suite failed on twice: a trust_reason
+    # whose labels are response_bounded, answer_truncated and retrieval_degraded,
+    # none of which any absence_gate prefix list contained.
+    def gated(factor, reason):
+        return {"negative": {"trust_reason": reason},
+                "_kin": {"verdict": {"state": "inconclusive", "limiting_factor": factor,
+                                     "inputs": {"absence_gate": "inconclusive"}}}}
+
+    live_reason = ("response_bounded: the response budget withheld part of this answer; "
+                   "answer_truncated: this answer stopped early; "
+                   "retrieval_degraded: this query reported degradations")
+    expect("the live shape passes when every trust_reason clause reaches the factor",
+           factor_carries_the_absence_gates_own_clauses(
+               gated(live_reason + "; counts_are_a_floor: lower bound", live_reason))[1], [])
+    expect("and it is checked rather than skipped",
+           factor_carries_the_absence_gates_own_clauses(
+               gated(live_reason, live_reason))[0], True)
+    expect("a dropped trust_reason clause is named",
+           [problem.split(" names ")[1].split(" and")[0]
+            for problem in factor_carries_the_absence_gates_own_clauses(
+                gated("response_bounded: x; retrieval_degraded: y", live_reason))[1]],
+           ["'answer_truncated'"])
+    expect("a clause deduplicated against another input still counts as carried",
+           factor_carries_the_absence_gates_own_clauses(
+               gated("retrieval_degraded: said once for two inputs",
+                     "retrieval_degraded: said once for two inputs"))[1], [])
+    expect("no trust_reason is UNREADABLE, not a pass",
+           factor_carries_the_absence_gates_own_clauses(
+               gated("response_bounded: x", None))[0], False)
+    expect("an absence_gate that does not refuse is not checked",
+           factor_carries_the_absence_gates_own_clauses(
+               {"negative": {"trust_reason": live_reason},
+                "_kin": {"verdict": {"state": "certified", "limiting_factor": None,
+                                     "inputs": {"absence_gate": "certified"}}}})[0], False)
+
     expect("a label said twice fails",
            len(factor_carries_every_refusing_input(bounded(two, full + "; substrate_partial: again"))[1]),
            1)

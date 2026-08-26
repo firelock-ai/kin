@@ -29,7 +29,6 @@ use kin_model::{
 // One declared bound governs both directions: what these routes accept is what
 // the transfer client reads.
 use kin_cli::commands::transfer::{DerivedViewRefresh, WorkspaceFollow};
-use kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1532,12 +1531,12 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route(
             "/repos/{repo_id}/transfer/export",
             post(repo_transfer_export)
-                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+                .layer(DefaultBodyLimit::max(configured_transfer_http_body_limit())),
         )
         .route(
             "/repos/{repo_id}/transfer/receive",
             post(repo_transfer_receive)
-                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+                .layer(DefaultBodyLimit::max(configured_transfer_http_body_limit())),
         )
         .route(
             "/repos/{repo_id}/archive/tar/{source_change_id}",
@@ -8117,6 +8116,30 @@ fn locate_entity_identity(entity: &kin_cli::commands::locate::LocateEntity) -> L
     }
 }
 
+/// Did this unresolved ranked key name an entity that was RETIRED, rather than
+/// one the graph has never held?
+///
+/// FIR-2727. kin-db refuses to resolve a revision key whose entity is gone,
+/// which is correct: nothing may be handed back as live when it is not. But
+/// "retired" and "never held" then arrive identically as `None`, and they take
+/// OPPOSITE remediations. Reporting the first as the second sends an operator
+/// to `kin admit` for a retirement, which does nothing at all.
+///
+/// Asked only on the `None` path and only for revision keys, so a healthy
+/// ranking where every key resolves pays nothing for it.
+///
+/// `entity_id_for_revision` is liveness-blind on purpose and exists for exactly
+/// this question. Do not "simplify" this by inferring retirement from the
+/// failed resolution: that inference is what printed the wrong remediation.
+fn unresolved_key_is_retired(graph: &kin_db::InMemoryGraph, key: &kin_db::RetrievalKey) -> bool {
+    match key {
+        kin_db::RetrievalKey::EntityRevision(revision_id) => graph
+            .entity_id_for_revision(revision_id)
+            .is_some_and(|entity_id| graph.get_entity(&entity_id).ok().flatten().is_none()),
+        _ => false,
+    }
+}
+
 fn build_semantic_locate_result(
     state: &DaemonState,
     graph: &kin_db::InMemoryGraph,
@@ -8304,7 +8327,25 @@ fn build_semantic_locate_result(
             break;
         }
         let Some(item) = graph.resolve_retrieval_key(&key) else {
-            unresolved_keys += 1;
+            // FIR-2727. A key that resolves to nothing is TWO different facts
+            // and they take opposite remediations, so they are separated here
+            // rather than collapsed into one count.
+            //
+            // kin-db refuses a revision key whose entity was retired, which is
+            // correct: nothing may be handed back as live when it is gone. But
+            // "retired" and "never held" arrive identically as `None`, and
+            // reporting the first as the second sends an operator to `kin
+            // admit` for a retirement, which does nothing.
+            //
+            // `entity_id_for_revision` is liveness-blind on purpose and exists
+            // for exactly this question. It is asked only on the `None` path
+            // and only for revision keys, so it costs nothing on a healthy
+            // ranking where every key resolves.
+            if unresolved_key_is_retired(graph, &key) {
+                retired_entity_keys += 1;
+            } else {
+                unresolved_keys += 1;
+            }
             continue;
         };
         // Entity-centric projection: the ENTITY (kind + name + signature) is the
@@ -8312,6 +8353,15 @@ fn build_semantic_locate_result(
         // below already dropped retired entities, but only when snippets were
         // on; under `include_snippet: false` or file granularity nothing
         // filtered them at all.
+        //
+        // FIR-2727: kin-db's resolve arm now enforces liveness upstream, so a
+        // retired entity should never reach this check at all. It stays anyway,
+        // as the SECOND layer the tripwire watches. Do not delete it as
+        // redundant: the tripwire's zero is what will prove the redundancy
+        // empirically, and a later cleanup can cite that measured zero rather
+        // than an argument. Deleting a working guard as a side effect of fixing
+        // what it guarded against is how the guard's absence gets discovered by
+        // a user instead of by a test.
         let entity_is_live = match &item {
             kin_db::ResolvedRetrievalItem::Entity(entity) => {
                 graph.get_entity(&entity.id).ok().flatten().is_some()
@@ -8473,7 +8523,22 @@ fn build_semantic_locate_result(
                      to entities the graph no longer holds, so they were dropped rather than \
                      served as ids no graph tool can take"
                 ),
-                remediation: "run 'kin embed' to re-index this graph's current entities"
+                // `kin embed`, and the reason is a chain worth writing down
+                // because the obvious guess is wrong twice over. A revision key
+                // outliving its entity is a normal pre-prune transient:
+                // retirement evicts the live Entity key immediately and the
+                // immutable revision keys stay until something prunes them.
+                //
+                // Nothing in kin calls `prune_orphaned_vectors` directly. kin-db
+                // calls it itself, and the path a user can reach is the embed
+                // one: `kin embed` -> `process_embedding_queue` ->
+                // `persist_embedded_batch` -> `persist_embedded_batch_inner(..,
+                // prune_on_empty = true)`, which prunes once the queue drains.
+                // `kin admit` is for content the graph never held, and
+                // `kin reconcile` republishes workspace changes into graph truth
+                // without touching the retrieval index.
+                remediation: "run 'kin embed' to drain the embedding queue, which prunes \
+                              retired revision keys from the retrieval index once it empties"
                     .to_string(),
             },
         );
@@ -10002,6 +10067,56 @@ struct RepositoryTransferReceiveRequest {
     pack: kin_remote::repository_transfer::RepositoryTransferPack,
 }
 
+/// The wire cap that lets this deployment's decoded ceiling actually arrive.
+///
+/// Derived, never written down twice. Bodies travel base64, so a decoded
+/// closure is about four thirds of its size on the wire, and a raised decoded
+/// ceiling behind an unchanged wire cap is invisible: the pack never reaches
+/// validation and every client sees a bare 413 instead of the refusal that
+/// names the bound and the knob. The 413 stays as the outer backstop and should
+/// never be what a client hits first, because it says nothing useful.
+fn configured_transfer_http_body_limit() -> usize {
+    kin_remote::repository_transfer_http::http_body_limit_for(
+        configured_transfer_limits().max_decoded_body_bytes,
+    )
+}
+
+/// The decoded-closure ceiling this deployment will accept on a receive.
+///
+/// The library takes limits and this layer decides them, because a deployment
+/// knob belongs where configuration already lives rather than inside a
+/// protocol crate that reads no environment at all today.
+///
+/// Unset, malformed or zero means the compiled default, which is the safe
+/// value. A raised ceiling costs memory rather than correctness: the decoded
+/// closure is held in one map while a pack is validated, so this number IS the
+/// peak allocation of a receive and a host pays it per concurrent receive.
+///
+/// It never overrides a peer. The effective bound is the smaller of this and
+/// whatever the sender advertised, which `validate_pack` enforces after the
+/// caller has taken the minimum.
+fn configured_transfer_limits() -> kin_remote::repository_transfer::RepositoryTransferLimits {
+    let compiled = kin_remote::repository_transfer::RepositoryTransferLimits::default();
+    let Ok(raw) = std::env::var(kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV) else {
+        return compiled;
+    };
+    // A malformed value keeps the default rather than refusing to start. An
+    // operator who mistypes a ceiling gets the safe number and a warning, not a
+    // daemon that will not boot, because the failure mode of the second is
+    // worse than the failure mode of the first.
+    match raw.trim().parse::<u64>() {
+        Ok(bytes) if bytes > 0 => compiled.with_decoded_body_ceiling(bytes),
+        _ => {
+            tracing::warn!(
+                var = kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV,
+                value = %raw,
+                "ignoring an unparseable transfer body ceiling; using the compiled default"
+            );
+            compiled
+        }
+    }
+}
+
 pub(crate) fn repository_transfer_authority(
     state: &DaemonState,
     repo_id: &str,
@@ -10184,6 +10299,7 @@ async fn repo_transfer_receive(
         &request.destination_ref,
         kin_model::AuthorId::new("kin-daemon:repository-transfer-receiver"),
         &request.pack,
+        &configured_transfer_limits(),
     )
     .map_err(repository_transfer_error)?;
 
@@ -10414,6 +10530,7 @@ pub(crate) async fn pull_into_replica(
                         &destination_ref,
                         kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
                         pack,
+                        &configured_transfer_limits(),
                     )?;
                     admitted_packs += 1;
                     if local_derived_views && !refresh.is_stale() {
@@ -15870,6 +15987,418 @@ mod tests {
         );
     }
 
+    /// Read the authority envelope straight off the persisted object.
+    ///
+    /// Deliberately not through the daemon. The question these tests ask is
+    /// what the NEXT open would find, and a served answer can be perfectly
+    /// right while the object underneath it has already been overwritten.
+    fn persisted_authority(storage: &FsPath, repo_id: &str) -> (bool, usize, u64) {
+        let backend = kin_db::LocalFileBackend::new(storage.to_path_buf());
+        match kin_db::load_recovered_snapshot(&backend, repo_id)
+            .expect("reading the persisted authority object must not fail")
+        {
+            Some(recovered) => {
+                let generation = recovered.generation;
+                match recovered.snapshot.repository_authority.as_ref() {
+                    Some(authority) => (true, authority.ref_state.refs.len(), generation),
+                    None => (false, 0, generation),
+                }
+            }
+            None => (false, 0, 0),
+        }
+    }
+
+    /// Open a second daemon over a backend that already holds a publication.
+    ///
+    /// This is the restart, and the restart is the trigger. A daemon that was
+    /// already running when the envelope was published keeps a stale cursor, so
+    /// its next flush CAS-fails and the envelope survives by accident. A daemon
+    /// that opens afterwards loads the current generation, so its CAS succeeds
+    /// and the erasure lands. Any fixture that reuses the seeding daemon tests
+    /// the accident instead of the defect.
+    ///
+    /// Returns the working directory beside the state because dropping it
+    /// deletes the layout out from under a live daemon.
+    fn reopen_hosted_daemon(
+        storage: &FsPath,
+        repo_id: &str,
+    ) -> (Arc<DaemonState>, tempfile::TempDir) {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(kin_db::LocalFileBackend::new(storage.to_path_buf())),
+                repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        (state, working)
+    }
+
+    /// A derived flush must not erase the envelope the backend published.
+    ///
+    /// The daemon serializes its in-place mutable graph, which does not own the
+    /// authority envelope and writes an explicit null where one belongs, then
+    /// hands those bytes to the write that IS the authority object. Refs,
+    /// receipts, workspaces, aliases and admission state go with it.
+    ///
+    /// Driven through `save_snapshot_full` and `save_snapshot`, which are the
+    /// two entry points every one of the four flush callers reaches: the
+    /// periodic loop, the shutdown flush, the pre-idle flush and the LSP sweep
+    /// all arrive through `save_snapshot_blocking`. Guarding the wall-clock
+    /// trigger rather than the write would leave the other three erasing.
+    #[tokio::test]
+    async fn a_hosted_flush_leaves_the_authority_envelope_the_backend_published() {
+        let repo_id = format!("hosted-flush-keeps-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8060,
+            "publish the head a derived flush must not erase",
+        );
+
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope carrying refs, or this test grades nothing"
+        );
+
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+        state
+            .save_snapshot_full()
+            .expect("a hosted flush must not fail");
+        state.save_snapshot().expect("a hosted flush must not fail");
+
+        let (still_present, still_refs, still_generation) =
+            persisted_authority(storage.path(), &repo_id);
+        assert!(
+            still_present,
+            "the flush erased the authority envelope the backend published"
+        );
+        assert_eq!(
+            still_refs, refs,
+            "the flush changed the published ref set it had no authority to touch"
+        );
+        assert_eq!(
+            still_generation, generation,
+            "the flush advanced the authority generation without committing authority"
+        );
+    }
+
+    /// The guard is keyed on the envelope, not on having a backend at all.
+    ///
+    /// Without this arm the fix could be "a hosted daemon never persists
+    /// anything", which passes the test above perfectly and breaks every
+    /// envelope-free hosted store, including the one in the bucket today. The
+    /// write must still happen where there is no publication to destroy.
+    #[tokio::test]
+    async fn a_hosted_flush_still_persists_where_the_backend_holds_no_envelope() {
+        let repo_id = format!("hosted-flush-writes-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+
+        let (present, _, before) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            !present,
+            "the fixture must start with no envelope, or this arm proves nothing"
+        );
+
+        state
+            .save_snapshot_full()
+            .expect("an envelope-free hosted store must still persist");
+
+        let (_, _, after) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            after > before,
+            "the flush was suppressed on a store with no envelope to protect: {before} -> {after}"
+        );
+    }
+
+    /// The periodic loop fires forever, so one safe flush is not the claim.
+    ///
+    /// A guard that holds once and then lets a later flush through, because it
+    /// consumed a flag or keyed on some first-pass state, would pass the arm
+    /// above and still erase the envelope on the second tick of a thirty-second
+    /// timer. The loop gets no fewer chances than this.
+    #[tokio::test]
+    async fn repeated_hosted_flushes_never_erode_the_published_envelope() {
+        let repo_id = format!("hosted-flush-repeat-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8061,
+            "publish a head many flushes must not erase",
+        );
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope"
+        );
+
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+        for tick in 0..8 {
+            state
+                .save_snapshot()
+                .unwrap_or_else(|error| panic!("flush {tick} failed: {error}"));
+            state
+                .save_snapshot_full()
+                .unwrap_or_else(|error| panic!("full flush {tick} failed: {error}"));
+            let (still_present, still_refs, still_generation) =
+                persisted_authority(storage.path(), &repo_id);
+            assert!(still_present, "flush {tick} erased the envelope");
+            assert_eq!(still_refs, refs, "flush {tick} changed the ref set");
+            assert_eq!(
+                still_generation, generation,
+                "flush {tick} advanced the authority generation"
+            );
+        }
+    }
+
+    /// The production-shaped chain, end to end.
+    ///
+    /// `POST /graph/mutations` reaches no save of its own; what it does is
+    /// `mark_dirty`, and the periodic loop refuses to flush at all unless
+    /// `is_dirty`. So the real sequence is a mutation ARMING the gate and the
+    /// wall clock firing it. An earlier reading of this ticket called the route
+    /// a third write path, which it is not, and an arm written that way would
+    /// have asserted something false.
+    ///
+    /// The batch is deliberately empty. The arming step is `mark_dirty`, which
+    /// the handler runs unconditionally after applying whatever it was given,
+    /// so an empty batch isolates exactly the step under test.
+    #[tokio::test]
+    async fn a_graph_mutation_arms_the_flush_that_must_not_erase_the_envelope() {
+        let repo_id = format!("hosted-flush-armed-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8062,
+            "publish a head an armed flush must not erase",
+        );
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope"
+        );
+
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/mutations")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the arming route must succeed, or this arm never reaches the flush"
+        );
+        assert!(
+            state.is_dirty(),
+            "the mutation must arm the dirty gate, or the periodic loop would skip the flush entirely"
+        );
+
+        state
+            .save_snapshot()
+            .expect("the armed flush must not fail");
+
+        let (still_present, still_refs, still_generation) =
+            persisted_authority(storage.path(), &repo_id);
+        assert!(still_present, "the armed flush erased the envelope");
+        assert_eq!(still_refs, refs, "the armed flush changed the ref set");
+        assert_eq!(
+            still_generation, generation,
+            "the armed flush advanced the authority generation"
+        );
+        assert!(
+            state.hosted_authority_flush_refusals() >= 1,
+            "the flush must have been refused the authority write, not merely found nothing to do"
+        );
+    }
+
+    /// Today's accidental protection, pinned so the fix is not credited with it.
+    ///
+    /// A daemon that was already running when the envelope was published keeps
+    /// the cursor it opened with, so its flush CAS-fails and the envelope
+    /// survives for a reason that has nothing to do with this guard. Without
+    /// this arm the fix could look like it protects a case that was already
+    /// safe, and the restart arm beside it would lose its meaning.
+    ///
+    /// The refusal counter reading zero is the whole point: the CAS did this.
+    #[tokio::test]
+    async fn a_live_daemons_stale_cursor_already_refuses_by_cas_not_by_the_guard() {
+        let repo_id = format!("hosted-flush-stale-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        // Opened against an empty store, so its cursor is the empty one.
+        let (state, _working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8063,
+            "publish a head under a daemon that is already running",
+        );
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope"
+        );
+
+        let outcome = state.save_snapshot_full();
+        assert!(
+            outcome.is_err(),
+            "a stale cursor must lose the compare-and-swap rather than overwrite"
+        );
+        assert_eq!(
+            state.hosted_authority_flush_refusals(),
+            0,
+            "this daemon opened before the publication, so the guard must not be what stopped it"
+        );
+
+        let (still_present, still_refs, still_generation) =
+            persisted_authority(storage.path(), &repo_id);
+        assert!(
+            still_present,
+            "the CAS failure must leave the envelope intact"
+        );
+        assert_eq!(still_refs, refs, "the ref set must be untouched");
+        assert_eq!(
+            still_generation, generation,
+            "the generation must be untouched"
+        );
+    }
+
+    /// A refusal is normal, so it must not be reported as a fault.
+    ///
+    /// The periodic loop calls `mark_clean` only when the flush returns `Ok`,
+    /// and backs off with a climbing `consecutive_failures` and a "persistence
+    /// unhealthy" error when it does not. A guard that refused by returning an
+    /// error would therefore turn a correctly-behaving hosted daemon into one
+    /// that logs an escalating fault every tick and never settles.
+    ///
+    /// So the claim is behavioural, not cosmetic: `Ok`, the dirty flag clears,
+    /// and the counter proves the refusal really happened rather than the flush
+    /// having found nothing to do.
+    #[tokio::test]
+    async fn a_refused_hosted_flush_reports_success_so_the_persist_loop_settles() {
+        let repo_id = format!("hosted-flush-settle-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8064,
+            "publish a head a settling loop must not erase",
+        );
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+
+        for tick in 1..=5u64 {
+            state.mark_dirty();
+            assert!(state.is_dirty(), "tick {tick} did not arm the gate");
+            state
+                .save_snapshot()
+                .unwrap_or_else(|error| panic!("tick {tick} reported a fault: {error}"));
+            assert_eq!(
+                state.hosted_authority_flush_refusals(),
+                tick,
+                "tick {tick} did not refuse exactly once"
+            );
+        }
+    }
+
+    /// The same guard, reached through a second caller.
+    ///
+    /// Four callers reach `save_snapshot_impl`, and the invariant is stated
+    /// regardless of caller. Every arm above drives the periodic entry points,
+    /// which leaves "the other three are also covered" resting on the guard's
+    /// position in the source rather than on anything observed. This drives the
+    /// shutdown path, which is a different function with its own dirty check
+    /// and its own wipe guard in front of the same write.
+    #[tokio::test]
+    async fn the_shutdown_flush_refuses_the_authority_write_too() {
+        let repo_id = format!("hosted-flush-shutdown-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8065,
+            "publish a head the shutdown flush must not erase",
+        );
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope"
+        );
+
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+        state.mark_dirty();
+        crate::daemon::run_shutdown_persistence(&state).await;
+
+        let (still_present, still_refs, still_generation) =
+            persisted_authority(storage.path(), &repo_id);
+        assert!(still_present, "the shutdown flush erased the envelope");
+        assert_eq!(still_refs, refs, "the shutdown flush changed the ref set");
+        assert_eq!(
+            still_generation, generation,
+            "the shutdown flush advanced the authority generation"
+        );
+        assert!(
+            state.hosted_authority_flush_refusals() >= 1,
+            "the shutdown flush must reach the same guard, not skip the write for some other reason"
+        );
+    }
+
+    /// Durability control: the guard is inert where there is no backend.
+    ///
+    /// A local daemon owns its own authority and must keep writing exactly as
+    /// before. The counter reading zero is what makes this a control rather
+    /// than a restatement: a flush that silently refused and a flush that had
+    /// nothing to do both return `Ok` and both leave the caller unable to tell
+    /// which happened.
+    #[tokio::test]
+    async fn a_daemon_with_no_backend_persists_and_never_refuses() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+
+        state.mark_dirty();
+        state
+            .save_snapshot()
+            .expect("a local daemon must still persist");
+        state
+            .save_snapshot_full()
+            .expect("a local daemon must still persist a full snapshot");
+
+        assert_eq!(
+            state.hosted_authority_flush_refusals(),
+            0,
+            "the authority-envelope guard must never fire on a daemon that owns its own authority"
+        );
+    }
+
     /// The hosted publication loop, end to end.
     ///
     /// An empty hosted store admits a native transfer and then serves the head
@@ -16272,7 +16801,7 @@ mod tests {
     /// right time to be told: the bound it records will have moved.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_git_admitted_store_adopting_a_hosted_identity_meets_the_git_authority_bound() {
+    async fn a_git_admitted_store_bootstraps_an_empty_hosted_replica_over_http() {
         const PATH: &str = "service/compose.yaml";
         let hosted_id = hosted_repository_id();
         let hosted_repository = RepositoryId::new(hosted_id.clone()).unwrap();
@@ -16314,16 +16843,37 @@ mod tests {
         let message = String::from_utf8_lossy(&body).to_string();
         assert_eq!(
             status,
-            StatusCode::CONFLICT,
-            "the Git-authority bound is a conflict, not an identity refusal: {message}"
+            StatusCode::OK,
+            "a Git-admitted store now bootstraps an empty hosted replica: {message}"
         );
         assert!(
-            message.contains("imported-Git authority"),
-            "the refusal must name the bound that stopped it, not the identity: {message}"
+            message.contains("\"outcome\":\"committed\""),
+            "the receipt must report a committed publication, not a no-op: {message}"
         );
         assert!(
-            !message.contains("does not match destination repository"),
-            "identity is no longer what stops a Git-admitted store: {message}"
+            message.contains("\"old\":null"),
+            "the receipt must show the authority being ESTABLISHED, which is an \
+             initialize delta with no old state: {message}"
+        );
+
+        // The publisher's word is not the evidence. Ask the hosted replica what
+        // it holds, through the route a reader would use.
+        let served = repository_authority_snapshot(&hosted_state, &hosted_id)
+            .await
+            .expect("the hosted replica serves the authority it just admitted");
+        assert!(
+            served
+                .repository_authority
+                .as_ref()
+                .is_some_and(|authority| authority.git_external_authority.is_some()),
+            "the hosted replica must hold imported-Git authority after the bootstrap"
+        );
+        assert!(
+            served
+                .repository_authority
+                .as_ref()
+                .is_some_and(|authority| !authority.ref_state.refs.is_empty()),
+            "the hosted replica must publish the ref the bootstrap established"
         );
     }
 
@@ -17767,6 +18317,107 @@ mod tests {
         assert!(
             class_gap < worker,
             "the structural gap leads and the run degradation follows: {rendered}"
+        );
+    }
+
+    /// FIR-2727. A ranked key that resolves to nothing is two different facts,
+    /// and they take opposite remediations.
+    ///
+    /// kin-db refuses a revision key whose entity was retired, so "retired" and
+    /// "never held" both arrive as `None`. Counting them together sends an
+    /// operator to `kin admit` for a retirement, which does nothing. This pins
+    /// that the classification separates them, and the three FALSE arms are
+    /// what stop it from simply answering true.
+    #[test]
+    fn a_retired_revision_key_is_classified_apart_from_a_key_the_graph_never_held() {
+        let graph = kin_db::InMemoryGraph::new();
+        let retired = test_entity("retired_fn", "src/retired.rs");
+        let live = test_entity("live_fn", "src/live.rs");
+        graph.upsert_entity(&retired).unwrap();
+        graph.upsert_entity(&live).unwrap();
+
+        let change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
+            parents: Vec::new(),
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("tester"),
+            message: "record revisions for both".into(),
+            entity_deltas: vec![
+                kin_model::EntityDelta::Added {
+                    new: retired.clone(),
+                },
+                kin_model::EntityDelta::Added { new: live.clone() },
+            ],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        };
+        // The id is the change's computed identity, not a chosen constant: the
+        // graph recomputes it on admission and refuses a mismatch. Naming a
+        // placeholder here fails with the hash it should have been, which is a
+        // good error and still a wasted round trip.
+        let change = kin_model::SemanticChange {
+            id: kin_core::compute_semantic_change_id(&change).unwrap(),
+            ..change
+        };
+        graph.create_change(&change).unwrap();
+
+        let revision_of = |id| {
+            graph
+                .to_snapshot()
+                .entity_revisions
+                .get(&id)
+                .and_then(|revisions| revisions.first().map(|rev| rev.revision_id))
+                .expect("the change must record a revision")
+        };
+        let retired_revision = revision_of(retired.id);
+        let live_revision = revision_of(live.id);
+
+        graph.remove_entity(&retired.id).unwrap();
+        assert!(
+            graph.get_entity(&retired.id).unwrap().is_none(),
+            "the entity must actually be retired, or the TRUE arm below is vacuous"
+        );
+
+        // TRUE: the key names an entity that WAS held and is now retired.
+        assert!(
+            unresolved_key_is_retired(
+                &graph,
+                &kin_db::RetrievalKey::EntityRevision(retired_revision)
+            ),
+            "a revision key whose entity was retired must classify as retired, or the \
+             operator is told to run kin admit for a retirement"
+        );
+
+        // FALSE, and each arm blocks a different way of answering true.
+        assert!(
+            !unresolved_key_is_retired(
+                &graph,
+                &kin_db::RetrievalKey::EntityRevision(live_revision)
+            ),
+            "a revision of a LIVE entity is not a retirement"
+        );
+        assert!(
+            !unresolved_key_is_retired(
+                &graph,
+                &kin_db::RetrievalKey::EntityRevision(kin_model::EntityRevisionId::from_hash(
+                    Hash256::from_bytes([0xAB; 32])
+                ))
+            ),
+            "a revision id no entity ever carried is a key the graph never held, not a \
+             retirement; this is the arm that fails if the check answers true on any \
+             unresolvable revision key"
+        );
+        assert!(
+            !unresolved_key_is_retired(&graph, &kin_db::RetrievalKey::Entity(retired.id)),
+            "a plain Entity key is already refused by resolution and is not this \
+             classification's business"
         );
     }
 
@@ -34875,5 +35526,125 @@ mod tests {
             &kin_mcp::budget::ResponseBudget::default(),
         );
         assert_eq!(mcp_result_text(&after), text);
+    }
+}
+
+#[cfg(test)]
+mod transfer_wire_cap_tests {
+    use super::*;
+    use kin_remote::repository_transfer_http::http_body_limit_for;
+
+    /// The size a decoded closure becomes on the wire, base64 included.
+    fn encoded(decoded: u64) -> usize {
+        (decoded.div_ceil(3) * 4) as usize
+    }
+
+    /// A real server carrying the SAME body limit the transfer routes carry,
+    /// built after the environment is set so it reads the configured ceiling.
+    ///
+    /// The library seam cannot see a body limit at all, so a seam test would
+    /// pass while every client got a 413. This is the layer that refuses, so
+    /// this is the layer the arm has to reach.
+    async fn serve_with_transfer_limit() -> (String, tokio::task::JoinHandle<()>) {
+        async fn arrived(body: axum::body::Bytes) -> String {
+            format!("arrived:{}", body.len())
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/transfer/receive",
+            post(arrived).layer(DefaultBodyLimit::max(configured_transfer_http_body_limit())),
+        );
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/transfer/receive"), handle)
+    }
+
+    async fn post_bytes(url: &str, len: usize) -> u16 {
+        let body = vec![b'a'; len];
+        reqwest::Client::new()
+            .post(url)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .expect("the server answered rather than dropping the connection")
+            .status()
+            .as_u16()
+    }
+
+    /// A body at the encoded size of the effective ceiling ARRIVES.
+    ///
+    /// This is the defect that made the ceiling raise invisible: bodies travel
+    /// base64, so a 64 MiB decoded closure is about 86 MiB on the wire, and the
+    /// hand-written 24 MiB wire cap refused it before `validate_pack` ever saw
+    /// it. Every client would have got a bare 413 naming neither the bound nor
+    /// the knob.
+    ///
+    /// The ceiling is set small here so the arm moves kilobytes rather than
+    /// eighty megabytes. It exercises the same derivation, the same layer and
+    /// the same transport; only the number is cheap.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_body_at_the_encoded_ceiling_arrives_over_real_http() {
+        let decoded = 48 * 1024u64;
+        let _knob = kin_core::test_env::EnvVarGuard::set(
+            kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV,
+            decoded.to_string(),
+        );
+        assert_eq!(
+            configured_transfer_http_body_limit(),
+            http_body_limit_for(decoded),
+            "the router's limit must follow the configured ceiling, not the compiled one"
+        );
+
+        let (url, server) = serve_with_transfer_limit().await;
+        let status = post_bytes(&url, encoded(decoded)).await;
+        server.abort();
+
+        assert_eq!(
+            status, 200,
+            "a body at the encoded size of the ceiling must reach the handler, or the raise is \
+             invisible and every client sees a 413 instead of a named refusal"
+        );
+    }
+
+    /// The 413 is the OUTER backstop, not the first thing a client meets.
+    ///
+    /// A pack over the decoded ceiling still has to arrive, so that
+    /// `validate_pack` can refuse it by name and say which bound applied and
+    /// which knob moves it. That only works while the wire cap sits above the
+    /// encoded ceiling, which is what the headroom buys and what this asserts
+    /// over the real transport.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pack_over_the_ceiling_still_arrives_so_the_named_refusal_is_what_fires() {
+        let decoded = 48 * 1024u64;
+        let _knob = kin_core::test_env::EnvVarGuard::set(
+            kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV,
+            decoded.to_string(),
+        );
+        let (url, server) = serve_with_transfer_limit().await;
+
+        // Comfortably past the DECODED ceiling once encoded, and still under
+        // the wire cap. This is the pack `validate_pack` must get to refuse.
+        let over_ceiling = encoded(decoded * 2);
+        assert!(
+            over_ceiling < configured_transfer_http_body_limit(),
+            "the headroom has to leave room for an over-ceiling pack to arrive"
+        );
+        let arrived = post_bytes(&url, over_ceiling).await;
+        assert_eq!(
+            arrived, 200,
+            "an over-ceiling pack must still ARRIVE, or its refusal is a bare 413 rather than \
+             the named one"
+        );
+
+        // And past the wire cap itself, the backstop does fire.
+        let past_cap = configured_transfer_http_body_limit() + 1;
+        let refused = post_bytes(&url, past_cap).await;
+        server.abort();
+        assert_eq!(refused, 413, "the wire cap is still the outer backstop");
     }
 }

@@ -359,6 +359,15 @@ pub struct Degraded {
     /// retires, so it clears itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation_census_loss: Option<bool>,
+    /// This store's last language-server enrichment sweep offered relations the
+    /// graph does not hold, or published some without invalidating their
+    /// endpoints' embeddings. Either way a producer that was supposed to fill
+    /// cross-file relations did not finish the job, so an absence measured here
+    /// may be a gap nothing is working on rather than a gap that is not there.
+    /// Set from the record the sweep writes and the next clean sweep retires,
+    /// so it clears itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrichment_shortfall: Option<bool>,
 }
 
 impl Degraded {
@@ -374,6 +383,7 @@ impl Degraded {
             self.sweep_suspended,
             self.memory_pressure,
             self.relation_census_loss,
+            self.enrichment_shortfall,
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
@@ -410,6 +420,9 @@ impl Degraded {
         }
         if self.relation_census_loss == Some(true) {
             labels.push("relation_census_loss");
+        }
+        if self.enrichment_shortfall == Some(true) {
+            labels.push("enrichment_shortfall");
         }
         labels
     }
@@ -1704,6 +1717,28 @@ impl Envelope {
         self
     }
 
+    /// Stamp that this store's last enrichment sweep did not publish everything
+    /// it offered.
+    ///
+    /// A flag rather than prose for the reason the two above are: the caller
+    /// acting on it is an agent deciding whether an absence it just measured is
+    /// authoritative, and a missing cross-file relation on a store whose sweep
+    /// fell short is a gap nothing is working on, which is a different answer
+    /// from a gap a running sweep is about to fill.
+    ///
+    /// Absent rather than `false` when the last sweep came out clean, because
+    /// `None` says this envelope makes no claim and a fabricated `false` would
+    /// say the store was checked and found whole on a call that never looked.
+    pub fn with_enrichment_shortfall(
+        mut self,
+        shortfall: Option<&kin_daemon_spawn::RefusedEnrichment>,
+    ) -> Self {
+        if shortfall.is_some() {
+            self.degraded.enrichment_shortfall = Some(true);
+        }
+        self
+    }
+
     /// Envelope for the case where the daemon was required but unreachable. The
     /// accompanying tool result is a transport error; this flags it structurally.
     pub fn daemon_unreachable() -> Self {
@@ -2199,18 +2234,74 @@ fn annotate_block(
     };
     let mut annotated = annotated;
     apply_response_budget(&mut annotated, tool_name, budget);
-    // The invariant that keeps the collapse from being undone one block at a
-    // time. It reads what a client will read, after the budget has had its say,
-    // so a block added later cannot reintroduce a second verdict without this
-    // firing in every debug build and every test.
-    debug_assert!(
-        crate::verdict::disagreements(&annotated).is_empty(),
-        "response for {tool_name} contradicts its own verdict: {:?}",
-        crate::verdict::disagreements(&annotated)
-    );
+    disclose_self_contradictions(&mut annotated, tool_name);
     let rendered =
         serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
+}
+
+/// Run the contradiction checker against what a client will actually read, and
+/// publish what it finds.
+///
+/// It used to be reached only from a `debug_assert!`, which a release build
+/// compiles out, so no shipped envelope was ever checked (FIR-2697). The v0.5.52
+/// response that certified an answer over an edge class its own completeness
+/// recorded as absent shipped with this checker present and inert, and the lane
+/// that found the hole found it because a falsification arm which DELETED the
+/// checker came back green under a release build: a removed detector and a
+/// silent one are the same run in that profile.
+///
+/// It discloses rather than panics. A contradiction is a defect in Kin, not in
+/// the caller's repository, and killing the response denies the caller both the
+/// answer and the warning. `_kin.self_check` names each disagreement in the
+/// words the checker uses, so a client, an acceptance run and a bug report all
+/// read the same sentence.
+///
+/// It does NOT feed the verdict. By this point the verdict is computed and the
+/// budget has been applied, so a refusing input arriving here would be a second
+/// verdict rather than an input to the one. The block says the response
+/// disagrees with itself and leaves the verdict as the thing it disagrees with.
+///
+/// The debug assertion it replaced is GONE rather than kept underneath, and that
+/// is deliberate. A panic in debug makes the disclosure untestable, because
+/// every test that constructs a contradiction dies before reaching the block it
+/// is meant to read, and tests are debug builds. A payload a test can assert on
+/// is the stronger guard anyway: `self_check` absent is a positive statement
+/// that nothing disagreed, where a panic that did not fire says only that
+/// nothing reached it.
+///
+/// **This does not close the certified-over-nothing hole (FIR-2723).** A checker
+/// catches a response that contradicts itself. A verdict that certifies over one
+/// input while five are silent contradicts nothing, so no arm here can see it.
+fn disclose_self_contradictions(annotated: &mut Value, tool_name: &str) {
+    let found = crate::verdict::disagreements(annotated);
+    if found.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        tool = tool_name,
+        disagreements = ?found,
+        "response contradicts its own verdict"
+    );
+    let Some(envelope) = annotated
+        .get_mut(ENVELOPE_KEY)
+        .and_then(Value::as_object_mut)
+    else {
+        // No envelope to disclose into. `disagreements` reads the verdict out of
+        // that same envelope, so it cannot have found anything without one, and
+        // this arm is unreachable rather than a silent drop.
+        return;
+    };
+    envelope.insert(
+        "self_check".to_string(),
+        json!({
+            "status": "contradicted",
+            "disagreements": found,
+            "note": "This response contradicts its own verdict, which is a defect in Kin rather \
+                     than a fact about the repository. Trust the most pessimistic reading of the \
+                     blocks named here, and report this.",
+        }),
+    );
 }
 
 /// Bound the fully annotated payload and record what that cost under
@@ -3458,6 +3549,47 @@ mod tests {
     /// than the prose. A closed circuit must claim nothing at all, because a
     /// fabricated `false` says this store was checked and found sweeping on a
     /// call that never looked.
+    /// A store whose last enrichment sweep fell short is flagged, and a store
+    /// whose sweep came out clean makes no claim at all.
+    ///
+    /// The absent case is the half that matters. `None` says this envelope did
+    /// not look; a fabricated `false` would say it looked and found the graph
+    /// whole, which is a claim no call that never read the record can make.
+    #[test]
+    fn an_enrichment_shortfall_is_flagged_and_labelled_and_absent_when_clean() {
+        let clean = Envelope::daemon().with_enrichment_shortfall(None);
+        assert_eq!(
+            clean.degraded.enrichment_shortfall, None,
+            "a sweep that lost nothing must leave this absent, never false"
+        );
+        assert!(!clean
+            .degraded
+            .active_labels()
+            .contains(&"enrichment_shortfall"));
+        assert!(!clean.degraded.any());
+
+        let record = kin_daemon_spawn::RefusedEnrichment {
+            lost: 12,
+            offered: 600,
+            vector_stale: 0,
+            at_unix: 0,
+        };
+        let short = Envelope::daemon().with_enrichment_shortfall(Some(&record));
+        assert_eq!(short.degraded.enrichment_shortfall, Some(true));
+        assert!(
+            short
+                .degraded
+                .active_labels()
+                .contains(&"enrichment_shortfall"),
+            "a flag that is set and not listed is a degradation nothing can observe: {:?}",
+            short.degraded.active_labels()
+        );
+        assert!(
+            short.degraded.any(),
+            "any() enumerates its fields by hand, so a new flag missing from it reports healthy"
+        );
+    }
+
     #[test]
     fn a_suspended_sweep_is_stamped_and_a_running_one_claims_nothing() {
         let running = Envelope::daemon().with_suspended_sweep(None);
@@ -3596,6 +3728,85 @@ mod tests {
         assert!(
             !json.contains("relation_census_loss"),
             "an unobserved flag is absent from the wire, not false: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod self_check_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A response whose blocks all agree, so nothing may be disclosed.
+    fn agreeing() -> Value {
+        json!({
+            "_kin": {
+                "verdict": {
+                    "state": "certified",
+                    "absence_claim": "authoritative",
+                    "safe_to_conclude_absent": true,
+                    "limiting_factor": Value::Null,
+                },
+                "completeness": {
+                    "status": "complete",
+                    "bound": "exact",
+                    "counted": {"reported": 2, "exact": true},
+                    "note": "the counts here are the whole set.",
+                },
+            },
+            "negative": {
+                "safe_to_conclude_absent": true,
+                "trust": "authoritative",
+            },
+        })
+    }
+
+    /// FIR-2697. The checker was reached only from a `debug_assert!`, so a
+    /// release binary never ran it and the v0.5.52 envelope that certified over
+    /// an absent edge class shipped with it present and inert.
+    ///
+    /// It runs unconditionally now and publishes what it finds, so this asserts
+    /// on the block a client reads rather than on a panic a release build
+    /// deletes.
+    #[test]
+    fn a_response_that_contradicts_itself_says_so_where_a_client_reads_it() {
+        let mut value = agreeing();
+        // The completeness refuses while the verdict certifies: the exact shape
+        // that shipped, and the one the certified-direction arms were added for.
+        value["_kin"]["completeness"]["status"] = json!("unknown");
+        value["_kin"]["completeness"]["bound"] = json!("at_least");
+
+        disclose_self_contradictions(&mut value, "find_references");
+
+        let check = &value["_kin"]["self_check"];
+        assert_eq!(check["status"], json!("contradicted"), "{value}");
+        let found = check["disagreements"]
+            .as_array()
+            .expect("the disagreements are named");
+        assert!(
+            found.iter().any(|line| line
+                .as_str()
+                .is_some_and(|line| line.contains("bound reads at_least under a certified"))),
+            "the disclosure names what disagreed: {found:?}"
+        );
+        assert!(
+            check["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("defect in Kin")),
+            "and says whose fault it is, since a caller cannot fix it: {check}"
+        );
+    }
+
+    /// The control, and the half that stops the fix being "disclose always".
+    /// A response whose blocks agree must carry no `self_check` at all, so its
+    /// absence is a positive statement rather than a field nobody set.
+    #[test]
+    fn an_agreeing_response_carries_no_self_check() {
+        let mut value = agreeing();
+        disclose_self_contradictions(&mut value, "find_references");
+        assert!(
+            value["_kin"].get("self_check").is_none(),
+            "an agreeing response disclosed a contradiction: {value}"
         );
     }
 }

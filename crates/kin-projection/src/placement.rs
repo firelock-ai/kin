@@ -328,6 +328,76 @@ mod tests {
         }
     }
 
+    /// A language whose every file carries a Module entity yields `Ambiguous`
+    /// with the candidate list, and that is the honest answer rather than a
+    /// regression.
+    ///
+    /// FIR-2675 made JavaScript and TypeScript emit a Module for every source
+    /// file, as Python has since `python.rs:301`. The fix design read the
+    /// resulting `Ambiguous` as a defect to be solved in the same pull request.
+    /// The sign is backwards. Step 3 has no `file_origin` and no
+    /// `lineage_parent` to go on; before the port it answered `ExistingFile`
+    /// whenever the language happened to have exactly one module file, which is
+    /// sparsity rather than evidence, and with two files it now says it cannot
+    /// decide and names what it could not decide between. A confidently wrong
+    /// answer is the defect; a correctly uncertain one is the honest state.
+    ///
+    /// Two facts bound how much this matters, and both are worth keeping beside
+    /// the assertion. Python has been in exactly this state since its own port,
+    /// so the condition is neither new nor language-specific. And
+    /// `decide_placement` has no caller: it is `pub` here and re-exported from
+    /// `lib.rs`, and a sweep of the workspace finds those two mentions and
+    /// nothing else, so no product surface observes either answer today. If it
+    /// ever gains a caller, what it should answer is that caller's ticket to
+    /// decide, not this one's.
+    ///
+    /// This test exists so the behaviour is asserted rather than incidental.
+    #[test]
+    fn a_per_file_module_language_yields_ambiguous_with_its_candidates() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut modules = Vec::new();
+        let mut tree = Vec::new();
+        for path in ["lib/application.js", "lib/router.js"] {
+            let mut module = make_entity(path, EntityKind::Module, LanguageId::JavaScript);
+            module.file_origin = Some(FilePathId::new(path));
+            modules.push(EntityDelta::Added { new: module });
+            // The graph refuses an entity whose repository path is not in the
+            // staged tree, so the files are staged beside their modules.
+            tree.push(TreeDelta::Added {
+                artifact_id: ArtifactId::new(),
+                new: LocatedEntry::new(
+                    RepoPath::from_utf8(path.to_string()).unwrap(),
+                    TreeEntry::blob(Hash256::from_bytes([0; 32]), false),
+                ),
+            });
+        }
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                entity_deltas: modules,
+                relation_deltas: vec![],
+                tree_deltas: tree,
+                admission_policy_delta: None,
+                external_reference_deltas: vec![],
+            })
+            .unwrap();
+
+        // No file_origin and no lineage_parent, so steps 1 and 2 cannot answer
+        // and step 3 is the one under test.
+        let orphan = make_entity("handle", EntityKind::Function, LanguageId::JavaScript);
+        let working_dir = tempfile::tempdir().unwrap();
+        match decide_placement(&orphan, &graph, working_dir.path()).unwrap() {
+            PlacementDecision::Ambiguous(candidates) => {
+                let mut names: Vec<String> = candidates.iter().map(|f| f.0.clone()).collect();
+                names.sort();
+                assert_eq!(names, vec!["lib/application.js", "lib/router.js"]);
+            }
+            other => panic!(
+                "a per-file-module language must report ambiguity and name its \
+                 candidates, got {other:?}"
+            ),
+        }
+    }
+
     #[test]
     fn generate_file_path_rust() {
         let entity = make_entity("process", EntityKind::Function, LanguageId::Rust);

@@ -60,6 +60,14 @@ const NOT_APPLICABLE: &str = "not_applicable";
 /// counts being called whole.
 const VERDICT_LIMIT: &str = "verdict_inconclusive";
 
+/// What separates two clauses when the factor is rendered as one sentence.
+///
+/// The rendering only. Nothing parses it back: clauses are carried as a list
+/// from the reading that produced them to the single join at serialization,
+/// because this string is also ordinary punctuation inside a clause's prose and
+/// a boundary inferred from it is a boundary a human never chose.
+pub(crate) const CLAUSE_SEPARATOR: &str = "; ";
+
 /// The limiting factor a response bounded by the size budget carries.
 const RESPONSE_BOUNDED_FACTOR: &str = "response_bounded: the response budget withheld part of \
                                        this answer, so its counts are a lower bound and its \
@@ -78,23 +86,32 @@ const RESPONSE_BOUNDED_FACTOR: &str = "response_bounded: the response budget wit
 /// label appears once, because the absence gate already composes the class gap
 /// and the degradations that the later readings repeat as named inputs.
 fn compose_limiting_factor(readings: &[(&str, Reading)]) -> Option<String> {
+    Some(compose_clauses(readings))
+        .filter(|clauses| !clauses.is_empty())
+        .map(|clauses| clauses.join(CLAUSE_SEPARATOR))
+}
+
+/// The factor's clauses, deduplicated by label, in the readings' order.
+///
+/// Each refusing reading hands over the clauses it built. Nothing is split back
+/// out of a joined string here, which is the whole change: the separator is also
+/// ordinary punctuation inside a clause's prose, so a boundary parsed from it is
+/// a boundary no author chose. `cross_file_edges_absent` and
+/// `name_filter_narrowed_to_zero` both carry one, and each used to arrive as a
+/// labelled clause plus a bare fragment that reached the reader with no label at
+/// all.
+fn compose_clauses(readings: &[(&str, Reading)]) -> Vec<String> {
     let mut labels: Vec<String> = Vec::new();
     let mut clauses: Vec<String> = Vec::new();
     for (_, reading) in readings {
-        let Reading::Inconclusive(reason) = reading else {
+        let Reading::Inconclusive(reasons) = reading else {
             continue;
         };
-        for clause in reason
-            .split("; ")
-            .map(str::trim)
-            .filter(|clause| !clause.is_empty())
-        {
-            let label = clause
-                .split(':')
-                .next()
-                .unwrap_or(clause)
-                .trim()
-                .to_string();
+        for clause in reasons.iter().map(|clause| clause.trim()) {
+            if clause.is_empty() {
+                continue;
+            }
+            let label = clause_label(clause);
             if labels.contains(&label) {
                 continue;
             }
@@ -102,15 +119,82 @@ fn compose_limiting_factor(readings: &[(&str, Reading)]) -> Option<String> {
             clauses.push(clause.to_string());
         }
     }
-    (!clauses.is_empty()).then(|| clauses.join("; "))
+    clauses
+}
+
+/// The gap a clause names, which is the text before its first colon.
+///
+/// Two readings that notice the same gap say it once (FIR-2672), and this is
+/// how they are recognised as the same. It is still inferred rather than stated,
+/// which is a known limit recorded on FIR-2723: nothing enforces that two
+/// readings sharing a prefix describe the same gap. What it no longer does is
+/// invent clause boundaries, so a label is always a label an author wrote.
+fn clause_label(clause: &str) -> String {
+    clause
+        .split(':')
+        .next()
+        .unwrap_or(clause)
+        .trim()
+        .to_string()
+}
+
+/// What this response says about absence, which is not what it says about trust.
+///
+/// One bool answered two questions and a reader could not branch on it
+/// (FIR-2673 finding 1). `safe_to_conclude_absent: false` meant either "this
+/// absence is not trustworthy" or "absence is not a concept for this call", and
+/// the second is the common case: a qualifier rides every retrieval answer, so
+/// the field is false on every answer that returned rows. A stranger read one
+/// `list_file_entities` response carrying `state: certified`, a note saying an
+/// absence in it is authoritative, and `safe_to_conclude_absent: false`, all in
+/// one object, and reported that the boolean gives the opposite of the verdict.
+///
+/// Three states, because there were always three cases.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AbsenceClaim {
+    /// This answer returned rows and asserts no absence, so there is nothing to
+    /// conclude absent and nothing to distrust. The case that used to be
+    /// indistinguishable from a refusal.
+    NotApplicable,
+    /// An absence is claimed and every input that could qualify it agreed.
+    Authoritative,
+    /// An absence is claimed and at least one input refuses, so it may not be
+    /// acted on.
+    NotAuthoritative,
+}
+
+impl AbsenceClaim {
+    fn as_str(self) -> &'static str {
+        match self {
+            AbsenceClaim::NotApplicable => "not_applicable",
+            AbsenceClaim::Authoritative => "authoritative",
+            AbsenceClaim::NotAuthoritative => "not_authoritative",
+        }
+    }
+
+    /// The legacy boolean, defined FROM the tri-state so the two can never
+    /// disagree.
+    ///
+    /// Kept because ten shipped tool descriptions name the field, `kin-bench`
+    /// branches on its negative-side twin, and two kinlab launch-copy strings
+    /// and a published blog post describe it. It is bit-identical to what
+    /// `certified && makes_absence_claim` produced.
+    fn legacy_bool(self) -> bool {
+        matches!(self, AbsenceClaim::Authoritative)
+    }
 }
 
 /// One input's reading of the same answer.
 enum Reading {
     /// The input observed nothing that stops this answer being acted on.
     Certified,
-    /// The input refuses, and says why in the reason it carries.
-    Inconclusive(String),
+    /// The input refuses, and says why in the clauses it carries.
+    ///
+    /// A list rather than one string, so the factor is never parsed back out of
+    /// a joined sentence. Most readings build exactly one clause; the absence
+    /// gate composes several, and it is the one whose prose contains the same
+    /// separator the renderer uses.
+    Inconclusive(Vec<String>),
     /// The input has nothing to say about this response, which is different from
     /// saying it is fine. A silent input never certifies anything.
     Silent,
@@ -129,7 +213,7 @@ impl Reading {
 /// The single verdict for one response, plus the inputs it was computed from.
 pub struct Verdict {
     certified: bool,
-    safe_to_conclude_absent: bool,
+    absence_claim: AbsenceClaim,
     limiting_factor: Option<String>,
     inputs: Map<String, Value>,
 }
@@ -188,7 +272,11 @@ impl Verdict {
 
         Some(Verdict {
             certified,
-            safe_to_conclude_absent: certified && makes_absence_claim,
+            absence_claim: match (makes_absence_claim, certified) {
+                (false, _) => AbsenceClaim::NotApplicable,
+                (true, true) => AbsenceClaim::Authoritative,
+                (true, false) => AbsenceClaim::NotAuthoritative,
+            },
             limiting_factor,
             inputs,
         })
@@ -334,20 +422,36 @@ impl Verdict {
 
     /// Serialize for embedding under `_kin.verdict`.
     pub fn to_value(&self) -> Value {
-        let note = if self.certified {
-            "Every input that could qualify this answer agreed, so the counts here are the whole \
-             set and an absence in it is authoritative."
-                .to_string()
-        } else {
-            format!(
+        // The note says the same thing the tri-state says, because it used to
+        // say something else. It promised "an absence in it is authoritative"
+        // on `certified` alone, so a caller whose answer carried five rows and
+        // claimed no absence read that promise beside a `false` flag in the
+        // same object, which is the contradiction FIR-2673 opens with. Each
+        // case now gets the sentence that is true for it.
+        let note = match (self.certified, self.absence_claim) {
+            (true, AbsenceClaim::NotApplicable) => "Every input that could qualify this answer \
+                 agreed, so the counts here are the whole set. This answer returned rows and \
+                 claims no absence, so there is no absence in it to conclude anything from."
+                .to_string(),
+            (true, _) => "Every input that could qualify this answer agreed, so the counts here \
+                 are the whole set and an absence in it is authoritative."
+                .to_string(),
+            (false, AbsenceClaim::NotApplicable) => format!(
+                "Treat this answer as a lower bound. It returned rows and claims no absence, so \
+                 the limit is on how many, not on whether something is missing. Limiting factor: \
+                 {}.",
+                self.limiting_factor.as_deref().unwrap_or("unreported")
+            ),
+            (false, _) => format!(
                 "Treat this answer as a lower bound and do not act on an absence in it. Limiting \
                  factor: {}.",
                 self.limiting_factor.as_deref().unwrap_or("unreported")
-            )
+            ),
         };
         json!({
             "state": if self.certified { CERTIFIED } else { INCONCLUSIVE },
-            "safe_to_conclude_absent": self.safe_to_conclude_absent,
+            "absence_claim": self.absence_claim.as_str(),
+            "safe_to_conclude_absent": self.absence_claim.legacy_bool(),
             "limiting_factor": self.limiting_factor.clone().map(Value::String).unwrap_or(Value::Null),
             "inputs": Value::Object(self.inputs.clone()),
             "note": note,
@@ -373,21 +477,51 @@ fn absence_gate_reading(tool: &str, payload: &Value, negative: Option<&Value>) -
         // rows inconclusive on its own success.
         return match negative.get("trust").and_then(Value::as_str) {
             Some("authoritative") => Reading::Certified,
+            // `trust_reason` arrives as one string off the wire, and it is a
+            // JOIN of clauses: `push_gap` builds it by repeated
+            // `format!("{trust_reason}; {gap}")` across seven call sites. So it
+            // is split back into clauses here, and that is NOT the boundary
+            // inference this change removed elsewhere.
+            //
+            // The difference is which side owns the string. Splitting a factor
+            // Kin had just joined itself was inventing a boundary; splitting a
+            // wire string that IS a join recovers one, and it is safe now
+            // because no clause carries the separator, which
+            // `no_clause_carries_the_separator_that_divides_clauses` asserts on
+            // the producer.
+            //
+            // Taking it as one clause instead was a real regression, caught by
+            // the `two_reasons` acceptance check on a live payload rather than
+            // by any unit test: `trust_reason` carries a `retrieval_degraded`
+            // clause of its own, and as one opaque blob it stopped deduplicating
+            // against the `degradations` reading's, so one answer named that gap
+            // twice. The dedupe was doing real work on this path.
             Some(_) => Reading::Inconclusive(
                 negative
                     .get("trust_reason")
                     .and_then(Value::as_str)
                     .unwrap_or("the absence gate refused and reported no reason")
-                    .to_string(),
+                    .split(CLAUSE_SEPARATOR)
+                    .map(str::trim)
+                    .filter(|clause| !clause.is_empty())
+                    .map(str::to_string)
+                    .collect(),
             ),
             None => Reading::Silent,
         };
     }
-    match crate::negative::absence_coverage_gap(tool, payload) {
-        Some(gap) => Reading::Inconclusive(gap),
-        None if crate::negative::declares_absence_dependency(tool, payload) => Reading::Certified,
-        None => Reading::Silent,
+    // The clauses, never the joined rendering. This is the path the probe on
+    // FIR-2723 caught: `cross_file_edges_absent`'s text carries a semicolon, so
+    // joining here and splitting in the composer cut it into a labelled clause
+    // and a bare fragment that reached the reader with no label at all.
+    let clauses = crate::negative::absence_coverage_clauses(tool, payload);
+    if !clauses.is_empty() {
+        return Reading::Inconclusive(clauses);
     }
+    if crate::negative::declares_absence_dependency(tool, payload) {
+        return Reading::Certified;
+    }
+    Reading::Silent
 }
 
 /// The raw `edge_coverage` observation's own reading, independent of whichever
@@ -424,31 +558,31 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     {
         "available" => {}
         "unsupported" => {
-            return Reading::Inconclusive(format!(
+            return Reading::Inconclusive(vec![format!(
                 "reference_enrichment_unsupported: this build wires no language-server adapter \
                  for {language}, so cross-file reference and override edges cannot exist for it \
                  at all"
-            ))
+            )])
         }
         "no_language_server" => {
-            return Reading::Inconclusive(format!(
+            return Reading::Inconclusive(vec![format!(
                 "reference_enrichment_no_language_server: an adapter is wired for {language} but \
                  no language server for it is installed on this host"
-            ))
+            )])
         }
         _ => {}
     }
     if coverage.get("scope_entities").and_then(Value::as_u64) == Some(0) {
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "absence_scope_empty: the graph holds no entity at all under the filter this query \
              applied for {language}"
-        ));
+        )]);
     }
     if coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true) {
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "edge_coverage_budget_exhausted: the coverage scan for {language} stopped before it \
              could establish what the graph holds"
-        ));
+        )]);
     }
 
     let requested = crate::negative::absence_cross_file_classes(tool, payload);
@@ -468,10 +602,10 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         // sharper reason. Read from the gate's own function so the input's
         // reading and the refusal can never disagree about one observation.
         if crate::negative::coverage_classes_unmeasured(coverage, &requested) {
-            return Reading::Inconclusive(format!(
+            return Reading::Inconclusive(vec![format!(
                 "absence_coverage_unmeasured: this answer measured no coverage class for \
                  {language}, so nothing established what the extractor admitted for it"
-            ));
+            )]);
         }
         return Reading::Certified;
     }
@@ -496,21 +630,21 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     let unproduced = in_state("unproduced");
     if !unproduced.is_empty() {
         let missing = unproduced.join(", ");
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "cross_file_edges_unproduced: this build produced no entity-level {missing} edge for \
              {language} although the source carries {missing} sites the linker resolved, so a \
              use that reaches the target through {missing} could not have been found, and the gap \
              is in the linker, not in the code"
-        ));
+        )]);
     }
     let absent = in_state("absent");
     if !absent.is_empty() {
         let missing = absent.join(", ");
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "cross_file_edges_absent: the graph was not observed to hold cross-file \
              {missing} edges for {language}, so a use that reaches the target through {missing} \
              could not have been found"
-        ));
+        )]);
     }
     let unhealthy: Vec<&str> = deciding
         .iter()
@@ -521,11 +655,11 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         Reading::Certified
     } else {
         let missing = unhealthy.join(", ");
-        Reading::Inconclusive(format!(
+        Reading::Inconclusive(vec![format!(
             "edge_coverage_unknown: whether the graph holds cross-file {missing} edges for \
              {language} could not be established, so a use that reaches the target through \
              {missing} may not have been found"
-        ))
+        )])
     }
 }
 
@@ -546,11 +680,11 @@ fn withheld_candidates_reading(payload: &Value) -> Reading {
         // verdict about nothing.
         None => Reading::Silent,
         Some(0) => Reading::Certified,
-        Some(withheld) => Reading::Inconclusive(format!(
+        Some(withheld) => Reading::Inconclusive(vec![format!(
             "withheld_candidates: {withheld} same-name candidate(s) are carried in `candidates` \
              and are not in the counts here, so the headline is a floor and each withheld row \
              may belong in it"
-        )),
+        )]),
     }
 }
 
@@ -563,11 +697,11 @@ fn degradations_reading(payload: &Value) -> Reading {
     if labels.is_empty() {
         Reading::Certified
     } else {
-        Reading::Inconclusive(format!(
+        Reading::Inconclusive(vec![format!(
             "retrieval_degraded: this query reported degradations [{}], so it did not run at \
              full capability",
             labels.join(", ")
-        ))
+        )])
     }
 }
 
@@ -612,19 +746,19 @@ fn completeness_reading(envelope: &Envelope) -> Reading {
         return Reading::Silent;
     };
     if completeness.status != "complete" {
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "substrate_{}: the coverage classes this answer depended on were not all observed \
              present ({})",
             completeness.status,
             completeness.decided_by.join(", ")
-        ));
+        )]);
     }
     if completeness.bound != "exact" {
-        return Reading::Inconclusive(
+        return Reading::Inconclusive(vec![
             "counts_are_a_floor: this answer's own accounting reports its numbers as a lower \
              bound"
                 .to_string(),
-        );
+        ]);
     }
     Reading::Certified
 }
@@ -1036,7 +1170,7 @@ mod tests {
                 inputs.insert(name.clone(), json!(INCONCLUSIVE));
                 let refusing = Verdict {
                     certified: false,
-                    safe_to_conclude_absent: false,
+                    absence_claim: AbsenceClaim::NotAuthoritative,
                     limiting_factor: Some(format!("{name}: refusing")),
                     inputs,
                 };
@@ -1084,6 +1218,179 @@ mod tests {
         }
     }
 
+    /// FIR-2673 finding 1, the case the stranger read as a refusal.
+    ///
+    /// A populated answer, every input clean, verdict certified. The old bool
+    /// was FALSE here, correctly, because no absence is claimed, and the note
+    /// beside it promised that an absence in the answer was authoritative. A
+    /// consumer branching on the bool got the opposite of the verdict, and the
+    /// one object said both things at once.
+    #[test]
+    fn a_populated_certified_answer_claims_no_absence_and_promises_none() {
+        let payload = populated_reference_payload("present");
+        let negative = json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+
+        assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+        assert_eq!(
+            verdict["absence_claim"],
+            json!("not_applicable"),
+            "a populated answer claims no absence: {verdict}"
+        );
+        let note = verdict["note"].as_str().expect("a note");
+        assert!(
+            !note.contains("absence in it is authoritative"),
+            "the note promised an authoritative absence to an answer claiming none: {note}"
+        );
+        assert!(
+            note.contains("claims no absence"),
+            "and it should say which case this is: {note}"
+        );
+        // The legacy bool stays false here, and that is correct rather than a
+        // bug: it is now DEFINED from the tri-state, so it can no longer
+        // contradict the note beside it.
+        assert_eq!(
+            verdict["safe_to_conclude_absent"],
+            json!(false),
+            "{verdict}"
+        );
+    }
+
+    /// The inverse, and the half that stops the split trading a false certify
+    /// for a field that never says yes.
+    ///
+    /// An empty answer with every requested class present must still certify
+    /// its absence, or a fix that answers `not_applicable` to everything would
+    /// pass the check above and say nothing.
+    #[test]
+    fn an_empty_certified_answer_still_certifies_its_absence() {
+        let mut payload = populated_reference_payload("present");
+        payload["references"] = json!([]);
+        payload["total_upstream"] = json!(0);
+        let negative = json!({ "interpretation": "absence_claimed", "trust": "authoritative" });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+
+        assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+        assert_eq!(
+            verdict["absence_claim"],
+            json!("authoritative"),
+            "an empty certified answer's absence is authoritative: {verdict}"
+        );
+        assert_eq!(verdict["limiting_factor"], Value::Null, "{verdict}");
+        assert_eq!(verdict["safe_to_conclude_absent"], json!(true), "{verdict}");
+        assert!(
+            verdict["note"]
+                .as_str()
+                .expect("a note")
+                .contains("absence in it is authoritative"),
+            "{verdict}"
+        );
+    }
+
+    /// The absence gate's `trust_reason` is a JOIN, and its clauses must
+    /// deduplicate against the later readings' like any others.
+    ///
+    /// This is the regression a unit test did not have. Taking `trust_reason`
+    /// as one opaque clause looked conservative and was not: the negative block
+    /// composes it by repeated concatenation, so it carries a
+    /// `retrieval_degraded` clause of its own, and as one blob that clause
+    /// stopped matching the `degradations` reading's. One live answer then named
+    /// the same gap twice, and the `two_reasons` acceptance check caught it on a
+    /// real payload after every unit test here passed.
+    ///
+    /// Splitting a wire string that IS a join recovers a boundary; splitting a
+    /// factor Kin had just joined itself invented one. Same operation, opposite
+    /// sides of the same seam, and only one of them is parsing prose.
+    #[test]
+    fn a_trust_reason_that_repeats_a_later_reading_says_that_gap_once() {
+        let negative = json!({
+            "trust": "inconclusive",
+            "trust_reason": "response_bounded: the response budget withheld part of this answer; \
+                             retrieval_degraded: this query reported degradations \
+                             [embed_worker:failed], so it did not run at full capability",
+        });
+        let readings = [
+            (
+                "absence_gate",
+                absence_gate_reading("find_references", &json!({}), Some(&negative)),
+            ),
+            (
+                "degradations",
+                Reading::Inconclusive(vec![
+                    "retrieval_degraded: this query reported degradations \
+                                            [embed_worker:failed], so it did not run at full \
+                                            capability"
+                        .to_string(),
+                ]),
+            ),
+        ];
+        let factor = compose_limiting_factor(&readings).expect("two inputs refused");
+        assert_eq!(
+            factor.matches("retrieval_degraded:").count(),
+            1,
+            "the gap the trust_reason and the degradations reading both carry is said once: \
+             {factor}"
+        );
+        assert!(
+            factor.contains("response_bounded:"),
+            "and the trust_reason's other clause survives rather than being swallowed: {factor}"
+        );
+    }
+
+    /// No clause may contain the string that separates clauses.
+    ///
+    /// The invariant the FIR-2723 fix rests on, asserted rather than assumed.
+    /// Clauses are carried as a list now, so Kin no longer mis-parses its own
+    /// factor, but the rendered sentence is still one string, and any reader
+    /// that splits it on the separator sees whatever the prose contains. Two
+    /// gap texts used to carry one, `cross_file_edges_absent` and
+    /// `name_filter_narrowed_to_zero`, and each arrived at the reader as a
+    /// labelled clause plus a bare fragment with no label at all.
+    ///
+    /// This drives the real producer over the shapes that reach it rather than
+    /// re-listing the texts, because a test that restates the strings is a
+    /// second copy of them and goes stale the day one is edited.
+    #[test]
+    fn no_clause_carries_the_separator_that_divides_clauses() {
+        let shapes = [
+            ("find_references", populated_reference_payload("absent")),
+            ("find_references", populated_reference_payload("unproduced")),
+            ("find_references", populated_reference_payload("unknown")),
+            ("impact_analysis", populated_reference_payload("absent")),
+            ("trace_data_flow", populated_reference_payload("absent")),
+        ];
+        let mut seen = 0;
+        for (tool, payload) in &shapes {
+            for clause in crate::negative::absence_coverage_clauses(tool, payload) {
+                seen += 1;
+                assert!(
+                    !clause.contains(CLAUSE_SEPARATOR),
+                    "{tool}: a clause carries the separator, so any reader that splits the \
+                     rendered factor will cut it into a labelled clause and an unlabelled \
+                     fragment: {clause}"
+                );
+            }
+        }
+        assert!(
+            seen > 0,
+            "no clause was produced by any shape, so this asserted nothing"
+        );
+    }
+
     /// FIR-2672, second finding. A verdict with two independent reasons names
     /// both: the class gap decided the state and the failed embedding worker
     /// stayed in the sentence after it, and the gap the absence gate and the
@@ -1094,27 +1401,27 @@ mod tests {
         let readings = [
             (
                 "absence_gate",
-                Reading::Inconclusive(
+                Reading::Inconclusive(vec![
                     "cross_file_edges_absent: the graph holds no cross-file imports edges for \
                      python"
                         .to_string(),
-                ),
+                ]),
             ),
             (
                 "edge_coverage",
-                Reading::Inconclusive(
+                Reading::Inconclusive(vec![
                     "cross_file_edges_absent: the graph was not observed to hold imports edges"
                         .to_string(),
-                ),
+                ]),
             ),
             ("withheld_candidates", Reading::Certified),
             (
                 "degradations",
-                Reading::Inconclusive(
+                Reading::Inconclusive(vec![
                     "retrieval_degraded: this query reported degradations [embed_worker_failed], \
                      so it did not run at full capability"
                         .to_string(),
-                ),
+                ]),
             ),
             ("completeness", Reading::Silent),
         ];
@@ -1169,6 +1476,31 @@ mod tests {
             factor.matches("cross_file_edges_absent:").count(),
             1,
             "one fact, one clause: {factor}"
+        );
+        // WHICH of the two clauses survives is decided by the readings array's
+        // order, not by the dedupe rule, and nothing else asserts it. The
+        // absence gate precedes the coverage reading, and its clause is the
+        // specific one: it names the language and says which classes do not
+        // stand in for the missing one. Swap the two in `compute` and both the
+        // assertion above and `every_refusing_input_keeps_its_clause_in_the_factor`
+        // stay green while every real reader quietly gets the shorter clause.
+        // Both clauses name the language, so that is not the difference. The
+        // absence gate's says where the gap IS, in extraction rather than in
+        // the caller's code, and why the classes that ARE present do not stand
+        // in for the missing one. The coverage reading's says only that the
+        // edges were not observed. A reader who acts on the first does not go
+        // looking through their own source; a reader who acts on the second
+        // might.
+        assert!(
+            factor.contains("rather than in the code"),
+            "the surviving clause is the absence gate's, which tells the reader the gap is not \
+             in their code. Which of the two survives is decided by the readings array's ORDER, \
+             not by the dedupe rule, so reordering `compute` silently downgrades what every \
+             reader sees while every other assertion here stays green: {factor}"
+        );
+        assert!(
+            factor.contains("do not stand in for"),
+            "and why the classes that are present do not compensate: {factor}"
         );
         assert!(factor.contains("embed_worker:failed"), "{factor}");
     }
@@ -1574,7 +1906,7 @@ mod tests {
             inputs.insert("graph_freshness".to_string(), json!(unknown_state));
             Verdict {
                 certified: false,
-                safe_to_conclude_absent: false,
+                absence_claim: AbsenceClaim::NotAuthoritative,
                 limiting_factor: Some("graph_freshness: the store is stale".to_string()),
                 inputs,
             }
@@ -1605,7 +1937,7 @@ mod tests {
         inputs.insert("completeness".to_string(), json!(INCONCLUSIVE));
         let verdict = Verdict {
             certified: false,
-            safe_to_conclude_absent: false,
+            absence_claim: AbsenceClaim::NotAuthoritative,
             limiting_factor: Some("completeness: unknown".to_string()),
             inputs,
         };

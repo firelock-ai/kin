@@ -41,8 +41,8 @@ for byte. You never open, stage or commit a transaction yourself, and those tool
 on your belt on purpose. The harness does it around every call you make: a file you create \
 with write_file is staged as Kin's create operation, carrying the repository-relative path \
 and the full body, and committed with provenance naming this agent. An edit to a file Kin \
-already tracks lands in the working tree and is recorded in this run's trace, and the \
-harness does not yet admit that edit to the graph in the same step.
+already tracks is staged as Kin's replace operation, carrying that path and the file's \
+complete new text as your edit left it, and committed the same way.
 
 Your tools are the mcp__kin__ ones named above plus edit_file and write_file. You have no \
 others.
@@ -675,6 +675,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                     &mut bracket,
                                                     session.as_deref(),
                                                     &plan,
+                                                    None,
                                                     &mut writer,
                                                 )?;
                                                 let provenance = close_transaction(
@@ -729,6 +730,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                         &mut bracket,
                                                         session.as_deref(),
                                                         &plan,
+                                                        outcome.body.as_deref(),
                                                         &mut writer,
                                                     )?
                                                 };
@@ -826,7 +828,12 @@ fn annotate(
     surfaced_degraded: &mut bool,
 ) -> String {
     let mut text = outcome.text.clone();
-    if outcome.safe_to_conclude_absent() == Some(false) {
+    // `claims_absence` first, and it is not a refinement. `safe_to_conclude_absent`
+    // is false on every POPULATED answer, because no absence is being claimed
+    // there, so this branch alone appended "This result is empty" to answers
+    // carrying rows, told the model to treat them as unknown, and counted each
+    // one as an unsafe absence event (FIR-2673 finding 1).
+    if outcome.claims_absence() && outcome.safe_to_conclude_absent() == Some(false) {
         counters.unsafe_absence_events += 1;
         let gap = outcome
             .limiting_factor()
@@ -1010,18 +1017,25 @@ fn end_kin_session(server: &mut Server, writer: &mut TranscriptWriter) -> anyhow
 
 /// What the harness will stage inside the bracket for one local tool call.
 ///
-/// `kin_transaction_stage` admits five disjoint shapes (`crates/kin-mcp/src/tools.rs`),
-/// and exactly one of them is keyed on a repository-relative path plus a body: the new
-/// source file, verb `create`. The in-place edit shape resolves its target against
-/// repository authority as an entity uuid or an exact entity name
+/// `kin_transaction_stage` admits several disjoint shapes (`crates/kin-mcp/src/tools.rs`),
+/// and two of them are keyed on a repository-relative path plus the file's whole text: the
+/// new source file, verb `create`, and the rewritten one, verb `replace`. Between them they
+/// cover both local tools, because a path and a complete body is exactly what a local write
+/// or edit leaves the harness holding. The entity-keyed `update` shape resolves its target
+/// against repository authority as an entity uuid or an exact entity name
 /// (`kin_mcp::handlers::sessions::resolve_target_entity`), which a text splice does not
-/// know, so the harness plans nothing for an edit rather than staging a shape the daemon
-/// would refuse at commit. A transaction with nothing in it is refused too, by design, so
-/// an unstageable call opens no transaction at all and the trace says why.
+/// know, so the harness never plans that one. A transaction with nothing in it is refused
+/// by design, so an unstageable call opens no transaction at all and the trace says why.
 enum StagePlan {
     /// Admit the file at this repository-relative path with this body. Repository
     /// authority refuses it by name if it already tracks the path.
     Create { target: String, body: String },
+    /// Rewrite the tracked file at this repository-relative path from its complete new
+    /// text. The body is deliberately not carried here: an edit's new text does not exist
+    /// until the edit has run, and this plan is made before it, so the body is read from
+    /// the file the harness just wrote. Repository authority refuses the operation by name
+    /// if it does not already track the path.
+    Replace { target: String },
     /// Nothing the stage surface admits fits this call, and this is the reason.
     Unstageable { reason: String },
 }
@@ -1030,18 +1044,25 @@ enum StagePlan {
 ///
 /// Whether the path is new is repository authority's question, not the filesystem's, and
 /// the two answers differ: a path can sit on disk untracked, or be tracked with nothing on
-/// disk yet. So the harness plans the create and lets the daemon refuse it by name if the
-/// graph already holds that path, which is the rule `create` documents. Probing the disk
-/// here would put a filesystem heuristic on the runtime path to answer a question the
-/// graph owns.
+/// disk yet. So the harness plans the create for a write and the replace for an edit, and
+/// lets the daemon refuse either by name when the graph disagrees about whether it holds
+/// that path, which is the rule both verbs document. Probing the disk here would put a
+/// filesystem heuristic on the runtime path to answer a question the graph owns.
 fn plan_stage(repo: &Path, tool: LocalTool, arguments: &Value) -> StagePlan {
     let raw_path = arguments.get("path").and_then(Value::as_str).unwrap_or("");
     match tool {
-        LocalTool::Edit => StagePlan::Unstageable {
-            reason: "an in-place edit has no stage shape keyed on a path; the update \
-                     operation names an entity uuid or an exact entity name"
-                .into(),
-        },
+        LocalTool::Edit => {
+            let path = match belt::resolve_in_repo(repo, raw_path) {
+                Ok(path) => path,
+                Err(problem) => return StagePlan::Unstageable { reason: problem },
+            };
+            match repository_relative(repo, &path) {
+                Some(target) => StagePlan::Replace { target },
+                None => StagePlan::Unstageable {
+                    reason: "the path did not reduce to a repository-relative target".into(),
+                },
+            }
+        }
         LocalTool::Write => {
             let content = arguments
                 .get("content")
@@ -1181,19 +1202,56 @@ fn stage_planned_operation(
     bracket: &mut Bracket,
     session: Option<&str>,
     plan: &StagePlan,
+    produced: Option<&str>,
     writer: &mut TranscriptWriter,
 ) -> anyhow::Result<bool> {
     let server_name = server.name();
-    let (Some(transaction_id), StagePlan::Create { target, body }) =
-        (bracket.transaction_id.clone(), plan)
-    else {
+    let Some(transaction_id) = bracket.transaction_id.clone() else {
         return Ok(false);
     };
+    // A create carries the body the model sent, because the file does not exist yet and
+    // repository authority is what writes it. A replace carries the file's complete new
+    // text, which only exists once the edit has run, so it comes from the tool that just
+    // ran rather than from the plan that was made before it.
+    let (verb, target, body) = match plan {
+        StagePlan::Create { target, body } => ("create", target.clone(), body.clone()),
+        StagePlan::Replace { target } => match produced {
+            Some(body) if !body.is_empty() => ("replace", target.clone(), body.to_string()),
+            _ => {
+                // Nothing is staged, so the bracket aborts rather than committing an empty
+                // transaction, and the provenance says so instead of going quiet.
+                let detail = format!("the edit of {target} produced no text to admit to the graph");
+                writer.trace(json!({
+                    "surface": "kin",
+                    "server": server_name,
+                    "tool": "kin_transaction_stage",
+                    "policy": "allowed",
+                    "event": "transaction_stage",
+                    "transaction_id": transaction_id,
+                    "verb": "replace",
+                    "target": target,
+                    "is_error": true,
+                    "detail": detail.clone(),
+                }))?;
+                bracket.staged = Some(json!({
+                    "verb": "replace",
+                    "target": target,
+                    "accepted": false,
+                    "detail": detail,
+                }));
+                return Ok(false);
+            }
+        },
+        StagePlan::Unstageable { .. } => return Ok(false),
+    };
     let operation = json!({
-        "verb": "create",
+        "verb": verb,
         "target": target,
         "body": body,
-        "description": format!("kin agent created {target}"),
+        "description": match verb {
+            "replace" => format!("kin agent rewrote {target}"),
+            _ => format!("kin agent created {target}"),
+        },
     });
     let mut arguments = json!({
         "transaction_id": transaction_id,
@@ -1214,14 +1272,14 @@ fn stage_planned_operation(
         "policy": "allowed",
         "event": "transaction_stage",
         "transaction_id": transaction_id,
-        "verb": "create",
+        "verb": verb,
         "target": target,
         "body_bytes": body.len(),
         "is_error": is_error,
         "detail": detail,
     }))?;
     bracket.staged = Some(json!({
-        "verb": "create",
+        "verb": verb,
         "target": target,
         "body_bytes": body.len(),
         "accepted": !is_error,
@@ -1406,4 +1464,89 @@ pub fn probe_mcp(
 /// Timestamp helper re-exported so callers can stamp their own records the same way.
 pub fn timestamp() -> String {
     now_iso()
+}
+
+#[cfg(test)]
+mod annotate_tests {
+    use super::*;
+    use crate::mcp::ToolOutcome;
+
+    fn outcome(text: &str, negative: Value) -> ToolOutcome {
+        ToolOutcome {
+            text: text.to_string(),
+            is_error: false,
+            envelope: None,
+            negative: Some(negative),
+            unreadable: false,
+            wall_ms: 1,
+        }
+    }
+
+    const EMPTY_WARNING: &str = "This result is empty";
+
+    /// FIR-2673 finding 1. A populated answer is not an absence claim, and the
+    /// warning that says it is must not reach the model.
+    ///
+    /// `safe_to_conclude_absent` is false here, and that is CORRECT: no absence
+    /// is being claimed, so none can be concluded. Reading that `false` as "the
+    /// absence cannot be trusted" appended "This result is empty" to an answer
+    /// carrying rows, told the model to treat it as unknown and not to answer
+    /// another way, and counted it as an unsafe absence event.
+    #[test]
+    fn a_populated_answer_is_never_told_it_is_empty() {
+        let mut counters = Counters::new();
+        let mut surfaced = false;
+        let annotated = annotate(
+            &outcome(
+                "3 rows",
+                json!({
+                    "safe_to_conclude_absent": false,
+                    "interpretation": "qualified_answer",
+                    "result_count": 3,
+                    "limiting_factor": "python bodies are not indexed",
+                }),
+            ),
+            &mut counters,
+            &mut surfaced,
+        );
+        assert!(
+            !annotated.contains(EMPTY_WARNING),
+            "a populated answer was told it was empty: {annotated}"
+        );
+        assert_eq!(
+            counters.unsafe_absence_events, 0,
+            "a populated answer counted as an unsafe absence"
+        );
+    }
+
+    /// The control, and the half that stops the fix being "warn about nothing".
+    /// A genuinely empty answer whose absence Kin refuses to trust must still
+    /// get the warning and still be counted.
+    #[test]
+    fn an_untrusted_empty_answer_still_gets_the_warning() {
+        let mut counters = Counters::new();
+        let mut surfaced = false;
+        let annotated = annotate(
+            &outcome(
+                "no rows",
+                json!({
+                    "safe_to_conclude_absent": false,
+                    "interpretation": "absence_claimed",
+                    "result_count": 0,
+                    "limiting_factor": "python bodies are not indexed",
+                }),
+            ),
+            &mut counters,
+            &mut surfaced,
+        );
+        assert!(
+            annotated.contains(EMPTY_WARNING),
+            "an untrusted absence lost its warning: {annotated}"
+        );
+        assert!(
+            annotated.contains("python bodies are not indexed"),
+            "the warning must name the gap it was given: {annotated}"
+        );
+        assert_eq!(counters.unsafe_absence_events, 1);
+    }
 }

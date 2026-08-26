@@ -17,7 +17,7 @@ use std::collections::HashMap;
 
 use kin_index::{link_cross_file, FileParseData};
 use kin_model::{ArtifactId, Entity, EntityKind, FilePathId, GraphNodeId, RelationKind};
-use kin_parser::{JavaScriptAdapter, LanguageAdapter, PythonAdapter};
+use kin_parser::{JavaScriptAdapter, LanguageAdapter, PythonAdapter, TypeScriptAdapter};
 
 fn parse_with(adapter: &dyn LanguageAdapter, path: &str, src: &str) -> FileParseData {
     let file_id = FilePathId::new(path);
@@ -45,6 +45,22 @@ fn py(path: &str, src: &str) -> FileParseData {
 
 fn js(path: &str, src: &str) -> FileParseData {
     parse_with(&JavaScriptAdapter, path, src)
+}
+
+fn ts(path: &str, src: &str) -> FileParseData {
+    parse_with(&TypeScriptAdapter, path, src)
+}
+
+/// The module entity's name, or `None`.
+///
+/// The presence check alone would pass on a module named anything at all, and
+/// the name is half of what FIR-2675 decides: an index file takes its
+/// directory's name and every other file takes its own stem.
+fn module_entity_name(file: &FileParseData) -> Option<&str> {
+    file.entities
+        .iter()
+        .find(|e| e.kind == EntityKind::Module)
+        .map(|e| e.name.as_str())
 }
 
 fn link(files: &[FileParseData]) -> Vec<kin_model::Relation> {
@@ -213,12 +229,12 @@ fn python_import_of_an_undefined_name_produces_no_entity_edge() {
 /// A non-index JavaScript file carries no module entity, so it cannot source an
 /// entity-level import edge however well its specifier resolved.
 ///
-/// This test asserts the CURRENT limitation on purpose. It is the honest record
-/// that JavaScript is not fixed, and it is written to fail loudly the day the
-/// JavaScript adapter starts emitting module entities for ordinary files, so
-/// nobody has to remember to come back and check.
+/// FIR-2675 turned this from a limitation into the behaviour. It was written to
+/// fail the day the JavaScript adapter started emitting module entities for
+/// ordinary files, and that is this change; the assertion is inverted rather
+/// than deleted, so the record of what moved stays in the file.
 #[test]
-fn javascript_non_index_file_still_sources_no_entity_import_edge() {
+fn javascript_non_index_file_sources_an_entity_import_edge() {
     let files = vec![
         js("lib/router.js", "function Router() {}\nmodule.exports = Router;\n"),
         js(
@@ -226,16 +242,45 @@ fn javascript_non_index_file_still_sources_no_entity_import_edge() {
             "var Router = require('./router');\nfunction use() { return Router(); }\nmodule.exports = use;\n",
         ),
     ];
-    assert!(
-        !has_module_entity(&files[1]),
-        "lib/application.js now carries a module entity; the JavaScript adapter changed, \
-         so the entity-level import edge for non-index files is now buildable and this \
-         limitation test should be replaced by a positive assertion"
+    assert_eq!(
+        module_entity_name(&files[1]),
+        Some("application"),
+        "a non-index file takes its own stem, the way a Python module does"
     );
+    // The edge lands on the MODULE, not on the function inside it, and that is
+    // the right target rather than a near miss. `require('./router')` names the
+    // whole module; `module.exports = Router` is what makes the two the same
+    // object at runtime, and the graph should say what the source said. Python
+    // already behaves this way for `import routing`, which is why this port
+    // mirrors it rather than inventing a rule. Before this change `lib/router.js`
+    // had no module entity at all, so the edge existed for nothing to land on.
     let pairs = entity_import_pairs(&files);
     assert!(
-        pairs.is_empty(),
-        "a non-index JavaScript file sourced an entity-level import edge; got {pairs:?}"
+        pairs.contains(&("application".to_string(), "router".to_string())),
+        "lib/application.js must source an entity-level import edge to the router module; \
+         got {pairs:?}"
+    );
+}
+
+/// A NAMED import still reaches the named entity rather than the module.
+///
+/// The test above pins that a whole-module require names the module. This pins
+/// the other half, because a port that made every import land on a module would
+/// satisfy that one while destroying the specifier-level answer `find_references`
+/// is built on.
+#[test]
+fn a_named_javascript_import_binds_the_named_entity_not_the_module() {
+    let files = vec![
+        js("lib/router.js", "export function Router() {}\n"),
+        js(
+            "lib/application.js",
+            "import { Router } from './router';\nexport function use() { return Router(); }\n",
+        ),
+    ];
+    let pairs = entity_import_pairs(&files);
+    assert!(
+        pairs.contains(&("application".to_string(), "Router".to_string())),
+        "a named import must bind the named entity; got {pairs:?}"
     );
 }
 
@@ -340,24 +385,94 @@ fn javascript_index_file_in_a_named_directory_carries_a_module_entity() {
     );
 }
 
-/// An `index.js` sitting directly in `lib/` or `src/` carries NO module entity,
-/// because `extract_module_name_from_path` refuses those two directory names
-/// outright.
+/// An `index.js` directly in `lib/` or `src/` now carries a module entity too.
 ///
-/// This is the sharper half of the JavaScript gap and it is worth pinning
-/// separately: the exclusion lands on exactly the directories a real library
-/// keeps its code in, so express's own `lib/` is unreachable at entity level
-/// twice over, once for not being an index file and once for the directory
-/// name. Asserted as the current limitation, and written to fail the day the
-/// rule changes.
+/// The old rule refused those two directory names outright, which landed on
+/// exactly the directories a real library keeps its code in: express's own
+/// `lib/` was unreachable at entity level twice over, once for not being an
+/// index file and once for the directory name. Python carries no such blocklist
+/// and neither does this any more, so `lib/index.js` is named `lib`, which is
+/// what `require('./lib')` calls it.
 #[test]
-fn javascript_index_file_directly_under_lib_or_src_carries_no_module_entity() {
-    for path in ["lib/index.js", "src/index.js"] {
+fn javascript_index_file_directly_under_lib_or_src_carries_a_module_entity() {
+    for (path, expected) in [("lib/index.js", "lib"), ("src/index.js", "src")] {
         let file = js(path, "module.exports = require('./router');\n");
-        assert!(
-            !has_module_entity(&file),
-            "{path} now carries a module entity; the JavaScript adapter's src/lib \
-             exclusion changed and this limitation test should become a positive one"
+        assert_eq!(
+            module_entity_name(&file),
+            Some(expected),
+            "{path} must carry a module entity named after its directory"
         );
     }
+}
+
+/// A root-level `index.js` still carries nothing, and that is deliberate.
+///
+/// An index file is named after the directory it indexes, and a file at the
+/// repository root has no such directory. It produced nothing before this change
+/// and produces nothing after it, so the port did not quietly widen into a case
+/// with no sensible name.
+#[test]
+fn a_root_level_index_file_carries_no_module_entity() {
+    let file = js("index.js", "module.exports = require('./lib/router');\n");
+    assert_eq!(module_entity_name(&file), None);
+}
+
+/// TypeScript had NO module-entity test at all before this change, so this is
+/// added rather than converted. The two adapters carried byte-identical copies
+/// of the rule and drifted anyway, which is why they now share one helper.
+#[test]
+fn typescript_files_carry_module_entities_by_the_same_rule_as_javascript() {
+    for (path, expected) in [
+        ("lib/application.ts", Some("application")),
+        ("components/Button.tsx", Some("Button")),
+        (
+            "packages/mui-base/src/useSelect/index.ts",
+            Some("useSelect"),
+        ),
+        ("lib/index.ts", Some("lib")),
+        ("index.ts", None),
+    ] {
+        let file = ts(path, "export function use() { return 1; }\n");
+        assert_eq!(
+            module_entity_name(&file),
+            expected,
+            "TypeScript module identity for {path}"
+        );
+    }
+}
+
+/// A `.d.ts` declaration file is named `foo`, not `foo.d`.
+///
+/// This is the drift the shared helper exists to stop: the old
+/// `is_ts_index_file` never matched `index.d.ts`, and stripping only `.ts` from
+/// `foo.d.ts` leaves a name no source ever writes. It is a separate test from
+/// the table above because it is the one case where suffix ORDER decides the
+/// answer.
+#[test]
+fn a_typescript_declaration_file_is_named_without_its_d_segment() {
+    assert_eq!(
+        module_entity_name(&ts(
+            "types/express.d.ts",
+            "export declare const x: number;\n"
+        )),
+        Some("express")
+    );
+}
+
+/// A path carrying none of the language's suffixes emits nothing.
+///
+/// This mirrors `python_module_identity`'s `.strip_suffix(".py").unwrap_or("")`
+/// exactly, and it is the guard that matters most: `round_trip_fuzz.rs` passes
+/// an extension-less `FilePathId`, and a module entity there would span the
+/// whole file and swallow every other entity in the region.
+#[test]
+fn an_extension_less_path_emits_no_module_entity() {
+    assert_eq!(
+        module_entity_name(&js("some/fixture", "function a() {}\n")),
+        None
+    );
+    assert_eq!(
+        module_entity_name(&ts("some/fixture", "function a() {}\n")),
+        None
+    );
 }

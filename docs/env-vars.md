@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (497 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (498 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -88,6 +88,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_STORAGE` | string | local | operational | daemon storage backend selector (e.g. local, gcs) |
 | `KIN_STRICT_BEHAVIOR_ENV` | bool | false | operational | escalate a CLI/daemon behavior-env divergence from a warning to a hard error |
 | `KIN_STRICT_BUILD_MATCH` | bool | false | correctness | require a strict historical build match when resolving a ref view |
+| `KIN_TRANSFER_MAX_DECODED_BODY_BYTES` | usize | 67108864 | operational | kin-daemon receive ceiling for one transfer pack's decoded body closure, in bytes; unset, zero or unparseable keeps the compiled 64 MiB, and the effective bound is always the smaller of this and what the sending peer advertised, so raising it never overrides a peer. It is a transport bound, not the product's answer to repository size, and it is held in memory per concurrent receive |
 | `KIN_VECTOR_SIMD` | bool | true | correctness | kin-vector NEON SIMD cosine-distance kernel on aarch64, on by default; only 0/false/no/off select the scalar reduction, and the two reduction orders differ in the last ULPs so distances and therefore ranking order can shift |
 | `KIN_VFS_BIN` | path | *(unset)* | operational | pin the `kin-vfs` projection driver Kin probes and runs, instead of searching beside the `kin` binary, in `~/.kin/bin`, and on PATH. When set it is the only candidate, so a pin naming a file that is not there reports an absent driver rather than resolving to another one. Use it to run a driver built with a mount feature without reordering PATH |
 | `KIN_VFS_DISABLE` | bool | false | correctness | kin-vfs interception kill switch: the literal 1 disables every projected read and write, default off |

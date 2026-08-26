@@ -1163,6 +1163,121 @@ fn grade_unwatched_death(kin_root: &Path, serving: &ServingDaemon) -> DaemonKill
     }
 }
 
+/// Where `kin_root` records what an enrichment sweep could not publish.
+pub const REFUSED_ENRICHMENT_FILE_NAME: &str = "lsp-refused-enrichment";
+
+/// Path to that record.
+pub fn refused_enrichment_path(kin_root: &Path) -> PathBuf {
+    kin_root.join(REFUSED_ENRICHMENT_FILE_NAME)
+}
+
+/// What an enrichment sweep offered the graph and did not get published, and
+/// what it published whose vectors may now be stale.
+///
+/// Durable for the reason [`SuspendedSweep`] and the pressure record are: the
+/// process that lost the work is a daemon nobody is watching, and every surface
+/// that has to say so runs later and in another process. Before this the whole
+/// disclosure was a `debug!` line per relation and a `warn!` with the totals,
+/// which is to say it reached a log nobody opens.
+///
+/// Two numbers rather than one because they are different claims. `lost` is
+/// relations the graph does not hold, which is data gone. `vector_stale` is
+/// relations the graph DOES hold whose embedding invalidation failed after the
+/// insert, so nothing is lost and some vectors may be out of date. Reporting
+/// the second as the first is how a sweep that dropped nothing gets recorded as
+/// having dropped hundreds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RefusedEnrichment {
+    /// Relations offered that the graph does not hold afterwards.
+    pub lost: u32,
+    /// Relations offered in the pass that recorded this.
+    pub offered: u32,
+    /// Relations the graph holds whose embedding invalidation failed.
+    pub vector_stale: u32,
+    /// When the pass ran, in unix seconds.
+    pub at_unix: u64,
+}
+
+impl RefusedEnrichment {
+    /// Record one pass's shortfall for this store.
+    ///
+    /// Last writer wins, like the pressure record: the useful fact is the most
+    /// recent pass, and a history of them would be a log with worse ergonomics.
+    /// A write that fails is dropped, because a daemon that cannot write its own
+    /// disclosure must not fail the work it was disclosing about.
+    pub fn record(kin_root: &Path, lost: u32, offered: u32, vector_stale: u32) {
+        let record = Self {
+            lost,
+            offered,
+            vector_stale,
+            at_unix: unix_now(),
+        };
+        if let Ok(body) = serde_json::to_vec(&record) {
+            let _ = fs::write(refused_enrichment_path(kin_root), body);
+        }
+    }
+
+    /// What this store records, or `None` when it records nothing.
+    ///
+    /// An unreadable or unparsable record reads as absent, for the same reason
+    /// the sweep tally does: this record exists to report a degradation and it
+    /// must never become one.
+    pub fn read(kin_root: &Path) -> Option<Self> {
+        let raw = fs::read(refused_enrichment_path(kin_root)).ok()?;
+        serde_json::from_slice(&raw).ok()
+    }
+
+    /// Retire the record, because a pass has since published everything it
+    /// offered with no stale vectors behind it.
+    ///
+    /// Called by the pass that comes out clean. Without this the row heals only
+    /// when a store is reinitialized, and a surface reporting last week's
+    /// shortfall reads exactly like one reporting this second's.
+    pub fn clear(kin_root: &Path) {
+        let _ = fs::remove_file(refused_enrichment_path(kin_root));
+    }
+
+    /// The fact alone, for a surface that carries its own remediation field.
+    ///
+    /// It does not say which relations, because the record keeps counts and no
+    /// ids. Naming them here would be the one thing on this line a reader could
+    /// not check.
+    pub fn cause_sentence(&self) -> String {
+        match (self.lost, self.vector_stale) {
+            (0, stale) => format!(
+                "this store's last enrichment sweep published everything it offered, but {stale} \
+                 of those relations left their endpoints' embeddings uninvalidated, so those \
+                 vectors may not reflect the edges now around them"
+            ),
+            (lost, 0) => format!(
+                "this store's last enrichment sweep offered {} relations and the graph does not \
+                 hold {lost} of them, so cross-file relations are short by that much and nothing \
+                 is retrying them",
+                self.offered
+            ),
+            (lost, stale) => format!(
+                "this store's last enrichment sweep offered {} relations, the graph does not hold \
+                 {lost} of them, and {stale} more were published without their embeddings being \
+                 invalidated",
+                self.offered
+            ),
+        }
+    }
+
+    /// What the reader can do about it.
+    pub fn remediation(&self) -> String {
+        "Run `kin daemon sweep` to offer them again; a pass that publishes everything clears \
+         this. If relations keep failing to publish, the graph is refusing them and the daemon \
+         log names the endpoint on each."
+            .to_string()
+    }
+
+    /// The whole thing on one line, for a surface that has only one line.
+    pub fn summary(&self) -> String {
+        format!("{}; run `kin daemon sweep` to retry", self.cause_sentence())
+    }
+}
+
 /// A store whose language-server enrichment has been switched off by the
 /// circuit, and the tally that switched it off.
 ///

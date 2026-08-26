@@ -1020,7 +1020,7 @@ fn a_converted_store_reports_its_admission_rather_than_unknown_freshness() {
 fn graph_status_publishes_per_language_parse_coverage_without_a_verdict() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
-    seed_javascript_repository(&repo, 3);
+    seed_mixed_language_repository(&repo, 3);
     let admitted = admit_seeded(&repo);
     let graph = workspace_query_graph(&admitted.binding);
     let response = graph_status(&admitted.binding, &graph);
@@ -1030,19 +1030,36 @@ fn graph_status_publishes_per_language_parse_coverage_without_a_verdict() {
         lines.contains("Parse coverage (files that produced an entity / files admitted):"),
         "the section prints: {lines}"
     );
+    // The denominator assertion moves to the rust row, and it has to: every one
+    // of the four JavaScript files now produces an entity, so a javascript row
+    // reading 4/4 could not tell a correct denominator from one that had been
+    // subtracted down to the numerator. The rust row is 0 of 3, where the two
+    // counts differ and the subtraction bug this guards would show.
     let row = response
+        .lines
+        .iter()
+        .find(|line| line.trim_start().starts_with("rust:"))
+        .unwrap_or_else(|| panic!("no rust row in:\n{lines}"));
+    assert!(
+        row.contains("/3"),
+        "the denominator is every admitted rust file, not the ones that produced an \
+         entity: {row}"
+    );
+    assert!(
+        lines.contains("no_entity:") && lines.contains("unreadable0.rs"),
+        "the silent files are named so a reader can open them: {lines}"
+    );
+    // And the other half of what FIR-2675 changed, pinned rather than implied:
+    // JavaScript can no longer be silent, so its row is whole.
+    let js_row = response
         .lines
         .iter()
         .find(|line| line.trim_start().starts_with("javascript:"))
         .unwrap_or_else(|| panic!("no javascript row in:\n{lines}"));
     assert!(
-        row.contains("/7"),
-        "the denominator is every admitted javascript file, not the ones that produced an \
-         entity: {row}"
-    );
-    assert!(
-        lines.contains("no_entity:") && lines.contains("unreadable0.js"),
-        "the silent files are named so a reader can open them: {lines}"
+        js_row.contains("5/5"),
+        "every javascript file carries at least its module entity since FIR-2675, including \
+         lib/quiet.js, which declares nothing and would have been silent before it: {js_row}"
     );
 
     // The control, and the half that can fail. A count is not a defect, so this
@@ -1073,7 +1090,7 @@ fn graph_status_publishes_per_language_parse_coverage_without_a_verdict() {
 
 /// A repository of four parseable JavaScript modules plus `silent` files that
 /// produce no entity.
-fn seed_javascript_repository(repo: &Path, silent: usize) {
+fn seed_mixed_language_repository(repo: &Path, silent: usize) {
     fs::create_dir_all(repo.join("lib")).expect("create lib directory");
     run_git(repo, &["init", "--initial-branch=main"]);
     run_git(repo, &["config", "user.email", "kin@example.invalid"]);
@@ -1085,14 +1102,34 @@ fn seed_javascript_repository(repo: &Path, silent: usize) {
         )
         .expect("write a parseable module");
     }
+    // A comment-only JavaScript file, which is the shape that used to be silent
+    // and no longer is. It exists so the javascript row below can tell the port
+    // working from the four parseable modules merely parsing: those four produce
+    // entities from their own functions with or without a module entity, so a
+    // row reading 4/4 says nothing about FIR-2675 at all. With this file the row
+    // is 5/5, and it falls to 4/5 the moment JavaScript stops emitting modules.
+    fs::write(
+        repo.join("lib/quiet.js"),
+        b"// nothing is declared here either\n" as &[u8],
+    )
+    .expect("write a formerly-silent javascript module");
     for index in 0..silent {
-        // Valid UTF-8 JavaScript that declares nothing. This is the honest
-        // shape: bytes an adapter is registered for, admitted as source, and
-        // holding no entity. NUL bytes would route the file to the opaque facet
-        // instead, which is a different state wearing the same numbers.
+        // The silent files are RUST, and they used to be JavaScript. FIR-2675
+        // made every JavaScript and TypeScript file emit a Module entity, so a
+        // comment-only `.js` file now produces one and is no longer silent:
+        // measured at 1 entity for exactly these bytes, against 0 before. That
+        // is the port working, and it deleted this fixture's silent case as a
+        // side effect, which is what this test caught.
+        //
+        // Rust carries no per-file module entity, so a comment-only `.rs` file
+        // still produces nothing: measured at 0. It is the same honest shape the
+        // old comment said, bytes an adapter is registered for, admitted as
+        // source, holding no entity. NUL bytes would route the file to the
+        // opaque facet instead, which is a different state wearing the same
+        // numbers.
         fs::write(
-            repo.join(format!("lib/unreadable{index}.js")),
-            b"require('./module0');\n// nothing is declared here\n" as &[u8],
+            repo.join(format!("lib/unreadable{index}.rs")),
+            b"// nothing is declared here\n" as &[u8],
         )
         .expect("write a silent module");
     }
