@@ -553,3 +553,159 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
         metadata.git_external_authority.as_ref().unwrap().closure.objects.len()
     );
 }
+
+/// Build a history with a real merge: a side line branched from the root and
+/// merged back, so one commit reaches two parents.
+fn build_merged_publisher(root: &std::path::Path) -> std::path::PathBuf {
+    let working = root.join("work");
+    std::fs::create_dir_all(working.join("service")).unwrap();
+    std::fs::write(working.join(PROBE_PATH), PROBE_BYTES).unwrap();
+    git(&working, &["init", "--initial-branch=main"]);
+    git(&working, &["config", "user.email", "probe@example.invalid"]);
+    git(&working, &["config", "user.name", "FIR-2729 Probe"]);
+    git(&working, &["add", "--all"]);
+    git(&working, &["commit", "-s", "-m", "root"]);
+
+    git(&working, &["checkout", "-b", "side"]);
+    std::fs::write(working.join("service/side.txt"), b"side line only\n").unwrap();
+    git(&working, &["add", "--all"]);
+    git(&working, &["commit", "-s", "-m", "side work"]);
+
+    git(&working, &["checkout", "main"]);
+    std::fs::write(working.join("service/main.txt"), b"main line only\n").unwrap();
+    git(&working, &["add", "--all"]);
+    git(&working, &["commit", "-s", "-m", "main work"]);
+
+    git(&working, &["merge", "--no-ff", "-m", "merge side into main", "side"]);
+    // Delete the side ref so the authority's roots are main and HEAD alone,
+    // which keeps the closure the same shape a single-ref bootstrap sees.
+    git(&working, &["branch", "-D", "side"]);
+    working
+}
+
+/// Does the manifest walk hold up when a commit reaches two parents?
+///
+/// The linear probe cannot answer this: every commit there has one parent, so
+/// a walk that followed only the first would look correct. A merge is where
+/// the subset property either holds or quietly loses a whole line of history,
+/// and losing it would produce a step authority that validates while
+/// describing less than it claims.
+#[test]
+fn a_merge_commit_reaches_both_parents_and_a_side_line_stays_out_of_the_other_branch() {
+    let repository_id = hosted_shaped_id();
+    let source_root = tempfile::tempdir().unwrap();
+    let working = build_merged_publisher(source_root.path());
+    let init = kin_core::init_from_git_adopting(&working, &repository_id).unwrap();
+    let source = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+        .unwrap()
+        .open_manager()
+        .unwrap();
+
+    let (full, aliases, changes, default_ref) = {
+        let lease = source.read_authority();
+        let metadata = lease.metadata();
+        (
+            metadata.git_external_authority.clone().expect("Git-admitted"),
+            metadata.aliases.clone(),
+            lease.snapshot().changes.values().cloned().collect::<Vec<_>>(),
+            metadata.ref_state.default_ref.clone().expect("default ref"),
+        )
+    };
+    assert_eq!(changes.len(), 4, "root, side, main and the merge");
+
+    let merge = changes
+        .iter()
+        .find(|change| change.parents.len() == 2)
+        .expect("the fixture must actually produce a merge commit");
+    let main_only = changes
+        .iter()
+        .find(|change| change.message.contains("main work"))
+        .expect("the main-line commit");
+    let side_only = changes
+        .iter()
+        .find(|change| change.message.contains("side work"))
+        .expect("the side-line commit");
+
+    let oid_of = |change_id| {
+        aliases
+            .iter()
+            .find(|alias| alias.change_id == change_id)
+            .map(|alias| {
+                kin_model::ExternalObjectId::new(kin_model::ExternalObjectKind::Commit, alias.oid)
+            })
+            .expect("every Git-origin change has an alias")
+    };
+
+    let from_merge: BTreeSet<_> = reachable_from(&full, oid_of(merge.id))
+        .into_iter()
+        .map(|record| record.object)
+        .collect();
+    let from_main: BTreeSet<_> = reachable_from(&full, oid_of(main_only.id))
+        .into_iter()
+        .map(|record| record.object)
+        .collect();
+    let side_commit = oid_of(side_only.id);
+
+    eprintln!(
+        "INC2 MERGE: full closure {} objects | from merge {} | from main-only {} | \
+         side commit in merge walk: {} | side commit in main walk: {}",
+        full.closure.objects.len(),
+        from_merge.len(),
+        from_main.len(),
+        from_merge.contains(&side_commit),
+        from_main.contains(&side_commit),
+    );
+
+    // The property: a merge reaches BOTH lines.
+    assert!(
+        from_merge.contains(&side_commit),
+        "the walk lost the side line at a merge, so a step authority at a merge would \
+         describe less history than it claims"
+    );
+    assert!(
+        from_merge.contains(&oid_of(main_only.id)),
+        "the walk lost the main line at a merge"
+    );
+    // The control that makes the above mean something: a walk that returned
+    // everything would satisfy it while proving nothing.
+    assert!(
+        !from_main.contains(&side_commit),
+        "the main-only line must NOT reach the side commit, or the walk is returning \
+         the whole closure regardless of where it started"
+    );
+    assert!(
+        from_main.len() < from_merge.len(),
+        "a pre-merge commit must reach strictly fewer objects than the merge"
+    );
+
+    // And the merge's step authority still derives and validates.
+    let mut loader = ManagerBodyLoader(&source);
+    let step = kin_model::GitExternalAuthority::from_raw_parts(
+        repository_id.clone(),
+        full.object_format,
+        vec![kin_model::GitRawRef {
+            name: default_ref.clone(),
+            target: kin_model::GitRawTarget::Direct {
+                object: oid_of(merge.id),
+            },
+        }],
+        kin_model::GitRawTarget::Symbolic {
+            target: default_ref.clone(),
+        },
+        reachable_from(&full, oid_of(merge.id)),
+        &mut loader,
+    )
+    .expect("a step authority at a merge derives and validates");
+    let merge_projection = step
+        .commit_projections
+        .iter()
+        .find(|projection| projection.parent_oids.len() == 2)
+        .expect("the derived authority must project the merge with BOTH parents");
+    eprintln!(
+        "INC2 MERGE RESULT: step authority at the merge validates, {} objects, \
+         {} projections, merge projection carries {} parents",
+        step.closure.objects.len(),
+        step.commit_projections.len(),
+        merge_projection.parent_oids.len()
+    );
+}
