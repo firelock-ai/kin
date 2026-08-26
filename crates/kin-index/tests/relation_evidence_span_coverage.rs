@@ -105,7 +105,7 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         language: "TypeScript",
-        min_relations: 3,
+        min_relations: 4,
         min_calls: 1,
         min_calls_with_span: 1,
         files: &[
@@ -129,7 +129,7 @@ const FIXTURES: &[Fixture] = &[
     },
     Fixture {
         language: "JavaScript",
-        min_relations: 3,
+        min_relations: 4,
         min_calls: 1,
         min_calls_with_span: 1,
         files: &[
@@ -706,7 +706,7 @@ fn print_table(rows: &[(String, Counts)], title: &str) {
 /// offset. This constant proves something different and narrower: that the
 /// linker carries a site the parser recorded all the way onto persisted
 /// evidence.
-const MEASURED_RELATIONS_WITH_SPAN: usize = 10;
+const MEASURED_RELATIONS_WITH_SPAN: usize = 12;
 
 /// Span-backed evidence RECORDS, which exceed span-backed relations whenever one
 /// caller reaches one callee at more than one site. Each fixture calls `compute`
@@ -718,7 +718,7 @@ const MEASURED_RELATIONS_WITH_SPAN: usize = 10;
 /// edge carries exactly one evidence record because a specifier binds once.
 /// The surplus of records over relations is unchanged, since it comes from
 /// repeat CALL sites and this edge adds none.
-const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 13;
+const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 15;
 
 #[test]
 fn relation_evidence_span_population_per_language() {

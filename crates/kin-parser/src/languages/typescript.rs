@@ -19,7 +19,8 @@ use crate::extract::{
 use super::javascript::{
     collect_js_property_definers, collect_js_require_imports, extract_calls_from_context,
     extract_js_assignment_function, extract_js_object_methods, extract_js_property_definition,
-    js_heritage_name, js_require_target, JsOwners, JsPropertyDefiner,
+    js_heritage_name, js_module_identity, js_require_target, JsOwners, JsPropertyDefiner,
+    TS_SUFFIXES,
 };
 
 pub struct TypeScriptAdapter;
@@ -59,23 +60,6 @@ impl LanguageAdapter for TypeScriptAdapter {
         let root = tree.root_node();
         let mut cursor = root.walk();
 
-        // Emit Module entity for index.ts/index.tsx files (TS packages).
-        // This makes the module searchable by its directory name, e.g.,
-        // `packages/mui-base/src/useSelect/index.ts` → entity "useSelect".
-        if is_ts_index_file(&file_id.0) {
-            if let Some(module_name) = extract_module_name_from_path(&file_id.0) {
-                entities.push(ExtractedEntity {
-                    kind: EntityKind::Module,
-                    name: module_name,
-                    signature: format!("module {}", file_id.0),
-                    visibility: Visibility::Public,
-                    doc_summary: None,
-                    fingerprint: compute_fingerprint(&root, source),
-                    span: span_from_node(&root, file_id),
-                });
-            }
-        }
-
         // Read the file's property-defining helpers before walking it; a
         // helper is not bound to its uses by declaration order.
         let definers = collect_js_property_definers(&root, source);
@@ -97,6 +81,43 @@ impl LanguageAdapter for TypeScriptAdapter {
             collect_js_require_imports(&child, source, &mut imports);
             // Detect describe/it/test calls (Jest/Vitest/Mocha)
             extract_js_tests(&child, source, &mut tests);
+        }
+
+        // Emitted after the walk and BEFORE `owners.finish`, and both halves of
+        // that are load-bearing.
+        //
+        // After the walk, because Python emits its module last and every
+        // consumer that looks an entity up by name depends on it: with the
+        // module first, a `.find(|e| leaf(e.name) == "caller")` over `caller.ts`
+        // returns the MODULE rather than the function, which is how the rename
+        // planner's TypeScript case lost its call edge.
+        //
+        // Before `owners.finish`, because that function's collision guard reads
+        // the entity list to decide whether a receiver's owner already exists.
+        // Run after it, the module is invisible to the guard, which then
+        // synthesizes a Class under the same name and leaves one file holding
+        // two entities called `router` that the linker's (file, name) index
+        // cannot tell apart. That is the exact outcome its own comment warns
+        // about.
+        // same helper JavaScript uses. The two adapters carried byte-identical
+        // copies of this rule and drifted anyway: the TypeScript index predicate
+        // never matched `index.d.ts`. Sharing the helper is what the header
+        // comment above already says the shared surface exists for.
+        let (module_name, is_package) = js_module_identity(&file_id.0, TS_SUFFIXES);
+        if !module_name.is_empty() {
+            entities.push(ExtractedEntity {
+                kind: EntityKind::Module,
+                name: module_name,
+                signature: if is_package {
+                    format!("package {}", file_id.0)
+                } else {
+                    format!("module {}", file_id.0)
+                },
+                visibility: Visibility::Public,
+                doc_summary: None,
+                fingerprint: compute_fingerprint(&root, source),
+                span: span_from_node(&root, file_id),
+            });
         }
 
         owners.finish(&mut entities);
@@ -994,28 +1015,27 @@ fn extract_js_tests(node: &tree_sitter::Node, source: &[u8], tests: &mut Vec<Ext
 }
 
 /// Check if a file is a TS index file (index.ts, index.tsx).
-fn is_ts_index_file(path: &str) -> bool {
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    matches!(basename, "index.ts" | "index.tsx")
-}
-
-/// Extract the module name from a file path for index files.
-/// `packages/mui-base/src/useSelect/index.ts` → `"useSelect"`
-fn extract_module_name_from_path(path: &str) -> Option<String> {
-    let without_basename = path.rsplit_once('/')?.0;
-    let dir_name = without_basename
-        .rsplit('/')
-        .next()
-        .unwrap_or(without_basename);
-    if dir_name.is_empty() || dir_name == "src" || dir_name == "lib" {
-        return None;
-    }
-    Some(dir_name.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every entity except the file's own Module.
+    ///
+    /// Every JS/TS file now carries a Module entity, as every Python file has
+    /// since `python.rs:301`. A test whose subject is a class binding or an
+    /// export rule is not about that module, and asserting the whole list would
+    /// make every such test carry it. This drops exactly the file's own module
+    /// and nothing else, so an unexpected extra entity still fails the assertion
+    /// it was written for. The module entity has its own tests.
+    fn entities_besides_the_files_own_module(
+        entities: &[ExtractedEntity],
+    ) -> Vec<(EntityKind, &str)> {
+        entities
+            .iter()
+            .filter(|e| e.kind != EntityKind::Module)
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect()
+    }
 
     #[test]
     fn parse_typescript_function() {
@@ -1215,7 +1235,7 @@ const isAbsolute = require('node:path').isAbsolute;
         let file_id = FilePathId::new("test.ts");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
         assert!(
-            output.entities.is_empty(),
+            entities_besides_the_files_own_module(&output.entities).is_empty(),
             "require bindings must not produce entities, got {:?}",
             output
                 .entities
@@ -1240,11 +1260,7 @@ const isAbsolute = require('node:path').isAbsolute;
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.ts");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert!(named.contains(&(EntityKind::Class, "View")), "{named:?}");
         assert!(
             named.contains(&(EntityKind::Method, "View.lookup")),
@@ -1266,11 +1282,7 @@ const isAbsolute = require('node:path').isAbsolute;
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.ts");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert_eq!(
             named,
             vec![
@@ -1300,11 +1312,7 @@ const isAbsolute = require('node:path').isAbsolute;
         let file_id = FilePathId::new("test.ts");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
 
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert_eq!(
             named,
             vec![

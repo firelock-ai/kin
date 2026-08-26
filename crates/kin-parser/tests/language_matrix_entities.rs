@@ -586,13 +586,28 @@ fn assert_relational_shape(out: &ParseOutput, lang: &str) {
     // against Python's 2.64. Asserting the ratio is what makes a regression
     // that halves the edge count fail on a fixture that still contains every
     // expected name.
-    let density = out.relations.len() as f64 / out.entities.len() as f64;
+    //
+    // The file's own Module entity is excluded from the denominator, and the
+    // exclusion is the point rather than a convenience. Since FIR-2675 every
+    // JS/TS file carries one, and it is deliberately not a container: Python's
+    // module is not one either, and making it one would put every top-level
+    // entity inside it, which `top_level_entities` in the round-trip fuzz reads
+    // as one whole-file region and collapses. So the module is a node this
+    // fixture's relational shape says nothing about, and counting it in the
+    // denominator measured the port rather than the edges. Left in, it dropped
+    // this fixture from 2.07 to 1.94 while not one relation had changed.
+    let counted: Vec<_> = out
+        .entities
+        .iter()
+        .filter(|e| e.kind != EntityKind::Module)
+        .collect();
+    let density = out.relations.len() as f64 / counted.len() as f64;
     assert!(
         density >= 2.0,
-        "{lang}: {} relations over {} entities is {density:.2} per entity, \
+        "{lang}: {} relations over {} non-module entities is {density:.2} per entity, \
          below the 2.0 floor this fixture must clear",
         out.relations.len(),
-        out.entities.len()
+        counted.len()
     );
 }
 
