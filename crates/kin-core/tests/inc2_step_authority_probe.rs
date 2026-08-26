@@ -53,8 +53,19 @@ fn hosted_shaped_id() -> RepositoryId {
     .unwrap()
 }
 
-/// Order changes parent-before-child, which every admission path requires and
-/// which a map's iteration order does not give.
+/// Order changes parent-before-child.
+///
+/// Not because storage requires it: kin-db sorts the snapshot's changes itself
+/// through `topological_change_order` (`kin-db repository.rs:4835`, called at
+/// `:4798` and `:4878`) over a map, so a transaction's `changes` VECTOR order
+/// is irrelevant to it. Reversing a step's changes here leaves the probe
+/// green, which is how that was established rather than assumed.
+///
+/// The PACK is what requires the order. `validate_pack` refuses a change that
+/// "appears before or without parent" (`repository_transfer.rs:1157`). So an
+/// increment-2 planner must order within a step for the pack even though the
+/// transaction underneath would not care, and a planner tested only against
+/// storage would pass while producing packs the receiver refuses.
 fn topological(changes: &[SemanticChange]) -> Vec<SemanticChange> {
     let mut ordered: Vec<SemanticChange> = Vec::with_capacity(changes.len());
     let mut placed: HashSet<SemanticChangeId> = HashSet::new();
@@ -776,9 +787,17 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
         let lease = source.read_authority();
         let metadata = lease.metadata();
         (
-            metadata.git_external_authority.clone().expect("Git-admitted"),
+            metadata
+                .git_external_authority
+                .clone()
+                .expect("Git-admitted"),
             metadata.aliases.clone(),
-            lease.snapshot().changes.values().cloned().collect::<Vec<_>>(),
+            lease
+                .snapshot()
+                .changes
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
             metadata.ref_state.default_ref.clone().expect("default ref"),
         )
     };
@@ -832,7 +851,8 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
         "step one must not already hold the side line, or this probe is not testing what it says"
     );
 
-    let derive = |head: kin_model::ExternalObjectId, records: Vec<kin_model::ExternalObjectRecord>| {
+    let derive = |head: kin_model::ExternalObjectId,
+                  records: Vec<kin_model::ExternalObjectRecord>| {
         let mut loader = ManagerBodyLoader(&source);
         kin_model::GitExternalAuthority::from_raw_parts(
             repository_id.clone(),
@@ -860,7 +880,9 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
     .unwrap();
     for record in one_objects.iter().chain(two_objects.iter()) {
         let bytes = source.load_source_blob(record.body_hash).unwrap().unwrap();
-        destination.save_source_blob(record.body_hash, &bytes).unwrap();
+        destination
+            .save_source_blob(record.body_hash, &bytes)
+            .unwrap();
     }
     for change in &changes {
         for delta in &change.tree_deltas {
@@ -917,7 +939,9 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
             sealed_observation: None,
         };
         drop(lease);
-        transaction.validate().expect("the step transaction is well formed");
+        transaction
+            .validate()
+            .expect("the step transaction is well formed");
         destination.commit_repository_transaction(transaction)
     };
 
@@ -929,7 +953,10 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
         step_one_head,
         601,
     ) {
-        Ok(receipt) => eprintln!("INC2 MERGE-STEP 1: committed, generation {}", receipt.generation),
+        Ok(receipt) => eprintln!(
+            "INC2 MERGE-STEP 1: committed, generation {}",
+            receipt.generation
+        ),
         Err(error) => panic!("INC2 MERGE-STEP 1 REFUSED: {error}"),
     }
     // Parent-before-child inside the step: the side line arrives before the
@@ -942,7 +969,10 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
         step_two_head,
         602,
     ) {
-        Ok(receipt) => eprintln!("INC2 MERGE-STEP 2: committed, generation {}", receipt.generation),
+        Ok(receipt) => eprintln!(
+            "INC2 MERGE-STEP 2: committed, generation {}",
+            receipt.generation
+        ),
         Err(error) => panic!(
             "INC2 MERGE-STEP 2 REFUSED, so a merge-headed step is a real bound rather than a \
              composition that just works: {error}"
