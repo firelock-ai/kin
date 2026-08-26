@@ -387,8 +387,7 @@ mod tests {
         let working_dir = tempfile::tempdir().unwrap();
         match decide_placement(&orphan, &graph, working_dir.path()).unwrap() {
             PlacementDecision::Ambiguous(candidates) => {
-                let mut names: Vec<String> =
-                    candidates.iter().map(|f| f.0.clone()).collect();
+                let mut names: Vec<String> = candidates.iter().map(|f| f.0.clone()).collect();
                 names.sort();
                 assert_eq!(names, vec!["lib/application.js", "lib/router.js"]);
             }

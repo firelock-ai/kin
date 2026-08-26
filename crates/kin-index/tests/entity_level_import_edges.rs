@@ -425,7 +425,10 @@ fn typescript_files_carry_module_entities_by_the_same_rule_as_javascript() {
     for (path, expected) in [
         ("lib/application.ts", Some("application")),
         ("components/Button.tsx", Some("Button")),
-        ("packages/mui-base/src/useSelect/index.ts", Some("useSelect")),
+        (
+            "packages/mui-base/src/useSelect/index.ts",
+            Some("useSelect"),
+        ),
         ("lib/index.ts", Some("lib")),
         ("index.ts", None),
     ] {
@@ -448,7 +451,10 @@ fn typescript_files_carry_module_entities_by_the_same_rule_as_javascript() {
 #[test]
 fn a_typescript_declaration_file_is_named_without_its_d_segment() {
     assert_eq!(
-        module_entity_name(&ts("types/express.d.ts", "export declare const x: number;\n")),
+        module_entity_name(&ts(
+            "types/express.d.ts",
+            "export declare const x: number;\n"
+        )),
         Some("express")
     );
 }
@@ -461,6 +467,12 @@ fn a_typescript_declaration_file_is_named_without_its_d_segment() {
 /// whole file and swallow every other entity in the region.
 #[test]
 fn an_extension_less_path_emits_no_module_entity() {
-    assert_eq!(module_entity_name(&js("some/fixture", "function a() {}\n")), None);
-    assert_eq!(module_entity_name(&ts("some/fixture", "function a() {}\n")), None);
+    assert_eq!(
+        module_entity_name(&js("some/fixture", "function a() {}\n")),
+        None
+    );
+    assert_eq!(
+        module_entity_name(&ts("some/fixture", "function a() {}\n")),
+        None
+    );
 }
