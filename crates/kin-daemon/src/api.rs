@@ -30110,6 +30110,71 @@ mod tests {
         );
     }
 
+    /// The alarming value, actually produced.
+    ///
+    /// The two tests above run on a daemon that pinned everything, so both read
+    /// `startup_authority_complete: true`, and a mutation hardcoding the field to
+    /// `true` left them both green. An assertion comparing the route's answer to
+    /// the state's answer cannot catch that when the two agree on `true` anyway,
+    /// which made it decoration rather than a control.
+    ///
+    /// This builds a daemon whose startup pass cannot bind a repository the
+    /// registry names, which is the condition the field exists to report, and
+    /// requires the route to say so. Hardcoding either value now fails one of
+    /// the two directions.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spine_health_reports_a_startup_authority_it_could_not_bind() {
+        // A registry row pointing at a directory that carries a `.kin` but no
+        // readable manifest. Binding it fails, which is what leaves the startup
+        // authority set short.
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("unbindable-sibling");
+        std::fs::create_dir_all(sibling_root.join(".kin")).unwrap();
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: "unbindable-sibling".to_string(),
+                path: sibling_root.clone(),
+                entities: 1,
+                last_commit: String::new(),
+                dependencies: vec![],
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(primary_dir.path()).unwrap().layout;
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        assert!(
+            !state.startup_authority_complete(),
+            "the fixture must actually produce a short startup authority, or this \
+             test proves nothing about reporting one"
+        );
+
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["startup_authority_complete"],
+            serde_json::json!(false),
+            "a registry row the daemon could not bind must reach the reader: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn spine_repos_returns_list() {
         let state = test_state();
