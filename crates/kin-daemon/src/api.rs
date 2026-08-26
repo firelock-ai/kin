@@ -15744,6 +15744,80 @@ mod tests {
         );
     }
 
+    /// The hosted publication loop, end to end.
+    ///
+    /// An empty hosted store admits a native transfer and then serves the head
+    /// it admitted. This is the operation that puts a repository into a hosted
+    /// bucket with an authority envelope, and it is the product's own route:
+    /// `kin push` drives exactly this `POST /repos/{id}/transfer/receive`.
+    ///
+    /// Worth its own test because the two halves were broken in different
+    /// places and only together do they make a hosted repository readable. The
+    /// receive half already worked; the read half answered 424 for everything,
+    /// so nothing that arrived this way could be seen afterwards. A test that
+    /// covered only one half would have gone green while the pair stayed
+    /// useless.
+    ///
+    /// It also pins the precondition the bucket currently violates. An empty
+    /// store mints genesis authority on open and admits this transfer; a store
+    /// holding a snapshot with no envelope refuses before the transfer starts,
+    /// which is why an export cannot be repaired in place and has to be moved
+    /// aside first.
+    #[tokio::test]
+    async fn a_hosted_store_admits_a_native_transfer_and_then_serves_the_head_it_admitted() {
+        let repo_id = format!("hosted-publish-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let pack = transfer_pack_for_unborn_destination(&repository_id);
+        let admitted_head = pack.source_head;
+        let (state, _working, _storage) = replica_state(&repo_id);
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post(format!("/repos/{repo_id}/transfer/receive"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "destination_ref": destination_ref,
+                            "pack": pack,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "an empty hosted store must admit a native transfer: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let snapshot = repository_authority_snapshot(&state, &repo_id)
+            .await
+            .expect("the head a hosted store admitted must be readable afterwards");
+        let metadata = snapshot
+            .repository_authority
+            .as_ref()
+            .expect("admitting a transfer publishes an envelope");
+        assert!(
+            metadata
+                .ref_state
+                .refs
+                .iter()
+                .any(|repository_ref| matches!(
+                    &repository_ref.target,
+                    kin_model::RefTarget::Change { change_id } if *change_id == admitted_head
+                )),
+            "the served refs must carry the change the transfer admitted"
+        );
+    }
+
     #[tokio::test]
     async fn native_push_and_pull_move_exact_history_between_two_daemons_over_http() {
         use kin_remote::repository_transfer_negotiation::{
