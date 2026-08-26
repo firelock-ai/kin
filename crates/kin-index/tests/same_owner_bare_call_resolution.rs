@@ -51,9 +51,7 @@ use kin_index::{
     link_cross_file as link_cross_file_with_identities, link_cross_file_incremental, FileParseData,
     IncrementalLinker,
 };
-use kin_model::{
-    ArtifactId, Entity, EntityId, FilePathId, Relation, RelationKind, RelationOrigin,
-};
+use kin_model::{ArtifactId, Entity, EntityId, FilePathId, Relation, RelationKind, RelationOrigin};
 use kin_parser::{
     CSharpAdapter, CppAdapter, GoAdapter, JavaAdapter, JavaScriptAdapter, KotlinAdapter,
     LanguageAdapter, PhpAdapter, PythonAdapter, RustAdapter, SwiftAdapter, TypeScriptAdapter,

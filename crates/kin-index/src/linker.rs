@@ -1440,13 +1440,14 @@ fn resolve_one_file(
         // a name-derived edge as proven.
         if name_fallback_allowed && !linked && !unresolvable_name_ambiguity {
             if let Some((sibling, _leaf)) =
-                same_owner_sibling_name(rel, src_id, &ctx.entity_language_by_id)
-                    .filter(|(_, leaf)| {
+                same_owner_sibling_name(rel, src_id, &ctx.entity_language_by_id).filter(
+                    |(_, leaf)| {
                         bare_leaf_names_one_thing(
                             ctx.entity_by_bare_name.get(leaf).map_or(0, |v| v.len()),
                             ctx.entity_by_name.get(leaf).map_or(0, |v| v.len()),
                         )
-                    })
+                    },
+                )
             {
                 let candidates: Vec<(&str, EntityId)> = ctx
                     .entity_by_name
