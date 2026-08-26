@@ -51,7 +51,11 @@ fn git(working: &std::path::Path, args: &[&str]) {
 /// A hosted-shaped repository identity: a slug, not UUID text, which is what
 /// the hosted daemon serves and what `--adopt-repository-id` now admits.
 fn hosted_shaped_id() -> RepositoryId {
-    RepositoryId::new(format!("kin-fir2729-probe-{}", uuid::Uuid::new_v4().simple())).unwrap()
+    RepositoryId::new(format!(
+        "kin-fir2729-probe-{}",
+        uuid::Uuid::new_v4().simple()
+    ))
+    .unwrap()
 }
 
 /// Every immutable body the transaction below will name, from both producers.
@@ -179,15 +183,22 @@ fn bootstrap_probe_wide(files: usize, bytes_each: usize) {
     let source_root = tempfile::tempdir().unwrap();
     let working = source_root.path().join("work");
     std::fs::create_dir_all(working.join("wide")).unwrap();
-    std::fs::write(working.join(PROBE_PATH_DIR).join("compose.yaml"), PROBE_BYTES).ok();
+    std::fs::write(
+        working.join(PROBE_PATH_DIR).join("compose.yaml"),
+        PROBE_BYTES,
+    )
+    .ok();
     std::fs::create_dir_all(working.join("service")).unwrap();
     std::fs::write(working.join(PROBE_PATH), PROBE_BYTES).unwrap();
     let filler: Vec<u8> = (0..bytes_each).map(|i| b'a' + (i % 26) as u8).collect();
     for index in 0..files {
         // Vary the first bytes so every blob is a distinct object rather than
         // one object referenced 4200 times, which would measure nothing.
-        let mut body = format!("fir2729-wide-{index:06}
-").into_bytes();
+        let mut body = format!(
+            "fir2729-wide-{index:06}
+"
+        )
+        .into_bytes();
         body.extend_from_slice(&filler);
         std::fs::write(working.join(format!("wide/f{index:06}.txt")), &body).unwrap();
     }
@@ -195,7 +206,10 @@ fn bootstrap_probe_wide(files: usize, bytes_each: usize) {
     git(&working, &["config", "user.email", "probe@example.invalid"]);
     git(&working, &["config", "user.name", "FIR-2729 Probe"]);
     git(&working, &["add", "--all"]);
-    git(&working, &["commit", "-s", "-m", "wide payload for the ceiling probe"]);
+    git(
+        &working,
+        &["commit", "-s", "-m", "wide payload for the ceiling probe"],
+    );
 
     let init = kin_core::init_from_git_adopting(&working, &repository_id)
         .expect("a wide Git-admitted store may adopt a hosted repository identity");
@@ -250,7 +264,9 @@ fn bootstrap_probe_wide(files: usize, bytes_each: usize) {
             .expect("read")
             .unwrap_or_else(|| panic!("publisher missing body {hash}"));
         staged_bytes += payload.len() as u64;
-        destination.save_source_blob(*hash, &payload).expect("stage");
+        destination
+            .save_source_blob(*hash, &payload)
+            .expect("stage");
     }
     assert!(
         staged_bytes > 16 * 1024 * 1024,

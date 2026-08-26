@@ -22,10 +22,10 @@ use kin_model::{
     compute_resolved_tree_hash, validate_semantic_change_id, AuthorId, ChangeOrigin, ChangeStore,
     DefaultRefExpectation, DefaultRefMutation, ExternalChangeAlias, ExternalObjectId,
     ExternalObjectKind, ExternalObjectRecord, GitExternalAuthority, GitExternalAuthorityDelta,
-    Hash256, ModelError,
-    OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
-    RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
-    RootBundle, SemanticChange, SemanticChangeId, TreeEntry, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+    Hash256, ModelError, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
+    RefUpdatePolicy, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId,
+    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, TreeEntry,
+    REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -2453,8 +2453,8 @@ mod tests {
                 }
             })
             .collect();
-        let source_tree_hash = compute_resolved_tree_hash(&store.resolve_tree_at(&head.id).unwrap())
-            .unwrap();
+        let source_tree_hash =
+            compute_resolved_tree_hash(&store.resolve_tree_at(&head.id).unwrap()).unwrap();
 
         // Every external object ships its own bytes: a pack is self-validating
         // and refuses a record whose body it does not carry.
@@ -2602,7 +2602,9 @@ mod tests {
             "rebinding is a conflict, not a validation error: {error}"
         );
         assert!(
-            error.to_string().contains("admitted only at generation zero"),
+            error
+                .to_string()
+                .contains("admitted only at generation zero"),
             "this test is about the generation-zero rule; another guard answering \
              means the layering moved and the test now proves something else: {error}"
         );
@@ -2664,7 +2666,9 @@ mod tests {
 
         let error = validate_pack(&pack).expect_err("a mismatched bootstrap hash is refused");
         assert!(
-            error.to_string().contains("does not hash to the source Git authority"),
+            error
+                .to_string()
+                .contains("does not hash to the source Git authority"),
             "the refusal must name the mismatch: {error}"
         );
     }
