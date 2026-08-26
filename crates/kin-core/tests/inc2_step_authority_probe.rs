@@ -1110,7 +1110,16 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
                     target.to_str().unwrap(),
                 ],
             );
-            (target, format!("real repository at {path}"))
+            // The sha the clone actually landed on, read back rather than
+            // assumed, because a measurement nobody can reproduce against a
+            // named commit is a number without a subject.
+            let head = std::process::Command::new("git")
+                .args(["rev-parse", "HEAD"])
+                .current_dir(&target)
+                .output()
+                .expect("git rev-parse runs in the clone");
+            let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+            (target, format!("real repository at {path}, HEAD {head}"))
         }
         Err(_) => {
             let commits: usize = std::env::var("KIN_INC2_SCALE_COMMITS")
