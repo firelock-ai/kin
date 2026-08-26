@@ -17177,54 +17177,159 @@ mod tests {
         }
     }
 
-    /// The pre-fix pin, carrying a payload, on both sides of the transfer cap.
+    /// The source's own bodies for a fixture, keyed by Kin content address, with
+    /// each one byte-verified against the bytes the fixture wrote.
     ///
-    /// `a_git_admitted_store_adopting_a_hosted_identity_meets_the_git_authority_bound`
-    /// already records the Git-authority bound with a two-line commit. This
-    /// records it with 24 MiB and with 4 MiB, which is the pair FIR-2746 needs,
-    /// and it asserts something that test cannot: that the refusal is the
-    /// AUTHORITY bound and not the SIZE one.
+    /// This is the half that makes the destination check a byte claim rather
+    /// than a name comparison. A Kin body hash IS the content, so a destination
+    /// committing to hash H has committed to those bytes, but only if something
+    /// independent has established what H's bytes are. That is what the SHA-256
+    /// here does, and it deliberately uses a different hash function from the
+    /// one the address is, so the two sides cannot agree by construction.
+    #[cfg(unix)]
+    fn source_payload_bodies(
+        authority: &ActiveApiRepositoryAuthority,
+        expected: &std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, (kin_model::Hash256, u64)> {
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .expect("the source replica projects a workspace")
+            .clone();
+
+        let mut bodies = std::collections::BTreeMap::new();
+        for (path, want) in expected {
+            let artifact = workspace
+                .tree
+                .artifacts_by_path()
+                .find(|artifact| artifact.path.as_bytes() == path.as_bytes())
+                .unwrap_or_else(|| panic!("the source projects no artifact at {path}"));
+            let digest = artifact
+                .entry
+                .blob_identity()
+                .unwrap_or_else(|| panic!("the artifact at {path} carries no blob identity"));
+            let bytes = authority
+                .manager
+                .load_source_blob(digest)
+                .unwrap_or_else(|error| panic!("reading {path} failed: {error}"))
+                .unwrap_or_else(|| panic!("the source holds no body for {path}"));
+            assert_eq!(
+                &hex::encode(Sha256::digest(&bytes)),
+                want,
+                "the source's bytes for {path} are not the bytes the fixture wrote, so \
+                 its content address cannot stand in for them"
+            );
+            bodies.insert(path.clone(), (digest, bytes.len() as u64));
+        }
+        assert_eq!(
+            bodies.len(),
+            expected.len(),
+            "every expected path must have produced a body"
+        );
+        bodies
+    }
+
+    /// Assert a hosted replica committed to the payload, read from its OWN
+    /// authority snapshot rather than from the sender's receipt.
     ///
-    /// That distinction is the whole point of writing this before a route
-    /// exists. Two independent bounds refuse a payload-bearing push today, and
-    /// a test asserting only "the push failed" would stay green through the fix
-    /// for bound one, because bound two would keep it failing. Pinning WHICH
-    /// bound answered is what makes this go red at the right moment, and going
-    /// red is what it is for: when Git-authority bootstrap lands, the under-cap
-    /// arm should publish and the over-cap arm should refuse on size, and both
-    /// of those are this test failing.
+    /// It cannot use the workspace-walking comparator: a bootstrapped hosted
+    /// replica commits with `workspace_mutation: null`, so it holds authority
+    /// without projecting a tree, and `ActiveApiRepositoryAuthority::open`
+    /// refuses it by name with "local daemon is missing its startup workspace
+    /// binding". That refusal is the replica behaving correctly, and reading it
+    /// as a failure would have been the easy mistake here.
     ///
-    /// **The tell is the STATUS, not a sentence, and the first draft of this
-    /// test got that wrong in a way that could not fail.** It asserted the
-    /// over-cap arm must not report `decoded body closure exceeds`, which is
-    /// `validate_pack`'s wording. A source-built pack never reaches that line.
-    /// The source's own byte check returns `Assembled::OverNegotiatedBound`
-    /// (`repository_transfer.rs:949`), which is SEGMENTATION rather than
-    /// refusal: the segment builder halves the change budget and rebuilds. It
-    /// only refuses when the step is indivisible, and a one-commit fixture is,
-    /// so it refuses at `:601` with a different sentence naming
-    /// `over negotiated limit`. The original assertion was keyed on a string
-    /// that can never appear, so it would have stayed green through exactly the
-    /// change it was written to catch.
+    /// So the destination is read through `repository_authority_snapshot`, which
+    /// is the reader that answers for a daemon serving a repository through a
+    /// backend rather than a startup binding.
     ///
-    /// `RepositoryTransferError::Invalid` maps to 422 and `Conflict` to 409
-    /// (`repository_transfer_error`, `api.rs:10046`), so the status separates
-    /// the two bounds with nothing to spell: 409 today, 422 once authority
-    /// bootstrap lands. The message assertions are kept beside it as the
-    /// second, weaker reading.
+    /// What this proves: the destination's committed authority names every one
+    /// of the source's payload bodies, by content address and with the same
+    /// declared length. Since `source_payload_bodies` has independently verified
+    /// what each of those addresses' bytes are, against a different hash
+    /// function, naming the address is a claim about the bytes.
     ///
-    /// It also establishes the ORDER, which nothing had measured.
-    /// `build_repository_transfer_segment` reads the source context, and its
-    /// Git-authority comparison, before any byte is counted, so the authority
-    /// bound is reached first and the size bound is unobservable end to end
-    /// until it moves. The over-cap arm proves that by observing the authority
-    /// refusal while being, on its own arithmetic, half again too large to fit.
+    /// What it does not prove: that the destination can SERVE those bytes on
+    /// demand. That is a body read against a hosted backend and it is not
+    /// reached here. Said plainly rather than left for a reader to assume.
+    #[cfg(unix)]
+    fn assert_destination_committed_payload(
+        snapshot: &kin_db::GraphSnapshot,
+        source_bodies: &std::collections::BTreeMap<String, (kin_model::Hash256, u64)>,
+    ) -> usize {
+        assert!(
+            !source_bodies.is_empty(),
+            "an empty expectation makes every assertion below vacuously true"
+        );
+        let authority = snapshot
+            .repository_authority
+            .as_ref()
+            .expect("admitting a bootstrap publishes an envelope");
+        let held: std::collections::BTreeMap<kin_model::Hash256, u64> = authority
+            .external_objects
+            .iter()
+            .map(|record| (record.body_hash, record.body_len))
+            .collect();
+        assert!(
+            !held.is_empty(),
+            "the destination's authority names no external object, so this verified \
+             nothing; a bootstrap that admitted no Git objects is what this would hide"
+        );
+
+        for (path, (digest, len)) in source_bodies {
+            let found = held.get(digest).unwrap_or_else(|| {
+                panic!(
+                    "the destination's authority does not name the body for {path}; it \
+                     names {} objects",
+                    held.len()
+                )
+            });
+            assert_eq!(
+                found, len,
+                "the destination declares a different length for {path}'s body"
+            );
+        }
+        source_bodies.len()
+    }
+
+    /// The payload pin, now that the bound in front of it has moved.
+    ///
+    /// This test was written before kin#1156 and asserted the 409 both arms then
+    /// got. It was built to go red the day Git-authority bootstrap landed,
+    /// keyed on the STATUS rather than on a sentence, and that is exactly how it
+    /// failed: `left: 422, right: 409` on the over-cap arm, with the message
+    /// naming the byte budget. The forward-looking half worked, so this is a
+    /// rewrite of what it pins rather than a relaxation of it.
+    ///
+    /// What it pins now is the DIVERGENCE, which is the whole content of the
+    /// change. The two arms differ in one variable, payload size, and now get
+    /// two different answers:
+    ///
+    /// The under-cap arm PUBLISHES. Not "does not fail": the receipt is read,
+    /// and it has to show a bootstrap rather than a fast-forward onto something
+    /// that already existed. `git_authority_delta.old` is null and `.new` is
+    /// present, which is authority being established on a replica that had
+    /// none, and the roots move from generation 0 to 1. Those are the two facts
+    /// that make it the thing kin#1156 built rather than an ordinary push.
+    ///
+    /// The over-cap arm is REFUSED BY NAME, 422, naming the negotiated byte
+    /// limit and the indivisible step. A bootstrap ships every Git object in one
+    /// pack because a pack is self-validating, so it cannot be segmented, and a
+    /// repository past the budget is refused rather than staged.
+    ///
+    /// Both halves are needed. An assertion that the under arm publishes would
+    /// pass on a build that had also stopped refusing the over arm, and an
+    /// assertion that the over arm refuses would pass on a build that refused
+    /// everything, which is what the 409 did yesterday.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_payload_bearing_push_meets_the_authority_bound_before_the_size_cap() {
-        for (label, blobs) in [
-            ("over", PAYLOAD_BLOBS_OVER_CAP),
-            ("under", PAYLOAD_BLOBS_UNDER_CAP),
+    async fn a_payload_bearing_push_bootstraps_under_the_cap_and_is_refused_over_it() {
+        for (label, blobs, fits) in [
+            ("over", PAYLOAD_BLOBS_OVER_CAP, false),
+            ("under", PAYLOAD_BLOBS_UNDER_CAP, true),
         ] {
             let hosted_id = hosted_repository_id();
             let hosted_repository = RepositoryId::new(hosted_id.clone()).unwrap();
@@ -17233,10 +17338,9 @@ mod tests {
 
             let fixture = payload_fixture(label, blobs, &hosted_repository);
             let cap = kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES;
-            let over_cap = fixture.payload_bytes > cap;
             assert_eq!(
-                over_cap,
-                label == "over",
+                fixture.payload_bytes > cap,
+                !fits,
                 "the {label} arm must sit on the side of the cap its name claims: \
                  {} bytes against {cap}",
                 fixture.payload_bytes
@@ -17255,45 +17359,91 @@ mod tests {
                 transfer_command(Arc::clone(&source_state), "push", &request).await;
             let message = String::from_utf8_lossy(&body).to_string();
 
-            assert_eq!(
-                status,
-                StatusCode::CONFLICT,
-                "the {label} arm must still be stopped by the Git-authority bound: {message}"
-            );
-            assert!(
-                message.contains("imported-Git authority"),
-                "the {label} arm must name the authority bound: {message}"
-            );
-            // The half that makes this a pin rather than a restatement. The
-            // size bound is a different error variant and therefore a different
-            // status, so the 409 above already excludes it; these name the two
-            // sentences the size bound can actually produce, so a reader who
-            // hits this failure is told which wording to look for.
-            assert!(
-                !message.contains("over negotiated limit"),
-                "the {label} arm must not be reporting the size bound yet; if it is, \
-                 Git-authority bootstrap has landed and this pin has to be \
-                 rewritten rather than relaxed: {message}"
-            );
-            assert!(
-                !message.contains("cannot be split across continuation packs"),
-                "the {label} arm must not be reporting the indivisible-step refusal \
-                 yet, which is how an over-cap one-commit history is refused once \
-                 the authority bound moves: {message}"
-            );
-            assert!(
-                !message.contains("does not match destination repository"),
-                "identity is not what stops a payload-bearing store: {message}"
-            );
+            if fits {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "the {label} arm must publish into the empty hosted replica: {message}"
+                );
+                // Read the receipt rather than the status. A 200 says the route
+                // answered; these say it BOOTSTRAPPED, which is the property
+                // kin#1156 added and the only one that distinguishes this from
+                // a push onto a replica that already had authority.
+                let receipt: serde_json::Value = serde_json::from_str(&message)
+                    .expect("a successful push answers with its receipt");
+                let delta = receipt
+                    .pointer("/outcome/receipts/0/authority_receipt/operation/git_authority_delta")
+                    .unwrap_or_else(|| {
+                        panic!("the receipt must carry a git authority delta: {message}")
+                    });
+                assert!(
+                    delta.get("old").is_some_and(|old| old.is_null()),
+                    "the destination must have held NO imported-Git authority before this \
+                     push, which is what makes it a bootstrap: {delta}"
+                );
+                assert!(
+                    delta.get("new").is_some_and(|new| !new.is_null()),
+                    "the push must have established imported-Git authority: {delta}"
+                );
+                let before = receipt
+                    .pointer("/outcome/receipts/0/authority_receipt/roots_before/generation");
+                let after =
+                    receipt.pointer("/outcome/receipts/0/authority_receipt/roots_after/generation");
+                assert_eq!(
+                    (
+                        before.and_then(|v| v.as_u64()),
+                        after.and_then(|v| v.as_u64())
+                    ),
+                    (Some(0), Some(1)),
+                    "an empty replica is generation zero and a bootstrap moves it to one: \
+                     {message}"
+                );
 
-            // The reassembly assertion's own input, checked here rather than
-            // where it will be used. A digest map that went empty would make
-            // every future byte-verification vacuously true.
-            assert_eq!(
-                fixture.source_digests.len(),
-                blobs,
-                "the {label} arm must carry one source digest per blob"
-            );
+                // The assertion this whole harness was built to be ready for,
+                // and the first day it can run. Until kin#1156 no route put a
+                // payload on a hosted replica, so the comparator ran against the
+                // source and proved only that it could answer. It now runs
+                // against the DESTINATION: every byte sequence the fixture wrote
+                // must be one the hosted replica can serve, by content hash
+                // against the bytes written, never by counting bodies.
+                let source_authority =
+                    ActiveApiRepositoryAuthority::open_layout_for_test(&fixture.layout).unwrap();
+                let source_bodies =
+                    source_payload_bodies(&source_authority, &fixture.source_digests);
+                drop(source_authority);
+                let snapshot = repository_authority_snapshot(&hosted_state, &hosted_id)
+                    .await
+                    .expect("the replica that admitted a bootstrap must be readable after it");
+                let verified = assert_destination_committed_payload(&snapshot, &source_bodies);
+                assert_eq!(
+                    verified, blobs,
+                    "every blob the {label} arm wrote must be verified on the destination"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "the {label} arm must be refused on the byte budget, which is Invalid \
+                     rather than Conflict: {message}"
+                );
+                assert!(
+                    message.contains("over negotiated limit"),
+                    "the {label} arm must name the negotiated byte limit: {message}"
+                );
+                assert!(
+                    message.contains("cannot be split across continuation packs"),
+                    "a bootstrap ships every object in one pack, so the refusal must be the \
+                     indivisible-step one rather than a segmentation retry: {message}"
+                );
+                // The bound that MOVED. If this ever comes back, the bootstrap
+                // has regressed and the arm above would still be green, because
+                // both bounds refuse.
+                assert!(
+                    !message.contains("imported-Git authority"),
+                    "the Git-authority bound is closed for the push direction; seeing it \
+                     again is a regression rather than this test being out of date: {message}"
+                );
+            }
             std::fs::remove_dir_all(&fixture.working).ok();
         }
     }
