@@ -2994,6 +2994,17 @@ struct EnrichmentWrite {
     /// separately because folding it into a green would trade one swallowed
     /// degradation for another.
     vector_stale: usize,
+    /// Whether the all-or-nothing batch was refused and the per-relation
+    /// backstop ran.
+    ///
+    /// Carried rather than only logged so it can be asserted. The batch is the
+    /// fast path and the backstop exists so one refused relation cannot cost
+    /// the rest; on a healthy sweep it must never run, and a claim nothing can
+    /// observe is a claim no test can hold to. Without this field the fast path
+    /// could stop being taken and every other assertion here would still pass,
+    /// because both paths reach the same end state and differ only in what they
+    /// cost.
+    backstop_fired: bool,
 }
 
 impl EnrichmentWrite {
@@ -3013,6 +3024,7 @@ impl EnrichmentWrite {
             published: count,
             offered: count,
             vector_stale: 0,
+            backstop_fired: false,
         }
     }
 }
@@ -3022,6 +3034,9 @@ impl std::ops::AddAssign for EnrichmentWrite {
         self.published += other.published;
         self.offered += other.offered;
         self.vector_stale += other.vector_stale;
+        // Sticky across a sweep: one batch falling back is the fact, and a
+        // later clean batch does not undo it.
+        self.backstop_fired |= other.backstop_fired;
     }
 }
 
@@ -3180,10 +3195,31 @@ fn install_lsp_relations(
     let offered = relations.len();
     let mut errored: std::collections::HashSet<kin_model::RelationId> =
         std::collections::HashSet::new();
-    for relation in &relations {
-        match state.graph.upsert_relation(relation) {
-            Ok(_) => {}
-            Err(error) => {
+
+    // One batch, so one invalidation pass. `upsert_relation` retires both
+    // endpoints' embeddings on every call, which is correct per relation
+    // because an entity's embed text carries its graph neighbourhood, but a
+    // sweep writing thousands one at a time pays that cost thousands of times
+    // over the same entities. `upsert_relations_batch` invalidates once for the
+    // whole batch and reaches the same end state.
+    //
+    // The batch is all-or-nothing: it validates every relation and refuses the
+    // lot if any endpoint is unadmitted. That is the backstop, and on a healthy
+    // sweep it must never fire. When it does, falling back to the per-relation
+    // loop keeps one bad relation from costing the other three thousand, which
+    // is the zero-loss guarantee the batch would otherwise trade away for
+    // throughput.
+    let batched = state.graph.upsert_relations_batch(&relations);
+    let backstop_fired = batched.is_err();
+    if let Err(error) = batched {
+        warn!(
+            offered,
+            %error,
+            "the enrichment batch was refused whole; falling back to per-relation writes so one \
+             refused relation does not cost the rest"
+        );
+        for relation in &relations {
+            if let Err(error) = state.graph.upsert_relation(relation) {
                 errored.insert(relation.id);
                 // Was `let _ =`. A write the graph refused was indistinguishable
                 // from one it took, and the count returned was the number of
@@ -3216,6 +3252,7 @@ fn install_lsp_relations(
         published,
         offered,
         vector_stale,
+        backstop_fired,
     };
 
     if written.lost() > 0 {
@@ -7413,6 +7450,44 @@ mod enrichment_marker_tests {
     /// file on the requests corpus yields 1167 relations, and a pass that held a
     /// file, or a sweep, would hold a structure sized by the store being swept.
     ///
+    /// A healthy sweep takes the batch and never runs the backstop.
+    ///
+    /// The tripwire for the cost fix, and the only assertion that can hold it.
+    /// The batch path and the per-relation path reach the same end state: the
+    /// same relations in the graph, the same endpoints invalidated. They differ
+    /// only in how many invalidation passes it took, which is internal to
+    /// kin-db and invisible from here. So every other test in this file passes
+    /// identically whichever path ran, and without this one the fast path could
+    /// stop being taken and nothing would notice.
+    ///
+    /// The backstop itself is not being tested here, only that it stays out of
+    /// the way. What it does when it fires is that one refused relation does not
+    /// cost the other three thousand, and that shape cannot be reached from this
+    /// fixture: kin-lsp mints only `Entity -> Entity` relations and kin-db
+    /// admits every entity endpoint, so no relation this producer can emit is
+    /// refusable. Asserting the zero is what stays honest.
+    #[test]
+    fn a_healthy_enrichment_write_takes_the_batch_and_never_the_backstop() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = DaemonState::open(kin_core::init(repo.path()).unwrap().layout).unwrap();
+        let source = entity("batch_source");
+        state.graph.upsert_entity(&source).unwrap();
+        let relations = derived_relations(source.id, 600);
+
+        let written = install_lsp_relations(&state, &relations);
+
+        assert_eq!(
+            written.published, 600,
+            "the batch path must publish everything it was offered"
+        );
+        assert!(
+            !written.backstop_fired,
+            "a healthy write must take the batch; the per-relation fallback exists for a refusal \
+             this producer cannot currently even emit"
+        );
+        assert_eq!(written.lost(), 0);
+    }
+
     /// The two assertions guard different things on purpose. The bound alone
     /// would pass for a buffer that silently dropped its overflow, and the total
     /// alone would pass for a buffer that held everything until the flush.
@@ -8684,6 +8759,7 @@ mod sweep_tally_tests {
             published: 588,
             offered: 600,
             vector_stale: 0,
+            backstop_fired: false,
         };
         assert_eq!(lossy.lost(), 12);
         assert!(
