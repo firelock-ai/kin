@@ -572,39 +572,39 @@ fn degradations_reading(payload: &Value) -> Reading {
 }
 
 /// The completeness signal's own reading of the substrate and the numbers.
-/// Whether graph truth was ever brought level with the repository, as an input
-/// the one verdict weighs.
+/// Graph freshness as a verdict input: wired, and deliberately weighing nothing
+/// until the durable marker reaches the health wire.
 ///
-/// Freshness used to reach the verdict only through `absence_gate`, which picked
-/// it up from the absence module, which read `envelope.behind`, which
-/// `GraphBehind::from_health` returns `None` for whenever nothing on disk is
-/// unadmitted. Three gates, and the outermost closed on exactly the case the
-/// ticket is about: a store with a clean working copy whose graph was built long
-/// ago certified with no qualifier at all (FIR-2226).
+/// The clock reaches the envelope now (see [`crate::envelope::GraphFreshness`]),
+/// which is the half of FIR-2226 that could be done honestly here. This is the
+/// seam that will carry it into the verdict, and it reports [`Reading::Silent`]
+/// in every state on purpose, contributing neither agreement nor refusal.
 ///
-/// What it refuses on is deliberately narrow. A daemon reporting no complete
-/// admission is refusing, because an answer taken over a graph nothing in this
-/// process ever brought level cannot be read as covering current code. A daemon
-/// that named one certifies, because this surface holds no second number to
-/// compare that clock against: the durable marker's `tracked_artifacts`, which
-/// is the comparison worth making, is not on the health wire, and a bare
-/// wall-clock threshold ages against whatever repository the next user brings.
-/// So this does NOT catch a months-stale store under a daemon that has been up
-/// the whole time and admitted once. That case waits for the durable marker to
-/// reach the wire, and saying so here is cheaper than having someone infer a
-/// guarantee this never made.
+/// **Why not refuse when no admission is recorded.** The wire's clock is the
+/// daemon's in-memory record, set only by a completed exact-tree admission pass,
+/// so a freshly initialized store whose daemon has not yet run one carries
+/// nothing. Absence is therefore the ordinary state of a healthy new store, not
+/// evidence of staleness, and refusing on it puts a floor under every answer on
+/// every such store. That is the regression `crate::negative`'s own gate comment
+/// warns about, and the acceptance suite's anti-vacuity control caught this
+/// module doing it.
 ///
-/// Silent, never certified, when the runtime reported no reconcile block at all:
-/// a silent input contributes no agreement, so a runtime with nothing to say
-/// cannot license anything.
+/// **Why not certify when one IS recorded.** A present clock proves an admission
+/// completed at some time. It does not prove the store is current, and the
+/// verdict's note asserts agreement of every input, so certifying here would
+/// state exactly the false all-clear for the case this cannot see: a months-stale
+/// store under a daemon that has been up the whole time and admitted once.
+///
+/// Both halves need the same missing fact, a reading the daemon does not
+/// publish: the durable last-admission marker, which survives a restart and
+/// carries `tracked_artifacts` beside its timestamp. With it, absence and
+/// staleness separate and this becomes a real input. Until then, silence is the
+/// only honest reading, and a silent input never contributes agreement, so
+/// nothing here can license an answer either.
 fn graph_freshness_reading(envelope: &Envelope) -> Reading {
-    let Some(freshness) = envelope.freshness.as_ref() else {
-        return Reading::Silent;
-    };
-    match freshness.limiting_factor() {
-        Some(factor) => Reading::Inconclusive(factor),
-        None => Reading::Certified,
-    }
+    // Read so the field is provably consumed and the seam is not decorative.
+    let _ = envelope.freshness.as_ref();
+    Reading::Silent
 }
 
 fn completeness_reading(envelope: &Envelope) -> Reading {
@@ -898,18 +898,20 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
 mod tests {
     use super::*;
 
-    /// FIR-2226. Freshness has to be an input the one verdict weighs. It used to
-    /// reach the verdict only through `absence_gate`, which read
-    /// `envelope.behind`, which `GraphBehind::from_health` returns `None` for
-    /// whenever nothing on disk is unadmitted, so a clean working copy over an
-    /// old graph certified with no qualifier.
+    /// FIR-2226 step 1. The clock reaches the envelope; the verdict seam is
+    /// wired and deliberately weighs nothing yet.
     ///
-    /// Driven through `with_health` rather than by building the state by hand,
-    /// because the question these arms have to answer is whether the reading
-    /// survives the shape the daemon actually sends. The field names below are
-    /// the producer's own (`crates/kin-cli/src/commands/resources.rs`), and both
-    /// are `skip_serializing_if = "Option::is_none"` there, which is why arm 2
-    /// omits the key rather than setting it null.
+    /// The arms below assert exactly that and no more. An earlier version of
+    /// this change refused when no admission was recorded, and the acceptance
+    /// suite's anti-vacuity control caught it certifying nothing: absence of the
+    /// in-memory clock is the ordinary state of a healthy fresh store, so
+    /// refusing on it floors every answer on every such store. The arms are
+    /// written against what this can honestly claim rather than against what it
+    /// was hoped to do.
+    ///
+    /// Driven through `with_health` using the producer's own field names, and
+    /// both are `skip_serializing_if = "Option::is_none"` there, which is why the
+    /// no-clock arm omits the key rather than setting it null.
     mod graph_freshness {
         use super::*;
 
@@ -921,116 +923,112 @@ mod tests {
             }))
         }
 
-        /// Arm 1, the positive control. A daemon that named an admission must
-        /// carry no freshness limit at all. Without this arm an implementation
-        /// that qualifies unconditionally passes arm 2 and is wrong.
-        #[test]
-        fn a_daemon_that_named_an_admission_is_not_limited_by_freshness() {
-            let envelope = envelope_with(json!({
+        fn with_clock() -> Envelope {
+            envelope_with(json!({
                 "untracked_path_count": 0,
                 "last_admission_success_at": "2026-08-26T00:00:00Z",
                 "last_admission_success_age_seconds": 12,
-            }));
+            }))
+        }
+
+        fn without_clock() -> Envelope {
+            envelope_with(json!({ "untracked_path_count": 0 }))
+        }
+
+        /// The disclosure, which is what step 1 actually delivers. Both stores
+        /// below hold zero unadmitted paths, so `behind` is silent by design and
+        /// used to take the clock down with it.
+        #[test]
+        fn the_clock_is_published_even_when_nothing_is_unadmitted() {
+            let recorded = with_clock();
             assert!(
-                matches!(graph_freshness_reading(&envelope), Reading::Certified),
-                "{:?}",
-                envelope.freshness
+                recorded.behind.is_none(),
+                "the count gate is what used to discard this: {:?}",
+                recorded.behind
+            );
+            assert!(
+                matches!(
+                    recorded.freshness,
+                    Some(crate::envelope::GraphFreshness::Recorded { .. })
+                ),
+                "a clean working copy must not hide a clock the daemon sent: {:?}",
+                recorded.freshness
+            );
+            assert!(
+                matches!(
+                    without_clock().freshness,
+                    Some(crate::envelope::GraphFreshness::NoAdmissionRecorded)
+                ),
+                "and the absence of one is itself a reading, not a parse failure"
             );
         }
 
-        /// Arm 2, the case the ticket is about. Zero unadmitted paths, so
-        /// `behind` is silent by design, and no admission recorded, so the
-        /// answer is over a graph nothing in this process brought level.
+        /// A runtime that reported no reconcile block has nothing to publish.
+        /// Distinct from a block that carries no clock, and the two must not
+        /// collapse.
         #[test]
-        fn a_daemon_with_no_recorded_admission_refuses_on_a_clean_working_copy() {
-            let envelope = envelope_with(json!({ "untracked_path_count": 0 }));
-            assert!(
-                envelope.behind.is_none(),
-                "the count gate is what used to discard this reading: {:?}",
-                envelope.behind
-            );
-            let Reading::Inconclusive(factor) = graph_freshness_reading(&envelope) else {
-                panic!(
-                    "a graph nothing admitted cannot certify: {:?}",
-                    envelope.freshness
-                );
-            };
-            assert!(
-                factor.starts_with("graph_admission_unrecorded"),
-                "the factor names the condition that held: {factor}"
-            );
-        }
-
-        /// Arm 3. A runtime that reported no reconcile block has nothing to say,
-        /// and a silent input contributes no agreement, so it can neither refuse
-        /// nor license.
-        #[test]
-        fn a_runtime_reporting_no_reconcile_block_is_silent_rather_than_current() {
+        fn a_runtime_reporting_no_reconcile_block_publishes_nothing() {
             let envelope = Envelope::daemon().with_health(&json!({ "graph_loaded": true }));
             assert!(envelope.freshness.is_none());
+        }
+
+        /// The seam weighs nothing, with a clock. Certifying here would state
+        /// agreement this cannot support: a present clock proves an admission
+        /// happened at some time, not that the store is current, and the
+        /// verdict's note asserts every input agreed.
+        #[test]
+        fn a_recorded_clock_does_not_certify() {
             assert!(matches!(
-                graph_freshness_reading(&envelope),
+                graph_freshness_reading(&with_clock()),
                 Reading::Silent
             ));
         }
 
-        /// The reading has to reach the composed factor, not merely exist. This
-        /// is the arm that catches a sixth entry left out of the readings array,
-        /// and it asserts on the named factor rather than on `certified == false`
-        /// because a reading that silently returns `Silent` still leaves the
-        /// response reading certified.
+        /// The seam weighs nothing, without one. Refusing here floors every
+        /// answer on every freshly initialized store, because the wire's clock is
+        /// the daemon's in-memory record and a daemon that has not yet completed
+        /// an admission pass carries none. This arm is the one the acceptance
+        /// control already proved can fail.
         #[test]
-        fn the_freshness_factor_reaches_the_one_verdict() {
-            let envelope = envelope_with(json!({ "untracked_path_count": 0 }));
-            let verdict = Verdict::compute(
-                "find_references",
-                &json!({ "references": [] }),
-                &envelope,
-                None,
-            )
-            .expect("a refusing input yields a verdict");
-            assert_eq!(
-                verdict
-                    .inputs
-                    .get("graph_freshness")
-                    .and_then(Value::as_str),
-                Some(INCONCLUSIVE),
-                "{:?}",
-                verdict.inputs
-            );
-            assert!(
-                verdict
-                    .limiting_factor
-                    .as_deref()
-                    .is_some_and(|factor| factor.contains("graph_admission_unrecorded")),
-                "the factor a reader acts on has to name it: {:?}",
-                verdict.limiting_factor
-            );
-            assert!(!verdict.certified);
+        fn an_unrecorded_clock_does_not_refuse() {
+            assert!(matches!(
+                graph_freshness_reading(&without_clock()),
+                Reading::Silent
+            ));
         }
 
-        /// The same call on a store that named an admission keeps the freshness
-        /// input out of the factor entirely, so the arm above cannot be passed
-        /// by a build that always refuses.
+        /// End to end: neither store may pick up a freshness clause, and the
+        /// input is present in the stamp as `not_applicable` rather than absent,
+        /// so the seam is visible to a reader and to the next reading added.
         #[test]
-        fn a_named_admission_leaves_the_factor_alone() {
-            let envelope = envelope_with(json!({
-                "untracked_path_count": 0,
-                "last_admission_success_at": "2026-08-26T00:00:00Z",
-            }));
-            let verdict = Verdict::compute(
-                "find_references",
-                &json!({ "references": [] }),
-                &envelope,
-                None,
-            );
-            let factor = verdict.as_ref().and_then(|v| v.limiting_factor.as_deref());
-            assert!(
-                !factor
-                    .unwrap_or_default()
-                    .contains("graph_admission_unrecorded"),
-                "{factor:?}"
-            );
+        fn neither_store_puts_a_freshness_clause_in_the_verdict() {
+            for envelope in [with_clock(), without_clock()] {
+                let verdict = Verdict::compute(
+                    "find_references",
+                    &json!({ "references": [] }),
+                    &envelope,
+                    None,
+                );
+                let Some(verdict) = verdict else { continue };
+                assert_eq!(
+                    verdict
+                        .inputs
+                        .get("graph_freshness")
+                        .and_then(Value::as_str),
+                    Some(NOT_APPLICABLE),
+                    "the seam is wired and weighs nothing: {:?}",
+                    verdict.inputs
+                );
+                assert!(
+                    !verdict
+                        .limiting_factor
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("graph_admission"),
+                    "no freshness clause may reach the factor yet: {:?}",
+                    verdict.limiting_factor
+                );
+            }
         }
     }
 
