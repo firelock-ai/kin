@@ -29,7 +29,6 @@ use kin_model::{
 // One declared bound governs both directions: what these routes accept is what
 // the transfer client reads.
 use kin_cli::commands::transfer::{DerivedViewRefresh, WorkspaceFollow};
-use kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1532,12 +1531,12 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route(
             "/repos/{repo_id}/transfer/export",
             post(repo_transfer_export)
-                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+                .layer(DefaultBodyLimit::max(configured_transfer_http_body_limit())),
         )
         .route(
             "/repos/{repo_id}/transfer/receive",
             post(repo_transfer_receive)
-                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+                .layer(DefaultBodyLimit::max(configured_transfer_http_body_limit())),
         )
         .route(
             "/repos/{repo_id}/archive/tar/{source_change_id}",
@@ -10068,6 +10067,56 @@ struct RepositoryTransferReceiveRequest {
     pack: kin_remote::repository_transfer::RepositoryTransferPack,
 }
 
+/// The wire cap that lets this deployment's decoded ceiling actually arrive.
+///
+/// Derived, never written down twice. Bodies travel base64, so a decoded
+/// closure is about four thirds of its size on the wire, and a raised decoded
+/// ceiling behind an unchanged wire cap is invisible: the pack never reaches
+/// validation and every client sees a bare 413 instead of the refusal that
+/// names the bound and the knob. The 413 stays as the outer backstop and should
+/// never be what a client hits first, because it says nothing useful.
+fn configured_transfer_http_body_limit() -> usize {
+    kin_remote::repository_transfer_http::http_body_limit_for(
+        configured_transfer_limits().max_decoded_body_bytes,
+    )
+}
+
+/// The decoded-closure ceiling this deployment will accept on a receive.
+///
+/// The library takes limits and this layer decides them, because a deployment
+/// knob belongs where configuration already lives rather than inside a
+/// protocol crate that reads no environment at all today.
+///
+/// Unset, malformed or zero means the compiled default, which is the safe
+/// value. A raised ceiling costs memory rather than correctness: the decoded
+/// closure is held in one map while a pack is validated, so this number IS the
+/// peak allocation of a receive and a host pays it per concurrent receive.
+///
+/// It never overrides a peer. The effective bound is the smaller of this and
+/// whatever the sender advertised, which `validate_pack` enforces after the
+/// caller has taken the minimum.
+fn configured_transfer_limits() -> kin_remote::repository_transfer::RepositoryTransferLimits {
+    let compiled = kin_remote::repository_transfer::RepositoryTransferLimits::default();
+    let Ok(raw) = std::env::var(kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV) else {
+        return compiled;
+    };
+    // A malformed value keeps the default rather than refusing to start. An
+    // operator who mistypes a ceiling gets the safe number and a warning, not a
+    // daemon that will not boot, because the failure mode of the second is
+    // worse than the failure mode of the first.
+    match raw.trim().parse::<u64>() {
+        Ok(bytes) if bytes > 0 => compiled.with_decoded_body_ceiling(bytes),
+        _ => {
+            tracing::warn!(
+                var = kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV,
+                value = %raw,
+                "ignoring an unparseable transfer body ceiling; using the compiled default"
+            );
+            compiled
+        }
+    }
+}
+
 pub(crate) fn repository_transfer_authority(
     state: &DaemonState,
     repo_id: &str,
@@ -10250,6 +10299,7 @@ async fn repo_transfer_receive(
         &request.destination_ref,
         kin_model::AuthorId::new("kin-daemon:repository-transfer-receiver"),
         &request.pack,
+        &configured_transfer_limits(),
     )
     .map_err(repository_transfer_error)?;
 
@@ -10480,6 +10530,7 @@ pub(crate) async fn pull_into_replica(
                         &destination_ref,
                         kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
                         pack,
+                        &configured_transfer_limits(),
                     )?;
                     admitted_packs += 1;
                     if local_derived_views && !refresh.is_stale() {
@@ -35475,5 +35526,125 @@ mod tests {
             &kin_mcp::budget::ResponseBudget::default(),
         );
         assert_eq!(mcp_result_text(&after), text);
+    }
+}
+
+#[cfg(test)]
+mod transfer_wire_cap_tests {
+    use super::*;
+    use kin_remote::repository_transfer_http::http_body_limit_for;
+
+    /// The size a decoded closure becomes on the wire, base64 included.
+    fn encoded(decoded: u64) -> usize {
+        (decoded.div_ceil(3) * 4) as usize
+    }
+
+    /// A real server carrying the SAME body limit the transfer routes carry,
+    /// built after the environment is set so it reads the configured ceiling.
+    ///
+    /// The library seam cannot see a body limit at all, so a seam test would
+    /// pass while every client got a 413. This is the layer that refuses, so
+    /// this is the layer the arm has to reach.
+    async fn serve_with_transfer_limit() -> (String, tokio::task::JoinHandle<()>) {
+        async fn arrived(body: axum::body::Bytes) -> String {
+            format!("arrived:{}", body.len())
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route(
+            "/transfer/receive",
+            post(arrived).layer(DefaultBodyLimit::max(configured_transfer_http_body_limit())),
+        );
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{addr}/transfer/receive"), handle)
+    }
+
+    async fn post_bytes(url: &str, len: usize) -> u16 {
+        let body = vec![b'a'; len];
+        reqwest::Client::new()
+            .post(url)
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .expect("the server answered rather than dropping the connection")
+            .status()
+            .as_u16()
+    }
+
+    /// A body at the encoded size of the effective ceiling ARRIVES.
+    ///
+    /// This is the defect that made the ceiling raise invisible: bodies travel
+    /// base64, so a 64 MiB decoded closure is about 86 MiB on the wire, and the
+    /// hand-written 24 MiB wire cap refused it before `validate_pack` ever saw
+    /// it. Every client would have got a bare 413 naming neither the bound nor
+    /// the knob.
+    ///
+    /// The ceiling is set small here so the arm moves kilobytes rather than
+    /// eighty megabytes. It exercises the same derivation, the same layer and
+    /// the same transport; only the number is cheap.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_body_at_the_encoded_ceiling_arrives_over_real_http() {
+        let decoded = 48 * 1024u64;
+        let _knob = kin_core::test_env::EnvVarGuard::set(
+            kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV,
+            decoded.to_string(),
+        );
+        assert_eq!(
+            configured_transfer_http_body_limit(),
+            http_body_limit_for(decoded),
+            "the router's limit must follow the configured ceiling, not the compiled one"
+        );
+
+        let (url, server) = serve_with_transfer_limit().await;
+        let status = post_bytes(&url, encoded(decoded)).await;
+        server.abort();
+
+        assert_eq!(
+            status, 200,
+            "a body at the encoded size of the ceiling must reach the handler, or the raise is \
+             invisible and every client sees a 413 instead of a named refusal"
+        );
+    }
+
+    /// The 413 is the OUTER backstop, not the first thing a client meets.
+    ///
+    /// A pack over the decoded ceiling still has to arrive, so that
+    /// `validate_pack` can refuse it by name and say which bound applied and
+    /// which knob moves it. That only works while the wire cap sits above the
+    /// encoded ceiling, which is what the headroom buys and what this asserts
+    /// over the real transport.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_pack_over_the_ceiling_still_arrives_so_the_named_refusal_is_what_fires() {
+        let decoded = 48 * 1024u64;
+        let _knob = kin_core::test_env::EnvVarGuard::set(
+            kin_remote::repository_transfer::DECODED_BODY_CEILING_ENV,
+            decoded.to_string(),
+        );
+        let (url, server) = serve_with_transfer_limit().await;
+
+        // Comfortably past the DECODED ceiling once encoded, and still under
+        // the wire cap. This is the pack `validate_pack` must get to refuse.
+        let over_ceiling = encoded(decoded * 2);
+        assert!(
+            over_ceiling < configured_transfer_http_body_limit(),
+            "the headroom has to leave room for an over-ceiling pack to arrive"
+        );
+        let arrived = post_bytes(&url, over_ceiling).await;
+        assert_eq!(
+            arrived, 200,
+            "an over-ceiling pack must still ARRIVE, or its refusal is a bare 413 rather than \
+             the named one"
+        );
+
+        // And past the wire cap itself, the backstop does fire.
+        let past_cap = configured_transfer_http_body_limit() + 1;
+        let refused = post_bytes(&url, past_cap).await;
+        server.abort();
+        assert_eq!(refused, 413, "the wire cap is still the outer backstop");
     }
 }
