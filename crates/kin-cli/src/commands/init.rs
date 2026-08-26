@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use super::status::{SemanticEnrichmentPresence, SemanticEnrichmentStatus};
@@ -127,11 +127,18 @@ macro_rules! note {
     }};
 }
 
-pub async fn run(path: Option<String>, json: bool, no_enrich: bool) -> Result<()> {
+pub async fn run(
+    path: Option<String>,
+    json: bool,
+    no_enrich: bool,
+    adopt_repository_id: Option<String>,
+) -> Result<()> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
+
+    let adopted = parse_adopted_repository_id(adopt_repository_id.as_deref())?;
 
     ensure_directory(&dir)?;
     reject_existing_repository(&dir)?;
@@ -143,12 +150,24 @@ pub async fn run(path: Option<String>, json: bool, no_enrich: bool) -> Result<()
         InitBoundary::NativeUnborn
     };
 
-    let result = match boundary {
-        InitBoundary::ExactGit => kin_core::init_from_git(&dir)
+    // Both boundaries honour adoption. A flag that worked on one of them and
+    // was silently ignored on the other would produce a store that looks
+    // adopted and pushes nowhere, which is the failure this whole path exists
+    // to remove.
+    let result = match (boundary, &adopted) {
+        (InitBoundary::ExactGit, None) => kin_core::init_from_git(&dir)
             .context("admit exact reachable Git repository authority")?,
-        InitBoundary::NativeUnborn => {
+        (InitBoundary::ExactGit, Some(adopted)) => kin_core::init_from_git_adopting(&dir, adopted)
+            .with_context(|| {
+                format!("admit exact reachable Git repository authority adopting {adopted}")
+            })?,
+        (InitBoundary::NativeUnborn, None) => {
             kin_core::init(&dir).context("initialize unborn Kin-native repository authority")?
         }
+        (InitBoundary::NativeUnborn, Some(adopted)) => kin_core::init_adopting(&dir, adopted)
+            .with_context(|| {
+                format!("initialize unborn Kin-native repository authority adopting {adopted}")
+            })?,
     };
 
     if let Err(error) = exclude_store_from_git(result.layout.working_dir()) {
@@ -203,6 +222,27 @@ pub async fn run(path: Option<String>, json: bool, no_enrich: bool) -> Result<()
         print_human_result(&result, boundary, &enrichment)?;
     }
     Ok(())
+}
+
+/// Resolve `--adopt-repository-id` into the identity the store will carry.
+///
+/// An empty or blank value is refused rather than treated as absent. The two
+/// mean opposite things: absent mints a fresh identity, and present says this
+/// store must be a replica of a repository that already exists. Reading a blank
+/// argument as absent would hand back a store that mints, which is exactly the
+/// state an operator reaching for this flag is trying to avoid, and it would
+/// only be discovered at the push.
+fn parse_adopted_repository_id(value: Option<&str>) -> Result<Option<kin_model::RepositoryId>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("--adopt-repository-id needs the identity to adopt; it was given an empty value");
+    }
+    kin_model::RepositoryId::new(trimmed.to_string())
+        .map(Some)
+        .map_err(|error| anyhow::anyhow!("invalid --adopt-repository-id {trimmed:?}: {error}"))
 }
 
 /// How long the conversion phase will wait for the sweep before handing the
@@ -1097,6 +1137,33 @@ mod tests {
     use super::*;
     use crate::commands::status::SemanticEnrichmentView;
 
+    /// `--adopt-repository-id` and no flag at all mean opposite things, so a
+    /// blank value must not quietly become the second one.
+    ///
+    /// An operator reaching for this flag is saying the store has to be a
+    /// replica of a repository that already exists. Reading a blank argument
+    /// as absent would hand them a store that minted its own identity, which
+    /// looks fine until the push, and the push is minutes of staging later.
+    #[test]
+    fn a_blank_adopted_repository_id_is_refused_rather_than_read_as_absent() {
+        assert!(parse_adopted_repository_id(None).unwrap().is_none());
+        assert_eq!(
+            parse_adopted_repository_id(Some("  kin-db  "))
+                .unwrap()
+                .map(|id| id.as_str().to_string()),
+            Some("kin-db".to_string()),
+            "surrounding whitespace is trimmed, not adopted"
+        );
+        for blank in ["", "   ", "\t"] {
+            let error = parse_adopted_repository_id(Some(blank))
+                .expect_err("a blank identity is not an absent one");
+            assert!(
+                error.to_string().contains("empty value"),
+                "the refusal must say what was missing: {error}"
+            );
+        }
+    }
+
     /// What `kin init` actually prints when a run produced no cross-file edges.
     ///
     /// The daemon-side rows are tested where they are decided. These test the
@@ -1907,7 +1974,7 @@ mod tests {
         // Enrichment off: this case is about the conversion transaction, and
         // starting a daemon to query a language server would make it depend on
         // what the host has installed.
-        run(Some(repo.to_str().unwrap().to_string()), false, true)
+        run(Some(repo.to_str().unwrap().to_string()), false, true, None)
             .await
             .expect("kin init must succeed under a scratch registry");
 

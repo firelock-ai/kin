@@ -32,7 +32,12 @@ pub struct KinManifest {
     #[serde(default)]
     pub adapters: Vec<String>,
 
-    /// Unique repository identifier (UUID v4).
+    /// Unique repository identifier.
+    ///
+    /// A UUID v4 when this build minted it. A replica that adopted another
+    /// repository's identity carries that identity verbatim instead, which is
+    /// how a hosted slug reaches a local manifest, so nothing may read this
+    /// field as UUID text without handling the case where it is not.
     pub repo_id: String,
 
     /// Unique identity of this local materialized workspace (UUID v4).
@@ -150,10 +155,13 @@ impl KinManifest {
     /// replicas share repository truth and must never share local
     /// workspace/session authority.
     ///
-    /// Shape is not validated here. `prepare_repository_layout_at` requires a
-    /// UUID v4 for both identities and refuses the pair when they are equal, so
-    /// an identity this build cannot serve is refused before any repository
-    /// layout is staged.
+    /// Shape is not validated here. `prepare_repository_layout_with_origin`
+    /// decides it, and what it admits depends on where the identity came from:
+    /// an adopted one must be one portable filesystem component, because a
+    /// local store is a directory named by its repository id, and a minted one
+    /// must be a UUID v4. Workspace identity is a UUID v4 either way, and the
+    /// pair is refused when they are equal. So an identity this build cannot
+    /// serve is refused before any repository layout is staged.
     pub fn adopting(repo_id: impl Into<String>) -> Self {
         Self {
             repo_id: repo_id.into(),

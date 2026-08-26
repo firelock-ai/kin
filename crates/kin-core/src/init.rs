@@ -440,7 +440,12 @@ impl Drop for PreparedRepositoryInit {
 ///
 /// Returns `KinError::AlreadyInitialized` if `.kin/` already exists.
 pub fn init(working_dir: &Path) -> Result<InitResult> {
-    init_with_config(working_dir, KinConfig::default(), KinManifest::new())
+    init_with_config(
+        working_dir,
+        KinConfig::default(),
+        KinManifest::new(),
+        RepositoryIdentityOrigin::Minted,
+    )
 }
 
 /// Initialize a repository that will adopt a remote's history over a native
@@ -464,6 +469,32 @@ pub fn init_replica(working_dir: &Path, default_branch: &str) -> Result<InitResu
         working_dir,
         replica_config(default_branch),
         KinManifest::new(),
+        RepositoryIdentityOrigin::Minted,
+    )
+}
+
+/// Initialize a repository that adopts an existing repository identity instead
+/// of minting one, admitting no history.
+///
+/// The native-boundary sibling of [`crate::init_from_git_adopting`]. Both exist
+/// for the same reason: every exact-transfer surface is identity-exact, so a
+/// store meant to publish into a repository that already exists has to carry
+/// that repository's identity from the moment it is created. Relabelling later
+/// is not available, because the identity is recorded in the committed
+/// authority metadata and in every external-change alias a pack carries.
+///
+/// # Errors
+///
+/// Returns `KinError::AlreadyInitialized` if `.kin/` already exists, and
+/// refuses an identity the local store cannot be keyed by. See
+/// [`RepositoryIdentityOrigin::Adopted`] for what that admits.
+pub fn init_adopting(working_dir: &Path, repository_id: &RepositoryId) -> Result<InitResult> {
+    refuse_adoption_over_existing_replica(working_dir, repository_id.as_str())?;
+    init_with_config(
+        working_dir,
+        KinConfig::default(),
+        KinManifest::adopting(repository_id.as_str()),
+        RepositoryIdentityOrigin::Adopted,
     )
 }
 
@@ -490,29 +521,20 @@ pub fn init_replica(working_dir: &Path, default_branch: &str) -> Result<InitResu
 ///
 /// Refuses a directory that already holds a Kin repository, naming the identity
 /// already there alongside the one being adopted, so an adoption never
-/// re-identifies an existing replica. Refuses an identity that is not a UUID
-/// v4, which is the shape every locally published repository identity has.
+/// re-identifies an existing replica. Refuses an identity the local store
+/// cannot be keyed by; see [`RepositoryIdentityOrigin::Adopted`].
 pub fn init_replica_adopting(
     working_dir: &Path,
     default_branch: &str,
     repository_id: &RepositoryId,
 ) -> Result<InitResult> {
     let adopted = repository_id.as_str();
-    match uuid::Uuid::parse_str(adopted) {
-        Ok(parsed) if parsed.get_version_num() == 4 => {}
-        _ => {
-            return Err(KinError::Config(format!(
-                "remote repository identity {adopted} is not a UUID v4, so no local replica can \
-                 adopt it. A local repository identity is minted as a UUID v4 and every authority \
-                 that opens one requires that shape"
-            )));
-        }
-    }
     refuse_adoption_over_existing_replica(working_dir, adopted)?;
     init_with_config(
         working_dir,
         replica_config(default_branch),
         KinManifest::adopting(adopted),
+        RepositoryIdentityOrigin::Adopted,
     )
 }
 
@@ -557,6 +579,7 @@ fn init_with_config(
     working_dir: &Path,
     config: KinConfig,
     manifest: KinManifest,
+    origin: RepositoryIdentityOrigin,
 ) -> Result<InitResult> {
     let canonical_working_dir = working_dir
         .canonicalize()
@@ -580,7 +603,8 @@ fn init_with_config(
     })?;
     let staging_dir = staging_parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
     let admission_case = detect_admission_case(&canonical_working_dir)?;
-    let mut prepared = prepare_repository_layout_at(&staging_dir, &kin_dir, config, manifest)?;
+    let mut prepared =
+        prepare_repository_layout_with_origin(&staging_dir, &kin_dir, config, manifest, origin)?;
     let transaction = build_repository_bootstrap_transaction(
         prepared.initial_roots().clone(),
         prepared.repository_id().clone(),
@@ -627,23 +651,108 @@ fn detect_admission_case(workspace_root: &Path) -> Result<AdmissionCase> {
     }
 }
 
+/// Where a repository identity being staged came from.
+///
+/// The two cases carry different obligations and always have; only one of them
+/// used to be reachable. A minted identity is this build's own choice, so it is
+/// held to the shape this build mints: a UUID v4, which is what keeps two
+/// repositories created independently from ever colliding. An adopted identity
+/// was chosen by the repository this replica is joining, and refusing it for
+/// not looking locally minted refuses the whole point of adoption. `RepositoryId`
+/// says so itself: "Hosted slugs and UUID text are both valid".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryIdentityOrigin {
+    /// Minted here. Must be a UUID v4.
+    Minted,
+    /// Taken verbatim from the repository this replica joins. Must be one
+    /// portable filesystem component, because a local store is a directory
+    /// named by its repository id (`{base}/{repo_id}/authority.json` in
+    /// `kin-db`'s `LocalFileBackend`), so an identity carrying a separator or a
+    /// parent reference would name storage outside the store.
+    Adopted,
+}
+
+/// Refuse an adopted identity the local store cannot be keyed by.
+///
+/// `RepositoryId` admits any non-control text up to 255 bytes, which is right
+/// for a wire identity and wrong for one that also names a directory. kin-db's
+/// `validate_source_blob_repo_id` refuses the unsafe shapes at the storage
+/// layer and would refuse these too; this runs first so the refusal names the
+/// identity the operator typed rather than surfacing from under a staged
+/// layout. Every hosted slug in use clears it.
+fn require_storable_adopted_identity(adopted: &str) -> Result<()> {
+    let portable = !adopted.is_empty()
+        && adopted.len() <= 255
+        && !matches!(adopted, "." | "..")
+        && !adopted.ends_with(['.', ' '])
+        && adopted
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+    if !portable {
+        return Err(KinError::Config(format!(
+            "repository identity {adopted:?} cannot be adopted: a local store is a directory \
+             named by its repository id, so an adopted identity must be one portable filesystem \
+             component of ASCII letters, digits, dot, underscore or hyphen"
+        )));
+    }
+    Ok(())
+}
+
 /// Create a complete unpublished repository layout at an explicit staging
 /// path. The path must be an absolute, direct child of an existing directory
 /// and its name must begin with `.kin.init-`.
+///
+/// Stages a minted identity. Use [`prepare_repository_layout_with_origin`] to
+/// stage one adopted from another replica.
 pub fn prepare_repository_layout_at(
     staging_kin_dir: &Path,
     final_kin_dir: &Path,
     config: KinConfig,
     manifest: KinManifest,
 ) -> Result<PreparedRepositoryInit> {
+    prepare_repository_layout_with_origin(
+        staging_kin_dir,
+        final_kin_dir,
+        config,
+        manifest,
+        RepositoryIdentityOrigin::Minted,
+    )
+}
+
+/// [`prepare_repository_layout_at`], saying where the identity came from.
+///
+/// Only the repository identity's admissible shape depends on `origin`.
+/// Workspace identity is always minted here and always a UUID v4, because
+/// repository truth is shared between replicas and local workspace authority
+/// never is.
+pub fn prepare_repository_layout_with_origin(
+    staging_kin_dir: &Path,
+    final_kin_dir: &Path,
+    config: KinConfig,
+    manifest: KinManifest,
+    origin: RepositoryIdentityOrigin,
+) -> Result<PreparedRepositoryInit> {
     config.validate()?;
-    let repository_uuid = uuid::Uuid::parse_str(&manifest.repo_id)
-        .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
-    if repository_uuid.get_version_num() != 4 {
-        return Err(KinError::Other(
-            "repository manifest identity must be a UUID v4".to_string(),
-        ));
-    }
+    let repository_uuid = match origin {
+        RepositoryIdentityOrigin::Minted => {
+            let minted = uuid::Uuid::parse_str(&manifest.repo_id).map_err(|error| {
+                KinError::Other(format!("invalid repository identity: {error}"))
+            })?;
+            if minted.get_version_num() != 4 {
+                return Err(KinError::Other(
+                    "repository manifest identity must be a UUID v4".to_string(),
+                ));
+            }
+            Some(minted)
+        }
+        RepositoryIdentityOrigin::Adopted => {
+            require_storable_adopted_identity(&manifest.repo_id)?;
+            // Parsed only so the distinctness check below still fires when a
+            // peer's identity happens to be UUID text. A slug parses as
+            // nothing and can never equal a workspace identity that must.
+            uuid::Uuid::parse_str(&manifest.repo_id).ok()
+        }
+    };
     let repository_id = RepositoryId::new(manifest.repo_id.clone())
         .map_err(|error| KinError::Other(format!("invalid repository identity: {error}")))?;
     let workspace_uuid = uuid::Uuid::parse_str(&manifest.workspace_id)
@@ -653,7 +762,7 @@ pub fn prepare_repository_layout_at(
             "workspace manifest identity must be a UUID v4".to_string(),
         ));
     }
-    if repository_uuid == workspace_uuid {
+    if repository_uuid == Some(workspace_uuid) {
         return Err(KinError::Other(
             "repository and workspace manifest identities must be distinct".to_string(),
         ));
@@ -2283,10 +2392,22 @@ pub(crate) fn recover_orphaned_repository_stages(
             }
             let repository_uuid = uuid::Uuid::parse_str(&record.repository_id).ok();
             let workspace_uuid = uuid::Uuid::parse_str(&record.workspace_id).ok();
-            if repository_uuid.is_none_or(|id| {
-                id.get_version_num() != 4 || id.to_string() != record.repository_id
-            }) || workspace_uuid
-                .is_none_or(|id| id.get_version_num() != 4 || id.to_string() != record.workspace_id)
+            // This gate asks one question: is this a record this build could
+            // have written? Since adoption, the answer has two shapes. A minted
+            // repository identity is a UUID v4 in canonical text; an adopted one
+            // is the peer's identity verbatim, which is a slug on every hosted
+            // repository there is. Admitting only the first left an interrupted
+            // adopting init's stage matching nothing here, so it was skipped on
+            // every later pass and its disk was never reclaimed. Workspace
+            // identity is always minted, so it keeps the stricter rule.
+            let repository_identity_is_one_this_build_writes = match repository_uuid {
+                Some(id) => id.get_version_num() == 4 && id.to_string() == record.repository_id,
+                None => require_storable_adopted_identity(&record.repository_id).is_ok(),
+            };
+            if !repository_identity_is_one_this_build_writes
+                || workspace_uuid.is_none_or(|id| {
+                    id.get_version_num() != 4 || id.to_string() != record.workspace_id
+                })
                 || repository_uuid == workspace_uuid
             {
                 continue;
@@ -2424,6 +2545,107 @@ mod tests {
         GitObjectBodyLoader, GitObjectFormat, Hash256, RefTarget, Timestamp, WorkspaceHead,
     };
     use sha2::{Digest, Sha256};
+
+    /// A store may adopt a hosted repository identity, and it is the committed
+    /// authority that has to carry it, not just the manifest.
+    ///
+    /// The manifest is the easy half and proves nothing a transfer cares
+    /// about. Every identity check on the transfer path reads
+    /// `authority_metadata().repository_id`, so that is what this asserts.
+    #[test]
+    fn an_adopted_hosted_identity_reaches_the_committed_authority() {
+        let working = tempfile::tempdir().unwrap();
+        let adopted = RepositoryId::new("kin-db".to_string()).unwrap();
+
+        let result = init_adopting(working.path(), &adopted).expect("a hosted slug is adoptable");
+
+        assert_eq!(result.repository_id, adopted);
+        assert_eq!(
+            KinManifest::load(&result.layout.manifest_path())
+                .unwrap()
+                .repo_id,
+            "kin-db"
+        );
+        let authority = RepositoryAuthorityManager::open(
+            adopted.clone(),
+            Arc::new(LocalFileBackend::new(result.layout.kindb_dir())) as Arc<dyn StorageBackend>,
+        )
+        .expect("the adopted store reopens under the identity it adopted");
+        assert_eq!(
+            authority.read_authority().metadata().repository_id,
+            adopted,
+            "the identity every transfer check reads must be the adopted one"
+        );
+    }
+
+    /// Minting is unchanged, and that is half of what makes adoption safe.
+    ///
+    /// Two repositories created independently must never collide, which is
+    /// what the UUID v4 shape buys. Adoption opts out of that because the peer
+    /// already chose the identity; a mint that opted out would be a
+    /// regression, so the gate is asserted from both sides.
+    #[test]
+    fn a_minted_identity_is_still_required_to_be_a_uuid_v4() {
+        let working = tempfile::tempdir().unwrap();
+        let minted = init(working.path()).expect("a plain init still mints");
+        let parsed = uuid::Uuid::parse_str(minted.repository_id.as_str())
+            .expect("a minted identity is UUID text");
+        assert_eq!(parsed.get_version_num(), 4);
+
+        // A slug never parses as UUID text at all, and a UUID of another
+        // version parses and is still the wrong shape. Both have to stay
+        // refused on the minting path, and only the second can reach the
+        // version check, so asserting on one of them would leave the other
+        // unguarded.
+        let staging = tempfile::tempdir().unwrap();
+        for (candidate, expected) in [
+            ("kin-db", "invalid repository identity"),
+            // A UUID v1: parses, wrong version.
+            ("2c5ea4c0-4067-11e9-8bad-9b1deb4d3b7d", "UUID v4"),
+        ] {
+            let error = prepare_repository_layout_at(
+                &staging.path().join(format!(".kin.init-{candidate}")),
+                &staging.path().join(".kin"),
+                KinConfig::default(),
+                KinManifest::adopting(candidate),
+            )
+            .expect_err("a mint refuses any identity it would not have minted");
+            assert!(
+                error.to_string().contains(expected),
+                "the refusal for {candidate} must name why a mint would not have produced it: {error}"
+            );
+        }
+    }
+
+    /// An adopted identity still has to be one the local store can be keyed
+    /// by, because a local store is a directory named by its repository id.
+    ///
+    /// `RepositoryId` admits any non-control text up to 255 bytes, which is
+    /// right for a wire identity and wrong for a directory name: kin-db's
+    /// `LocalFileBackend` lays a store out at `{base}/{repo_id}/authority.json`,
+    /// so a separator would nest the store and a parent reference would put it
+    /// outside the tree entirely. Both are valid `RepositoryId` values, so the
+    /// type cannot refuse them and this must.
+    #[test]
+    fn an_adopted_identity_that_is_not_one_path_component_is_refused() {
+        for hostile in ["..", ".", "../escaped", "org/repo", "has space", ""] {
+            let working = tempfile::tempdir().unwrap();
+            let Ok(candidate) = RepositoryId::new(hostile.to_string()) else {
+                // Refused by the type already, which is the outcome this wants.
+                continue;
+            };
+            let error = init_adopting(working.path(), &candidate)
+                .expect_err("an identity the store cannot be keyed by is refused");
+            assert!(
+                error.to_string().contains("portable filesystem component"),
+                "the refusal must name why {hostile:?} cannot be adopted: {error}"
+            );
+            assert!(
+                !working.path().join(".kin").exists(),
+                "a refused adoption leaves no store behind for {hostile:?}"
+            );
+        }
+    }
 
     /// A concurrent recovery scan holding this init's own owner file must not
     /// fail the init.
@@ -2917,23 +3139,63 @@ mod tests {
             .contains(&existing.repository_id.to_string()));
     }
 
-    /// A repository identity is minted as a UUID v4 and every local authority
-    /// requires that shape, so an identity that is not one has to be refused
+    /// A clone adopts the identity its peer published, whatever shape that is,
+    /// and refuses one the local store could not be keyed by. Both halves are
+    /// asserted here because this entry point is the one that adopts an
+    /// identity the local operator did not choose.
+    ///
+    /// This test used to require a UUID v4 and refuse everything else. That was
+    /// right while a peer could only ever be another locally minted repository,
+    /// and wrong the moment a peer could be a hosted one, whose repositories are
+    /// named by slug. `RepositoryId` says so itself: hosted slugs and UUID text
+    /// are both valid. What survives from the old contract is the part that was
+    /// always the point, that an identity this store cannot serve is refused
     /// before a layout is staged rather than after.
     #[test]
-    fn a_remote_identity_that_is_not_a_uuid_v4_is_refused_before_anything_is_created() {
+    fn a_remote_identity_is_adopted_when_the_store_can_be_keyed_by_it_and_refused_when_it_cannot() {
         let parent = tempfile::tempdir().unwrap();
+
         for adopted in [
             RepositoryId::new("hosted-repo-42").unwrap(),
-            RepositoryId::new(uuid::Uuid::nil().to_string()).unwrap(),
+            RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap(),
         ] {
-            let replica = parent.path().join(adopted.as_str());
+            let replica = parent.path().join(format!("adopted-{}", adopted.as_str()));
             std::fs::create_dir(&replica).unwrap();
-            let error = init_replica_adopting(&replica, "main", &adopted).unwrap_err();
+            let result = init_replica_adopting(&replica, "main", &adopted)
+                .expect("a peer's own identity is adoptable");
+            assert_eq!(result.repository_id, adopted);
+            assert_eq!(
+                KinManifest::load(&result.layout.manifest_path())
+                    .unwrap()
+                    .repo_id,
+                adopted.as_str()
+            );
+        }
+
+        // A local store is a directory named by its repository id, so these are
+        // valid `RepositoryId` values that no local replica can be built on.
+        for hostile in ["..", "org/repo", "trailing.", "has space"] {
+            let Ok(adopted) = RepositoryId::new(hostile.to_string()) else {
+                continue;
+            };
+            let replica = parent.path().join("refused");
+            std::fs::create_dir_all(&replica).unwrap();
+            let error = init_replica_adopting(&replica, "main", &adopted)
+                .expect_err("an identity the store cannot be keyed by is refused");
             let message = error.to_string();
-            assert!(matches!(error, KinError::Config(_)), "{message}");
-            assert!(message.contains(adopted.as_str()), "{message}");
-            assert!(!replica.join(".kin").exists(), "{message}");
+            assert!(
+                matches!(error, KinError::Config(_)),
+                "{hostile:?}: {message}"
+            );
+            assert!(
+                message.contains("portable filesystem component"),
+                "{hostile:?}: {message}"
+            );
+            assert!(
+                !replica.join(".kin").exists(),
+                "{hostile:?} must be refused before a layout is staged: {message}"
+            );
+            std::fs::remove_dir_all(&replica).unwrap();
         }
     }
 
@@ -3033,6 +3295,69 @@ mod tests {
         );
         assert!(!staging_root.exists());
         assert!(!owner_path.exists());
+    }
+
+    /// A stage left by an interrupted adopting init is still reapable.
+    ///
+    /// Orphan recovery refuses to act on an owner record this build could not
+    /// have written, and it decided that by requiring a UUID v4 repository
+    /// identity. Adoption made a second shape writable, so that gate started
+    /// skipping the very stages it exists to reclaim: an adopting init killed
+    /// mid-run left a private staging root that every later pass walked past in
+    /// silence, and for a repository the size of `kin` that is gigabytes nothing
+    /// ever comes back for.
+    ///
+    /// The minted stage beside it is the control. Both are built the same way
+    /// and only the identity differs, so a pass that reclaims one and not the
+    /// other is measuring the identity and nothing else.
+    #[test]
+    fn orphan_recovery_reclaims_a_stage_whose_repository_identity_was_adopted() {
+        for (label, manifest, origin) in [
+            (
+                "adopted",
+                KinManifest::adopting("kin-db"),
+                RepositoryIdentityOrigin::Adopted,
+            ),
+            (
+                "minted",
+                KinManifest::new(),
+                RepositoryIdentityOrigin::Minted,
+            ),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let parent = directory.path().canonicalize().unwrap();
+            let final_kin = parent.join(".kin");
+
+            let mut prepared = prepare_repository_layout_with_origin(
+                &parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4())),
+                &final_kin,
+                KinConfig::default(),
+                manifest,
+                origin,
+            )
+            .unwrap();
+            let stage_root = prepared.layout.root().to_path_buf();
+            let owner_path = prepared.stage_lease.as_ref().unwrap().owner_path.clone();
+            // Abandon the stage the way a kill does: nothing runs, and what is
+            // on disk is all the next pass has to go on.
+            prepared.cleanup_armed = false;
+            drop(prepared);
+            assert!(stage_root.is_dir(), "{label} stage must exist to be reaped");
+
+            assert_eq!(
+                recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+                1,
+                "an abandoned {label} stage must be reclaimed, not walked past"
+            );
+            assert!(
+                !stage_root.exists(),
+                "the {label} stage root must be gone after recovery"
+            );
+            assert!(
+                !owner_path.exists(),
+                "the {label} owner record must be gone after recovery"
+            );
+        }
     }
 
     #[test]
