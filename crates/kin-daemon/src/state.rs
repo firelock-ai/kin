@@ -1199,6 +1199,13 @@ pub struct DaemonState {
     /// outright, so the only way one appears is a transfer, and a transfer
     /// advances the generation the daemon's CAS is pinned to.
     hosted_authority_envelope: bool,
+    /// How many flushes have been refused the backend authority write.
+    ///
+    /// Exists so the healthy path can assert zero rather than merely not
+    /// asserting anything: a guard that fires where it should not is invisible
+    /// from the outside, because a refused flush and a flush with nothing to do
+    /// both return `Ok` and both leave the object alone.
+    hosted_authority_flush_refusals: AtomicU64,
     /// Startup-opened local storage capability. Reusing this exact backend
     /// preserves KinDB's device/inode root pin across every local authority
     /// request; constructing a new backend from the mutable path would bless a
@@ -2550,6 +2557,7 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
             hosted_authority_envelope: false,
+            hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: Some(local_repository_backend),
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
@@ -2802,6 +2810,7 @@ impl DaemonState {
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
             hosted_authority_envelope,
+            hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: None,
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
@@ -4241,6 +4250,13 @@ impl DaemonState {
         self.save_snapshot_impl(SnapshotSaveMode::Incremental)
     }
 
+    /// How many flushes this daemon has refused the backend authority write.
+    ///
+    /// Zero is the assertion that matters on a healthy path.
+    pub fn hosted_authority_flush_refusals(&self) -> u64 {
+        self.hosted_authority_flush_refusals.load(Ordering::SeqCst)
+    }
+
     pub fn save_snapshot_full(&self) -> Result<()> {
         self.save_snapshot_impl(SnapshotSaveMode::Full)
     }
@@ -4810,11 +4826,22 @@ impl DaemonState {
                 // once already, and it is worse than not flushing, because it
                 // is silent.
                 self.graph.flush_text_index().map_err(DaemonError::from)?;
+                let refusals = self
+                    .hosted_authority_flush_refusals
+                    .fetch_add(1, Ordering::SeqCst)
+                    + 1;
                 debug!(
                     repo_id,
                     generation = expected_gen,
+                    refusals,
                     "flushed derived text index only; the backend authority envelope is not this daemon's to rewrite"
                 );
+                // Deliberately `Ok`, not an error. The periodic loop marks the
+                // state clean on success and only then stops flushing until the
+                // next mutation; an error would instead climb
+                // `consecutive_failures`, back off, and log "persistence
+                // unhealthy" on a daemon behaving exactly as designed. A
+                // refusal that is normal must not be reported as a fault.
                 expected_gen
             } else if force_full
                 || expected_gen == kin_db::GENERATION_INIT

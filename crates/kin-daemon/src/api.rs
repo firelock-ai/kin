@@ -16112,6 +16112,242 @@ mod tests {
         }
     }
 
+    /// The production-shaped chain, end to end.
+    ///
+    /// `POST /graph/mutations` reaches no save of its own; what it does is
+    /// `mark_dirty`, and the periodic loop refuses to flush at all unless
+    /// `is_dirty`. So the real sequence is a mutation ARMING the gate and the
+    /// wall clock firing it. An earlier reading of this ticket called the route
+    /// a third write path, which it is not, and an arm written that way would
+    /// have asserted something false.
+    ///
+    /// The batch is deliberately empty. The arming step is `mark_dirty`, which
+    /// the handler runs unconditionally after applying whatever it was given,
+    /// so an empty batch isolates exactly the step under test.
+    #[tokio::test]
+    async fn a_graph_mutation_arms_the_flush_that_must_not_erase_the_envelope() {
+        let repo_id = format!("hosted-flush-armed-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8062,
+            "publish a head an armed flush must not erase",
+        );
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope"
+        );
+
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/graph/mutations")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the arming route must succeed, or this arm never reaches the flush"
+        );
+        assert!(
+            state.is_dirty(),
+            "the mutation must arm the dirty gate, or the periodic loop would skip the flush entirely"
+        );
+
+        state
+            .save_snapshot()
+            .expect("the armed flush must not fail");
+
+        let (still_present, still_refs, still_generation) =
+            persisted_authority(storage.path(), &repo_id);
+        assert!(still_present, "the armed flush erased the envelope");
+        assert_eq!(still_refs, refs, "the armed flush changed the ref set");
+        assert_eq!(
+            still_generation, generation,
+            "the armed flush advanced the authority generation"
+        );
+        assert!(
+            state.hosted_authority_flush_refusals() >= 1,
+            "the flush must have been refused the authority write, not merely found nothing to do"
+        );
+    }
+
+    /// Today's accidental protection, pinned so the fix is not credited with it.
+    ///
+    /// A daemon that was already running when the envelope was published keeps
+    /// the cursor it opened with, so its flush CAS-fails and the envelope
+    /// survives for a reason that has nothing to do with this guard. Without
+    /// this arm the fix could look like it protects a case that was already
+    /// safe, and the restart arm beside it would lose its meaning.
+    ///
+    /// The refusal counter reading zero is the whole point: the CAS did this.
+    #[tokio::test]
+    async fn a_live_daemons_stale_cursor_already_refuses_by_cas_not_by_the_guard() {
+        let repo_id = format!("hosted-flush-stale-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        // Opened against an empty store, so its cursor is the empty one.
+        let (state, _working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8063,
+            "publish a head under a daemon that is already running",
+        );
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope"
+        );
+
+        let outcome = state.save_snapshot_full();
+        assert!(
+            outcome.is_err(),
+            "a stale cursor must lose the compare-and-swap rather than overwrite"
+        );
+        assert_eq!(
+            state.hosted_authority_flush_refusals(),
+            0,
+            "this daemon opened before the publication, so the guard must not be what stopped it"
+        );
+
+        let (still_present, still_refs, still_generation) =
+            persisted_authority(storage.path(), &repo_id);
+        assert!(
+            still_present,
+            "the CAS failure must leave the envelope intact"
+        );
+        assert_eq!(still_refs, refs, "the ref set must be untouched");
+        assert_eq!(
+            still_generation, generation,
+            "the generation must be untouched"
+        );
+    }
+
+    /// A refusal is normal, so it must not be reported as a fault.
+    ///
+    /// The periodic loop calls `mark_clean` only when the flush returns `Ok`,
+    /// and backs off with a climbing `consecutive_failures` and a "persistence
+    /// unhealthy" error when it does not. A guard that refused by returning an
+    /// error would therefore turn a correctly-behaving hosted daemon into one
+    /// that logs an escalating fault every tick and never settles.
+    ///
+    /// So the claim is behavioural, not cosmetic: `Ok`, the dirty flag clears,
+    /// and the counter proves the refusal really happened rather than the flush
+    /// having found nothing to do.
+    #[tokio::test]
+    async fn a_refused_hosted_flush_reports_success_so_the_persist_loop_settles() {
+        let repo_id = format!("hosted-flush-settle-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8064,
+            "publish a head a settling loop must not erase",
+        );
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+
+        for tick in 1..=5u64 {
+            state.mark_dirty();
+            assert!(state.is_dirty(), "tick {tick} did not arm the gate");
+            state
+                .save_snapshot()
+                .unwrap_or_else(|error| panic!("tick {tick} reported a fault: {error}"));
+            assert_eq!(
+                state.hosted_authority_flush_refusals(),
+                tick,
+                "tick {tick} did not refuse exactly once"
+            );
+        }
+    }
+
+    /// The same guard, reached through a second caller.
+    ///
+    /// Four callers reach `save_snapshot_impl`, and the invariant is stated
+    /// regardless of caller. Every arm above drives the periodic entry points,
+    /// which leaves "the other three are also covered" resting on the guard's
+    /// position in the source rather than on anything observed. This drives the
+    /// shutdown path, which is a different function with its own dirty check
+    /// and its own wipe guard in front of the same write.
+    #[tokio::test]
+    async fn the_shutdown_flush_refuses_the_authority_write_too() {
+        let repo_id = format!("hosted-flush-shutdown-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8065,
+            "publish a head the shutdown flush must not erase",
+        );
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope"
+        );
+
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+        state.mark_dirty();
+        crate::daemon::run_shutdown_persistence(&state).await;
+
+        let (still_present, still_refs, still_generation) =
+            persisted_authority(storage.path(), &repo_id);
+        assert!(still_present, "the shutdown flush erased the envelope");
+        assert_eq!(still_refs, refs, "the shutdown flush changed the ref set");
+        assert_eq!(
+            still_generation, generation,
+            "the shutdown flush advanced the authority generation"
+        );
+        assert!(
+            state.hosted_authority_flush_refusals() >= 1,
+            "the shutdown flush must reach the same guard, not skip the write for some other reason"
+        );
+    }
+
+    /// Durability control: the guard is inert where there is no backend.
+    ///
+    /// A local daemon owns its own authority and must keep writing exactly as
+    /// before. The counter reading zero is what makes this a control rather
+    /// than a restatement: a flush that silently refused and a flush that had
+    /// nothing to do both return `Ok` and both leave the caller unable to tell
+    /// which happened.
+    #[tokio::test]
+    async fn a_daemon_with_no_backend_persists_and_never_refuses() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+
+        state.mark_dirty();
+        state
+            .save_snapshot()
+            .expect("a local daemon must still persist");
+        state
+            .save_snapshot_full()
+            .expect("a local daemon must still persist a full snapshot");
+
+        assert_eq!(
+            state.hosted_authority_flush_refusals(),
+            0,
+            "the authority-envelope guard must never fire on a daemon that owns its own authority"
+        );
+    }
+
     /// The hosted publication loop, end to end.
     ///
     /// An empty hosted store admits a native transfer and then serves the head

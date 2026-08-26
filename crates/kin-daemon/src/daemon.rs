@@ -650,7 +650,12 @@ const DEFERRED_CHECKPOINT_RETRY_MAX: Duration = Duration::from_secs(300);
 /// Runs under the persistence task's own shutdown budget
 /// (`KIN_DAEMON_SHUTDOWN_FLUSH_SECS`, five minutes by default), which exists
 /// because the graph flush here can need minutes on a real store.
-async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
+/// Visible to the crate so the authority-envelope guard can be exercised
+/// through this caller as well as the periodic one. The invariant it protects
+/// is stated regardless of caller, and four callers reach the same write, so a
+/// test that only ever drives the periodic path proves the guard is positioned
+/// correctly by inspection rather than by behaviour.
+pub(crate) async fn run_shutdown_persistence(state: &Arc<DaemonState>) {
     if state.is_dirty() {
         if state.shutdown_flush_would_wipe_graph() {
             // The in-memory graph collapsed to a small fraction of the last
