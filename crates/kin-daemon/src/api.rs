@@ -17049,6 +17049,22 @@ mod tests {
 
     #[cfg(unix)]
     fn payload_fixture(label: &str, blobs: usize, hosted: &RepositoryId) -> PayloadFixture {
+        payload_fixture_inner(label, blobs, Some(hosted))
+    }
+
+    /// The same fixture with the identity minted rather than adopted, which is
+    /// the one variable the identity control changes.
+    #[cfg(unix)]
+    fn payload_fixture_minting(label: &str, blobs: usize) -> PayloadFixture {
+        payload_fixture_inner(label, blobs, None)
+    }
+
+    #[cfg(unix)]
+    fn payload_fixture_inner(
+        label: &str,
+        blobs: usize,
+        hosted: Option<&RepositoryId>,
+    ) -> PayloadFixture {
         install_test_registry_override();
         let working =
             std::env::temp_dir().join(format!("kin-daemon-payload-{label}-{}", Uuid::new_v4()));
@@ -17087,16 +17103,23 @@ mod tests {
             ["commit", "-s", "-m", "one commit carrying a real payload"],
         );
 
-        let init = kin_core::init_from_git_adopting(&working, hosted)
-            .expect("a Git-admitted store may adopt a hosted repository identity");
-        assert_eq!(
-            kin_core::manifest::KinManifest::load(&init.layout.manifest_path())
-                .unwrap()
-                .repo_id,
-            hosted.as_str(),
-            "the fixture must carry the hosted identity, or the push it drives \
-             measures identity rather than payload"
-        );
+        let init = match hosted {
+            Some(hosted) => {
+                let init = kin_core::init_from_git_adopting(&working, hosted)
+                    .expect("a Git-admitted store may adopt a hosted repository identity");
+                assert_eq!(
+                    kin_core::manifest::KinManifest::load(&init.layout.manifest_path())
+                        .unwrap()
+                        .repo_id,
+                    hosted.as_str(),
+                    "the fixture must carry the hosted identity, or the push it drives \
+                     measures identity rather than payload"
+                );
+                init
+            }
+            None => kin_core::init_from_git(&working)
+                .expect("a Git-admitted store may mint its own identity"),
+        };
 
         PayloadFixture {
             layout: init.layout,
@@ -17242,6 +17265,74 @@ mod tests {
             );
             std::fs::remove_dir_all(&fixture.working).ok();
         }
+    }
+
+    /// The control that makes the pin above evidence rather than a restatement
+    /// of "pushes fail".
+    ///
+    /// A harness that observes a refusal proves nothing unless it can be shown
+    /// to distinguish refusals. This drives the same payload through the same
+    /// route with ONE property changed, the identity minted rather than
+    /// adopted, and requires a DIFFERENT answer: the identity refusal, named
+    /// with the minted id, and explicitly not the authority bound.
+    ///
+    /// If this and the pin above ever agreed, the pin would be measuring the
+    /// route's willingness to refuse anything, and both would stay green
+    /// through a fix for either bound.
+    ///
+    /// It uses the under-cap arm deliberately. A payload that could not fit
+    /// even if it were admitted would leave the refusal over-determined, and
+    /// the point here is that identity alone decides it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_payload_bearing_push_under_a_minted_identity_is_refused_on_identity_instead() {
+        let hosted_id = hosted_repository_id();
+        let (hosted_state, _hosted_working, _hosted_storage) = hosted_peer_state(&hosted_id);
+        let hosted_url = serve_replica(Arc::clone(&hosted_state)).await;
+
+        // Adopt nothing: mint, the way `kin init` does for an operator who
+        // never names a hosted repository.
+        let fixture = payload_fixture_minting("minted", PAYLOAD_BLOBS_UNDER_CAP);
+        let minted = kin_core::manifest::KinManifest::load(&fixture.layout.manifest_path())
+            .unwrap()
+            .repo_id;
+        assert_ne!(
+            minted, hosted_id,
+            "the control only means something if the two identities differ"
+        );
+
+        let source_state =
+            Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
+        let request = kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: hosted_url,
+            remote_token: None,
+            // Left unset so the push sends what the store actually holds.
+            // Naming the hosted id here is refused locally before a byte
+            // crosses the wire, which measures the local daemon's repository
+            // scope rather than the remote's.
+            repository_id: None,
+            source_ref: None,
+            destination_ref: None,
+        };
+        let (status, body) = transfer_command(Arc::clone(&source_state), "push", &request).await;
+        let message = String::from_utf8_lossy(&body).to_string();
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a minted identity must never reach a hosted repository that holds another: {message}"
+        );
+        assert!(
+            message.contains(minted.as_str()),
+            "the refusal must name the identity that was asked for: {message}"
+        );
+        assert!(
+            !message.contains("imported-Git authority"),
+            "this arm must be stopped by identity, not by the authority bound; if it \
+             reports the authority bound then the pin beside it is measuring \
+             refusal-in-general rather than that bound: {message}"
+        );
+        std::fs::remove_dir_all(&fixture.working).ok();
     }
 
     /// Two replicas of ONE repository: a real local one with a graph-owned
