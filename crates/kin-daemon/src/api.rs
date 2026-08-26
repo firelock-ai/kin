@@ -16075,6 +16075,258 @@ mod tests {
         );
     }
 
+    /// A hosted daemon in the shape production runs: a detached storage
+    /// backend, an explicit repository id, and the `KIN_REPO_IDS` allowlist
+    /// that decides which repositories it answers for at all.
+    ///
+    /// The allowlist is what made the real refusal a 404. Without it the
+    /// transfer routes would open genesis authority under whatever id was
+    /// asked for, so a store pushing its own minted identity would be handed a
+    /// brand new repository rather than being refused, and the control below
+    /// would prove nothing.
+    fn hosted_peer_state(
+        repo_id: &str,
+    ) -> (Arc<DaemonState>, tempfile::TempDir, tempfile::TempDir) {
+        install_test_registry_override();
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(kin_db::LocalFileBackend::new(storage.path().to_path_buf())),
+                repo_id,
+                Some(std::iter::once(repo_id.to_string()).collect()),
+            )
+            .unwrap(),
+        );
+        (state, working, storage)
+    }
+
+    /// A hosted repository id, shaped the way the hosted daemon's are: a slug,
+    /// not UUID text. Suffixed so concurrent tests never share a namespace.
+    fn hosted_repository_id() -> String {
+        format!("kin-hosted-{}", Uuid::new_v4().simple())
+    }
+
+    /// The gate this closes: a store built here from nothing can publish into
+    /// a hosted repository that already holds an identity.
+    ///
+    /// Before this, `kin init` minted a fresh identity on every path an
+    /// operator could reach, and the hosted daemon serves transfer under the
+    /// id it already holds, so the push was refused by construction with no
+    /// flag able to change it. The three refusals that make it so are worth
+    /// naming because none of them can be worked around at the wire: the
+    /// destination's transfer status is looked up by route id, a segment
+    /// refuses a source authority whose repository differs from the
+    /// destination's, and pack validation refuses a pack whose alias records
+    /// name a repository other than the header. Identity has to be true of the
+    /// store, not asserted at the push.
+    #[tokio::test]
+    async fn a_store_that_adopted_a_hosted_repository_id_publishes_into_that_repository() {
+        let hosted_id = hosted_repository_id();
+        let hosted_repository = RepositoryId::new(hosted_id.clone()).unwrap();
+        let (hosted_state, _hosted_working, _hosted_storage) = hosted_peer_state(&hosted_id);
+        let hosted_url = serve_replica(Arc::clone(&hosted_state)).await;
+
+        // The publisher: a store `kin init` created, adopting the hosted
+        // identity rather than minting one.
+        install_test_registry_override();
+        let working = tempfile::tempdir().unwrap();
+        let init = kin_core::init_adopting(working.path(), &hosted_repository)
+            .expect("a store may adopt a hosted repository identity");
+        let manifest = kin_core::manifest::KinManifest::load(&init.layout.manifest_path()).unwrap();
+        assert_eq!(
+            manifest.repo_id, hosted_id,
+            "the store has to carry the hosted identity, not a minted one"
+        );
+        assert_ne!(
+            manifest.workspace_id, manifest.repo_id,
+            "repository truth is shared between replicas and workspace authority never is"
+        );
+
+        let source_head = seed_replica_change(
+            &init.layout.kindb_dir(),
+            &hosted_repository,
+            None,
+            0x2724,
+            "publish into the hosted repository",
+        );
+        let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
+
+        let request = kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: hosted_url,
+            remote_token: None,
+            repository_id: Some(hosted_id.clone()),
+            source_ref: None,
+            destination_ref: None,
+        };
+        let (status, body) = transfer_command(Arc::clone(&source_state), "push", &request).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a store carrying the hosted identity must publish into it: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let pushed: kin_cli::commands::transfer::CommandTransferResponse =
+            serde_json::from_slice(&body).unwrap();
+        let receipt = pushed
+            .outcome
+            .final_receipt()
+            .expect("a moved head returns a receipt");
+        assert_eq!(receipt.destination_head, source_head);
+        assert_eq!(receipt.repository_id, hosted_repository);
+
+        // Read back off the hosted peer through its own authority path rather
+        // than believing the push's own response, which is the whole reason
+        // the runbook reads `/repos/<id>/refs` after publishing.
+        let snapshot = repository_authority_snapshot(&hosted_state, &hosted_id)
+            .await
+            .expect("the hosted repository serves the authority it just admitted");
+        let metadata = snapshot
+            .repository_authority
+            .as_ref()
+            .expect("admitting a transfer publishes an envelope");
+        assert_eq!(
+            metadata.repository_id, hosted_repository,
+            "the head landed under the hosted identity, not a second repository"
+        );
+        assert!(
+            metadata
+                .ref_state
+                .refs
+                .iter()
+                .any(|repository_ref| matches!(
+                    &repository_ref.target,
+                    kin_model::RefTarget::Change { change_id } if *change_id == source_head
+                )),
+            "the hosted repository must serve the head the push admitted"
+        );
+    }
+
+    /// The control the test above needs to mean anything: a store that minted
+    /// its own identity is still refused, and the refusal still names the
+    /// identity it asked with.
+    ///
+    /// This is the exact failure the hosted republish hit on 2026-08-26. It has
+    /// to keep happening: adoption is a way to carry the right identity, never
+    /// a way to publish under the wrong one.
+    #[tokio::test]
+    async fn a_store_that_minted_its_own_identity_cannot_publish_into_a_hosted_repository() {
+        let hosted_id = hosted_repository_id();
+        let (hosted_state, _hosted_working, _hosted_storage) = hosted_peer_state(&hosted_id);
+        let hosted_url = serve_replica(hosted_state).await;
+
+        install_test_registry_override();
+        let working = tempfile::tempdir().unwrap();
+        let init = kin_core::init(working.path()).unwrap();
+        let minted = init.repository_id.clone();
+        assert_ne!(minted.as_str(), hosted_id);
+        seed_replica_change(
+            &init.layout.kindb_dir(),
+            &minted,
+            None,
+            0x2725,
+            "publish under a minted identity",
+        );
+        let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
+
+        let request = kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: hosted_url,
+            remote_token: None,
+            // Left unset on purpose, so the push sends what the store actually
+            // holds. Naming the hosted id here would be refused locally before
+            // any byte crossed the wire, which measures the local daemon's
+            // repository scope rather than the remote's.
+            repository_id: None,
+            source_ref: None,
+            destination_ref: None,
+        };
+        let (status, body) = transfer_command(Arc::clone(&source_state), "push", &request).await;
+        let message = String::from_utf8_lossy(&body).to_string();
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a minted identity must never reach a hosted repository that holds another: {message}"
+        );
+        assert!(
+            message.contains(minted.as_str()),
+            "the refusal must name the identity that was asked for: {message}"
+        );
+    }
+
+    /// Adoption works on the Git boundary too, and the bound it then runs into
+    /// is a different one. Recorded rather than left to be rediscovered.
+    ///
+    /// The hosted republish runbook stages its stores with `kin init` over a
+    /// one-commit Git worktree, so its sources are Git-admitted. Identity is no
+    /// longer what stops them: the store carries the hosted id and the
+    /// negotiation reaches the source lease. What stops them is that
+    /// repository-v6 transfer v1 carries a fast-forward only between replicas
+    /// whose imported-Git authority already matches, and an empty hosted store
+    /// has none to match. `TransferSourceContext::read` refuses it, and the
+    /// receive transaction carries `git_authority_delta: None`, so no push can
+    /// establish one either.
+    ///
+    /// This test goes red the day Git-authority bootstrap lands, which is the
+    /// right time to be told: the bound it records will have moved.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_git_admitted_store_adopting_a_hosted_identity_meets_the_git_authority_bound() {
+        const PATH: &str = "service/compose.yaml";
+        let hosted_id = hosted_repository_id();
+        let hosted_repository = RepositoryId::new(hosted_id.clone()).unwrap();
+        let (hosted_state, _hosted_working, _hosted_storage) = hosted_peer_state(&hosted_id);
+        let hosted_url = serve_replica(Arc::clone(&hosted_state)).await;
+
+        install_test_registry_override();
+        let working =
+            std::env::temp_dir().join(format!("kin-daemon-hostedid-git-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(working.join("service")).unwrap();
+        run_test_git(&working, ["init", "--initial-branch=main"]);
+        run_test_git(&working, ["config", "user.email", "kin@example.invalid"]);
+        run_test_git(&working, ["config", "user.name", "Kin Hosted Id Test"]);
+        std::fs::write(working.join(PATH), b"services:\n  api: {}\n").unwrap();
+        run_test_git(&working, ["add", "--all"]);
+        run_test_git(
+            &working,
+            ["commit", "-s", "-m", "one commit staged for publish"],
+        );
+
+        let init = kin_core::init_from_git_adopting(&working, &hosted_repository)
+            .expect("a Git-admitted store may adopt a hosted repository identity");
+        assert_eq!(
+            kin_core::manifest::KinManifest::load(&init.layout.manifest_path())
+                .unwrap()
+                .repo_id,
+            hosted_id
+        );
+        let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
+
+        let request = kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: hosted_url,
+            remote_token: None,
+            repository_id: Some(hosted_id.clone()),
+            source_ref: None,
+            destination_ref: None,
+        };
+        let (status, body) = transfer_command(Arc::clone(&source_state), "push", &request).await;
+        let message = String::from_utf8_lossy(&body).to_string();
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "the Git-authority bound is a conflict, not an identity refusal: {message}"
+        );
+        assert!(
+            message.contains("imported-Git authority"),
+            "the refusal must name the bound that stopped it, not the identity: {message}"
+        );
+        assert!(
+            !message.contains("does not match destination repository"),
+            "identity is no longer what stops a Git-admitted store: {message}"
+        );
+    }
+
     /// Two replicas of ONE repository: a real local one with a graph-owned
     /// workspace projecting into a working directory, and a peer that forked
     /// from it and has since moved `refs/heads/main` ahead by one exact edit.

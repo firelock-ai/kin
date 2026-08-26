@@ -73,15 +73,15 @@ pub use exact_tree::{
     exact_tree_correction, plan_artifact_copy, plan_artifact_move, plan_artifact_operations,
     plan_observed_tree_deltas, ArtifactTreeOperation,
 };
-pub use git_init::init_from_git;
+pub use git_init::{init_from_git, init_from_git_adopting};
 pub use hooks::{
     generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,
 };
 pub use init::{
-    init, init_replica, init_replica_adopting, initialize_repository_authority,
-    prepare_repository_layout_at, publish_repository_layout, publish_repository_layout_linearized,
-    InitResult, PreparedRepositoryInit, PublishedRepository, RepositoryBootstrap,
-    RepositoryPublication,
+    init, init_adopting, init_replica, init_replica_adopting, initialize_repository_authority,
+    prepare_repository_layout_at, prepare_repository_layout_with_origin, publish_repository_layout,
+    publish_repository_layout_linearized, InitResult, PreparedRepositoryInit, PublishedRepository,
+    RepositoryBootstrap, RepositoryIdentityOrigin, RepositoryPublication,
 };
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
