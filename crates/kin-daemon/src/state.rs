@@ -795,6 +795,11 @@ pub struct SpineIngestOutcome {
 
 /// Outcome of refreshing cross-repo edges across every registered repo.
 ///
+/// Operator lever for how many siblings the spine loads eagerly. Registered in
+/// `kin-core`'s env registry, which is the surface that decides whether a
+/// `KIN_*` name is a lever or an unrecognized read.
+pub(crate) const EAGER_SIBLING_BOUND_ENV: &str = "KIN_SPINE_MAX_EAGER_SIBLINGS";
+
 /// Returned by [`DaemonState::refresh_all_cross_repo_edges`] and surfaced by the
 /// `POST /spine/refresh-cross-repo-edges` route. The hosted import orchestrator
 /// runs this final pass once every repo is registered so cross-repo edges
@@ -1222,6 +1227,13 @@ pub struct DaemonState {
     /// Startup registry/binding gaps prevent a complete local spine claim even
     /// when every retained sibling that remains can be loaded.
     registered_local_repository_authority_incomplete: bool,
+    /// Resolved once, here, rather than read inside the capture loop.
+    ///
+    /// A daemon captures its levers at process start; reading the environment
+    /// per pass would also make this untestable without mutating process-global
+    /// state that every other test in this binary shares, which is a race
+    /// rather than a fixture.
+    eager_sibling_bound: usize,
     /// Frozen startup policy for deployments whose graph backend is the only
     /// write authority. When true, no filesystem/session/VFS compatibility
     /// surface may reconcile bytes back into graph truth.
@@ -2664,6 +2676,7 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
+            eager_sibling_bound: Self::eager_sibling_load_bound(),
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(false),
             ),
@@ -2918,6 +2931,7 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
+            eager_sibling_bound: Self::eager_sibling_load_bound(),
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(true),
             ),
@@ -3356,7 +3370,23 @@ impl DaemonState {
         // Capture only sibling capabilities frozen during startup. Lazy
         // initialization may load graph bytes, but cannot rediscover registry
         // paths, manifests, or storage roots from a request.
-        for registered in &self.registered_local_repository_authorities {
+        //
+        // Bounded, because each iteration opens that sibling's whole workspace
+        // graph and joins before the next one starts. This host carries 81
+        // registered siblings over 70.67 GiB, so an unbounded pass is the
+        // startup cost, and the identity fix in this branch is what re-arms it.
+        let eager_bound = self.eager_sibling_bound;
+        let registered_sibling_count = self.registered_local_repository_authorities.len();
+        let mut bounded_out = 0_usize;
+        for (position, registered) in self
+            .registered_local_repository_authorities
+            .iter()
+            .enumerate()
+        {
+            if position >= eager_bound {
+                bounded_out += 1;
+                continue;
+            }
             let sibling_id = registered.repo_id.clone();
             let binding = registered.binding.clone();
             let loaded = std::thread::Builder::new()
@@ -3459,7 +3489,16 @@ impl DaemonState {
             .map(|capture| capture.repo_id.clone())
             .collect::<HashSet<_>>();
         let registered_repo_ids = backend.registered_repo_ids();
-        if registered_repo_ids != captured_repo_ids {
+        // Two different states share one inequality, and conflating them is what
+        // this branch has to avoid. A capture the configured bound stopped is
+        // BOUNDED: deliberate, disclosed, and the captures it did take are
+        // sound. A sibling that failed to load is INCOMPLETE: an answer whose
+        // shape nobody chose. Only the second is a reason to distrust anything.
+        let uncaptured = registered_repo_ids
+            .difference(&captured_repo_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !uncaptured.is_empty() {
             authority_incomplete = true;
             warn!(
                 captured = captured_repo_ids.len(),
@@ -3467,10 +3506,14 @@ impl DaemonState {
                 "spine contains durable advisory repos without a current graph capture"
             );
         }
-        if authority_incomplete {
-            for repo_id in &registered_repo_ids {
-                backend.invalidate_cross_repo_edges(repo_id);
-            }
+        // Scoped, where this used to invalidate every registered repo including
+        // the primary. Edges between captured repos were recomputed from those
+        // captures moments ago and are valid; only edges into a repo this pass
+        // did not capture can be stale. One sibling failing used to mark the
+        // whole cross-repo edge set dirty, which is a far larger blast radius
+        // than the fact that produced it.
+        for repo_id in &uncaptured {
+            backend.invalidate_cross_repo_edges(repo_id);
         }
 
         // A writer announcing itself after the preparation checks but before
@@ -3499,15 +3542,66 @@ impl DaemonState {
             return;
         }
 
+        // `capture_set_complete` keeps meaning what it meant: nothing failed.
+        // The bounded fields are a separate claim, that a deliberate cap left
+        // siblings unconsulted, and they carry the counts so a reader can size
+        // the gap rather than guess at it. A silent cap would be the worse bug:
+        // a complete-looking answer over a subset nobody was told about.
         info!(
             cross_repo_edges = backend.edge_count(),
             capture_set_complete = !authority_incomplete,
+            sibling_capture_bounded = bounded_out > 0,
+            siblings_captured = registered_sibling_count.saturating_sub(bounded_out),
+            siblings_registered = registered_sibling_count,
+            eager_sibling_bound = eager_bound,
             "spine index initialized"
         );
+        if bounded_out > 0 {
+            info!(
+                captured = registered_sibling_count.saturating_sub(bounded_out),
+                registered = registered_sibling_count,
+                bound = eager_bound,
+                var = EAGER_SIBLING_BOUND_ENV,
+                "sibling graph capture stopped at its configured bound; the spine \
+                 answers over a bounded capture set, not an incomplete one"
+            );
+        }
         let _ = self.spine.get_or_init(move || backend);
     }
 
     /// Create the appropriate spine backend based on environment.
+    /// How many registered siblings the spine loads eagerly at startup.
+    ///
+    /// Each one opens that sibling's whole workspace graph and is joined before
+    /// the next starts, so this number is the startup cost of cross-repo
+    /// authority. It is deliberately conservative: this host carries 81
+    /// registered siblings over 70.67 GiB, and 16 bounds the eager pass to
+    /// roughly a fifth of that while still covering an umbrella of ordinary
+    /// size.
+    ///
+    /// Zero disables eager sibling loading and the spine answers over the
+    /// primary alone, which is a supported operator choice rather than a
+    /// failure. An unparseable value keeps the default and warns, because a
+    /// daemon that will not start is a worse failure than one that starts
+    /// conservatively.
+    fn eager_sibling_load_bound() -> usize {
+        const DEFAULT: usize = 16;
+        let Ok(raw) = std::env::var(EAGER_SIBLING_BOUND_ENV) else {
+            return DEFAULT;
+        };
+        match raw.trim().parse::<usize>() {
+            Ok(bound) => bound,
+            Err(_) => {
+                warn!(
+                    var = EAGER_SIBLING_BOUND_ENV,
+                    value = %raw,
+                    "ignoring an unparseable eager sibling load bound; using the default"
+                );
+                DEFAULT
+            }
+        }
+    }
+
     fn create_spine_backend(&self) -> Arc<dyn kin_spine::SpineBackend> {
         #[cfg(feature = "firestore")]
         {
