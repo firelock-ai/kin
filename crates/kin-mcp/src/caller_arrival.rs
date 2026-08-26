@@ -61,7 +61,7 @@
 //! cannot see who imports anything" are opposite facts and only the first is
 //! evidence about the focal.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use kin_model::graph::{EntityFilter, GraphStore};
 use kin_model::{entity::Entity, EntityId, FilePathId, RelationKind};
@@ -78,14 +78,13 @@ pub const UNRESOLVED_ARRIVAL_LIMITING_FACTOR: &str = "caller_arrival_unresolved"
 /// Limiting-factor id for a family that could not be established at all.
 pub const UNMEASURED_ARRIVAL_LIMITING_FACTOR: &str = "caller_arrival_unmeasured";
 
-/// Entities scanned before the reading gives up and reports `unmeasured`.
+/// Importing files examined before the reading declines.
 ///
-/// The walk costs one relation read per entity of the focal's file plus one per
-/// entity of each family file. A repository large enough to make that expensive
-/// gets an honest refusal rather than a query nobody asked for, and `unmeasured`
-/// is a real answer here: it declines to certify rather than certifying on a
-/// scan that did not finish.
-const ARRIVAL_SCAN_CAP: usize = 4_000;
+/// Each costs one entity query plus one relation read per entity of that file.
+/// A hub imported by more files than this gets an honest `unmeasured` rather
+/// than a verdict drawn from a truncated set, because truncating and reporting
+/// `accounted` is the silent cap this module exists to refuse.
+const FAMILY_FILE_CAP: usize = 200;
 
 /// How completely this reading could account for the ways a caller reaches the
 /// focal.
@@ -241,14 +240,27 @@ fn parsed_call_sites(entity: &Entity) -> Option<u64> {
 /// control could not witness import linking, and both decline.
 const IMPORT_WITNESS_BUDGET: usize = 500;
 
-/// Whether this language links imports across files anywhere in this graph.
+/// Whether this graph links imports across files at all, for this language.
 ///
-/// The control for an empty family. It answers a question about the LANGUAGE,
-/// never about the focal's file, because a file nothing imports holds no import
-/// edge by construction and reading the control off that file would make every
-/// such file unmeasurable.
-fn language_links_imports<G: GraphStore>(store: &G, language_entities: &[Entity]) -> bool {
-    for entity in language_entities.iter().take(IMPORT_WITNESS_BUDGET) {
+/// The last-resort control for an empty family, and it is reached only when the
+/// focal's own file holds no import edge in EITHER direction, which on a real
+/// repository is rare. It answers a question about the LANGUAGE and never about
+/// the focal's file: a file nothing imports holds no incoming import edge by
+/// construction, and reading the control off that alone would make every such
+/// file unmeasurable.
+///
+/// This is the only path here that reads the whole language, and it declines
+/// rather than truncating when the language is larger than the walk: a sample
+/// that finds no import edge and a store that holds none are the same answer
+/// from this function, and only one of them is evidence.
+fn language_links_imports<G: GraphStore>(store: &G, language: kin_model::LanguageId) -> bool {
+    let Ok(entities) = store.query_entities(&EntityFilter {
+        languages: Some(vec![language]),
+        ..EntityFilter::default()
+    }) else {
+        return false;
+    };
+    for entity in entities.iter().take(IMPORT_WITNESS_BUDGET) {
         let Ok(relations) = store.get_all_relations_for_entity(&entity.id) else {
             continue;
         };
@@ -262,57 +274,60 @@ fn language_links_imports<G: GraphStore>(store: &G, language_entities: &[Entity]
     false
 }
 
+/// Entities of one file, and the parse-side call count the extractor stamped on
+/// every one of them. The count is identical across a file's entities, so the
+/// first entity carrying it settles the file, and `None` means unmeasured.
+fn file_entities<G: GraphStore>(
+    store: &G,
+    file: &FilePathId,
+) -> Option<(Vec<EntityId>, Option<u64>)> {
+    let entities = store
+        .query_entities(&EntityFilter {
+            file_path: Some(file.clone()),
+            ..EntityFilter::default()
+        })
+        .ok()?;
+    let parsed = entities.iter().find_map(parsed_call_sites);
+    Some((
+        entities.into_iter().map(|entity| entity.id).collect(),
+        parsed,
+    ))
+}
+
 /// Whether a caller could reach `focal` through a call this graph does not hold.
 ///
-/// Never fails the request: any error or budget exhaustion becomes `Unmeasured`,
-/// which declines to certify rather than certifying on an unfinished scan.
+/// Never fails the request: any error, an oversized family or an unreadable
+/// index becomes `Unmeasured`, which declines to certify rather than certifying
+/// on a walk that did not finish.
+///
+/// Every read here is scoped to one file. An earlier version loaded the whole
+/// language to build a file index and refused above a cap, which on any real
+/// repository is every query: kin's own Rust alone declares more than seven
+/// thousand functions, so the gate would have reported `unmeasured` for every
+/// focal in the store and put a floor under every absence in it. The cost now
+/// scales with the focal's file and its importers, not with the repository.
 pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> CallerArrival {
     let Some(focal_file) = focal.file_origin.clone() else {
         return CallerArrival::unmeasured("the focal entity carries no file of origin");
     };
 
-    let Ok(language_entities) = store.query_entities(&EntityFilter {
-        languages: Some(vec![focal.language]),
-        ..EntityFilter::default()
-    }) else {
-        return CallerArrival::unmeasured("the entity index could not be read for this language");
+    let Some((focal_file_entities, _)) = file_entities(store, &focal_file) else {
+        return CallerArrival::unmeasured(
+            "the entity index could not be read for the focal's file",
+        );
     };
-    if language_entities.len() > ARRIVAL_SCAN_CAP {
-        return CallerArrival::unmeasured(format!(
-            "this language holds {} entities, above the {ARRIVAL_SCAN_CAP} this reading walks",
-            language_entities.len()
-        ));
-    }
-
-    // One pass builds every index the walk needs: which file each entity sits
-    // in, which entities each file owns, and the file's parse-side call count.
-    // The count is stamped identically on every entity of the file, so the first
-    // one carrying it settles the file.
-    let mut file_of: HashMap<EntityId, FilePathId> = HashMap::new();
-    let mut entities_by_file: HashMap<FilePathId, Vec<EntityId>> = HashMap::new();
-    let mut parsed_by_file: HashMap<FilePathId, u64> = HashMap::new();
-    for entity in &language_entities {
-        let Some(file) = entity.file_origin.clone() else {
-            continue;
-        };
-        file_of.insert(entity.id, file.clone());
-        entities_by_file
-            .entry(file.clone())
-            .or_default()
-            .push(entity.id);
-        if let Some(count) = parsed_call_sites(entity) {
-            parsed_by_file.entry(file).or_insert(count);
-        }
-    }
+    let focal_owned: HashSet<EntityId> = focal_file_entities.iter().copied().collect();
 
     // The family: files holding an import edge into an entity of the focal's
     // file. Walked from the focal's file outward, because the focal's file owns
-    // few entities while the language owns many.
+    // few entities and the repository owns many.
+    //
+    // `focal_file_imports_something` rides along as the cheap half of the
+    // empty-family control: if this file's own imports resolved to edges, then
+    // import linking demonstrably works here, and no language-wide read is
+    // needed to establish it.
     let mut family: HashSet<FilePathId> = HashSet::new();
-    let focal_file_entities = entities_by_file
-        .get(&focal_file)
-        .cloned()
-        .unwrap_or_default();
+    let mut focal_file_imports_something = false;
     for entity_id in &focal_file_entities {
         let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
             return CallerArrival::unmeasured(
@@ -323,37 +338,44 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
             if !FAMILY_KINDS.contains(&relation.kind) {
                 continue;
             }
-            let Some(source) = relation.src.as_entity() else {
+            let (Some(source), Some(destination)) =
+                (relation.src.as_entity(), relation.dst.as_entity())
+            else {
                 continue;
             };
-            let Some(source_file) = file_of.get(&source) else {
-                continue;
-            };
-            // An import edge whose destination is not this file says nothing
-            // about who can reach it, and a file never imports itself.
-            if relation.dst.as_entity().and_then(|dst| file_of.get(&dst)) != Some(&focal_file) {
+            if focal_owned.contains(&source) {
+                focal_file_imports_something = true;
+            }
+            // An import edge out of this file says nothing about who can reach
+            // it. Only one INTO it puts the importer in the family.
+            if !focal_owned.contains(&destination) || focal_owned.contains(&source) {
                 continue;
             }
-            if source_file != &focal_file {
-                family.insert(source_file.clone());
+            let Ok(Some(importer)) = store.get_entity(&source) else {
+                continue;
+            };
+            if let Some(importer_file) = importer.file_origin {
+                if importer_file != focal_file {
+                    family.insert(importer_file);
+                }
             }
         }
     }
 
     if family.is_empty() {
         // Nothing imports this file. Whether that is a fact about the repository
-        // or about the graph depends on whether this language links imports at
-        // all, and only one of those licenses certifying an absence.
+        // or about the graph depends on whether imports link here at all, and
+        // only one of those licenses certifying an absence.
         //
         // The control is taken over the LANGUAGE and not over the focal's own
-        // file, and that distinction is load-bearing rather than pedantic: a
-        // file nothing imports holds no import edge by definition, so reading
-        // the control off the walk above would report every such file as
-        // unmeasured and put a floor under every absence in the store. Four
+        // incoming edges, and that distinction is load-bearing rather than
+        // pedantic: a file nothing imports holds no incoming import edge by
+        // definition, so reading the control there would report every such file
+        // as unmeasured and put a floor under every absence in the store. Four
         // handler fixtures went inconclusive on exactly that mistake, including
         // the one built to prove a graph linking every class across files still
         // earns its absence.
-        if language_links_imports(store, &language_entities) {
+        if focal_file_imports_something || language_links_imports(store, focal.language) {
             return CallerArrival {
                 state: ArrivalState::Accounted,
                 family_files: 0,
@@ -368,17 +390,33 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
         );
     }
 
+    let mut family_files: Vec<FilePathId> = family.into_iter().collect();
+    family_files.sort_by(|left, right| left.0.cmp(&right.0));
+    // A hub file can be imported by hundreds of others, and reading them all is
+    // work nobody asked for. Truncating and reporting `accounted` would be the
+    // silent cap this whole module exists to refuse, so an oversized family
+    // declines instead: it is the honest word for a set that was not examined.
+    if family_files.len() > FAMILY_FILE_CAP {
+        return CallerArrival::unmeasured(format!(
+            "{} files import the focal's file, above the {FAMILY_FILE_CAP} this reading examines, \
+             so their call sites were not accounted for",
+            family_files.len()
+        ));
+    }
+
     let mut unaccounted = Vec::new();
     let mut family_measured = 0usize;
-    let mut family_files: Vec<&FilePathId> = family.iter().collect();
-    family_files.sort_by(|left, right| left.0.cmp(&right.0));
     for file in &family_files {
-        let parsed = parsed_by_file.get(*file).copied();
+        let Some((entity_ids, parsed)) = file_entities(store, file) else {
+            return CallerArrival::unmeasured(
+                "the entity index could not be read for a file in the focal's family",
+            );
+        };
         if parsed.is_some() {
             family_measured += 1;
         }
         let mut resolved = 0u64;
-        for entity_id in entities_by_file.get(*file).into_iter().flatten() {
+        for entity_id in &entity_ids {
             let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
                 return CallerArrival::unmeasured(
                     "the relation index could not be read for a file in the focal's family",
@@ -754,6 +792,83 @@ mod tests {
         );
         assert_eq!(arrival.family_files, 0);
         assert_eq!(arrival.limiting_factor(), None);
+    }
+
+    #[test]
+    fn a_repository_larger_than_any_scan_cap_is_still_measured() {
+        // The regression this guards shipped in the first draft of this module
+        // and would have been invisible in every arm above: the reading built a
+        // file index by loading the whole language and refused above a cap. On
+        // any real repository that is every query. Kin's own Rust declares more
+        // than seven thousand functions, so the gate would have reported
+        // `unmeasured` for every focal in the store and put a floor under every
+        // absence in it, which is the exact over-correction the ticket names.
+        //
+        // Five thousand entities in unrelated files, well past any cap a future
+        // edit is likely to reintroduce. The verdict must still be the real one.
+        let (store, focal) = store_with(Some(3), 2, true);
+        for index in 0..5_000 {
+            store
+                .upsert_entity(&entity_in(
+                    &format!("unrelated{index}"),
+                    &format!("src/notekeeper/bulk{}.py", index % 250),
+                    Some(1),
+                ))
+                .unwrap();
+        }
+
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Unaccounted,
+            "the reading must scale with the focal's file and its importers, never with the \
+             repository; a cap on the language turns this into `unmeasured`"
+        );
+        assert_eq!(arrival.family_files, 1, "the family is unchanged by bulk");
+        assert_eq!(arrival.unaccounted[0].file, CALLER_FILE);
+    }
+
+    #[test]
+    fn a_family_too_large_to_examine_declines_rather_than_truncating() {
+        // A hub imported by more files than the reading examines. Truncating and
+        // reporting `accounted` would be the silent cap this module exists to
+        // refuse, so the verdict is `unmeasured` and the reason carries the
+        // number, which is the one word that does not overstate what was read.
+        let store = InMemoryGraph::new();
+        let focal = entity_in("note_body", FOCAL_FILE, Some(2));
+        let focal_module = entity_in("storage", FOCAL_FILE, Some(2));
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&focal_module).unwrap();
+        for index in 0..(FAMILY_FILE_CAP + 1) {
+            let importer = entity_in(
+                &format!("importer{index}"),
+                &format!("tests/test_{index}.py"),
+                Some(1),
+            );
+            store.upsert_entity(&importer).unwrap();
+            store
+                .upsert_relation(&edge(RelationKind::Imports, &importer, &focal_module))
+                .unwrap();
+        }
+
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(arrival.state, ArrivalState::Unmeasured);
+        let reason = arrival
+            .unmeasured_reason
+            .as_deref()
+            .expect("an oversized family names its own size");
+        assert!(
+            reason.contains(&(FAMILY_FILE_CAP + 1).to_string()),
+            "the reason must say how many files it did not examine: {reason}"
+        );
+
+        // The control that keeps the cap from being a blanket refusal: one file
+        // under the cap is examined normally.
+        let (small, small_focal) = store_with(Some(2), 2, true);
+        assert_eq!(
+            observe_caller_arrival(&small, &small_focal).state,
+            ArrivalState::Accounted
+        );
     }
 
     #[test]
