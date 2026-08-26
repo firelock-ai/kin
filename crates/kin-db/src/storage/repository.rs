@@ -1022,6 +1022,60 @@ fn extend_authenticated_gitlinks<'a>(
     }
 }
 
+/// The Gitlinks one transaction's admission verifier may treat as authority.
+///
+/// The persisted index plus the Gitlinks carried by the Git-origin changes
+/// this transaction publishes. Reading only the persisted half refused every
+/// bootstrap that installs Git authority and native history together, and one
+/// transaction must do both: `validate_transaction_git_projection_membership`
+/// requires a Git-origin change's commit projection to arrive in the same
+/// transaction as the change, so authority and history cannot be split across
+/// two commits and the pre-transaction index can never hold the first one's
+/// Gitlinks.
+///
+/// A change contributes only when the SUCCESSOR authority projects its commit.
+/// That is what makes reading the transaction safe rather than credulous.
+/// `apply_git_authority` runs before every admission verifier, and for each
+/// projected commit it compares the authority against its exact old-state
+/// lease, requires every closure object to match its persisted descriptor,
+/// replays the raw Git tree against the deterministic semantic tree so an
+/// artifact's entry must equal the raw one exactly, and validates the raw
+/// bodies against immutable CAS. A Native change and a bare external-object
+/// record pass none of that and contribute nothing, which
+/// `extend_authenticated_gitlinks` enforces by origin.
+///
+/// The projection filter is also what keeps the rule fail-closed if a verifier
+/// is ever moved ahead of `apply_git_authority`: an authority that has not been
+/// applied projects none of this transaction's commits, so the successor set is
+/// exactly the persisted one and the caller refuses precisely as it did before.
+fn successor_authenticated_gitlinks(
+    current: &RepositoryAuthorityState,
+    metadata: &PersistedRepositoryAuthority,
+    transaction: &RepositoryTransaction,
+) -> BTreeSet<(ArtifactId, GitObjectId)> {
+    let projected = metadata
+        .git_external_authority
+        .iter()
+        .flat_map(|authority| {
+            authority
+                .commit_projections
+                .iter()
+                .map(|projection| projection.commit_oid)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut authenticated = current.authenticated_gitlinks().clone();
+    extend_authenticated_gitlinks(
+        &mut authenticated,
+        transaction.changes.iter().filter(|change| {
+            matches!(
+                change.origin,
+                kin_model::ChangeOrigin::GitCommit { oid } if projected.contains(&oid)
+            )
+        }),
+    );
+    authenticated
+}
+
 impl VersionedAuthorityState for RepositoryAuthorityState {
     fn generation(&self) -> Generation {
         self.metadata().roots.generation
@@ -4230,7 +4284,6 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     metadata: &PersistedRepositoryAuthority,
     transaction: &RepositoryTransaction,
 ) -> Result<(), KinDbError> {
-    let authenticated_gitlinks = current.authenticated_gitlinks();
     let native_changes = transaction
         .changes
         .iter()
@@ -4242,6 +4295,7 @@ fn verify_native_change_admission<B: StorageBackend + ?Sized>(
     if native_changes.is_empty() {
         return Ok(());
     }
+    let authenticated_gitlinks = successor_authenticated_gitlinks(current, metadata, transaction);
     // Every tree this loop reads comes out of one pass over the changes'
     // shared first-parent lineage. Resolving them one at a time inside the
     // loop below walked that lineage once per change AND once per parent, so
@@ -9561,7 +9615,7 @@ mod tests {
     }
 
     #[test]
-    fn same_transaction_git_parent_cannot_authorize_a_native_gitlink() {
+    fn a_same_transaction_git_import_authenticates_a_native_child_over_its_gitlink() {
         let manager = initial_manager(Arc::new(MemoryBackend::default()));
         let mut fixture = git_authority_transaction_fixture(&manager, 0xa141);
         let parent = fixture
@@ -9582,10 +9636,81 @@ mod tests {
             parents: vec![parent],
             timestamp: Timestamp::now(),
             author: AuthorId::new("authority-test"),
-            message: "attempt to inherit uncommitted Gitlink authority".to_string(),
+            message: "native history over an imported Gitlink".to_string(),
             entity_deltas: Vec::new(),
             relation_deltas: Vec::new(),
             tree_deltas: Vec::new(),
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+        };
+        native.id = compute_semantic_change_id(&native).unwrap();
+        let native_id = native.id;
+        fixture.transaction.changes.push(native);
+
+        manager
+            .commit_repository_transaction(fixture.transaction)
+            .expect("a Native child inherits a Gitlink its own transaction authenticates");
+
+        // Generation alone would also read 1 for a transaction that admitted
+        // the Git half and dropped the Native change, so the child itself is
+        // what the assertions name.
+        let lease = manager.read_authority();
+        assert_eq!(lease.generation(), 1);
+        assert!(
+            lease.snapshot().changes.contains_key(&native_id),
+            "the Native child must be persisted, not merely tolerated"
+        );
+        assert!(lease.metadata().git_external_authority.is_some());
+        assert!(
+            lease
+                .authenticated_gitlinks()
+                .contains(&(ArtifactId(Uuid::from_u128(0xa4)), fixture.gitlink_target)),
+            "the committed authority index must carry the Gitlink the child inherited"
+        );
+    }
+
+    /// The successor authority authenticates its own exact Gitlinks and no
+    /// others, so the bootstrap allowance cannot be widened into "any Gitlink
+    /// inside a transaction that happens to carry Git authority".
+    #[test]
+    fn a_same_transaction_git_import_authenticates_only_its_exact_gitlink_target() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let mut fixture = git_authority_transaction_fixture(&manager, 0xa151);
+        let parent = fixture
+            .transaction
+            .changes
+            .iter()
+            .find(|change| {
+                matches!(
+                    change.origin,
+                    ChangeOrigin::GitCommit { oid } if oid == fixture.head.object.oid
+                )
+            })
+            .unwrap()
+            .id;
+        let submodule = RepoPath::from_utf8("submodule").unwrap();
+        let unauthenticated = GitObjectId::sha1([0x66; 20]);
+        let mut native = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: vec![parent],
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("authority-test"),
+            message: "retarget an imported Gitlink to an unauthenticated commit".to_string(),
+            entity_deltas: Vec::new(),
+            relation_deltas: Vec::new(),
+            tree_deltas: vec![TreeDelta::Updated {
+                artifact_id: ArtifactId(Uuid::from_u128(0xa4)),
+                old: LocatedEntry::new(
+                    submodule.clone(),
+                    TreeEntry::gitlink(fixture.gitlink_target),
+                ),
+                new: LocatedEntry::new(submodule, TreeEntry::gitlink(unauthenticated)),
+            }],
             admission_policy_delta: None,
             external_reference_deltas: Vec::new(),
             projected_files: Vec::new(),
@@ -9598,14 +9723,64 @@ mod tests {
 
         let error = manager
             .commit_repository_transaction(fixture.transaction)
-            .expect_err("a Native child must wait for Git authority to become persisted");
+            .expect_err("a retargeted Gitlink has no authority in the imported history");
         assert!(
             error
                 .to_string()
                 .contains("without verified Git external authority"),
-            "unexpected same-transaction Native error: {error}"
+            "unexpected retargeted-gitlink error: {error}"
         );
         assert_eq!(manager.read_authority().generation(), 0);
+    }
+
+    /// The successor allowance is bound to the authority actually applied, so
+    /// moving a verifier ahead of `apply_git_authority` refuses rather than
+    /// admits. Nothing in the commit path can reach that ordering today, which
+    /// is exactly why the property is asserted on the function instead.
+    #[test]
+    fn successor_gitlinks_carry_only_what_the_applied_authority_projects() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let fixture = git_authority_transaction_fixture(&manager, 0xa161);
+        let artifact = ArtifactId(Uuid::from_u128(0xa4));
+        let lease = manager.read_authority();
+        let current: &RepositoryAuthorityState = &lease;
+
+        let unapplied =
+            successor_authenticated_gitlinks(current, lease.metadata(), &fixture.transaction);
+        assert!(
+            unapplied.is_empty(),
+            "an authority this metadata has not applied projects nothing: {unapplied:?}"
+        );
+
+        let mut metadata = lease.metadata().clone();
+        metadata.git_external_authority = Some(fixture.authority.clone());
+        let applied = successor_authenticated_gitlinks(current, &metadata, &fixture.transaction);
+        assert_eq!(
+            applied,
+            BTreeSet::from([
+                (artifact, fixture.previous_gitlink_target),
+                (artifact, fixture.gitlink_target),
+            ]),
+            "an applied authority carries exactly its own projected Gitlinks"
+        );
+
+        let mut with_native = fixture.transaction.clone();
+        let mut native = with_native.changes[0].clone();
+        native.origin = ChangeOrigin::Native;
+        native.id = SemanticChangeId::from_hash(Hash256::from_bytes([9; 32]));
+        native.tree_deltas = vec![TreeDelta::Added {
+            artifact_id: ArtifactId(Uuid::from_u128(0xbe)),
+            new: LocatedEntry::new(
+                RepoPath::from_utf8("vendor/forged").unwrap(),
+                TreeEntry::gitlink(GitObjectId::sha1([0x77; 20])),
+            ),
+        }];
+        with_native.changes.push(native);
+        let with_native_set = successor_authenticated_gitlinks(current, &metadata, &with_native);
+        assert_eq!(
+            with_native_set, applied,
+            "a Native change contributes no Gitlink authority"
+        );
     }
 
     #[test]
