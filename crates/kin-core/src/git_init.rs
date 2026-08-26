@@ -550,6 +550,10 @@ fn init_from_git_with_hooks(
     // tree is legitimately not the tree the repository holds. A dirty conversion
     // has no complete admission of its working copy yet and keeps saying so.
     if result.workspace_divergence.is_empty() {
+        // Named because it is not free: on a full-history conversion this write
+        // is the longest unnamed stretch in the whole ladder, and an unnamed
+        // stretch is memory a profile charges to no phase.
+        let _span = info_span!("kin.init.record_complete_admission").entered();
         crate::last_admission::record(&result.layout, admitted_tracked_artifacts);
     }
 
