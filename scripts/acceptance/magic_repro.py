@@ -2805,17 +2805,31 @@ def check_21(suite):
     supported set, so:
 
     - `docs/notes.md` must carry `content_opaque` true and an `opaque_reason`
-      naming its own extension. A reason that named some other extension would
-      pass a weaker assertion.
+      naming its own extension. Naming the extension, rather than merely being
+      present, is what makes this arm able to fail: a flag computed from anything
+      other than the registry names something else or nothing.
     - `pkg/parsed.py` must carry neither. A flag hardcoded true fails here.
-    - `pkg/empty.py` must carry neither, and it is the arm that matters most: an
-      adapter read it and it correctly holds nothing, so any version of this
-      derived from "the file has zero entities" reports it as opaque and fails.
+    - `pkg/empty.py` must carry neither. It is a docstring-only module that an
+      adapter read successfully, so it holds an entity rather than none; what it
+      controls is that the disclosure keys on the adapter and not on how thin a
+      file is.
 
-    Falsify by hardcoding the flag, or by deriving it from the entity count
-    rather than from the registry. The first goes red on the second arm, the
-    second on the third, and neither can go red on the first, which is why all
-    three are here.
+    Both mutations were run against a release build and both went red, each on a
+    different arm, which is the point of having three.
+
+    - Hardcoding the flag true fails on `pkg/parsed.py`, which reports 4 entities
+      and would be labelled opaque.
+    - Deriving the flag from the entity count fails on `docs/notes.md`, whose
+      reason then reads `no_adapter_for_extension:derived` and names no
+      extension at all.
+
+    One thing this suite deliberately does NOT prove, because its fixture cannot:
+    that a file an adapter read and found genuinely EMPTY is not reported opaque.
+    `pkg/empty.py` holds one entity, so a count-derived flag would not fire on it
+    here. That control lives in the unit fixtures beside the code
+    (`crates/kin-mcp/src/handlers/file_entities.rs`), where `src/empty.py` is
+    parsed `full` with zero entities. Said out loud because an arm that reads
+    like a control and is not one is worse than no arm.
     """
     res = Result("21", "MD-OPAQUE",
                  "a file whose type no adapter claims discloses that as the reason")
