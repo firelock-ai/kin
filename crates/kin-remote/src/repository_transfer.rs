@@ -21,7 +21,8 @@ use kin_db::{
 use kin_model::{
     compute_resolved_tree_hash, validate_semantic_change_id, AuthorId, ChangeOrigin, ChangeStore,
     DefaultRefExpectation, DefaultRefMutation, ExternalChangeAlias, ExternalObjectId,
-    ExternalObjectKind, ExternalObjectRecord, GitExternalAuthority, Hash256, ModelError,
+    ExternalObjectKind, ExternalObjectRecord, GitExternalAuthority, GitExternalAuthorityDelta,
+    Hash256, ModelError,
     OperationId, RefExpectation, RefMutation, RefName, RefTarget, RefUpdatePolicy,
     RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId, RepositoryTransaction,
     RootBundle, SemanticChange, SemanticChangeId, TreeEntry, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
@@ -72,7 +73,13 @@ pub const REPOSITORY_TRANSFER_PROTOCOL: &str = "kin-repository-v6-fast-forward";
 /// deliberate continuation segment apart from a peer whose authority moved
 /// under the negotiation. A version 1 peer is refused by name rather than
 /// through a field-shape parse error.
-pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 adds `git_authority_bootstrap`, which is what lets a Git-admitted
+/// replica publish into an EMPTY one. Transfer v1 carries a fast-forward only
+/// between replicas whose imported-Git authority already matches, and no push
+/// could establish one, so a repository that came from Git had no route into a
+/// hosted store at all. A version 2 peer is refused by name, same as version 1.
+pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 3;
 pub const FEATURE_EXACT_TREES: &str = "exact-trees-v1";
 pub const FEATURE_IMMUTABLE_SOURCE_CAS: &str = "immutable-source-cas-v1";
 pub const FEATURE_REF_CAS: &str = "ref-cas-v1";
@@ -315,6 +322,23 @@ pub struct RepositoryTransferPack {
     /// Git baseline. A changed Git authority is rejected rather than adapted.
     pub source_git_authority_hash: Option<Hash256>,
     pub expected_destination_git_authority_hash: Option<Hash256>,
+    /// The imported-Git authority this pack ESTABLISHES on a destination that
+    /// has none.
+    ///
+    /// Present only for a bootstrap, which is the one case where the two
+    /// replicas' Git authority is allowed to differ: the destination's is
+    /// absent and this pack is what gives it one. Every other pack leaves this
+    /// `None` and the equality rule above stands unchanged.
+    ///
+    /// A bootstrap is admitted only into a replica that is empty in five
+    /// respects at once, and it declares all five in the `expected_destination`
+    /// fields, which the receiver compare-and-swaps against its own live lease
+    /// before it commits. So the guard against a second publisher rebinding an
+    /// established repository is the lease check that already exists, not
+    /// anything this field introduces. kin-db refuses the same thing again
+    /// underneath, because an `initialize` delta carries `old: None` and the
+    /// storage layer compares it against what is actually there.
+    pub git_authority_bootstrap: Option<GitExternalAuthority>,
     pub required_features: Vec<String>,
     /// Parent-before-child exact semantic closure.
     pub changes: Vec<SemanticChange>,
@@ -972,6 +996,11 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         expected_destination_default_ref: expectation.default_ref.clone(),
         source_git_authority_hash: context.source_git_authority_hash,
         expected_destination_git_authority_hash: expectation.git_authority_hash,
+        // The sender does not bootstrap yet. Teaching it to is the other half
+        // of this change and it lands separately; until then every pack this
+        // function builds is an ordinary fast-forward and the equality rule
+        // applies to it unchanged.
+        git_authority_bootstrap: None,
         required_features: required_features(),
         changes,
         trees,
@@ -1076,7 +1105,24 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     }
     let current_git_hash =
         hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
-    if current_git_hash != pack.expected_destination_git_authority_hash
+    // Both arms compare against what this replica actually holds right now,
+    // read from the lease rather than from anything the sender said during the
+    // negotiation. That is what decides a race between two publishers: the
+    // second one finds a non-empty replica here and is refused, whatever it
+    // declared.
+    if pack.git_authority_bootstrap.is_some() {
+        if current_git_hash.is_some() {
+            return Err(RepositoryTransferError::Conflict(
+                "this replica already holds imported-Git authority and cannot be bootstrapped again"
+                    .to_string(),
+            ));
+        }
+        if !lease.snapshot().changes.is_empty() {
+            return Err(RepositoryTransferError::Conflict(
+                "this replica already holds history and cannot be bootstrapped".to_string(),
+            ));
+        }
+    } else if current_git_hash != pack.expected_destination_git_authority_hash
         || current_git_hash != pack.source_git_authority_hash
     {
         return Err(RepositoryTransferError::Conflict(
@@ -1120,11 +1166,7 @@ pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
         return Err(invalid(format!("unsupported protocol {:?}", pack.protocol)));
     }
     pack.expected_destination_roots.validate().map_err(model)?;
-    if pack.source_git_authority_hash != pack.expected_destination_git_authority_hash {
-        return Err(RepositoryTransferError::Conflict(
-            "transfer v1 cannot carry imported-Git authority divergence".to_string(),
-        ));
-    }
+    validate_git_authority_shape(pack)?;
     validate_required_features(&pack.required_features)?;
     enforce_count("changes", pack.changes.len(), MAX_TRANSFER_CHANGES as u32)?;
     enforce_count("trees", pack.trees.len(), MAX_TRANSFER_TREES as u32)?;
@@ -1290,6 +1332,69 @@ pub fn validate_pack(pack: &RepositoryTransferPack) -> Result<()> {
                 )));
             }
         }
+    }
+    Ok(())
+}
+
+/// Decide whether this pack's imported-Git authority story is coherent, which
+/// is two different rules depending on whether it bootstraps.
+///
+/// Without a bootstrap the old rule stands exactly: both replicas' authority
+/// must already hash the same. With one, exactly one divergence is legal, the
+/// one from absent to present, and every other property of an empty
+/// destination has to hold too. The five emptiness declarations here are
+/// checked again in `apply_repository_transfer_pack` against the live lease,
+/// which is what makes them a guard rather than an assertion: a sender can
+/// declare anything, and the receiver believes its own storage.
+fn validate_git_authority_shape(pack: &RepositoryTransferPack) -> Result<()> {
+    let Some(bootstrap) = pack.git_authority_bootstrap.as_ref() else {
+        if pack.source_git_authority_hash != pack.expected_destination_git_authority_hash {
+            return Err(RepositoryTransferError::Conflict(
+                "transfer v1 cannot carry imported-Git authority divergence".to_string(),
+            ));
+        }
+        return Ok(());
+    };
+
+    if pack.expected_destination_git_authority_hash.is_some() {
+        return Err(RepositoryTransferError::Conflict(
+            "a bootstrap establishes imported-Git authority and cannot be applied to a replica that already has one"
+                .to_string(),
+        ));
+    }
+    if bootstrap.repository_id != pack.repository_id {
+        return Err(invalid(format!(
+            "bootstrap authority belongs to repository {}, not {}",
+            bootstrap.repository_id, pack.repository_id
+        )));
+    }
+    // The hash the sender advertised has to be the hash of the authority it
+    // actually shipped, or the negotiation and the payload describe different
+    // repositories and only one of them was agreed to.
+    let shipped = hash_git_authority(Some(bootstrap))?;
+    if shipped != pack.source_git_authority_hash {
+        return Err(invalid(
+            "bootstrap authority does not hash to the source Git authority this pack declares"
+                .to_string(),
+        ));
+    }
+    // An empty replica is empty in five respects, not one. Declaring fewer
+    // would let a bootstrap land on a replica that already holds history under
+    // a different lineage.
+    if pack.expected_destination_head.is_some()
+        || pack.expected_destination_target.is_some()
+        || pack.expected_destination_default_ref.is_some()
+    {
+        return Err(RepositoryTransferError::Conflict(
+            "a bootstrap is admitted only into a replica with no head, no ref target and no default ref"
+                .to_string(),
+        ));
+    }
+    if pack.expected_destination_roots.generation != 0 {
+        return Err(RepositoryTransferError::Conflict(format!(
+            "a bootstrap is admitted only at generation zero, not generation {}",
+            pack.expected_destination_roots.generation
+        )));
     }
     Ok(())
 }
@@ -1562,6 +1667,29 @@ fn validate_body_coverage<B: StorageBackend + ?Sized + 'static>(
     Ok(())
 }
 
+/// Where a pack's published head lives, which is not the same answer for a
+/// Git-origin head as for a native one.
+///
+/// A native change is named by its own identity. A Git-origin change's ref
+/// points at the external commit object, which is what a Git import commits
+/// and what the authority's own projections describe. Publishing a Git-origin
+/// head as `RefTarget::change` would name a target the resulting authority does
+/// not project, and the transaction would be refused for a reason that reads
+/// like a bug in the sender.
+fn published_ref_target(pack: &RepositoryTransferPack) -> RefTarget {
+    match pack
+        .changes
+        .iter()
+        .find(|change| change.id == pack.source_head)
+        .map(|change| change.origin)
+    {
+        Some(ChangeOrigin::GitCommit { oid }) => {
+            RefTarget::external_object(ExternalObjectId::new(ExternalObjectKind::Commit, oid))
+        }
+        _ => RefTarget::change(pack.source_head),
+    }
+}
+
 fn transfer_transaction(
     pack: &RepositoryTransferPack,
     actor: AuthorId,
@@ -1592,13 +1720,21 @@ fn transfer_transaction(
             pack.transfer_id, pack.destination_ref
         ),
         external_objects: pack.external_objects.clone(),
-        git_authority_delta: None,
+        // A bootstrap and a fast-forward differ here and nowhere else in this
+        // transaction. Bound 4 is why they cannot be two transactions: the
+        // resulting authority has to project every Git-origin change this
+        // transaction admits, and the changes have to alias every projection
+        // that authority carries, so neither half validates without the other.
+        git_authority_delta: pack
+            .git_authority_bootstrap
+            .clone()
+            .map(GitExternalAuthorityDelta::initialize),
         changes: pack.changes.clone(),
         aliases: pack.aliases.clone(),
         ref_mutations: vec![RefMutation {
             name: pack.destination_ref.clone(),
             expected,
-            new_target: Some(RefTarget::change(pack.source_head)),
+            new_target: Some(published_ref_target(pack)),
             policy: RefUpdatePolicy::FastForwardOnly,
         }],
         default_ref_mutation,
