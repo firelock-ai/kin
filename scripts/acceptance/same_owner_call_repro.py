@@ -122,6 +122,27 @@ def grade(callers, expected, forbidden):
     return (PASS, "callers were %s" % (sorted(callers) or "none"))
 
 
+def report_payload(results, label):
+    """The report shape `scripts/acceptance/gate.py` reads.
+
+    The key is `results` and not `checks`. That is not a style choice: the gate
+    calls `payload.get("results")` and refuses anything else with "carries no
+    results list", which is what it did to the first version of this file. A
+    suite that ran, graded, printed three green CHECK lines and wrote a report
+    the gate cannot read has not passed; it has produced an unreadable verdict,
+    and the gate is right to say so. The self-test now drives the gate's own
+    reader over this payload rather than a copy of its rules.
+    """
+    return {
+        "label": label,
+        "ticket": TICKET,
+        "results": [
+            {"id": r.id, "ticket": TICKET, "status": r.status, "detail": r.detail}
+            for r in results
+        ],
+    }
+
+
 # ── fixtures ──
 
 JAVA_SRC = (
@@ -310,6 +331,55 @@ def self_test():
     expect("unreadable never grades as a pass",
            grade(None, [], ["A"])[0], UNREADABLE)
 
+    # The report shape, driven through the GATE'S OWN reader rather than a copy
+    # of its rules. A copy is exactly what failed: this suite printed three green
+    # CHECK lines locally and wrote a report keyed `checks`, and the gate refused
+    # it with "carries no results list". The local pass proved the suite ran and
+    # said nothing about whether the verdict could be read, and the gate is the
+    # verdict.
+    import importlib.util
+    import tempfile
+    gate_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.py")
+    if not os.path.exists(gate_path):
+        failures.append("gate.py is not beside this file, so the report shape went unchecked")
+    else:
+        spec = importlib.util.spec_from_file_location("acceptance_gate", gate_path)
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        rows = [Result("0", PASS, "a"), Result("1", FAIL, "b")]
+        scratch = tempfile.mkdtemp(prefix="same-owner-selftest-")
+        try:
+            good = os.path.join(scratch, "good.json")
+            with open(good, "w") as handle:
+                json.dump(report_payload(rows, "selftest"), handle)
+            try:
+                loaded = gate.load_report(good)
+                expect("the gate reads this suite's report", sorted(loaded), ["0", "1"])
+                expect("the gate reads a status off each row",
+                       loaded["1"].get("status"), FAIL)
+            except Exception as exc:
+                failures.append("the gate refused this suite's own report: %s" % exc)
+
+            # CONTROL: the shape that shipped broken must still be refused, or
+            # the check above would pass on any payload at all.
+            bad = os.path.join(scratch, "bad.json")
+            with open(bad, "w") as handle:
+                json.dump({"label": "x", "ticket": TICKET,
+                           "checks": [{"id": "0", "status": PASS}]}, handle)
+            try:
+                gate.load_report(bad)
+                failures.append("CONTROL: the gate accepted a `checks`-keyed report, "
+                                "so this check cannot fail")
+            except Exception:
+                print("ok: the gate still refuses the `checks`-keyed shape that broke CI")
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    # A relative --kin resolves against each fixture's cwd, not the caller's, so
+    # it is absolutized at parse time. This pins that the absolutizing happens.
+    expect("a relative kin path is made absolute",
+           os.path.isabs(os.path.abspath("target/release/kin")), True)
+
     for line in failures:
         print("SELFTEST FAIL %s" % line)
     if failures:
@@ -338,13 +408,21 @@ def main(argv=None):
     if not args.kin:
         print("error: --kin (or KIN_BIN) is required", file=sys.stderr)
         return 3
-    if not os.path.isfile(args.kin) or not os.access(args.kin, os.X_OK):
-        print("error: %s is not an executable kin binary" % args.kin, file=sys.stderr)
+    # Absolutized HERE, before anything reads it. Every probe runs with `cwd` set
+    # to a fixture repository, so a relative `--kin target/release/kin` resolves
+    # against that fixture and not against the caller's directory. It validates
+    # from the caller's cwd and then fails from the fixture's, which is a check
+    # that passed and a use that did not: CI reported three UNREADABLE probes,
+    # `No such file or directory: 'target/release/kin'`, while the identical run
+    # with an absolute path passed locally.
+    kin = os.path.abspath(args.kin)
+    if not os.path.isfile(kin) or not os.access(kin, os.X_OK):
+        print("error: %s is not an executable kin binary" % kin, file=sys.stderr)
         return 3
 
-    daemon = args.daemon
+    daemon = os.path.abspath(args.daemon) if args.daemon else None
     if not daemon:
-        beside = os.path.join(os.path.dirname(os.path.abspath(args.kin)), "kin-daemon")
+        beside = os.path.join(os.path.dirname(kin), "kin-daemon")
         if os.path.isfile(beside) and os.access(beside, os.X_OK):
             daemon = beside
 
@@ -354,7 +432,7 @@ def main(argv=None):
 
     workdir = args.workdir or tempfile.mkdtemp(prefix="same-owner-call-")
     os.makedirs(workdir, exist_ok=True)
-    suite = Suite(args.kin, workdir, daemon=daemon, verbose=args.verbose)
+    suite = Suite(kin, workdir, daemon=daemon, verbose=args.verbose)
 
     results = []
     try:
@@ -380,9 +458,7 @@ def main(argv=None):
 
     if args.json:
         with open(args.json, "w") as handle:
-            json.dump({"label": args.label, "ticket": TICKET,
-                       "checks": [{"id": r.id, "status": r.status, "detail": r.detail}
-                                  for r in results]}, handle, indent=2)
+            json.dump(report_payload(results, args.label), handle, indent=2, sort_keys=True)
 
     if failed:
         return 1
