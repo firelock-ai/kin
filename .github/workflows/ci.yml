@@ -843,19 +843,38 @@ jobs:
       - name: Report the documentation-only fast path
         run: echo "documentation-only diff; build and test validation not applicable"
 
-  # The macOS half of this job moved to `check-macos` + `check-macos-aggregate`
-  # below, so this one now carries the ubuntu-latest context alone. The matrix
-  # stays, with one value, because it is what makes the display name expand to
-  # `Check & Test (ubuntu-latest)`, the exact required context name, and what
-  # keeps a SKIPPED job from expanding at all. The `runner.os == 'Linux'`
-  # conditions further down are now always true and are kept rather than
-  # deleted: they document which steps are Linux-only by intent, and they are
-  # what would keep this job honest if a platform were ever added back.
+  # The ubuntu half of Check & Test, sharded, and the job every source-reading
+  # gate in this repository runs in. The macOS half moved to `check-macos` +
+  # `check-macos-aggregate` below; this one carries the ubuntu-latest evidence
+  # and now splits its test step the same way, because `Test` was 14.98 min of
+  # a 21.8-minute job and was the last unpartitioned suite in the workflow.
+  #
+  # Within that set, shard 1 runs everything and shard 2 runs its own build and
+  # its own partition. The gates on shard 1 read source and cannot answer
+  # differently on a second runner, so running them twice would pay twice for
+  # one answer; the build is the one thing a partition genuinely needs of its
+  # own. Everything a partition consumes stays on both legs: the toolchain, the
+  # registry check, the cache, the build, nextest, and the language servers the
+  # enrichment proof needs, since which shard that test lands in is decided by
+  # the partitioner rather than by anything written here.
+  #
+  # The job id stays `check`. Two things read it and neither reads a display
+  # name: `bin/kin-precheck` in the umbrella enumerates this job's gate list out
+  # of this file by that id, and `rust-cache` composes its key from the job id
+  # when no shared key is given, so `feature-tests` reaches this job's warm
+  # dependency graph by asking for `check`. Renaming it would break the lane
+  # inner loop and silently cost the ubuntu permutations their cache, which is
+  # the same defect the macOS leg of that job carried until FIR-2722.
+  #
+  # This job publishes no required context. `check-aggregate` below does, and it
+  # fails unless every shard here succeeded. The `runner.os == 'Linux'`
+  # conditions further down are always true and are kept rather than deleted:
+  # they document which steps are Linux-only by intent.
   check:
-    name: Check & Test
+    name: Check & Test ubuntu shard
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     # The all-features clippy/build/test sequence can otherwise retain more
     # than a hosted runner's available disk in incremental objects and debug
@@ -866,8 +885,13 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     strategy:
+      # A shard that dies must not take its sibling with it. With fail-fast on,
+      # one red shard cancels the other, the aggregate reads `cancelled` for a
+      # partition that was passing, and the run reports one cause where there
+      # may be two.
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest]
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v7
 
@@ -879,6 +903,7 @@ jobs:
       # crates/ is never classified documentation-only, so it never takes the
       # inert fast path.
       - name: Check the README language count against the adapter registry
+        if: matrix.shard == 1
         shell: bash
         run: |
           set -euo pipefail
@@ -957,6 +982,7 @@ jobs:
           echo "README and the adapter registry agree on $derived languages."
 
       - name: Install runtime guard tools
+        if: matrix.shard == 1
         shell: bash
         run: |
           if ! command -v rg >/dev/null 2>&1; then
@@ -995,6 +1021,7 @@ jobs:
           command -v rg
 
       - name: Validate installer checksum fixtures
+        if: matrix.shard == 1
         run: python3 scripts/test-install-checksum.py
 
       # A gate whose assertion lost its call site still exits 0, so passing the
@@ -1007,9 +1034,11 @@ jobs:
       # scripts/test-release-workflow-authority.py asserts this step exists, so
       # the pair cannot be half-removed.
       - name: Validate that every release gate assertion still runs
+        if: matrix.shard == 1
         run: python3 scripts/test-assertion-reachability.py
 
       - name: Validate mandatory Homebrew release outcome gate
+        if: matrix.shard == 1
         run: python3 scripts/test-homebrew-release-gate.py
 
       # Every validator below polices a repo-global invariant, so a break in one
@@ -1026,7 +1055,7 @@ jobs:
       # the gate because the assertion-reachability gate reads this file to
       # prove each suite still runs on pull requests.
       - name: Validate automatic release policy
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard == 1
         env:
           GH_TOKEN: ${{ github.token }}
           KIN_POLICY_EVENT: ${{ github.event_name }}
@@ -1060,7 +1089,7 @@ jobs:
       # success while the original moves, and release.yml is the one workflow
       # whose mistakes a later commit cannot repair.
       - name: Check the RC build mirrors the release build
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard == 1
         run: node scripts/check-rc-build-drift.mjs
 
       # release.yml refuses a release whose Kin lock resolves a different
@@ -1071,7 +1100,7 @@ jobs:
       # here, against the pin read out of release.yml, so the answer arrives
       # while a commit can still change it.
       - name: Verify Kin/kin-vfs compatibility at the pinned release input
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard == 1
         env:
           GH_TOKEN: ${{ github.token }}
         run: node scripts/check-kin-vfs-compat.mjs
@@ -1099,6 +1128,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
+        if: matrix.shard == 1
         run: cargo fmt -- --check
 
       # Two guards, two jobs. The Python checker walks every crate and carries
@@ -1107,9 +1137,11 @@ jobs:
       # kin-cli unit test drives. Both run, and the third step falsifies them,
       # because a guard that has never been shown to fail proves nothing.
       - name: Check Zero File-Search Invariant
+        if: matrix.shard == 1
         run: python3 scripts/verify-zero-file-search.py
 
       - name: Check Zero File-Search Invariant (answer modules)
+        if: matrix.shard == 1
         run: bash scripts/zero_file_search_guard.sh
 
       # Deep history is a PROJECTION re-authored at ingest, not a stored fact:
@@ -1120,9 +1152,11 @@ jobs:
       # releases that rewrote replay. This pins the replay surface by digest, so
       # an edit cannot ship without an explicit, reviewed manifest update.
       - name: Check Hydration Replay Semantics
+        if: matrix.shard == 1
         run: python3 scripts/verify-hydration-semantics.py
 
       - name: Falsify Hydration Replay Semantics guard
+        if: matrix.shard == 1
         run: |
           set -euo pipefail
           poisoned="$(mktemp -d)"
@@ -1142,7 +1176,7 @@ jobs:
       # deciding. Both run after the toolchain step because the leg helpers
       # resolve a compilation unit through cargo.
       - name: Falsify the release policy and Windows leg gates
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard == 1
         run: |
           bash scripts/test-release-policy-gate.sh
           bash scripts/test-windows-authority-legs.sh
@@ -1153,6 +1187,7 @@ jobs:
       # list would drift, and the drift would be invisible until the platform
       # whose copy lost an allow went red for a lint nobody meant to enforce.
       - name: Clippy
+        if: matrix.shard == 1
         shell: bash
         run: |
           set -euo pipefail
@@ -1170,15 +1205,18 @@ jobs:
           cargo clippy --all-targets --all-features -- $allows
 
       - name: Check Runtime Boundaries
+        if: matrix.shard == 1
         run: bash scripts/check_runtime_boundaries.sh
 
       - name: Check Private Repo Coupling
+        if: matrix.shard == 1
         run: bash scripts/check_private_repo_coupling.sh
 
       # The guard above is invoked from the repository root here and nowhere
       # else, which is the one working directory that hid a broken exclusion.
       # These tests run it from a foreign directory in both directions.
       - name: Test Private Repo Coupling Guard
+        if: matrix.shard == 1
         run: python3 scripts/test-private-repo-coupling.py
 
       # The committed Cargo.lock plus .cargo/config.toml pins kin-* dependencies
@@ -1198,7 +1236,7 @@ jobs:
       # One deliberate bound: it checks rather than builds, so it proves
       # compilation and name resolution and not linking.
       - name: Check the Linux release target (musl)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard == 1
         run: |
           set -euo pipefail
           rustup target add x86_64-unknown-linux-musl
@@ -1229,7 +1267,7 @@ jobs:
       # leg proves that natively on ubuntu-24.04-arm, where musl-tools does
       # supply an aarch64 musl-gcc, which is why nothing here is a cross build.
       - name: Check the aarch64 Linux release target (musl)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && matrix.shard == 1
         run: |
           set -euo pipefail
           rustup target add aarch64-unknown-linux-musl
@@ -1257,12 +1295,60 @@ jobs:
         if: runner.os == 'Linux'
         run: bash scripts/ci-install-language-servers.sh
 
+      # `--partition count:N/M` splits the suite by test, deterministically,
+      # so the two shards together run exactly the set one unpartitioned run
+      # ran. `check-aggregate` below is what makes "together" enforceable: a
+      # shard that never reported cannot leave its partition silently unrun.
       - name: Test
-        run: cargo nextest run --locked
+        run: cargo nextest run --locked --partition count:${{ matrix.shard }}/2
 
       - name: Doc tests
+        if: matrix.shard == 1
         # nextest does not run doctests; keep them covered explicitly.
         run: cargo test --doc --locked
+
+  # The required context for ubuntu. Its display name plus its one matrix value
+  # compose to `Check & Test (ubuntu-latest)`, byte for byte what ruleset
+  # 19746451, release-tag.yml's REQUIRED_CHECKS and expected_provenance tables,
+  # scripts/test-release-workflow-authority.py and docs/release-bot.md all name.
+  # Nothing about that string changes; only the job producing it does.
+  #
+  # The matrix is not decoration, for the same reason `check-macos-aggregate`
+  # carries one: a skipped matrix job never expands, so on a documentation-only
+  # diff this publishes the bare `Check & Test` name and leaves
+  # `check-docs-only` as the sole producer of the expanded one. Without the
+  # matrix, a skipped aggregate would publish `Check & Test (ubuntu-latest)` as
+  # `skipped` beside the stub's success, and two check runs under one required
+  # name is the ambiguity the release mint refuses on.
+  check-aggregate:
+    name: Check & Test
+    needs: [changes, check]
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    steps:
+      # `needs.<job>.result` for a matrix job is the roll-up of every leg, so
+      # this is `success` only when both shards succeeded. Requiring exactly
+      # `success` is what makes a SKIPPED or CANCELLED shard fail this check
+      # rather than pass it: a shard that never ran left half the ubuntu suite
+      # unexecuted, and a required context that goes green on that is worse than
+      # no context at all.
+      - name: Require every ubuntu shard to have succeeded
+        env:
+          SHARDS: ${{ needs.check.result }}
+        run: |
+          set -euo pipefail
+          if [ "$SHARDS" != "success" ]; then
+            echo "::error title=ubuntu shards did not pass::the sharded ubuntu Check & Test legs reported '$SHARDS'"
+            echo "Every partition of the ubuntu suite has to report success for this" >&2
+            echo "context to be evidence that the suite ran. 'skipped' and 'cancelled'" >&2
+            echo "mean a partition did not run at all." >&2
+            exit 1
+          fi
+          echo "every ubuntu Check & Test shard succeeded"
 
   # The macOS half of Check & Test, sharded.
   #
@@ -1455,6 +1541,29 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      # A test that resolves a home through a real call site without
+      # `#[serial]` passes on a quiet laptop, lands green, and ejects a
+      # merge-queue entry weeks later from inside a `merge_group` run that marks
+      # no pull request. Two of the four ejections in the 2026-08-26 window were
+      # one such test, and the pull requests it removed showed every check green.
+      # FIR-2714 removed that instance; this is what stops the next.
+      #
+      # It runs here rather than in `check` because it is a source read that
+      # resolves no dependencies, which is this job's whole admission rule, and
+      # because a script step in `check` is a gate `bin/kin-precheck` in the
+      # umbrella enumerates and must classify by name. Wiring it there without
+      # the matching umbrella entry makes precheck refuse with no tally, on this
+      # tree and on every lane still on an older base, which is measured rather
+      # than assumed: 16 of 17 gates passed and the run printed no tally.
+      # Promoting it later is this step moving one job and one name joining
+      # precheck's LOCAL list, which is FIR-2720's remaining half.
+      #
+      # The guard carries its own blanker, recogniser and discovery controls, so
+      # a scan that has stopped being able to say yes fails here instead of
+      # reporting a clean tree.
+      - name: Check home-reading test isolation
+        run: python3 scripts/check-home-reader-tests.py
+
       - name: Falsify Zero File-Search guards
         # Both guards still run on both platforms in Check & Test. Only this
         # meta-proof, that the guards are not vacuous, is single-legged.
@@ -1614,19 +1723,32 @@ jobs:
           grep -q '^\[registries\.kin\]' .cargo/config.toml
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
 
-      # `shared-key: check` is the key Check & Test's own cache already writes,
-      # so these permutations start from that warm third-party dependency graph
-      # instead of compiling it from nothing. Only the workspace crates rebuild
-      # for the changed feature set, which is what they cost inside Check & Test
-      # too. `save-if: false` because this job must never write that entry: it
-      # resolves a different feature set, and a save from here would hand
-      # Check & Test a target directory missing the artifacts its steps expect.
-      # A rename of the `check` job silently costs this job its warm start, so
-      # the cache-hit line in this step's log is the thing to read if it slows.
+      # These permutations start from the warm third-party dependency graph
+      # Check & Test's own cache already writes, instead of compiling it from
+      # nothing. Only the workspace crates rebuild for the changed feature set,
+      # which is what they cost inside Check & Test too. `save-if: false`
+      # because this job must never write that entry: it resolves a different
+      # feature set, and a save from here would hand Check & Test a target
+      # directory missing the artifacts its steps expect.
+      #
+      # Check & Test is two jobs, so one shared key cannot serve both legs of
+      # this matrix. `rust-cache` composes its key from the JOB ID when no
+      # shared key is given, so ubuntu's entry is written under `check` and
+      # macOS's under `check-macos`, and the expression below is which of the
+      # two this leg is entitled to read. Asking `check` on Darwin, which is
+      # what this step did until FIR-2722, requested
+      # `v0-rust-check-Darwin-arm64-*`, a key nothing in this workflow has ever
+      # written, so the macOS leg logged `No cache found.` on every run and
+      # compiled the dependency graph from nothing. The comment that used to
+      # sit here predicted exactly that and nobody read the line it named.
+      #
+      # Read the cache line in THIS step's log, on both legs, never the caches
+      # API listing, which is not an inventory and omitted every macOS entry
+      # while a job log showed a full match on one of them.
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          shared-key: check
+          shared-key: ${{ matrix.os == 'macos-latest' && 'check-macos' || 'check' }}
           save-if: false
 
       - name: Install nextest
