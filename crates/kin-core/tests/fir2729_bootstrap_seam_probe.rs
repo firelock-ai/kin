@@ -144,7 +144,7 @@ fn an_empty_replica_admits_the_bootstrap_transaction_a_git_admitted_store_would_
         source_body_count,
     ) = {
         let lease = source.read_authority();
-        let metadata = lease.authority_metadata().clone();
+        let metadata = lease.metadata().clone();
         let changes: Vec<SemanticChange> = lease.snapshot().changes.values().cloned().collect();
         let default_ref = metadata
             .ref_state
@@ -201,7 +201,7 @@ fn an_empty_replica_admits_the_bootstrap_transaction_a_git_admitted_store_would_
 
     let (destination_roots, destination_generation) = {
         let lease = destination.read_authority();
-        let metadata = lease.authority_metadata();
+        let metadata = lease.metadata();
         // The five-field empty signature the real bootstrap will compare-and-swap
         // against. Asserting it here is what makes this an EMPTY-replica probe
         // rather than an any-replica one.
@@ -300,7 +300,7 @@ fn an_empty_replica_admits_the_bootstrap_transaction_a_git_admitted_store_would_
     // hosted test already proves; this reads the BYTES back, which is the
     // thing no test in the tree does today.
     let lease = destination.read_authority();
-    let metadata_after = lease.authority_metadata();
+    let metadata_after = lease.metadata();
     assert!(
         metadata_after.git_external_authority.is_some(),
         "the destination must hold imported-Git authority after the bootstrap"
