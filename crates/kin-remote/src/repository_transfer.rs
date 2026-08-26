@@ -2845,6 +2845,97 @@ mod tests {
         );
     }
 
+    /// A transport that answers straight out of a local manager, so a pull can
+    /// be negotiated against a Git-admitted remote without a socket.
+    struct GitAdmittedPeer<'a>(&'a TestManager);
+
+    impl crate::repository_transfer_negotiation::RepositoryTransferTransport for GitAdmittedPeer<'_> {
+        fn advertise_refs(
+            &self,
+            repository_id: &RepositoryId,
+        ) -> Result<RepositoryRefAdvertisement> {
+            repository_ref_advertisement(self.0, repository_id)
+        }
+
+        fn transfer_status(
+            &self,
+            repository_id: &RepositoryId,
+            destination_ref: &RefName,
+        ) -> Result<RepositoryTransferStatus> {
+            repository_transfer_status(self.0, repository_id, destination_ref)
+        }
+
+        fn export_pack(
+            &self,
+            _repository_id: &RepositoryId,
+            source_ref: &RefName,
+            expectation: &RepositoryTransferExpectation,
+        ) -> Result<RepositoryTransferPack> {
+            build_repository_transfer_segment(self.0, source_ref, expectation)
+                .map(|segment| segment.pack)
+        }
+
+        fn receive_pack(
+            &self,
+            repository_id: &RepositoryId,
+            destination_ref: &RefName,
+            pack: &RepositoryTransferPack,
+        ) -> Result<RepositoryTransferReceipt> {
+            apply_repository_transfer_pack(
+                self.0,
+                repository_id,
+                destination_ref,
+                AuthorId::new("peer"),
+                pack,
+            )
+        }
+    }
+
+    /// The pull direction reaches a bootstrap too, and this is the composition
+    /// the push tests do not cover.
+    ///
+    /// Every piece was already proven separately: an unborn replica's status is
+    /// the five-field empty signature, and a Git-admitted source handed that
+    /// expectation builds a bootstrap. What had no test was the negotiation
+    /// joining them, which is where a short-circuit for a replica holding no
+    /// ref would have hidden. So this drives the real `fetch_pull_pack` and
+    /// asserts the pack it comes back with is a bootstrap.
+    ///
+    /// It stops at the pack rather than admitting it, because this fixture's
+    /// tree carries a gitlink and admitting would meet FIR-2751 rather than
+    /// anything about pulling. What a bootstrap lands is proven by the
+    /// Git-origin-only test above.
+    #[test]
+    fn an_unborn_replica_negotiating_a_pull_is_offered_a_bootstrap() {
+        use crate::repository_transfer_negotiation::{fetch_pull_pack, PullNegotiation};
+
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+        let remote = GitAdmittedPeer(&fixture.source);
+
+        let negotiation = fetch_pull_pack(
+            &empty,
+            &remote,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .expect("an unborn replica may negotiate a pull from a Git-admitted remote");
+
+        let PullNegotiation::Pack(pack) = negotiation else {
+            panic!("an unborn replica has everything to admit, so the remote must offer a pack");
+        };
+        assert!(
+            pack.git_authority_bootstrap.is_some(),
+            "the remote must offer a BOOTSTRAP, not a fast-forward the puller cannot apply"
+        );
+        assert_eq!(
+            pack.expected_destination_git_authority_hash, None,
+            "the pack must be bound to the unborn lease this replica actually has"
+        );
+    }
+
     /// The other reachable layer: a publisher that LIES about the destination
     /// being empty.
     ///
