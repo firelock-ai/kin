@@ -1261,6 +1261,31 @@ mod tests {
             1,
             "one fact, one clause: {factor}"
         );
+        // WHICH of the two clauses survives is decided by the readings array's
+        // order, not by the dedupe rule, and nothing else asserts it. The
+        // absence gate precedes the coverage reading, and its clause is the
+        // specific one: it names the language and says which classes do not
+        // stand in for the missing one. Swap the two in `compute` and both the
+        // assertion above and `every_refusing_input_keeps_its_clause_in_the_factor`
+        // stay green while every real reader quietly gets the shorter clause.
+        // Both clauses name the language, so that is not the difference. The
+        // absence gate's says where the gap IS, in extraction rather than in
+        // the caller's code, and why the classes that ARE present do not stand
+        // in for the missing one. The coverage reading's says only that the
+        // edges were not observed. A reader who acts on the first does not go
+        // looking through their own source; a reader who acts on the second
+        // might.
+        assert!(
+            factor.contains("rather than in the code"),
+            "the surviving clause is the absence gate's, which tells the reader the gap is not \
+             in their code. Which of the two survives is decided by the readings array's ORDER, \
+             not by the dedupe rule, so reordering `compute` silently downgrades what every \
+             reader sees while every other assertion here stays green: {factor}"
+        );
+        assert!(
+            factor.contains("do not stand in for"),
+            "and why the classes that are present do not compensate: {factor}"
+        );
         assert!(factor.contains("embed_worker:failed"), "{factor}");
     }
 
