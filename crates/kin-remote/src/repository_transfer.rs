@@ -2721,7 +2721,7 @@ mod tests {
     /// pack proves the two kinds of history travel together rather than only
     /// the Git half.
     #[test]
-    fn a_publisher_negotiating_with_an_unborn_replica_builds_a_bootstrap_from_the_advertisement_alone() {
+    fn a_publisher_decides_to_bootstrap_from_an_unborn_advertisement_alone() {
         let fixture = fixture();
         let empty_dir = tempfile::tempdir().unwrap();
         let empty = manager(&empty_dir, &fixture.repository_id);
@@ -2806,7 +2806,9 @@ mod tests {
         )
         .expect_err("native history over a gitlink cannot bootstrap");
         assert!(
-            error.to_string().contains("without verified Git external authority"),
+            error
+                .to_string()
+                .contains("without verified Git external authority"),
             "the refusal must name the gitlink authentication bound rather than any \
              of the five this change is about: {error}"
         );
