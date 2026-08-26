@@ -16960,6 +16960,290 @@ mod tests {
         );
     }
 
+    // ── FIR-2729 / FIR-2746: the payload-bearing transfer harness ──────────
+    //
+    // Everything above proves the transfer LOOP. `a_hosted_store_admits_a_
+    // native_transfer_and_then_serves_the_head_it_admitted` builds its pack
+    // from `seed_replica_change`, whose changes carry empty `tree_deltas` and
+    // empty `entity_deltas`, so it says nothing about whether a transfer can
+    // carry content. Every hosted repository IS content, so the loop passing
+    // is not evidence the republish can work.
+    //
+    // This harness carries a payload. It exists before the route that would
+    // let one through, so today its job is to pin the refusals precisely
+    // enough that the day a route lands, the right assertion moves and the
+    // wrong one does not.
+
+    /// One megabyte per blob: comfortably under `MAX_TRANSFER_BODY_BYTES`
+    /// (8 MiB, the PER-BODY cap), so a fixture built from these can only ever
+    /// cross the decoded-CLOSURE cap and never the per-body one. Isolating the
+    /// two matters: a fixture that tripped the per-body cap would refuse with a
+    /// different message for a different reason and read exactly like the cap
+    /// this harness is about.
+    #[cfg(unix)]
+    const PAYLOAD_BLOB_BYTES: usize = 1024 * 1024;
+
+    /// Mirrors `kin`'s own tip tree, which FIR-2746 measured at 842 unique
+    /// blobs and 27.77 MiB decoded and which DOES NOT FIT. The property that
+    /// matters is the decoded total, not the blob count, so this carries the
+    /// total in far fewer blobs: 24 keeps it three orders of magnitude clear of
+    /// `MAX_TRANSFER_BODIES` (4096) and `MAX_TRANSFER_EXTERNAL_OBJECTS` (4096),
+    /// which is what makes a refusal here attributable to the byte cap alone.
+    #[cfg(unix)]
+    const PAYLOAD_BLOBS_OVER_CAP: usize = 24;
+
+    /// Mirrors the four hosted repositories FIR-2746 measured as fitting, the
+    /// largest of which is kin-db at 4.30 MiB. Same generator, same blob size,
+    /// same commit shape; the only variable between this and the fixture above
+    /// is how many blobs there are, which is what makes the pair a comparison
+    /// rather than two separate observations.
+    #[cfg(unix)]
+    const PAYLOAD_BLOBS_UNDER_CAP: usize = 4;
+
+    /// Deterministic, distinct-per-blob, and not compressible into nothing.
+    ///
+    /// All three properties are load-bearing. Deterministic because a
+    /// reassembly assertion compares content hashes against the source tree and
+    /// a fixture that differs run to run cannot be compared to anything.
+    /// Distinct because `validate_pack` deduplicates bodies by hash
+    /// (`repository_transfer.rs:1222`), so a fixture of identical blobs would
+    /// collapse to ONE body and measure deduplication rather than size, while
+    /// still looking like a 24 MiB fixture on disk. Incompressible because the
+    /// cap is on DECODED bytes and a fixture of zeroes would prove nothing
+    /// about what a real tree costs.
+    #[cfg(unix)]
+    fn payload_blob_bytes(seed: u64, len: usize) -> Vec<u8> {
+        // SplitMix64. Chosen because it needs no dependency and is exactly
+        // reproducible from the seed, which is what makes the digests below a
+        // fixture property rather than a run property.
+        let mut out = Vec::with_capacity(len + 8);
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        while out.len() < len {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// A Git-admitted store carrying real content, adopting a hosted identity,
+    /// built the way the hosted republish runbook stages its five stores:
+    /// `git init`, one commit, `kin init`.
+    #[cfg(unix)]
+    struct PayloadFixture {
+        layout: kin_core::KinLayout,
+        working: PathBuf,
+        /// Repository-relative path to the SHA-256 of the bytes written there.
+        /// This is the source of truth a reassembly assertion compares against,
+        /// and it is a content hash rather than a count on purpose: a count
+        /// survives every corruption that matters.
+        source_digests: std::collections::BTreeMap<String, String>,
+        /// What the fixture's payload actually costs, summed from the bytes
+        /// this function wrote rather than from anything the store reports.
+        payload_bytes: u64,
+    }
+
+    #[cfg(unix)]
+    fn payload_fixture(label: &str, blobs: usize, hosted: &RepositoryId) -> PayloadFixture {
+        install_test_registry_override();
+        let working =
+            std::env::temp_dir().join(format!("kin-daemon-payload-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(working.join("payload")).unwrap();
+        run_test_git(&working, ["init", "--initial-branch=main"]);
+        run_test_git(&working, ["config", "user.email", "kin@example.invalid"]);
+        run_test_git(&working, ["config", "user.name", "Kin Payload Harness"]);
+
+        let mut source_digests = std::collections::BTreeMap::new();
+        let mut payload_bytes = 0_u64;
+        for index in 0..blobs {
+            let path = format!("payload/blob-{index:04}.bin");
+            let bytes = payload_blob_bytes(index as u64 + 1, PAYLOAD_BLOB_BYTES);
+            std::fs::write(working.join(&path), &bytes).unwrap();
+            let digest = hex::encode(Sha256::digest(&bytes));
+            payload_bytes += bytes.len() as u64;
+            source_digests.insert(path, digest);
+        }
+        // The generator is only distinct if it is distinct. Asserting it here
+        // rather than trusting the seed is what stops a later edit to
+        // `payload_blob_bytes` from silently turning this fixture into one
+        // blob deduplicated `blobs` times.
+        assert_eq!(
+            source_digests
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            blobs,
+            "every payload blob must be distinct, or the pack deduplicates them \
+             and this fixture measures deduplication rather than size"
+        );
+
+        run_test_git(&working, ["add", "--all"]);
+        run_test_git(
+            &working,
+            ["commit", "-s", "-m", "one commit carrying a real payload"],
+        );
+
+        let init = kin_core::init_from_git_adopting(&working, hosted)
+            .expect("a Git-admitted store may adopt a hosted repository identity");
+        assert_eq!(
+            kin_core::manifest::KinManifest::load(&init.layout.manifest_path())
+                .unwrap()
+                .repo_id,
+            hosted.as_str(),
+            "the fixture must carry the hosted identity, or the push it drives \
+             measures identity rather than payload"
+        );
+
+        PayloadFixture {
+            layout: init.layout,
+            working,
+            source_digests,
+            payload_bytes,
+        }
+    }
+
+    /// The fixture pair is a comparison, so its two arms have to differ in
+    /// exactly one property and that property has to be the one under test.
+    ///
+    /// This asserts the arithmetic before any push depends on it. Without it
+    /// the pair could drift into measuring something else entirely and both
+    /// arms would still refuse, still for a reason, and still look right.
+    #[cfg(unix)]
+    #[test]
+    fn the_payload_fixtures_straddle_the_transfer_cap_and_nothing_else() {
+        let cap = kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES;
+        let per_body = kin_remote::repository_transfer::MAX_TRANSFER_BODY_BYTES;
+        let max_bodies = kin_remote::repository_transfer::MAX_TRANSFER_BODIES;
+
+        let over = (PAYLOAD_BLOBS_OVER_CAP * PAYLOAD_BLOB_BYTES) as u64;
+        let under = (PAYLOAD_BLOBS_UNDER_CAP * PAYLOAD_BLOB_BYTES) as u64;
+
+        assert!(
+            over > cap,
+            "the over-cap arm must exceed the decoded closure cap: {over} vs {cap}"
+        );
+        assert!(
+            under < cap,
+            "the under-cap arm must fit under the decoded closure cap: {under} vs {cap}"
+        );
+        // The isolation half. An arm that crossed one of the OTHER caps would
+        // be refused for a reason this harness is not about, and its refusal
+        // would read exactly like the one it is about.
+        assert!(
+            (PAYLOAD_BLOB_BYTES as u64) < per_body,
+            "no single blob may cross the per-body cap: {PAYLOAD_BLOB_BYTES} vs {per_body}"
+        );
+        assert!(
+            PAYLOAD_BLOBS_OVER_CAP < max_bodies,
+            "the over-cap arm must stay clear of the body-count cap: \
+             {PAYLOAD_BLOBS_OVER_CAP} vs {max_bodies}"
+        );
+        assert!(
+            PAYLOAD_BLOBS_UNDER_CAP < PAYLOAD_BLOBS_OVER_CAP,
+            "the two arms must differ in blob count and nothing else"
+        );
+    }
+
+    /// The pre-fix pin, carrying a payload, on both sides of the transfer cap.
+    ///
+    /// `a_git_admitted_store_adopting_a_hosted_identity_meets_the_git_authority_bound`
+    /// already records the Git-authority bound with a two-line commit. This
+    /// records it with 24 MiB and with 4 MiB, which is the pair FIR-2746 needs,
+    /// and it asserts something that test cannot: that the refusal is the
+    /// AUTHORITY bound and not the SIZE one.
+    ///
+    /// That distinction is the whole point of writing this before a route
+    /// exists. Two independent bounds refuse a payload-bearing push today, and
+    /// a test asserting only "the push failed" would stay green through the fix
+    /// for bound one, because bound two would keep it failing. Pinning WHICH
+    /// bound answered is what makes this go red at the right moment, and going
+    /// red is what it is for: when Git-authority bootstrap lands, the under-cap
+    /// arm should publish and the over-cap arm should move to
+    /// `decoded body closure exceeds`, and both of those are this test failing.
+    ///
+    /// It also establishes the ORDER, which nothing had measured. `validate_pack`
+    /// enforces the byte cap on the destination's side of a pack that the
+    /// source only builds after `TransferSourceContext::read` has already
+    /// compared the two replicas' Git authority, so the authority bound is
+    /// reached first and the size bound is unobservable end to end until it
+    /// moves. The over-cap arm proves that by observing the authority refusal
+    /// while being, on its own arithmetic, half again too large to ever fit.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_payload_bearing_push_meets_the_authority_bound_before_the_size_cap() {
+        for (label, blobs) in [
+            ("over", PAYLOAD_BLOBS_OVER_CAP),
+            ("under", PAYLOAD_BLOBS_UNDER_CAP),
+        ] {
+            let hosted_id = hosted_repository_id();
+            let hosted_repository = RepositoryId::new(hosted_id.clone()).unwrap();
+            let (hosted_state, _hosted_working, _hosted_storage) = hosted_peer_state(&hosted_id);
+            let hosted_url = serve_replica(Arc::clone(&hosted_state)).await;
+
+            let fixture = payload_fixture(label, blobs, &hosted_repository);
+            let cap = kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES;
+            let over_cap = fixture.payload_bytes > cap;
+            assert_eq!(
+                over_cap,
+                label == "over",
+                "the {label} arm must sit on the side of the cap its name claims: \
+                 {} bytes against {cap}",
+                fixture.payload_bytes
+            );
+
+            let source_state =
+                Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
+            let request = kin_cli::commands::transfer::CommandTransferRequest {
+                remote_base_url: hosted_url,
+                remote_token: None,
+                repository_id: Some(hosted_id.clone()),
+                source_ref: None,
+                destination_ref: None,
+            };
+            let (status, body) =
+                transfer_command(Arc::clone(&source_state), "push", &request).await;
+            let message = String::from_utf8_lossy(&body).to_string();
+
+            assert_eq!(
+                status,
+                StatusCode::CONFLICT,
+                "the {label} arm must still be stopped by the Git-authority bound: {message}"
+            );
+            assert!(
+                message.contains("imported-Git authority"),
+                "the {label} arm must name the authority bound: {message}"
+            );
+            // The half that makes this a pin rather than a restatement. The
+            // size cap refuses with a different variant and a different
+            // sentence, and an over-cap push that started reporting THAT would
+            // mean bound one had moved.
+            assert!(
+                !message.contains("decoded body closure exceeds"),
+                "the {label} arm must not be reporting the size cap yet; if it is, \
+                 Git-authority bootstrap has landed and this pin has to be \
+                 rewritten rather than relaxed: {message}"
+            );
+            assert!(
+                !message.contains("does not match destination repository"),
+                "identity is not what stops a payload-bearing store: {message}"
+            );
+
+            // The reassembly assertion's own input, checked here rather than
+            // where it will be used. A digest map that went empty would make
+            // every future byte-verification vacuously true.
+            assert_eq!(
+                fixture.source_digests.len(),
+                blobs,
+                "the {label} arm must carry one source digest per blob"
+            );
+            std::fs::remove_dir_all(&fixture.working).ok();
+        }
+    }
+
     /// Two replicas of ONE repository: a real local one with a graph-owned
     /// workspace projecting into a working directory, and a peer that forked
     /// from it and has since moved `refs/heads/main` ahead by one exact edit.
