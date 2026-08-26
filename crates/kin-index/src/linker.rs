@@ -4616,6 +4616,13 @@ fn make_entity_import_relations(
                 resolved_path: Some(resolved_path.to_string()),
                 parser_rule: Some(IMPORT_SPECIFIER_BINDING_RULE.to_string()),
                 occurrence_count: 1,
+                // The import statement's own bytes, which is what makes this
+                // edge renameable. Without it a rename planner searches the
+                // SOURCE ENTITY's span, and this edge is sourced at the
+                // importing file's module entity whose span is the whole file,
+                // so it finds every mention of the name rather than the import
+                // site and refuses on a count it can never satisfy.
+                source_span: Some(import.site.to_source_span(&FilePathId::new(importer_file))),
                 ..RelationEvidence::default()
             }],
         });
