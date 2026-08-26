@@ -1317,6 +1317,68 @@ mod tests {
     /// `negative` or `_kin.verdict` certifying an answer whose rows were removed
     /// is the same defect arriving through the one path that removes answers on
     /// purpose.
+    /// A CERTIFIED verdict over a completeness that refuses is a contradiction,
+    /// and until now nothing looked for it.
+    ///
+    /// The five arms that existed all read one direction: a surface claiming
+    /// certification under an inconclusive verdict. None read the reverse, so an
+    /// envelope whose verdict certified while its own completeness reported
+    /// `status: unknown` or `bound: at_least` graded clean.
+    ///
+    /// This is the only shape that can falsify the arm. Deleting a detector
+    /// cannot make anything go red, because a detector's absence is silence, so
+    /// the proof has to give it something to detect and confirm it speaks. The
+    /// end-to-end suite cannot do it either: `disagreements` is reached from a
+    /// `debug_assert!`, which a release build compiles out.
+    #[test]
+    fn a_certified_verdict_over_a_refusing_completeness_is_a_disagreement() {
+        let mut response = agreeing_response();
+        // Everything else still agrees; only completeness refuses.
+        response["_kin"]["completeness"]["status"] = json!("unknown");
+        response["_kin"]["completeness"]["bound"] = json!("at_least");
+
+        let found = disagreements(&response);
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("bound reads at_least under a certified")),
+            "a certified verdict over an at_least bound must be reported: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("status reads unknown under a certified")),
+            "a certified verdict over an unknown status must be reported: {found:?}"
+        );
+    }
+
+    /// The same arm on the negative block, and the control beside it.
+    ///
+    /// The control is the half that matters: an untouched agreeing response must
+    /// report NOTHING. Without it this pair would pass just as happily if the
+    /// arm reported a disagreement on every response it was handed, which is a
+    /// detector that fires always and is no more useful than one that never
+    /// fires.
+    #[test]
+    fn a_certified_verdict_over_a_refusing_negative_is_a_disagreement() {
+        let mut response = agreeing_response();
+        response["negative"]["trust"] = json!("inconclusive");
+        response["negative"]["safe_to_conclude_absent"] = json!(true);
+
+        let found = disagreements(&response);
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("negative.trust refuses under a certified")),
+            "a certified verdict over a refusing negative must be reported: {found:?}"
+        );
+
+        assert!(
+            disagreements(&agreeing_response()).is_empty(),
+            "control: an agreeing response must report no disagreement at all"
+        );
+    }
+
     #[test]
     fn a_budget_cut_downgrades_the_verdict_and_the_absence_together() {
         let mut response = agreeing_response();
