@@ -997,6 +997,58 @@ mod tests {
             ));
         }
 
+        /// The readings array and the stamp's derivation agree on every name,
+        /// which neither side can prove on its own.
+        ///
+        /// kin#1123 asserts `edge_coverage_limits` picks up an input the
+        /// function was never told about, and it happens to use
+        /// `graph_freshness` as that unknown name, with the map built by hand.
+        /// The arms above assert `compute` puts `graph_freshness` into the map.
+        /// Both hardcode the string, so renaming the reading leaves both green
+        /// while the real behaviour breaks: the stamp would go on naming a key
+        /// nothing emits, and the emitted key would be one nothing names.
+        ///
+        /// So this asserts the join rather than either end. It reads the names
+        /// `compute` actually produced and requires the stamp to name each one
+        /// when that input refuses, which is a property over the real input set
+        /// and cannot be satisfied by a string written twice.
+        #[test]
+        fn every_input_compute_emits_is_one_the_stamp_can_name() {
+            let verdict = Verdict::compute(
+                "find_references",
+                &json!({ "references": [] }),
+                &with_clock(),
+                None,
+            )
+            .expect("the readings are not all silent");
+            let names: Vec<String> = verdict.inputs.keys().cloned().collect();
+            assert!(
+                names.iter().any(|name| name == "graph_freshness"),
+                "the seam must be in the stamp's input set at all: {names:?}"
+            );
+
+            for name in names {
+                if name == "edge_coverage" {
+                    continue;
+                }
+                let mut inputs = Map::new();
+                inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+                inputs.insert(name.clone(), json!(INCONCLUSIVE));
+                let refusing = Verdict {
+                    certified: false,
+                    safe_to_conclude_absent: false,
+                    limiting_factor: Some(format!("{name}: refusing")),
+                    inputs,
+                };
+                assert!(
+                    refusing
+                        .edge_coverage_limits()
+                        .contains(&format!("{name}:inconclusive")),
+                    "the stamp must name {name}, which compute emits, without being told about it"
+                );
+            }
+        }
+
         /// End to end: neither store may pick up a freshness clause, and the
         /// input is present in the stamp as `not_applicable` rather than absent,
         /// so the seam is visible to a reader and to the next reading added.
