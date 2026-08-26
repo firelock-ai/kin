@@ -7977,6 +7977,54 @@ mod tests {
         }
     }
 
+    /// FIR-2763's remaining acceptance: what the eager sibling pass costs on a
+    /// REAL populated registry, measured rather than argued.
+    ///
+    /// `#[ignore]` because it opens this host's own registry and loads whole
+    /// sibling workspace graphs. `KIN_SPINE_MEASURE_BOUNDS` names the bounds to
+    /// sweep, smallest first, so the curve can be stopped before the box is.
+    /// Each arm is a fresh `DaemonState`, because the capture happens once per
+    /// process and a second call would measure a `OnceLock` read.
+    ///
+    /// It reports the bound, the wall clock, and what the capture actually did,
+    /// so a row can be read against the work it describes rather than against
+    /// an assumption about how many siblings that bound reached.
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "measurement against this host's real registry, not a guard"]
+    fn measure_eager_sibling_capture_against_the_real_registry() {
+        let bounds = std::env::var("KIN_SPINE_MEASURE_BOUNDS")
+            .unwrap_or_else(|_| "0,1,2,4,8".to_string());
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+
+        eprintln!("FIR2763 MEASURE bound | seconds | captured/registered | bounded | incomplete");
+        for raw in bounds.split(',') {
+            let bound: usize = raw.trim().parse().expect("bounds must be integers");
+            // A fresh state per arm: `ensure_spine` publishes once, so reusing
+            // one would time a OnceLock read rather than a capture.
+            let mut state = test_state(primary_init.layout.clone(), primary_dir.path());
+            let registered = state.registered_local_repository_authorities.len();
+            state.eager_sibling_bound = bound;
+
+            let started = std::time::Instant::now();
+            let _ = state.ensure_spine();
+            let seconds = started.elapsed().as_secs_f64();
+
+            let report = state.sibling_capture_report();
+            eprintln!(
+                "FIR2763 MEASURE {bound:>5} | {seconds:>7.2} | {:>19} | {:>7} | {:>10}",
+                report
+                    .map(|r| format!("{}/{}", r.captured, r.registered))
+                    .unwrap_or_else(|| format!("-/{registered}")),
+                report.map(|r| r.bounded.to_string()).unwrap_or("-".into()),
+                report
+                    .map(|r| r.authority_incomplete.to_string())
+                    .unwrap_or("-".into()),
+            );
+        }
+    }
+
     /// FIR-2763's bound, and FIR-2772's scoping, from the BOUNDED side.
     ///
     /// A capture the configured bound stopped is not an incomplete authority. It
