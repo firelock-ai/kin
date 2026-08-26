@@ -17346,17 +17346,23 @@ mod tests {
                 fixture.payload_bytes
             );
 
-            // The destination's BEFORE, which is the half that makes the after
-            // a statement about the destination. Falsification caught this:
-            // pointed at the source, the after-only check still passed, because
+            let source_state =
+                Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
+
+            // The destination's BEFORE, which is the half that makes the after a
+            // statement about the destination. Falsification caught the
+            // after-only version: pointed at the source it still passed, because
             // a Git-admitted store names its own bodies from the moment it is
-            // created. Only an empty replica can name none and then name all.
-            // ONE binding for both readings, deliberately. Falsification pointed
-            // the after-reading at the source while the before-reading stayed on
-            // the peer, and the pair passed: before from an empty replica, after
-            // from a full one, no single replica described. Naming the observed
-            // replica once means a change of target moves both halves, so the
-            // before assertion below refuses it. The join, not the endpoints.
+            // created, so only an empty replica can name none and then name all.
+            //
+            // ONE binding for both readings, deliberately, and declared after
+            // the source so that swapping its target is a compiling mutation
+            // rather than an ordering error. Falsification caught that too: with
+            // only the after-reading retargeted, before came from an empty
+            // replica and after from a full one, and neither described a single
+            // replica. Two correct readings that jointly guarantee nothing,
+            // because the property lives in their agreement. The join, not the
+            // endpoints.
             let observed_replica = Arc::clone(&hosted_state);
             let before = repository_authority_snapshot(&observed_replica, &hosted_id)
                 .await
@@ -17372,8 +17378,6 @@ mod tests {
                  after-reading proves nothing about what crossed"
             );
 
-            let source_state =
-                Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
             let request = kin_cli::commands::transfer::CommandTransferRequest {
                 remote_base_url: hosted_url,
                 remote_token: None,
