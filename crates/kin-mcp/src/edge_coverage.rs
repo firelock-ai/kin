@@ -31,9 +31,18 @@
 //!   "cross_file_classes": ["calls", "imports"],
 //!   "reference_enrichment": "unknown",
 //!   "budget_exhausted": false,
-//!   "entities_examined": 3
+//!   "entities_examined": 3,
+//!   "limits": ["completeness:inconclusive"]
 //! }
 //! ```
+//!
+//! `limits` names the inputs that stop this block licensing a certification on
+//! its own, in the same vocabulary `_kin.completeness.limits` uses, and is
+//! absent when it licenses on its own. A block can report every requested class
+//! as present while the answer around it is not whole, and reading the classes
+//! without the limits is how one response comes to carry two verdicts. The list
+//! is stamped by the one verdict computation, which is the only place holding
+//! every input, so this block and the verdict cannot drift.
 //!
 //! `classes` is the load-bearing field: `present` means a cross-file edge of
 //! that class was observed for the focal's language, `absent` means the scan
@@ -625,8 +634,10 @@ fn deciding_classes_all_present(
 ///
 /// Scoped to the focal's language, which makes exactly the fields this reads
 /// exact: `parsed_call_sites` and `parsed_import_statements` are tallied off
-/// entities of that language, and `resolved_call_edges` / `resolved_import_edges`
-/// off their outgoing relations. The cross-file, intra-file and external split is
+/// entities of that language, `resolved_call_edges` off their outgoing
+/// relations, and `resolved_import_statements` off each file's coverage
+/// certificate, which is the only place a statement count exists. The
+/// cross-file, intra-file and external split is
 /// NOT read here, because classifying a target requires the target's own entity
 /// and a language-scoped list does not carry targets in other languages, which
 /// would report a cross-language edge as external.
@@ -689,7 +700,11 @@ fn attach_reference_resolution<S: EntityStore>(
         "resolved_call_edges": measured.resolved_call_edges,
         "call_percent": measured.call_percent(),
         "parsed_import_statements": measured.parsed_import_statements,
-        "resolved_import_edges": measured.resolved_import_edges,
+        // `null` when no file of this language carried a coverage certificate,
+        // which is the only place the resolved-statement count exists. An
+        // unmeasured resolution is not a zero, and the wire says so rather than
+        // publishing a number drawn from a different population.
+        "resolved_import_statements": measured.resolved_import_statements,
         "resolution": measured.resolution.label(),
     });
 }

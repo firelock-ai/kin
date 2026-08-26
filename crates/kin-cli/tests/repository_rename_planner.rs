@@ -818,3 +818,136 @@ fn real_linker_spanless_relations_are_exact_or_refused_across_eight_languages() 
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Import evidence has no source span, so the planner refuses. FIR-2690.
+//
+// `plan_rename` calls `require_repository_reference_coverage` at :184, ahead of
+// the grouping loop at :192, and that function refuses at :472 whenever a
+// reparse of the importing file names the target among its import specifiers.
+// `FileImport` carries no span (`kin-parser/src/extract.rs:318`), so the
+// evidence has nothing to offer and the guard fails closed rather than editing
+// a site it cannot locate.
+//
+// These pin the CURRENT refusal. Each is written to fail the day FIR-2690 lands
+// and the span exists, which is the signal to convert it to a positive
+// assertion rather than delete it. That is the same pattern the JavaScript
+// module-entity limitation uses in `entity_level_import_edges.rs`.
+//
+// They are not `#[ignore]`d on purpose: an ignored test is a test nobody runs.
+// ---------------------------------------------------------------------------
+
+const IMPORT_SPAN_REFUSAL: &str = "graph import evidence has no exact source span";
+
+/// The shape kin#1123's entity-level import edges produce: a module entity
+/// sourcing an `Imports` edge into a symbol another file defines.
+#[test]
+fn a_module_sourced_import_edge_still_refuses_for_want_of_a_span() {
+    let mut harness = PlannerHarness::new();
+    let importer_body = "from .parsing import parse_note\n\n\ndef build():\n    return parse_note(1)\n\n\ndef again():\n    return parse_note(2)\n";
+    let target_body = "def parse_note(x):\n    return x\n";
+    harness.add_file("app/parsing.py", target_body, ParseCompleteness::Full);
+    harness.add_file("app/main.py", importer_body, ParseCompleteness::Full);
+
+    let target = harness.add_entity_at(
+        "parse_note",
+        "app/parsing.py",
+        0,
+        target_body.len(),
+        0,
+        1,
+        LanguageId::Python,
+    );
+    // A Python module entity's span is the whole file, which is what
+    // `python.rs` emits for every Python source file.
+    let module = harness.add_entity_at(
+        "main",
+        "app/main.py",
+        0,
+        importer_body.len(),
+        0,
+        8,
+        LanguageId::Python,
+    );
+    harness
+        .graph
+        .upsert_relation(&Relation {
+            id: RelationId::new(),
+            kind: RelationKind::Imports,
+            src: GraphNodeId::Entity(module.id),
+            dst: GraphNodeId::Entity(target.id),
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: Some(".parsing".to_string()),
+            evidence: vec![RelationEvidence {
+                token: Some("parse_note".to_string()),
+                source_path: Some(".parsing".to_string()),
+                resolved_path: Some("app/parsing.py".to_string()),
+                parser_rule: Some("import_specifier_binding".to_string()),
+                occurrence_count: 1,
+                source_span: None,
+                ..RelationEvidence::default()
+            }],
+        })
+        .unwrap();
+
+    let err = harness
+        .plan("parse_note", "mask_code_spans", "app/parsing.py")
+        .expect_err(
+            "the planner must refuse while import evidence carries no span; if this now \
+             SUCCEEDS, FIR-2690 has landed and this test should assert the edits instead",
+        );
+    assert!(
+        err.to_string().contains(IMPORT_SPAN_REFUSAL),
+        "expected the FIR-2690 import-span refusal, got: {err}"
+    );
+}
+
+/// CONTROL, and the reason it exists is worth more than the assertion.
+///
+/// The same fixture with NO import edge in the graph at all refuses identically.
+/// That is what proves the refusal is a property of the planner meeting an
+/// imported symbol, and NOT of the entity-level import edges kin#1123 adds. A
+/// diagnosis attributing it to those edges was written and verified twice before
+/// this control was run.
+///
+/// Keep it. The day someone reads the refusal beside the new edges and blames
+/// them again, this test answers in one run.
+#[test]
+fn the_import_span_refusal_is_not_caused_by_entity_level_import_edges() {
+    let mut harness = PlannerHarness::new();
+    let importer_body = "from .parsing import parse_note\n\n\ndef build():\n    return parse_note(1)\n\n\ndef again():\n    return parse_note(2)\n";
+    let target_body = "def parse_note(x):\n    return x\n";
+    harness.add_file("app/parsing.py", target_body, ParseCompleteness::Full);
+    harness.add_file("app/main.py", importer_body, ParseCompleteness::Full);
+
+    harness.add_entity_at(
+        "parse_note",
+        "app/parsing.py",
+        0,
+        target_body.len(),
+        0,
+        1,
+        LanguageId::Python,
+    );
+    harness.add_entity_at(
+        "main",
+        "app/main.py",
+        0,
+        importer_body.len(),
+        0,
+        8,
+        LanguageId::Python,
+    );
+    // Deliberately no Imports relation of any kind.
+
+    let err = harness
+        .plan("parse_note", "mask_code_spans", "app/parsing.py")
+        .expect_err("the planner refuses an imported symbol with no import edge present");
+    assert!(
+        err.to_string().contains(IMPORT_SPAN_REFUSAL),
+        "the refusal must be the import-span one, proving it is independent of any import \
+         edge, got: {err}"
+    );
+}

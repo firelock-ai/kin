@@ -8570,6 +8570,15 @@ mod tests {
     /// a graph that links only its calls is honestly short of imports and
     /// references and cannot certify an absence, so a fixture standing for a
     /// linked graph links all three.
+    ///
+    /// The sentence is now false as a statement about the product, not only as
+    /// a reason for a fixture. The linker emits an entity-level `Imports` edge
+    /// from an importing file's module entity to each symbol its specifiers
+    /// name, so real graphs produce that shape: 9,162 of them on django, 504 on
+    /// fastapi. It stays quoted here because it is the record of how long an
+    /// assumption can hold once nothing produces the thing it denies, and
+    /// because the consumer that counted this class had been written against
+    /// it and was double-counting the day it filled.
     fn seed_cross_file_call_witness(store: &InMemoryGraph) {
         let caller = make_entity("witness_caller", "src/witness_caller.rs");
         let callee = make_entity("witness_callee", "src/witness_callee.rs");

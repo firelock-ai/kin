@@ -77,6 +77,20 @@ pub const CALL_SHAPE_EVIDENCE_INCOMPLETE_EXTRACTION_V1: &str =
 /// Ref-scoped review requires this positive evidence because old graph history
 /// has no way to distinguish a full parse from a recovered parse that omitted
 /// every relevant call.
+/// Marks the import half of a file's coverage certificate.
+///
+/// Carried as its own evidence entry beside the call-coverage one rather than as
+/// its own relation, because a per-file certificate is an artifact self-loop and
+/// `stable_relation_node_id` hashes `(src, dst, kind)`, so a sibling self-loop of
+/// the same kind would collide with it.
+///
+/// `occurrence_count` holds the import STATEMENTS the parser read, and `token`
+/// holds how many of them resolved to a file this repository holds, rendered as
+/// a decimal string. Both are in the `FileImport` unit, which is the unit
+/// `parsed_import_statements` counts in and the only unit in which the ratio
+/// means what its label says.
+pub const IMPORT_RESOLUTION_COVERAGE_V1: &str = "import_resolution_coverage_v1";
+
 pub const CALL_SHAPE_PARSE_COVERAGE_FULL_V1: &str = "call_shape_parse_coverage_full_v1";
 
 /// File-level marker that call-site coverage is incomplete or unknown.
@@ -1553,20 +1567,37 @@ fn merge_resolved(
             files = files.len()
         )
         .entered();
+        let module_entities = module_entity_by_file(files);
         let per_file_artifact: Vec<Vec<Relation>> = files
             .par_iter()
             .map(|file| {
-                file.imports
-                    .iter()
-                    .filter_map(|imp| {
-                        make_artifact_import_relation(
-                            &file.file_path,
-                            imp,
-                            &ctx.known_files,
-                            artifact_ids,
-                        )
-                    })
-                    .collect()
+                let mut out: Vec<Relation> = Vec::new();
+                for imp in &file.imports {
+                    // Resolved once, and the kind decided once, for both builders.
+                    let Some((target, kind)) =
+                        resolve_import_target(&file.file_path, imp, &ctx.known_files)
+                    else {
+                        continue;
+                    };
+                    if let Some(rel) = make_artifact_import_relation(
+                        &file.file_path,
+                        imp,
+                        &target,
+                        kind,
+                        artifact_ids,
+                    ) {
+                        out.push(rel);
+                    }
+                    out.extend(make_entity_import_relations(
+                        &file.file_path,
+                        imp,
+                        &target,
+                        kind,
+                        &|path| module_entities.get(path).copied(),
+                        &|path, name| ctx.entity_by_file_name.get(&(path, name)).copied(),
+                    ));
+                }
+                out
             })
             .collect();
         for file_relations in per_file_artifact {
@@ -1579,7 +1610,13 @@ fn merge_resolved(
         }
     }
 
-    append_parse_coverage_relations(&mut resolved, files, artifact_ids, completeness);
+    append_parse_coverage_relations(
+        &mut resolved,
+        files,
+        artifact_ids,
+        completeness,
+        &ctx.known_files,
+    );
 
     resolved
 }
@@ -1652,11 +1689,31 @@ fn merge_resolved_serial(
         }
     }
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let file_refs: Vec<&FileParseData> = files.iter().collect();
+    let module_entities = module_entity_by_file(&file_refs);
     for file in files {
         for imp in &file.imports {
+            let Some((target, kind)) =
+                resolve_import_target(&file.file_path, imp, &ctx.known_files)
+            else {
+                continue;
+            };
             if let Some(rel) =
-                make_artifact_import_relation(&file.file_path, imp, &ctx.known_files, artifact_ids)
+                make_artifact_import_relation(&file.file_path, imp, &target, kind, artifact_ids)
             {
+                let key = (rel.src, rel.dst, rel.kind);
+                if seen_artifact.insert(key) {
+                    resolved.push(rel);
+                }
+            }
+            for rel in make_entity_import_relations(
+                &file.file_path,
+                imp,
+                &target,
+                kind,
+                &|path| module_entities.get(path).copied(),
+                &|path, name| ctx.entity_by_file_name.get(&(path, name)).copied(),
+            ) {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
                     resolved.push(rel);
@@ -4327,20 +4384,32 @@ where
     })
 }
 
-fn make_artifact_import_relation<S>(
+/// Resolve an import specifier to the repository file it names.
+///
+/// Both edge builders below need this one answer, and `resolve_module_path`
+/// scans the whole `known_files` set and probes extensions and index files, so
+/// it is the most expensive step in the import path. Resolving once per import
+/// site rather than once per builder is why this exists as its own function.
+///
+/// `require('.')` from a file that IS its directory's index resolves back to
+/// the importer. A module does not import itself, and a self-loop would be
+/// counted as a resolved import by every surface that reads these edges, so
+/// that rule is applied here, once, for both builders.
+///
+/// It returns the relation kind alongside the path so the two edge builders
+/// cannot disagree about it. A C or C++ `#include` is an `Includes` edge, not
+/// an `Imports` one, and having each builder decide that for itself is how one
+/// site would come to carry two different kinds.
+fn resolve_import_target<S>(
     importer_file: &str,
     import: &FileImport,
     known_files: &HashSet<S>,
-    artifact_ids: &ArtifactIdentityMap,
-) -> Option<Relation>
+) -> Option<(String, RelationKind)>
 where
     S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
 {
-    let resolved_path = resolve_module_path(importer_file, &import.module_path, known_files)?;
-    // `require('.')` from a file that IS its directory's index resolves back to
-    // the importer. A module does not import itself, and a self-loop would be
-    // counted as a resolved import by every surface that reads these edges.
-    if resolved_path == importer_file {
+    let resolved = resolve_module_path(importer_file, &import.module_path, known_files)?;
+    if resolved == importer_file {
         return None;
     }
     let kind = if is_header_like_module_path(&import.module_path) {
@@ -4348,11 +4417,21 @@ where
     } else {
         RelationKind::Imports
     };
+    Some((resolved, kind))
+}
+
+fn make_artifact_import_relation(
+    importer_file: &str,
+    import: &FileImport,
+    resolved_path: &str,
+    kind: RelationKind,
+    artifact_ids: &ArtifactIdentityMap,
+) -> Option<Relation> {
     let src = GraphNodeId::Artifact(*artifact_ids.get(importer_file)?);
-    let dst = GraphNodeId::Artifact(*artifact_ids.get(&resolved_path)?);
+    let dst = GraphNodeId::Artifact(*artifact_ids.get(resolved_path)?);
     let evidence = RelationEvidence {
         source_path: Some(import.module_path.clone()),
-        resolved_path: Some(resolved_path.clone()),
+        resolved_path: Some(resolved_path.to_string()),
         parser_rule: Some(
             match kind {
                 RelationKind::Includes => "include_directive",
@@ -4376,6 +4455,178 @@ where
     })
 }
 
+/// How many of a file's import STATEMENTS resolved to a file this repository
+/// holds, and how many did not.
+///
+/// Returned as `(statements, resolved)`. The unit is the `FileImport`, one per
+/// import statement, which is exactly the unit `parsed_import_statements`
+/// counts in.
+///
+/// It has to be taken HERE, because it cannot be recovered downstream. Measured
+/// with the real adapter: `from storage import Store, open_db` is one
+/// `FileImport` with two specifiers, and the same two names on separate lines
+/// are two `FileImport`s with one each. Those two shapes produce byte-identical
+/// graph content, one artifact edge (the linker dedupes on `(src, dst, kind)`)
+/// and two entity edges (one per specifier), while differing here, 1 against 2.
+/// So no key derived from edges can tell them apart, and a collector counting
+/// edges against a denominator of statements reports a ratio between two
+/// different populations.
+///
+/// The unresolved remainder is also the honest external count for a language
+/// whose specifier syntax cannot settle externality on its own. A Python
+/// `import re` names a module outside the repository exactly when no file the
+/// repository holds answers to it, which is what `known_files` decides here,
+/// and which is strictly better evidence than the syntactic bare-specifier
+/// proxy JavaScript uses.
+fn import_resolution_counts<S>(
+    file_path: &str,
+    imports: &[FileImport],
+    known_files: &HashSet<S>,
+) -> ImportResolutionCounts
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let resolved = imports
+        .iter()
+        .filter(|import| resolve_import_target(file_path, import, known_files).is_some())
+        .count();
+    ImportResolutionCounts {
+        statements: imports.len(),
+        resolved,
+    }
+}
+
+/// A file's import statements and how many of them reached this repository.
+///
+/// `statements - resolved` is the count that names a module outside the
+/// repository, decided against `known_files` rather than by specifier syntax.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct ImportResolutionCounts {
+    statements: usize,
+    resolved: usize,
+}
+
+/// Index each file's module entity, the endpoint an entity-level import edge
+/// sources from.
+///
+/// A file carrying no module entity is absent from the map rather than mapped
+/// to something else, because there is no second-best answer: anchoring to
+/// another entity in the file is exactly the claim [`merge_resolved`]'s call
+/// site refuses to make.
+fn module_entity_by_file<'a>(files: &[&'a FileParseData]) -> HashMap<&'a str, EntityId> {
+    let mut out = HashMap::new();
+    for file in files {
+        if let Some(entity) = file
+            .entities
+            .iter()
+            .find(|entity| entity.kind == EntityKind::Module)
+        {
+            // First in parse order wins. The caller's file list is ordered, so
+            // a file that somehow carried two module entities still resolves
+            // the same way on every run.
+            out.entry(file.file_path.as_str()).or_insert(entity.id);
+        }
+    }
+    out
+}
+
+/// Entity-level import edges for the names an import actually binds.
+///
+/// [`make_artifact_import_relation`] answers "which file imports which file".
+/// It cannot answer "who imports this export", because the reference walk in
+/// the MCP layer skips any relation whose `src` is not an entity, so an
+/// artifact-rooted edge is invisible to `find_references` however exactly its
+/// specifier resolved. Every named specifier that resolves to an entity the
+/// target actually defines therefore gets a second edge here, from the
+/// importing file's MODULE entity to that entity.
+///
+/// The module entity is the importer's file surface, which is what owns a
+/// file-level dependency. It is deliberately not "the first entity in the
+/// file": anchoring there would claim one particular symbol owns the
+/// dependency, which is the shape [`merge_resolved`]'s call site refuses, and
+/// that refusal is right. This satisfies it rather than working around it.
+///
+/// An importer carrying no module entity yields nothing rather than falling
+/// back to some other entity. That is a real gap for JavaScript and TypeScript,
+/// whose adapters emit a module entity only for index files, and it is left
+/// visible as a gap rather than papered over with a guess.
+///
+/// The artifact edge is unaffected. Both are emitted, they carry different node
+/// ids so they cannot collide in the caller's dedup, and every consumer reading
+/// artifact import edges today keeps reading exactly what it read before.
+/// The two lookups are closures rather than maps because the batch linker and
+/// the incremental linker hold their indexes in different shapes. Passing the
+/// lookup instead of the container is what lets both paths run this one
+/// function, so an incrementally relinked file cannot quietly disagree with a
+/// fully relinked one.
+fn make_entity_import_relations(
+    importer_file: &str,
+    import: &FileImport,
+    resolved_path: &str,
+    kind: RelationKind,
+    module_of: &dyn Fn(&str) -> Option<EntityId>,
+    entity_of: &dyn Fn(&str, &str) -> Option<EntityId>,
+) -> Vec<Relation> {
+    let Some(src_id) = module_of(importer_file) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for spec in &import.specifiers {
+        // A default specifier binds the module object itself, which is what a
+        // CommonJS `require` produces. Its local name is the importer's choice
+        // and names no symbol in the target, so scoring it against the target's
+        // symbols would report a miss for an import that made no such claim.
+        // The entity it reaches is the target's own module entity.
+        let dst_id = if spec.is_default {
+            module_of(resolved_path)
+        } else {
+            // Bind the ORIGINAL name wherever the import renamed it, because
+            // that is the name the target defines. Binding the local alias
+            // would point the edge at a name no file declares.
+            let wanted = spec
+                .original_name
+                .as_deref()
+                .unwrap_or(spec.local_name.as_str());
+            entity_of(resolved_path, wanted)
+        };
+        let Some(dst_id) = dst_id else {
+            continue;
+        };
+        if dst_id == src_id {
+            continue;
+        }
+        let src = GraphNodeId::Entity(src_id);
+        let dst = GraphNodeId::Entity(dst_id);
+        out.push(Relation {
+            id: stable_relation_node_id(&src, &dst, &kind),
+            kind,
+            src,
+            dst,
+            // The specifier resolved to a file this repository holds and the
+            // name matched an entity that file declares. Both halves are exact,
+            // so this is as certain as the artifact edge beside it.
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: Some(import.module_path.clone()),
+            evidence: vec![RelationEvidence {
+                token: Some(spec.local_name.clone()),
+                source_path: Some(import.module_path.clone()),
+                resolved_path: Some(resolved_path.to_string()),
+                parser_rule: Some(IMPORT_SPECIFIER_BINDING_RULE.to_string()),
+                occurrence_count: 1,
+                ..RelationEvidence::default()
+            }],
+        });
+    }
+    out
+}
+
+/// Parser rule recorded on an entity-level import edge, so a consumer can tell
+/// one apart from the artifact edge that shares its import.
+const IMPORT_SPECIFIER_BINDING_RULE: &str = "import_specifier_binding";
+
 /// Build the graph-owned file-level call-coverage certificate used by
 /// ref-scoped review. Coverage state lives in relation evidence; history paths
 /// compare the complete relation payload and replace changed evidence.
@@ -4384,6 +4635,7 @@ fn make_parse_coverage_relation(
     artifact_id: ArtifactId,
     completeness: Option<&ParseCompleteness>,
     call_extraction_complete: bool,
+    imports: ImportResolutionCounts,
 ) -> Relation {
     let is_full = call_extraction_complete && matches!(completeness, Some(ParseCompleteness::Full));
     let (parser_rule, token) = if !call_extraction_complete {
@@ -4416,22 +4668,50 @@ fn make_parse_coverage_relation(
         origin: RelationOrigin::Parsed,
         created_in: None,
         import_source: None,
-        evidence: vec![RelationEvidence {
-            token: Some(token.to_string()),
-            source_path: Some(file_path.to_string()),
-            parser_rule: Some(parser_rule.to_string()),
-            occurrence_count: 1,
-            ..RelationEvidence::default()
-        }],
+        evidence: vec![
+            RelationEvidence {
+                token: Some(token.to_string()),
+                source_path: Some(file_path.to_string()),
+                parser_rule: Some(parser_rule.to_string()),
+                occurrence_count: 1,
+                ..RelationEvidence::default()
+            },
+            RelationEvidence {
+                token: Some(imports.resolved.to_string()),
+                source_path: Some(file_path.to_string()),
+                parser_rule: Some(IMPORT_RESOLUTION_COVERAGE_V1.to_string()),
+                occurrence_count: imports.statements as u32,
+                ..RelationEvidence::default()
+            },
+        ],
     }
 }
 
-fn append_parse_coverage_relations(
+/// Emit each file's coverage certificate.
+///
+/// Emitted only where the caller supplied a completeness map, which is where it
+/// has always been emitted.
+///
+/// Making it unconditional so the import half reached the three callers that
+/// link without completeness (`kin-cli` graph, `kin-daemon` api, `kin-index`
+/// pipeline) put a certificate on paths that never carried one, and 18 tests
+/// counting relations saw the extra edge. Those tests are right: adding a
+/// relation to every file on paths that had none is a change to the graph, not
+/// a change to a report.
+///
+/// So the gate stays, and a file with no certificate reports its import counts
+/// as UNMEASURED rather than as zero, exactly as the call side already does for
+/// a file whose extraction was incomplete. A bucket nobody measured is not a
+/// bucket that reads zero, and that rule is what keeps the absence honest.
+fn append_parse_coverage_relations<S>(
     resolved: &mut Vec<Relation>,
     files: &[&FileParseData],
     artifact_ids: &ArtifactIdentityMap,
     completeness: Option<&FileParseCompletenessMap>,
-) {
+    known_files: &HashSet<S>,
+) where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
     let Some(completeness) = completeness else {
         return;
     };
@@ -4450,6 +4730,7 @@ fn append_parse_coverage_relations(
                 artifact_id,
                 completeness.get(&file.file_path),
                 call_extraction_complete,
+                import_resolution_counts(&file.file_path, &file.imports, known_files),
             ));
         }
     }
@@ -6586,15 +6867,53 @@ fn merge_incremental_resolved(
         }
     }
 
-    // Step 4: Create artifact-level import/include edges from import declarations.
+    // Step 4: Create import/include edges from import declarations, at both the
+    // artifact level and the entity level.
+    //
+    // The entity-level lookups read the linker's own repository-wide indexes
+    // rather than the changed-file slice, because an incremental relink of one
+    // file still imports from files it did not touch. Building them from
+    // `files` would silently drop every edge whose target sat outside the
+    // change, and a partially relinked graph would disagree with a fully
+    // relinked one for as long as nobody rebuilt from scratch.
     let mut seen_artifact: HashSet<(GraphNodeId, GraphNodeId, RelationKind)> = HashSet::new();
+    let module_of = |path: &str| -> Option<EntityId> {
+        linker
+            .entities_by_file
+            .get(path)?
+            .iter()
+            .find(|(id, _)| linker.entity_kind_by_id.get(id) == Some(&EntityKind::Module))
+            .map(|(id, _)| *id)
+    };
+    let entity_of = |path: &str, name: &str| -> Option<EntityId> {
+        linker.entity_by_file_name.get(path)?.get(name).copied()
+    };
     for file in files {
         for imp in &file.imports {
+            let Some((target, kind)) =
+                resolve_import_target(&file.file_path, imp, &linker.known_files)
+            else {
+                continue;
+            };
             if let Some(rel) = make_artifact_import_relation(
                 &file.file_path,
                 imp,
-                &linker.known_files,
+                &target,
+                kind,
                 &linker.artifact_ids,
+            ) {
+                let key = (rel.src, rel.dst, rel.kind);
+                if seen_artifact.insert(key) {
+                    resolved.push(rel);
+                }
+            }
+            for rel in make_entity_import_relations(
+                &file.file_path,
+                imp,
+                &target,
+                kind,
+                &module_of,
+                &entity_of,
             ) {
                 let key = (rel.src, rel.dst, rel.kind);
                 if seen_artifact.insert(key) {
@@ -6610,6 +6929,7 @@ fn merge_incremental_resolved(
         &file_refs,
         &linker.artifact_ids,
         completeness,
+        &linker.known_files,
     );
 
     resolved
@@ -9185,6 +9505,159 @@ void f();
         );
         assert!(targets.contains(&GraphNodeId::Entity(foo_new.id)));
         assert!(targets.contains(&GraphNodeId::Entity(bar_new.id)));
+    }
+
+    /// The relation kind for an import site is decided once, by
+    /// `resolve_import_target`, and handed to both edge builders.
+    ///
+    /// This is a unit test rather than an end-to-end one on purpose. The C and
+    /// C++ adapters emit no module entity, so an entity-level edge cannot
+    /// currently be built for a header include at all, and an integration test
+    /// asserting "no Imports kind on a header fixture" passes whether the kind
+    /// is shared or hardcoded. It was written that way first and a mutant
+    /// survived it. This asserts the decision itself, which is the thing that
+    /// would otherwise drift the day those adapters do emit module entities.
+    #[test]
+    fn import_target_resolution_decides_includes_for_headers_and_imports_otherwise() {
+        let known: HashSet<&str> = ["src/helper.h", "app/routing.py", "src/main.c"]
+            .into_iter()
+            .collect();
+
+        let header = FileImport {
+            module_path: "helper.h".to_string(),
+            specifiers: vec![],
+        };
+        let (path, kind) = resolve_import_target("src/main.c", &header, &known)
+            .expect("a repo-local header resolves");
+        assert_eq!(path, "src/helper.h");
+        assert_eq!(
+            kind,
+            RelationKind::Includes,
+            "a header specifier must resolve to an Includes kind"
+        );
+
+        let module = FileImport {
+            module_path: "app.routing".to_string(),
+            specifiers: vec![],
+        };
+        let (path, kind) = resolve_import_target("app/main.py", &module, &known)
+            .expect("a repo-local python module resolves");
+        assert_eq!(path, "app/routing.py");
+        assert_eq!(
+            kind,
+            RelationKind::Imports,
+            "a non-header specifier must resolve to an Imports kind"
+        );
+    }
+
+    /// A specifier resolving back to its own file yields nothing, so the rule is
+    /// applied once for both builders rather than twice with a chance to differ.
+    #[test]
+    fn import_target_resolution_refuses_a_self_import() {
+        let known: HashSet<&str> = ["lib/index.js"].into_iter().collect();
+        let selfref = FileImport {
+            module_path: ".".to_string(),
+            specifiers: vec![],
+        };
+        assert!(
+            resolve_import_target("lib/index.js", &selfref, &known).is_none(),
+            "a module resolving to itself must produce no import target"
+        );
+    }
+
+    /// The two shapes that prove the unit, with the `FileImport` counts the real
+    /// adapter produces for them.
+    ///
+    /// These assert on the LINKER's own per-file count, before anything reaches
+    /// a collector, because the collector cannot distinguish them: both produce
+    /// one artifact edge and two entity edges.
+    #[test]
+    fn import_resolution_counts_statements_not_edges() {
+        let known: HashSet<&str> = ["app/main.py", "app/storage.py"].into_iter().collect();
+
+        // `from .storage import Store, open_db`: ONE statement, two specifiers.
+        let one_statement = vec![FileImport {
+            module_path: ".storage".to_string(),
+            specifiers: vec![
+                ImportedName {
+                    local_name: "Store".to_string(),
+                    original_name: None,
+                    is_default: false,
+                },
+                ImportedName {
+                    local_name: "open_db".to_string(),
+                    original_name: None,
+                    is_default: false,
+                },
+            ],
+        }];
+        assert_eq!(
+            import_resolution_counts("app/main.py", &one_statement, &known),
+            ImportResolutionCounts {
+                statements: 1,
+                resolved: 1
+            },
+            "one statement with two specifiers is one statement, resolved once"
+        );
+
+        // The same two names on separate lines: TWO statements.
+        let two_statements = vec![
+            FileImport {
+                module_path: ".storage".to_string(),
+                specifiers: vec![ImportedName {
+                    local_name: "Store".to_string(),
+                    original_name: None,
+                    is_default: false,
+                }],
+            },
+            FileImport {
+                module_path: ".storage".to_string(),
+                specifiers: vec![ImportedName {
+                    local_name: "open_db".to_string(),
+                    original_name: None,
+                    is_default: false,
+                }],
+            },
+        ];
+        assert_eq!(
+            import_resolution_counts("app/main.py", &two_statements, &known),
+            ImportResolutionCounts {
+                statements: 2,
+                resolved: 2
+            },
+            "two statements naming one module are two statements, both resolved"
+        );
+    }
+
+    /// A statement naming something the repository does not hold counts as a
+    /// statement and not as a resolution, which is the external count.
+    #[test]
+    fn import_resolution_counts_an_unresolved_statement_as_external() {
+        let known: HashSet<&str> = ["app/main.py", "app/storage.py"].into_iter().collect();
+        let mixed = vec![
+            FileImport {
+                module_path: "re".to_string(),
+                specifiers: vec![],
+            },
+            FileImport {
+                module_path: ".storage".to_string(),
+                specifiers: vec![],
+            },
+        ];
+        let ImportResolutionCounts {
+            statements,
+            resolved,
+        } = import_resolution_counts("app/main.py", &mixed, &known);
+        assert_eq!(statements, 2, "both lines are statements");
+        assert_eq!(
+            resolved, 1,
+            "the stdlib module resolves to no file this repository holds"
+        );
+        assert_eq!(
+            statements - resolved,
+            1,
+            "the unresolved remainder is the external count"
+        );
     }
 
     #[test]

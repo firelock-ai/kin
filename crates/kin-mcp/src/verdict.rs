@@ -234,6 +234,54 @@ impl Verdict {
     /// reader acts on, so they follow the one verdict; `status`, `classes`,
     /// `decided_by` and `limits` are the observation the verdict was computed
     /// from and stay exactly as measured.
+    /// The qualifiers that stop the `edge_coverage` block licensing a
+    /// certification on its own, named by the input that limits it.
+    ///
+    /// The block reports what a scan observed. It does not, and must not, report
+    /// whether the answer around it can be trusted as whole, and a reader with
+    /// only the block in hand cannot tell those apart: "every requested class is
+    /// present" and "this answer's completeness is unknown" are both true at
+    /// once, and the block renders only the first. A suite reading it alone
+    /// therefore graded it as certifying beside a completeness that refused, and
+    /// that is one response with two verdicts.
+    ///
+    /// This never re-derives another block's state. It reads the states this
+    /// verdict already computed, which is why it lives here: `compute` is the
+    /// one place holding every input, so the block's self-presentation and the
+    /// verdict cannot drift. An empty list means the block licenses on its own.
+    ///
+    /// The class states themselves are left alone. A class that is present IS
+    /// present, and reporting it otherwise to settle a disagreement would make a
+    /// true fact read false, which is the failure this envelope exists to stop.
+    /// The list is DERIVED from `self.inputs` rather than written out, because
+    /// "every input except `edge_coverage`" spelled as four names is only
+    /// correct until a fifth arrives. A name this function has never heard of
+    /// yields a shorter list, not an error, so the block would go on presenting
+    /// itself as licensing on its own while a reading nobody enumerated here
+    /// refused. That is the edge-class trap in its other form: the hazard is not
+    /// a consumer that counts a class, it is a producer that enumerates the
+    /// classes it knows.
+    ///
+    /// Sorted so the stamp is byte-stable. `Map` is a `BTreeMap` unless
+    /// serde_json's `preserve_order` is enabled, and a wire field's order should
+    /// not depend on a feature flag in a transitive dependency.
+    pub fn edge_coverage_limits(&self) -> Vec<String> {
+        if self.inputs.get("edge_coverage").and_then(Value::as_str) != Some(CERTIFIED) {
+            // The block already qualifies itself; nothing to add.
+            return Vec::new();
+        }
+        let mut limits: Vec<String> = self
+            .inputs
+            .iter()
+            .filter(|(name, state)| {
+                name.as_str() != "edge_coverage" && state.as_str() == Some(INCONCLUSIVE)
+            })
+            .map(|(name, _)| format!("{name}:inconclusive"))
+            .collect();
+        limits.sort();
+        limits
+    }
+
     pub fn project_onto_completeness(
         &self,
         completeness: &mut Option<crate::envelope::Completeness>,
@@ -709,6 +757,40 @@ pub fn disagreements(response: &Value) -> Vec<String> {
                      _kin.verdict"
                         .to_string(),
                 );
+            }
+        }
+    }
+
+    // The five arms above all read one direction: a surface claiming
+    // certification under an inconclusive verdict. Nothing read the other way,
+    // which is why a shipped envelope could carry a CERTIFIED verdict over a
+    // completeness that refused and still grade clean. A contradiction does not
+    // care which side is the optimistic one.
+    if certified {
+        if let Some(completeness) = response
+            .get(crate::envelope::ENVELOPE_KEY)
+            .and_then(|envelope| envelope.get("completeness"))
+        {
+            let bound = completeness.get("bound").and_then(Value::as_str);
+            if matches!(bound, Some("at_least")) {
+                found.push(
+                    "_kin.completeness.bound reads at_least under a certified _kin.verdict"
+                        .to_string(),
+                );
+            }
+            if completeness.get("status").and_then(Value::as_str) == Some("unknown") {
+                found.push(
+                    "_kin.completeness.status reads unknown under a certified _kin.verdict"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(negative) = response.get(crate::negative::NEGATIVE_KEY) {
+            if matches!(
+                negative.get("trust").and_then(Value::as_str),
+                Some("inconclusive") | Some("unreliable")
+            ) {
+                found.push("negative.trust refuses under a certified _kin.verdict".to_string());
             }
         }
     }
@@ -1245,6 +1327,139 @@ mod tests {
     /// `negative` or `_kin.verdict` certifying an answer whose rows were removed
     /// is the same defect arriving through the one path that removes answers on
     /// purpose.
+    /// An input this function never heard of still limits the stamp.
+    ///
+    /// The list used to be four names written out, which is "every input except
+    /// `edge_coverage`" in a five-input world and silently wrong in a six-input
+    /// one. A reading added later would not appear, and the failure is the
+    /// quiet kind: a missing name yields a SHORTER list, never an error, so the
+    /// block goes on presenting itself as licensing on its own beside an input
+    /// that refuses.
+    ///
+    /// This test is shaped like the mutation that catches it. The name is
+    /// deliberately one no code in this file mentions, so it cannot pass by
+    /// being enumerated somewhere; the hardcoded version fails it, and any
+    /// future hardcoded version will fail it too. The pair of assertions is the
+    /// point: an unknown input that REFUSES must appear, and an unknown input
+    /// that certifies must not, or a function returning every input it sees
+    /// would pass the first assertion alone.
+    #[test]
+    fn an_input_this_function_has_never_heard_of_still_limits_the_stamp() {
+        let build = |unknown_state: &str| {
+            let mut inputs = Map::new();
+            inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+            inputs.insert("completeness".to_string(), json!(CERTIFIED));
+            inputs.insert("graph_freshness".to_string(), json!(unknown_state));
+            Verdict {
+                certified: false,
+                safe_to_conclude_absent: false,
+                limiting_factor: Some("graph_freshness: the store is stale".to_string()),
+                inputs,
+            }
+        };
+
+        let limits = build(INCONCLUSIVE).edge_coverage_limits();
+        assert!(
+            limits.contains(&"graph_freshness:inconclusive".to_string()),
+            "an input added after this function was written must still limit the block: {limits:?}"
+        );
+
+        assert!(
+            build(CERTIFIED).edge_coverage_limits().is_empty(),
+            "an unknown input that certifies limits nothing, or the function is just \
+             listing its inputs"
+        );
+    }
+
+    /// `edge_coverage` never limits itself, whatever the derivation does.
+    ///
+    /// The old hardcoded list excluded it by not mentioning it. Deriving from
+    /// the map means the exclusion is now a filter clause, which is a line
+    /// someone can delete, so it gets an assertion rather than a comment.
+    #[test]
+    fn the_edge_coverage_input_is_never_one_of_its_own_limits() {
+        let mut inputs = Map::new();
+        inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+        inputs.insert("completeness".to_string(), json!(INCONCLUSIVE));
+        let verdict = Verdict {
+            certified: false,
+            safe_to_conclude_absent: false,
+            limiting_factor: Some("completeness: unknown".to_string()),
+            inputs,
+        };
+
+        let limits = verdict.edge_coverage_limits();
+        assert_eq!(limits, vec!["completeness:inconclusive".to_string()]);
+        assert!(
+            !limits
+                .iter()
+                .any(|limit| limit.starts_with("edge_coverage")),
+            "the block cannot cite itself as the reason it does not license: {limits:?}"
+        );
+    }
+
+    /// A CERTIFIED verdict over a completeness that refuses is a contradiction,
+    /// and until now nothing looked for it.
+    ///
+    /// The five arms that existed all read one direction: a surface claiming
+    /// certification under an inconclusive verdict. None read the reverse, so an
+    /// envelope whose verdict certified while its own completeness reported
+    /// `status: unknown` or `bound: at_least` graded clean.
+    ///
+    /// This is the only shape that can falsify the arm. Deleting a detector
+    /// cannot make anything go red, because a detector's absence is silence, so
+    /// the proof has to give it something to detect and confirm it speaks. The
+    /// end-to-end suite cannot do it either: `disagreements` is reached from a
+    /// `debug_assert!`, which a release build compiles out.
+    #[test]
+    fn a_certified_verdict_over_a_refusing_completeness_is_a_disagreement() {
+        let mut response = agreeing_response();
+        // Everything else still agrees; only completeness refuses.
+        response["_kin"]["completeness"]["status"] = json!("unknown");
+        response["_kin"]["completeness"]["bound"] = json!("at_least");
+
+        let found = disagreements(&response);
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("bound reads at_least under a certified")),
+            "a certified verdict over an at_least bound must be reported: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("status reads unknown under a certified")),
+            "a certified verdict over an unknown status must be reported: {found:?}"
+        );
+    }
+
+    /// The same arm on the negative block, and the control beside it.
+    ///
+    /// The control is the half that matters: an untouched agreeing response must
+    /// report NOTHING. Without it this pair would pass just as happily if the
+    /// arm reported a disagreement on every response it was handed, which is a
+    /// detector that fires always and is no more useful than one that never
+    /// fires.
+    #[test]
+    fn a_certified_verdict_over_a_refusing_negative_is_a_disagreement() {
+        let mut response = agreeing_response();
+        response["negative"]["trust"] = json!("inconclusive");
+        response["negative"]["safe_to_conclude_absent"] = json!(true);
+
+        let found = disagreements(&response);
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("negative.trust refuses under a certified")),
+            "a certified verdict over a refusing negative must be reported: {found:?}"
+        );
+
+        assert!(
+            disagreements(&agreeing_response()).is_empty(),
+            "control: an agreeing response must report no disagreement at all"
+        );
+    }
+
     #[test]
     fn a_budget_cut_downgrades_the_verdict_and_the_absence_together() {
         let mut response = agreeing_response();

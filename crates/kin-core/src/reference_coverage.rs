@@ -179,15 +179,6 @@ impl GraphRelationTotals {
 /// The same set `find_references` defaults to. Dead-code, coverage, and
 /// references must not each carry their own list: the four-entity contradiction
 /// FIR-2356 records is what two lists produce.
-/// The two artifact-level edge kinds an import statement can resolve to.
-///
-/// `Includes` is here because a C or C++ `#include` of a repo-local header
-/// resolves through the same import path and lands on the same artifact-level
-/// edge; counting only `Imports` would under-report those languages the same
-/// way `Imports` alone under-reported JavaScript.
-const ARTIFACT_IMPORT_RELATION_KINDS: [RelationKind; 2] =
-    [RelationKind::Imports, RelationKind::Includes];
-
 pub const REFERENCE_RELATION_KINDS: [RelationKind; 3] = [
     RelationKind::Calls,
     RelationKind::Imports,
@@ -277,7 +268,20 @@ pub struct LanguageReferenceCoverage {
     /// file and its import edge therefore joins two artifacts. Zero here still
     /// does not on its own decide `resolution`: an import can only resolve to a
     /// target the repository holds.
-    pub resolved_import_edges: u64,
+    /// Import STATEMENTS the linker resolved to a file this repository holds.
+    ///
+    /// Read from each file's coverage certificate, which is the only place the
+    /// number exists. It is deliberately NOT counted from edges: one resolved
+    /// import produces an artifact edge and, where the importer carries a module
+    /// entity, an entity edge beside it, so counting edges scores one import
+    /// twice and drives the ratio past its own denominator. Worse, the unit is
+    /// wrong in the other direction too, because `from storage import Store,
+    /// open_db` and the same two names on separate lines produce identical
+    /// edges while being one statement and two.
+    ///
+    /// `None` when no file of this language carried a certificate, which means
+    /// the resolved count is UNMEASURED rather than zero.
+    pub resolved_import_statements: Option<u64>,
     /// Of `parsed_import_statements`, how many name a module outside this
     /// repository, so no resolver could have produced an in-repo target.
     ///
@@ -337,7 +341,10 @@ impl LanguageReferenceCoverage {
     }
 
     pub fn import_percent(&self) -> Option<u32> {
-        percent(self.parsed_import_statements, self.resolved_import_edges)
+        percent(
+            self.parsed_import_statements,
+            self.resolved_import_statements?,
+        )
     }
 
     /// Whether an absence answered from this language's edges can be trusted.
@@ -676,19 +683,38 @@ fn language_summary(coverage: &LanguageReferenceCoverage) -> String {
         }
         _ => String::new(),
     };
-    let imports = match (coverage.parsed_import_statements, coverage.import_percent()) {
-        (Some(parsed), Some(percent)) => format!(
-            "imports {}/{parsed} ({percent}%){external}",
-            coverage.resolved_import_edges
-        ),
-        (Some(_), None) => format!(
-            "imports {} resolved, parse side counted no import statements",
-            coverage.resolved_import_edges
-        ),
-        (None, _) => format!(
-            "imports {} resolved, parse side unmeasured",
-            coverage.resolved_import_edges
-        ),
+    let imports = match (
+        coverage.parsed_import_statements,
+        coverage.resolved_import_statements,
+        coverage.import_percent(),
+    ) {
+        (Some(parsed), Some(resolved), Some(percent)) => {
+            format!("imports {resolved}/{parsed} ({percent}%){external}")
+        }
+        // A parse side that read no import statements has no denominator, so
+        // stating a fraction would be a ratio against nothing.
+        (Some(_), Some(resolved), None) => {
+            format!(
+                "imports {resolved} resolved, parse side counted no import statements{external}"
+            )
+        }
+        (None, Some(resolved), _) => {
+            format!("imports {resolved} resolved, parse side unmeasured{external}")
+        }
+        // No file of this language carried a coverage certificate, so how many
+        // of its imports resolved was never measured. Printing a count here
+        // would report an absence as a zero, which is the whole failure this
+        // surface exists to avoid.
+        //
+        // The external share still prints. It is measured on its own path, off
+        // specifier syntax for JavaScript and off the certificate elsewhere, so
+        // an unmeasured RESOLUTION says nothing about it. Dropping it here cost
+        // a JavaScript repository the one line that explains why its import
+        // ratio is low, which is the disclosure this surface exists for.
+        (Some(parsed), None, _) => {
+            format!("imports resolution unmeasured, parse side read {parsed} statements{external}")
+        }
+        (None, None, _) => format!("imports unmeasured{external}"),
     };
     format!(
         "{}: {} files, {calls}, {imports}, cross-file {}, intra-file {} [{}]",
@@ -710,7 +736,22 @@ struct LanguageTally {
     call_site_files: usize,
     import_statement_files: usize,
     resolved_call_edges: u64,
-    resolved_import_edges: u64,
+    /// Import STATEMENTS the linker resolved to a file this repository holds,
+    /// summed from each file's coverage certificate.
+    ///
+    /// The certificate is the only place this number exists. It cannot be
+    /// recovered from edges: `from storage import Store, open_db` and the same
+    /// two names on separate lines produce byte-identical graph content while
+    /// differing in statement count, so an edge-derived numerator states a ratio
+    /// against a denominator drawn from a different population.
+    certified_resolved_statements: u64,
+    /// Statements the certificates accounted for. Carried beside the parser's
+    /// own count so a disagreement between the two is visible rather than
+    /// absorbed into a ratio.
+    certified_statements: u64,
+    /// Files of this language whose certificate was found. Zero means the
+    /// resolved count is UNMEASURED for this language, not that it is zero.
+    certified_files: usize,
     external_module_imports: u64,
     external_module_import_files: usize,
     cross_file: u64,
@@ -807,10 +848,12 @@ where
                 continue;
             };
             let tally = tallies.entry(language.to_string()).or_default();
-            match relation.kind {
-                RelationKind::Calls => tally.resolved_call_edges += 1,
-                RelationKind::Imports => tally.resolved_import_edges += 1,
-                _ => {}
+            // Imports are deliberately absent here. One resolved import can
+            // produce an edge at BOTH levels, so counting them scores a single
+            // import twice, and the edge unit cannot express statements anyway.
+            // The count comes from each file's coverage certificate below.
+            if relation.kind == RelationKind::Calls {
+                tally.resolved_call_edges += 1;
             }
             match by_id.get(&dst).and_then(|(_, file)| file.as_ref()) {
                 Some(dst_file) => match src_file {
@@ -823,15 +866,17 @@ where
         }
     }
 
-    // An import of a module this repository owns joins two ARTIFACTS, not two
-    // entities, so nothing above can see it: the loop reads relations rooted at
-    // an entity, and then keeps only the ones whose endpoints are both
-    // entities. Every relative `require` and every resolved ESM specifier lands
-    // in that blind spot, which is how a JavaScript repository whose imports
-    // had all resolved still reported `imports 0/220 (0%)`. Ask the graph for
-    // them by artifact instead, attributed to the language of the file that
-    // wrote the import.
-    let mut counted_artifact_relations: HashSet<kin_model::RelationId> = HashSet::new();
+    // The artifact pass that used to sit here counted artifact-rooted import
+    // edges, because the entity walk above could not see them. Both are gone
+    // from the import count now: an edge count cannot express STATEMENTS, which
+    // is the unit the denominator is in, and once the entity pass began
+    // producing import edges the two passes scored the same import twice. The
+    // certificate below carries the number the linker actually knows.
+
+    // Read each file's coverage certificate for the counts only the linker could
+    // produce. The certificate is an artifact self-loop of kind `DependsOn`, so
+    // it is invisible to both passes above, which is exactly why it can carry a
+    // STATEMENT count without disturbing an EDGE count.
     for tally in tallies.values_mut() {
         let mut files: Vec<&String> = tally.files.iter().collect();
         files.sort();
@@ -843,18 +888,30 @@ where
                 continue;
             };
             let node = GraphNodeId::Artifact(artifact_id);
-            let neighborhood = store.traverse(&node, &ARTIFACT_IMPORT_RELATION_KINDS, 1)?;
+            let neighborhood = store.traverse(&node, &[RelationKind::DependsOn], 1)?;
             for relation in neighborhood.relations {
-                // `traverse` walks both directions, so an edge INTO this file
-                // shows up here too and belongs to the importer's language, not
-                // this one.
-                if relation.src != node
-                    || !ARTIFACT_IMPORT_RELATION_KINDS.contains(&relation.kind)
-                    || !counted_artifact_relations.insert(relation.id)
-                {
+                if relation.src != node {
                     continue;
                 }
-                tally.resolved_import_edges += 1;
+                for evidence in &relation.evidence {
+                    if evidence.parser_rule.as_deref()
+                        != Some(kin_index::IMPORT_RESOLUTION_COVERAGE_V1)
+                    {
+                        continue;
+                    }
+                    // A certificate whose resolved count cannot be read says
+                    // nothing; it does not say zero.
+                    let Some(resolved) = evidence
+                        .token
+                        .as_deref()
+                        .and_then(|raw| raw.parse::<u64>().ok())
+                    else {
+                        continue;
+                    };
+                    tally.certified_statements += u64::from(evidence.occurrence_count);
+                    tally.certified_resolved_statements += resolved;
+                    tally.certified_files += 1;
+                }
             }
         }
     }
@@ -879,9 +936,26 @@ where
                 call_sites_measured_files: tally.call_site_files,
                 parsed_import_statements,
                 resolved_call_edges: tally.resolved_call_edges,
-                resolved_import_edges: tally.resolved_import_edges,
-                external_module_imports: (tally.external_module_import_files > 0)
-                    .then_some(tally.external_module_imports),
+                resolved_import_statements: (tally.certified_files > 0)
+                    .then_some(tally.certified_resolved_statements),
+                // JavaScript and TypeScript settle externality from specifier
+                // syntax at parse time. Every other language cannot, so its
+                // external count comes from the certificate instead: a statement
+                // that reached no file this repository holds names something
+                // outside it, which is strictly better evidence than a
+                // syntactic bare-specifier proxy. Absent when neither source
+                // measured it, so a reader sees unmeasured rather than zero.
+                external_module_imports: if tally.external_module_import_files > 0 {
+                    Some(tally.external_module_imports)
+                } else if tally.certified_files > 0 {
+                    Some(
+                        tally
+                            .certified_statements
+                            .saturating_sub(tally.certified_resolved_statements),
+                    )
+                } else {
+                    None
+                },
                 cross_file_reference_edges: tally.cross_file,
                 intra_file_reference_edges: tally.intra_file,
                 external_reference_edges: tally.external,
@@ -1224,6 +1298,7 @@ mod tests {
         Visibility,
     };
     use kin_model::ids::{FilePathId, Hash256, RelationId};
+    use kin_model::relation::RelationEvidence;
     use kin_model::relation::{Relation, RelationOrigin};
 
     fn entity(name: &str, file: &str, calls: Option<u64>, imports: Option<u64>) -> Entity {
@@ -1311,6 +1386,40 @@ mod tests {
         entity
     }
 
+    /// A file's coverage certificate, in the shape the linker emits.
+    ///
+    /// An artifact self-loop of kind `DependsOn` whose evidence carries the
+    /// import counts: `occurrence_count` the statements the parser read, `token`
+    /// how many of them resolved to a file this repository holds. This is the
+    /// only channel those numbers travel on, because they cannot be recovered
+    /// from edges, so a fixture that omits it is a fixture where import
+    /// resolution is genuinely unmeasured.
+    fn import_certificate(
+        artifact_id: kin_model::ArtifactId,
+        path: &str,
+        statements: u32,
+        resolved: u64,
+    ) -> Relation {
+        let node = GraphNodeId::Artifact(artifact_id);
+        Relation {
+            id: RelationId::new(),
+            kind: RelationKind::DependsOn,
+            src: node,
+            dst: node,
+            confidence: 1.0,
+            origin: RelationOrigin::Parsed,
+            created_in: None,
+            import_source: None,
+            evidence: vec![RelationEvidence {
+                token: Some(resolved.to_string()),
+                source_path: Some(path.to_string()),
+                parser_rule: Some(kin_index::IMPORT_RESOLUTION_COVERAGE_V1.to_string()),
+                occurrence_count: statements,
+                ..RelationEvidence::default()
+            }],
+        }
+    }
+
     fn artifact_import(src: kin_model::ArtifactId, dst: kin_model::ArtifactId) -> Relation {
         Relation {
             id: RelationId::new(),
@@ -1330,7 +1439,7 @@ mod tests {
     /// reported `imports 0/220 (0%)` for a repository whose relative specifiers
     /// had all resolved, and a reader took that for a broken graph.
     #[test]
-    fn a_resolved_module_import_counts_even_though_it_joins_two_artifacts() {
+    fn an_artifact_import_edge_is_not_a_resolved_statement_count() {
         let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
         graph
             .upsert_entity(&js_entity("createApplication", "lib/express.js", 3, 3))
@@ -1351,11 +1460,24 @@ mod tests {
 
         assert_eq!(js.parsed_import_statements, Some(4));
         assert_eq!(
-            js.resolved_import_edges, 1,
-            "the artifact-level import edge is the resolution, and must be counted"
+            js.resolved_import_statements, None,
+            "this graph holds an artifact import edge and no coverage certificate. \
+             An edge is not a statement count: one statement naming two symbols and \
+             two statements naming one each produce byte-identical graph content, so \
+             deriving the numerator from edges states a ratio against a denominator \
+             drawn from a different population. Unmeasured is the honest reading"
         );
-        assert_eq!(js.import_percent(), Some(25));
-        assert_eq!(js.external_module_imports, Some(3));
+        assert_eq!(
+            js.import_percent(),
+            None,
+            "and no percentage can be stated without a numerator"
+        );
+        assert_eq!(
+            js.external_module_imports,
+            Some(3),
+            "the external share is measured off specifier syntax, so it survives an \
+             unmeasured resolution"
+        );
     }
 
     /// The importing file's language owns the edge. `traverse` walks both
@@ -1386,15 +1508,175 @@ mod tests {
             .iter()
             .find(|row| row.language == LanguageId::Python.to_string())
             .expect("python row");
-        assert_eq!(js.resolved_import_edges, 1);
         assert_eq!(
-            python.resolved_import_edges, 0,
-            "the imported file did not write the import statement"
+            js.parsed_import_statements,
+            Some(1),
+            "the importing file's language owns the statement"
+        );
+        assert_eq!(
+            python.parsed_import_statements,
+            Some(0),
+            "and `traverse` walks both directions from a node, so the edge INTO \
+             helper.py must not credit Python with app.js's import statement"
+        );
+        assert_eq!(js.resolved_import_statements, None);
+        assert_eq!(
+            python.resolved_import_statements, None,
+            "neither language carried a coverage certificate, so how many of their \
+             imports resolved was never measured on this path"
         );
     }
 
     /// The rendered line names the external share, so a low ratio reads as a
     /// repository with more dependencies than modules rather than as a defect.
+    /// The rendered line names the external share, so a low ratio reads as a
+    /// repository with more dependencies than modules rather than as a defect.
+    /// The four-file Python project the v0.5.52 stranger wrote, at the numbers
+    /// this lane measured on it, rendering the line it should always have.
+    ///
+    /// Kin reported `imports 1/10 (10%)` on that project with no external
+    /// clause, and it was handed to this lane as evidence that Python import
+    /// resolution was broken. It was not. An independent count with CPython's
+    /// own `ast` module found 9 statements, 4 naming a module in the repository
+    /// and 5 naming `re`, `typing`, `json`, `pathlib` and `pytest`. The linker
+    /// resolves all 4.
+    ///
+    /// What was broken was the reporting: `specifier_syntax_settles_externality`
+    /// is true only for JavaScript and TypeScript, so a Python row printed no
+    /// external clause and its ratio read as a 90 percent failure against a
+    /// denominator nine tenths of which could never have resolved.
+    #[test]
+    fn the_four_file_python_project_line_discloses_its_external_imports() {
+        let (graph, ids) = graph_with_artifacts(&["notekeeper/parsing.py"]);
+        // 9 statements read across the project, 4 of them resolving in-repo.
+        graph
+            .upsert_entity(&entity(
+                "parsing",
+                "notekeeper/parsing.py",
+                Some(0),
+                Some(9),
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&import_certificate(ids[0], "notekeeper/parsing.py", 9, 4))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let line = coverage
+            .summary_lines()
+            .into_iter()
+            .find(|line| line.contains("python:"))
+            .expect("python row is rendered");
+
+        assert!(
+            line.contains("imports 4/9 (44%), 5 name a module outside this repository"),
+            "the python line must read its resolved statements against its parsed ones AND \
+             disclose the external count; got: {line}"
+        );
+    }
+
+    /// The certificate's statement count and the parser's must agree, because
+    /// they are two independent counts of one population.
+    ///
+    /// The parser stamps `parsed_import_statements` per file at extraction; the
+    /// linker counts the same `FileImport`s again when it writes the
+    /// certificate. Computing both and comparing neither would leave a
+    /// disagreement invisible, and a disagreement is the tell that the two are
+    /// counting different populations, which is the failure this change exists
+    /// to remove.
+    ///
+    /// They can legitimately differ when only SOME files of a language carry a
+    /// certificate, because three link paths supply no completeness map and emit
+    /// none. That partition gap is FIR-2686. This fixture gives every file a
+    /// certificate, so the two counts must match exactly.
+    #[test]
+    fn the_certificate_and_the_parser_count_the_same_statements() {
+        let (graph, ids) = graph_with_artifacts(&["app/main.py", "app/storage.py"]);
+        graph
+            .upsert_entity(&entity("main", "app/main.py", Some(0), Some(3)))
+            .unwrap();
+        graph
+            .upsert_entity(&entity("Store", "app/storage.py", Some(0), Some(0)))
+            .unwrap();
+        graph
+            .upsert_relation(&import_certificate(ids[0], "app/main.py", 3, 1))
+            .unwrap();
+        graph
+            .upsert_relation(&import_certificate(ids[1], "app/storage.py", 0, 0))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let python = coverage
+            .languages
+            .iter()
+            .find(|row| row.language == LanguageId::Python.to_string())
+            .expect("python row");
+
+        let parsed = python
+            .parsed_import_statements
+            .expect("the parser counted statements");
+        let resolved = python
+            .resolved_import_statements
+            .expect("every file carried a certificate");
+        let external = python
+            .external_module_imports
+            .expect("the certificate settles externality here");
+
+        assert_eq!(
+            resolved + external,
+            parsed,
+            "resolved plus external must partition the parsed statements exactly"
+        );
+    }
+
+    /// Python's external count comes from the certificate, not from specifier
+    /// syntax, and the line says so.
+    ///
+    /// `specifier_syntax_settles_externality` is true only for JavaScript and
+    /// TypeScript, because a Python `import re` could name a local `re.py`. So
+    /// Python printed no external clause at all, and `imports 1/10` read as a 90
+    /// percent failure when nine of the ten were stdlib and could never have
+    /// resolved. The linker knows the answer, because `known_files` decides it,
+    /// and the certificate carries it here.
+    #[test]
+    fn a_python_row_reports_its_external_imports_from_the_certificate() {
+        let (graph, ids) = graph_with_artifacts(&["app/main.py", "app/storage.py"]);
+        graph
+            .upsert_entity(&entity("main", "app/main.py", Some(0), Some(3)))
+            .unwrap();
+        graph
+            .upsert_entity(&entity("Store", "app/storage.py", Some(0), Some(0)))
+            .unwrap();
+        // Three statements read, one reached a file this repository holds. The
+        // other two are `re` and `typing`.
+        graph
+            .upsert_relation(&import_certificate(ids[0], "app/main.py", 3, 1))
+            .unwrap();
+
+        let coverage = collect_reference_edge_coverage(&graph).unwrap();
+        let python = coverage
+            .languages
+            .iter()
+            .find(|row| row.language == LanguageId::Python.to_string())
+            .expect("python row");
+        assert_eq!(python.resolved_import_statements, Some(1));
+        assert_eq!(
+            python.external_module_imports,
+            Some(2),
+            "two statements named a module outside the repository"
+        );
+
+        let line = coverage
+            .summary_lines()
+            .into_iter()
+            .find(|line| line.contains("python:"))
+            .expect("python row is rendered");
+        assert!(
+            line.contains("name a module outside this repository"),
+            "a python line must disclose its external imports, got: {line}"
+        );
+    }
+
     #[test]
     fn the_summary_line_discloses_imports_that_name_a_module_outside_the_repository() {
         let (graph, ids) = graph_with_artifacts(&["index.js", "lib/express.js"]);
@@ -1415,8 +1697,12 @@ mod tests {
             .find(|line| line.contains("javascript:"))
             .expect("javascript row is rendered");
         assert!(
-            line.contains("imports 1/4 (25%), 3 name a module outside this repository"),
-            "{line}"
+            line.contains(
+                "imports resolution unmeasured, parse side read 4 statements, \
+                 3 name a module outside this repository"
+            ),
+            "the external share is what this line exists to disclose, and an \
+             unmeasured resolution must not take it down with it: {line}"
         );
     }
 
@@ -1541,7 +1827,10 @@ mod tests {
 
         assert_eq!(python.files, 2);
         assert_eq!(python.parsed_import_statements, Some(3));
-        assert_eq!(python.resolved_import_edges, 0);
+        assert_eq!(
+            python.resolved_import_statements, None,
+            "unmeasured rather than zero: this graph carries no coverage certificate"
+        );
         assert_eq!(python.cross_file_reference_edges, 0);
         assert_eq!(python.intra_file_reference_edges, 1);
         assert!(!coverage.absence_is_supportable());
@@ -1616,7 +1905,7 @@ mod tests {
                 call_sites_measured_files: 12,
                 parsed_import_statements: Some(16),
                 resolved_call_edges: 16,
-                resolved_import_edges: 0,
+                resolved_import_statements: Some(0),
                 external_module_imports: None,
                 cross_file_reference_edges: 0,
                 intra_file_reference_edges: 16,
@@ -1731,7 +2020,7 @@ mod tests {
             call_sites_measured_files: 2,
             parsed_import_statements: Some(2),
             resolved_call_edges: 4,
-            resolved_import_edges: 2,
+            resolved_import_statements: Some(2),
             external_module_imports: None,
             cross_file_reference_edges: 2,
             intra_file_reference_edges: 2,
@@ -1771,7 +2060,7 @@ mod tests {
         row.parsed_call_sites = Some(10);
         row.resolved_call_edges = 3;
         row.parsed_import_statements = Some(8);
-        row.resolved_import_edges = 2;
+        row.resolved_import_statements = Some(2);
         let coverage = ReferenceEdgeCoverage {
             parse: None,
             languages: vec![row],
