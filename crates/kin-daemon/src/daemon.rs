@@ -5341,6 +5341,35 @@ pub async fn run_with_authority_on(
                             .store(tally.blocked() as u64, std::sync::atomic::Ordering::SeqCst);
                         let unaccounted = tally.unaccounted(total_files);
                         let not_visited = tally.not_visited(total_files);
+
+                        // The sweep's own zero-loss verdict, written where a
+                        // later process can read it. A pass that published
+                        // everything it offered with nothing left stale retires
+                        // the record; anything else writes it, because a
+                        // shortfall that reaches only a log line reaches nobody.
+                        //
+                        // Recorded here rather than inside the per-batch write:
+                        // the claim is about the sweep, and a per-batch record
+                        // under last-writer-wins would report whatever the final
+                        // batch happened to do.
+                        if total_relations.lost() > 0 || total_relations.vector_stale > 0 {
+                            warn!(
+                                offered = total_relations.offered,
+                                published = total_relations.published,
+                                lost = total_relations.lost(),
+                                vector_stale = total_relations.vector_stale,
+                                "this sweep did not publish everything it offered"
+                            );
+                            kin_daemon_spawn::RefusedEnrichment::record(
+                                lsp_state.layout.root(),
+                                total_relations.lost() as u32,
+                                total_relations.offered as u32,
+                                total_relations.vector_stale as u32,
+                            );
+                        } else {
+                            kin_daemon_spawn::RefusedEnrichment::clear(lsp_state.layout.root());
+                        }
+
                         info!(
                             files = tally.files_processed(),
                             total_files,

@@ -359,6 +359,15 @@ pub struct Degraded {
     /// retires, so it clears itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation_census_loss: Option<bool>,
+    /// This store's last language-server enrichment sweep offered relations the
+    /// graph does not hold, or published some without invalidating their
+    /// endpoints' embeddings. Either way a producer that was supposed to fill
+    /// cross-file relations did not finish the job, so an absence measured here
+    /// may be a gap nothing is working on rather than a gap that is not there.
+    /// Set from the record the sweep writes and the next clean sweep retires,
+    /// so it clears itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enrichment_shortfall: Option<bool>,
 }
 
 impl Degraded {
@@ -374,6 +383,7 @@ impl Degraded {
             self.sweep_suspended,
             self.memory_pressure,
             self.relation_census_loss,
+            self.enrichment_shortfall,
         ]
         .into_iter()
         .any(|flag| flag == Some(true))
@@ -410,6 +420,9 @@ impl Degraded {
         }
         if self.relation_census_loss == Some(true) {
             labels.push("relation_census_loss");
+        }
+        if self.enrichment_shortfall == Some(true) {
+            labels.push("enrichment_shortfall");
         }
         labels
     }
@@ -1700,6 +1713,28 @@ impl Envelope {
     ) -> Self {
         if hold.is_some() {
             self.degraded.relation_census_loss = Some(true);
+        }
+        self
+    }
+
+    /// Stamp that this store's last enrichment sweep did not publish everything
+    /// it offered.
+    ///
+    /// A flag rather than prose for the reason the two above are: the caller
+    /// acting on it is an agent deciding whether an absence it just measured is
+    /// authoritative, and a missing cross-file relation on a store whose sweep
+    /// fell short is a gap nothing is working on, which is a different answer
+    /// from a gap a running sweep is about to fill.
+    ///
+    /// Absent rather than `false` when the last sweep came out clean, because
+    /// `None` says this envelope makes no claim and a fabricated `false` would
+    /// say the store was checked and found whole on a call that never looked.
+    pub fn with_enrichment_shortfall(
+        mut self,
+        shortfall: Option<&kin_daemon_spawn::RefusedEnrichment>,
+    ) -> Self {
+        if shortfall.is_some() {
+            self.degraded.enrichment_shortfall = Some(true);
         }
         self
     }
@@ -3458,6 +3493,47 @@ mod tests {
     /// than the prose. A closed circuit must claim nothing at all, because a
     /// fabricated `false` says this store was checked and found sweeping on a
     /// call that never looked.
+    /// A store whose last enrichment sweep fell short is flagged, and a store
+    /// whose sweep came out clean makes no claim at all.
+    ///
+    /// The absent case is the half that matters. `None` says this envelope did
+    /// not look; a fabricated `false` would say it looked and found the graph
+    /// whole, which is a claim no call that never read the record can make.
+    #[test]
+    fn an_enrichment_shortfall_is_flagged_and_labelled_and_absent_when_clean() {
+        let clean = Envelope::daemon().with_enrichment_shortfall(None);
+        assert_eq!(
+            clean.degraded.enrichment_shortfall, None,
+            "a sweep that lost nothing must leave this absent, never false"
+        );
+        assert!(!clean
+            .degraded
+            .active_labels()
+            .contains(&"enrichment_shortfall"));
+        assert!(!clean.degraded.any());
+
+        let record = kin_daemon_spawn::RefusedEnrichment {
+            lost: 12,
+            offered: 600,
+            vector_stale: 0,
+            at_unix: 0,
+        };
+        let short = Envelope::daemon().with_enrichment_shortfall(Some(&record));
+        assert_eq!(short.degraded.enrichment_shortfall, Some(true));
+        assert!(
+            short
+                .degraded
+                .active_labels()
+                .contains(&"enrichment_shortfall"),
+            "a flag that is set and not listed is a degradation nothing can observe: {:?}",
+            short.degraded.active_labels()
+        );
+        assert!(
+            short.degraded.any(),
+            "any() enumerates its fields by hand, so a new flag missing from it reports healthy"
+        );
+    }
+
     #[test]
     fn a_suspended_sweep_is_stamped_and_a_running_one_claims_nothing() {
         let running = Envelope::daemon().with_suspended_sweep(None);

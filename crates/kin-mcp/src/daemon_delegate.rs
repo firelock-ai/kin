@@ -594,6 +594,16 @@ pub(crate) fn relation_census_hold() -> Option<kin_core::relation_census::Census
     kin_core::relation_census::CensusHold::read(&discover_kin_dir()?)
 }
 
+/// What this store's last enrichment sweep could not publish.
+///
+/// Read fresh on every call for the reason the others are: the record is
+/// retired by the next sweep that comes out clean, and a server that cached it
+/// would keep telling agents the graph was short of edges after a later pass
+/// had filled them.
+pub(crate) fn enrichment_shortfall() -> Option<kin_daemon_spawn::RefusedEnrichment> {
+    kin_daemon_spawn::RefusedEnrichment::read(&discover_kin_dir()?)
+}
+
 /// The recorded cause and a remediation the caller can perform, ready to append
 /// to an error about a daemon that stopped answering.
 ///
