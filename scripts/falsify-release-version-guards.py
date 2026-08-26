@@ -40,7 +40,9 @@ INTENT = "scripts/release-intent.mjs"
 INTENT_SUITE = "scripts/release-intent.test.mjs"
 VERSION = "scripts/check-release-version.mjs"
 VERSION_SUITE = "scripts/check-release-version.test.mjs"
-COPIED = (INTENT, INTENT_SUITE, VERSION, VERSION_SUITE)
+PREPARE = "scripts/prepare-release.mjs"
+PREPARE_SUITE = "scripts/prepare-release.test.mjs"
+COPIED = (INTENT, INTENT_SUITE, VERSION, VERSION_SUITE, PREPARE, PREPARE_SUITE)
 
 
 class FalsificationError(RuntimeError):
@@ -222,6 +224,21 @@ PROBES: tuple[tuple[str, str, str, Callable[[Path], None]], ...] = (
             VERSION,
             "export function classifyPath(path) {",
             "export function classifyPath(path) {\n  if (path) return 'release';",
+        ),
+    ),
+    (
+        "the release generator's entry point goes back to unresolved paths",
+        PREPARE_SUITE,
+        "the generator runs from a copy reached through a symlinked directory",
+        lambda tree: poison(
+            tree,
+            PREPARE,
+            "  try {\n"
+            "    return realpathSync(entry) === realpathSync(self);\n"
+            "  } catch {\n"
+            "    return true;\n"
+            "  }",
+            "  return false;",
         ),
     ),
 )

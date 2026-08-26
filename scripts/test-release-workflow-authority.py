@@ -961,6 +961,54 @@ def workflow_active_header_source(workflow: str) -> str:
     return classifier_active_job_source(workflow.split(marker, 1)[0])
 
 
+# Block comment delimiters, longest opener first so `<!--` is tried before any
+# prefix of it could match.
+BLOCK_COMMENTS = (("<!--", "-->"), ("<#", "#>"), ("/*", "*/"))
+
+
+def strip_block_comments(lines: list[str]) -> list[str]:
+    """Drop block comments written as block comments, and nothing else.
+
+    A block comment is recognized only where one is actually written: the
+    opener begins a line, and the closer ends that line or a later one.
+
+    This used to be three DOTALL regexes over the whole text, which cannot tell
+    a comment from a pair of shell globs. In ci.yml the `docs/*)` pattern in a
+    `case` arm opened one and `hashFiles('**/Cargo.lock')` closed it, and 46,138
+    characters, 48% of the file, vanished from every assertion built on the
+    result; release-train.yml lost 24% the same way. No workflow contains a real
+    block comment at all, so that stripping has only ever produced silent false
+    negatives, and an assertion that cannot see the line it names passes exactly
+    like one that checked it.
+    """
+
+    kept: list[str] = []
+    closer: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        if closer is not None:
+            if stripped.endswith(closer):
+                closer = None
+            continue
+        consumed = False
+        for opener, end in BLOCK_COMMENTS:
+            if not stripped.startswith(opener):
+                continue
+            # A complete one-line comment closes itself; anything else opens a
+            # span that the next line ending in the closer will end.
+            if not (
+                stripped.endswith(end) and len(stripped) >= len(opener) + len(end)
+            ):
+                closer = end
+            consumed = True
+            break
+        # Blank lines pass through. `active_lines` drops them, and counting them
+        # here would make every file look like it had lost a comment.
+        if not consumed:
+            kept.append(line)
+    return kept
+
+
 def active_lines(source: str) -> list[str]:
     """Return a block's non-blank, non-comment lines, stripped of indentation.
 
@@ -971,13 +1019,9 @@ def active_lines(source: str) -> list[str]:
     user-facing warning become a valid no-op block while satisfying a guard.
     """
 
-    uncommented = source
-    for pattern in (r"<#.*?#>", r"/\*.*?\*/", r"<!--.*?-->"):
-        uncommented = re.sub(pattern, "", uncommented, flags=re.DOTALL)
-
     return [
         line.strip()
-        for line in uncommented.splitlines()
+        for line in strip_block_comments(source.splitlines())
         if line.strip()
         and not line.strip().startswith("#")
         and not line.strip().startswith("//")
@@ -4390,6 +4434,83 @@ def assert_installer_archive_binary_guard_wired(ci: str) -> None:
             "installer can abort on a complete archive and no pull request "
             "would go red"
         )
+
+
+# A fixture in the exact shape ci.yml carries: a `case` arm whose glob ends in
+# `/*`, a cache key holding `**/`, and a line between them that every assertion
+# reading this file depends on being able to see.
+ACTIVE_LINES_FIXTURE = """\
+case "$path" in
+  *.md | docs/*) ;;
+esac
+run: python3 ./scripts/the-line-between.py
+key: ${{ hashFiles('**/Cargo.lock') }}
+/* a real block comment
+   spanning two lines */
+const kept = 1;
+/* a one-line block comment */
+const alsoKept = 2;
+"""
+ACTIVE_LINES_SURVIVOR = "run: python3 ./scripts/the-line-between.py"
+
+
+def assert_active_lines_cannot_span_unrelated_shell(workflows: dict[Path, str]) -> None:
+    """Keep the comment stripper from eating the lines every assertion reads.
+
+    `active_lines` used to strip `<# #>`, `/* */` and `<!-- -->` with three
+    DOTALL regexes over the whole text, which cannot tell a comment from a pair
+    of shell globs. In ci.yml the `docs/*)` arm of a `case` opened one and
+    `hashFiles('**/Cargo.lock')` closed it: 46,138 characters, 48% of the file,
+    were removed before any assertion saw them, and release-train.yml lost 24%
+    the same way. An assertion that cannot see the line it names passes exactly
+    like one that checked it, which is the shape this whole suite exists to
+    prevent.
+
+    No workflow contains a real block comment, so that stripping never removed
+    one. The last check below is what keeps that true: if a workflow ever does
+    open a block comment, this fails and asks for the decision to be reviewed
+    here rather than discovered as a silent hole later.
+    """
+
+    kept = active_lines(ACTIVE_LINES_FIXTURE)
+    if ACTIVE_LINES_SURVIVOR not in kept:
+        raise AssertionError(
+            "active_lines dropped a line between two unrelated shell globs; a "
+            "glob is not a block comment and an assertion reading past one "
+            "would pass without seeing what it names"
+        )
+    for survivor in ("const kept = 1;", "const alsoKept = 2;"):
+        if survivor not in kept:
+            raise AssertionError(f"active_lines dropped live source: {survivor}")
+    for comment in ("a real block comment", "spanning two lines */", "a one-line block comment"):
+        if any(comment in line for line in kept):
+            raise AssertionError(
+                f"active_lines kept a real block comment: {comment}; a commented-out "
+                "validator would then satisfy a guard"
+            )
+
+    # The fixture has to be able to tell the two implementations apart. Without
+    # this, a fixture that both forms handle identically would report a fix
+    # that is not there.
+    superseded = ACTIVE_LINES_FIXTURE
+    for pattern in (r"<#.*?#>", r"/\*.*?\*/", r"<!--.*?-->"):
+        superseded = re.sub(pattern, "", superseded, flags=re.DOTALL)
+    if ACTIVE_LINES_SURVIVOR in {line.strip() for line in superseded.splitlines()}:
+        raise AssertionError(
+            "the active_lines fixture cannot distinguish the DOTALL form from "
+            "the line-oriented one, so it proves nothing"
+        )
+
+    for workflow, content in sorted(workflows.items()):
+        lines = content.splitlines()
+        dropped = len(lines) - len(strip_block_comments(lines))
+        if dropped:
+            raise AssertionError(
+                f"{workflow.relative_to(ROOT).as_posix()} opens a block comment "
+                f"and loses {dropped} line(s) before any assertion reads it. If "
+                "that comment is real, review this census; if it is a glob, the "
+                "stripper is wrong again"
+            )
 
 
 def assert_release_version_gate_wired(ci: str) -> None:
@@ -12300,6 +12421,7 @@ def main() -> None:
             ci_workflow.replace(INSTALLER_BINARY_FALSIFIER_POLICY, "scripts/absent.py")
         ),
     )
+    assert_active_lines_cannot_span_unrelated_shell(workflow_sources)
     assert_release_version_gate_wired(ci_workflow)
     expect_assertion(
         "ci.yml drops the job that runs the version gate on a release PR",

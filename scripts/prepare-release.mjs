@@ -3,8 +3,9 @@
 // Copyright 2026 Firelock, LLC
 
 import fs from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { execFile } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { parseVersion, readManifestVersion } from './check-release-version.mjs';
@@ -316,7 +317,32 @@ async function main() {
   );
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Run only when this file IS the entry point, comparing REAL paths.
+//
+// The usual idiom compares `import.meta.url` against
+// `pathToFileURL(process.argv[1])`. Node resolves symlinks for the first and
+// not the second, so invoking this file through a symlinked directory makes
+// the two disagree and it generates nothing, writes no $GITHUB_OUTPUT, and
+// exits 0. release-train.yml runs it from a copy in
+// `$RUNNER_TEMP/release-policy`, which is exactly that shape and is not a
+// symlink today, which is the only reason the naive form has held.
+//
+// Unresolvable paths fall to running, not skipping. A generator that silently
+// declines to generate leaves the train reading an empty version; a test that
+// runs `main()` by mistake fails loudly on the spot.
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const self = fileURLToPath(import.meta.url);
+  if (entry === self) return true;
+  try {
+    return realpathSync(entry) === realpathSync(self);
+  } catch {
+    return true;
+  }
+}
+
+if (isDirectRun()) {
   main().catch((error) => {
     console.error(error.message);
     process.exitCode = 1;
