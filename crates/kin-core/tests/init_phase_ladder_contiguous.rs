@@ -35,8 +35,8 @@ use tracing_subscriber::Layer;
 
 /// Commits in the fixture history. Enough that the phases are separable in
 /// wall clock; small enough that this runs in the default suite.
-const COMMITS: usize = 12;
-const MODULES: usize = 4;
+const COMMITS: usize = 32;
+const MODULES: usize = 8;
 const ITEMS_PER_MODULE: usize = 4;
 
 /// Largest share of the run that may pass with no ladder phase open.
@@ -50,9 +50,12 @@ const ITEMS_PER_MODULE: usize = 4;
 /// The largest single gap separates far better, because deleting any one span
 /// makes exactly one hole and the hole is the size of that phase. Measured on
 /// this fixture: 0.1 percent with the ladder whole, against 6.5, 3.4 and 2.8
-/// percent with each of the three spans renamed away. The bar sits at 1 percent,
-/// which is seven times the intact reading and well under the smallest breach.
-const MAX_GAP_FRACTION: f64 = 0.01;
+/// percent with two of the three spans renamed away. The bar sits at 2 percent,
+/// a bit over twice the intact reading and well under the smallest breach.
+///
+/// It cannot catch the loss of a phase that is small on this fixture, which is
+/// why `REQUIRED_LADDER_PHASES` below exists beside it.
+const MAX_GAP_FRACTION: f64 = 0.02;
 
 /// Share of the wall clock the ladder must account for in total.
 ///
@@ -60,6 +63,26 @@ const MAX_GAP_FRACTION: f64 = 0.01;
 /// gap would show, such as many phases each shrinking, which the gap bar alone
 /// would miss.
 const REQUIRED_COVERAGE: f64 = 0.95;
+
+/// Phases that must still appear in the ladder by name.
+///
+/// The gap bar above cannot see a small phase leave, and falsification proved
+/// it: `kin.init.record_complete_admission` runs about 9 ms on any synthetic
+/// fixture, no matter how much history it is given, because it scales with
+/// tracked artifacts rather than commits. Renaming it off the ladder moved the
+/// largest gap by well under the bar, so a gap-only guard went green with that
+/// span deleted. On a real conversion the same phase sits in a 30.6 second
+/// tail, so it matters far more than any fixture can show.
+///
+/// Hence a second, blunter assertion: these phases exist. If one is renamed on
+/// purpose, change it here in the same commit, which is the point. A deletion
+/// then has to be deliberate rather than silent.
+const REQUIRED_LADDER_PHASES: &[&str] = &[
+    "kin.init.commit_bootstrap_transaction",
+    "kin.init.verify_staged_layout",
+    "kin.init.finalize_publication",
+    "kin.init.record_complete_admission",
+];
 
 /// One span boundary, with the time it happened.
 struct Edge {
@@ -225,6 +248,16 @@ fn the_admission_ladder_accounts_for_the_whole_of_init() {
         }
         cursor = cursor.max(*end);
     }
+    // The stretch after the last phase closes counts too, and an earlier draft
+    // of this guard missed it. Deleting the final span does not open a gap
+    // between two phases, it just ends the ladder early, so a check that only
+    // looks between phases stays green for exactly the span whose loss leaves
+    // the most work unnamed. In the run that motivated this guard that tail was
+    // 30.6 seconds, the largest hole of all.
+    let tail = total_ms - cursor;
+    if tail > worst.0 {
+        worst = (tail, "previous phase", "the end of init, with no phase open");
+    }
 
     println!(
         "ladder covered {covered:.0} ms of {total_ms:.0} ms ({:.1}%), {} top-level phases, \
@@ -254,6 +287,18 @@ fn the_admission_ladder_accounts_for_the_whole_of_init() {
         worst.2,
         support::PHASE_PREFIX,
     );
+    for required in REQUIRED_LADDER_PHASES {
+        assert!(
+            ladder.iter().any(|(phase, _, _)| phase == required),
+            "`{required}` is no longer a top-level phase of the admission ladder. Every phase \
+             here was added because work was running unnamed and a memory profile could not \
+             charge it to anything. If this phase was renamed deliberately, update \
+             REQUIRED_LADDER_PHASES in the same commit so the removal is a decision rather \
+             than a silent regression. Ladder seen: {:?}",
+            ladder.iter().map(|(p, _, _)| *p).collect::<Vec<_>>(),
+        );
+    }
+
     assert!(
         coverage >= REQUIRED_COVERAGE,
         "the admission ladder accounts for only {:.1}% of init_from_git's {total_ms:.0} ms, \
