@@ -16338,7 +16338,7 @@ mod tests {
     /// right time to be told: the bound it records will have moved.
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_git_admitted_store_adopting_a_hosted_identity_meets_the_git_authority_bound() {
+    async fn a_git_admitted_store_bootstraps_an_empty_hosted_replica_over_http() {
         const PATH: &str = "service/compose.yaml";
         let hosted_id = hosted_repository_id();
         let hosted_repository = RepositoryId::new(hosted_id.clone()).unwrap();
@@ -16380,16 +16380,37 @@ mod tests {
         let message = String::from_utf8_lossy(&body).to_string();
         assert_eq!(
             status,
-            StatusCode::CONFLICT,
-            "the Git-authority bound is a conflict, not an identity refusal: {message}"
+            StatusCode::OK,
+            "a Git-admitted store now bootstraps an empty hosted replica: {message}"
         );
         assert!(
-            message.contains("imported-Git authority"),
-            "the refusal must name the bound that stopped it, not the identity: {message}"
+            message.contains("\"outcome\":\"committed\""),
+            "the receipt must report a committed publication, not a no-op: {message}"
         );
         assert!(
-            !message.contains("does not match destination repository"),
-            "identity is no longer what stops a Git-admitted store: {message}"
+            message.contains("\"old\":null"),
+            "the receipt must show the authority being ESTABLISHED, which is an \
+             initialize delta with no old state: {message}"
+        );
+
+        // The publisher's word is not the evidence. Ask the hosted replica what
+        // it holds, through the route a reader would use.
+        let served = repository_authority_snapshot(&hosted_state, &hosted_id)
+            .await
+            .expect("the hosted replica serves the authority it just admitted");
+        assert!(
+            served
+                .repository_authority
+                .as_ref()
+                .is_some_and(|authority| authority.git_external_authority.is_some()),
+            "the hosted replica must hold imported-Git authority after the bootstrap"
+        );
+        assert!(
+            served
+                .repository_authority
+                .as_ref()
+                .is_some_and(|authority| !authority.ref_state.refs.is_empty()),
+            "the hosted replica must publish the ref the bootstrap established"
         );
     }
 
