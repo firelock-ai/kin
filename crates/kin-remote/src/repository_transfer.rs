@@ -722,8 +722,29 @@ struct TransferSourceContext {
     all_changes: std::collections::HashMap<SemanticChangeId, SemanticChange>,
     source_head: SemanticChangeId,
     source_git_authority_hash: Option<Hash256>,
+    /// The authority this transfer will ESTABLISH, present only when the
+    /// destination has none and is otherwise empty.
+    ///
+    /// Carrying the value rather than only its hash is what lets the pack ship
+    /// it. Every other transfer leaves this `None` and the two replicas' hashes
+    /// must already agree.
+    bootstrap_authority: Option<GitExternalAuthority>,
     aliases: Vec<ExternalChangeAlias>,
     external_objects: Vec<ExternalObjectRecord>,
+}
+
+/// Whether the destination this expectation describes has admitted anything at
+/// all.
+///
+/// Five fields, not one. A replica with no Git authority but a native history
+/// is not a bootstrap target: giving it an imported-Git baseline would claim
+/// its existing changes came from a Git lineage they never came from.
+fn destination_is_unborn(expectation: &RepositoryTransferExpectation) -> bool {
+    expectation.git_authority_hash.is_none()
+        && expectation.destination_head.is_none()
+        && expectation.destination_target.is_none()
+        && expectation.default_ref.is_none()
+        && expectation.roots.generation == 0
 }
 
 impl TransferSourceContext {
@@ -750,19 +771,29 @@ impl TransferSourceContext {
         let source_head = lease
             .resolve_target_change_id(&source_target)
             .map_err(storage)?;
-        let source_git_authority_hash =
-            hash_git_authority(lease.authority_metadata().git_external_authority.as_ref())?;
-        if source_git_authority_hash != expectation.git_authority_hash {
+        let source_authority = lease.authority_metadata().git_external_authority.clone();
+        let source_git_authority_hash = hash_git_authority(source_authority.as_ref())?;
+        // Three outcomes, and only the middle one is new. Matching authority is
+        // an ordinary fast-forward. A source with authority publishing into a
+        // replica that has admitted nothing is a bootstrap, which establishes
+        // the baseline instead of requiring one. Anything else is the
+        // divergence transfer v1 has never carried and still does not.
+        let bootstrap_authority = if source_git_authority_hash == expectation.git_authority_hash {
+            None
+        } else if source_authority.is_some() && destination_is_unborn(expectation) {
+            source_authority
+        } else {
             return Err(RepositoryTransferError::Conflict(
-                "repository-v6 transfer v1 requires identical imported-Git authority on both replicas; Git-authority bootstrap/divergence is not adapted"
+                "repository-v6 transfer requires identical imported-Git authority on both replicas, or a destination that has admitted nothing; Git-authority divergence is not adapted"
                     .to_string(),
             ));
-        }
+        };
 
         Ok(Self {
             all_changes: lease.snapshot().changes.clone(),
             source_head,
             source_git_authority_hash,
+            bootstrap_authority,
             aliases: lease.authority_metadata().aliases.clone(),
             external_objects: lease.authority_metadata().external_objects.clone(),
         })
@@ -874,6 +905,21 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
     // same change. The pack then publishes that head and carries nothing,
     // which is what a caller that asked for a pack anyway should get back.
     let segment_head = plan.ordered.last().copied().unwrap_or(context.source_head);
+    // A bootstrap cannot be a segment. The authority it installs describes the
+    // repository's whole ref set and every commit reachable from it, and kin-db
+    // refuses an authority whose projections name changes the snapshot does not
+    // hold. So a partial bootstrap is not a smaller bootstrap, it is one that
+    // cannot commit, and the honest answer is to refuse here by name rather
+    // than to send a pack whose failure would surface from three layers down as
+    // a missing alias.
+    if context.bootstrap_authority.is_some() && segment_head != context.source_head {
+        return Ok(Assembled::OverNegotiatedBound(format!(
+            "a bootstrap publishes the whole imported history in one pack and this one does not \
+             fit the negotiated envelope: {} of {} changes",
+            plan.ordered.len(),
+            context.all_changes.len()
+        )));
+    }
     let store = TransferChangeStore::new(context.all_changes.values().cloned());
     let segment_tree = store.resolve_tree_at(&segment_head).map_err(model)?;
     let segment_tree_hash = compute_resolved_tree_hash(&segment_tree).map_err(model)?;
@@ -915,20 +961,37 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         changes.push(change);
     }
 
-    let aliases = context
-        .aliases
-        .iter()
-        .filter(|alias| {
-            included.contains(&alias.change_id) || required_git_oids.contains(&alias.oid)
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    let external_objects = context
-        .external_objects
-        .iter()
-        .filter(|record| required_git_oids.contains(&record.object.oid))
-        .cloned()
-        .collect::<Vec<_>>();
+    // Same reasoning as the external objects below: an installed authority
+    // projects every commit in its closure, and kin-db requires each projection
+    // to have an alias, so a bootstrap carries all of them rather than only the
+    // ones its included changes name.
+    let aliases = if context.bootstrap_authority.is_some() {
+        context.aliases.clone()
+    } else {
+        context
+            .aliases
+            .iter()
+            .filter(|alias| {
+                included.contains(&alias.change_id) || required_git_oids.contains(&alias.oid)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // An ordinary pack carries only the objects its own Git-origin changes name,
+    // because the destination already holds the baseline. A bootstrap carries
+    // the WHOLE closure, because the authority it installs describes every one
+    // of them and kin-db refuses an authority whose closure names an object the
+    // repository's external-object set does not hold.
+    let external_objects = if context.bootstrap_authority.is_some() {
+        context.external_objects.clone()
+    } else {
+        context
+            .external_objects
+            .iter()
+            .filter(|record| required_git_oids.contains(&record.object.oid))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
     for record in &external_objects {
         required_body_hashes.insert(record.body_hash);
     }
@@ -996,11 +1059,7 @@ fn assemble_segment_pack<B: StorageBackend + ?Sized + 'static>(
         expected_destination_default_ref: expectation.default_ref.clone(),
         source_git_authority_hash: context.source_git_authority_hash,
         expected_destination_git_authority_hash: expectation.git_authority_hash,
-        // The sender does not bootstrap yet. Teaching it to is the other half
-        // of this change and it lands separately; until then every pack this
-        // function builds is an ordinary fast-forward and the equality rule
-        // applies to it unchanged.
-        git_authority_bootstrap: None,
+        git_authority_bootstrap: context.bootstrap_authority.clone(),
         required_features: required_features(),
         changes,
         trees,
@@ -1972,6 +2031,47 @@ mod tests {
         }
     }
 
+    /// Commit one artifact-free native root change, so a publisher exists that
+    /// has history and no imported-Git authority at all.
+    ///
+    /// Artifact-free on purpose: a Native change that introduces an artifact
+    /// needs a bound workspace admission context and a transfer's receive
+    /// transaction carries none, which is a different bound entirely and not
+    /// what this control is about.
+    fn seed_native_line(manager: &TestManager, main: &RefName) {
+        let change = native_change(Vec::new(), "native root", Vec::new());
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(Uuid::from_u128(701)),
+            repository_id: lease.metadata().repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("native-seed"),
+            reason: "seed a publisher with no imported-Git authority".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: vec![change.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: main.clone(),
+                expected: RefExpectation::MustNotExist,
+                new_target: Some(RefTarget::change(change.id)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: Some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(main.clone()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+    }
+
     fn native_change(
         parents: Vec<SemanticChangeId>,
         message: &str,
@@ -2607,6 +2707,135 @@ mod tests {
                 .contains("admitted only at generation zero"),
             "this test is about the generation-zero rule; another guard answering \
              means the layering moved and the test now proves something else: {error}"
+        );
+    }
+
+    /// The sender half: a Git-admitted publisher negotiating with a
+    /// replica that has admitted nothing decides to bootstrap on its own, from
+    /// the advertisement alone.
+    ///
+    /// This is the case the whole capability exists for and the one that was
+    /// refused by construction before it. The publisher here carries a real
+    /// imported Git baseline AND a native change on top of it, which is what a
+    /// converted repository looks like the moment anyone works in it, so the
+    /// pack proves the two kinds of history travel together rather than only
+    /// the Git half.
+    #[test]
+    fn a_publisher_negotiating_with_an_unborn_replica_builds_a_bootstrap_from_the_advertisement_alone() {
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+
+        // The expectation an unborn replica publishes about itself. Read from
+        // the replica rather than constructed, so the sender is reacting to the
+        // real advertisement and not to a fixture's idea of one.
+        let status =
+            repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
+        assert!(
+            status.git_authority_hash.is_none() && status.destination_head.is_none(),
+            "the destination must actually be unborn or this test is about something else"
+        );
+        let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+
+        let segment =
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+                .expect("a publisher with Git authority may bootstrap an unborn replica");
+        let pack = segment.pack;
+        assert_eq!(
+            segment.remaining_changes, 0,
+            "a bootstrap publishes the whole history in one pack or refuses"
+        );
+        assert!(
+            pack.git_authority_bootstrap.is_some(),
+            "the sender must decide to bootstrap on its own, from the advertisement alone"
+        );
+        assert!(
+            pack.changes
+                .iter()
+                .any(|change| matches!(change.origin, ChangeOrigin::GitCommit { .. }))
+                && pack
+                    .changes
+                    .iter()
+                    .any(|change| matches!(change.origin, ChangeOrigin::Native)),
+            "the pack must carry both the imported baseline and the native work on top of it"
+        );
+
+        // Landing this exact pack is a different test, because this fixture's
+        // tree carries a gitlink and that meets a bound of its own, recorded
+        // immediately below. What a bootstrap actually lands is proven by
+        // `a_bootstrap_pack_establishes_git_authority_on_a_replica_that_had_none`,
+        // whose history is Git-origin throughout.
+    }
+
+    /// A converted repository holding ANY submodule cannot bootstrap once it
+    /// has native history, and the reason is the exact mirror of the rule that
+    /// forces authority and history into one transaction.
+    ///
+    /// `verify_native_change_admission` reads `authenticated_gitlinks` from the
+    /// state BEFORE the transaction (kin-db repository.rs:4228 and :4233), so a
+    /// bootstrap's own authority install cannot authenticate anything: at the
+    /// moment of the check the replica still has no authority at all. One rule
+    /// requires the two halves to arrive together and this one is broken by
+    /// their arriving together.
+    ///
+    /// It is wider than "a change that touches a submodule". The check walks
+    /// the whole RESOLVED TREE of each native change rather than its deltas, so
+    /// a native change inherits every gitlink in the tree and one submodule
+    /// anywhere catches all of them. Here the gitlink sits at `dependency` and
+    /// the native change only edits `compose.yaml`.
+    ///
+    /// Recorded rather than worked around, so the class is never rediscovered.
+    #[test]
+    fn a_bootstrap_carrying_native_history_over_a_gitlink_is_refused_by_name() {
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+        let status =
+            repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
+        let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        let pack = build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+            .expect("the sender builds the bootstrap; the refusal is the receiver's")
+            .pack;
+
+        let error = apply_repository_transfer_pack(
+            &empty,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("bootstrap-sender-test"),
+            &pack,
+        )
+        .expect_err("native history over a gitlink cannot bootstrap");
+        assert!(
+            error.to_string().contains("without verified Git external authority"),
+            "the refusal must name the gitlink authentication bound rather than any \
+             of the five this change is about: {error}"
+        );
+    }
+
+    /// The control: a publisher with NO Git authority negotiating with the same
+    /// unborn replica builds an ordinary pack, not a bootstrap.
+    ///
+    /// Without this, the test above would pass equally well against a sender
+    /// that stamped a bootstrap onto everything, and the field would be
+    /// decoration rather than a decision.
+    #[test]
+    fn a_publisher_without_git_authority_builds_no_bootstrap() {
+        let fixture = fixture();
+        let native_dir = tempfile::tempdir().unwrap();
+        let native = manager(&native_dir, &fixture.repository_id);
+        seed_native_line(&native, &fixture.main);
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+        let status =
+            repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
+        let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+
+        let segment = build_repository_transfer_segment(&native, &fixture.main, &expectation)
+            .expect("a native publisher may publish into an unborn replica");
+        assert!(
+            segment.pack.git_authority_bootstrap.is_none(),
+            "a publisher with no imported-Git authority has nothing to bootstrap"
         );
     }
 
