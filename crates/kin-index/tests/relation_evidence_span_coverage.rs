@@ -45,11 +45,14 @@ use kin_model::{ArtifactId, FilePathId, Relation, RelationEvidence, RelationId};
 /// has something to resolve, and every fixture repeats at least one call so
 /// multi-site edges are exercised rather than assumed away.
 ///
-/// The calls are written cross-file on purpose: a bare call to a qualified
+/// The calls are written cross-file on purpose. A bare call to a qualified
 /// sibling in the *same* file (`render()` calling `compute()` inside one class)
-/// resolves to no edge at all, in every language checked. That is a separate
-/// gap from this one and would make a fixture look span-less when it was really
-/// edge-less.
+/// used to resolve to no edge at all in every language checked, which would make
+/// a fixture look span-less when it was really edge-less. FIR-1826 closed that
+/// for the languages where a bare call carries an implicit receiver, so the Java
+/// and C# fixtures below now yield that edge too and their `min_calls` floors
+/// count it. The cross-file shape stays because it is the one every language
+/// resolves, so a fixture's span rate is never confounded by a binding rule.
 struct Fixture {
     language: &'static str,
     /// Fewest relations this fixture must yield. A language that silently stops
@@ -203,7 +206,9 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         language: "Java",
         min_relations: 4,
-        min_calls: 1,
+        // Two: the cross-file `compute()` every language resolves, and the
+        // same-file `render()` -> `compute()` sibling FIR-1826 added.
+        min_calls: 2,
         min_calls_with_span: 0,
         files: &[
             (
@@ -228,7 +233,8 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         language: "CSharp",
         min_relations: 5,
-        min_calls: 1,
+        // Two, for the same reason as Java above.
+        min_calls: 2,
         min_calls_with_span: 0,
         files: &[
             (

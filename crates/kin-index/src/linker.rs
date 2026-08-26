@@ -1420,6 +1420,70 @@ fn resolve_one_file(
             }
         }
 
+        // (c2a) A bare call to a same-file sibling under the caller's own
+        // owner. `void Foo::a() { b(); }` in a file that also defines `Foo::b`
+        // reached no tier at all before this one, so the call site existed in
+        // the source and in no edge. See `same_owner_sibling_name` for why the
+        // sibling is composed rather than searched, and
+        // `bare_call_reaches_owner_sibling` for the language allowlist that
+        // decides where a bare call carries an implicit receiver.
+        //
+        // It links only when exactly one distinct candidate survives the same
+        // filters (c2) applies. Fanning out here would reopen the decoy problem
+        // the (c) comment above describes, in the one place a decoy is most
+        // likely: the caller's own file.
+        //
+        // LOCALITY_DISAMBIGUATED_CONFIDENCE and deliberately not 1.0. Locality
+        // plus a unique owner-qualified leaf beats the cross-file fan-out and
+        // stays under the parser-certain same-file edge (a) emits, because 1.0
+        // would stamp `RelationOrigin::Parsed` and let `find_references` report
+        // a name-derived edge as proven.
+        if name_fallback_allowed && !linked && !unresolvable_name_ambiguity {
+            if let Some((sibling, _leaf)) =
+                same_owner_sibling_name(rel, src_id, &ctx.entity_language_by_id).filter(
+                    |(_, leaf)| {
+                        bare_leaf_names_one_thing(
+                            ctx.entity_by_bare_name.get(leaf).map_or(0, |v| v.len()),
+                            ctx.entity_by_name.get(leaf).map_or(0, |v| v.len()),
+                        )
+                    },
+                )
+            {
+                let candidates: Vec<(&str, EntityId)> = ctx
+                    .entity_by_name
+                    .get(sibling.as_str())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+                    .iter()
+                    .copied()
+                    .filter(|&(fp, dst_id)| {
+                        fp == file.file_path.as_str()
+                            && dst_id != src_id
+                            && blind_inference_target_allowed(
+                                src_id,
+                                dst_id,
+                                &ctx.entity_language_by_id,
+                            )
+                    })
+                    .collect();
+                let candidates =
+                    prune_pairs_by_arity(candidates, call_arity, &ctx.entity_arity_by_id);
+                let candidates = narrow_pairs_by_role(src_id, candidates, &ctx.entity_role_by_id);
+                let distinct: HashSet<EntityId> =
+                    candidates.into_iter().map(|(_, id)| id).collect();
+                if distinct.len() == 1 {
+                    for dst_id in sorted_fanout_targets(distinct) {
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
+                        );
+                        linked = true;
+                    }
+                }
+            }
+        }
+
         // (c4) C++ receiver-scoped inherited method. A `Owner::method` call
         // whose receiver type the parser pinned matched no exact entity above
         // (own method — same-file (a) or cross-file (c)) resolves through the
@@ -3533,6 +3597,133 @@ fn rust_bare_call_may_reach_owned(
 ) -> bool {
     !imports_are_name_complete(&file.imports)
         || file_imports.is_some_and(|imports| imports.contains_key(dst_name))
+}
+
+/// The owner path of a qualified entity name, and the separator that joined it.
+///
+/// Mirrors [`bare_entity_name`]'s precedence exactly, `::` before `.`, so the
+/// two can never disagree about where a name splits: this returns the owner of
+/// the leaf that one returns. `None` for an unqualified name, which is what
+/// keeps a free function out of the sibling tier below.
+fn entity_owner_path(name: &str) -> Option<(&str, &str)> {
+    match name.rfind("::") {
+        Some(idx) if idx > 0 => Some((&name[..idx], "::")),
+        Some(_) => None,
+        None => match name.rfind('.') {
+            Some(idx) if idx > 0 => Some((&name[..idx], ".")),
+            _ => None,
+        },
+    }
+}
+
+/// Whether a bare `name(..)` in this language reaches a sibling member of the
+/// caller's own owner with no receiver written.
+///
+/// Measured against the real adapters rather than assumed. Every adapter this
+/// indexes emits the identical relation for `b()` inside `Foo.a`: a `Calls`
+/// with `dst_name = "b"` and no receiver. The relation cannot tell the
+/// languages apart, so only the language can.
+///
+/// The five here give a member call an implicit receiver, so `b()` inside
+/// `Foo.a` is `this.b()` or `self.b()` and the same-owner sibling is the target
+/// the source names. Every other language is left out, each for its own reason:
+///
+///   * Python and Rust need `self.b()` or `Self::b()`. The gates at
+///     [`is_python_bare_identifier_call`] and [`rust_bare_call_may_reach_owned`]
+///     already say so, and this tier must not step around them.
+///   * Go needs `f.b()`; a bare `b()` inside a method names a package-level
+///     function.
+///   * PHP needs `$this->b()`; a bare `b()` inside a method names a global
+///     function.
+///   * JavaScript and TypeScript need `this.b()`.
+///   * C has no owner-qualified entities, so the lookup could never hit.
+///   * Ruby's adapter records no call at all for the bare shape, so a rule for
+///     it would be a rule nothing exercises.
+///   * HCL has no call syntax.
+///
+/// An allowlist and not a denylist, on purpose: a language added to
+/// [`LanguageId`] tomorrow inherits no binding rule until somebody makes the
+/// same judgement for it and writes it here.
+fn bare_call_reaches_owner_sibling(
+    src_id: EntityId,
+    languages: &HashMap<EntityId, LanguageId>,
+) -> bool {
+    matches!(
+        languages.get(&src_id),
+        Some(
+            LanguageId::Java
+                | LanguageId::CSharp
+                | LanguageId::Cpp
+                | LanguageId::Kotlin
+                | LanguageId::Swift
+        )
+    )
+}
+
+/// (c2a) The name of the same-file sibling under the caller's own owner that a
+/// bare call reaches, if this call can reach one at all.
+///
+/// No tier before this one can. Tier (a) keys `entity_by_file_name` on the FULL
+/// name and `Foo::b` is not `b`; tier (c) keys `entity_by_name` the same way;
+/// tier (c2) does hold `Foo::b` under its bare leaf and drops every candidate
+/// in the caller's own file. So `void Foo::a() { b(); }` emitted no relation of
+/// any kind, not even a placeholder, and `find_references`, blast radius and
+/// every rename built on the graph omitted the site with nothing to say so.
+///
+/// This composes the sibling's full name from the caller's own owner. Composing
+/// rather than searching the bare-leaf index is what keeps the tier safe: that
+/// index would also offer `Bar::b` in the same file, which a bare call in none
+/// of these languages can reach. The composed name is then looked up by the
+/// caller, which applies the same candidate filters (c2) applies before
+/// deciding, so the two tiers cannot drift on what an overload or a test-only
+/// target admits.
+fn same_owner_sibling_name<'r>(
+    rel: &'r ExtractedRelation,
+    src_id: EntityId,
+    languages: &HashMap<EntityId, LanguageId>,
+) -> Option<(String, &'r str)> {
+    if rel.kind != RelationKind::Calls || rel.receiver.is_some() {
+        return None;
+    }
+    let leaf = rel.dst_name.as_str();
+    if leaf.is_empty() || leaf.contains('.') || leaf.contains("::") {
+        return None;
+    }
+    if !bare_call_reaches_owner_sibling(src_id, languages) {
+        return None;
+    }
+    let (owner, separator) = entity_owner_path(rel.src_name.as_str())?;
+    Some((format!("{owner}{separator}{leaf}"), leaf))
+}
+
+/// Whether the bare leaf of a call can mean anything in this repository other
+/// than the sibling [`same_owner_sibling_name`] composed.
+///
+/// The adapters for every language in [`bare_call_reaches_owner_sibling`] record
+/// NO receiver for `h.b()`. That is measured, in
+/// `tests/same_owner_bare_call_resolution.rs`, not assumed: Java, C#, Kotlin,
+/// Swift and C++ all emit the same relation for `h.b()` as for `b()`, a `Calls`
+/// with `dst_name = "b"` and `receiver: None`. Only Python and Rust separate the
+/// two shapes at extraction time, and neither is in the allowlist. So this tier
+/// cannot ask whether a receiver was written, and something else has to stand in
+/// for that question, or an object call would bind to whatever member of the
+/// caller's own class shares the leaf. That is the phantom-consumer defect the
+/// `proxies.get("no_proxy")` gate above exists to prevent, arriving in the one
+/// place a decoy is most likely.
+///
+/// Uniqueness stands in. When the leaf names exactly one owner-qualified entity
+/// in the whole universe and no unqualified one, there is nothing else the call
+/// could have meant whatever was written before the dot. That is precisely the
+/// shape the ticket describes, a bare call whose ONLY candidate is a same-file
+/// qualified-name entity, and it is what keeps `h.b()` off the caller's own
+/// `Foo.b` wherever `Helper.b` is in the graph.
+///
+/// The bound it leaves is stated rather than hidden: a receiver call whose
+/// receiver type the graph does not hold at all still binds to the caller's own
+/// sibling. Closing that needs the adapters to record receivers for these
+/// languages, which is a parser change and not a linker one.
+fn bare_leaf_names_one_thing(bare_holders: usize, exact_holders: usize) -> bool {
+    bare_holders == 1 && exact_holders == 0
 }
 
 /// Drop the method candidates a bare Python call can never dispatch to.
@@ -6642,6 +6833,58 @@ fn resolve_one_file_incremental(
                             &mut resolved,
                             &mut relation_indices,
                             make_relation(rel, src_id, dst_id, RECEIVER_NAME_FANOUT_CONFIDENCE),
+                        );
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // (c2a) The incremental counterpart of the batch linker's (c2a): a
+        // bare call to a same-file sibling under the caller's own owner.
+        // Without this step the edge a full-tree link resolved is dropped the
+        // moment an incremental relink of the caller re-derives its edges,
+        // which is how a warm store loses edges a cold one has.
+        if name_fallback_allowed && !unresolvable_name_ambiguity {
+            if let Some((sibling, _leaf)) =
+                same_owner_sibling_name(rel, src_id, &linker.entity_language_by_id).filter(
+                    |(_, leaf)| {
+                        bare_leaf_names_one_thing(
+                            linker.entity_by_bare_name.get(*leaf).map_or(0, |v| v.len()),
+                            linker.entity_by_name.get(*leaf).map_or(0, |v| v.len()),
+                        )
+                    },
+                )
+            {
+                let candidates: Vec<(&str, EntityId)> = linker
+                    .entity_by_name
+                    .get(sibling.as_str())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|(fp, dst_id)| {
+                        fp == &file.file_path
+                            && *dst_id != src_id
+                            && blind_inference_target_allowed(
+                                src_id,
+                                *dst_id,
+                                &linker.entity_language_by_id,
+                            )
+                    })
+                    .map(|(fp, id)| (fp.as_str(), *id))
+                    .collect();
+                let candidates =
+                    prune_pairs_by_arity(candidates, call_arity, &linker.entity_arity_by_id);
+                let candidates =
+                    narrow_pairs_by_role(src_id, candidates, &linker.entity_role_by_id);
+                let distinct: HashSet<EntityId> =
+                    candidates.into_iter().map(|(_, id)| id).collect();
+                if distinct.len() == 1 {
+                    for dst_id in sorted_fanout_targets(distinct) {
+                        accumulate_relation(
+                            &mut resolved,
+                            &mut relation_indices,
+                            make_relation(rel, src_id, dst_id, LOCALITY_DISAMBIGUATED_CONFIDENCE),
                         );
                     }
                     continue;
