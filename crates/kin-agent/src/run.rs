@@ -710,7 +710,7 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                     (outcome, provenance)
                                                 }
                                             } else {
-                                                let outcome = match tool {
+                                                let mut outcome = match tool {
                                                     LocalTool::Edit => {
                                                         belt::run_edit(&repo, &call.arguments)
                                                     }
@@ -746,6 +746,24 @@ pub fn run(config: AgentConfig) -> anyhow::Result<RunOutcome> {
                                                     && !published_by_authority(&provenance)
                                                 {
                                                     counters.unpublished_changes += 1;
+                                                    // The model has to hear this. A bare
+                                                    // success reads as "the edit reached
+                                                    // the graph", and it did not: the
+                                                    // change is on disk and the
+                                                    // transaction aborted. The create
+                                                    // branch has said so since kin#1082,
+                                                    // and this branch had no traffic at
+                                                    // all until an edit could stage.
+                                                    if !outcome.is_error {
+                                                        outcome.text = format!(
+                                                            "{} Repository authority did \
+                                                             not publish it: {}. The \
+                                                             change is on disk and \
+                                                             uncommitted.",
+                                                            outcome.text,
+                                                            unpublished_reason(&provenance),
+                                                        );
+                                                    }
                                                 }
                                                 (outcome, provenance)
                                             };

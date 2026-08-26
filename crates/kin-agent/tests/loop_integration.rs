@@ -185,7 +185,7 @@ def call(name, args):
         # the mirror of it: a replace whose path authority does not track. TRACKED stands
         # for the fixture graph's contents, so both refusals are the graph's answer rather
         # than a look at the working tree.
-        TRACKED = ("src/greet.py", "README.md")
+        TRACKED = ("src/greet.py", "README.md", "src/dirty.py")
         for op in args.get("operations", []):
             verb = op.get("verb")
             target = op.get("target")
@@ -208,6 +208,14 @@ def call(name, args):
         # FIR-2624 shipped: the harness wrote the file first and every real commit was
         # refused while this suite stayed green.
         operations = STAGED.pop(args.get("transaction_id"), [])
+        # Real authority validates tree cleanliness at COMMIT, not at stage, so a rewrite
+        # can stage cleanly and still be refused when the working copy drifted. A stand-in
+        # that only ever refuses at stage cannot produce the state this test is about.
+        for op in operations:
+            if op.get("verb") in ("replace", "overwrite") and op.get("target") == "src/dirty.py":
+                return payload({"message": "repository authority refused the rewrite of "
+                                           "src/dirty.py: the working copy is not clean",
+                                "_kin": ENVELOPE}, is_error=True)
         for op in operations:
             target = op.get("target")
             if op.get("verb") in ("create", "add", "insert") and os.path.exists(target):
@@ -262,6 +270,14 @@ fn fixture_repo(dir: &Path) -> PathBuf {
     )
     .unwrap();
     std::fs::write(repo.join("README.md"), "# fixture\n").unwrap();
+    // Tracked in the fixture graph and refused at COMMIT by the scripted server, which is
+    // how a rewrite fails in the product: authority validates tree cleanliness when it
+    // commits, not when it stages, so a replace can stage cleanly and still not land.
+    std::fs::write(
+        repo.join("src/dirty.py"),
+        "def stale(name):\n    return name\n",
+    )
+    .unwrap();
     repo
 }
 
@@ -590,6 +606,76 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
     assert_eq!(
         requests[1]["messages"].as_array().unwrap().last().unwrap()["role"],
         "tool"
+    );
+}
+
+/// A staged edit the daemon refuses to commit must not read to the model as a success.
+///
+/// The create path has amended its own result since kin#1082. The edit path could not: until
+/// an edit could stage, nothing reached this branch, so it incremented `unpublished_changes`
+/// and handed the model "Edited `src/dirty.py`: replaced 1 occurrence" with no hint that the
+/// transaction aborted. The trace recorded the refusal, which does not help a model that
+/// only reads its own tool result and goes on believing the graph has its change.
+#[test]
+fn a_staged_edit_the_daemon_refuses_tells_the_model_it_did_not_land() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = fixture_repo(dir.path());
+    let out = dir.path().join("out");
+    let server = write_fake_mcp_server(dir.path());
+    let log = dir.path().join("mcp-calls.jsonl");
+
+    let endpoint = FakeEndpoint::start(vec![
+        completion(
+            "Fixing it.",
+            Some(tool_call(
+                "c1",
+                "edit_file",
+                json!({
+                    "path": "src/dirty.py",
+                    "find": "return name",
+                    "replace": "return name.strip()"
+                }),
+            )),
+        ),
+        completion("Fixed.", None),
+    ]);
+    let base_url = endpoint.base_url.clone();
+
+    let outcome = kin_agent::run(config(&repo, &out, &base_url, mcp_command(&server, &log)))
+        .expect("the run completes");
+
+    // The stage was taken and the commit was refused, so the run is downgraded.
+    assert_eq!(outcome.status, ExitStatus::ChangesUnpublished);
+    assert_eq!(outcome.result["kin_agent"]["unpublished_changes"], 1);
+
+    let calls = mcp_log(&log);
+    let staged = calls
+        .iter()
+        .find(|call| call["tool"] == "kin_transaction_stage")
+        .expect("the edit is staged");
+    assert_eq!(staged["args"]["operations"][0]["verb"], "replace");
+
+    // The assertion this test exists for. The model's own tool result, which is the only
+    // thing it reads, has to say the change did not land.
+    let records = read_jsonl(&outcome.transcript_path);
+    let view = analyze(&records);
+    let result = &view
+        .tool_results
+        .iter()
+        .find(|(id, _, _)| id == &view.tool_uses[0].0)
+        .expect("the edit has a result")
+        .1;
+    assert!(
+        result.contains("did not publish it"),
+        "the model must be told its edit did not land, got: {result}"
+    );
+    assert!(
+        result.contains("working copy is not clean"),
+        "the model must be told WHY, in the server's own words, got: {result}"
+    );
+    assert!(
+        result.contains("uncommitted"),
+        "the model must be told where its work is, got: {result}"
     );
 }
 
