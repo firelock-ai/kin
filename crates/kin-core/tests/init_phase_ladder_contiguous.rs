@@ -120,7 +120,11 @@ where
             if phase.starts_with(support::PHASE_PREFIX) {
                 let at_ms = now_ms();
                 if let Ok(mut edges) = EDGES.lock() {
-                    edges.push(Edge { phase, entering: true, at_ms });
+                    edges.push(Edge {
+                        phase,
+                        entering: true,
+                        at_ms,
+                    });
                 }
             }
         }
@@ -132,7 +136,11 @@ where
             if phase.starts_with(support::PHASE_PREFIX) {
                 let at_ms = now_ms();
                 if let Ok(mut edges) = EDGES.lock() {
-                    edges.push(Edge { phase, entering: false, at_ms });
+                    edges.push(Edge {
+                        phase,
+                        entering: false,
+                        at_ms,
+                    });
                 }
             }
         }
@@ -256,7 +264,11 @@ fn the_admission_ladder_accounts_for_the_whole_of_init() {
     // 30.6 seconds, the largest hole of all.
     let tail = total_ms - cursor;
     if tail > worst.0 {
-        worst = (tail, "previous phase", "the end of init, with no phase open");
+        worst = (
+            tail,
+            "previous phase",
+            "the end of init, with no phase open",
+        );
     }
 
     println!(
