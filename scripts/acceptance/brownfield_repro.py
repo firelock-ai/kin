@@ -102,7 +102,7 @@ Options:
     --corpus-cache PATH  pinned upstream clones (default: ~/.cache/kin-brownfield-repro)
     --offline            refuse to fetch; the cache must already carry both pins
     --label NAME         label recorded in the JSON report
-    --only IDS           comma-separated check ids to run, 0 through 10 (default: all)
+    --only IDS           comma-separated check ids to run, 0 through 11 (default: all)
     --json PATH          write machine-readable results here
     --compare PATH       a prior run's --json; a check that passed there and fails
                          here reads REGRESSION rather than plain FAIL
@@ -267,6 +267,17 @@ APP_HANDLE_FABRICATED = [
 # `exports.Router = Router;`. It carries 32 in-repo hits, the first at
 # examples/multi-router/controllers/api_v1.js:5, so an authoritative absence on it is
 # the delete-what-Kin-called-safe case.
+# FIR-2758's three module-sourced consumers, each with the line the ticket cites
+# and grep confirms. A consumer found at file granularity is directionally right
+# and operationally incomplete: a developer still has to search the file by hand
+# and an editor integration has nothing to highlight. These are (focal export,
+# referencing file, line).
+EXPRESS_MODULE_SOURCED_SITES = (
+    ("Route", "test/Route.js", 6),
+    ("application", "test/exports.js", 38),
+    ("response", "test/exports.js", 48),
+)
+
 EXPRESS_EXPORT = "Router"
 EXPRESS_EXPORT_FILE = "lib/express.js"
 EXPRESS_EXPORT_LINE = 71
@@ -1988,6 +1999,64 @@ def check_10(suite):
     return res
 
 
+def check_11(suite):
+    """FIR-2758: a module-sourced consumer names the line, not just the file.
+
+    After kin#1152 every JavaScript file has a Module entity, and the consumers of
+    an export are found through it. Found is not the whole job: on 2c091d3f each
+    came back with `reference_lines` empty and `reference_lines_absent_reason`
+    `no_evidence_span`, so an answer that correctly named `test/Route.js` could not
+    say the use is on line 6.
+
+    The class is pinned here because the symptom stopped reproducing without an
+    attributable fix, and an unattributed fix can regress unattributably. Nothing
+    else in this suite reads `reference_lines` on a module-sourced row.
+
+    `no_evidence_span` is trustworthy as a label, which is what makes this check
+    cheap: `relation_reference_lines` has exactly two outcomes per evidence span,
+    a line inside the caller's file or a counted `outside_caller_file`, with no
+    third uncounted drop. So an empty list here means the parser recorded no
+    position, never that the projection hid one.
+    """
+    res = Result("11", "FIR-2758", "module-sourced consumers carry their site lines")
+    repo = suite.fixture("express")
+    try:
+        suite.sweep_gate("express")
+    except ProbeError as exc:
+        res.unknown(str(exc))
+        return res
+    for export, caller_file, line in EXPRESS_MODULE_SOURCED_SITES:
+        try:
+            payload = suite.cached(repo, "find_references", {"query": export})
+        except ProbeError as exc:
+            res.unknown("find_references(%s): %s" % (export, exc))
+            return res
+        if not (payload.get("focal_entity") or {}).get("id"):
+            res.unknown("find_references(%s) resolved no focal entity, so its "
+                        "reference lines cannot be judged" % export)
+            return res
+        counted, _withheld = upstream_rows(payload)
+        row = next((r for r in counted
+                    if r.get("file_path") == caller_file
+                    and str(r.get("kind", "")).lower() == "module"), None)
+        if row is None:
+            res.bad("%s: no module-sourced row for %s among %d counted row(s); the "
+                    "consumer is not found at all, which is FIR-2679 rather than "
+                    "this check"
+                    % (export, caller_file, len(counted)))
+            continue
+        lines = row.get("reference_lines") or []
+        if line in lines:
+            res.ok("%s: %s module names line %d" % (export, caller_file, line))
+        else:
+            res.bad("%s: %s module is counted but its reference_lines are %s, not "
+                    "the site at line %d (absent reason %r); the consumer is found "
+                    "and cannot be jumped to"
+                    % (export, caller_file, lines or "[]", line,
+                       row.get("reference_lines_absent_reason")))
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -2000,6 +2069,7 @@ CHECKS = [
     ("8", check_8),
     ("9", check_9),
     ("10", check_10),
+    ("11", check_11),
 ]
 
 
