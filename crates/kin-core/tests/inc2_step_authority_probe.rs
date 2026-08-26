@@ -749,3 +749,216 @@ fn a_merge_commit_reaches_both_parents_and_a_side_line_stays_out_of_the_other_br
         merge_projection.parent_oids.len()
     );
 }
+
+/// The last named unknown: does a step COMMIT when its head is a merge?
+///
+/// The commit probe is linear, so every step there had one parent. The merge
+/// probe stops at derivation, so nothing ever handed a merge-headed step to
+/// kin-db. This is the composition of the two, and it is the case a planner
+/// would otherwise meet first on any repository with a branch in it.
+///
+/// The interesting part is not the merge commit itself. It is that step two
+/// admits a WHOLE SIDE LINE that step one never saw, so the merge's second
+/// parent arrives in the same transaction as the merge, and kin-db checks a
+/// change's parents against its projection's parent aliases.
+#[test]
+fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line() {
+    let repository_id = hosted_shaped_id();
+    let source_root = tempfile::tempdir().unwrap();
+    let working = build_merged_publisher(source_root.path());
+    let init = kin_core::init_from_git_adopting(&working, &repository_id).unwrap();
+    let source = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+        .unwrap()
+        .open_manager()
+        .unwrap();
+
+    let (full, aliases, changes, default_ref) = {
+        let lease = source.read_authority();
+        let metadata = lease.metadata();
+        (
+            metadata.git_external_authority.clone().expect("Git-admitted"),
+            metadata.aliases.clone(),
+            lease.snapshot().changes.values().cloned().collect::<Vec<_>>(),
+            metadata.ref_state.default_ref.clone().expect("default ref"),
+        )
+    };
+    let pick = |needle: &str| {
+        changes
+            .iter()
+            .find(|change| change.message.contains(needle))
+            .cloned()
+            .unwrap_or_else(|| panic!("the fixture must contain a {needle} commit"))
+    };
+    let root = pick("root");
+    let side = pick("side work");
+    let main = pick("main work");
+    let merge = changes
+        .iter()
+        .find(|change| change.parents.len() == 2)
+        .cloned()
+        .expect("the fixture must produce a merge");
+
+    let oid_of = |change_id| {
+        aliases
+            .iter()
+            .find(|alias| alias.change_id == change_id)
+            .map(|alias| {
+                kin_model::ExternalObjectId::new(kin_model::ExternalObjectKind::Commit, alias.oid)
+            })
+            .expect("every Git-origin change has an alias")
+    };
+    let aliases_for = |carried: &[SemanticChange]| {
+        let ids: BTreeSet<_> = carried.iter().map(|change| change.id).collect();
+        aliases
+            .iter()
+            .filter(|alias| ids.contains(&alias.change_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // Step one stops on the main line, so it never sees the side line at all.
+    // Step two's head is the merge, which pulls the side line and the merge in
+    // together.
+    let step_one_head = oid_of(main.id);
+    let step_two_head = oid_of(merge.id);
+    let one_objects: Vec<_> = reachable_from(&full, step_one_head);
+    let one_ids: BTreeSet<_> = one_objects.iter().map(|record| record.object).collect();
+    let two_objects: Vec<_> = reachable_from(&full, step_two_head)
+        .into_iter()
+        .filter(|record| !one_ids.contains(&record.object))
+        .collect();
+    assert!(
+        !one_ids.contains(&oid_of(side.id)),
+        "step one must not already hold the side line, or this probe is not testing what it says"
+    );
+
+    let derive = |head: kin_model::ExternalObjectId, records: Vec<kin_model::ExternalObjectRecord>| {
+        let mut loader = ManagerBodyLoader(&source);
+        kin_model::GitExternalAuthority::from_raw_parts(
+            repository_id.clone(),
+            full.object_format,
+            vec![kin_model::GitRawRef {
+                name: default_ref.clone(),
+                target: kin_model::GitRawTarget::Direct { object: head },
+            }],
+            kin_model::GitRawTarget::Symbolic {
+                target: default_ref.clone(),
+            },
+            records,
+            &mut loader,
+        )
+        .expect("a step authority derives")
+    };
+    let authority_one = derive(step_one_head, one_objects.clone());
+    let authority_two = derive(step_two_head, reachable_from(&full, step_two_head));
+
+    let destination_root = tempfile::tempdir().unwrap();
+    let destination = RepositoryAuthorityManager::open(
+        repository_id.clone(),
+        Arc::new(LocalFileBackend::new(destination_root.path().to_path_buf())),
+    )
+    .unwrap();
+    for record in one_objects.iter().chain(two_objects.iter()) {
+        let bytes = source.load_source_blob(record.body_hash).unwrap().unwrap();
+        destination.save_source_blob(record.body_hash, &bytes).unwrap();
+    }
+    for change in &changes {
+        for delta in &change.tree_deltas {
+            if let Some(state) = delta.new_state() {
+                if let Some(hash) = state.entry.blob_identity() {
+                    if let Some(bytes) = source.load_source_blob(hash).unwrap() {
+                        destination.save_source_blob(hash, &bytes).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    let commit = |carried: Vec<SemanticChange>,
+                  objects: Vec<kin_model::ExternalObjectRecord>,
+                  authority: &kin_model::GitExternalAuthority,
+                  previous: Option<&kin_model::GitExternalAuthority>,
+                  head: kin_model::ExternalObjectId,
+                  op: u128| {
+        let lease = destination.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(uuid::Uuid::from_u128(op)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("inc2-merge-step-probe"),
+            reason: format!("step publishing {}", head.oid),
+            external_objects: objects,
+            git_authority_delta: Some(match previous {
+                None => GitExternalAuthorityDelta::initialize(authority.clone()),
+                Some(old) => GitExternalAuthorityDelta::update(old.clone(), authority.clone()),
+            }),
+            aliases: aliases_for(&carried),
+            changes: carried,
+            ref_mutations: vec![RefMutation {
+                name: default_ref.clone(),
+                expected: match previous {
+                    None => RefExpectation::MustNotExist,
+                    Some(_) => RefExpectation::MustEqual {
+                        target: kin_model::RefTarget::external_object(step_one_head),
+                    },
+                },
+                new_target: Some(kin_model::RefTarget::external_object(head)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: previous.is_none().then(|| DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(default_ref.clone()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        drop(lease);
+        transaction.validate().expect("the step transaction is well formed");
+        destination.commit_repository_transaction(transaction)
+    };
+
+    match commit(
+        vec![root.clone(), main.clone()],
+        one_objects,
+        &authority_one,
+        None,
+        step_one_head,
+        601,
+    ) {
+        Ok(receipt) => eprintln!("INC2 MERGE-STEP 1: committed, generation {}", receipt.generation),
+        Err(error) => panic!("INC2 MERGE-STEP 1 REFUSED: {error}"),
+    }
+    // Parent-before-child inside the step: the side line arrives before the
+    // merge that reaches it.
+    match commit(
+        vec![side.clone(), merge.clone()],
+        two_objects,
+        &authority_two,
+        Some(&authority_one),
+        step_two_head,
+        602,
+    ) {
+        Ok(receipt) => eprintln!("INC2 MERGE-STEP 2: committed, generation {}", receipt.generation),
+        Err(error) => panic!(
+            "INC2 MERGE-STEP 2 REFUSED, so a merge-headed step is a real bound rather than a \
+             composition that just works: {error}"
+        ),
+    }
+
+    let lease = destination.read_authority();
+    assert_eq!(
+        lease.snapshot().changes.len(),
+        4,
+        "the destination must hold the whole merged history"
+    );
+    assert_eq!(
+        lease.resolve_ref_target(&default_ref).unwrap(),
+        Some(kin_model::RefTarget::external_object(step_two_head)),
+        "the ref must stand at the merge"
+    );
+    eprintln!("INC2 MERGE-STEP RESULT: a merge-headed step COMMITS over a step that never saw the side line");
+}
