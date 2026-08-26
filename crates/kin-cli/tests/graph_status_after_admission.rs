@@ -1057,8 +1057,9 @@ fn graph_status_publishes_per_language_parse_coverage_without_a_verdict() {
         .find(|line| line.trim_start().starts_with("javascript:"))
         .unwrap_or_else(|| panic!("no javascript row in:\n{lines}"));
     assert!(
-        js_row.contains("4/4"),
-        "every javascript file carries at least its module entity since FIR-2675: {js_row}"
+        js_row.contains("5/5"),
+        "every javascript file carries at least its module entity since FIR-2675, including \
+         lib/quiet.js, which declares nothing and would have been silent before it: {js_row}"
     );
 
     // The control, and the half that can fail. A count is not a defect, so this
@@ -1101,6 +1102,17 @@ fn seed_mixed_language_repository(repo: &Path, silent: usize) {
         )
         .expect("write a parseable module");
     }
+    // A comment-only JavaScript file, which is the shape that used to be silent
+    // and no longer is. It exists so the javascript row below can tell the port
+    // working from the four parseable modules merely parsing: those four produce
+    // entities from their own functions with or without a module entity, so a
+    // row reading 4/4 says nothing about FIR-2675 at all. With this file the row
+    // is 5/5, and it falls to 4/5 the moment JavaScript stops emitting modules.
+    fs::write(
+        repo.join("lib/quiet.js"),
+        b"// nothing is declared here either\n" as &[u8],
+    )
+    .expect("write a formerly-silent javascript module");
     for index in 0..silent {
         // The silent files are RUST, and they used to be JavaScript. FIR-2675
         // made every JavaScript and TypeScript file emit a Module entity, so a
