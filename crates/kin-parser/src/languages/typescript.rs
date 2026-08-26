@@ -60,27 +60,6 @@ impl LanguageAdapter for TypeScriptAdapter {
         let root = tree.root_node();
         let mut cursor = root.walk();
 
-        // Emit a Module entity for every TypeScript source file, through the
-        // same helper JavaScript uses. The two adapters carried byte-identical
-        // copies of this rule and drifted anyway: the TypeScript index predicate
-        // never matched `index.d.ts`. Sharing the helper is what the header
-        // comment above already says the shared surface exists for.
-        let (module_name, is_package) = js_module_identity(&file_id.0, TS_SUFFIXES);
-        if !module_name.is_empty() {
-            entities.push(ExtractedEntity {
-                kind: EntityKind::Module,
-                name: module_name,
-                signature: if is_package {
-                    format!("package {}", file_id.0)
-                } else {
-                    format!("module {}", file_id.0)
-                },
-                visibility: Visibility::Public,
-                doc_summary: None,
-                fingerprint: compute_fingerprint(&root, source),
-                span: span_from_node(&root, file_id),
-            });
-        }
 
         // Read the file's property-defining helpers before walking it; a
         // helper is not bound to its uses by declaration order.
@@ -103,6 +82,43 @@ impl LanguageAdapter for TypeScriptAdapter {
             collect_js_require_imports(&child, source, &mut imports);
             // Detect describe/it/test calls (Jest/Vitest/Mocha)
             extract_js_tests(&child, source, &mut tests);
+        }
+
+        // Emitted after the walk and BEFORE `owners.finish`, and both halves of
+        // that are load-bearing.
+        //
+        // After the walk, because Python emits its module last and every
+        // consumer that looks an entity up by name depends on it: with the
+        // module first, a `.find(|e| leaf(e.name) == "caller")` over `caller.ts`
+        // returns the MODULE rather than the function, which is how the rename
+        // planner's TypeScript case lost its call edge.
+        //
+        // Before `owners.finish`, because that function's collision guard reads
+        // the entity list to decide whether a receiver's owner already exists.
+        // Run after it, the module is invisible to the guard, which then
+        // synthesizes a Class under the same name and leaves one file holding
+        // two entities called `router` that the linker's (file, name) index
+        // cannot tell apart. That is the exact outcome its own comment warns
+        // about.
+        // same helper JavaScript uses. The two adapters carried byte-identical
+        // copies of this rule and drifted anyway: the TypeScript index predicate
+        // never matched `index.d.ts`. Sharing the helper is what the header
+        // comment above already says the shared surface exists for.
+        let (module_name, is_package) = js_module_identity(&file_id.0, TS_SUFFIXES);
+        if !module_name.is_empty() {
+            entities.push(ExtractedEntity {
+                kind: EntityKind::Module,
+                name: module_name,
+                signature: if is_package {
+                    format!("package {}", file_id.0)
+                } else {
+                    format!("module {}", file_id.0)
+                },
+                visibility: Visibility::Public,
+                doc_summary: None,
+                fingerprint: compute_fingerprint(&root, source),
+                span: span_from_node(&root, file_id),
+            });
         }
 
         owners.finish(&mut entities);
@@ -128,6 +144,7 @@ impl LanguageAdapter for TypeScriptAdapter {
                 }
             }
         }
+
 
         Ok(ParseOutput {
             entities,

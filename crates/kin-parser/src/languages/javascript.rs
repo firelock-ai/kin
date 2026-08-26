@@ -51,29 +51,6 @@ impl LanguageAdapter for JavaScriptAdapter {
         let root = tree.root_node();
         let mut cursor = root.walk();
 
-        // Emit a Module entity for every JavaScript source file, as Python does.
-        // Previously only index files produced one, and only when their directory
-        // was not `src` or `lib`, so one of the 58 JS/TS files kin itself tracks
-        // carried a module entity. A file with no module entity cannot SOURCE an
-        // entity-level import edge, because the linker anchors those on the
-        // importing file's module, so every import in every other file stayed
-        // invisible to `find_references`.
-        let (module_name, is_package) = js_module_identity(&file_id.0, JS_SUFFIXES);
-        if !module_name.is_empty() {
-            entities.push(ExtractedEntity {
-                kind: EntityKind::Module,
-                name: module_name,
-                signature: if is_package {
-                    format!("package {}", file_id.0)
-                } else {
-                    format!("module {}", file_id.0)
-                },
-                visibility: Visibility::Public,
-                doc_summary: None,
-                fingerprint: compute_fingerprint(&root, source),
-                span: span_from_node(&root, file_id),
-            });
-        }
 
         // Read the file's property-defining helpers before walking it.
         // Declaration order does not bind a helper to its uses: express
@@ -99,6 +76,45 @@ impl LanguageAdapter for JavaScriptAdapter {
             extract_js_tests_from_node(&child, source, &mut tests);
         }
 
+        // Emitted after the walk and BEFORE `owners.finish`, and both halves of
+        // that are load-bearing.
+        //
+        // After the walk, because Python emits its module last and every
+        // consumer that looks an entity up by name depends on it: with the
+        // module first, a `.find(|e| leaf(e.name) == "caller")` over `caller.ts`
+        // returns the MODULE rather than the function, which is how the rename
+        // planner's TypeScript case lost its call edge.
+        //
+        // Before `owners.finish`, because that function's collision guard reads
+        // the entity list to decide whether a receiver's owner already exists.
+        // Run after it, the module is invisible to the guard, which then
+        // synthesizes a Class under the same name and leaves one file holding
+        // two entities called `router` that the linker's (file, name) index
+        // cannot tell apart. That is the exact outcome its own comment warns
+        // about.
+        // Previously only index files produced one, and only when their directory
+        // was not `src` or `lib`, so one of the 58 JS/TS files kin itself tracks
+        // carried a module entity. A file with no module entity cannot SOURCE an
+        // entity-level import edge, because the linker anchors those on the
+        // importing file's module, so every import in every other file stayed
+        // invisible to `find_references`.
+        let (module_name, is_package) = js_module_identity(&file_id.0, JS_SUFFIXES);
+        if !module_name.is_empty() {
+            entities.push(ExtractedEntity {
+                kind: EntityKind::Module,
+                name: module_name,
+                signature: if is_package {
+                    format!("package {}", file_id.0)
+                } else {
+                    format!("module {}", file_id.0)
+                },
+                visibility: Visibility::Public,
+                doc_summary: None,
+                fingerprint: compute_fingerprint(&root, source),
+                span: span_from_node(&root, file_id),
+            });
+        }
+
         owners.finish(&mut entities);
 
         // Build import lookup: local_name -> module_path
@@ -122,6 +138,7 @@ impl LanguageAdapter for JavaScriptAdapter {
                 }
             }
         }
+
 
         Ok(ParseOutput {
             entities,
@@ -2868,9 +2885,14 @@ exports.static = require('serve-static');
             .collect();
         assert_eq!(
             named,
+            // The module comes LAST, as Python's does. What this test is about
+            // is that there is exactly one `router` and it is still a Module:
+            // the guard in `JsOwners::finish` reads the entity list to decide
+            // whether the owner already exists, so the module has to be in that
+            // list before it runs, and it is.
             vec![
-                (EntityKind::Module, "router"),
                 (EntityKind::Method, "router.handle"),
+                (EntityKind::Module, "router"),
             ],
             "the module keeps its kind and no second `router` is added"
         );

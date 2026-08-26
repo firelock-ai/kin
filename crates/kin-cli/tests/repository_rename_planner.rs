@@ -621,7 +621,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.ts",
         caller_source: "import { target } from './defs';\nexport function caller(): number { return target() + target(); }\n",
         has_named_import: true,
-        emits_module_entity_per_file: false,
+        emits_module_entity_per_file: true,
         records_call_sites: true,
     },
     LanguageFixture {
@@ -631,7 +631,7 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         caller_path: "caller.js",
         caller_source: "import { target } from './defs';\nexport function caller() { return target() + target(); }\n",
         has_named_import: true,
-        emits_module_entity_per_file: false,
+        emits_module_entity_per_file: true,
         records_call_sites: true,
     },
     LanguageFixture {
@@ -814,12 +814,14 @@ fn real_linker_spanless_relations_are_exact_or_refused_across_eight_languages() 
             },
         );
         if fixture.has_named_import && !fixture.emits_module_entity_per_file {
-            // FIR-2675, not FIR-2690. The parser records this language's import
-            // span correctly; there is simply no module entity to source the
-            // edge at, so no entity-level import edge exists and no evidence
-            // carries the span. The refusal is right and stays asserted, so
-            // this suite says out loud which languages the import fix does not
-            // reach yet.
+            // FIR-2675 emptied this branch. It held JavaScript and TypeScript,
+            // which recorded their import spans correctly and had no module
+            // entity to source the edge at, so the refusal was right and this
+            // suite said out loud which languages the import fix did not reach.
+            // Both now emit a module entity per file and have moved to the
+            // branch below. The branch stays rather than being deleted: it is
+            // the shape any language added without a per-file module falls into,
+            // and it is what would catch a regression that took one back out.
             let error = result.unwrap_err();
             assert!(
                 error

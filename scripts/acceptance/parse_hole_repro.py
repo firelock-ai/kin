@@ -155,7 +155,7 @@ def doctor_row_names_the_files(report):
         return None
     row = rows[0]
     detail = row.get("detail") or ""
-    return row.get("status") == "healthy" and ".js" in detail
+    return row.get("status") == "healthy" and ".rs" in detail
 
 
 GRADERS = {
@@ -224,13 +224,22 @@ class Suite(object):
                     "module.exports = handler%d;\n" % (following, index, index)
                 )
         for index in range(silent):
-            # Valid UTF-8 JavaScript that declares nothing. This is the honest
-            # shape: bytes an adapter is registered for, admitted as source, and
-            # holding no entity. NUL bytes would route the file to the opaque
-            # facet instead, which is a different state wearing the same
-            # numbers, and it is what an earlier version of this fixture used.
-            with open(os.path.join(repo, "lib", "silent%d.js" % index), "w") as handle:
-                handle.write("require('./module0');\n// nothing is declared here\n")
+            # The silent files are RUST, and they used to be JavaScript.
+            # FIR-2675 made every JavaScript and TypeScript file emit a Module
+            # entity, so a comment-only `.js` file now produces one and is no
+            # longer silent: measured at 1 entity for exactly these bytes against
+            # 0 before. That is the port working, and it emptied this fixture's
+            # hole as a side effect, which is what this suite caught.
+            #
+            # Rust carries no per-file module entity, so a comment-only `.rs`
+            # file still produces nothing: measured at 0. It is the same honest
+            # shape the old comment described, bytes an adapter is registered
+            # for, admitted as source, and holding no entity. NUL bytes would
+            # route the file to the opaque facet instead, which is a different
+            # state wearing the same numbers, and it is what an earlier version
+            # of this fixture used.
+            with open(os.path.join(repo, "lib", "silent%d.rs" % index), "w") as handle:
+                handle.write("// nothing is declared here\n")
         self.git(["add", "--all"], repo)
         rc, out = self.git(["commit", "-m", "a javascript library"], repo)
         if rc != 0:
@@ -322,15 +331,15 @@ def self_test():
     cases = [
         ("status_publishes_the_census", True,
          "Parse coverage (files that produced an entity / files admitted):\n"
-         "  javascript: 4/7 (57%)\n  no_entity: 3 of 7 admitted javascript files produced "
-         "no entity, including lib/silent0.js"),
+         "  javascript: 4/7 (57%)\n  no_entity: 3 of 7 admitted rust files produced "
+         "no entity, including lib/silent0.rs"),
         # The header alone is not the delta: a repository-grain count already
         # existed on that page, and the per-language row plus the named paths
         # are what this suite is about.
         ("status_publishes_the_census", False,
          "Parse coverage (files that produced an entity / files admitted):\n"
-         "  javascript: 7/7 (100%)"),
-        ("status_publishes_the_census", False, "no_entity: 3 of 7 admitted javascript files"),
+         "  rust: 3/3 (100%)"),
+        ("status_publishes_the_census", False, "no_entity: 3 of 3 admitted rust files"),
         ("status_publishes_the_census", False, "Entities: 4  |  Files: 4"),
     ]
     failures = []
@@ -342,13 +351,13 @@ def self_test():
     # The doctor grader reads a structure rather than a string.
     doctor_cases = [
         (True, {"checks": [{"id": "parse_coverage", "status": "healthy",
-                            "detail": "javascript 4/7; no_entity: 3 of 7, including lib/silent0.js"}]}),
+                            "detail": "rust 0/3; no_entity: 3 of 3, including lib/silent0.rs"}]}),
         # A row that went red on a count is the failure mode this suite exists
         # to prevent, so the grader must not accept one.
         (False, {"checks": [{"id": "parse_coverage", "status": "stale",
-                             "detail": "javascript 4/7, including lib/silent0.js"}]}),
+                             "detail": "rust 0/3, including lib/silent0.rs"}]}),
         (False, {"checks": [{"id": "parse_coverage", "status": "healthy",
-                             "detail": "javascript 7/7"}]}),
+                             "detail": "rust 3/3"}]}),
         (False, {"checks": [{"id": "parse_coverage", "status": "healthy"}]}),
         (None, {"checks": [{"id": "relation_census", "status": "healthy"}]}),
         (None, {"checks": []}),
