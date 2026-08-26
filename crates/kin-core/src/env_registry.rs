@@ -34,6 +34,12 @@ mod generated {
 }
 pub use generated::GENERATED_KNOBS;
 
+/// The daemon's graph-authority test hold, named once so the registry entry,
+/// the read site in `kin-daemon`, and the acceptance check that arms it cannot
+/// drift apart. A lever spelled three times is a lever that silently stops
+/// working when one spelling changes.
+pub const GRAPH_AUTHORITY_TEST_HOLD_MS_VAR: &str = "KIN_DAEMON_TEST_GRAPH_AUTHORITY_HOLD_MS";
+
 /// Value-kind of a `KIN_*` variable. Drives both validation and the documented
 /// contract for what an operator may set.
 #[derive(Debug, Clone, Copy)]
@@ -418,6 +424,7 @@ pub const DOWNSTREAM: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_EMBED_PIPELINED", kind: Kind::Bool, default: "", sensitivity: Sensitivity::Correctness, summary: "kin-db staged embed pipeline overlapping prep, forward, and persist; unset engages it only under the throughput resource profile, and an explicit value overrides in either direction. The serial path is what keeps persisted vector order byte-for-byte, so forcing it on makes a run non-citable" },
     // ---- kin-db: embedding diagnostics and fault injection --------------------
     EnvVarSpec { name: "KIN_EMBED_BATCH_TRACE", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Diagnostic, summary: "kin-db per-sub-batch embedding shape and forward-timing trace; any non-empty value other than '0' enables it" },
+    EnvVarSpec { name: GRAPH_AUTHORITY_TEST_HOLD_MS_VAR, kind: Kind::Usize, default: "", sensitivity: Sensitivity::Diagnostic, summary: "daemon fault injection: every graph-authority mutation guard holds its window open this many extra milliseconds before closing, so an acceptance check can place a reference read inside a real write window on demand instead of racing an enrichment sweep for one; unset or zero disarms it. Test IO only: it changes how long a window stays open, never what any answer says" },
     EnvVarSpec { name: "KIN_EMBED_TEST_FORCE_METAL_OOM", kind: Kind::Usize, default: "", sensitivity: Sensitivity::Diagnostic, summary: "kin-db fault injection: replaces the first N Metal embedding dispatches with a synthetic out-of-memory so the CPU-degrade retry path can be exercised; unset or non-positive disarms it" },
     // ---- kin-db: lexical ranking weight ---------------------------------------
     EnvVarSpec { name: "KIN_LOCATE_WEIGHT_FILE_PATH", kind: Kind::NonNegF32, default: "0", sensitivity: Sensitivity::Correctness, summary: "kin-db BM25 field weight for the file path; 0 (the default) keeps file paths out of lexical scoring so entities rank on names, signatures, and bodies, and any positive value indexes path text and changes ranking" },
