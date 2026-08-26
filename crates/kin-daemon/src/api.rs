@@ -17488,6 +17488,162 @@ mod tests {
         std::fs::remove_dir_all(&fixture.working).ok();
     }
 
+    /// What the transfer will say about these fixtures once the authority bound
+    /// moves, MEASURED rather than reasoned about.
+    ///
+    /// The push pin beside this cannot reach the size bound: the authority
+    /// comparison runs first and answers 409 for both arms. So the size bound's
+    /// behaviour would be an assertion nobody had ever run, written against a
+    /// route that does not exist, and the first time anyone saw its result
+    /// would be the day it mattered. That is the shape of an assertion that
+    /// turns out to have been wrong all along.
+    ///
+    /// This runs it today by removing the one thing that stops it. The
+    /// expectation is built from the SOURCE store's own transfer status, so its
+    /// `git_authority_hash` is the source's own and `TransferSourceContext::read`
+    /// agrees with itself; the destination is set unborn, which is what an empty
+    /// hosted store looks like. Everything downstream of the authority
+    /// comparison then runs for real against a real payload.
+    ///
+    /// What it establishes, and none of it was measured before:
+    ///
+    /// The under-cap arm assembles a pack. Its body closure covers every blob
+    /// the fixture wrote, verified by content hash against the source digests
+    /// rather than by counting bodies.
+    ///
+    /// The over-cap arm is refused, and refused by the INDIVISIBLE-STEP path
+    /// rather than by `validate_pack`. A one-commit history is one change, and
+    /// `Assembled::OverNegotiatedBound` is segmentation, so the builder has
+    /// nothing smaller to try. The sentence names `over negotiated limit`, which
+    /// is what the push pin's negative assertions are keyed on, so this is also
+    /// what proves those strings are the right ones to watch for.
+    #[cfg(unix)]
+    #[test]
+    fn the_size_bound_answers_for_real_once_the_authority_bound_is_out_of_the_way() {
+        let main = kin_model::RefName::branch(b"main").unwrap();
+
+        for (label, blobs, fits) in [
+            ("under", PAYLOAD_BLOBS_UNDER_CAP, true),
+            ("over", PAYLOAD_BLOBS_OVER_CAP, false),
+        ] {
+            let hosted_id = hosted_repository_id();
+            let hosted_repository = RepositoryId::new(hosted_id).unwrap();
+            let fixture = payload_fixture(label, blobs, &hosted_repository);
+            let authority =
+                ActiveApiRepositoryAuthority::open_layout_for_test(&fixture.layout).unwrap();
+
+            let status = kin_remote::repository_transfer::repository_transfer_status(
+                &authority.manager,
+                &hosted_repository,
+                &main,
+            )
+            .unwrap();
+            let mut expectation =
+                kin_remote::repository_transfer::RepositoryTransferExpectation::try_from(status)
+                    .unwrap();
+            // An empty hosted store's ref is unborn. Both fields move together
+            // because `validate_expectation` requires them both present or both
+            // absent, and a half-set destination would be refused for a reason
+            // that is not the one under test.
+            expectation.destination_target = None;
+            expectation.destination_head = None;
+
+            // The SEGMENT builder, because that is what a push calls
+            // (`push_to_remote` -> `build_repository_transfer_segment`). Its
+            // sibling `build_repository_transfer_pack` refuses the same
+            // condition with a shorter sentence, so probing that one would pin
+            // wording no push can produce. Measured, not read: the first draft
+            // of this test called the sibling and got
+            // `carries a 16777491 byte source body closure, over negotiated
+            // limit 16777216` with no mention of the indivisible step.
+            let built = kin_remote::repository_transfer::build_repository_transfer_segment(
+                &authority.manager,
+                &main,
+                &expectation,
+            );
+
+            if fits {
+                let pack = built
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "the {label} arm must assemble a segment once authority agrees: {error}"
+                        )
+                    })
+                    .pack;
+                let closure: u64 = pack.bodies.iter().map(|body| body.byte_len).sum();
+                assert!(
+                    closure >= fixture.payload_bytes,
+                    "the {label} arm's body closure must cover the payload it wrote: \
+                     {closure} against {}",
+                    fixture.payload_bytes
+                );
+                // By content hash, never by count. A pack carrying the right
+                // number of bodies with the wrong bytes passes any count.
+                let carried: std::collections::BTreeSet<String> = pack
+                    .bodies
+                    .iter()
+                    .map(|body| {
+                        hex::encode(Sha256::digest(
+                            &body
+                                .decode()
+                                .expect("a pack body decodes to its declared length"),
+                        ))
+                    })
+                    .collect();
+                for (path, want) in &fixture.source_digests {
+                    assert!(
+                        carried.contains(want),
+                        "the {label} arm's pack carries no body whose bytes hash to the \
+                         fixture's {path}"
+                    );
+                }
+            } else {
+                let error = built.err().unwrap_or_else(|| {
+                    panic!(
+                        "the over-cap arm must be refused once authority agrees, or the \
+                         cap FIR-2746 records does not bind"
+                    )
+                });
+                let message = error.to_string();
+                assert!(
+                    message.contains("over negotiated limit"),
+                    "the {label} arm must name the negotiated byte limit: {message}"
+                );
+                assert!(
+                    message.contains("cannot be split across continuation packs"),
+                    "a one-commit history is one change, so the refusal must be the \
+                     indivisible-step one rather than a segmentation retry: {message}"
+                );
+                // The number the refusal reports is a LOWER bound, not the
+                // payload. `assemble_segment_pack` returns the moment the
+                // running total crosses the limit, so it names the total at the
+                // crossing and stops counting. Asserting it equalled the
+                // fixture's 24 MiB would fail against a correct implementation.
+                assert!(
+                    message.contains(
+                        &kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES
+                            .to_string()
+                    ),
+                    "the refusal must name the limit it enforced, which is what makes \
+                     the number in it readable: {message}"
+                );
+                // The variant decides the HTTP status the push pin watches, so
+                // it is asserted here rather than left to be assumed there.
+                assert!(
+                    matches!(
+                        error,
+                        kin_remote::repository_transfer::RepositoryTransferError::Invalid(_)
+                    ),
+                    "the size bound must be Invalid, which maps to 422 and is what \
+                     separates it from the authority bound's 409: {message}"
+                );
+            }
+
+            drop(authority);
+            std::fs::remove_dir_all(&fixture.working).ok();
+        }
+    }
+
     /// Two replicas of ONE repository: a real local one with a graph-owned
     /// workspace projecting into a working directory, and a peer that forked
     /// from it and has since moved `refs/heads/main` ahead by one exact edit.
