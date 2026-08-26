@@ -2274,6 +2274,29 @@ impl DaemonState {
     /// spine initialization receives only retained identity/storage bindings,
     /// so a registry edit or storage-root replacement cannot silently change
     /// the daemon's authority set.
+    ///
+    /// **The manifest names the repository; the registry only points at it.**
+    /// This used to refuse a sibling whose registry id differed from its
+    /// manifest's `repo_id`. The two are written by different producers in
+    /// different alphabets: the manifest mints a UUID (`KinManifest::new`) and
+    /// the registry records the directory name (`kin_migrate::update_registry`,
+    /// which is what `kin init` calls). A UUID is never a directory name, so the
+    /// comparison could not pass for any repository on any host, and cross-repo
+    /// spine authority has been empty since it landed. One refused sibling also
+    /// sets `incomplete`, which invalidates the cross-repo edges of every
+    /// registered repo including the primary, so the cost was the whole edge set
+    /// rather than one absent sibling.
+    ///
+    /// Reading the manifest is strictly the safer of the two. The registry is a
+    /// file a user can edit and a stale row can point at a path holding a
+    /// different repository entirely; the manifest is read from the path that is
+    /// actually there, so the identity always describes what was actually
+    /// opened. The registry id is kept only to name the row in a log.
+    ///
+    /// Two rows resolving to one repository identity is the one case this still
+    /// refuses. It means two registry paths hold the same repository, a copied
+    /// checkout being the usual cause, and registering both would silently let
+    /// one overwrite the other's graph authority under the same spine key.
     fn pin_registered_local_repository_authorities(
         layout: &KinLayout,
     ) -> (Vec<RegisteredLocalRepositoryAuthority>, bool) {
@@ -2291,8 +2314,9 @@ impl DaemonState {
             .root()
             .canonicalize()
             .unwrap_or_else(|_| layout.root().to_path_buf());
-        let mut pinned = Vec::new();
+        let mut pinned: Vec<RegisteredLocalRepositoryAuthority> = Vec::new();
         let mut incomplete = false;
+        let mut adopted_identities = 0usize;
 
         for repo in registry.repos {
             let repo_root = repo
@@ -2318,20 +2342,42 @@ impl DaemonState {
                         continue;
                     }
                 };
-            if binding.repository_id().as_str() != repo.id {
+            let manifest_repo_id = binding.repository_id().as_str().to_string();
+            if let Some(existing) = pinned
+                .iter()
+                .find(|pinned| pinned.repo_id == manifest_repo_id)
+            {
                 incomplete = true;
                 warn!(
                     repo_id = %repo.id,
                     path = %repo.path.display(),
-                    manifest_repo_id = %binding.repository_id(),
-                    "registry repository identity does not match startup-pinned manifest authority"
+                    manifest_repo_id = %manifest_repo_id,
+                    already_pinned_as = %existing.repo_id,
+                    "two registry paths hold one repository identity; the later one is not pinned"
                 );
                 continue;
             }
+            if manifest_repo_id != repo.id {
+                adopted_identities += 1;
+                debug!(
+                    registry_id = %repo.id,
+                    path = %repo.path.display(),
+                    manifest_repo_id = %manifest_repo_id,
+                    "registry row names the repository by a label; pinning its manifest identity"
+                );
+            }
             pinned.push(RegisteredLocalRepositoryAuthority {
-                repo_id: repo.id,
+                repo_id: manifest_repo_id,
                 binding,
             });
+        }
+
+        if adopted_identities > 0 {
+            info!(
+                adopted = adopted_identities,
+                pinned = pinned.len(),
+                "pinned sibling authorities under their manifest identities"
+            );
         }
 
         (pinned, incomplete)
@@ -7880,29 +7926,44 @@ mod tests {
             })
             .unwrap();
 
-        let (repo_count, edge_count, registered_sibling_root) = {
+        let primary_repo_id = state.cached_repo_id.clone();
+        let (repo_count, edge_count, spine_ids, sibling_roots) = {
             let spine = state.ensure_spine().expect("spine must be enabled");
-            (
-                spine.repo_count(),
-                spine.edge_count(),
-                spine.root_hash(&sibling_id),
-            )
+            let ids = spine.registered_repo_ids();
+            let roots = ids
+                .iter()
+                .filter(|id| *id != &primary_repo_id)
+                .filter_map(|id| spine.root_hash(id).map(|root| (id.clone(), root)))
+                .collect::<Vec<_>>();
+            (spine.repo_count(), spine.edge_count(), ids, roots)
         };
 
+        // Deliberately says nothing about WHICH identity the spine keys on. That
+        // is the open design question this check must outlive: it pins the
+        // consequence, that a sibling `kin init` registered is pinned and its
+        // edges materialize, so an identity change can move the key without
+        // moving this check, and cannot silently zero the spine.
         assert_eq!(
             repo_count, 2,
             "the sibling `kin init` registered must be pinned beside the primary \
-             (registry id {sibling_id:?}); a repo_count of 1 means the daemon refused it at startup"
+             (registry id {sibling_id:?}, spine ids {spine_ids:?}); a repo_count of 1 \
+             means the daemon refused it at startup"
+        );
+        assert_eq!(
+            sibling_roots.len(),
+            1,
+            "exactly one non-primary repository must carry a registered root \
+             (got {sibling_roots:?})"
         );
         assert!(
-            registered_sibling_root.is_some(),
-            "the pinned sibling must be registered in the spine under the identity the \
-             registry carries ({sibling_id:?})"
+            !sibling_roots[0].1.is_empty(),
+            "the pinned sibling's registered root must be its real graph root, not empty \
+             (got {sibling_roots:?})"
         );
         assert!(
             edge_count > 0,
             "cross-repo edges must materialize for a sibling registered the way `kin init` \
-             registers one (got {edge_count})"
+             registers one (got {edge_count}, spine ids {spine_ids:?})"
         );
     }
 
