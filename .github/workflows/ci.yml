@@ -294,6 +294,30 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744. `rust-cache` hashes EVERY toolchain `rustup toolchain
+          # list` reports, not the one this repository pins, so two jobs in one
+          # run that drew runner images with different preinstalled Rust
+          # produce different keys and cannot share an entry. Measured on run
+          # 32961965498: `check` saw 1.96.0/1.97.1 and hit
+          # `v0-rust-check-Linux-x64-8374e8ea-433e5115`, while
+          # `feature-tests` saw 1.96.0/1.98.0 sixty-five seconds later, asked
+          # `...-6ea01539-...` and logged `No cache found.` Same prefix, same
+          # lockfile hash, nothing in this repository chose either image.
+          #
+          # What this drops, stated rather than assumed. The hash covers the
+          # toolchain versions AND every CARGO, CC, CFLAGS, CXX, CMAKE and RUST
+          # environment variable. Toolchain sensitivity survives, because
+          # `rust-toolchain.toml` and `.github/actions/rust-toolchain/action.yml`
+          # are both in the key's lockfiles half, which the job log's
+          # "Lockfiles considered" list shows. Environment sensitivity does not,
+          # and that only matters where a key is SHARED between jobs, which is
+          # `check`, `check-macos` and `feature-tests`. They declare an
+          # identical cargo env today and
+          # `assert_shared_cache_key_jobs_declare_one_environment` in
+          # scripts/test-release-workflow-authority.py is what keeps them that
+          # way, because a divergence would otherwise be a silent cache
+          # collision rather than a failure.
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
@@ -448,6 +472,8 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
@@ -515,6 +541,8 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
 
@@ -1509,6 +1537,8 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
@@ -1802,6 +1832,8 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # See .github/clippy-allowed-lints.txt. This is the only clippy pass over
@@ -2164,6 +2196,8 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
           shared-key: ${{ matrix.os == 'macos-latest' && 'check-macos' || 'check' }}
           save-if: false
 
@@ -2335,6 +2369,8 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744, and see the note on the first cache step in this file.
+          add-rust-environment-hash-key: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # The build stamps its own source identity, and `kin bench-meta` reports
