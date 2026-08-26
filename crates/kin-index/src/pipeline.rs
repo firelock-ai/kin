@@ -300,13 +300,26 @@ impl IndexPipeline {
             parse_state,
         } = output;
 
-        // Convert extracted entities to model entities
+        // Convert extracted entities to model entities.
+        //
+        // The in-file test promotion below is the same one the full-parse path
+        // applies, and it is here because its absence made role path-dependent:
+        // a `#[test] fn` in `src/lib.rs` was Test after a full parse and Source
+        // after an incremental reconcile, so the same code changed role
+        // depending on which path last touched the file (FIR-1940). A promotion
+        // on one path only is the shape kin#1123 caught in a different consumer.
         let role = classify_file_role(&file_id.0);
+        let test_names: std::collections::HashSet<&str> =
+            tests.iter().map(|test| test.name.as_str()).collect();
         let mut entities: Vec<Entity> = extracted_entities
             .into_iter()
             .map(|e| {
                 let mut ent = e.into_entity_with_source(language, file_id, Some(&source));
-                ent.role = role;
+                ent.role = if role == EntityRole::Source && test_names.contains(ent.name.as_str()) {
+                    EntityRole::Test
+                } else {
+                    role
+                };
                 ent
             })
             .collect();
@@ -676,6 +689,53 @@ fn is_test_dir_component(component: &str) -> bool {
 /// signature/breaking changes on the contract surface. A repo's actual test tree
 /// (`tests/`, `__tests__/`, or any `test_*`/`*_test` file) still resolves to the
 /// test role.
+/// Whether a filename names a test by one of the conventions the ecosystems in
+/// this registry actually use.
+///
+/// This was eight literal extensions, which classified `Foo.test.tsx`,
+/// `FooTest.java`, `foo_spec.rb` and every other colocated framework test as
+/// production source. A React repository with colocated tests read 100% Source,
+/// and two linker gates that filter on `role != Test` then removed nothing,
+/// because nothing was Test (FIR-1940).
+///
+/// The rule is delimited rather than a bare suffix, and the delimiter is what
+/// makes it safe to widen. `latest.java` ends with the letters `test.java`, and
+/// a lowercased `ends_with` would call it a test; `release.rs` under a `latest/`
+/// directory is the same hazard one level up. So a marker counts only when a
+/// delimiter or a case boundary separates it from the rest of the stem:
+///
+/// - `test_foo.py`, delimited by the underscore that follows.
+/// - `foo_test.go`, `foo_spec.rb`, delimited by the underscore before.
+/// - `foo.test.tsx`, `foo.spec.js`, delimited by the dot before, which covers
+///   every extension the JS and TS adapters claim rather than four of them.
+/// - `FooTest.java`, `FooTests.cs`, `FooSpec.kt`, `FooTests.swift`, delimited by
+///   the capital. This is the one case that reads the ORIGINAL spelling: the
+///   lowercased form cannot tell `FooTest` from `latest`.
+///
+/// `original` is the filename as written; `lower` is the same string lowercased,
+/// passed in because the caller already has it.
+fn is_test_file_name(original: &str, lower: &str) -> bool {
+    let stem_lower = lower.rsplit_once('.').map_or(lower, |(stem, _)| stem);
+    if stem_lower.starts_with("test_")
+        || stem_lower.ends_with("_test")
+        || stem_lower.ends_with("_spec")
+        || stem_lower.ends_with(".test")
+        || stem_lower.ends_with(".spec")
+    {
+        return true;
+    }
+    // The capital is the delimiter. Matching on the original spelling is what
+    // separates `FooTest` from `latest`, and lowercasing first is what made the
+    // widened rule unsafe in the first place.
+    let stem = original.rsplit_once('.').map_or(original, |(stem, _)| stem);
+    for marker in ["Test", "Tests", "Spec", "Specs"] {
+        if stem.len() > marker.len() && stem.ends_with(marker) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn classify_file_role(path: &str) -> EntityRole {
     let lower = path.to_ascii_lowercase();
     let components: Vec<&str> = lower.split('/').filter(|c| !c.is_empty()).collect();
@@ -690,14 +750,10 @@ pub fn classify_file_role(path: &str) -> EntityRole {
         .iter()
         .take(dir_len)
         .any(|c| is_test_dir_component(c));
-    let is_test_file = file_name.starts_with("test_")
-        || file_name.ends_with("_test.py")
-        || file_name.ends_with("_test.rs")
-        || file_name.ends_with("_test.go")
-        || file_name.ends_with(".test.ts")
-        || file_name.ends_with(".test.js")
-        || file_name.ends_with(".spec.ts")
-        || file_name.ends_with(".spec.js");
+    // The ORIGINAL spelling, taken from `path` rather than from `lower`, because
+    // the capital in `FooTest` is a delimiter and lowercasing destroys it.
+    let original_file_name = path.rsplit('/').next().unwrap_or("");
+    let is_test_file = is_test_file_name(original_file_name, file_name);
     if in_test_dir || is_test_file {
         return EntityRole::Test;
     }
@@ -1128,6 +1184,66 @@ mod tests {
             classify_file_role("__tests__/App.test.ts"),
             EntityRole::Test
         );
+    }
+
+    /// Colocated framework tests, which the eight-literal rule read as product
+    /// source. A React repository with `Foo.test.tsx` beside `Foo.tsx`
+    /// classified 100% Source, and the two linker gates that filter on
+    /// `role != Test` then removed nothing, because nothing was Test
+    /// (FIR-1940).
+    ///
+    /// The controls are the point. Widening a suffix rule is only safe if it
+    /// stays delimited, and every name in the second group ends with the letters
+    /// of a marker without being a test.
+    #[test]
+    fn classify_colocated_framework_test_files() {
+        for path in [
+            // The dot-delimited family, across every extension the JS and TS
+            // adapters claim rather than the four the old rule listed.
+            "src/Foo.test.tsx",
+            "src/Foo.spec.tsx",
+            "src/foo.test.jsx",
+            "src/foo.test.mjs",
+            "src/foo.test.cjs",
+            // The underscore-delimited family, beyond py/rs/go.
+            "src/foo_test.ts",
+            "src/foo_test.js",
+            "spec/models/user_spec.rb",
+            // The capital-delimited family. Java, C#, Kotlin and Swift name the
+            // test after the type under test, with no separator but the case.
+            "src/main/java/com/example/FooTest.java",
+            "src/main/java/com/example/FooTests.java",
+            "tests/FooTests.cs",
+            "src/FooSpec.kt",
+            "Tests/FooTests.swift",
+        ] {
+            assert_eq!(
+                classify_file_role(path),
+                EntityRole::Test,
+                "{path} is a test by a convention this rule has to cover"
+            );
+        }
+
+        // Controls. Each ends with a marker's letters and is not a test, which
+        // is what a bare lowercased `ends_with` would get wrong.
+        for path in [
+            // `latest` ends with `test`. This is the name that makes a widened
+            // suffix rule unsafe without a delimiter.
+            "src/latest.java",
+            "src/Latest.java",
+            "latest/release.rs",
+            "src/contest.py",
+            "src/manifest.rs",
+            // And the case the previous fix bought: pytest's own product
+            // package must not be swept in by any widening.
+            "src/_pytest/python.py",
+        ] {
+            assert_eq!(
+                classify_file_role(path),
+                EntityRole::Source,
+                "{path} is product code and no marker is delimited in it"
+            );
+        }
     }
 
     /// A testing tool ships product code whose package name embeds "test"
