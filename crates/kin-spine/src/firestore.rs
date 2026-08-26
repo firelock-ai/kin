@@ -176,6 +176,16 @@ impl SpineBackend for FirestoreSpineBackend {
         self.cache.cross_repo_edges_for(repo_id, entity_id)
     }
 
+    fn authority_complete(&self) -> bool {
+        // The same fail-closed rule the snapshot below applies, said directly.
+        // The trait's default derives this by materializing the whole snapshot,
+        // which for this backend clones every cached edge and entity to arrive
+        // at a constant. Stating it here keeps the policy in one readable place
+        // per backend rather than emergent from what the default happens to
+        // read, and a health probe stops paying a full clone for one boolean.
+        false
+    }
+
     fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
         // Durable rows and this pod's graph refreshes are useful advisory
         // positives, but neither can prove that every other pod observed the

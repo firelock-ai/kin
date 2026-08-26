@@ -2254,6 +2254,19 @@ impl DaemonState {
         Ok(true)
     }
 
+    /// Whether every registry row naming a live local repository was pinned at
+    /// startup.
+    ///
+    /// A distinct question from the spine's own edge-authority completeness, and
+    /// the two must be reported side by side rather than collapsed. The spine's
+    /// reading goes false for a refresh in flight as readily as for an authority
+    /// that is short; this one is false only when the startup pass could not
+    /// bind a repository the registry named, which is the condition that leaves
+    /// cross-repo answers empty for the rest of the process's life.
+    pub fn startup_authority_complete(&self) -> bool {
+        !self.registered_local_repository_authority_incomplete
+    }
+
     /// Freeze local sibling authority capabilities before the daemon becomes
     /// externally visible.
     ///
