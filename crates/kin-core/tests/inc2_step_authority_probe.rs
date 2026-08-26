@@ -19,7 +19,7 @@
 use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 
-use kin_db::{LocalFileBackend, PersistedRepositoryAuthority, RepositoryAuthorityManager};
+use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_model::{
     AuthorId, DefaultRefExpectation, DefaultRefMutation, GitExternalAuthorityDelta, Hash256,
     OperationId, RefExpectation, RefMutation, RefUpdatePolicy, RepositoryId, RepositoryTransaction,
@@ -30,7 +30,6 @@ use kin_model::{
 /// read-back that returns them cannot be a default, an empty state, or another
 /// fixture's leftovers.
 const PROBE_PATH: &str = "service/compose.yaml";
-const PROBE_PATH_DIR: &str = "service";
 const PROBE_BYTES: &[u8] = b"services:\n  api:\n    image: fir2729-probe-payload-marker\n";
 
 fn git(working: &std::path::Path, args: &[&str]) {
@@ -52,37 +51,6 @@ fn hosted_shaped_id() -> RepositoryId {
         uuid::Uuid::new_v4().simple()
     ))
     .unwrap()
-}
-
-/// Every immutable body the transaction below will name, from both producers.
-///
-/// Two producers, and missing either one is a refusal at a different line:
-/// the Git object closure the authority describes, and the blob each tree
-/// delta introduces. They are collected together because the destination has
-/// to hold the union before the transaction commits, not one or the other.
-fn required_bodies(
-    metadata: &PersistedRepositoryAuthority,
-    changes: &[SemanticChange],
-) -> BTreeSet<Hash256> {
-    let mut hashes = BTreeSet::new();
-    for record in &metadata.external_objects {
-        hashes.insert(record.body_hash);
-    }
-    if let Some(authority) = metadata.git_external_authority.as_ref() {
-        for entry in &authority.closure.objects {
-            hashes.insert(entry.record.body_hash);
-        }
-    }
-    for change in changes {
-        for delta in &change.tree_deltas {
-            if let Some(state) = delta.new_state() {
-                if let Some(hash) = state.entry.blob_identity() {
-                    hashes.insert(hash);
-                }
-            }
-        }
-    }
-    hashes
 }
 
 /// Order changes parent-before-child, which every admission path requires and
@@ -138,7 +106,6 @@ fn build_publisher(root: &std::path::Path, commits: usize) -> std::path::PathBuf
     working
 }
 
-
 /// Load bodies out of the publisher's own CAS, which is where a sender
 /// deriving a step authority would read them.
 struct ManagerBodyLoader<'a>(&'a kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>);
@@ -147,7 +114,9 @@ impl kin_model::GitObjectBodyLoader for ManagerBodyLoader<'_> {
     type Error = String;
 
     fn load_body(&mut self, body_hash: &Hash256) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.0.load_source_blob(*body_hash).map_err(|e| e.to_string())
+        self.0
+            .load_source_blob(*body_hash)
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -174,7 +143,9 @@ fn reachable_from(
         if !seen.insert(id) {
             continue;
         }
-        let Some(entry) = by_id.get(&id) else { continue };
+        let Some(entry) = by_id.get(&id) else {
+            continue;
+        };
         out.push(entry.record.clone());
         for dependency in &entry.dependencies {
             stack.push(dependency.target);
@@ -201,14 +172,26 @@ fn a_step_authority_for_a_mid_history_commit_validates_from_the_manifest_alone()
         let lease = source.read_authority();
         let metadata = lease.metadata();
         (
-            metadata.git_external_authority.clone().expect("Git-admitted"),
+            metadata
+                .git_external_authority
+                .clone()
+                .expect("Git-admitted"),
             metadata.aliases.clone(),
-            lease.snapshot().changes.values().cloned().collect::<Vec<_>>(),
+            lease
+                .snapshot()
+                .changes
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
             metadata.ref_state.default_ref.clone().expect("default ref"),
         )
     };
     let ordered = topological(&changes);
-    assert_eq!(ordered.len(), COMMITS, "the publisher must admit one change per commit");
+    assert_eq!(
+        ordered.len(),
+        COMMITS,
+        "the publisher must admit one change per commit"
+    );
 
     // The commit this step would publish, found through the alias rather than
     // by guessing: the STEP_AT-th change in parent-before-child order.
@@ -399,17 +382,32 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
         let lease = source.read_authority();
         let metadata = lease.metadata();
         (
-            metadata.git_external_authority.clone().expect("Git-admitted"),
+            metadata
+                .git_external_authority
+                .clone()
+                .expect("Git-admitted"),
             metadata.aliases.clone(),
-            lease.snapshot().changes.values().cloned().collect::<Vec<_>>(),
+            lease
+                .snapshot()
+                .changes
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
             metadata.ref_state.default_ref.clone().expect("default ref"),
         )
     };
     let ordered = topological(&changes);
 
     let first = plan_step(
-        &source, &full, &ordered, &all_aliases, &default_ref, &repository_id,
-        0, STEP_ONE, &BTreeSet::new(),
+        &source,
+        &full,
+        &ordered,
+        &all_aliases,
+        &default_ref,
+        &repository_id,
+        0,
+        STEP_ONE,
+        &BTreeSet::new(),
     );
     let after_first: BTreeSet<_> = first
         .external_objects
@@ -417,15 +415,23 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
         .map(|record| record.object)
         .collect();
     let second = plan_step(
-        &source, &full, &ordered, &all_aliases, &default_ref, &repository_id,
-        STEP_ONE, STEP_TWO, &after_first,
+        &source,
+        &full,
+        &ordered,
+        &all_aliases,
+        &default_ref,
+        &repository_id,
+        STEP_ONE,
+        STEP_TWO,
+        &after_first,
     );
 
     // The property that makes chunking work at all: a later step ships only
     // what earlier steps did not. Without this each step re-sends the whole
     // closure and segmentation buys nothing.
     assert!(
-        second.external_objects.len() < first.external_objects.len() + second.external_objects.len(),
+        second.external_objects.len()
+            < first.external_objects.len() + second.external_objects.len(),
         "the second step must carry fewer objects than the union, or nothing is being reused"
     );
     assert_eq!(
@@ -450,12 +456,18 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
     .unwrap();
 
     // Stage every body both steps name. Content addressed, grants nothing.
-    for record in first.external_objects.iter().chain(second.external_objects.iter()) {
+    for record in first
+        .external_objects
+        .iter()
+        .chain(second.external_objects.iter())
+    {
         let bytes = source
             .load_source_blob(record.body_hash)
             .unwrap()
             .expect("the publisher holds every body its manifest names");
-        destination.save_source_blob(record.body_hash, &bytes).unwrap();
+        destination
+            .save_source_blob(record.body_hash, &bytes)
+            .unwrap();
     }
     for change in ordered.iter() {
         for delta in &change.tree_deltas {
@@ -469,61 +481,67 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
         }
     }
 
-    let commit_step = |step: &Step, previous: Option<&kin_model::GitExternalAuthority>, op: u128| {
-        let lease = destination.read_authority();
-        let delta = match previous {
-            None => GitExternalAuthorityDelta::initialize(step.authority.clone()),
-            Some(old) => GitExternalAuthorityDelta::update(old.clone(), step.authority.clone()),
-        };
-        let expected = match previous {
-            None => RefExpectation::MustNotExist,
-            Some(_) => RefExpectation::MustEqual {
-                target: kin_model::RefTarget::external_object(
-                    lease
-                        .metadata()
-                        .ref_state
-                        .refs
-                        .iter()
-                        .find(|entry| entry.name == default_ref)
-                        .and_then(|entry| match entry.target {
-                            kin_model::RefTarget::ExternalObject { object } => Some(object),
-                            _ => None,
-                        })
-                        .expect("the previous step published an external-object ref"),
+    let commit_step =
+        |step: &Step, previous: Option<&kin_model::GitExternalAuthority>, op: u128| {
+            let lease = destination.read_authority();
+            let delta = match previous {
+                None => GitExternalAuthorityDelta::initialize(step.authority.clone()),
+                Some(old) => GitExternalAuthorityDelta::update(old.clone(), step.authority.clone()),
+            };
+            let expected = match previous {
+                None => RefExpectation::MustNotExist,
+                Some(_) => RefExpectation::MustEqual {
+                    target: kin_model::RefTarget::external_object(
+                        lease
+                            .metadata()
+                            .ref_state
+                            .refs
+                            .iter()
+                            .find(|entry| entry.name == default_ref)
+                            .and_then(|entry| match entry.target {
+                                kin_model::RefTarget::ExternalObject { object } => Some(object),
+                                _ => None,
+                            })
+                            .expect("the previous step published an external-object ref"),
+                    ),
+                },
+            };
+            let transaction = RepositoryTransaction {
+                schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+                operation_id: OperationId::from_uuid(uuid::Uuid::from_u128(op)),
+                repository_id: repository_id.clone(),
+                expected_generation: lease.roots().generation,
+                expected_roots: lease.roots().clone(),
+                actor: AuthorId::new("inc2-step-probe"),
+                reason: format!(
+                    "segmented bootstrap step publishing {}",
+                    step.head_object.oid
                 ),
-            },
+                external_objects: step.external_objects.clone(),
+                git_authority_delta: Some(delta),
+                changes: step.changes.clone(),
+                aliases: step.aliases.clone(),
+                ref_mutations: vec![RefMutation {
+                    name: default_ref.clone(),
+                    expected,
+                    new_target: Some(kin_model::RefTarget::external_object(step.head_object)),
+                    policy: RefUpdatePolicy::FastForwardOnly,
+                }],
+                default_ref_mutation: previous.is_none().then(|| DefaultRefMutation {
+                    expected: DefaultRefExpectation::MustBeUnset,
+                    new_default: Some(default_ref.clone()),
+                }),
+                workspace_mutation: None,
+                local_overlay_delta: None,
+                merge_transaction_delta: None,
+                sealed_observation: None,
+            };
+            drop(lease);
+            transaction
+                .validate()
+                .expect("the step transaction is well formed");
+            destination.commit_repository_transaction(transaction)
         };
-        let transaction = RepositoryTransaction {
-            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
-            operation_id: OperationId::from_uuid(uuid::Uuid::from_u128(op)),
-            repository_id: repository_id.clone(),
-            expected_generation: lease.roots().generation,
-            expected_roots: lease.roots().clone(),
-            actor: AuthorId::new("inc2-step-probe"),
-            reason: format!("segmented bootstrap step publishing {}", step.head_object.oid),
-            external_objects: step.external_objects.clone(),
-            git_authority_delta: Some(delta),
-            changes: step.changes.clone(),
-            aliases: step.aliases.clone(),
-            ref_mutations: vec![RefMutation {
-                name: default_ref.clone(),
-                expected,
-                new_target: Some(kin_model::RefTarget::external_object(step.head_object)),
-                policy: RefUpdatePolicy::FastForwardOnly,
-            }],
-            default_ref_mutation: previous.is_none().then(|| DefaultRefMutation {
-                expected: DefaultRefExpectation::MustBeUnset,
-                new_default: Some(default_ref.clone()),
-            }),
-            workspace_mutation: None,
-            local_overlay_delta: None,
-            merge_transaction_delta: None,
-            sealed_observation: None,
-        };
-        drop(lease);
-        transaction.validate().expect("the step transaction is well formed");
-        destination.commit_repository_transaction(transaction)
-    };
 
     match commit_step(&first, None, 401) {
         Ok(receipt) => eprintln!("INC2 STEP 1: committed, generation {}", receipt.generation),
@@ -531,13 +549,18 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
     }
     match commit_step(&second, Some(&first.authority), 402) {
         Ok(receipt) => eprintln!("INC2 STEP 2: committed, generation {}", receipt.generation),
-        Err(error) => panic!("INC2 STEP 2 REFUSED (the between-steps swap is the suspect): {error}"),
+        Err(error) => {
+            panic!("INC2 STEP 2 REFUSED (the between-steps swap is the suspect): {error}")
+        }
     }
 
     let lease = destination.read_authority();
     let metadata = lease.metadata();
     assert_eq!(
-        metadata.git_external_authority.as_ref().map(|a| a.closure.objects.len()),
+        metadata
+            .git_external_authority
+            .as_ref()
+            .map(|a| a.closure.objects.len()),
         Some(second.authority.closure.objects.len()),
         "the destination must end on step two's authority, not step one's"
     );
@@ -550,7 +573,13 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
         "INC2 STEPS RESULT: segmented bootstrap COMMITS. destination at {} changes, \
          authority closure {} objects",
         lease.snapshot().changes.len(),
-        metadata.git_external_authority.as_ref().unwrap().closure.objects.len()
+        metadata
+            .git_external_authority
+            .as_ref()
+            .unwrap()
+            .closure
+            .objects
+            .len()
     );
 }
 
@@ -576,7 +605,10 @@ fn build_merged_publisher(root: &std::path::Path) -> std::path::PathBuf {
     git(&working, &["add", "--all"]);
     git(&working, &["commit", "-s", "-m", "main work"]);
 
-    git(&working, &["merge", "--no-ff", "-m", "merge side into main", "side"]);
+    git(
+        &working,
+        &["merge", "--no-ff", "-m", "merge side into main", "side"],
+    );
     // Delete the side ref so the authority's roots are main and HEAD alone,
     // which keeps the closure the same shape a single-ref bootstrap sees.
     git(&working, &["branch", "-D", "side"]);
@@ -605,9 +637,17 @@ fn a_merge_commit_reaches_both_parents_and_a_side_line_stays_out_of_the_other_br
         let lease = source.read_authority();
         let metadata = lease.metadata();
         (
-            metadata.git_external_authority.clone().expect("Git-admitted"),
+            metadata
+                .git_external_authority
+                .clone()
+                .expect("Git-admitted"),
             metadata.aliases.clone(),
-            lease.snapshot().changes.values().cloned().collect::<Vec<_>>(),
+            lease
+                .snapshot()
+                .changes
+                .values()
+                .cloned()
+                .collect::<Vec<_>>(),
             metadata.ref_state.default_ref.clone().expect("default ref"),
         )
     };
