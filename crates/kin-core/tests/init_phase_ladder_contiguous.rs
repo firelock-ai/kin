@@ -39,14 +39,27 @@ const COMMITS: usize = 12;
 const MODULES: usize = 4;
 const ITEMS_PER_MODULE: usize = 4;
 
-/// Share of `init_from_git`'s wall clock the top-level ladder must account for.
+/// Largest share of the run that may pass with no ladder phase open.
 ///
-/// Set from measurement rather than taste. With the ladder complete this
-/// fixture covers essentially all of the call; the run that motivated the guard
-/// covered 92.0 percent and had a 5.4 second hole in it. The bar sits between
-/// those, close enough to 1.0 that removing any single ladder span fails it and
-/// far enough from 1.0 that span entry and exit bookkeeping does not.
-const REQUIRED_COVERAGE: f64 = 0.97;
+/// This, not total coverage, is the assertion that bites. Falsifying an earlier
+/// draft of this guard showed why: renaming `kin.init.record_complete_admission`
+/// off the ladder still left 97.2 percent covered, so a 97 percent coverage bar
+/// went green with a span it was written to protect deleted. One phase is a
+/// small share of the total and a coverage bar cannot see it go.
+///
+/// The largest single gap separates far better, because deleting any one span
+/// makes exactly one hole and the hole is the size of that phase. Measured on
+/// this fixture: 0.1 percent with the ladder whole, against 6.5, 3.4 and 2.8
+/// percent with each of the three spans renamed away. The bar sits at 1 percent,
+/// which is seven times the intact reading and well under the smallest breach.
+const MAX_GAP_FRACTION: f64 = 0.01;
+
+/// Share of the wall clock the ladder must account for in total.
+///
+/// Kept as a second, looser assertion. It catches a diffuse loss that no single
+/// gap would show, such as many phases each shrinking, which the gap bar alone
+/// would miss.
+const REQUIRED_COVERAGE: f64 = 0.95;
 
 /// One span boundary, with the time it happened.
 struct Edge {
@@ -225,18 +238,28 @@ fn the_admission_ladder_accounts_for_the_whole_of_init() {
         println!("  {phase:<52} {start:>9.0} -> {end:>9.0} ms");
     }
 
+    let gap_fraction = worst.0 / total_ms;
+    assert!(
+        gap_fraction <= MAX_GAP_FRACTION,
+        "init_from_git ran for {:.0} ms with no admission phase open, {:.1}% of its \
+         {total_ms:.0} ms, over the {:.1}% this guard allows. The stretch sits immediately \
+         before `{}`. Work that no span covers is work a memory profile charges to no phase: \
+         when this last happened the peak of a 6,733-commit conversion landed in such a \
+         stretch, only `kin.command` and `kin.init` were open, and the whole measurement had \
+         to be discarded. Wrap the uncovered work in an `info_span!(\"{}...\")` rather than \
+         lowering this bar.",
+        worst.0,
+        gap_fraction * 100.0,
+        MAX_GAP_FRACTION * 100.0,
+        worst.2,
+        support::PHASE_PREFIX,
+    );
     assert!(
         coverage >= REQUIRED_COVERAGE,
         "the admission ladder accounts for only {:.1}% of init_from_git's {total_ms:.0} ms, \
-         under the {:.1}% this guard requires, with the largest unnamed stretch {:.0} ms \
-         immediately before `{}`. Work that no span covers is work a memory profile charges \
-         to no phase: when this last happened the peak of a real conversion landed in such a \
-         stretch and the whole measurement had to be discarded. Wrap the uncovered work in an \
-         `info_span!(\"{}...\")` rather than lowering this bar.",
+         under the {:.1}% this guard requires, and no single gap was large enough to explain \
+         it. That means the ladder is losing time diffusely rather than in one hole.",
         coverage * 100.0,
         REQUIRED_COVERAGE * 100.0,
-        worst.0,
-        worst.2,
-        support::PHASE_PREFIX,
     );
 }
