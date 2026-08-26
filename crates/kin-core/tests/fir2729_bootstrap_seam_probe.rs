@@ -34,6 +34,7 @@ use kin_model::{
 /// read-back that returns them cannot be a default, an empty state, or another
 /// fixture's leftovers.
 const PROBE_PATH: &str = "service/compose.yaml";
+const PROBE_PATH_DIR: &str = "service";
 const PROBE_BYTES: &[u8] = b"services:\n  api:\n    image: fir2729-probe-payload-marker\n";
 
 fn git(working: &std::path::Path, args: &[&str]) {
@@ -153,6 +154,160 @@ fn an_empty_replica_admits_the_bootstrap_transaction_a_git_admitted_store_would_
 #[test]
 fn an_empty_replica_admits_a_multi_commit_history_in_one_bootstrap_transaction() {
     bootstrap_probe(12);
+}
+
+/// Does the STORAGE seam carry ceilings of its own, or are bound 3's ceilings
+/// purely a transfer-v1 artifact?
+///
+/// This is the question that decides increment 2's options. The pack caps a
+/// transfer at 4096 external objects and 16 MiB of decoded bodies, and this
+/// probe bypasses the pack entirely by committing at the storage boundary. So
+/// if a publisher past BOTH caps still commits here, the ceilings are a
+/// protocol choice and raising them is a protocol decision. If storage refuses
+/// too, they are a real limit and segmentation is the only route.
+///
+/// One fixture crosses both caps at once: 4200 files of roughly 4 KiB each is
+/// over 4096 objects and over 16 MiB.
+#[test]
+#[ignore = "builds a 4200-file repository; run explicitly with --ignored"]
+fn the_storage_seam_admits_a_publisher_past_both_transfer_v1_ceilings() {
+    bootstrap_probe_wide(4200, 4096);
+}
+
+fn bootstrap_probe_wide(files: usize, bytes_each: usize) {
+    let repository_id = hosted_shaped_id();
+    let source_root = tempfile::tempdir().unwrap();
+    let working = source_root.path().join("work");
+    std::fs::create_dir_all(working.join("wide")).unwrap();
+    std::fs::write(working.join(PROBE_PATH_DIR).join("compose.yaml"), PROBE_BYTES).ok();
+    std::fs::create_dir_all(working.join("service")).unwrap();
+    std::fs::write(working.join(PROBE_PATH), PROBE_BYTES).unwrap();
+    let filler: Vec<u8> = (0..bytes_each).map(|i| b'a' + (i % 26) as u8).collect();
+    for index in 0..files {
+        // Vary the first bytes so every blob is a distinct object rather than
+        // one object referenced 4200 times, which would measure nothing.
+        let mut body = format!("fir2729-wide-{index:06}
+").into_bytes();
+        body.extend_from_slice(&filler);
+        std::fs::write(working.join(format!("wide/f{index:06}.txt")), &body).unwrap();
+    }
+    git(&working, &["init", "--initial-branch=main"]);
+    git(&working, &["config", "user.email", "probe@example.invalid"]);
+    git(&working, &["config", "user.name", "FIR-2729 Probe"]);
+    git(&working, &["add", "--all"]);
+    git(&working, &["commit", "-s", "-m", "wide payload for the ceiling probe"]);
+
+    let init = kin_core::init_from_git_adopting(&working, &repository_id)
+        .expect("a wide Git-admitted store may adopt a hosted repository identity");
+    let source = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+        .expect("binding")
+        .open_manager()
+        .expect("open");
+
+    let (metadata, changes, default_ref, target, generation) = {
+        let lease = source.read_authority();
+        let metadata = lease.metadata().clone();
+        let changes: Vec<SemanticChange> = lease.snapshot().changes.values().cloned().collect();
+        let default_ref = metadata.ref_state.default_ref.clone().expect("default ref");
+        let target = metadata
+            .ref_state
+            .refs
+            .iter()
+            .find(|entry| entry.name == default_ref)
+            .map(|entry| entry.target.clone())
+            .expect("default ref resolves");
+        let generation = lease.roots().generation;
+        (metadata, changes, default_ref, target, generation)
+    };
+    let ordered_changes = topological(&changes);
+    let git_authority = metadata
+        .git_external_authority
+        .clone()
+        .expect("a Git-admitted store carries imported-Git authority");
+
+    let bodies = required_bodies(&metadata, &ordered_changes);
+    let object_count = metadata.external_objects.len();
+    assert!(
+        object_count > 4096,
+        "the fixture must cross MAX_TRANSFER_EXTERNAL_OBJECTS or it measures nothing; got {object_count}"
+    );
+
+    let destination_root = tempfile::tempdir().unwrap();
+    let destination = RepositoryAuthorityManager::open(
+        repository_id.clone(),
+        Arc::new(LocalFileBackend::new(destination_root.path().to_path_buf())),
+    )
+    .expect("empty store opens");
+    let (destination_roots, destination_generation) = {
+        let lease = destination.read_authority();
+        (lease.roots().clone(), lease.roots().generation)
+    };
+
+    let mut staged_bytes = 0u64;
+    for hash in &bodies {
+        let payload = source
+            .load_source_blob(*hash)
+            .expect("read")
+            .unwrap_or_else(|| panic!("publisher missing body {hash}"));
+        staged_bytes += payload.len() as u64;
+        destination.save_source_blob(*hash, &payload).expect("stage");
+    }
+    assert!(
+        staged_bytes > 16 * 1024 * 1024,
+        "the fixture must cross MAX_TRANSFER_DECODED_BODY_BYTES or it measures nothing; got {staged_bytes}"
+    );
+    eprintln!(
+        "PROBE wide publisher: generation={generation} changes={} external_objects={object_count} \
+         distinct_bodies={} staged_bytes={staged_bytes} ({:.2} MiB)",
+        ordered_changes.len(),
+        bodies.len(),
+        staged_bytes as f64 / 1048576.0,
+    );
+
+    let transaction = RepositoryTransaction {
+        schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: OperationId::new(),
+        repository_id: repository_id.clone(),
+        expected_generation: destination_generation,
+        expected_roots: destination_roots,
+        actor: AuthorId::new("fir2729-bootstrap-probe"),
+        reason: "probe: bootstrap past both transfer v1 ceilings".to_string(),
+        external_objects: metadata.external_objects.clone(),
+        git_authority_delta: Some(GitExternalAuthorityDelta::initialize(git_authority)),
+        changes: ordered_changes.clone(),
+        aliases: metadata.aliases.clone(),
+        ref_mutations: vec![RefMutation {
+            name: default_ref.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(target),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        }],
+        default_ref_mutation: Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(default_ref),
+        }),
+        workspace_mutation: None,
+        local_overlay_delta: None,
+        merge_transaction_delta: None,
+        sealed_observation: None,
+    };
+    match transaction.validate() {
+        Ok(()) => eprintln!("PROBE wide model validate: OK"),
+        Err(error) => panic!("PROBE WIDE STOPPED AT MODEL VALIDATION: {error}"),
+    }
+    let started = std::time::Instant::now();
+    match destination.commit_repository_transaction(transaction) {
+        Ok(receipt) => eprintln!(
+            "PROBE WIDE RESULT: storage ADMITTED {object_count} objects and {:.2} MiB in one \
+             transaction, outcome={:?} generation={} in {:.1}s. Bound 3's ceilings are a \
+             transfer-v1 protocol choice, not a storage limit.",
+            staged_bytes as f64 / 1048576.0,
+            receipt.outcome,
+            receipt.generation,
+            started.elapsed().as_secs_f64(),
+        ),
+        Err(error) => panic!("PROBE WIDE STOPPED AT STORAGE ADMISSION: {error}"),
+    }
 }
 
 fn bootstrap_probe(commits: usize) {
