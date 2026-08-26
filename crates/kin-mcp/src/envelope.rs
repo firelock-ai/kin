@@ -611,6 +611,89 @@ impl GraphBehind {
     }
 }
 
+/// Whether the daemon can name a complete admission at all, read on its own
+/// rather than through the unadmitted-path count.
+///
+/// [`GraphBehind`] answers "is there content on disk the graph never took", and
+/// it correctly says nothing when the working copy holds no new files. That made
+/// it the wrong carrier for a second, independent fact: whether graph truth was
+/// ever brought level with the repository in the first place. A store whose
+/// working copy is clean and whose graph was built long ago has nothing
+/// unadmitted and is still not current, so the clock was discarded by
+/// `GraphBehind::from_health`'s zero-count gate before anything could read it,
+/// and the answer certified (FIR-2226).
+///
+/// Read from the daemon's reconcile block, which is the same reading
+/// `GraphBehind` uses and carries the clock whether or not the count is zero.
+/// Note WHICH clock: it is the daemon's in-memory record of this process's own
+/// admissions, so a restart resets it. That is not a flaw in the reading, it is
+/// the condition the ticket is about, and it is exactly what makes
+/// [`Self::NoAdmissionRecorded`] worth reporting.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum GraphFreshness {
+    /// The daemon named a complete admission.
+    ///
+    /// This says an admission succeeded in this daemon's life and when. It does
+    /// NOT say the graph is current, because nothing on this surface measures
+    /// distance between graph truth and the repository, and a wall-clock
+    /// threshold would age against whatever repository the next user brings.
+    Recorded {
+        at: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        age_seconds: Option<u64>,
+    },
+    /// The daemon reported a reconcile reading and no complete admission inside
+    /// it, which is the restart case: the record lives in daemon memory, so a
+    /// restart erases it and every surface then reports that none has ever
+    /// succeeded in this daemon's life. An answer taken over that store is
+    /// answering from a graph nothing in this process ever brought level.
+    NoAdmissionRecorded,
+}
+
+impl GraphFreshness {
+    /// Read the clock out of a daemon `/health` body, independently of the
+    /// unadmitted-path count.
+    ///
+    /// `None` when the body carries no reconcile reading at all: a runtime that
+    /// reported nothing has nothing to say here, and inventing `current` for it
+    /// is the shape of wrong answer this type exists to stop. The two fields are
+    /// `skip_serializing_if = "Option::is_none"` at their producer, so their
+    /// absence from a reconcile block that IS present is itself the reading,
+    /// not a parse failure.
+    pub fn from_health(health: &Value) -> Option<Self> {
+        let reconcile = health.get("reconcile")?;
+        let Some(at) = reconcile
+            .get("last_admission_success_at")
+            .and_then(Value::as_str)
+        else {
+            return Some(Self::NoAdmissionRecorded);
+        };
+        Some(Self::Recorded {
+            at: at.to_string(),
+            age_seconds: reconcile
+                .get("last_admission_success_age_seconds")
+                .and_then(Value::as_u64),
+        })
+    }
+
+    /// The factor a store with no recorded admission carries into the verdict.
+    ///
+    /// `None` for a store that named one, because this surface has no basis to
+    /// refuse an answer over a clock it cannot compare to anything.
+    pub fn limiting_factor(&self) -> Option<String> {
+        match self {
+            Self::Recorded { .. } => None,
+            Self::NoAdmissionRecorded => Some(
+                "graph_admission_unrecorded: this daemon reports no complete admission of the \
+                 repository into graph truth, so how far the graph is behind the working tree is \
+                 unmeasured and an answer here cannot be read as covering current code"
+                    .to_string(),
+            ),
+        }
+    }
+}
+
 impl Durability {
     /// Derive the durability state from the two counts the daemon observed.
     ///
@@ -1389,6 +1472,16 @@ pub struct Envelope {
     /// an all-clear.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub behind: Option<GraphBehind>,
+    /// Whether graph truth was ever brought level with the repository at all,
+    /// beside `behind` rather than inside it because the two count different
+    /// things and can disagree. `behind` answers "is there content on disk the
+    /// graph never took" and goes quiet on a clean working copy; this answers
+    /// "was the graph ever admitted", which a clean working copy says nothing
+    /// about. A store can hold zero unadmitted paths and still have been built
+    /// against content that has since moved, which is the pair FIR-2226 caught
+    /// certifying an all-clear.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub freshness: Option<GraphFreshness>,
     /// Honest graph freshness context; omitted entirely when nothing is known.
     #[serde(default, skip_serializing_if = "GraphState::is_empty")]
     pub graph_state: GraphState,
@@ -1430,6 +1523,7 @@ impl Envelope {
             graph_as_of: None,
             durability: None,
             behind: None,
+            freshness: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 offline_fallback: Some(true),
@@ -1452,6 +1546,7 @@ impl Envelope {
             graph_as_of: None,
             durability: None,
             behind: None,
+            freshness: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
             completeness: None,
@@ -1619,6 +1714,7 @@ impl Envelope {
             graph_as_of: None,
             durability: None,
             behind: None,
+            freshness: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 daemon_unreachable: Some(true),
@@ -1646,6 +1742,7 @@ impl Envelope {
             graph_as_of: None,
             durability: None,
             behind: None,
+            freshness: None,
             graph_state: GraphState::default(),
             degraded: Degraded {
                 workspace_mismatch: Some(true),
@@ -1698,6 +1795,10 @@ impl Envelope {
         // graph never met, and without it every surface built from the counts
         // above states an all-clear it did not verify.
         self.behind = GraphBehind::from_health(health);
+        // Read from the same reconcile block and deliberately NOT through
+        // `behind`: the count gates that object off on a clean working copy, and
+        // the clock is a fact about the graph rather than about the disk.
+        self.freshness = GraphFreshness::from_health(health);
         if let Some(behind) = self.behind.as_ref() {
             self.durability = self
                 .durability

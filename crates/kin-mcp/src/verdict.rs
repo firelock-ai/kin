@@ -169,6 +169,7 @@ impl Verdict {
             ("withheld_candidates", withheld_candidates_reading(payload)),
             ("degradations", degradations_reading(payload)),
             ("completeness", completeness_reading(envelope)),
+            ("graph_freshness", graph_freshness_reading(envelope)),
         ];
 
         if readings
@@ -571,6 +572,41 @@ fn degradations_reading(payload: &Value) -> Reading {
 }
 
 /// The completeness signal's own reading of the substrate and the numbers.
+/// Graph freshness as a verdict input: wired, and deliberately weighing nothing
+/// until the durable marker reaches the health wire.
+///
+/// The clock reaches the envelope now (see [`crate::envelope::GraphFreshness`]),
+/// which is the half of FIR-2226 that could be done honestly here. This is the
+/// seam that will carry it into the verdict, and it reports [`Reading::Silent`]
+/// in every state on purpose, contributing neither agreement nor refusal.
+///
+/// **Why not refuse when no admission is recorded.** The wire's clock is the
+/// daemon's in-memory record, set only by a completed exact-tree admission pass,
+/// so a freshly initialized store whose daemon has not yet run one carries
+/// nothing. Absence is therefore the ordinary state of a healthy new store, not
+/// evidence of staleness, and refusing on it puts a floor under every answer on
+/// every such store. That is the regression `crate::negative`'s own gate comment
+/// warns about, and the acceptance suite's anti-vacuity control caught this
+/// module doing it.
+///
+/// **Why not certify when one IS recorded.** A present clock proves an admission
+/// completed at some time. It does not prove the store is current, and the
+/// verdict's note asserts agreement of every input, so certifying here would
+/// state exactly the false all-clear for the case this cannot see: a months-stale
+/// store under a daemon that has been up the whole time and admitted once.
+///
+/// Both halves need the same missing fact, a reading the daemon does not
+/// publish: the durable last-admission marker, which survives a restart and
+/// carries `tracked_artifacts` beside its timestamp. With it, absence and
+/// staleness separate and this becomes a real input. Until then, silence is the
+/// only honest reading, and a silent input never contributes agreement, so
+/// nothing here can license an answer either.
+fn graph_freshness_reading(envelope: &Envelope) -> Reading {
+    // Read so the field is provably consumed and the seam is not decorative.
+    let _ = envelope.freshness.as_ref();
+    Reading::Silent
+}
+
 fn completeness_reading(envelope: &Envelope) -> Reading {
     let Some(completeness) = &envelope.completeness else {
         return Reading::Silent;
@@ -861,6 +897,192 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FIR-2226 step 1. The clock reaches the envelope; the verdict seam is
+    /// wired and deliberately weighs nothing yet.
+    ///
+    /// The arms below assert exactly that and no more. An earlier version of
+    /// this change refused when no admission was recorded, and the acceptance
+    /// suite's anti-vacuity control caught it certifying nothing: absence of the
+    /// in-memory clock is the ordinary state of a healthy fresh store, so
+    /// refusing on it floors every answer on every such store. The arms are
+    /// written against what this can honestly claim rather than against what it
+    /// was hoped to do.
+    ///
+    /// Driven through `with_health` using the producer's own field names, and
+    /// both are `skip_serializing_if = "Option::is_none"` there, which is why the
+    /// no-clock arm omits the key rather than setting it null.
+    mod graph_freshness {
+        use super::*;
+
+        fn envelope_with(reconcile: Value) -> Envelope {
+            Envelope::daemon().with_health(&json!({
+                "graph_loaded": true,
+                "initialized": true,
+                "reconcile": reconcile,
+            }))
+        }
+
+        fn with_clock() -> Envelope {
+            envelope_with(json!({
+                "untracked_path_count": 0,
+                "last_admission_success_at": "2026-08-26T00:00:00Z",
+                "last_admission_success_age_seconds": 12,
+            }))
+        }
+
+        fn without_clock() -> Envelope {
+            envelope_with(json!({ "untracked_path_count": 0 }))
+        }
+
+        /// The disclosure, which is what step 1 actually delivers. Both stores
+        /// below hold zero unadmitted paths, so `behind` is silent by design and
+        /// used to take the clock down with it.
+        #[test]
+        fn the_clock_is_published_even_when_nothing_is_unadmitted() {
+            let recorded = with_clock();
+            assert!(
+                recorded.behind.is_none(),
+                "the count gate is what used to discard this: {:?}",
+                recorded.behind
+            );
+            assert!(
+                matches!(
+                    recorded.freshness,
+                    Some(crate::envelope::GraphFreshness::Recorded { .. })
+                ),
+                "a clean working copy must not hide a clock the daemon sent: {:?}",
+                recorded.freshness
+            );
+            assert!(
+                matches!(
+                    without_clock().freshness,
+                    Some(crate::envelope::GraphFreshness::NoAdmissionRecorded)
+                ),
+                "and the absence of one is itself a reading, not a parse failure"
+            );
+        }
+
+        /// A runtime that reported no reconcile block has nothing to publish.
+        /// Distinct from a block that carries no clock, and the two must not
+        /// collapse.
+        #[test]
+        fn a_runtime_reporting_no_reconcile_block_publishes_nothing() {
+            let envelope = Envelope::daemon().with_health(&json!({ "graph_loaded": true }));
+            assert!(envelope.freshness.is_none());
+        }
+
+        /// The seam weighs nothing, with a clock. Certifying here would state
+        /// agreement this cannot support: a present clock proves an admission
+        /// happened at some time, not that the store is current, and the
+        /// verdict's note asserts every input agreed.
+        #[test]
+        fn a_recorded_clock_does_not_certify() {
+            assert!(matches!(
+                graph_freshness_reading(&with_clock()),
+                Reading::Silent
+            ));
+        }
+
+        /// The seam weighs nothing, without one. Refusing here floors every
+        /// answer on every freshly initialized store, because the wire's clock is
+        /// the daemon's in-memory record and a daemon that has not yet completed
+        /// an admission pass carries none. This arm is the one the acceptance
+        /// control already proved can fail.
+        #[test]
+        fn an_unrecorded_clock_does_not_refuse() {
+            assert!(matches!(
+                graph_freshness_reading(&without_clock()),
+                Reading::Silent
+            ));
+        }
+
+        /// The readings array and the stamp's derivation agree on every name,
+        /// which neither side can prove on its own.
+        ///
+        /// kin#1123 asserts `edge_coverage_limits` picks up an input the
+        /// function was never told about, and it happens to use
+        /// `graph_freshness` as that unknown name, with the map built by hand.
+        /// The arms above assert `compute` puts `graph_freshness` into the map.
+        /// Both hardcode the string, so renaming the reading leaves both green
+        /// while the real behaviour breaks: the stamp would go on naming a key
+        /// nothing emits, and the emitted key would be one nothing names.
+        ///
+        /// So this asserts the join rather than either end. It reads the names
+        /// `compute` actually produced and requires the stamp to name each one
+        /// when that input refuses, which is a property over the real input set
+        /// and cannot be satisfied by a string written twice.
+        #[test]
+        fn every_input_compute_emits_is_one_the_stamp_can_name() {
+            let verdict = Verdict::compute(
+                "find_references",
+                &json!({ "references": [] }),
+                &with_clock(),
+                None,
+            )
+            .expect("the readings are not all silent");
+            let names: Vec<String> = verdict.inputs.keys().cloned().collect();
+            assert!(
+                names.iter().any(|name| name == "graph_freshness"),
+                "the seam must be in the stamp's input set at all: {names:?}"
+            );
+
+            for name in names {
+                if name == "edge_coverage" {
+                    continue;
+                }
+                let mut inputs = Map::new();
+                inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+                inputs.insert(name.clone(), json!(INCONCLUSIVE));
+                let refusing = Verdict {
+                    certified: false,
+                    safe_to_conclude_absent: false,
+                    limiting_factor: Some(format!("{name}: refusing")),
+                    inputs,
+                };
+                assert!(
+                    refusing
+                        .edge_coverage_limits()
+                        .contains(&format!("{name}:inconclusive")),
+                    "the stamp must name {name}, which compute emits, without being told about it"
+                );
+            }
+        }
+
+        /// End to end: neither store may pick up a freshness clause, and the
+        /// input is present in the stamp as `not_applicable` rather than absent,
+        /// so the seam is visible to a reader and to the next reading added.
+        #[test]
+        fn neither_store_puts_a_freshness_clause_in_the_verdict() {
+            for envelope in [with_clock(), without_clock()] {
+                let verdict = Verdict::compute(
+                    "find_references",
+                    &json!({ "references": [] }),
+                    &envelope,
+                    None,
+                );
+                let Some(verdict) = verdict else { continue };
+                assert_eq!(
+                    verdict
+                        .inputs
+                        .get("graph_freshness")
+                        .and_then(Value::as_str),
+                    Some(NOT_APPLICABLE),
+                    "the seam is wired and weighs nothing: {:?}",
+                    verdict.inputs
+                );
+                assert!(
+                    !verdict
+                        .limiting_factor
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("graph_admission"),
+                    "no freshness clause may reach the factor yet: {:?}",
+                    verdict.limiting_factor
+                );
+            }
+        }
+    }
 
     /// FIR-2672, second finding. A verdict with two independent reasons names
     /// both: the class gap decided the state and the failed embedding worker
