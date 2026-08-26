@@ -253,22 +253,32 @@ impl Verdict {
     /// The class states themselves are left alone. A class that is present IS
     /// present, and reporting it otherwise to settle a disagreement would make a
     /// true fact read false, which is the failure this envelope exists to stop.
+    /// The list is DERIVED from `self.inputs` rather than written out, because
+    /// "every input except `edge_coverage`" spelled as four names is only
+    /// correct until a fifth arrives. A name this function has never heard of
+    /// yields a shorter list, not an error, so the block would go on presenting
+    /// itself as licensing on its own while a reading nobody enumerated here
+    /// refused. That is the edge-class trap in its other form: the hazard is not
+    /// a consumer that counts a class, it is a producer that enumerates the
+    /// classes it knows.
+    ///
+    /// Sorted so the stamp is byte-stable. `Map` is a `BTreeMap` unless
+    /// serde_json's `preserve_order` is enabled, and a wire field's order should
+    /// not depend on a feature flag in a transitive dependency.
     pub fn edge_coverage_limits(&self) -> Vec<String> {
-        let mut limits = Vec::new();
         if self.inputs.get("edge_coverage").and_then(Value::as_str) != Some(CERTIFIED) {
             // The block already qualifies itself; nothing to add.
-            return limits;
+            return Vec::new();
         }
-        for input in [
-            "completeness",
-            "absence_gate",
-            "withheld_candidates",
-            "degradations",
-        ] {
-            if self.inputs.get(input).and_then(Value::as_str) == Some(INCONCLUSIVE) {
-                limits.push(format!("{input}:inconclusive"));
-            }
-        }
+        let mut limits: Vec<String> = self
+            .inputs
+            .iter()
+            .filter(|(name, state)| {
+                name.as_str() != "edge_coverage" && state.as_str() == Some(INCONCLUSIVE)
+            })
+            .map(|(name, _)| format!("{name}:inconclusive"))
+            .collect();
+        limits.sort();
         limits
     }
 
@@ -1317,6 +1327,77 @@ mod tests {
     /// `negative` or `_kin.verdict` certifying an answer whose rows were removed
     /// is the same defect arriving through the one path that removes answers on
     /// purpose.
+    /// An input this function never heard of still limits the stamp.
+    ///
+    /// The list used to be four names written out, which is "every input except
+    /// `edge_coverage`" in a five-input world and silently wrong in a six-input
+    /// one. A reading added later would not appear, and the failure is the
+    /// quiet kind: a missing name yields a SHORTER list, never an error, so the
+    /// block goes on presenting itself as licensing on its own beside an input
+    /// that refuses.
+    ///
+    /// This test is shaped like the mutation that catches it. The name is
+    /// deliberately one no code in this file mentions, so it cannot pass by
+    /// being enumerated somewhere; the hardcoded version fails it, and any
+    /// future hardcoded version will fail it too. The pair of assertions is the
+    /// point: an unknown input that REFUSES must appear, and an unknown input
+    /// that certifies must not, or a function returning every input it sees
+    /// would pass the first assertion alone.
+    #[test]
+    fn an_input_this_function_has_never_heard_of_still_limits_the_stamp() {
+        let build = |unknown_state: &str| {
+            let mut inputs = Map::new();
+            inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+            inputs.insert("completeness".to_string(), json!(CERTIFIED));
+            inputs.insert("graph_freshness".to_string(), json!(unknown_state));
+            Verdict {
+                certified: false,
+                safe_to_conclude_absent: false,
+                limiting_factor: Some("graph_freshness: the store is stale".to_string()),
+                inputs,
+            }
+        };
+
+        let limits = build(INCONCLUSIVE).edge_coverage_limits();
+        assert!(
+            limits.contains(&"graph_freshness:inconclusive".to_string()),
+            "an input added after this function was written must still limit the block: {limits:?}"
+        );
+
+        assert!(
+            build(CERTIFIED).edge_coverage_limits().is_empty(),
+            "an unknown input that certifies limits nothing, or the function is just \
+             listing its inputs"
+        );
+    }
+
+    /// `edge_coverage` never limits itself, whatever the derivation does.
+    ///
+    /// The old hardcoded list excluded it by not mentioning it. Deriving from
+    /// the map means the exclusion is now a filter clause, which is a line
+    /// someone can delete, so it gets an assertion rather than a comment.
+    #[test]
+    fn the_edge_coverage_input_is_never_one_of_its_own_limits() {
+        let mut inputs = Map::new();
+        inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+        inputs.insert("completeness".to_string(), json!(INCONCLUSIVE));
+        let verdict = Verdict {
+            certified: false,
+            safe_to_conclude_absent: false,
+            limiting_factor: Some("completeness: unknown".to_string()),
+            inputs,
+        };
+
+        let limits = verdict.edge_coverage_limits();
+        assert_eq!(limits, vec!["completeness:inconclusive".to_string()]);
+        assert!(
+            !limits
+                .iter()
+                .any(|limit| limit.starts_with("edge_coverage")),
+            "the block cannot cite itself as the reason it does not license: {limits:?}"
+        );
+    }
+
     /// A CERTIFIED verdict over a completeness that refuses is a contradiction,
     /// and until now nothing looked for it.
     ///
