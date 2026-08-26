@@ -11884,6 +11884,17 @@ async fn spine_health(
     // cross-repo answers empty for the rest of the process's life. Collapsing
     // them into one boolean would make a transient refresh indistinguishable
     // from a permanently short authority.
+    // A THIRD reading, for the same reason there are two. A capture stopped at
+    // its configured bound is complete by both fields above: nothing failed, so
+    // the spine's edge authority is sound, and every registered sibling pinned,
+    // so the startup pass is complete. Yet siblings were never consulted. Without
+    // this the route reports a bounded answer as a healthy one, which is the bare
+    // zero this endpoint exists to prevent, arriving from a different direction.
+    //
+    // `bounded` is deliberately not folded into either boolean above. A cap is
+    // expected and its captures are sound; an incomplete authority is neither,
+    // and a reader that cannot tell them apart cannot act on either.
+    let capture = state.sibling_capture_report();
     Ok(Json(json!({
         "status": "ok",
         "repos": spine.repo_count(),
@@ -11891,6 +11902,9 @@ async fn spine_health(
         "cross_repo_edges": spine.edge_count(),
         "authority_complete": spine.authority_complete(),
         "startup_authority_complete": state.startup_authority_complete(),
+        "sibling_capture_bounded": capture.map(|report| report.bounded).unwrap_or(false),
+        "siblings_captured": capture.map(|report| report.captured).unwrap_or(0),
+        "siblings_registered": capture.map(|report| report.registered).unwrap_or(0),
     })))
 }
 
@@ -31050,6 +31064,53 @@ mod tests {
             json["startup_authority_complete"],
             serde_json::json!(true),
             "a daemon whose registry named nothing it could not pin is complete: {json}"
+        );
+    }
+
+    /// A bounded capture is a third state, and both of 1171's readings call it
+    /// healthy.
+    ///
+    /// FIR-2763's eager-sibling bound stops the capture deliberately. Nothing
+    /// failed, so `authority_complete` is true; every registered sibling pinned,
+    /// so `startup_authority_complete` is true. A reader with only those two
+    /// fields cannot tell a bounded answer from a complete one, which is the
+    /// bare zero this endpoint exists to prevent arriving from a new direction.
+    /// So the route reports the bound too, with the counts that size it.
+    ///
+    /// The healthy control is the half that makes it able to fail: on a daemon
+    /// that capped nothing, `sibling_capture_bounded` must be FALSE, so the
+    /// field cannot be hardcoded to the alarming value and read as working.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spine_health_reports_a_bounded_sibling_capture_as_its_own_state() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json["sibling_capture_bounded"].is_boolean(),
+            "a bounded capture must be reportable beside the two completeness readings: {json}"
+        );
+        assert!(
+            json["siblings_captured"].is_u64(),
+            "a bound is only actionable with the counts that size it: {json}"
+        );
+        assert!(
+            json["siblings_registered"].is_u64(),
+            "captured means nothing without the registered total beside it: {json}"
+        );
+        assert_eq!(
+            json["sibling_capture_bounded"],
+            serde_json::json!(false),
+            "a daemon that capped nothing must not claim it was bounded: {json}"
         );
     }
 
