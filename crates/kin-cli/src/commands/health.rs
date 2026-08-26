@@ -196,6 +196,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_parse_coverage(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
+    checks.push(check_memory_floor());
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
     checks.push(check_interrupted_init());
@@ -3991,6 +3992,222 @@ fn check_commit_memory_headroom() -> HealthCheck {
     };
     let footprint = crate::commands::store_footprint::StoreFootprint::measure(&layout);
     commit_memory_headroom_check_for(&footprint, &crate::capability::memory_evidence())
+}
+
+/// What this machine affords Kin, stated before a conversion starts rather than
+/// after one has already cost something.
+///
+/// Every other memory row on this page needs a store to talk about, so on a
+/// fresh box, before `kin init`, all of them read n/a and the page says nothing
+/// at all about whether Kin fits here. FIR-2787 is what that costs: four
+/// separate disclosures reached one reader, each of them true, each on a
+/// different surface, and each after the work it described had been paid for.
+/// This row needs no repository, so it is the one that arrives first.
+///
+/// It states three things a reader can act on before an import runs for eleven
+/// minutes: the ceiling this process actually runs under, what one repository
+/// daemon will be allowed to hold inside it, and whether this machine is over
+/// the line where locate runs its full multihop budget. It forecasts nothing
+/// about a particular store, which is the neighbouring row's job and needs one
+/// to exist.
+///
+/// Advisory by construction, like every memory row here. `Degraded` never
+/// blocks readiness, because a machine smaller than Kin wants is a fact about
+/// the machine, and a check that failed on it would fail every correct install
+/// on a small host.
+fn check_memory_floor() -> HealthCheck {
+    memory_floor_check_for(
+        &crate::capability::memory_evidence(),
+        &crate::capability::CapabilityDetection::detect(),
+    )
+}
+
+/// Core of [`check_memory_floor`] with both readings as inputs, so every branch
+/// is testable on any host, including the small container no developer here
+/// runs on.
+fn memory_floor_check_for(
+    evidence: &crate::capability::MemoryEvidence,
+    detection: &crate::capability::CapabilityDetection,
+) -> HealthCheck {
+    const ID: &str = "memory_floor";
+    const LABEL: &str = "Memory floor";
+
+    let available = format_health_bytes(evidence.limit_bytes);
+    let ceiling_source = evidence.limit_source.describe();
+    let budget = kin_core::memory_pressure::FootprintBudget::derived_from(evidence.limit_bytes);
+    let daemon_clause = format!(
+        "one repository daemon is allowed {} of that, half the ceiling, and its background \
+         embedding is the first work held back once that is spent; a second repository gets its \
+         own daemon and its own {}, so two of them are allowed {} here",
+        format_health_bytes(budget),
+        format_health_bytes(budget),
+        format_health_bytes(budget.saturating_mul(2)),
+    );
+
+    let (tier_clause, tier_is_full) = memory_floor_tier_clause(detection);
+
+    // The cheapest commit anybody has measured, so a ceiling under it is under
+    // every row in the table. A reader with no store cannot pick a row by store
+    // size the way `Commit memory headroom` does, so this quotes the floor of
+    // the table and names the repository it came from.
+    let cheapest = MEASURED_COMMIT_PEAKS
+        .iter()
+        .min_by_key(|point| point.peak_bytes);
+    let (commit_clause, ceiling_clears) = match cheapest {
+        None => (None, true),
+        Some(point) => {
+            let comfortable = point.peak_bytes.saturating_add(
+                point.peak_bytes.saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT) / 100,
+            );
+            let clears = evidence.limit_bytes >= comfortable;
+            let clause = if clears {
+                format!(
+                    "The cheapest commit Kin has measured drove a {} machine to {} in total on \
+                     {} ({} store), and this ceiling clears that by at least {}%",
+                    format_health_bytes(point.observed_ceiling_bytes),
+                    format_health_bytes(point.peak_bytes),
+                    point.repository,
+                    format_health_bytes(point.store_bytes),
+                    COMMIT_PEAK_COMFORT_MARGIN_PERCENT,
+                )
+            } else {
+                format!(
+                    "The cheapest commit Kin has measured drove a {} machine to {} in total on \
+                     {} ({} store), and {available} is not {}% clear of that, so a commit here \
+                     has no measured room. That total is a whole-machine reading with everything \
+                     else resident inside it rather than a commit's own demand, so this compares \
+                     a ceiling against an observation and forecasts nothing about a write here",
+                    format_health_bytes(point.observed_ceiling_bytes),
+                    format_health_bytes(point.peak_bytes),
+                    point.repository,
+                    format_health_bytes(point.store_bytes),
+                    COMMIT_PEAK_COMFORT_MARGIN_PERCENT,
+                )
+            };
+            (Some(clause), clears)
+        }
+    };
+
+    let mut detail = format!("{available} of memory here ({ceiling_source}); {daemon_clause}. {tier_clause}");
+    if let Some(commit_clause) = commit_clause {
+        detail.push_str(". ");
+        detail.push_str(&commit_clause);
+    }
+    detail.push('.');
+
+    if ceiling_clears && tier_is_full {
+        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, detail);
+    }
+
+    // One fix line, carrying only the moves that apply. A fix that listed a
+    // larger machine under a shortfall the machine does not have is the kind of
+    // advice that sends a reader to buy hardware they already own, which is the
+    // defect `disabled_signals` was corrected for.
+    let mut moves: Vec<String> = Vec::new();
+    if !ceiling_clears {
+        moves.push(
+            "convert one repository at a time here, and run `kin daemon stop` in a repository you \
+             are not working in"
+                .to_string(),
+        );
+        moves.push(format!(
+            "raise this ceiling above {}",
+            format_health_bytes(
+                cheapest
+                    .map(|point| point.peak_bytes.saturating_add(
+                        point.peak_bytes.saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT) / 100,
+                    ))
+                    .unwrap_or(evidence.limit_bytes)
+            )
+        ));
+    }
+    if !tier_is_full {
+        moves.push(format!(
+            "run locate work on a machine with {} cores and {:.0} GB to get the full multihop \
+             budget",
+            crate::capability::PERFORMANCE_TIER_MIN_CORES,
+            crate::capability::PERFORMANCE_TIER_MIN_RAM_GB,
+        ));
+    }
+    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, detail).with_manual_fix(format!(
+        "Before converting a repository here: {}.",
+        moves.join(", or ")
+    ))
+}
+
+/// The tier half of the row, and whether this machine is over the line.
+///
+/// Split out because it has four shapes and the row has two, and because the
+/// case that matters most is the one nobody can reach on a developer host: a
+/// tier scored against a stand-in after the memory probe failed. That tier must
+/// never be reported as a reading, since "run on a bigger host" is actively
+/// wrong advice for a host that was never read.
+fn memory_floor_tier_clause(detection: &crate::capability::CapabilityDetection) -> (String, bool) {
+    let full = detection.profile == crate::capability::LocateProfile::Performance;
+    let line = format!(
+        "the {} core / {:.0} GB line",
+        crate::capability::PERFORMANCE_TIER_MIN_CORES,
+        crate::capability::PERFORMANCE_TIER_MIN_RAM_GB,
+    );
+    let narrowing = format!(
+        "multihop depth {} of {}, frontier {} of {}, timeout {}ms of {}ms",
+        detection.profile.multihop_max_depth(),
+        crate::capability::LocateProfile::Performance.multihop_max_depth(),
+        detection.profile.multihop_frontier_limit(),
+        crate::capability::LocateProfile::Performance.multihop_frontier_limit(),
+        detection.profile.multihop_timeout_ms(),
+        crate::capability::LocateProfile::Performance.multihop_timeout_ms(),
+    );
+
+    if detection.forced_by_env {
+        let clause = if full {
+            format!(
+                "KIN_LOCATE_PROFILE pins locate to the {} tier, so no reading of this host decided \
+                 it and it runs the full multihop budget",
+                detection.profile.name()
+            )
+        } else {
+            format!(
+                "KIN_LOCATE_PROFILE pins locate to the {} tier, so no reading of this host decided \
+                 it: {narrowing}",
+                detection.profile.name()
+            )
+        };
+        return (clause, full);
+    }
+
+    // A probe that could not answer is scored against a stand-in, and the
+    // stand-in is 4 GB, so this arm is always below the line. Saying which
+    // numbers were read is the whole point: the remediation differs.
+    if let Some(reason) = detection.misread_host() {
+        return (
+            format!(
+                "this host's memory could not be read ({reason}), so locate was scored against a \
+                 stand-in rather than a measurement and sits on the {} tier: {narrowing}",
+                detection.profile.name()
+            ),
+            false,
+        );
+    }
+
+    let cores = detection.cores.unwrap_or(0);
+    let ram = detection
+        .memory
+        .as_ref()
+        .map(|memory| memory.gb_or_stand_in())
+        .unwrap_or(0.0);
+    let clause = if full {
+        format!(
+            "{cores} cores and {ram:.1} GB put this machine at or over {line}, so locate runs its \
+             full multihop budget"
+        )
+    } else {
+        format!(
+            "{cores} cores and {ram:.1} GB put locate on the {} tier, under {line}: {narrowing}",
+            detection.profile.name()
+        )
+    };
+    (clause, full)
 }
 
 /// Whether a daemon serving this store was killed, and what killed it.

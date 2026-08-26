@@ -44,6 +44,17 @@
 //! reason out to the caller so a tier chosen from a stand-in is never presented
 //! as a reading.
 
+/// Effective cores a machine needs before locate runs its full multihop budget.
+///
+/// Public because `kin doctor` states this line before a conversion starts, and
+/// a reader deciding which machine to convert on needs the number rather than
+/// the word "performance". [`LocateProfile::score`] is its only other reader,
+/// so the line a user is told and the line that is scored are one value.
+pub const PERFORMANCE_TIER_MIN_CORES: usize = 8;
+
+/// GiB a machine needs alongside those cores, on the same terms.
+pub const PERFORMANCE_TIER_MIN_RAM_GB: f64 = 16.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LocateProfile {
     /// ≤2 cores OR ≤4GB RAM
@@ -63,8 +74,14 @@ impl LocateProfile {
     ///
     /// Pure, so the thresholds are testable without a host to run on and
     /// without the env override in the way.
+    ///
+    /// The `Performance` arm reads its two numbers from the constants beside
+    /// this enum rather than writing them here, because `kin doctor` states
+    /// that line to a reader deciding where to run, and a threshold written
+    /// twice is a threshold that can move in one place. The row quotes the
+    /// same constants.
     fn score(cores: usize, ram_gb: f64) -> Self {
-        if cores >= 8 && ram_gb >= 16.0 {
+        if cores >= PERFORMANCE_TIER_MIN_CORES && ram_gb >= PERFORMANCE_TIER_MIN_RAM_GB {
             Self::Performance
         } else if cores >= 4 && ram_gb >= 8.0 {
             Self::Standard
