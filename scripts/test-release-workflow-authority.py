@@ -35,6 +35,10 @@ HOLD_ALARM_POLICY = "scripts/release-hold-alarm.mjs"
 PROOF_GATE = ROOT / "scripts" / "check-release-proof-artifacts.mjs"
 PROOF_GATE_POLICY = "scripts/check-release-proof-artifacts.mjs"
 INSTALL_PROOF_CANARY = WORKFLOWS / "install-proof-canary.yml"
+RUST_TOOLCHAIN_ACTION = ROOT / ".github" / "actions" / "rust-toolchain" / "action.yml"
+TOOLCHAIN_PRUNE = (
+    ROOT / ".github" / "actions" / "rust-toolchain" / "prune-image-toolchains.sh"
+)
 CAPABILITY_CONTRACT = ROOT / "scripts" / "verify-capability-proof.mjs"
 CAPABILITY_CONTRACT_POLICY = "scripts/verify-capability-proof.mjs"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
@@ -3547,6 +3551,251 @@ def assert_install_proof_status_contract(
         'kin status --json | tee "$captures/kin-embedded-status.json"',
         "post-embedding repository status capture",
     )
+
+
+def assert_toolchain_prune_is_wired(action: str) -> None:
+    """Keep the cache key a function of this repository, not of the runner image.
+
+    `Swatinem/rust-cache` hashes every entry of `rustup toolchain list` into half its key.
+    Two ubuntu-latest jobs sixty-five seconds apart drew images carrying 1.97.1 and 1.98.0,
+    hashed to 8374e8ea and 6ea01539 against one `Cargo.lock`, and could not restore each
+    other's cache. Nothing in this repository chose either version.
+
+    The obvious fix is the wrong one and has its own arm below: turning off
+    `add-rust-environment-hash-key` gates BOTH halves of the key in that action's source,
+    so the key freezes at its bare prefix and stops varying on `Cargo.lock` at all.
+
+    Order is the load-bearing part here. The image's set has to be recorded BEFORE the
+    install, because afterwards nothing can tell an image toolchain from the one this action
+    added, and a prune that reads the list after the install would remove the toolchain it
+    just installed or nothing at all.
+    """
+
+    for step in (
+        "Record the toolchains the runner image shipped",
+        "Prune toolchains this repository never named",
+    ):
+        if action.count(f"- name: {step}\n") != 1:
+            raise AssertionError(
+                f"the rust-toolchain action must declare exactly one step named {step!r}; "
+                "without it the cargo cache key carries whatever toolchain the runner "
+                "image happened to ship"
+            )
+    record = action.index("- name: Record the toolchains the runner image shipped")
+    install = action.index("- name: Install the toolchain")
+    prune = action.index("- name: Prune toolchains this repository never named")
+    if not record < install < prune:
+        raise AssertionError(
+            "the image toolchain set must be recorded before the install and pruned after "
+            "it; recorded after the install it cannot tell the image's toolchains from ours"
+        )
+    # The needle is the INVOCATION, never the name. The step's own comment names the
+    # script, so a needle of `prune-image-toolchains.sh` matches a step that calls nothing
+    # and this assertion could not fail. That is how it read on the first run of the
+    # mutation below, which is the only reason it is written this way.
+    if 'bash "$GITHUB_ACTION_PATH/prune-image-toolchains.sh"' not in action:
+        raise AssertionError(
+            "the prune step must call prune-image-toolchains.sh, which is the copy the "
+            "behavioral cases below drive"
+        )
+    if "repo_pin=$repo_pin" not in action and 'repo_pin=$repo_pin' not in action:
+        raise AssertionError(
+            "the resolve step must publish repo_pin, because the prune keeps the channel "
+            "rust-toolchain.toml names as well as the toolchain the caller asked for"
+        )
+
+
+def run_prune(
+    tmp: Path,
+    resolved: str,
+    preinstalled: list[str],
+    repo_pin: str = "",
+    uninstall_fails: str = "",
+    uninstall_fails_after: str = "",
+    after: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Drive the prune script against a stub rustup, so its logic is testable off CI.
+
+    The stub is the whole point. Asserting the script's TEXT would pass on a script that
+    removes the wrong toolchain, and a check that cannot fail is not evidence. `after` lets
+    a case model a rustup that reports something the prune did not achieve, which is the
+    straggler the assertion exists to catch.
+    """
+
+    bindir = tmp / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    state = tmp / "installed.txt"
+    state.write_text("\n".join(preinstalled) + "\n", encoding="utf-8")
+    forced = tmp / "forced-after.txt"
+    if after is not None:
+        forced.write_text("\n".join(after) + "\n", encoding="utf-8")
+    stub = bindir / "rustup"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'STATE="{state}"\n'
+        f'FORCED="{forced}"\n'
+        f'FAILS="{uninstall_fails}"\n'
+        f'FAILS_AFTER="{uninstall_fails_after}"\n'
+        'if [ "$1" = "toolchain" ] && [ "$2" = "list" ]; then\n'
+        '  if [ -f "$FORCED" ]; then cat "$FORCED"; else cat "$STATE"; fi\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = "toolchain" ] && [ "$2" = "uninstall" ]; then\n'
+        '  if [ -n "$FAILS" ] && [ "$3" = "$FAILS" ]; then echo "stub refuses $3" >&2; exit 1; fi\n'
+        '  grep -v "^$3\\( \\|$\\)" "$STATE" > "$STATE.new" || true\n'
+        '  mv "$STATE.new" "$STATE"\n'
+        '  if [ -n "$FAILS_AFTER" ] && [ "$3" = "$FAILS_AFTER" ]; then echo "stub errored after removing $3" >&2; exit 1; fi\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    before = tmp / "before.txt"
+    before.write_text("\n".join(preinstalled) + "\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    return subprocess.run(
+        ["bash", str(TOOLCHAIN_PRUNE), resolved, str(before), repo_pin],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def assert_toolchain_prune_behavior() -> None:
+    """The prune keeps what this repository names and removes what the image shipped."""
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+
+        # The measured case: the image shipped a second stable nobody here chose.
+        run = run_prune(
+            tmp / "image-extra",
+            "1.96.0",
+            [
+                "1.96.0-x86_64-unknown-linux-gnu (default)",
+                "1.98.0-x86_64-unknown-linux-gnu",
+            ],
+            repo_pin="1.96.0",
+        )
+        if run.returncode != 0:
+            raise AssertionError(f"the prune refused an ordinary image: {run.stderr}")
+        if "removing 1.98.0-x86_64-unknown-linux-gnu" not in run.stdout:
+            raise AssertionError(
+                f"the prune left the image's own toolchain installed: {run.stdout}"
+            )
+        if "keeping 1.96.0-x86_64-unknown-linux-gnu" not in run.stdout:
+            raise AssertionError(
+                f"the prune removed the toolchain this repository pins: {run.stdout}"
+            )
+
+        # fuzz.yml's shape: a caller-supplied nightly, and a bare `cargo` that
+        # rust-toolchain.toml resolves to the stable pin. Both survive.
+        run = run_prune(
+            tmp / "two-named",
+            "nightly-2026-06-17",
+            [
+                "1.96.0-x86_64-unknown-linux-gnu",
+                "1.98.0-x86_64-unknown-linux-gnu",
+                "nightly-2026-06-17-x86_64-unknown-linux-gnu",
+            ],
+            repo_pin="1.96.0",
+        )
+        if run.returncode != 0:
+            raise AssertionError(f"the prune refused the fuzz shape: {run.stderr}")
+        for kept in ("1.96.0-x86_64", "nightly-2026-06-17-x86_64"):
+            if f"keeping {kept}" not in run.stdout:
+                raise AssertionError(
+                    f"the prune removed {kept}, which this repository names: {run.stdout}"
+                )
+        if "removing 1.98.0-x86_64-unknown-linux-gnu" not in run.stdout:
+            raise AssertionError(
+                f"the prune kept a toolchain nobody named: {run.stdout}"
+            )
+
+        # A prefix must not be read as a match in either direction.
+        run = run_prune(
+            tmp / "prefix",
+            "1.9",
+            ["1.96.0-x86_64-unknown-linux-gnu"],
+        )
+        if run.returncode == 0:
+            raise AssertionError(
+                "channel 1.9 matched toolchain 1.96.0, so a prefix is being read as a "
+                "match and the wrong toolchain can be kept"
+            )
+
+        # A refused uninstall must stop the job. Swallowed, it leaves a third toolchain in
+        # the list under a green run, which is exactly the defect being fixed.
+        run = run_prune(
+            tmp / "refused",
+            "1.96.0",
+            [
+                "1.96.0-x86_64-unknown-linux-gnu",
+                "1.98.0-x86_64-unknown-linux-gnu",
+            ],
+            repo_pin="1.96.0",
+            uninstall_fails="1.98.0-x86_64-unknown-linux-gnu",
+        )
+        if run.returncode == 0:
+            raise AssertionError(
+                "a refused uninstall exited zero, so a toolchain this repository never "
+                "chose survives into the cache key under a green run"
+            )
+        if "could not uninstall" not in run.stderr:
+            raise AssertionError(
+                f"a refused uninstall did not name itself: {run.stderr}"
+            )
+
+        # The same refusal from a rustup that removed the toolchain and THEN errored. It
+        # leaves no straggler, so the assertion below cannot shield it, and the loud
+        # failure is the only thing that can stop the job. Without this case the
+        # "could not uninstall" assertion is unreachable: every refusal the other stub mode
+        # produces is caught by the straggler check first, and an assertion nothing can
+        # reach is not evidence.
+        run = run_prune(
+            tmp / "refused-after",
+            "1.96.0",
+            [
+                "1.96.0-x86_64-unknown-linux-gnu",
+                "1.98.0-x86_64-unknown-linux-gnu",
+            ],
+            repo_pin="1.96.0",
+            uninstall_fails_after="1.98.0-x86_64-unknown-linux-gnu",
+        )
+        if run.returncode == 0:
+            raise AssertionError(
+                "an uninstall that errored after doing the work exited zero, so nothing "
+                "stops a job whose toolchain removal is only half trustworthy"
+            )
+        if "could not uninstall" not in run.stderr:
+            raise AssertionError(
+                f"a refusal that left no straggler was not named: {run.stderr}"
+            )
+
+        # And the straggler assertion, which is what turns this from a hope into a check:
+        # a rustup that reports an unnamed toolchain still installed must fail the step,
+        # however it got there.
+        run = run_prune(
+            tmp / "straggler",
+            "1.96.0",
+            ["1.96.0-x86_64-unknown-linux-gnu"],
+            repo_pin="1.96.0",
+            after=[
+                "1.96.0-x86_64-unknown-linux-gnu",
+                "1.99.0-x86_64-unknown-linux-gnu",
+            ],
+        )
+        if run.returncode == 0:
+            raise AssertionError(
+                "a toolchain this repository never named survived the prune and the step "
+                "still passed, so the invariant is asserted nowhere"
+            )
+        if "survived the prune" not in run.stderr:
+            raise AssertionError(f"the straggler was not named: {run.stderr}")
 
 
 def assert_docs_only_classifier_guard(workflow: str) -> None:
@@ -12361,6 +12610,35 @@ def main() -> None:
     classifier = ci_workflow[classifier_start:classifier_end]
     assert_docs_only_classifier_guard(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
+    toolchain_action = RUST_TOOLCHAIN_ACTION.read_text(encoding="utf-8")
+    assert_toolchain_prune_is_wired(toolchain_action)
+    assert_toolchain_prune_behavior()
+    for label, original, replacement, expected in (
+        (
+            "the prune step is dropped, so the image decides the cache key",
+            "    - name: Prune toolchains this repository never named",
+            "    - name: Prune nothing at all",
+            "must declare exactly one step named",
+        ),
+        (
+            "the image set is recorded after the install, where it cannot tell them apart",
+            "    - name: Record the toolchains the runner image shipped",
+            "    - name: Recorded too late",
+            "must declare exactly one step named",
+        ),
+        (
+            "the prune stops calling the script the behavioral cases drive",
+            'bash "$GITHUB_ACTION_PATH/prune-image-toolchains.sh" \\',
+            "true \\",
+            "must call prune-image-toolchains.sh",
+        ),
+    ):
+        mutant = replace_exactly_once(toolchain_action, original, replacement, label)
+        expect_assertion(
+            label,
+            expected,
+            lambda mutant=mutant: assert_toolchain_prune_is_wired(mutant),
+        )
     assert_cargo_deny_reads_every_advisory(sast)
     assert_advisory_sweep_authority(advisory_sweep, release_train)
     for label, source, original, replacement, expected, check in (
