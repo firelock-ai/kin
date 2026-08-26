@@ -15936,6 +15936,182 @@ mod tests {
         );
     }
 
+    /// Read the authority envelope straight off the persisted object.
+    ///
+    /// Deliberately not through the daemon. The question these tests ask is
+    /// what the NEXT open would find, and a served answer can be perfectly
+    /// right while the object underneath it has already been overwritten.
+    fn persisted_authority(storage: &FsPath, repo_id: &str) -> (bool, usize, u64) {
+        let backend = kin_db::LocalFileBackend::new(storage.to_path_buf());
+        match kin_db::load_recovered_snapshot(&backend, repo_id)
+            .expect("reading the persisted authority object must not fail")
+        {
+            Some(recovered) => {
+                let generation = recovered.generation;
+                match recovered.snapshot.repository_authority.as_ref() {
+                    Some(authority) => (true, authority.ref_state.refs.len(), generation),
+                    None => (false, 0, generation),
+                }
+            }
+            None => (false, 0, 0),
+        }
+    }
+
+    /// Open a second daemon over a backend that already holds a publication.
+    ///
+    /// This is the restart, and the restart is the trigger. A daemon that was
+    /// already running when the envelope was published keeps a stale cursor, so
+    /// its next flush CAS-fails and the envelope survives by accident. A daemon
+    /// that opens afterwards loads the current generation, so its CAS succeeds
+    /// and the erasure lands. Any fixture that reuses the seeding daemon tests
+    /// the accident instead of the defect.
+    ///
+    /// Returns the working directory beside the state because dropping it
+    /// deletes the layout out from under a live daemon.
+    fn reopen_hosted_daemon(
+        storage: &FsPath,
+        repo_id: &str,
+    ) -> (Arc<DaemonState>, tempfile::TempDir) {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(kin_db::LocalFileBackend::new(storage.to_path_buf())),
+                repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        (state, working)
+    }
+
+    /// A derived flush must not erase the envelope the backend published.
+    ///
+    /// The daemon serializes its in-place mutable graph, which does not own the
+    /// authority envelope and writes an explicit null where one belongs, then
+    /// hands those bytes to the write that IS the authority object. Refs,
+    /// receipts, workspaces, aliases and admission state go with it.
+    ///
+    /// Driven through `save_snapshot_full` and `save_snapshot`, which are the
+    /// two entry points every one of the four flush callers reaches: the
+    /// periodic loop, the shutdown flush, the pre-idle flush and the LSP sweep
+    /// all arrive through `save_snapshot_blocking`. Guarding the wall-clock
+    /// trigger rather than the write would leave the other three erasing.
+    #[tokio::test]
+    async fn a_hosted_flush_leaves_the_authority_envelope_the_backend_published() {
+        let repo_id = format!("hosted-flush-keeps-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8060,
+            "publish the head a derived flush must not erase",
+        );
+
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope carrying refs, or this test grades nothing"
+        );
+
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+        state
+            .save_snapshot_full()
+            .expect("a hosted flush must not fail");
+        state.save_snapshot().expect("a hosted flush must not fail");
+
+        let (still_present, still_refs, still_generation) =
+            persisted_authority(storage.path(), &repo_id);
+        assert!(
+            still_present,
+            "the flush erased the authority envelope the backend published"
+        );
+        assert_eq!(
+            still_refs, refs,
+            "the flush changed the published ref set it had no authority to touch"
+        );
+        assert_eq!(
+            still_generation, generation,
+            "the flush advanced the authority generation without committing authority"
+        );
+    }
+
+    /// The guard is keyed on the envelope, not on having a backend at all.
+    ///
+    /// Without this arm the fix could be "a hosted daemon never persists
+    /// anything", which passes the test above perfectly and breaks every
+    /// envelope-free hosted store, including the one in the bucket today. The
+    /// write must still happen where there is no publication to destroy.
+    #[tokio::test]
+    async fn a_hosted_flush_still_persists_where_the_backend_holds_no_envelope() {
+        let repo_id = format!("hosted-flush-writes-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+
+        let (present, _, before) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            !present,
+            "the fixture must start with no envelope, or this arm proves nothing"
+        );
+
+        state
+            .save_snapshot_full()
+            .expect("an envelope-free hosted store must still persist");
+
+        let (_, _, after) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            after > before,
+            "the flush was suppressed on a store with no envelope to protect: {before} -> {after}"
+        );
+    }
+
+    /// The periodic loop fires forever, so one safe flush is not the claim.
+    ///
+    /// A guard that holds once and then lets a later flush through, because it
+    /// consumed a flag or keyed on some first-pass state, would pass the arm
+    /// above and still erase the envelope on the second tick of a thirty-second
+    /// timer. The loop gets no fewer chances than this.
+    #[tokio::test]
+    async fn repeated_hosted_flushes_never_erode_the_published_envelope() {
+        let repo_id = format!("hosted-flush-repeat-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        let (_seeded, _seed_working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8061,
+            "publish a head many flushes must not erase",
+        );
+        let (present, refs, generation) = persisted_authority(storage.path(), &repo_id);
+        assert!(
+            present && refs > 0,
+            "the fixture must publish a real envelope"
+        );
+
+        let (state, _reopened_working) = reopen_hosted_daemon(storage.path(), &repo_id);
+        for tick in 0..8 {
+            state
+                .save_snapshot()
+                .unwrap_or_else(|error| panic!("flush {tick} failed: {error}"));
+            state
+                .save_snapshot_full()
+                .unwrap_or_else(|error| panic!("full flush {tick} failed: {error}"));
+            let (still_present, still_refs, still_generation) =
+                persisted_authority(storage.path(), &repo_id);
+            assert!(still_present, "flush {tick} erased the envelope");
+            assert_eq!(still_refs, refs, "flush {tick} changed the ref set");
+            assert_eq!(
+                still_generation, generation,
+                "flush {tick} advanced the authority generation"
+            );
+        }
+    }
+
     /// The hosted publication loop, end to end.
     ///
     /// An empty hosted store admits a native transfer and then serves the head
