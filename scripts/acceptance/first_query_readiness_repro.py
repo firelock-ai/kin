@@ -76,16 +76,35 @@ STILL_STARTING_OPENING = re.compile(
 STILL_STARTING_DETAIL = re.compile(r"\((?P<phase>[^;)]+); (?P<elapsed>\d+)s so far\)")
 STILL_STARTING_ADVICE = "This is startup latency, not a failure"
 
+# The daemon-side fault injection this suite consumes. Registered in
+# crates/kin-core/src/env_registry.rs at Diagnostic sensitivity, off by default,
+# captured at daemon start like every other behaviour lever. They exist because
+# nothing in the acceptance estate can otherwise reach the states graded below,
+# and they ship with this consumer so neither is a branch nothing exercises.
+STARTUP_HOLD_ENV = "KIN_DAEMON_TEST_STARTUP_HOLD_SECS"
+HOLD_SWEEP_ENV = "KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP"
+# Comfortably past TOOLS_CALL_STARTUP_BIND_GRACE (10s), and comfortably inside
+# FIRST_QUERY_BOUND_SECONDS, so the disclosure is reached and the run is short.
+STARTUP_HOLD_SECONDS = 20
+
 # How long the first query may take before silence stops being defensible. The
 # disclosure is what makes any wait acceptable, so this bounds the case where
 # NEITHER an answer nor a disclosure arrives.
 FIRST_QUERY_BOUND_SECONDS = 120
 
-# The fixture defines one function and references it from two other modules, so
-# a complete answer carries two upstreams and a thin one carries fewer. Two is
-# the smallest number that can tell "thin" from "empty", which matters because
-# an empty answer has other causes.
-EXPECTED_UPSTREAM = 2
+# This suite deliberately asserts NO expected upstream count.
+#
+# It used to, as a thin-answer check, and that check could not fail. Three
+# fixtures were tried against a provably-refused enrichment sweep and all three
+# answered completely: Python with the sweep held returned every reference while
+# the refusal line appeared twice in the fixture's own daemon.log against a
+# control of 91 lines, and JavaScript returned total_upstream=2 held and unheld
+# alike. Kin's own parser resolves simple cross-file references without
+# enrichment, so a synthetic fixture cannot observe a thin first answer at all;
+# that needs a reference class only enrichment produces, which on the evidence
+# means a real corpus. Tracked separately rather than shipped as a check that
+# passes for the wrong reason. The count is still REPORTED below, because a
+# number in a detail line is evidence; it is simply never asserted on.
 
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -166,16 +185,6 @@ def focal_entity_resolved(payload):
     return isinstance(focal, dict) and bool(focal.get("id"))
 
 
-def answer_is_complete(payload, expected=EXPECTED_UPSTREAM):
-    """Does this answer carry every upstream the fixture contains?
-
-    This is the thin-answer grader. It reads the count, never elapsed time,
-    because a thin answer arrives promptly and successfully.
-    """
-    total = upstream_total(payload)
-    return total is not None and total >= expected
-
-
 # ------------------------------------------------------------------- results
 
 
@@ -224,12 +233,23 @@ class ProbeError(RuntimeError):
 
 # ------------------------------------------------------------------- fixture
 
-# One definition, referenced from two other modules. Small on purpose: this
-# suite grades a readiness contract and an edge count, not ingestion.
+# One definition, imported and called from two other modules.
+#
+# JavaScript on purpose, and this is the whole reason the thin arm can fail.
+# The first version of this fixture was Python, and kin's own parser resolved
+# every reference in it without the LSP sweep, so holding the sweep changed
+# nothing and `disclosed` passed with a complete answer while the sweep was
+# provably refused. The brownfield suite records why: on JavaScript, import
+# references resolve 0 of 305 without enrichment. So a JavaScript import is a
+# reference class that EXISTS only once the cross-file sweep publishes, which
+# is exactly the state the thin arm grades.
+#
+# Small on purpose otherwise: this suite grades a readiness contract and an
+# edge count, not ingestion.
 FIXTURE = {
-    "core.py": "def widen(value):\n    return value * 2\n",
-    "alpha.py": "from core import widen\n\n\ndef run_alpha(x):\n    return widen(x) + 1\n",
-    "beta.py": "from core import widen\n\n\ndef run_beta(x):\n    return widen(x) - 1\n",
+    "core.js": "export function widen(value) {\n  return value * 2;\n}\n",
+    "alpha.js": "import { widen } from './core.js';\n\nexport function runAlpha(x) {\n  return widen(x) + 1;\n}\n",
+    "beta.js": "import { widen } from './core.js';\n\nexport function runBeta(x) {\n  return widen(x) - 1;\n}\n",
 }
 
 
@@ -252,6 +272,21 @@ class Suite(object):
         # GPU fails on host load rather than on its diff, and the fleet holds
         # the gpu lock for anything that wants the device.
         self.env.setdefault("KIN_EMBED_BACKEND", "cpu")
+        # Arm the startup hold, and this is the line that makes the suite worth
+        # running. A three-file fixture opens in under a second, so without it
+        # the first query always answers inside the bound, `postinit` always
+        # takes its trivial branch, and the disclosure contract this suite
+        # exists to grade is never reached. Measured: the first run of this
+        # suite passed 2 of 2 with zero occurrences of the disclosure in its
+        # own log. Held longer than TOOLS_CALL_STARTUP_BIND_GRACE, which is 10s
+        # in crates/kin-mcp/src/server.rs, or the call settles before the grace
+        # matters and nothing changes. A caller-set value wins, so a
+        # falsification run can disarm it without editing this file.
+        self.env.setdefault(STARTUP_HOLD_ENV, str(STARTUP_HOLD_SECONDS))
+        # KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP is deliberately NOT set here.
+        # Armed, it creates the thin-answer state, which is what `disclosed`
+        # must go red on; the default run has to be the healthy one or the
+        # control grades nothing.
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
         for path in (self.env["KIN_HOME"], self.env["HOME"], self.repo):
@@ -455,25 +490,27 @@ def check_postinit(suite):
                        "still-starting disclosure: %s" % tail(probe["raw"], 240))
         return result
 
-    result.ok("the first query answered in %.1fs with total_upstream=%s"
-              % (probe["elapsed"], upstream_total(probe["json"])))
+    armed = suite.env.get(STARTUP_HOLD_ENV, "0")
+    result.ok("the first query answered in %.1fs with total_upstream=%s "
+              "(no disclosure was owed; %s=%s)"
+              % (probe["elapsed"], upstream_total(probe["json"]),
+                 STARTUP_HOLD_ENV, armed))
     return result
 
 
 def check_disclosed(suite):
-    """A hot daemon answers completely, and says nothing about starting.
+    """A hot daemon answers, resolves, and says nothing about starting.
 
-    This is the control, and it is the arm that matters. It fails a LATE answer,
-    because a hot daemon still emitting the still-starting text means readiness
-    never settled. And it fails a THIN answer, because the fixture contains two
-    references and an answer carrying fewer is wrong rather than slow.
+    The control for `check_postinit`, and it grades two things that can fail. A
+    daemon still emitting the still-starting text here means readiness never
+    settled, so the disclosure the first query got was a permanent state rather
+    than a transient one. And a query that resolves no focal entity means the
+    fixture has nothing to find, which would let `postinit` pass on an empty
+    repository having proven nothing.
 
-    Without this arm, `check_postinit` passes instantly on a fixture with no
-    references at all, having proven nothing, and the same defect that silences
-    the first call silences the control. Thinness is the reason this suite runs
-    with auto-embed on: the LSP cold sweep is ordered behind the embedding
-    backfill, and until it publishes the cross-file edges this count depends on
-    do not exist.
+    It does NOT assert an upstream count. See the note above the fixture: that
+    assertion could not fail, and shipping it would have been a check named for
+    a defect it cannot observe.
     """
     result = Result("disclosed", "a hot daemon answers completely and says nothing about starting")
     suite.ready()
@@ -517,16 +554,9 @@ def check_disclosed(suite):
                        "completeness cannot be graded either way")
         return result
 
-    if not answer_is_complete(probe["json"]):
-        result.bad(
-            "the answer is thin, not late: find_references returned "
-            "total_upstream=%d where the fixture contains %d, so the surface "
-            "answered promptly and wrongly"
-            % (total, EXPECTED_UPSTREAM))
-        return result
-
-    result.ok("a hot daemon answered in %.1fs with total_upstream=%d and no "
-              "still-starting text" % (probe["elapsed"], total))
+    result.ok("a hot daemon answered in %.1fs with a resolved focal entity, "
+              "total_upstream=%d, and no still-starting text"
+              % (probe["elapsed"], total))
     return result
 
 
@@ -577,13 +607,6 @@ def self_test():
          disclosure_names_phase_and_elapsed(
              real.replace("phase: opening durable state", "")) is None)
 
-    want("a complete answer is complete", answer_is_complete({"total_upstream": 2}))
-    want("more than expected is still complete",
-         answer_is_complete({"total_upstream": 5}))
-    # The thin-answer grader, in both directions. Without the second line a
-    # grader that returned True for everything would pass this self-test.
-    want("a thin answer is refused", not answer_is_complete({"total_upstream": 1}))
-    want("an empty answer is refused", not answer_is_complete({"total_upstream": 0}))
     want("a payload with no count is unreadable, not zero",
          upstream_total({"upstream": []}) is None)
     want("a resolved focal entity is recognised",
