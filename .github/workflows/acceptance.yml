@@ -93,6 +93,16 @@ jobs:
       - name: Falsify the parse-hole verdict graders
         run: python3 scripts/acceptance/parse_hole_repro.py --self-test
 
+      # FIR-1826. The suite's verdicts are decided by two graders: one that reads
+      # the callers out of a `kin graph inspect`, and one that turns a caller set
+      # into PASS or FAIL. Both are driven against the input that must produce
+      # the opposite answer, including the pair that matters most, an inspect
+      # that printed no edge line and an entity nothing calls. Those two collapse
+      # into one empty set the moment the grader stops telling them apart, and a
+      # failed probe then reads as a clean negative.
+      - name: Falsify the same-owner call graders
+        run: python3 scripts/acceptance/same_owner_call_repro.py --self-test
+
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
@@ -386,6 +396,39 @@ jobs:
             echo "::error title=Parse-hole acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
+      # The end-to-end arm of FIR-1826. The unit arm drives the linker directly
+      # in crates/kin-index; this asks the built binary what calls what, in two
+      # languages that must bind and one that must not. The negative is what
+      # makes the positives mean anything: the rule is a per-language judgement,
+      # so a build that bound every language would satisfy both positives.
+      - name: Same-owner call suite (verdict comes from the gate step)
+        id: sameowner
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/same_owner_call_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/sameowner.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/sameowner.log 2>&1 || rc=$?
+          cat acceptance/sameowner.log
+          {
+            echo "### Same-owner call suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/sameowner.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Same-owner call suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
       - name: Memory-pressure refusal suite (verdict comes from the gate step)
         id: memorypressure
         if: always()
@@ -647,6 +690,7 @@ jobs:
             --report brownfield=acceptance/brownfield.json \
             --report response_budget=acceptance/response_budget.json \
             --report parsehole=acceptance/parsehole.json \
+            --report sameowner=acceptance/sameowner.json \
             --report memory_pressure=acceptance/memory_pressure.json \
             --report memory_footprint=acceptance/memory_footprint.json \
             --report initmemory=acceptance/initmemory.json \
