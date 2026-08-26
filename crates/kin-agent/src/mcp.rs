@@ -77,6 +77,25 @@ impl ToolOutcome {
             .as_bool()
     }
 
+    /// Whether this answer is claiming an absence at all.
+    ///
+    /// A qualifier rides EVERY retrieval answer now, populated or not, so the
+    /// negative object's presence stopped meaning "something is being asserted
+    /// absent". The object says which it is, and a populated answer carries
+    /// `interpretation: "qualified_answer"` with a subject saying in as many
+    /// words that it returned rows and therefore asserts no absence.
+    ///
+    /// This exists because `safe_to_conclude_absent` cannot answer it.
+    /// That field is false on a populated answer PRECISELY because no absence
+    /// is claimed there, so reading its `false` as "the absence is untrusted"
+    /// turns every successful answer into a warning (FIR-2673 finding 1).
+    pub fn claims_absence(&self) -> bool {
+        let Some(negative) = self.negative.as_ref() else {
+            return false;
+        };
+        negative.get("interpretation").and_then(Value::as_str) != Some("qualified_answer")
+    }
+
     /// The named reason an absence cannot be trusted, when the server named one.
     pub fn limiting_factor(&self) -> Option<String> {
         let negative = self.negative.as_ref()?;

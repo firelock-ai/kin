@@ -826,7 +826,12 @@ fn annotate(
     surfaced_degraded: &mut bool,
 ) -> String {
     let mut text = outcome.text.clone();
-    if outcome.safe_to_conclude_absent() == Some(false) {
+    // `claims_absence` first, and it is not a refinement. `safe_to_conclude_absent`
+    // is false on every POPULATED answer, because no absence is being claimed
+    // there, so this branch alone appended "This result is empty" to answers
+    // carrying rows, told the model to treat them as unknown, and counted each
+    // one as an unsafe absence event (FIR-2673 finding 1).
+    if outcome.claims_absence() && outcome.safe_to_conclude_absent() == Some(false) {
         counters.unsafe_absence_events += 1;
         let gap = outcome
             .limiting_factor()
@@ -1406,4 +1411,89 @@ pub fn probe_mcp(
 /// Timestamp helper re-exported so callers can stamp their own records the same way.
 pub fn timestamp() -> String {
     now_iso()
+}
+
+#[cfg(test)]
+mod annotate_tests {
+    use super::*;
+    use crate::mcp::ToolOutcome;
+
+    fn outcome(text: &str, negative: Value) -> ToolOutcome {
+        ToolOutcome {
+            text: text.to_string(),
+            is_error: false,
+            envelope: None,
+            negative: Some(negative),
+            unreadable: false,
+            wall_ms: 1,
+        }
+    }
+
+    const EMPTY_WARNING: &str = "This result is empty";
+
+    /// FIR-2673 finding 1. A populated answer is not an absence claim, and the
+    /// warning that says it is must not reach the model.
+    ///
+    /// `safe_to_conclude_absent` is false here, and that is CORRECT: no absence
+    /// is being claimed, so none can be concluded. Reading that `false` as "the
+    /// absence cannot be trusted" appended "This result is empty" to an answer
+    /// carrying rows, told the model to treat it as unknown and not to answer
+    /// another way, and counted it as an unsafe absence event.
+    #[test]
+    fn a_populated_answer_is_never_told_it_is_empty() {
+        let mut counters = Counters::new();
+        let mut surfaced = false;
+        let annotated = annotate(
+            &outcome(
+                "3 rows",
+                json!({
+                    "safe_to_conclude_absent": false,
+                    "interpretation": "qualified_answer",
+                    "result_count": 3,
+                    "limiting_factor": "python bodies are not indexed",
+                }),
+            ),
+            &mut counters,
+            &mut surfaced,
+        );
+        assert!(
+            !annotated.contains(EMPTY_WARNING),
+            "a populated answer was told it was empty: {annotated}"
+        );
+        assert_eq!(
+            counters.unsafe_absence_events, 0,
+            "a populated answer counted as an unsafe absence"
+        );
+    }
+
+    /// The control, and the half that stops the fix being "warn about nothing".
+    /// A genuinely empty answer whose absence Kin refuses to trust must still
+    /// get the warning and still be counted.
+    #[test]
+    fn an_untrusted_empty_answer_still_gets_the_warning() {
+        let mut counters = Counters::new();
+        let mut surfaced = false;
+        let annotated = annotate(
+            &outcome(
+                "no rows",
+                json!({
+                    "safe_to_conclude_absent": false,
+                    "interpretation": "absence_claimed",
+                    "result_count": 0,
+                    "limiting_factor": "python bodies are not indexed",
+                }),
+            ),
+            &mut counters,
+            &mut surfaced,
+        );
+        assert!(
+            annotated.contains(EMPTY_WARNING),
+            "an untrusted absence lost its warning: {annotated}"
+        );
+        assert!(
+            annotated.contains("python bodies are not indexed"),
+            "the warning must name the gap it was given: {annotated}"
+        );
+        assert_eq!(counters.unsafe_absence_events, 1);
+    }
 }
