@@ -11872,11 +11872,25 @@ async fn spine_health(
         )
     })?;
 
+    // Two completeness readings, never one. `cross_repo_edges: 0` beside nothing
+    // else is a bare zero: it reads as "this install has no cross-repo edges"
+    // whether the authority was built and found none or was never built at all.
+    //
+    // They answer different questions and both are needed to tell those apart.
+    // `authority_complete` is the spine's own edge authority, which goes false
+    // for a refresh in flight as readily as for an authority that is short.
+    // `startup_authority_complete` is false only when the startup pass could not
+    // bind a repository the registry named, which is the condition that leaves
+    // cross-repo answers empty for the rest of the process's life. Collapsing
+    // them into one boolean would make a transient refresh indistinguishable
+    // from a permanently short authority.
     Ok(Json(json!({
         "status": "ok",
         "repos": spine.repo_count(),
         "entities": spine.entity_count(),
         "cross_repo_edges": spine.edge_count(),
+        "authority_complete": spine.authority_complete(),
+        "startup_authority_complete": state.startup_authority_complete(),
     })))
 }
 
@@ -30008,6 +30022,92 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
+    }
+
+    /// A zero edge count says nothing on its own, so the health route reports
+    /// what produced it.
+    ///
+    /// `cross_repo_edges: 0` beside nothing else is the bare zero this ticket is
+    /// about: an authority that was built and found no edges and an authority
+    /// that was never built read identically. The two completeness fields are
+    /// what separate them, and this asserts both are present and typed, on a
+    /// healthy single-repo daemon where the answer is a real zero.
+    #[tokio::test]
+    async fn spine_health_reports_both_completeness_readings_beside_the_edge_count() {
+        let state = test_state();
+        let startup_complete = state.startup_authority_complete();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json["cross_repo_edges"].is_u64(),
+            "the count this qualifies must still be reported: {json}"
+        );
+        assert!(
+            json["authority_complete"].is_boolean(),
+            "the spine's own edge-authority reading must be reported: {json}"
+        );
+        assert!(
+            json["startup_authority_complete"].is_boolean(),
+            "the startup pin's reading must be reported beside it: {json}"
+        );
+        // Healthy control: a single-repo daemon that pinned everything the
+        // registry named reports a complete startup authority, so the field
+        // cannot be hardcoded to the alarming value and read as working.
+        assert_eq!(
+            json["startup_authority_complete"],
+            serde_json::json!(startup_complete),
+            "the route must report the state's own reading, not a constant: {json}"
+        );
+        assert_eq!(
+            json["startup_authority_complete"],
+            serde_json::json!(true),
+            "a daemon whose registry named nothing it could not pin is complete: {json}"
+        );
+    }
+
+    /// The two readings are not the same reading, and the route must not
+    /// collapse them.
+    ///
+    /// A refresh in flight turns the spine's own authority incomplete while the
+    /// startup pin stays complete. If one field were derived from the other, or
+    /// both from one source, this case would report the startup pass as short
+    /// and send a reader hunting a registry problem that does not exist.
+    #[tokio::test]
+    async fn a_dirty_edge_authority_does_not_report_the_startup_pin_as_short() {
+        let state = test_state();
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        for repo in spine.registered_repo_ids() {
+            spine.invalidate_cross_repo_edges(&repo);
+        }
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["authority_complete"],
+            serde_json::json!(false),
+            "a dirtied edge authority must read incomplete: {json}"
+        );
+        assert_eq!(
+            json["startup_authority_complete"],
+            serde_json::json!(true),
+            "dirtying edges says nothing about what the startup pass could bind: {json}"
+        );
     }
 
     #[tokio::test]

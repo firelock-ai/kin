@@ -593,6 +593,28 @@ impl SpineIndex {
         inner.authority_revision = cross_repo_snapshot_revision(&roots, &canonical_edges);
     }
 
+    /// This index's own cross-repo authority completeness, read without
+    /// materializing the edge set.
+    ///
+    /// `cross_repo_edges_snapshot().complete` answers the same question and
+    /// clones every edge and entity to do it, which is the wrong price for a
+    /// health endpoint that wants one boolean.
+    ///
+    /// What it means is narrow on purpose: the edge authority this index is
+    /// currently serving is closed and nothing is dirty. It goes false for a
+    /// refresh in flight as readily as for an authority that is genuinely short,
+    /// so a caller reporting WHY cross-repo answers are empty needs the startup
+    /// pin's own reading beside it, not this alone.
+    pub fn authority_is_complete(&self) -> bool {
+        let inner = self.inner.read();
+        let roots = inner
+            .root_hashes
+            .iter()
+            .map(|(repo, root)| (repo.clone(), root.clone()))
+            .collect::<BTreeMap<_, _>>();
+        Self::authority_complete(&inner, &roots)
+    }
+
     fn authority_complete(inner: &SpineInner, roots: &BTreeMap<RepoId, String>) -> bool {
         inner.active_edge_refreshes == 0
             && inner.active_full_refresh_epoch.is_none()

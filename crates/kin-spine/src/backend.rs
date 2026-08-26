@@ -110,6 +110,17 @@ pub trait SpineBackend: Send + Sync {
     /// ignoring a failed refresh.
     fn invalidate_cross_repo_edges(&self, repo_id: &str);
 
+    /// Whether the cross-repo edge authority this backend is serving is
+    /// complete.
+    ///
+    /// The default derives it from the snapshot, which is correct for any
+    /// backend and costs a full materialization; a backend that can answer
+    /// cheaply should override. Reported so an empty cross-repo answer can say
+    /// whether it is an observed zero or an unbuilt authority.
+    fn authority_complete(&self) -> bool {
+        self.cross_repo_edges_snapshot().complete
+    }
+
     /// Acquire one all-repo refresh lease against an exact registered root set.
     /// While active, per-source refreshes cannot advertise completeness.
     fn begin_cross_repo_refresh_pass(
@@ -163,6 +174,10 @@ impl Default for InMemorySpineBackend {
 }
 
 impl SpineBackend for InMemorySpineBackend {
+    fn authority_complete(&self) -> bool {
+        self.index.authority_is_complete()
+    }
+
     fn register_repo(&self, repo_id: &str, entries: Vec<EntityEntry>, root_hash: &str) {
         self.index.register_repo(repo_id, entries, root_hash);
     }
