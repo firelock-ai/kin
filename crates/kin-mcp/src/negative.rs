@@ -1856,7 +1856,7 @@ fn focal_is_method(payload: &Value) -> bool {
 /// cannot act on, describing a state the response already reports in full under
 /// `cross_repo`, teaches the reader to discount every limit including the real
 /// ones.
-enum CrossRepoQualifier {
+pub(crate) enum CrossRepoQualifier {
     /// The spine answered completely. Nothing to report.
     Complete,
     /// A configured spine failed, went stale, or answered incompletely. The
@@ -1921,6 +1921,28 @@ fn apply_cross_repo_qualifier(
         CrossRepoQualifier::Gap(reason) => push_gap(trustworthy, trust_reason, reason),
         CrossRepoQualifier::Note(note) => notes.push(note),
         CrossRepoQualifier::Complete => {}
+    }
+}
+
+/// The cross-repo qualifier this response earns, for the callers that need it
+/// outside this gate.
+///
+/// Exposed because [`crate::verdict`] must weigh the same fact, and a second
+/// implementation of "is cross-repo authority a gap" would drift from this one.
+/// The rule lives here once; the verdict maps it onto a reading.
+///
+/// `None` means the payload carries no cross-repo accounting at all, which is
+/// not the same as reporting that nothing was missed. This gate treats an absent
+/// block as a gap when an absence is being claimed, because an answer that says
+/// "nothing references this" while silently reporting no cross-repo authority is
+/// the exact shape it exists to refuse. A populated answer claims no absence, so
+/// there the honest reading is that the concept is not carried.
+pub(crate) fn cross_repo_qualifier(tool: &str, payload: &Value) -> Option<CrossRepoQualifier> {
+    payload.get("cross_repo")?;
+    match tool {
+        "find_references" => Some(cross_repo_references_qualifier(payload)),
+        "bulk_check_references" => Some(cross_repo_bulk_qualifier(payload)),
+        _ => None,
     }
 }
 

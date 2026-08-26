@@ -2844,11 +2844,16 @@ mod tests {
                 // cross-repo authority is not the fully-resolved answer these
                 // cases are about: it would read as a floor for a reason the
                 // test never meant to exercise.
+                "focal_entity": { "id": "0195f2a1-0000-7000-8000-00000000f0ca" },
                 "cross_repo": {
                     "status": "available",
                     "authority_complete": true,
                     "authority_revision": "sha256:complete",
                     "authority_roots": { "local": "local-root" },
+                    "authority_anchor": {
+                        "repo_id": "local",
+                        "entity_id": "0195f2a1-0000-7000-8000-00000000f0ca",
+                    },
                 },
                 // Every class but the one the case varies is present, and the
                 // host can produce reference edges. Since FIR-2672 every
@@ -2902,11 +2907,16 @@ mod tests {
                 "references": vec![json!({"name": "extract_tags"}); 5],
                 "relation_kinds": ["calls", "imports", "references"],
                 "degradations": [],
+                "focal_entity": { "id": "0195f2a1-0000-7000-8000-00000000f0ca" },
                 "cross_repo": {
                     "status": "available",
                     "authority_complete": true,
                     "authority_revision": "sha256:complete",
                     "authority_roots": { "local": "local-root" },
+                    "authority_anchor": {
+                        "repo_id": "local",
+                        "entity_id": "0195f2a1-0000-7000-8000-00000000f0ca",
+                    },
                 },
                 "edge_coverage": {
                     "scope": "language",

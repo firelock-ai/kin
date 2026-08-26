@@ -25,6 +25,11 @@ outputs:
   toolchain:
     description: The resolved toolchain name, suitable for `cargo +<name>`.
     value: ${{ steps.resolve.outputs.toolchain }}
+  repo_pin:
+    description: >
+      The channel in rust-toolchain.toml, which may differ from the resolved toolchain when
+      a caller passes one of its own. Kept installed alongside it.
+    value: ${{ steps.resolve.outputs.repo_pin }}
 
 runs:
   using: composite
@@ -40,16 +45,18 @@ runs:
       run: |
         set -euo pipefail
         toolchain="$INPUT_TOOLCHAIN"
+        # Resolved unconditionally, because the prune step needs the repository's own channel
+        # whether or not the caller passed a toolchain of its own.
+        pin="$GITHUB_ACTION_PATH/../../../rust-toolchain.toml"
+        if [ ! -f "$pin" ]; then
+          pin="$GITHUB_WORKSPACE/rust-toolchain.toml"
+        fi
         if [ -z "$toolchain" ]; then
-          # This action lives at <repo>/.github/actions/rust-toolchain, so the
-          # repository root is three levels above it. Deriving the root from the
-          # action's own location keeps this correct when a job checks the
-          # repository out under a `path:` instead of at the workspace root,
-          # where $GITHUB_WORKSPACE would point at the wrong tree.
-          pin="$GITHUB_ACTION_PATH/../../../rust-toolchain.toml"
-          if [ ! -f "$pin" ]; then
-            pin="$GITHUB_WORKSPACE/rust-toolchain.toml"
-          fi
+          # `pin` is resolved above. This action lives at
+          # <repo>/.github/actions/rust-toolchain, so the repository root is three levels
+          # above it. Deriving the root from the action's own location keeps this correct
+          # when a job checks the repository out under a `path:` instead of at the workspace
+          # root, where $GITHUB_WORKSPACE would point at the wrong tree.
           if [ -f "$pin" ]; then
             toolchain=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p;' "$pin" | sed -n '1p')
           fi
@@ -62,6 +69,16 @@ runs:
         fi
         echo "toolchain=$toolchain" >> "$GITHUB_OUTPUT"
         echo "resolved toolchain: $toolchain"
+        # Published separately from the resolved toolchain because the two differ whenever a
+        # caller passes `toolchain:` explicitly, and the prune below keeps both: fuzz.yml
+        # installs a pinned nightly and still runs a bare `cargo install`, which
+        # rust-toolchain.toml resolves to this channel.
+        repo_pin=""
+        if [ -f "$pin" ]; then
+          repo_pin=$(sed -n 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p;' "$pin" | sed -n '1p')
+        fi
+        echo "repo_pin=$repo_pin" >> "$GITHUB_OUTPUT"
+        echo "rust-toolchain.toml channel: ${repo_pin:-<none>}"
 
     - name: Pin CARGO_HOME for later steps
       shell: bash
@@ -104,6 +121,17 @@ runs:
           echo "${CARGO_HOME:-$USERPROFILE\\.cargo}\\bin" >> "$GITHUB_PATH"
         fi
 
+    # Captured BEFORE the install, because afterwards nothing can tell a toolchain the
+    # image shipped from the one this action just added, and the difference is the whole
+    # input the cache key was varying on.
+    - name: Record the toolchains the runner image shipped
+      shell: bash
+      run: |
+        set -euo pipefail
+        rustup toolchain list > "$RUNNER_TEMP/kin-preinstalled-toolchains.txt" || true
+        echo "image toolchains:"
+        cat "$RUNNER_TEMP/kin-preinstalled-toolchains.txt"
+
     # The flag lists are built as strings and expanded unquoted on purpose:
     # that is the word split that turns "clippy, rustfmt" into two --component
     # flags. An empty string expands to no argument at all, which is why this
@@ -138,6 +166,21 @@ runs:
       env:
         TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
       run: rustup default "$TOOLCHAIN"
+
+    # `Swatinem/rust-cache` hashes every entry of `rustup toolchain list` into half its key,
+    # so a runner image's own preinstalled toolchain decided whether two jobs could share a
+    # cache. Removing what the image shipped makes that list a function of this repository's
+    # files. The mechanism, the measurement and why the obvious flag is the wrong fix are in
+    # prune-image-toolchains.sh.
+    - name: Prune toolchains this repository never named
+      shell: bash
+      env:
+        TOOLCHAIN: ${{ steps.resolve.outputs.toolchain }}
+        REPO_PIN: ${{ steps.resolve.outputs.repo_pin }}
+      run: |
+        set -euo pipefail
+        bash "$GITHUB_ACTION_PATH/prune-image-toolchains.sh" \
+          "$TOOLCHAIN" "$RUNNER_TEMP/kin-preinstalled-toolchains.txt" "$REPO_PIN"
 
     - name: Set the Cargo defaults CI expects
       shell: bash
