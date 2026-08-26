@@ -406,7 +406,7 @@ fn embed_resource_exhaustion(
     let cause = match (observed_kills, observed_ceiling_hits, under_recommendation) {
         (Some(count), _, _) => format!(
             "the daemon was lost during this embed pass and this container's kernel recorded \
-             {count} out-of-memory kill(s) while it ran, so the embed ran out of memory"
+             {count} out-of-memory kill(s) while it ran, so this container ran out of memory"
         ),
         // No byte figure in this sentence, deliberately. The ceiling count and
         // `limit_bytes` are resolved by two separate walks up the cgroup tree,
@@ -416,7 +416,8 @@ fn embed_resource_exhaustion(
         // worth aiming at is named in the guidance below.
         (None, Some(hits), _) => format!(
             "the daemon was lost during this embed pass and this container's memory charge was \
-             held at its ceiling {hits} time(s) while it ran, so it most likely ran out of memory"
+             held at its ceiling {hits} time(s) while it ran, so this container most likely ran \
+             out of memory"
         ),
         (None, None, true) => format!(
             "the daemon was lost during this embed pass and only {} of memory is available to \
@@ -425,15 +426,37 @@ fn embed_resource_exhaustion(
         ),
         (None, None, false) => return None,
     };
+    // The floor is advice only for a machine that is under it. Quoting it
+    // unconditionally is what FIR-2493 caught: a 12 GiB container that had
+    // recorded 27 kills was told to "give this machine at least 2.0 GiB", six
+    // times what it already had, and a setup session spent a whole debugging
+    // pass on batch sizes and resource profiles on the strength of it. A
+    // machine already above the floor did not die for want of the model's
+    // working set, so it is pointed at the other heavy resident instead of at
+    // a number it already clears.
+    let guidance = if under_recommendation {
+        format!(
+            "`kin embed` loads the {EMBED_MODEL_DOWNLOAD} {EMBED_MODEL_ID} model and a real \
+             repository peaks well above that, so give this machine at least {}.",
+            human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
+        )
+    } else {
+        format!(
+            "This machine already clears the {} the {EMBED_MODEL_DOWNLOAD} {EMBED_MODEL_ID} \
+             model needs, so more memory is not the first thing to reach for. The other heavy \
+             resident in this daemon is the language-server enrichment sweep, measured taking a \
+             daemon from 15 MB to 11.5 GB on a store of about one gigabyte. Set \
+             `KIN_DAEMON_DISABLE_LSP=1` and re-run to take it out of the picture.",
+            human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
+        )
+    };
     Some(format!(
         "{cause}.\n\
-         `kin embed` loads the {EMBED_MODEL_DOWNLOAD} {EMBED_MODEL_ID} model and a real \
-         repository peaks well above that, so give this machine at least {}.\n\
-         Coverage already embedded is persisted, so re-running `kin embed` under a higher limit \
-         resumes rather than starting over.\n\
+         {guidance}\n\
+         Coverage already embedded is persisted, so re-running `kin embed` resumes rather than \
+         starting over.\n\
          Lexical and graph retrieval need no model: `kin locate` and `kin search` keep answering \
-         without vectors.",
-        human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
+         without vectors."
     ))
 }
 
@@ -1344,7 +1367,8 @@ mod tests {
             "the count reported must be the pass's one, not the container's four: {guidance}"
         );
         assert!(
-            guidance.contains("so the embed ran out of memory"),
+            guidance.contains("so this container ran out of memory")
+                && !guidance.contains("most likely"),
             "a kill during the pass is reported as observed, not hedged: {guidance}"
         );
     }
@@ -1407,6 +1431,47 @@ mod tests {
             embed_resource_exhaustion(OOM_KILLED_MID_PASS, &untouched),
             None,
             "6344 ceiling hits that all predate the pass say nothing about the pass"
+        );
+    }
+
+    /// FIR-2493: a machine already above the model's floor is not told to reach
+    /// it, and a container-wide kill counter does not name the embed.
+    ///
+    /// The stranger's container had 12 GiB and 27 recorded kills and was told
+    /// to "give this machine at least 2.0 GiB". The advice was off by six
+    /// times, and it named the embedder on evidence that names no process at
+    /// all: the same run measured 23 of those 27 kills landing while the
+    /// language-server sweep ran, and none in the eleven minutes after it was
+    /// disabled.
+    ///
+    /// Two arms, because below the floor the floor is still the right advice. A
+    /// fix that simply deleted the sentence would pass the first arm alone.
+    #[test]
+    fn a_machine_above_the_model_floor_is_not_told_to_reach_it() {
+        let roomy = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(12 << 30, Some(27)))
+            .expect("a kill during the pass is a memory diagnosis");
+        assert!(
+            !roomy.contains("give this machine at least"),
+            "a 12 GiB machine must not be told to reach 2.0 GiB: {roomy}"
+        );
+        assert!(
+            roomy.contains("KIN_DAEMON_DISABLE_LSP=1"),
+            "a machine above the floor is pointed at the other heavy resident: {roomy}"
+        );
+        assert!(
+            !roomy.contains("so the embed ran out of memory"),
+            "a container-wide kill counter does not say the embed was the consumer: {roomy}"
+        );
+
+        let cramped = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(512 << 20, Some(1)))
+            .expect("a kill under the floor is a memory diagnosis too");
+        assert!(
+            cramped.contains("give this machine at least 2.0 GiB"),
+            "below the floor the floor is exactly the right advice: {cramped}"
+        );
+        assert!(
+            !cramped.contains("KIN_DAEMON_DISABLE_LSP=1"),
+            "a machine that cannot hold the model at all is not a sweep problem: {cramped}"
         );
     }
 
