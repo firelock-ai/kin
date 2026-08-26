@@ -1044,10 +1044,10 @@ impl kin_model::GitObjectBodyLoader for CachingBodyLoader<'_> {
 /// history. Measuring both is the only way to say which term dominates at a
 /// real repository's size, and the difference is a planner design decision
 /// rather than a micro-optimization.
-fn reachable_from_index<'a>(
+fn reachable_from_index(
     by_id: &std::collections::HashMap<
         kin_model::ExternalObjectId,
-        &'a kin_model::GitObjectClosureEntry,
+        &kin_model::GitObjectClosureEntry,
     >,
     root: kin_model::ExternalObjectId,
 ) -> Vec<kin_model::ExternalObjectRecord> {
@@ -1230,9 +1230,7 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
     );
 
     let mut cached_loader = CachingBodyLoader::new(&source);
-    eprintln!(
-        "INC2 SCALE  step |   upto |  subset | walk ms | hoisted ms | derive ms | cached ms"
-    );
+    eprintln!("INC2 SCALE  step |   upto |  subset | walk ms | hoisted ms | derive ms | cached ms");
     let mut walk_total = 0.0_f64;
     let mut hoisted_total = 0.0_f64;
     let mut derive_total = 0.0_f64;
