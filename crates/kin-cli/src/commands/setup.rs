@@ -17911,10 +17911,27 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     /// interactive, so the two blocks go to two files: the PATH line where a
     /// script, a Makefile or an agent shelling out will read it, and the hook
     /// where it will not be injected into one.
+    /// Isolated and serial for the same reason as the fish case below it: this
+    /// resolves the home through `rc_write_plan`, which reads it twice, and a
+    /// sibling mutating `HOME` in between changes what the plan is about. zsh's
+    /// count survives that race because its two files differ by name whatever
+    /// the home is, so this was not the test that ejected anything; it is the
+    /// same read and it gets the same isolation rather than waiting to become
+    /// the next one.
     #[test]
+    #[serial]
     fn zsh_writes_its_path_line_where_a_non_interactive_shell_reads_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+
         let plan = rc_write_plan("zsh").unwrap();
         assert_eq!(plan.len(), 2, "{plan:?}");
+        assert!(
+            plan.iter().all(|target| target.path.starts_with(&home)),
+            "every target must be about the home under test: {plan:?}"
+        );
 
         let hook = plan
             .iter()
@@ -17945,14 +17962,56 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
 
     /// fish and PowerShell read one file for both, and splitting them there
     /// would write a second block nothing reads.
+    ///
+    /// Isolated from the machine's real home, and `#[serial]`, because both
+    /// mattered and neither was here. `rc_write_plan` resolves the home TWICE,
+    /// once for the hook file and once inside `shell_path_rcs`, and compares the
+    /// two paths to decide whether one file carries both blocks. So a sibling
+    /// test mutating `HOME` between those two reads makes the paths differ and
+    /// the plan grow to two, and on a runner whose real home already holds
+    /// `~/.config/fish/config.fish` the extra entry is that real file sitting
+    /// beside a temporary one. The count then depended on which runner image the
+    /// job landed on and on which tests happened to interleave, so this passed or
+    /// failed by environment rather than by the code, and it ejected two entries
+    /// from the merge queue before anyone read the merge-group log.
+    ///
+    /// `PROFILE` is unset because `shell_rc("powershell")` prefers it over the
+    /// home, and a runner that sets it would put the plan outside the home under
+    /// test.
     #[test]
+    #[serial]
     fn a_shell_that_reads_one_file_still_gets_one_plan() {
-        for shell in ["fish", "powershell"] {
-            let plan = rc_write_plan(shell).unwrap();
-            assert_eq!(plan.len(), 1, "{shell}: {plan:?}");
-            assert_eq!(plan[0].blocks, RcBlocks::HookAndPath, "{shell}");
-            assert_eq!(plan[0].path, shell_rc(shell).unwrap(), "{shell}");
-            assert!(plan[0].seed_when_absent.is_none(), "{shell}");
+        // Both arms, because the file's existence is the thing the runner
+        // differs on: a home that already carries the fish rc, and one that does
+        // not. Neither may change the count, and both must stay inside the home
+        // under test.
+        for rc_exists in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            let home = tmp.path().join("home");
+            fs::create_dir_all(&home).unwrap();
+            if rc_exists {
+                fs::create_dir_all(home.join(".config/fish")).unwrap();
+                fs::write(home.join(".config/fish/config.fish"), "# existing\n").unwrap();
+            }
+            let _home = EnvVarGuard::set("HOME", &home);
+            let _xdg = EnvVarGuard::unset("XDG_CONFIG_HOME");
+            let _profile = EnvVarGuard::unset("PROFILE");
+
+            for shell in ["fish", "powershell"] {
+                let plan = rc_write_plan(shell).unwrap();
+                assert_eq!(plan.len(), 1, "{shell} (rc_exists={rc_exists}): {plan:?}");
+                assert_eq!(plan[0].blocks, RcBlocks::HookAndPath, "{shell}");
+                assert_eq!(plan[0].path, shell_rc(shell).unwrap(), "{shell}");
+                assert!(plan[0].seed_when_absent.is_none(), "{shell}");
+                // The assertion that makes this runner-independent. Without it
+                // the three above hold against the machine's real home just as
+                // well as against this one.
+                assert!(
+                    plan[0].path.starts_with(&home),
+                    "{shell}: the plan must be about the home under test rather \
+                     than the machine's: {plan:?}"
+                );
+            }
         }
     }
 
