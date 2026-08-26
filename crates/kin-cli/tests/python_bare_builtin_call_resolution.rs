@@ -26,8 +26,55 @@ use kin_cli::commands::trace_data_flow::{
 };
 use kin_db::InMemoryGraph;
 use kin_index::{link_cross_file, FileParseData};
-use kin_model::{ArtifactId, Entity, EntityStore, FilePathId};
+use std::collections::HashMap;
+
+use kin_model::{
+    ArtifactId, Entity, EntityStore, FilePathId, Hash256, LocatedEntry, RepoPath, TransactionDelta,
+    TreeDelta, TreeEntry,
+};
 use kin_parser::{LanguageAdapter, PythonAdapter};
+
+/// Admit one artifact per parsed file into the graph's repository tree, and
+/// return the identity map the linker takes.
+///
+/// This fixture used to mint an `ArtifactId` per file and admit none of them.
+/// That builds a store that could never exist: every persist gate refuses a
+/// relation whose artifact endpoint the resolved tree does not carry, so the
+/// graph these tests assembled was one no snapshot would have accepted, and
+/// kin-db now refuses the same edge at the write. Admitting through a
+/// transaction carrying a `TreeDelta::Added` is the path the product itself
+/// uses, so the fixture now describes a repository that could really hold what
+/// it is asserting about.
+fn admit_file_artifacts(
+    graph: &InMemoryGraph,
+    files: &[FileParseData],
+) -> HashMap<String, ArtifactId> {
+    let mut artifact_ids = HashMap::new();
+    for file in files {
+        let artifact_id = ArtifactId::new();
+        // Nothing here reads blob content; the artifact only has to exist at
+        // this path. Deriving the hash from the path keeps the fixture
+        // deterministic without pulling in a hasher.
+        let mut seed = [0u8; 32];
+        for (slot, byte) in seed.iter_mut().zip(file.file_path.as_bytes()) {
+            *slot = *byte;
+        }
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(&file.file_path).expect("fixture path is utf-8"),
+                        TreeEntry::blob(Hash256::from_bytes(seed), false),
+                    ),
+                }],
+                ..TransactionDelta::default()
+            })
+            .expect("admit fixture artifact");
+        artifact_ids.insert(file.file_path.clone(), artifact_id);
+    }
+    artifact_ids
+}
 
 /// `parse_file` reads with the builtin `open` and imports nothing from storage.
 /// This is the call site the ticket names, verbatim in shape.
@@ -136,13 +183,10 @@ fn notekeeper_project() -> (InMemoryGraph, Vec<FileParseData>) {
         parse_py("parsing.py", PARSING_PY),
         parse_py("storage.py", STORAGE_PY),
     ];
-    let artifact_ids = files
-        .iter()
-        .map(|file| (file.file_path.clone(), ArtifactId::new()))
-        .collect();
+    let graph = InMemoryGraph::new();
+    let artifact_ids = admit_file_artifacts(&graph, &files);
     let relations = link_cross_file(&files, &artifact_ids).expect("link fixture");
 
-    let graph = InMemoryGraph::new();
     for entity in files.iter().flat_map(|file| file.entities.iter()) {
         graph.upsert_entity(entity).expect("upsert entity");
     }

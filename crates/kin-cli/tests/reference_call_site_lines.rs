@@ -29,7 +29,10 @@ use kin_index::{
     link_cross_file_incremental_with_completeness, FileParseCompletenessMap, FileParseData,
     IndexPipeline,
 };
-use kin_model::{ArtifactId, Entity, EntityStore, FilePathId, Relation};
+use kin_model::{
+    ArtifactId, Entity, EntityStore, FilePathId, Hash256, LocatedEntry, Relation, RepoPath,
+    TransactionDelta, TreeDelta, TreeEntry,
+};
 
 /// A caller file that reaches `compute` twice, at lines the fixture states
 /// outright, plus a definition file. The two sites are on different lines so a
@@ -186,6 +189,29 @@ fn link_incremental(files: &[IndexedFixtureFile]) -> Vec<Relation> {
 /// never writes.
 fn graph_with(files: &[IndexedFixtureFile], linked: &[Relation]) -> InMemoryGraph {
     let graph = InMemoryGraph::new();
+    // Admit each fixture file's artifact before any relation names it. The
+    // linker roots reference edges at the file's artifact, so a graph that
+    // never admitted one holds edges no persist gate would accept, and kin-db
+    // refuses them at the write. A transaction carrying a `TreeDelta::Added`
+    // is the product's own admission path.
+    for file in files {
+        let mut seed = [0u8; 32];
+        for (slot, byte) in seed.iter_mut().zip(file.parse.file_path.as_bytes()) {
+            *slot = *byte;
+        }
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: file.artifact_id,
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(&file.parse.file_path).expect("fixture path is utf-8"),
+                        TreeEntry::blob(Hash256::from_bytes(seed), false),
+                    ),
+                }],
+                ..TransactionDelta::default()
+            })
+            .expect("admit fixture artifact");
+    }
     for file in files {
         for entity in &file.entities {
             let mut entity = entity.clone();
