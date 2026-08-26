@@ -29,7 +29,6 @@ use kin_model::{
 // One declared bound governs both directions: what these routes accept is what
 // the transfer client reads.
 use kin_cli::commands::transfer::{DerivedViewRefresh, WorkspaceFollow};
-use kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -1532,12 +1531,12 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route(
             "/repos/{repo_id}/transfer/export",
             post(repo_transfer_export)
-                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+                .layer(DefaultBodyLimit::max(configured_transfer_http_body_limit())),
         )
         .route(
             "/repos/{repo_id}/transfer/receive",
             post(repo_transfer_receive)
-                .layer(DefaultBodyLimit::max(REPOSITORY_TRANSFER_HTTP_BODY_LIMIT)),
+                .layer(DefaultBodyLimit::max(configured_transfer_http_body_limit())),
         )
         .route(
             "/repos/{repo_id}/archive/tar/{source_change_id}",
@@ -10066,6 +10065,20 @@ struct RepositoryTransferExportRequest {
 struct RepositoryTransferReceiveRequest {
     destination_ref: kin_model::RefName,
     pack: kin_remote::repository_transfer::RepositoryTransferPack,
+}
+
+/// The wire cap that lets this deployment's decoded ceiling actually arrive.
+///
+/// Derived, never written down twice. Bodies travel base64, so a decoded
+/// closure is about four thirds of its size on the wire, and a raised decoded
+/// ceiling behind an unchanged wire cap is invisible: the pack never reaches
+/// validation and every client sees a bare 413 instead of the refusal that
+/// names the bound and the knob. The 413 stays as the outer backstop and should
+/// never be what a client hits first, because it says nothing useful.
+fn configured_transfer_http_body_limit() -> usize {
+    kin_remote::repository_transfer_http::http_body_limit_for(
+        configured_transfer_limits().max_decoded_body_bytes,
+    )
 }
 
 /// The decoded-closure ceiling this deployment will accept on a receive.
