@@ -138,6 +138,52 @@ fn clause_label(clause: &str) -> String {
         .to_string()
 }
 
+/// What this response says about absence, which is not what it says about trust.
+///
+/// One bool answered two questions and a reader could not branch on it
+/// (FIR-2673 finding 1). `safe_to_conclude_absent: false` meant either "this
+/// absence is not trustworthy" or "absence is not a concept for this call", and
+/// the second is the common case: a qualifier rides every retrieval answer, so
+/// the field is false on every answer that returned rows. A stranger read one
+/// `list_file_entities` response carrying `state: certified`, a note saying an
+/// absence in it is authoritative, and `safe_to_conclude_absent: false`, all in
+/// one object, and reported that the boolean gives the opposite of the verdict.
+///
+/// Three states, because there were always three cases.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum AbsenceClaim {
+    /// This answer returned rows and asserts no absence, so there is nothing to
+    /// conclude absent and nothing to distrust. The case that used to be
+    /// indistinguishable from a refusal.
+    NotApplicable,
+    /// An absence is claimed and every input that could qualify it agreed.
+    Authoritative,
+    /// An absence is claimed and at least one input refuses, so it may not be
+    /// acted on.
+    NotAuthoritative,
+}
+
+impl AbsenceClaim {
+    fn as_str(self) -> &'static str {
+        match self {
+            AbsenceClaim::NotApplicable => "not_applicable",
+            AbsenceClaim::Authoritative => "authoritative",
+            AbsenceClaim::NotAuthoritative => "not_authoritative",
+        }
+    }
+
+    /// The legacy boolean, defined FROM the tri-state so the two can never
+    /// disagree.
+    ///
+    /// Kept because ten shipped tool descriptions name the field, `kin-bench`
+    /// branches on its negative-side twin, and two kinlab launch-copy strings
+    /// and a published blog post describe it. It is bit-identical to what
+    /// `certified && makes_absence_claim` produced.
+    fn legacy_bool(self) -> bool {
+        matches!(self, AbsenceClaim::Authoritative)
+    }
+}
+
 /// One input's reading of the same answer.
 enum Reading {
     /// The input observed nothing that stops this answer being acted on.
@@ -167,7 +213,7 @@ impl Reading {
 /// The single verdict for one response, plus the inputs it was computed from.
 pub struct Verdict {
     certified: bool,
-    safe_to_conclude_absent: bool,
+    absence_claim: AbsenceClaim,
     limiting_factor: Option<String>,
     inputs: Map<String, Value>,
 }
@@ -226,7 +272,11 @@ impl Verdict {
 
         Some(Verdict {
             certified,
-            safe_to_conclude_absent: certified && makes_absence_claim,
+            absence_claim: match (makes_absence_claim, certified) {
+                (false, _) => AbsenceClaim::NotApplicable,
+                (true, true) => AbsenceClaim::Authoritative,
+                (true, false) => AbsenceClaim::NotAuthoritative,
+            },
             limiting_factor,
             inputs,
         })
@@ -372,20 +422,36 @@ impl Verdict {
 
     /// Serialize for embedding under `_kin.verdict`.
     pub fn to_value(&self) -> Value {
-        let note = if self.certified {
-            "Every input that could qualify this answer agreed, so the counts here are the whole \
-             set and an absence in it is authoritative."
-                .to_string()
-        } else {
-            format!(
+        // The note says the same thing the tri-state says, because it used to
+        // say something else. It promised "an absence in it is authoritative"
+        // on `certified` alone, so a caller whose answer carried five rows and
+        // claimed no absence read that promise beside a `false` flag in the
+        // same object, which is the contradiction FIR-2673 opens with. Each
+        // case now gets the sentence that is true for it.
+        let note = match (self.certified, self.absence_claim) {
+            (true, AbsenceClaim::NotApplicable) => "Every input that could qualify this answer \
+                 agreed, so the counts here are the whole set. This answer returned rows and \
+                 claims no absence, so there is no absence in it to conclude anything from."
+                .to_string(),
+            (true, _) => "Every input that could qualify this answer agreed, so the counts here \
+                 are the whole set and an absence in it is authoritative."
+                .to_string(),
+            (false, AbsenceClaim::NotApplicable) => format!(
+                "Treat this answer as a lower bound. It returned rows and claims no absence, so \
+                 the limit is on how many, not on whether something is missing. Limiting factor: \
+                 {}.",
+                self.limiting_factor.as_deref().unwrap_or("unreported")
+            ),
+            (false, _) => format!(
                 "Treat this answer as a lower bound and do not act on an absence in it. Limiting \
                  factor: {}.",
                 self.limiting_factor.as_deref().unwrap_or("unreported")
-            )
+            ),
         };
         json!({
             "state": if self.certified { CERTIFIED } else { INCONCLUSIVE },
-            "safe_to_conclude_absent": self.safe_to_conclude_absent,
+            "absence_claim": self.absence_claim.as_str(),
+            "safe_to_conclude_absent": self.absence_claim.legacy_bool(),
             "limiting_factor": self.limiting_factor.clone().map(Value::String).unwrap_or(Value::Null),
             "inputs": Value::Object(self.inputs.clone()),
             "note": note,
@@ -1087,7 +1153,7 @@ mod tests {
                 inputs.insert(name.clone(), json!(INCONCLUSIVE));
                 let refusing = Verdict {
                     certified: false,
-                    safe_to_conclude_absent: false,
+                    absence_claim: AbsenceClaim::NotAuthoritative,
                     limiting_factor: Some(format!("{name}: refusing")),
                     inputs,
                 };
@@ -1133,6 +1199,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// FIR-2673 finding 1, the case the stranger read as a refusal.
+    ///
+    /// A populated answer, every input clean, verdict certified. The old bool
+    /// was FALSE here, correctly, because no absence is claimed, and the note
+    /// beside it promised that an absence in the answer was authoritative. A
+    /// consumer branching on the bool got the opposite of the verdict, and the
+    /// one object said both things at once.
+    #[test]
+    fn a_populated_certified_answer_claims_no_absence_and_promises_none() {
+        let payload = populated_reference_payload("present");
+        let negative = json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+
+        assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+        assert_eq!(
+            verdict["absence_claim"],
+            json!("not_applicable"),
+            "a populated answer claims no absence: {verdict}"
+        );
+        let note = verdict["note"].as_str().expect("a note");
+        assert!(
+            !note.contains("absence in it is authoritative"),
+            "the note promised an authoritative absence to an answer claiming none: {note}"
+        );
+        assert!(
+            note.contains("claims no absence"),
+            "and it should say which case this is: {note}"
+        );
+        // The legacy bool stays false here, and that is correct rather than a
+        // bug: it is now DEFINED from the tri-state, so it can no longer
+        // contradict the note beside it.
+        assert_eq!(
+            verdict["safe_to_conclude_absent"],
+            json!(false),
+            "{verdict}"
+        );
+    }
+
+    /// The inverse, and the half that stops the split trading a false certify
+    /// for a field that never says yes.
+    ///
+    /// An empty answer with every requested class present must still certify
+    /// its absence, or a fix that answers `not_applicable` to everything would
+    /// pass the check above and say nothing.
+    #[test]
+    fn an_empty_certified_answer_still_certifies_its_absence() {
+        let mut payload = populated_reference_payload("present");
+        payload["references"] = json!([]);
+        payload["total_upstream"] = json!(0);
+        let negative = json!({ "interpretation": "absence_claimed", "trust": "authoritative" });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+
+        assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+        assert_eq!(
+            verdict["absence_claim"],
+            json!("authoritative"),
+            "an empty certified answer's absence is authoritative: {verdict}"
+        );
+        assert_eq!(verdict["limiting_factor"], Value::Null, "{verdict}");
+        assert_eq!(verdict["safe_to_conclude_absent"], json!(true), "{verdict}");
+        assert!(
+            verdict["note"]
+                .as_str()
+                .expect("a note")
+                .contains("absence in it is authoritative"),
+            "{verdict}"
+        );
     }
 
     /// No clause may contain the string that separates clauses.
@@ -1690,7 +1839,7 @@ mod tests {
             inputs.insert("graph_freshness".to_string(), json!(unknown_state));
             Verdict {
                 certified: false,
-                safe_to_conclude_absent: false,
+                absence_claim: AbsenceClaim::NotAuthoritative,
                 limiting_factor: Some("graph_freshness: the store is stale".to_string()),
                 inputs,
             }
@@ -1721,7 +1870,7 @@ mod tests {
         inputs.insert("completeness".to_string(), json!(INCONCLUSIVE));
         let verdict = Verdict {
             certified: false,
-            safe_to_conclude_absent: false,
+            absence_claim: AbsenceClaim::NotAuthoritative,
             limiting_factor: Some("completeness: unknown".to_string()),
             inputs,
         };
