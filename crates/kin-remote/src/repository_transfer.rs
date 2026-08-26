@@ -2785,6 +2785,10 @@ mod tests {
     /// the native change only edits `compose.yaml`.
     ///
     /// Recorded rather than worked around, so the class is never rediscovered.
+    /// Tracked as FIR-2751, whose fix has the gitlink check consult the
+    /// successor authority the same transaction installs, the way projection
+    /// membership already validates against the resulting state. This test and
+    /// the bound-4 invariant it mirrors both stay green through that.
     #[test]
     fn a_bootstrap_carrying_native_history_over_a_gitlink_is_refused_by_name() {
         let fixture = fixture();
