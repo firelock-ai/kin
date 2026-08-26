@@ -2080,6 +2080,64 @@ mod tests {
         );
     }
 
+    /// The other tool that carries a cross-repo block reaches the same input.
+    ///
+    /// The dispatch names two tools, and the absence gate names the same two, so
+    /// the strings are written twice in one file. A rename that moved one and not
+    /// the other would leave this arm matching nothing, and nothing about a
+    /// find_references test can see that: the verdict would simply stop weighing
+    /// cross-repo authority on bulk answers and no assertion anywhere would go
+    /// red.
+    ///
+    /// So the arm gets its own case, with the healthy direction beside the
+    /// refusing one. A dispatch that stopped matching would certify both.
+    #[test]
+    fn the_bulk_tool_reaches_the_same_cross_repo_input() {
+        let complete = json!({
+            "status": "available",
+            "authority_complete": true,
+            "authority_revision": "sha256:complete",
+            "authority_roots": {"local": "local-root"},
+            "relation_subtype_complete": true,
+            "verdicts_complete": true,
+        });
+        let mut incomplete = complete.clone();
+        incomplete["authority_complete"] = json!(false);
+
+        for (case, cross_repo, expected_state, expected_input) in [
+            ("a complete bulk authority", complete, CERTIFIED, CERTIFIED),
+            (
+                "a bulk authority that answered incompletely",
+                incomplete,
+                INCONCLUSIVE,
+                INCONCLUSIVE,
+            ),
+        ] {
+            let payload = json!({
+                "results": [{"name": "index_note", "has_references": true}],
+                "degradations": [],
+                "cross_repo": cross_repo,
+            });
+            let negative =
+                json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
+            let verdict = Verdict::compute(
+                "bulk_check_references",
+                &payload,
+                &Envelope::daemon(),
+                Some(&negative),
+            )
+            .expect("a retrieval payload carries a verdict")
+            .to_value();
+
+            assert_eq!(
+                verdict["inputs"]["cross_repo"],
+                json!(expected_input),
+                "{case}: the bulk dispatch arm must be reached: {verdict}"
+            );
+            assert_eq!(verdict["state"], json!(expected_state), "{case}: {verdict}");
+        }
+    }
+
     /// FIR-2672, the sole-cause case. Every input is clean except one requested
     /// class the answer could not read, and that alone makes the verdict
     /// inconclusive and names the class, for each of the three states a class
