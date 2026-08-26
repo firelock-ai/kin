@@ -1,6 +1,6 @@
 {
   "name": "@kinlab/kin",
-  "version": "0.5.52",
+  "version": "0.5.53",
   "description": "Canonical installer and launcher for Kin, the system of record for AI-written software. Provisions and runs the managed kin + kin-daemon release. MCP is one included mode (kin mcp start).",
   "license": "Apache-2.0",
   "type": "module",
@@ -19,7 +19,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "homepage": "https://github.com/firelock-ai/kin",
+  "homepage": "https://kinlab.ai",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/firelock-ai/kin.git",

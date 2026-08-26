@@ -161,6 +161,15 @@ jobs:
       - name: Falsify the eject-journal graders
         run: python3 scripts/acceptance/eject_journal_repro.py --self-test
 
+      # FIR-2672. The one verdict certified an answer as the whole set while
+      # its own completeness block recorded a requested edge class it could not
+      # read, on every release since the verdict existed. The graders here are
+      # handed the exact 0.5.52 envelope and have to fail on it, and the fixed
+      # shape and the all-present shape must both pass, so a grader that refuses
+      # everything fails here too.
+      - name: Falsify the verdict-limits graders
+        run: python3 scripts/acceptance/verdict_limits_repro.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -577,6 +586,34 @@ jobs:
             echo "::error title=Eject-journal acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
           fi
 
+      - name: Verdict-limits acceptance suite (verdict comes from the gate step)
+        id: verdictlimits
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/verdict_limits_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/verdict_limits.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/verdict_limits.log 2>&1 || rc=$?
+          cat acceptance/verdict_limits.log
+          {
+            echo "### Verdict-limits acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/verdict_limits.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=Verdict-limits acceptance suite failed::exit $rc (1 FAIL, 2 UNREADABLE, 3 setup); see the CHECK lines above"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -616,4 +653,5 @@ jobs:
             --report registry_isolation=acceptance/registry_isolation.json \
             --report first_contact=acceptance/first_contact.json \
             --report eject_journal=acceptance/eject_journal.json \
+            --report verdict_limits=acceptance/verdict_limits.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk comes back truncated=True with clipped_steps=None on ubuntu-latest, so an absent edge cannot be told from a dropped one. Build profile, product code from 0.5.44 through 0.5.46, and the pinned language-server versions are all ruled out; platform and code newer than 0.5.46 are still confounded. The moment the check passes this allowance announces itself stale and can go.'

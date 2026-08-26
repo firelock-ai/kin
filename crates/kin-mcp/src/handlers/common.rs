@@ -1103,6 +1103,21 @@ pub struct ReferenceRow {
     /// candidate rather than a reference (FIR-1552), and only a row with no
     /// other kind of edge behind it is one.
     pub receiver_name_guess: bool,
+    /// How the graph classifies the referencing entity: product source, a test,
+    /// vendored code, and so on.
+    ///
+    /// A caller's role changes what its reference means. Thirty callers that are
+    /// all tests is a different fact about blast radius than thirty production
+    /// call sites, and a reader who could not see which had to re-resolve every
+    /// row through `get_entity` to find out (FIR-1940). The role is already in
+    /// hand where the row is built, so it is served rather than dropped.
+    ///
+    /// `None` is load-bearing rather than a default. A federated spine xref row
+    /// has no local entity to read a role from (see `entity_id` above), and
+    /// [`EntityRole`](kin_model::EntityRole) defaults to `Source`, so a bare enum
+    /// would report every cross-repo caller as product code on no evidence at
+    /// all. Absent, not guessed.
+    pub role: Option<kin_model::EntityRole>,
 }
 
 /// Why a reference row carries no site lines.
@@ -1226,6 +1241,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                 // Every contributing edge has to be a guess for the row to be
                 // one, so this starts true and any other edge clears it.
                 receiver_name_guess: true,
+                role: Some(entity.role),
             });
         if entry.file_path.is_none() {
             entry.file_path = file_path;
@@ -1329,6 +1345,7 @@ pub fn collect_graph_reference_rows<G: GraphStore>(
                     // name guess, and starting true would leave a row created
                     // here in `candidates` if the assignment were ever removed.
                     receiver_name_guess: false,
+                    role: Some(entity.role),
                 });
             let tally = relation_reference_lines(&rel, entity.file_origin.as_ref());
             entry.reference_lines.extend(tally.lines);
@@ -3391,6 +3408,57 @@ mod override_composition_tests {
 
     fn rows_for(graph: &InMemoryGraph, focal: &EntityId) -> Vec<ReferenceRow> {
         collect_graph_reference_rows(graph, focal, &[RelationKind::Calls], None).unwrap()
+    }
+
+    /// A caller's role rides on the row it produces, and two callers with
+    /// different roles produce different rows.
+    ///
+    /// Thirty callers that are all tests is a different fact about blast radius
+    /// than thirty production call sites. The role is in hand where the row is
+    /// built and was dropped there, so a reader had to re-resolve every row
+    /// through `get_entity` to recover it (FIR-1940).
+    ///
+    /// Two roles rather than one, deliberately. A test asserting only that the
+    /// field is populated passes against a row that hardcodes `Source`, which is
+    /// the shape that would state the wrong fact about every test caller.
+    #[test]
+    fn a_reference_row_carries_the_calling_entitys_role() {
+        let graph = InMemoryGraph::new();
+        let focal = entity("HTTPAdapter.send", "src/requests/adapters.py");
+        let product_caller = entity("Session.send", "src/requests/sessions.py");
+        let mut test_caller = entity("test_send", "tests/test_requests.py");
+        test_caller.role = EntityRole::Test;
+        for e in [&focal, &product_caller, &test_caller] {
+            graph.upsert_entity(e).unwrap();
+        }
+        for caller in [&product_caller, &test_caller] {
+            graph
+                .upsert_relation(&relation(
+                    caller.id,
+                    focal.id,
+                    RelationKind::Calls,
+                    RelationOrigin::Lsp,
+                    0.95,
+                ))
+                .unwrap();
+        }
+        let rows = rows_for(&graph, &focal.id);
+        let role_of = |id: EntityId| {
+            rows.iter()
+                .find(|row| row.entity_id.as_deref() == Some(&id.to_string()[..]))
+                .unwrap_or_else(|| panic!("every proven caller is a row: {rows:?}"))
+                .role
+        };
+        assert_eq!(
+            role_of(product_caller.id),
+            Some(EntityRole::Source),
+            "a product caller reports the role the graph holds"
+        );
+        assert_eq!(
+            role_of(test_caller.id),
+            Some(EntityRole::Test),
+            "and a test caller reports a different one"
+        );
     }
 
     /// Both legs proven: the caller counts, and the row says which base it came

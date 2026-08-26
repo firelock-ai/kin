@@ -449,20 +449,19 @@ fn reference_classes() -> Vec<String> {
 /// classes are still disclosed through [`edge_coverage_degradation_labels`], so a
 /// reader sees what the verdict rests on either way.
 ///
-/// A query that asked for no load-bearing class falls back to the classes it did
-/// ask for, so an `imports`-only or `references`-only query is still gated on
-/// what it actually read rather than on nothing.
+/// Every class the query asked for. This used to narrow to `calls`, on the
+/// reasoning above, and the narrowing is what FIR-2672 is: the verdict rested on
+/// `calls` alone, published `imports: absent` beside it as a limit nobody
+/// weighed, and certified an answer as the whole set while its own completeness
+/// block recorded the class it could not have read. A class the answer could not
+/// have read is a class its counts cannot be whole over, whatever the reason,
+/// so every requested class decides. What the narrowing was protecting against,
+/// every Python answer reading inconclusive because Kin minted no entity-level
+/// `Imports` edge, is now said in those words: the scan reports such a class
+/// `unproduced` rather than `absent`, and the verdict names the build gap as its
+/// limiting factor instead of hiding it.
 pub(crate) fn load_bearing_classes(requested: &[String]) -> Vec<String> {
-    let load_bearing: Vec<String> = requested
-        .iter()
-        .filter(|class| class.as_str() == "calls")
-        .cloned()
-        .collect();
-    if load_bearing.is_empty() {
-        requested.to_vec()
-    } else {
-        load_bearing
-    }
+    requested.to_vec()
 }
 
 /// Whether this answer's own observation says cross-file reference edges were
@@ -508,14 +507,13 @@ pub(crate) fn references_producible(payload: &Value) -> bool {
 /// absence is a finding rather than the ordinary silence of a language server
 /// that never ran.
 pub(crate) fn deciding_classes(requested: &[String], references_producible: bool) -> Vec<String> {
-    let mut deciding = load_bearing_classes(requested);
-    if references_producible
-        && requested.iter().any(|class| class == "references")
-        && !deciding.iter().any(|class| class == "references")
-    {
-        deciding.push("references".to_string());
-    }
-    deciding
+    // Every requested class decides (FIR-2672). `references` no longer joins
+    // conditionally: when this host cannot produce it, `reference_enrichment`
+    // refuses by name before any class is read, and when nobody established
+    // whether it can, an unread class is the unknown case the whole module
+    // refuses on rather than the healthy one.
+    let _ = references_producible;
+    load_bearing_classes(requested)
 }
 
 /// Why the graph cannot certify this absence, or `None` when every substrate the
@@ -618,10 +616,24 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
 
     if !requested.is_empty() {
         let required = deciding_classes(&requested, references_producible(payload));
+        let unproduced = classes_in_state(&required, states, "unproduced");
         let absent = classes_in_state(&required, states, "absent");
         let unknown = classes_in_state(&required, states, "unknown");
         let present = classes_in_state(&requested, states, "present");
 
+        if !unproduced.is_empty() {
+            // The build, not the code. The scan completed, saw no entity-rooted
+            // edge of the class at all, and the parse side shows sites the
+            // linker had to resolve, so no scan of this graph could have found a
+            // use that reaches the target through it (FIR-2672).
+            let missing = unproduced.join(", ");
+            gaps.push(format!(
+                "cross_file_edges_unproduced: this build produced no entity-level {missing} edge \
+                 for {language} although the source carries {missing} sites the linker \
+                 resolved, so a use that reaches the target through {missing} could not have \
+                 been found, and the gap is in the linker, not in the code"
+            ));
+        }
         if !absent.is_empty() {
             let missing = absent.join(", ");
             // Naming what IS present matters as much as naming what is missing. The
@@ -786,19 +798,27 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
         _ => None,
     };
     if let Some(cause) = cause {
-        gaps.push(if requested.is_empty() {
-            format!(
-                "entity_index_unresolved: {cause}, so nothing resolves the program behind its \
+        // At the head of the list, not the tail. Since FIR-2672 every requested
+        // class refuses on its own, so a language whose reference edges could
+        // never exist reports the class gap and this one, and this is the
+        // sharper of the two: nothing a reader does about coverage moves a
+        // class the build or the host cannot produce.
+        gaps.insert(
+            0,
+            if requested.is_empty() {
+                format!(
+                    "entity_index_unresolved: {cause}, so nothing resolves the program behind its \
                  parsed declarations, and an empty name/kind filter cannot separate a declaration \
                  the repository does not have from one the extractor did not admit as an entity \
                  of that kind"
-            )
-        } else {
-            format!(
+                )
+            } else {
+                format!(
                 "reference_enrichment_unsupported: {cause}, so an empty result cannot separate a \
                  symbol nothing uses from one this graph could never have linked"
             )
-        });
+            },
+        );
     }
 
     // FIR-2496, and the gate every other one in this function was standing in
@@ -1806,33 +1826,94 @@ fn focal_is_method(payload: &Value) -> bool {
         .is_some_and(kin_core::reference_coverage::kind_name_under_resolves_incoming_calls)
 }
 
-/// The label an unavailable cross-repo answer reports, and its detail.
+/// What a cross-repo authority report says about the answer beside it.
+///
+/// A spine that is configured and did not answer limits the answer. A spine that
+/// was never configured for this repository does not, and the two shared one
+/// channel until FIR-2633: a single-repo install pushed a gap whose own producer
+/// text ends "this is the ordinary single-repo state and says nothing about
+/// references inside this repository", and that sentence was then quoted back as
+/// the limiting factor that made the answer inconclusive. A limit the reader
+/// cannot act on, describing a state the response already reports in full under
+/// `cross_repo`, teaches the reader to discount every limit including the real
+/// ones.
+enum CrossRepoQualifier {
+    /// The spine answered completely. Nothing to report.
+    Complete,
+    /// A configured spine failed, went stale, or answered incompletely. The
+    /// answer is limited and the verdict follows.
+    Gap(String),
+    /// No spine is configured for this repository. Reported so a reader can see
+    /// cross-repo authority was considered, and never as a limit.
+    Note(String),
+}
+
+/// The qualifier an unavailable cross-repo answer earns, carrying the code of the
+/// condition that held beside its human detail.
 ///
 /// The producer names the condition that held under `code`, so the label is that
 /// name rather than one catch-all. `cross_repo_unavailable` remains the label for
 /// an answer carrying no code, because a reason with no computed condition behind
 /// it must not be dressed up as one.
-fn cross_repo_unavailable_gap(cross_repo: &Value) -> String {
-    let code = cross_repo
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or("cross_repo_unavailable");
+///
+/// [`SPINE_REPO_UNREGISTERED`](crate::handlers::entities::SPINE_REPO_UNREGISTERED)
+/// is the one code that is not a gap. The producer already separates it from
+/// `SPINE_ROOT_STALE` at its own source (FIR-2353), so this reads a distinction
+/// that exists rather than inventing one: an unregistered repository is the
+/// ordinary state of a single-repo install, while every other code describes a
+/// spine that IS configured and did not answer.
+fn cross_repo_unavailable_qualifier(cross_repo: &Value) -> CrossRepoQualifier {
+    let code = cross_repo.get("code").and_then(Value::as_str);
     let reason = cross_repo
         .get("reason")
         .and_then(Value::as_str)
         .unwrap_or("the cross-repo spine could not answer");
-    format!("{code}: {reason}")
+    let qualifier = format!("{}: {reason}", code.unwrap_or("cross_repo_unavailable"));
+    if code == Some(crate::handlers::entities::SPINE_REPO_UNREGISTERED) {
+        CrossRepoQualifier::Note(qualifier)
+    } else {
+        CrossRepoQualifier::Gap(qualifier)
+    }
 }
 
-fn cross_repo_references_gap(payload: &Value) -> Option<String> {
+/// The note a repository with no cross-repo spine configured earns.
+///
+/// Kept identical for both tools: it is one fact about the install, not about the
+/// query, and two spellings of it would read as two conditions.
+fn cross_repo_not_configured_note() -> CrossRepoQualifier {
+    CrossRepoQualifier::Note(
+        "cross_repo_not_configured: no cross-repo spine is configured, so this answer is \
+         scoped to this repository"
+            .to_string(),
+    )
+}
+
+/// Route a cross-repo qualifier to the channel it belongs in.
+///
+/// A gap flips the verdict; a note never does. A note that could move the verdict
+/// is a gap, and belongs in `trust_reason` instead.
+fn apply_cross_repo_qualifier(
+    qualifier: CrossRepoQualifier,
+    trustworthy: &mut bool,
+    trust_reason: &mut String,
+    notes: &mut Vec<String>,
+) {
+    match qualifier {
+        CrossRepoQualifier::Gap(reason) => push_gap(trustworthy, trust_reason, reason),
+        CrossRepoQualifier::Note(note) => notes.push(note),
+        CrossRepoQualifier::Complete => {}
+    }
+}
+
+fn cross_repo_references_qualifier(payload: &Value) -> CrossRepoQualifier {
     let Some(cross_repo) = payload.get("cross_repo") else {
-        return Some(
+        return CrossRepoQualifier::Gap(
             "cross_repo_authority_missing: find_references did not report cross-repo authority"
                 .to_string(),
         );
     };
     match cross_repo.get("status").and_then(Value::as_str) {
-        Some("unavailable") => Some(cross_repo_unavailable_gap(cross_repo)),
+        Some("unavailable") => cross_repo_unavailable_qualifier(cross_repo),
         Some("available") => {
             let authority_complete = cross_repo
                 .get("authority_complete")
@@ -1870,35 +1951,36 @@ fn cross_repo_references_gap(payload: &Value) -> Option<String> {
                 && anchor_is_bound
                 && relation_subtype_complete
             {
-                None
+                CrossRepoQualifier::Complete
             } else {
-                Some(format!(
+                CrossRepoQualifier::Gap(format!(
                     "cross_repo_authority_incomplete: spine topology or requested relation subtype is incomplete at revision {}",
                     revision.unwrap_or("unwatermarked")
                 ))
             }
         }
-        Some("not_configured") => {
-            Some("cross_repo_not_configured: cross-repo authority did not answer".to_string())
-        }
-        Some(status) => Some(format!(
+        // Not a gap. No spine is configured, so there is no cross-repo authority
+        // to have failed, and nothing about this repository's own graph is in
+        // question (FIR-2633).
+        Some("not_configured") => cross_repo_not_configured_note(),
+        Some(status) => CrossRepoQualifier::Gap(format!(
             "cross_repo_authority_unknown: unrecognized cross-repo authority status '{status}'"
         )),
-        None => {
-            Some("cross_repo_authority_missing: cross-repo authority status is missing".to_string())
-        }
+        None => CrossRepoQualifier::Gap(
+            "cross_repo_authority_missing: cross-repo authority status is missing".to_string(),
+        ),
     }
 }
 
-fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
+fn cross_repo_bulk_qualifier(payload: &Value) -> CrossRepoQualifier {
     let Some(cross_repo) = payload.get("cross_repo") else {
-        return Some(
+        return CrossRepoQualifier::Gap(
             "cross_repo_authority_missing: bulk reachability did not report cross-repo authority"
                 .to_string(),
         );
     };
     match cross_repo.get("status").and_then(Value::as_str) {
-        Some("unavailable") => Some(cross_repo_unavailable_gap(cross_repo)),
+        Some("unavailable") => cross_repo_unavailable_qualifier(cross_repo),
         Some("available") => {
             let authority_complete = cross_repo
                 .get("authority_complete")
@@ -1924,23 +2006,24 @@ fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
                 && subtype_complete
                 && verdicts_complete
             {
-                None
+                CrossRepoQualifier::Complete
             } else {
-                Some(format!(
+                CrossRepoQualifier::Gap(format!(
                     "cross_repo_authority_incomplete: bulk topology or requested relation subtype is incomplete at revision {}",
                     revision.unwrap_or("unwatermarked")
                 ))
             }
         }
-        Some("not_configured") => {
-            Some("cross_repo_not_configured: cross-repo authority did not answer".to_string())
-        }
-        Some(status) => Some(format!(
+        // Not a gap. No spine is configured, so there is no cross-repo authority
+        // to have failed, and nothing about this repository's own graph is in
+        // question (FIR-2633).
+        Some("not_configured") => cross_repo_not_configured_note(),
+        Some(status) => CrossRepoQualifier::Gap(format!(
             "cross_repo_authority_unknown: unrecognized cross-repo authority status '{status}'"
         )),
-        None => {
-            Some("cross_repo_authority_missing: cross-repo authority status is missing".to_string())
-        }
+        None => CrossRepoQualifier::Gap(
+            "cross_repo_authority_missing: cross-repo authority status is missing".to_string(),
+        ),
     }
 }
 
@@ -2114,16 +2197,27 @@ pub fn negative_for(
     // no such thing, and applying it there would report every answer on every
     // repository with no spine configured as a floor forever, which is the
     // "mark everything uncertain" regression arriving through a side door.
+    // Conditions this answer weighed and ruled out as limits. They are reported
+    // so a reader can see cross-repo authority was considered, and they never
+    // reach `trust`.
+    let mut notes: Vec<String> = Vec::new();
+
     if tool == "find_references" && claims_absence {
-        if let Some(reason) = cross_repo_references_gap(payload) {
-            push_gap(&mut trustworthy, &mut trust_reason, reason);
-        }
+        apply_cross_repo_qualifier(
+            cross_repo_references_qualifier(payload),
+            &mut trustworthy,
+            &mut trust_reason,
+            &mut notes,
+        );
     }
 
     if tool == "bulk_check_references" && claims_absence {
-        if let Some(reason) = cross_repo_bulk_gap(payload) {
-            push_gap(&mut trustworthy, &mut trust_reason, reason);
-        }
+        apply_cross_repo_qualifier(
+            cross_repo_bulk_qualifier(payload),
+            &mut trustworthy,
+            &mut trust_reason,
+            &mut notes,
+        );
     }
 
     // An empty edge set has two readings with opposite consequences: a focal
@@ -2338,6 +2432,12 @@ pub fn negative_for(
         )),
     );
     negative.insert("degraded_signals".to_string(), json!(degraded_signals));
+    // Stated conditions that are NOT limits, kept in their own key so nothing
+    // downstream can read one as a gap. `trust`, `trust_reason` and `advice` are
+    // computed above and none of them sees this array.
+    if !notes.is_empty() {
+        negative.insert("notes".to_string(), json!(notes));
+    }
     Some(Value::Object(negative))
 }
 
@@ -2572,12 +2672,16 @@ mod tests {
     /// `imports` stays absent because Kin's linker mints no entity-level
     /// `Imports` relation on any language, healthy or not.
     fn cross_file_edges_observed() -> Value {
+        // Every requested class present. This fixture used to read `imports:
+        // absent` and still stand for a healthy graph, because the verdict
+        // weighed `calls` alone; since FIR-2672 every requested class decides,
+        // so "healthy" means what it says.
         json!({
             "scope": "language",
             "language": "Rust",
             "requested_classes": ["calls", "imports", "references"],
-            "classes": { "calls": "present", "imports": "absent", "references": "present" },
-            "cross_file_classes": ["calls", "references"],
+            "classes": { "calls": "present", "imports": "present", "references": "present" },
+            "cross_file_classes": ["calls", "imports", "references"],
             "reference_enrichment": "available",
             "budget_exhausted": false,
             "entities_examined": 2,
@@ -4157,8 +4261,15 @@ mod tests {
     /// cross-file. This fixture claimed the resolution and denied the edges
     /// until FIR-2505, which is the same contradiction the express payload
     /// shipped, and it is why nothing here failed while a deletion was certified.
+    /// FIR-2672. This case used to assert that the shape certified, under the
+    /// reasoning that Kin minted no entity-level `Imports` edge and a gate on
+    /// the class would refuse every Python answer. It is the shape the rc0552s
+    /// stranger received, verbatim in every field that decides: `calls` and
+    /// `references` present, a language server available, `imports: absent`
+    /// disclosed one field away, and a certification over it. The rename it
+    /// made on the certified sites broke on the import sites Kin never read.
     #[test]
-    fn a_python_graph_that_resolves_its_imports_still_certifies_an_unused_symbol() {
+    fn a_python_graph_whose_import_edges_were_never_produced_does_not_certify_an_unused_symbol() {
         let mut payload = authoritative_empty_references("function");
         payload["focal_entity"]["name"] = json!("never_used_anywhere");
         payload["focal_entity"]["file_path"] = json!("pkg/parsing.py");
@@ -4177,36 +4288,35 @@ mod tests {
 
         assert_eq!(
             negative["safe_to_conclude_absent"],
-            json!(true),
-            "a language this build can enrich, whose cross-file uses resolve, still \
-             earns absence: {}",
-            negative
+            json!(false),
+            "a class the answer could not read is a class its absence cannot be certified \
+             over: {negative}"
         );
-        assert_eq!(negative["trust"], json!("authoritative"));
-        assert!(negative["advice"]
-            .as_str()
-            .unwrap()
-            .contains("Absence is authoritative"));
-        // Certified, and still honest about the class it did not observe. The
-        // verdict rests on the resolved calls and references; saying that no
-        // entity-level import edge was seen is what keeps the next reader from
-        // mistaking it for full coverage.
-        assert_eq!(
-            negative["degraded_signals"],
-            json!(["edge_coverage:imports_absent"])
-        );
-        // And FIR-2505's second half on the shape where it bites: an
-        // authoritative verdict that publishes a signal must recite it rather
-        // than claim the response carried none.
+        assert_eq!(negative["trust"], json!("inconclusive"));
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(
-            !reason.contains("no degraded signals"),
-            "a verdict disclosing imports_absent must not claim there were none: {reason}"
+            reason.starts_with("cross_file_edges_absent") && reason.contains("imports"),
+            "the reason leads with the class and its state: {reason}"
         );
-        assert!(
-            reason.contains("edge_coverage:imports_absent"),
-            "the reason recites what it disclosed: {reason}"
+        assert_eq!(
+            negative["degraded_signals"],
+            json!(["edge_coverage:imports_absent"]),
+            "and the class is still disclosed as the signal it always was"
         );
+
+        // The inverse: the same answer over a graph whose import edges exist
+        // certifies, so the refusal is the class and nothing else.
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
+        payload["edge_coverage"]["cross_file_classes"] = json!(["calls", "imports", "references"]);
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "{negative}"
+        );
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert_eq!(negative["degraded_signals"], json!([]));
     }
 
     /// The one gate reads two independent declarations, and a tool that
@@ -4278,11 +4388,15 @@ mod tests {
     /// repository and `express.static` 26 times.
     #[test]
     fn a_producible_reference_class_that_produced_nothing_blocks_the_deletion_verdict() {
-        let payload = json!({
+        let mut payload = json!({
             "entity_impacts": [],
             "dependents": [],
             "edge_coverage": express_deletion_coverage("absent", "available")
         });
+        // Isolate the class under test. The express shape carries `imports:
+        // absent` too, and since FIR-2672 that refuses on its own, so it would
+        // lead the sentence this case reads for `references`.
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
         for tool in ["impact_analysis", "get_context_pack"] {
             let gap = absence_coverage_gap(tool, &payload)
                 .unwrap_or_else(|| panic!("{tool} must not certify the express deletion shape"));
@@ -4321,31 +4435,38 @@ mod tests {
 
     /// The control FIR-2404's descendants exist to protect: the gate must not
     /// answer "uncertain" to everything. The identical question on a graph whose
-    /// enrichment actually delivered still certifies, so a genuinely dead entity
-    /// stays deletable and the verdict keeps its ability to say yes.
+    /// enrichment actually delivered, and whose every requested class is
+    /// present, still certifies, so a genuinely dead entity stays deletable and
+    /// the verdict keeps its ability to say yes. This is also FIR-2672's
+    /// inverse: the fix must not trade a false certification for a false
+    /// refusal.
     #[test]
     fn an_enriched_graph_still_certifies_the_same_deletion_question() {
-        let payload = json!({
+        let mut payload = json!({
             "entity_impacts": [],
             "dependents": [],
             "edge_coverage": express_deletion_coverage("present", "available")
         });
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
         for tool in ["impact_analysis", "get_context_pack"] {
             assert_eq!(
                 absence_coverage_gap(tool, &payload),
                 None,
-                "{tool} must still certify when the reference class is present"
+                "{tool} must still certify when every requested class is present"
             );
         }
     }
 
-    /// The boundary that keeps the gate narrow. Kin's linker mints no
-    /// entity-level `Imports` relation on any language, so `imports: absent` is
-    /// the reading on every real graph including the healthy ones, and gating on
-    /// it would report every answer everywhere as inconclusive. The express
-    /// payload named it as a limit and it is disclosed, not load-bearing.
+    /// FIR-2672. This used to assert the opposite, under the reasoning that Kin
+    /// minted no entity-level `Imports` edge on any language, so gating on the
+    /// class would report every answer everywhere as inconclusive. That is
+    /// exactly what happened to the rc0552s stranger: the express payload named
+    /// `imports_absent` as a limit, the verdict weighed `calls` alone, and a
+    /// deletion was certified over a class the answer could never have read.
+    /// A class the answer could not read is a class its counts cannot be whole
+    /// over, whatever the reason, and the gap says which reason it was.
     #[test]
-    fn imports_absent_alone_is_never_what_blocks_a_verdict() {
+    fn imports_absent_alone_blocks_a_verdict_and_names_itself() {
         let payload = json!({
             "entity_impacts": [],
             "edge_coverage": express_deletion_coverage("present", "available")
@@ -4354,7 +4475,30 @@ mod tests {
             payload["edge_coverage"]["classes"]["imports"],
             json!("absent")
         );
-        assert_eq!(absence_coverage_gap("impact_analysis", &payload), None);
+        let gap = absence_coverage_gap("impact_analysis", &payload)
+            .expect("an absent requested class refuses on its own");
+        assert!(
+            gap.starts_with("cross_file_edges_absent"),
+            "the gap leads with the class's state: {gap}"
+        );
+        assert!(
+            gap.contains("no cross-file imports edges for JavaScript"),
+            "and names the class and the language: {gap}"
+        );
+
+        // The build-gap reading of the same class, when the scan could say so.
+        let mut unproduced = payload.clone();
+        unproduced["edge_coverage"]["classes"]["imports"] = json!("unproduced");
+        let gap = absence_coverage_gap("impact_analysis", &unproduced)
+            .expect("an unproduced requested class refuses on its own");
+        assert!(
+            gap.starts_with("cross_file_edges_unproduced"),
+            "the gap leads with the class's state: {gap}"
+        );
+        assert!(
+            gap.contains("the gap is in the linker, not in the code"),
+            "and says where the gap is: {gap}"
+        );
     }
 
     /// A host that could never have produced the class keeps its own reason. The
@@ -4390,17 +4534,40 @@ mod tests {
     /// makes no claim about silence.
     #[test]
     fn a_certified_verdict_recites_its_disclosed_signals_instead_of_denying_them() {
-        let payload = json!({
+        // FIR-2672 closed the shape this case was written on: a coverage signal
+        // disclosed beside an authoritative verdict. Every disclosed coverage
+        // shortfall now refuses, so the invariant this case guards, that the
+        // reason sentence agrees with the `degraded_signals` beside it, is
+        // asserted on both arms it can still take: a verdict with nothing
+        // disclosed says so, and a verdict with a class disclosed short recites
+        // that class in its refusal rather than claiming there was nothing.
+        let mut payload = json!({
             "entity_impacts": [],
             "edge_coverage": express_deletion_coverage("present", "available")
         });
+        payload["edge_coverage"]["classes"]["imports"] = json!("present");
         let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
             .expect("impact_analysis always qualifies");
-        assert_eq!(negative["trust"], json!("authoritative"));
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        assert_eq!(negative["degraded_signals"], json!([]), "{negative}");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("no degraded signals"),
+            "a verdict with nothing disclosed says so: {reason}"
+        );
+        assert!(
+            reason.contains("structural_authoritative"),
+            "the substrate verdict is kept, not replaced: {reason}"
+        );
+
+        payload["edge_coverage"]["classes"]["imports"] = json!("absent");
+        let negative = negative_for("impact_analysis", &payload, &structural_ready_envelope())
+            .expect("impact_analysis always qualifies");
+        assert_eq!(negative["trust"], json!("inconclusive"), "{negative}");
         let signals = negative["degraded_signals"].as_array().unwrap().clone();
         assert!(
-            !signals.is_empty(),
-            "this shape discloses imports_absent, or the test is asserting nothing"
+            signals.contains(&json!("edge_coverage:imports_absent")),
+            "the short class is disclosed as a signal: {negative}"
         );
         let reason = negative["trust_reason"].as_str().unwrap();
         assert!(
@@ -4408,12 +4575,8 @@ mod tests {
             "a verdict publishing {signals:?} must not claim there were none: {reason}"
         );
         assert!(
-            reason.contains("edge_coverage:imports_absent"),
-            "the reason recites what it disclosed: {reason}"
-        );
-        assert!(
-            reason.contains("structural_authoritative"),
-            "the substrate verdict is kept, not replaced: {reason}"
+            reason.contains("imports"),
+            "the reason recites the class it disclosed: {reason}"
         );
     }
 
@@ -4586,7 +4749,11 @@ mod tests {
             embed_worker_failed: Some(true),
             ..Degraded::default()
         };
-        let payload = authoritative_empty_references("function");
+        // One coverage shortfall on purpose, so the second half of the
+        // assertion below has something to keep: the healthy fixture carries
+        // none since FIR-2672 made every class decide.
+        let mut payload = authoritative_empty_references("function");
+        payload["edge_coverage"]["classes"]["imports"] = json!("absent");
         let negative = negative_for("find_references", &payload, &env).unwrap();
         assert_eq!(negative["safe_to_conclude_absent"], json!(false));
         assert!(negative["trust_reason"]
@@ -4742,11 +4909,18 @@ mod tests {
             .starts_with("spine_root_stale"));
     }
 
-    /// An unregistered repository is the ordinary single-repo state, and it must
-    /// not be reported as a mismatch of anything. The old wording made a healthy
-    /// local install look misconfigured.
+    /// An unregistered repository is the ordinary single-repo state. It must not
+    /// be reported as a mismatch of anything, and it must not be reported as the
+    /// limit that stopped this answer being trusted.
+    ///
+    /// The producer's own sentence ends "says nothing about references inside
+    /// this repository", and that sentence was being handed back as the limiting
+    /// factor for an answer about this repository (FIR-2633). A reader cannot act
+    /// on it, and the response already reports the state in full under
+    /// `cross_repo`. It is stated as a note instead, which is the channel a
+    /// condition that limits nothing belongs in.
     #[test]
-    fn an_unregistered_repository_is_not_reported_as_a_root_mismatch() {
+    fn an_unregistered_repository_is_stated_as_a_note_and_never_as_a_limit() {
         let mut payload = authoritative_empty_references("function");
         payload["cross_repo"] = json!({
             "status": "unavailable",
@@ -4756,9 +4930,124 @@ mod tests {
         });
         let negative =
             negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "{negative}"
+        );
         let reason = negative["trust_reason"].as_str().unwrap();
-        assert!(reason.starts_with("spine_repo_unregistered"), "{reason}");
+        assert!(
+            !reason.contains("spine_repo_unregistered"),
+            "a spine that was never configured limited nothing: {reason}"
+        );
         assert!(!reason.contains("mismatch"), "nothing mismatched: {reason}");
+        assert!(
+            !negative["advice"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("spine_repo_unregistered"),
+            "and the advice must not instruct the reader to act on it: {negative}"
+        );
+        assert!(
+            note_matching(&negative, "spine_repo_unregistered").is_some(),
+            "the condition is still stated, in the channel that limits nothing: {negative}"
+        );
+    }
+
+    /// The note channel, read the way every assertion below reads it.
+    fn note_matching(negative: &Value, prefix: &str) -> Option<String> {
+        negative
+            .get("notes")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|note| note.starts_with(prefix))
+            .map(str::to_string)
+    }
+
+    /// A single-repo install has no cross-repo authority to have failed, so
+    /// `not_configured` states itself and leaves the verdict alone.
+    ///
+    /// This is the case FIR-2633 is about at its most common: every absent
+    /// `find_references` on every install with no spine came back inconclusive,
+    /// naming a limit about other repositories as the reason an answer about this
+    /// one could not be trusted.
+    #[test]
+    fn a_spine_that_was_never_configured_does_not_limit_a_single_repo_answer() {
+        let mut payload = authoritative_empty_references("function");
+        payload["cross_repo"] = json!({ "status": "not_configured" });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "{negative}"
+        );
+        assert!(
+            !negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("cross_repo_not_configured"),
+            "{negative}"
+        );
+        let note = note_matching(&negative, "cross_repo_not_configured")
+            .unwrap_or_else(|| panic!("the state is still reported: {negative}"));
+        assert!(
+            note.contains("scoped to this repository"),
+            "and it says what it means rather than naming a failure: {note}"
+        );
+    }
+
+    /// The control that stops this fix becoming "never report cross-repo", for
+    /// both tools and every code that describes a spine which IS configured.
+    ///
+    /// Suppressing all cross-repo gaps would pass every assertion above and lose
+    /// a real one. These are the qualifiers that must stay gaps.
+    #[test]
+    fn a_configured_spine_that_did_not_answer_still_limits_the_answer() {
+        for status in [
+            json!({ "status": "unavailable", "code": "spine_root_stale", "reason": "root has advanced" }),
+            json!({ "status": "unavailable", "reason": "malformed spine xref response" }),
+            json!({ "status": "mystery" }),
+            json!({}),
+        ] {
+            for qualifier in [
+                cross_repo_references_qualifier(&json!({ "cross_repo": status.clone() })),
+                cross_repo_bulk_qualifier(&json!({ "cross_repo": status.clone() })),
+            ] {
+                assert!(
+                    matches!(qualifier, CrossRepoQualifier::Gap(_)),
+                    "a configured spine that did not answer is a real gap: {status}"
+                );
+            }
+        }
+    }
+
+    /// The same table from the other side: the two states that are NOT gaps, on
+    /// both tools. The bulk twin shares the classification and is asserted here
+    /// rather than left to be assumed from the `find_references` cases above.
+    #[test]
+    fn an_unconfigured_spine_is_a_note_on_both_reference_tools() {
+        for status in [
+            json!({ "status": "not_configured" }),
+            json!({
+                "status": "unavailable",
+                "code": "spine_repo_unregistered",
+                "reason": "no registered spine root",
+            }),
+        ] {
+            for qualifier in [
+                cross_repo_references_qualifier(&json!({ "cross_repo": status.clone() })),
+                cross_repo_bulk_qualifier(&json!({ "cross_repo": status.clone() })),
+            ] {
+                assert!(
+                    matches!(qualifier, CrossRepoQualifier::Note(_)),
+                    "an unconfigured spine states itself and limits nothing: {status}"
+                );
+            }
+        }
     }
 
     /// A reason with no computed code behind it keeps the catch-all label rather
@@ -4782,10 +5071,9 @@ mod tests {
     fn find_references_missing_or_unknown_cross_repo_authority_is_inconclusive() {
         for (cross_repo, expected_reason) in [
             (None, "cross_repo_authority_missing"),
-            (
-                Some(json!({ "status": "not_configured" })),
-                "cross_repo_not_configured",
-            ),
+            // `not_configured` is deliberately absent here: it is the one
+            // status that reports a spine which was never configured, so it is
+            // a note rather than a gap and is asserted as one above (FIR-2633).
             (
                 Some(json!({ "status": "mystery" })),
                 "cross_repo_authority_unknown",
@@ -5877,7 +6165,7 @@ mod tests {
             "scope": "language",
             "language": "Python",
             "requested_classes": ["calls", "imports", "references"],
-            "classes": {"calls": "present", "imports": "absent", "references": "absent"},
+            "classes": {"calls": "present", "imports": "present", "references": "present"},
             "reference_enrichment": "unknown",
             "budget_exhausted": false,
         });

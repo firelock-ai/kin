@@ -64,6 +64,45 @@ jobs:
           done < <(git rev-list "${base}..${head}")
           exit "$missing"
 
+  # scripts/check-release-version.mjs has carried the right refusal since
+  # before the release train existed, and nothing ever ran it on a pull
+  # request. Its one real invocation is inside the train's own branch-writer
+  # step, which runs once against a tree that step just regenerated and never
+  # again on the head that merges, so a release pull request could lose its
+  # version bump afterwards and every check would stay green. The mint then
+  # reads a workspace version whose tag already exists, calls that nothing to
+  # release, and exits 0 on a fifteen-minute cron with no tag and no alarm.
+  #
+  # Scope is release pull requests, not all of them. The gate refuses a
+  # release-affecting diff that does not move the version, and demanding that
+  # of every pull request is a policy change wearing a bug fix's clothes. The
+  # branch condition is the half that cannot be dodged, because a ruleset owns
+  # that ref; the label is there so a hand-cut release is covered too.
+  release-version:
+    name: Release version gate
+    if: >-
+      github.event_name == 'pull_request' &&
+      (github.head_ref == 'automation/release-next' ||
+      contains(github.event.pull_request.labels.*.name, 'release:automated'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The gate reads Cargo.toml out of the base commit. A shallow
+          # pull-request checkout does not carry it, and `git show` would fail
+          # in a way that reads like a broken gate rather than a missing fetch.
+          fetch-depth: 0
+
+      # Base and labels arrive as environment variables, never interpolated
+      # into the command line: a pull-request label is attacker-controlled text
+      # and `--labels ${{ ... }}` would put it in an argv the shell expands.
+      - name: Check the workspace version moved with the release
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: node scripts/check-release-version.mjs
+
   npm-launchers:
     name: npm launcher tests
     runs-on: ubuntu-latest
@@ -105,6 +144,7 @@ jobs:
           node --test \
             ./scripts/check-glibc-floor.test.mjs \
             ./scripts/check-release-version.test.mjs \
+            ./scripts/release-intent.test.mjs \
             ./scripts/extract-release-notes.test.mjs \
             ./scripts/prepare-release.test.mjs \
             ./scripts/read-update-build-identity.test.cjs \
@@ -1004,6 +1044,7 @@ jobs:
             scripts/check-release-proof-artifacts.test.mjs \
             scripts/release-train-body.test.mjs \
             scripts/check-release-version.test.mjs \
+            scripts/release-intent.test.mjs \
             scripts/extract-release-notes.test.mjs \
             scripts/prepare-release.test.mjs \
             scripts/release-archive-shape.test.cjs \
@@ -1515,6 +1556,17 @@ jobs:
           fail_expected "python guard" "text_refs.rs" python3 "$poisoned/scripts/verify-zero-file-search.py" "$poisoned"
 
           echo "Zero File-Search guards are falsifiable: every probe was caught."
+
+      # Both release version guards existed before this step did and neither
+      # could fail: the version gate ran on no pull request, and the mint read
+      # a version whose tag already existed and called that nothing to release.
+      # A suite written for guards of that shape is worth exactly as much as
+      # the run that watched it go red, so the falsifier poisons a copy of each
+      # gate and requires the suite to name the test that caught it. Half its
+      # probes break the refusal and half break the pass, because a gate that
+      # refused every quiet cycle would be switched off within a day.
+      - name: Falsify the release version guards
+        run: python3 ./scripts/falsify-release-version-guards.py
   # A skipped matrix job never expands, so its per-leg context names do not
   # appear at all rather than appearing skipped. `check-docs-only` exists for
   # exactly that reason and this is its counterpart: once the branch ruleset

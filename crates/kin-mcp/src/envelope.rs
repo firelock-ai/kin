@@ -771,6 +771,9 @@ impl CoverageSubstrate {
 const STATE_PRESENT: &str = "present";
 const STATE_ABSENT: &str = "absent";
 const STATE_UNKNOWN: &str = "unknown";
+/// A class the scan completed empty on while the parse side shows the linker
+/// had sites of it to resolve: a gap in the build, not the code (FIR-2672).
+const STATE_UNPRODUCED: &str = "unproduced";
 
 /// The completeness signal every retrieval response carries, empty or not
 /// (FIR-2357 item 1).
@@ -921,9 +924,12 @@ impl Completeness {
             .collect();
         let status = if deciding_states.is_empty() {
             STATE_UNKNOWN
-        } else if deciding_states.iter().any(|state| *state == STATE_ABSENT) {
+        } else if deciding_states
+            .iter()
+            .any(|state| *state == STATE_ABSENT || *state == STATE_UNPRODUCED)
+        {
             "partial"
-        } else if deciding_states.iter().any(|state| *state == STATE_UNKNOWN) {
+        } else if deciding_states.iter().any(|state| *state != STATE_PRESENT) {
             STATE_UNKNOWN
         } else {
             "complete"
@@ -1133,7 +1139,21 @@ fn merge_file_coverage_classes(
     classes.insert("file_parsed".to_string(), json!(parsed));
     decided_by.push("file_parsed".to_string());
     if parsed != STATE_PRESENT {
-        limits.push(format!("file_parsed_{parsed}"));
+        // Name the cause when the answer carries one. `file_parsed_absent` is
+        // true and says nothing: a file no adapter claims and a file whose
+        // adapter fell over earn the same word, and only the second is evidence
+        // about the code, so a reader acting on the limit cannot tell which they
+        // have. `content_opaque` is computed from the adapter registry one file
+        // over, so this reads a cause rather than inferring one.
+        limits.push(
+            match coverage
+                .and_then(|coverage| coverage.get("opaque_reason"))
+                .and_then(Value::as_str)
+            {
+                Some(reason) => format!("file_content_opaque_{reason}"),
+                None => format!("file_parsed_{parsed}"),
+            },
+        );
     }
 
     let enriched = match coverage
@@ -2583,15 +2603,19 @@ mod tests {
                     "authority_revision": "sha256:complete",
                     "authority_roots": { "local": "local-root" },
                 },
+                // Every class but the one the case varies is present, and the
+                // host can produce reference edges. Since FIR-2672 every
+                // requested class decides, so a "fully resolved" fixture has
+                // to be one.
                 "edge_coverage": {
                     "scope": "language",
                     "language": "Python",
                     "classes": {
                         "calls": calls_state,
-                        "imports": "absent",
-                        "references": "absent",
+                        "imports": "present",
+                        "references": "present",
                     },
-                    "reference_enrichment": "unknown",
+                    "reference_enrichment": "available",
                     "budget_exhausted": false,
                 },
                 // Unambiguous on purpose, and present on purpose. The handler
@@ -2609,6 +2633,123 @@ mod tests {
             })
             .to_string(),
         )
+    }
+
+    /// The FIR-2672 shape at the envelope layer: the populated answer the
+    /// rc0552s stranger received on 0.5.52, `calls` and `references` present,
+    /// `imports` short, with a language server available and nothing else
+    /// wrong. Every field a reader acts on must follow the one verdict, and the
+    /// `disagreements` scanner is the invariant that says they do.
+    fn stranger_reference_payload(imports: &str) -> ToolCallResult {
+        ToolCallResult::text(
+            json!({
+                "total_upstream": 5,
+                "counts": {
+                    "counted": "referencing_entities",
+                    "referencing_entities": 5,
+                    "reference_sites": 5,
+                    "known_reference_sites": 5,
+                    "reference_sites_complete": true,
+                    "receiver_name_candidates": 0,
+                },
+                "references": vec![json!({"name": "extract_tags"}); 5],
+                "relation_kinds": ["calls", "imports", "references"],
+                "degradations": [],
+                "cross_repo": {
+                    "status": "available",
+                    "authority_complete": true,
+                    "authority_revision": "sha256:complete",
+                    "authority_roots": { "local": "local-root" },
+                },
+                "edge_coverage": {
+                    "scope": "language",
+                    "language": "Python",
+                    "requested_classes": ["calls", "imports", "references"],
+                    "classes": {
+                        "calls": "present",
+                        "imports": imports,
+                        "references": "present",
+                    },
+                    "reference_enrichment": "available",
+                    "budget_exhausted": false,
+                },
+                "focal_resolution": {
+                    "addressed_by": "entity_id",
+                    "same_name_candidates": 1,
+                    "matched": "exact_focal_name",
+                    "other_candidates": [],
+                },
+            })
+            .to_string(),
+        )
+    }
+
+    /// FIR-2672. A populated answer over a requested class it could not read
+    /// does not certify, every acted-on field follows, the class is named in
+    /// `limits` and in the limiting factor, and the response carries no
+    /// disagreement. With the one class present the same answer certifies.
+    #[test]
+    fn a_populated_answer_over_an_unread_class_does_not_certify_and_stays_consistent() {
+        for (state, label) in [
+            ("absent", "edge_coverage:imports_absent"),
+            ("unproduced", "edge_coverage:imports_unproduced"),
+        ] {
+            let annotated = finalize(
+                stranger_reference_payload(state),
+                ready_daemon_envelope(),
+                "find_references",
+            );
+            let value = annotated_value(&annotated);
+            let verdict = &value[ENVELOPE_KEY]["verdict"];
+            let completeness = &value[ENVELOPE_KEY]["completeness"];
+            assert_eq!(verdict["state"], "inconclusive", "{state}: {value}");
+            assert!(
+                verdict["limiting_factor"]
+                    .as_str()
+                    .is_some_and(|factor| factor.contains("imports")),
+                "{state}: the factor names the class: {verdict}"
+            );
+            assert_eq!(
+                verdict["inputs"]["edge_coverage"], "inconclusive",
+                "{state}"
+            );
+            assert_eq!(completeness["status"], "partial", "{state}: {completeness}");
+            assert_eq!(completeness["bound"], "at_least", "{state}: {completeness}");
+            assert_eq!(
+                completeness["counted"]["exact"], false,
+                "{state}: {completeness}"
+            );
+            assert_eq!(completeness["classes"]["imports"], state, "{completeness}");
+            assert!(
+                completeness["limits"]
+                    .as_array()
+                    .is_some_and(|limits| limits.iter().any(|limit| limit == label)),
+                "{state}: limits name the class: {completeness}"
+            );
+            assert!(
+                completeness["decided_by"]
+                    .as_array()
+                    .is_some_and(|decided| decided.iter().any(|class| class == "imports")),
+                "{state}: the class that refused is on the record of what decided: \
+                 {completeness}"
+            );
+            let found = crate::verdict::disagreements(&value);
+            assert!(found.is_empty(), "{state}: {found:?}");
+        }
+
+        let annotated = finalize(
+            stranger_reference_payload("present"),
+            ready_daemon_envelope(),
+            "find_references",
+        );
+        let value = annotated_value(&annotated);
+        assert_eq!(
+            value[ENVELOPE_KEY]["verdict"]["state"], "certified",
+            "{value}"
+        );
+        assert_eq!(value[ENVELOPE_KEY]["completeness"]["status"], "complete");
+        assert_eq!(value[ENVELOPE_KEY]["completeness"]["bound"], "exact");
+        assert!(crate::verdict::disagreements(&value).is_empty());
     }
 
     /// The FIR-2357 headline at the envelope layer. A NON-empty answer over a
@@ -2673,16 +2814,18 @@ mod tests {
         assert_eq!(completeness["bound"], "exact", "{completeness}");
         assert_eq!(completeness["counted"]["reported"], 5);
         assert_eq!(completeness["counted"]["exact"], true);
-        // `imports` is absent here and on every real graph, since Kin mints no
-        // entity-level import edge, so it is disclosed and does not decide.
-        // `references` is absent here too, and does not decide because this
-        // fixture's `reference_enrichment` reads `unknown`: nothing established
-        // that this host could produce the class. Where a host CAN produce it,
-        // `references` does decide (FIR-2505), which is the case the test below
-        // pins. Both directions of this contract hold only because the deciding
-        // set is computed from that fact rather than fixed.
-        assert_eq!(completeness["classes"]["imports"], "absent");
-        assert_eq!(completeness["decided_by"], json!(["calls"]));
+        // Every requested class decides and every one is present (FIR-2672).
+        // This used to pin `imports: absent` beside `decided_by: ["calls"]`,
+        // the shipped 0.5.52 shape, as the fully resolved case.
+        assert_eq!(completeness["classes"]["imports"], "present");
+        assert_eq!(
+            completeness["decided_by"],
+            json!(["calls", "imports", "references"])
+        );
+        assert!(
+            completeness["limits"].is_null() || completeness["limits"] == json!([]),
+            "nothing was short, so nothing is named as a limit: {completeness}"
+        );
     }
 
     /// FIR-2505 and FIR-2492, on the block that carried the sentence. Shipped
@@ -2726,8 +2869,8 @@ mod tests {
 
         assert_eq!(
             completeness["decided_by"],
-            json!(["calls", "references"]),
-            "a class this host could produce is one the verdict rests on: {completeness}"
+            json!(["calls", "imports", "references"]),
+            "every requested class is one the verdict rests on: {completeness}"
         );
         assert_eq!(completeness["status"], "partial", "{completeness}");
         assert_eq!(completeness["bound"], "at_least", "{completeness}");
