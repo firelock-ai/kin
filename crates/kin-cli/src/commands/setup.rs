@@ -18008,8 +18008,17 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     /// while the defect was fully present, which makes it a falsification that
     /// cannot fail. This one cannot pass while the defect is present, and cannot
     /// be constructed once it is gone, because `rc_write_plan_in` takes one home.
+    ///
+    /// `PROFILE` is unset and the test is serial because the home is not the
+    /// only input to the PowerShell arm: `shell_rc_in` prefers `PROFILE` over
+    /// the home it is handed, so on a runner that sets it both homes would
+    /// answer the same path and the assertion below would fail for a reason
+    /// that is not the defect. Pinning it is what makes this a statement about
+    /// the home rather than about the machine.
     #[test]
+    #[serial]
     fn two_homes_would_have_produced_two_targets_for_a_one_file_shell() {
+        let _profile = EnvVarGuard::unset("PROFILE");
         let tmp = tempfile::tempdir().unwrap();
         let first = tmp.path().join("home-a");
         let second = tmp.path().join("home-b");
@@ -18071,8 +18080,15 @@ printf 'LD=[%s]\n' "$LD_PRELOAD"
     /// a one-file shell gets exactly one target and it is under that home. There
     /// is no second home to disagree with, which is the difference between a
     /// defect made unlikely and one made unrepresentable.
+    ///
+    /// `PROFILE` is unset for the same reason as its counterpart above: with it
+    /// set, the PowerShell arm correctly answers a path outside the home, and
+    /// "every path is under the home given" would be the wrong assertion rather
+    /// than a flaky one.
     #[test]
+    #[serial]
     fn a_plan_describes_the_one_home_it_was_given() {
+        let _profile = EnvVarGuard::unset("PROFILE");
         let tmp = tempfile::tempdir().unwrap();
         for name in ["home-a", "home-b"] {
             let home = tmp.path().join(name);
