@@ -256,6 +256,8 @@ class Suite(object):
             self.env["KIN_DAEMON_BIN"] = daemon
         for path in (self.env["KIN_HOME"], self.env["HOME"], self.repo):
             os.makedirs(path, exist_ok=True)
+        self._ready = None
+        self._setup_error = None
 
     def run(self, args, cwd=None, timeout=900):
         proc = subprocess.run(
@@ -375,6 +377,34 @@ class Suite(object):
                 "elapsed": elapsed, "timed_out": False,
                 "stderr": tail(err, 200)}
 
+    def ready(self):
+        """Build and init once, for whichever check runs first.
+
+        Setup used to live inside `check_postinit`, which made `check_disclosed`
+        depend on a sibling having run and having succeeded. Reorder the CHECKS
+        list, or let init fail, and the control would grade a repository that
+        was never built while reporting it as a control-query problem. Both
+        checks call this, it runs once, and a setup failure raises the same
+        error into both so neither can report a misleading cause.
+        """
+        if self._ready is None:
+            try:
+                self.build_fixture()
+                self.init()
+                self._ready = True
+            except Exception as error:  # noqa: BLE001 - any setup failure is UNREADABLE
+                # Deliberately wider than ProbeError. `kin init` can fail with a
+                # raw OSError before it ever produces output, and catching only
+                # ProbeError let that escape, skip the memo, and run setup a
+                # second time for the second check, so both reported a raw
+                # exception instead of the one honest cause.
+                self._setup_error = "%s: %s" % (type(error).__name__, error)
+                self._ready = False
+        if not self._ready:
+            raise ProbeError("the fixture never reached a queryable state, so "
+                             "nothing about readiness can be read: %s"
+                             % self._setup_error)
+
     def find_references(self, timeout=FIRST_QUERY_BOUND_SECONDS):
         # `query`, not a symbol/file pair. Read off the handler and confirmed
         # against how brownfield_repro.py calls the same tool; a guessed
@@ -396,8 +426,7 @@ def check_postinit(suite):
     because those two facts are what separate progress from a hang.
     """
     result = Result("postinit", "the first query after init answers or discloses")
-    suite.build_fixture()
-    suite.init()
+    suite.ready()
 
     probe = suite.find_references()
     if probe["timed_out"]:
@@ -447,6 +476,7 @@ def check_disclosed(suite):
     do not exist.
     """
     result = Result("disclosed", "a hot daemon answers completely and says nothing about starting")
+    suite.ready()
 
     probe = None
     deadline = time.time() + FIRST_QUERY_BOUND_SECONDS * 4
