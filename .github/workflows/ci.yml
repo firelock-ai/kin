@@ -1219,19 +1219,6 @@ jobs:
         if: matrix.shard == 1
         run: python3 scripts/test-private-repo-coupling.py
 
-      # A test that resolves a home through a real call site without
-      # `#[serial]` passes on a quiet laptop, lands green, and ejects a
-      # merge-queue entry weeks later from inside a `merge_group` run that
-      # marks no pull request. Two of the four ejections in the 2026-08-26
-      # window were one such test, and the pull requests it removed showed
-      # every check green. FIR-2714 removed that instance; this is what stops
-      # the next, and the guard carries its own blanker, recogniser and
-      # discovery controls so a scan that has stopped being able to say yes
-      # fails instead of reporting a clean tree.
-      - name: Check home-reading test isolation
-        if: matrix.shard == 1
-        run: python3 scripts/check-home-reader-tests.py
-
       # The committed Cargo.lock plus .cargo/config.toml pins kin-* dependencies
       # to public source until every crate is registry-published.
       - name: Build
@@ -1553,6 +1540,29 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt -- --check
+
+      # A test that resolves a home through a real call site without
+      # `#[serial]` passes on a quiet laptop, lands green, and ejects a
+      # merge-queue entry weeks later from inside a `merge_group` run that marks
+      # no pull request. Two of the four ejections in the 2026-08-26 window were
+      # one such test, and the pull requests it removed showed every check green.
+      # FIR-2714 removed that instance; this is what stops the next.
+      #
+      # It runs here rather than in `check` because it is a source read that
+      # resolves no dependencies, which is this job's whole admission rule, and
+      # because a script step in `check` is a gate `bin/kin-precheck` in the
+      # umbrella enumerates and must classify by name. Wiring it there without
+      # the matching umbrella entry makes precheck refuse with no tally, on this
+      # tree and on every lane still on an older base, which is measured rather
+      # than assumed: 16 of 17 gates passed and the run printed no tally.
+      # Promoting it later is this step moving one job and one name joining
+      # precheck's LOCAL list, which is FIR-2720's remaining half.
+      #
+      # The guard carries its own blanker, recogniser and discovery controls, so
+      # a scan that has stopped being able to say yes fails here instead of
+      # reporting a clean tree.
+      - name: Check home-reading test isolation
+        run: python3 scripts/check-home-reader-tests.py
 
       - name: Falsify Zero File-Search guards
         # Both guards still run on both platforms in Check & Test. Only this

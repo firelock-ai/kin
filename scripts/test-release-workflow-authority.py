@@ -574,7 +574,6 @@ UBUNTU_SHARD_ONE_ONLY_GATES = (
     "Check Runtime Boundaries",
     "Check Private Repo Coupling",
     "Test Private Repo Coupling Guard",
-    "Check home-reading test isolation",
     "Check the Linux release target (musl)",
     "Check the aarch64 Linux release target (musl)",
     "Doc tests",
