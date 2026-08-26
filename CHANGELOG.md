@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tell the model when its staged edit was not published (#1166)
 - Pin the module-sourced reference line in the acceptance suite (#1169)
 - Probe the segmented bootstrap and measure what its planning costs at repository scale (#1167)
+- Report why the cross-repo edge count is what it is, beside the count (#1171)
+- Weigh cross-repo authority in the verdict, not only when an absence is claimed (#1168)
+- Make the cargo cache key a function of this repository, not of the runner image (#1164)
 
 
 ## [0.6.0] - 2026-08-25
