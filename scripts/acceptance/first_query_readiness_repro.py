@@ -152,6 +152,20 @@ def upstream_total(payload):
     return total
 
 
+def focal_entity_resolved(payload):
+    """Did the query resolve to an entity at all?
+
+    An unresolved symbol and a symbol with no references are different facts,
+    and only the second is thinness. Without this, a resolution failure reports
+    as `total_upstream=0` and the suite files a confident finding of thinness
+    against a query that never named anything.
+    """
+    if not isinstance(payload, dict):
+        return False
+    focal = payload.get("focal_entity")
+    return isinstance(focal, dict) and bool(focal.get("id"))
+
+
 def answer_is_complete(payload, expected=EXPECTED_UPSTREAM):
     """Does this answer carry every upstream the fixture contains?
 
@@ -362,9 +376,11 @@ class Suite(object):
                 "stderr": tail(err, 200)}
 
     def find_references(self, timeout=FIRST_QUERY_BOUND_SECONDS):
-        return self.mcp("find_references",
-                        {"symbol": "widen", "file": "core.py"},
-                        timeout=timeout)
+        # `query`, not a symbol/file pair. Read off the handler and confirmed
+        # against how brownfield_repro.py calls the same tool; a guessed
+        # argument name returns a protocol error, which this suite would report
+        # as UNREADABLE and which would look like a daemon problem.
+        return self.mcp("find_references", {"query": "widen"}, timeout=timeout)
 
 
 # -------------------------------------------------------------------- checks
@@ -458,6 +474,13 @@ def check_disclosed(suite):
                        % tail(probe["raw"], 240))
         return result
 
+    if not focal_entity_resolved(probe["json"]):
+        result.unknown("the control query resolved no focal entity, so nothing "
+                       "about completeness can be read: an unresolved symbol "
+                       "and a symbol with no references are different facts and "
+                       "only the second is thinness")
+        return result
+
     total = upstream_total(probe["json"])
     if total is None:
         result.unknown("the control payload carried no total_upstream key, so "
@@ -533,6 +556,14 @@ def self_test():
     want("an empty answer is refused", not answer_is_complete({"total_upstream": 0}))
     want("a payload with no count is unreadable, not zero",
          upstream_total({"upstream": []}) is None)
+    want("a resolved focal entity is recognised",
+         focal_entity_resolved({"focal_entity": {"id": "e1"}, "total_upstream": 2}))
+    want("an unresolved query is not mistaken for a thin answer",
+         not focal_entity_resolved({"focal_entity": None, "total_upstream": 0}))
+    want("a focal entity with no id is unresolved",
+         not focal_entity_resolved({"focal_entity": {}, "total_upstream": 0}))
+    want("a payload with no focal entity at all is unresolved",
+         not focal_entity_resolved({"total_upstream": 0}))
     want("a boolean is not a count", upstream_total({"total_upstream": True}) is None)
     want("a non-object payload is unreadable", upstream_total("2") is None)
 
