@@ -51,7 +51,6 @@ impl LanguageAdapter for JavaScriptAdapter {
         let root = tree.root_node();
         let mut cursor = root.walk();
 
-
         // Read the file's property-defining helpers before walking it.
         // Declaration order does not bind a helper to its uses: express
         // declares `defineGetter` below all twelve calls to it.
@@ -138,7 +137,6 @@ impl LanguageAdapter for JavaScriptAdapter {
                 }
             }
         }
-
 
         Ok(ParseOutput {
             entities,

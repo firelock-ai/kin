@@ -60,7 +60,6 @@ impl LanguageAdapter for TypeScriptAdapter {
         let root = tree.root_node();
         let mut cursor = root.walk();
 
-
         // Read the file's property-defining helpers before walking it; a
         // helper is not bound to its uses by declaration order.
         let definers = collect_js_property_definers(&root, source);
@@ -144,7 +143,6 @@ impl LanguageAdapter for TypeScriptAdapter {
                 }
             }
         }
-
 
         Ok(ParseOutput {
             entities,
