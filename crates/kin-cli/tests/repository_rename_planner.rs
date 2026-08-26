@@ -55,7 +55,10 @@ impl PlannerHarness {
         artifact_id
     }
 
-    fn add_file(&mut self, path: &str, body: &str, completeness: ParseCompleteness) {
+    /// Returns the artifact this file was admitted as, so a test that needs
+    /// to name it in a relation uses the admitted identity rather than
+    /// minting a fresh one the tree does not carry.
+    fn add_file(&mut self, path: &str, body: &str, completeness: ParseCompleteness) -> ArtifactId {
         let artifact_id = self.add_tree_blob(path, body);
         let parser_rule = if completeness == ParseCompleteness::Full {
             kin_index::CALL_SHAPE_PARSE_COVERAGE_FULL_V1
@@ -91,6 +94,7 @@ impl PlannerHarness {
                 regions: Vec::new(),
             })
             .unwrap();
+        artifact_id
     }
 
     fn add_entity(&self, name: &str, path: &str, start_byte: usize, end_byte: usize) -> Entity {
@@ -485,8 +489,8 @@ fn extraction_incomplete_certificate_refuses_a_syntax_full_partial_refactor() {
     let target_body = "def target():\n    return 1\n";
     let caller_body =
         "def other():\n    return 2\n\ndef caller(flag):\n    return (target if flag else other)()\n";
-    harness.add_file("target.py", target_body, ParseCompleteness::Full);
-    harness.add_file("caller.py", caller_body, ParseCompleteness::Full);
+    let target_artifact = harness.add_file("target.py", target_body, ParseCompleteness::Full);
+    let caller_artifact = harness.add_file("caller.py", caller_body, ParseCompleteness::Full);
     harness.add_entity_at(
         "target",
         "target.py",
@@ -501,8 +505,12 @@ fn extraction_incomplete_certificate_refuses_a_syntax_full_partial_refactor() {
         .upsert_relation(&Relation {
             id: RelationId::new(),
             kind: RelationKind::DependsOn,
-            src: GraphNodeId::Artifact(ArtifactId::new()),
-            dst: GraphNodeId::Artifact(ArtifactId::new()),
+            // The certificate is about caller.py depending on target.py, so
+            // it names the artifacts the harness actually admitted. Minting
+            // fresh ids here described a dependency between two files the
+            // repository does not contain.
+            src: GraphNodeId::Artifact(caller_artifact),
+            dst: GraphNodeId::Artifact(target_artifact),
             confidence: 1.0,
             origin: RelationOrigin::Parsed,
             created_in: None,

@@ -1651,9 +1651,52 @@ mod tests {
     use super::*;
     use kin_model::{
         ArtifactId, Entity, EntityMetadata, FilePathId, FingerprintAlgorithm, GraphNodeId, Hash256,
-        LanguageId, Relation, RelationId, RelationOrigin, RepoPath, ResolvedArtifact, ResolvedTree,
-        SemanticFingerprint, SourceSpan, TreeEntry, Visibility,
+        LanguageId, LocatedEntry, Relation, RelationId, RelationOrigin, RepoPath, ResolvedArtifact,
+        ResolvedTree, SemanticFingerprint, SourceSpan, TestCase, TestId, TestKind, TestRunner,
+        TransactionDelta, TreeDelta, TreeEntry, VerificationStore, Visibility,
     };
+
+    /// Admit a test case so a `Test` endpoint names something the store holds.
+    ///
+    /// These fixtures used to mint a `TestId` and relate it without ever
+    /// creating the case, which described coverage by a test the repository
+    /// does not have. `create_test_case` with no scopes admits the identity and
+    /// writes no relations of its own, so the fixture's own edge stays the only
+    /// one it asserts about.
+    fn admit_test_case(graph: &kin_db::InMemoryGraph, test_id: TestId) {
+        graph
+            .create_test_case(&TestCase {
+                test_id,
+                name: "fixture_case".into(),
+                language: "rust".into(),
+                kind: TestKind::Unit,
+                scopes: Vec::new(),
+                runner: TestRunner::Cargo,
+                file_origin: Some(FilePathId::new("tests/fixture.rs")),
+            })
+            .unwrap();
+    }
+
+    /// Admit an artifact at `path` so an `Artifact` endpoint names something the
+    /// resolved tree carries, through the transaction path the product uses.
+    fn admit_artifact(graph: &kin_db::InMemoryGraph, artifact_id: ArtifactId, path: &str) {
+        let mut seed = [0u8; 32];
+        for (slot, byte) in seed.iter_mut().zip(path.as_bytes()) {
+            *slot = *byte;
+        }
+        graph
+            .apply_transaction_delta(&TransactionDelta {
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id,
+                    new: LocatedEntry::new(
+                        RepoPath::from_utf8(path).unwrap(),
+                        TreeEntry::blob(Hash256::from_bytes(seed), false),
+                    ),
+                }],
+                ..TransactionDelta::default()
+            })
+            .unwrap();
+    }
     use std::fs;
 
     /// The one-shot authority arm, which is what a test with no server around
@@ -3441,10 +3484,12 @@ mod tests {
         let (_temp, binding, graph) = graph_validation_fixture();
         let entity = test_entity("run_task");
         graph.upsert_entity(&entity).unwrap();
+        let test_id = kin_model::TestId::new();
+        admit_test_case(&graph, test_id);
         graph
             .upsert_relation(&graph_relation(
                 RelationKind::Covers,
-                GraphNodeId::Test(kin_model::TestId::new()),
+                GraphNodeId::Test(test_id),
                 GraphNodeId::Entity(entity.id),
             ))
             .unwrap();
@@ -3785,6 +3830,8 @@ mod tests {
 
         let test_id = kin_model::TestId::new();
         let artifact_id = ArtifactId::new();
+        admit_test_case(&graph, test_id);
+        admit_artifact(&graph, artifact_id, "src/dispatch.rs");
         graph
             .upsert_relation(&graph_relation(
                 RelationKind::Covers,
