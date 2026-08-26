@@ -1126,9 +1126,28 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(400);
+            let working = build_publisher(source_root.path(), commits);
+            // An annotated tag is a closure root that no commit walk can ever
+            // reach, because the tag object points at its commit and never the
+            // reverse. One of them makes the synthetic arm exercise the same ref
+            // gap a real repository's tags produce, and makes the all-roots
+            // assertion below falsifiable: without an unreachable root, dropping
+            // roots from that walk changes nothing and the check cannot fail.
+            // The four probe arms above carry no tag and are the zero-gap control.
+            git(
+                &working,
+                &[
+                    "tag",
+                    "-a",
+                    "probe-unreachable-root",
+                    "-m",
+                    "a closure root no commit walk reaches",
+                    "HEAD",
+                ],
+            );
             (
-                build_publisher(source_root.path(), commits),
-                format!("synthetic publisher of {commits} commits"),
+                working,
+                format!("synthetic publisher of {commits} commits plus one annotated tag"),
             )
         }
     };
@@ -1357,9 +1376,13 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
         cached_loader.hits,
         cached_loader.misses
     );
+    // Each object the plan VISITS, which is not the whole closure: steps are
+    // nested, so the distinct set the plan touches is the last step's subset,
+    // and anything only a non-tip root reaches is never loaded at all. Asserting
+    // the closure here instead would fail on every repository carrying a tag.
     assert_eq!(
-        cached_loader.misses, closure_objects,
-        "a cache over a whole plan loads each closure object exactly once"
+        cached_loader.misses, last_subset,
+        "a cache over a whole plan loads each object the plan visits exactly once"
     );
 
     eprintln!(
