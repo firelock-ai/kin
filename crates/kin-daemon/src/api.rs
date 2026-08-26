@@ -17192,7 +17192,10 @@ mod tests {
         // legal edit from not fitting: raising PAYLOAD_BLOB_BYTES to 8 MiB is
         // allowed by the per-body cap above and would put the over arm's wire
         // size past this limit while every other assertion here still passed.
-        let wire = (over + 2) / 3 * 4;
+        // Computed the way `http_body_limit_for` computes the limit it is
+        // compared against, so the two cannot drift into disagreeing about what
+        // base64 expansion costs.
+        let wire = over.div_ceil(3) * 4;
         let http_limit =
             kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT as u64;
         assert!(
