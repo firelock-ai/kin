@@ -1139,7 +1139,21 @@ fn merge_file_coverage_classes(
     classes.insert("file_parsed".to_string(), json!(parsed));
     decided_by.push("file_parsed".to_string());
     if parsed != STATE_PRESENT {
-        limits.push(format!("file_parsed_{parsed}"));
+        // Name the cause when the answer carries one. `file_parsed_absent` is
+        // true and says nothing: a file no adapter claims and a file whose
+        // adapter fell over earn the same word, and only the second is evidence
+        // about the code, so a reader acting on the limit cannot tell which they
+        // have. `content_opaque` is computed from the adapter registry one file
+        // over, so this reads a cause rather than inferring one.
+        limits.push(
+            match coverage
+                .and_then(|coverage| coverage.get("opaque_reason"))
+                .and_then(Value::as_str)
+            {
+                Some(reason) => format!("file_content_opaque_{reason}"),
+                None => format!("file_parsed_{parsed}"),
+            },
+        );
     }
 
     let enriched = match coverage

@@ -1438,6 +1438,9 @@ fn spine_reference_rows(
             // payload could show that it was.
             resolution: None,
             receiver_name_guess: false,
+            // No local entity, so no role. Defaulting this to `Source` would
+            // report every federated caller as product code on no evidence.
+            role: None,
             // A federated xref reaches the focal directly in the other
             // repository's graph; nothing here is composed over an override.
             via_override_of: None,
@@ -1607,6 +1610,12 @@ fn reference_row_json(row: ReferenceRow, include_snippets: bool) -> serde_json::
         "entity_id": row.entity_id,
         "name": row.name,
         "kind": row.kind,
+        // How the graph classifies this CALLER: `source`, `test`, `vendored`,
+        // and so on. Thirty test callers and thirty production callers are
+        // different facts about blast radius, and this is the field that
+        // separates them without a per-row `get_entity` round-trip. Null for a
+        // federated row, which has no local entity to carry one.
+        "role": row.role,
         "file_path": row.file_path,
         // `start_line` locates the CALLER's definition; `reference_lines` locates
         // the usages inside it. Both are graph facts and both are 1-based, so an
@@ -3269,8 +3278,11 @@ focal: direction='calls' walks outward to callees, 'callers' walks inward to cal
 'both' merges them — recursing to depth N with a per-step fan-out cap, and inlining \
 each step's body (in product mode, served from graph source records). Address the focal \
 by entity_id or by exact name. Reach for it when you need to follow a path \"what does \
-this call, and what do those call?\" or \"trace this value back to its source\" and want \
-the chain in traversal order, not a bag of neighbors. Its value is that the whole walk \
+this call, and what do those call?\" and want the chain in traversal order, not a bag of \
+neighbors. The unit is the entity, not the value: it walks Calls/Imports/References edges \
+between functions, classes and modules, so a parameter or a variable is followed only as \
+far as the function that receives it, and never through an assignment, a field or a \
+return. It cannot trace a value back to its source. Its value is that the whole walk \
 happens substrate-side and comes back as one structured response, so you don't loop \
 get_entity_source per hop and exhaust your tool-call budget. Ask for the chain's SHAPE with \
 include_body=false (names, kinds, roles, spans, edges, no source) — that is the cheap call, and \
@@ -5124,6 +5136,87 @@ mod tests {
     };
     use kin_spine::SpineBackend as _;
 
+    /// A row as the wire carries it, so the field cannot be added to the struct
+    /// and dropped by the serializer.
+    ///
+    /// The federated case is asserted beside it because
+    /// [`kin_model::EntityRole`] defaults to `Source`: a row with no local
+    /// entity must report null, never the default, or every cross-repo caller
+    /// arrives labelled product code on no evidence.
+    #[test]
+    fn the_wire_row_carries_the_callers_role_and_a_federated_row_reports_null() {
+        let local = super::reference_row_json(
+            ReferenceRow {
+                entity_id: Some("local".to_string()),
+                name: "test_send".to_string(),
+                kind: Some("Function".to_string()),
+                file_path: Some("tests/test_requests.py".to_string()),
+                start_line: Some(4),
+                reference_lines: vec![7],
+                reference_lines_absent: None,
+                signature: None,
+                snippet: None,
+                relation_kinds: Vec::new(),
+                resolution: None,
+                via_override_of: None,
+                receiver_name_guess: false,
+                role: Some(EntityRole::Test),
+            },
+            false,
+        );
+        assert_eq!(local["role"], serde_json::json!("test"), "{local}");
+
+        let federated = super::reference_row_json(
+            ReferenceRow {
+                entity_id: None,
+                name: "consumer".to_string(),
+                kind: None,
+                file_path: Some("[other] src/app.py".to_string()),
+                start_line: None,
+                reference_lines: Vec::new(),
+                reference_lines_absent: Some(ReferenceLinesAbsent::FederatedXref),
+                signature: None,
+                snippet: None,
+                relation_kinds: Vec::new(),
+                resolution: None,
+                via_override_of: None,
+                receiver_name_guess: false,
+                role: None,
+            },
+            false,
+        );
+        assert_eq!(
+            federated["role"],
+            serde_json::Value::Null,
+            "a row with no local entity has no role to report: {federated}"
+        );
+    }
+
+    /// The description states the unit it walks and promises nothing finer.
+    ///
+    /// `trace_data_flow` walks entity-level Calls/Imports/References edges. There
+    /// is no `FlowsTo` relation kind and no `Parameter` entity kind in the model,
+    /// so "trace this value back to its source" was a promise the substrate
+    /// cannot keep, and a reader who took it spent a tool call learning that
+    /// (FIR-2603). The capability is a separate, much larger piece of work; this
+    /// guard is only that the description stops claiming it.
+    #[test]
+    fn the_trace_description_promises_entity_edges_and_never_value_tracing() {
+        let description = TRACE_DATA_FLOW_DESC;
+        assert!(
+            !description.contains("trace this value back to its source"),
+            "the description must not promise value-level tracing: {description}"
+        );
+        assert!(
+            description.contains("The unit is the entity, not the value"),
+            "and it must state the unit it does walk: {description}"
+        );
+        assert!(
+            description.contains("Calls/Imports/References edges"),
+            "naming the edge classes it follows: {description}"
+        );
+    }
+
     fn make_entity(name: &str, file: &str) -> Entity {
         make_entity_in(LanguageId::Rust, name, file)
     }
@@ -6630,7 +6723,10 @@ mod tests {
     #[tokio::test]
     async fn find_references_excludes_a_self_edge() {
         let store = InMemoryGraph::new();
-        let caller = make_entity("caller", "src/a.rs");
+        let mut caller = make_entity("caller", "src/a.rs");
+        // A role the graph did not default to, so the assertion below proves the
+        // VALUE reached the wire and not merely the key (FIR-1940).
+        caller.role = EntityRole::Test;
         let target = make_entity("recurse", "src/b.rs");
         store.upsert_entity(&caller).unwrap();
         store.upsert_entity(&target).unwrap();
@@ -6656,6 +6752,11 @@ mod tests {
             caller.id.to_string(),
             "the one row must be the external caller: {body:#}"
         );
+        assert_eq!(
+            body["references"][0]["role"],
+            serde_json::json!("test"),
+            "a local row carries the caller's own role through the whole handler: {body:#}"
+        );
     }
 
     #[tokio::test]
@@ -6674,6 +6775,77 @@ mod tests {
         let body = parsed_response(&handle_find_references(&args, &store, None).await.unwrap());
         assert_eq!(body["total_upstream"], 0);
         assert!(body["references"].as_array().unwrap().is_empty());
+    }
+
+    /// The single-repo case FIR-2633 is really about, driven through the real
+    /// producer rather than a hand-written payload.
+    ///
+    /// A store with no spine at all is the ordinary install, and every absent
+    /// `find_references` on one used to come back qualified by a limit about
+    /// other repositories. The producer's own word for the state is checked here
+    /// too: a fixture that guessed it would prove the gate against a status
+    /// nothing emits, which is how the sibling disclosure in this PR was a no-op
+    /// on every real store until an acceptance fixture caught it.
+    #[tokio::test]
+    async fn an_install_with_no_spine_is_not_limited_by_cross_repo_authority() {
+        let store = InMemoryGraph::new();
+        let target = make_entity("orphan", "src/orphan.rs");
+        store.upsert_entity(&target).unwrap();
+        // An empty answer is evidence about the target only once the graph can
+        // hold a cross-file reference at all.
+        seed_cross_file_call_witness(&store);
+
+        let live_root = graph_root(&store);
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        // The daemon authority with no spine backend, which is what a repository
+        // that has an id and no cross-repo topology actually is. The ambient
+        // path with no `KIN_REPO_ID` at all reports a different state, and that
+        // one is deliberately untouched here.
+        let response = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &store,
+                FindReferencesAuthority {
+                    repo_id: "nk",
+                    graph_root: &live_root,
+                    spine: None,
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        assert!(
+            response["references"].as_array().unwrap().is_empty(),
+            "the absence path is the one under test: {response:#}"
+        );
+        assert_eq!(
+            response["cross_repo"]["status"], "not_configured",
+            "the producer's own word for a store with no spine: {}",
+            response["cross_repo"]
+        );
+        let trust_reason = response["negative"]["trust_reason"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            !trust_reason.contains("cross_repo"),
+            "a spine that does not exist limited nothing: {trust_reason}"
+        );
+        let notes = response["negative"]["notes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the state is still reported: {}", response["negative"]));
+        assert!(
+            notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.starts_with("cross_repo_not_configured"))),
+            "in the channel that limits nothing: {notes:?}"
+        );
     }
 
     #[tokio::test]
@@ -6804,14 +6976,32 @@ mod tests {
             !reason.contains("mismatch"),
             "an unregistered repository has nothing to mismatch: {reason}"
         );
+        // The state is reported in full under `cross_repo` above. What it must
+        // NOT do is limit the verdict: an install with no spine registered is
+        // the ordinary single-repo state, and quoting it back as the reason an
+        // answer about THIS repository could not be trusted is FIR-2633.
         let trust_reason = response["negative"]["trust_reason"].as_str().unwrap();
         assert!(
-            trust_reason.starts_with(SPINE_REPO_UNREGISTERED),
-            "the reason names the condition that held: {trust_reason}"
+            !trust_reason.contains(SPINE_REPO_UNREGISTERED),
+            "a spine that was never configured limited nothing: {trust_reason}"
         );
         assert!(
             !trust_reason.contains("mismatch"),
-            "and never the one that did not: {trust_reason}"
+            "and nothing mismatched: {trust_reason}"
+        );
+        assert_eq!(
+            response["negative"]["trust"], "authoritative",
+            "{}",
+            response["negative"]
+        );
+        let notes = response["negative"]["notes"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the condition is still stated: {}", response["negative"]));
+        assert!(
+            notes.iter().any(|note| note
+                .as_str()
+                .is_some_and(|note| note.starts_with(SPINE_REPO_UNREGISTERED))),
+            "in the channel that limits nothing: {notes:?}"
         );
     }
 
@@ -7795,6 +7985,17 @@ mod tests {
         );
         assert_eq!(unfiltered["total_upstream"], 1);
         assert_eq!(unfiltered["references"][0]["name"], "caller");
+        // A federated row has no local entity, so it has no role to read. Null
+        // rather than the `EntityRole` default, which would label every
+        // cross-repo caller product code on no evidence (FIR-1940). Asserted on
+        // the row the spine path actually built, because a hand-made row proves
+        // the serializer and not this constructor.
+        assert_eq!(
+            unfiltered["references"][0]["role"],
+            serde_json::Value::Null,
+            "{}",
+            unfiltered["references"][0]
+        );
     }
 
     #[tokio::test]

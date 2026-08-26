@@ -2783,6 +2783,119 @@ def check_20(suite):
     return res
 
 
+def check_21(suite):
+    """A file no adapter claims must say WHY it holds nothing, and a file an
+    adapter read must not borrow that reason.
+
+    Kin admits every file it is given. One whose extension no language adapter
+    claims is content-addressed, previewed, stored as an opaque artifact, and
+    extracts nothing. Until now every surface reported that outcome in exactly
+    the words it uses for a parse that was attempted and fell short: `parsed:
+    absent`, and `file_parsed_absent` as the envelope's limiting factor. Those
+    are opposite facts and only the second is evidence about the code, so seven
+    markdown files going into a graph and producing nothing read as a parser
+    defect to the reader who put them there. Nothing anywhere named the cause.
+
+    Check 17 already proves the neighbouring fact, that such a file must not be
+    certified. This proves the one after it: the answer has to say why. The two
+    are separable, and a build can pass 17 while telling the reader nothing.
+
+    Three arms, and the second and third are what let this fail. The disclosure
+    is computed from the adapter registry, which is the one authority on the
+    supported set, so:
+
+    - `docs/notes.md` must carry `content_opaque` true and an `opaque_reason`
+      naming its own extension. Naming the extension, rather than merely being
+      present, is what makes this arm able to fail: a flag computed from anything
+      other than the registry names something else or nothing.
+    - `pkg/parsed.py` must carry neither. A flag hardcoded true fails here.
+    - `pkg/empty.py` must carry neither. It is a docstring-only module that an
+      adapter read successfully, so it holds an entity rather than none; what it
+      controls is that the disclosure keys on the adapter and not on how thin a
+      file is.
+
+    Both mutations were run against a release build and both went red, each on a
+    different arm, which is the point of having three.
+
+    - Hardcoding the flag true fails on `pkg/parsed.py`, which reports 4 entities
+      and would be labelled opaque.
+    - Deriving the flag from the entity count fails on `docs/notes.md`, whose
+      reason then reads `no_adapter_for_extension:derived` and names no
+      extension at all.
+
+    One thing this suite deliberately does NOT prove, because its fixture cannot:
+    that a file an adapter read and found genuinely EMPTY is not reported opaque.
+    `pkg/empty.py` holds one entity, so a count-derived flag would not fire on it
+    here. That control lives in the unit fixtures beside the code
+    (`crates/kin-mcp/src/handlers/file_entities.rs`), where `src/empty.py` is
+    parsed `full` with zero entities. Said out loud because an arm that reads
+    like a control and is not one is worse than no arm.
+    """
+    res = Result("21", "MD-OPAQUE",
+                 "a file whose type no adapter claims discloses that as the reason")
+    repo = suite.fixture("threestate")
+
+    def coverage(rel):
+        try:
+            payload, _ = suite.mcp(repo, "list_file_entities", {"path": rel})
+        except McpError as exc:
+            return None, str(exc)
+        cov = payload.get("file_coverage")
+        if not isinstance(cov, dict):
+            return None, ("the response carries no file_coverage object; keys were %s"
+                          % sorted(payload.keys())[:12])
+        cov = dict(cov)
+        cov["total_in_file"] = payload.get("total_in_file")
+        return cov, None
+
+    # Arm 1: the unclaimed type names itself.
+    cov, why = coverage(NO_ADAPTER_FILE)
+    if cov is None:
+        res.unknown("%s could not be read through MCP: %s" % (NO_ADAPTER_FILE, why[:250]))
+    elif "content_opaque" not in cov:
+        res.unknown("%s reports no content_opaque field; file_coverage keys were %s"
+                    % (NO_ADAPTER_FILE, sorted(cov.keys())))
+    else:
+        extension = NO_ADAPTER_FILE.rsplit(".", 1)[-1]
+        reason = cov.get("opaque_reason")
+        if cov.get("content_opaque") is not True:
+            res.bad("%s has no language adapter and its enumeration is empty, yet the answer "
+                    "reports content_opaque=%r. The reader is left with parsed=%r, which is "
+                    "the same word a failed parse earns. Whole file_coverage: %r"
+                    % (NO_ADAPTER_FILE, cov.get("content_opaque"), cov.get("parsed"), cov))
+        elif not isinstance(reason, str) or extension not in reason:
+            res.bad("%s is disclosed as opaque but the reason does not name its extension "
+                    "%r: opaque_reason=%r. A cause that names the wrong type is not a cause"
+                    % (NO_ADAPTER_FILE, extension, reason))
+        else:
+            res.ok("%s discloses its type as the reason it holds nothing: content_opaque=True "
+                   "opaque_reason=%r tier=%r" % (NO_ADAPTER_FILE, reason, cov.get("tier")))
+
+    # Arms 2 and 3: the controls. Without them the arm above is satisfied by a
+    # build that reports every file opaque, which carries no information at all.
+    for label in ("parsed", "empty"):
+        rel = THREE_STATE_FILES[label]
+        cov, why = coverage(rel)
+        if cov is None:
+            res.unknown("%s could not be read through MCP: %s" % (rel, why[:250]))
+            continue
+        if "content_opaque" not in cov:
+            res.unknown("%s reports no content_opaque field; keys were %s"
+                        % (rel, sorted(cov.keys())))
+        elif cov.get("content_opaque") is not False or cov.get("opaque_reason") is not None:
+            res.bad("%s was read by a language adapter and holds %s entities, yet it reports "
+                    "content_opaque=%r opaque_reason=%r. A file with no entities is not the "
+                    "same fact as a file with no adapter, and this control is what separates "
+                    "them"
+                    % (rel, cov.get("total_in_file"), cov.get("content_opaque"),
+                       cov.get("opaque_reason")))
+        else:
+            res.ok("%s holds %s entities and claims no opaque cause, so the disclosure is "
+                   "computed rather than unconditional"
+                   % (rel, cov.get("total_in_file")))
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -2805,6 +2918,7 @@ CHECKS = [
     ("18", check_18),
     ("19", check_19),
     ("20", check_20),
+    ("21", check_21),
 ]
 
 

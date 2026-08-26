@@ -1826,33 +1826,94 @@ fn focal_is_method(payload: &Value) -> bool {
         .is_some_and(kin_core::reference_coverage::kind_name_under_resolves_incoming_calls)
 }
 
-/// The label an unavailable cross-repo answer reports, and its detail.
+/// What a cross-repo authority report says about the answer beside it.
+///
+/// A spine that is configured and did not answer limits the answer. A spine that
+/// was never configured for this repository does not, and the two shared one
+/// channel until FIR-2633: a single-repo install pushed a gap whose own producer
+/// text ends "this is the ordinary single-repo state and says nothing about
+/// references inside this repository", and that sentence was then quoted back as
+/// the limiting factor that made the answer inconclusive. A limit the reader
+/// cannot act on, describing a state the response already reports in full under
+/// `cross_repo`, teaches the reader to discount every limit including the real
+/// ones.
+enum CrossRepoQualifier {
+    /// The spine answered completely. Nothing to report.
+    Complete,
+    /// A configured spine failed, went stale, or answered incompletely. The
+    /// answer is limited and the verdict follows.
+    Gap(String),
+    /// No spine is configured for this repository. Reported so a reader can see
+    /// cross-repo authority was considered, and never as a limit.
+    Note(String),
+}
+
+/// The qualifier an unavailable cross-repo answer earns, carrying the code of the
+/// condition that held beside its human detail.
 ///
 /// The producer names the condition that held under `code`, so the label is that
 /// name rather than one catch-all. `cross_repo_unavailable` remains the label for
 /// an answer carrying no code, because a reason with no computed condition behind
 /// it must not be dressed up as one.
-fn cross_repo_unavailable_gap(cross_repo: &Value) -> String {
-    let code = cross_repo
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or("cross_repo_unavailable");
+///
+/// [`SPINE_REPO_UNREGISTERED`](crate::handlers::entities::SPINE_REPO_UNREGISTERED)
+/// is the one code that is not a gap. The producer already separates it from
+/// `SPINE_ROOT_STALE` at its own source (FIR-2353), so this reads a distinction
+/// that exists rather than inventing one: an unregistered repository is the
+/// ordinary state of a single-repo install, while every other code describes a
+/// spine that IS configured and did not answer.
+fn cross_repo_unavailable_qualifier(cross_repo: &Value) -> CrossRepoQualifier {
+    let code = cross_repo.get("code").and_then(Value::as_str);
     let reason = cross_repo
         .get("reason")
         .and_then(Value::as_str)
         .unwrap_or("the cross-repo spine could not answer");
-    format!("{code}: {reason}")
+    let qualifier = format!("{}: {reason}", code.unwrap_or("cross_repo_unavailable"));
+    if code == Some(crate::handlers::entities::SPINE_REPO_UNREGISTERED) {
+        CrossRepoQualifier::Note(qualifier)
+    } else {
+        CrossRepoQualifier::Gap(qualifier)
+    }
 }
 
-fn cross_repo_references_gap(payload: &Value) -> Option<String> {
+/// The note a repository with no cross-repo spine configured earns.
+///
+/// Kept identical for both tools: it is one fact about the install, not about the
+/// query, and two spellings of it would read as two conditions.
+fn cross_repo_not_configured_note() -> CrossRepoQualifier {
+    CrossRepoQualifier::Note(
+        "cross_repo_not_configured: no cross-repo spine is configured, so this answer is \
+         scoped to this repository"
+            .to_string(),
+    )
+}
+
+/// Route a cross-repo qualifier to the channel it belongs in.
+///
+/// A gap flips the verdict; a note never does. A note that could move the verdict
+/// is a gap, and belongs in `trust_reason` instead.
+fn apply_cross_repo_qualifier(
+    qualifier: CrossRepoQualifier,
+    trustworthy: &mut bool,
+    trust_reason: &mut String,
+    notes: &mut Vec<String>,
+) {
+    match qualifier {
+        CrossRepoQualifier::Gap(reason) => push_gap(trustworthy, trust_reason, reason),
+        CrossRepoQualifier::Note(note) => notes.push(note),
+        CrossRepoQualifier::Complete => {}
+    }
+}
+
+fn cross_repo_references_qualifier(payload: &Value) -> CrossRepoQualifier {
     let Some(cross_repo) = payload.get("cross_repo") else {
-        return Some(
+        return CrossRepoQualifier::Gap(
             "cross_repo_authority_missing: find_references did not report cross-repo authority"
                 .to_string(),
         );
     };
     match cross_repo.get("status").and_then(Value::as_str) {
-        Some("unavailable") => Some(cross_repo_unavailable_gap(cross_repo)),
+        Some("unavailable") => cross_repo_unavailable_qualifier(cross_repo),
         Some("available") => {
             let authority_complete = cross_repo
                 .get("authority_complete")
@@ -1890,35 +1951,36 @@ fn cross_repo_references_gap(payload: &Value) -> Option<String> {
                 && anchor_is_bound
                 && relation_subtype_complete
             {
-                None
+                CrossRepoQualifier::Complete
             } else {
-                Some(format!(
+                CrossRepoQualifier::Gap(format!(
                     "cross_repo_authority_incomplete: spine topology or requested relation subtype is incomplete at revision {}",
                     revision.unwrap_or("unwatermarked")
                 ))
             }
         }
-        Some("not_configured") => {
-            Some("cross_repo_not_configured: cross-repo authority did not answer".to_string())
-        }
-        Some(status) => Some(format!(
+        // Not a gap. No spine is configured, so there is no cross-repo authority
+        // to have failed, and nothing about this repository's own graph is in
+        // question (FIR-2633).
+        Some("not_configured") => cross_repo_not_configured_note(),
+        Some(status) => CrossRepoQualifier::Gap(format!(
             "cross_repo_authority_unknown: unrecognized cross-repo authority status '{status}'"
         )),
-        None => {
-            Some("cross_repo_authority_missing: cross-repo authority status is missing".to_string())
-        }
+        None => CrossRepoQualifier::Gap(
+            "cross_repo_authority_missing: cross-repo authority status is missing".to_string(),
+        ),
     }
 }
 
-fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
+fn cross_repo_bulk_qualifier(payload: &Value) -> CrossRepoQualifier {
     let Some(cross_repo) = payload.get("cross_repo") else {
-        return Some(
+        return CrossRepoQualifier::Gap(
             "cross_repo_authority_missing: bulk reachability did not report cross-repo authority"
                 .to_string(),
         );
     };
     match cross_repo.get("status").and_then(Value::as_str) {
-        Some("unavailable") => Some(cross_repo_unavailable_gap(cross_repo)),
+        Some("unavailable") => cross_repo_unavailable_qualifier(cross_repo),
         Some("available") => {
             let authority_complete = cross_repo
                 .get("authority_complete")
@@ -1944,23 +2006,24 @@ fn cross_repo_bulk_gap(payload: &Value) -> Option<String> {
                 && subtype_complete
                 && verdicts_complete
             {
-                None
+                CrossRepoQualifier::Complete
             } else {
-                Some(format!(
+                CrossRepoQualifier::Gap(format!(
                     "cross_repo_authority_incomplete: bulk topology or requested relation subtype is incomplete at revision {}",
                     revision.unwrap_or("unwatermarked")
                 ))
             }
         }
-        Some("not_configured") => {
-            Some("cross_repo_not_configured: cross-repo authority did not answer".to_string())
-        }
-        Some(status) => Some(format!(
+        // Not a gap. No spine is configured, so there is no cross-repo authority
+        // to have failed, and nothing about this repository's own graph is in
+        // question (FIR-2633).
+        Some("not_configured") => cross_repo_not_configured_note(),
+        Some(status) => CrossRepoQualifier::Gap(format!(
             "cross_repo_authority_unknown: unrecognized cross-repo authority status '{status}'"
         )),
-        None => {
-            Some("cross_repo_authority_missing: cross-repo authority status is missing".to_string())
-        }
+        None => CrossRepoQualifier::Gap(
+            "cross_repo_authority_missing: cross-repo authority status is missing".to_string(),
+        ),
     }
 }
 
@@ -2134,16 +2197,27 @@ pub fn negative_for(
     // no such thing, and applying it there would report every answer on every
     // repository with no spine configured as a floor forever, which is the
     // "mark everything uncertain" regression arriving through a side door.
+    // Conditions this answer weighed and ruled out as limits. They are reported
+    // so a reader can see cross-repo authority was considered, and they never
+    // reach `trust`.
+    let mut notes: Vec<String> = Vec::new();
+
     if tool == "find_references" && claims_absence {
-        if let Some(reason) = cross_repo_references_gap(payload) {
-            push_gap(&mut trustworthy, &mut trust_reason, reason);
-        }
+        apply_cross_repo_qualifier(
+            cross_repo_references_qualifier(payload),
+            &mut trustworthy,
+            &mut trust_reason,
+            &mut notes,
+        );
     }
 
     if tool == "bulk_check_references" && claims_absence {
-        if let Some(reason) = cross_repo_bulk_gap(payload) {
-            push_gap(&mut trustworthy, &mut trust_reason, reason);
-        }
+        apply_cross_repo_qualifier(
+            cross_repo_bulk_qualifier(payload),
+            &mut trustworthy,
+            &mut trust_reason,
+            &mut notes,
+        );
     }
 
     // An empty edge set has two readings with opposite consequences: a focal
@@ -2358,6 +2432,12 @@ pub fn negative_for(
         )),
     );
     negative.insert("degraded_signals".to_string(), json!(degraded_signals));
+    // Stated conditions that are NOT limits, kept in their own key so nothing
+    // downstream can read one as a gap. `trust`, `trust_reason` and `advice` are
+    // computed above and none of them sees this array.
+    if !notes.is_empty() {
+        negative.insert("notes".to_string(), json!(notes));
+    }
     Some(Value::Object(negative))
 }
 
@@ -4829,11 +4909,18 @@ mod tests {
             .starts_with("spine_root_stale"));
     }
 
-    /// An unregistered repository is the ordinary single-repo state, and it must
-    /// not be reported as a mismatch of anything. The old wording made a healthy
-    /// local install look misconfigured.
+    /// An unregistered repository is the ordinary single-repo state. It must not
+    /// be reported as a mismatch of anything, and it must not be reported as the
+    /// limit that stopped this answer being trusted.
+    ///
+    /// The producer's own sentence ends "says nothing about references inside
+    /// this repository", and that sentence was being handed back as the limiting
+    /// factor for an answer about this repository (FIR-2633). A reader cannot act
+    /// on it, and the response already reports the state in full under
+    /// `cross_repo`. It is stated as a note instead, which is the channel a
+    /// condition that limits nothing belongs in.
     #[test]
-    fn an_unregistered_repository_is_not_reported_as_a_root_mismatch() {
+    fn an_unregistered_repository_is_stated_as_a_note_and_never_as_a_limit() {
         let mut payload = authoritative_empty_references("function");
         payload["cross_repo"] = json!({
             "status": "unavailable",
@@ -4843,9 +4930,124 @@ mod tests {
         });
         let negative =
             negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "{negative}"
+        );
         let reason = negative["trust_reason"].as_str().unwrap();
-        assert!(reason.starts_with("spine_repo_unregistered"), "{reason}");
+        assert!(
+            !reason.contains("spine_repo_unregistered"),
+            "a spine that was never configured limited nothing: {reason}"
+        );
         assert!(!reason.contains("mismatch"), "nothing mismatched: {reason}");
+        assert!(
+            !negative["advice"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("spine_repo_unregistered"),
+            "and the advice must not instruct the reader to act on it: {negative}"
+        );
+        assert!(
+            note_matching(&negative, "spine_repo_unregistered").is_some(),
+            "the condition is still stated, in the channel that limits nothing: {negative}"
+        );
+    }
+
+    /// The note channel, read the way every assertion below reads it.
+    fn note_matching(negative: &Value, prefix: &str) -> Option<String> {
+        negative
+            .get("notes")?
+            .as_array()?
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|note| note.starts_with(prefix))
+            .map(str::to_string)
+    }
+
+    /// A single-repo install has no cross-repo authority to have failed, so
+    /// `not_configured` states itself and leaves the verdict alone.
+    ///
+    /// This is the case FIR-2633 is about at its most common: every absent
+    /// `find_references` on every install with no spine came back inconclusive,
+    /// naming a limit about other repositories as the reason an answer about this
+    /// one could not be trusted.
+    #[test]
+    fn a_spine_that_was_never_configured_does_not_limit_a_single_repo_answer() {
+        let mut payload = authoritative_empty_references("function");
+        payload["cross_repo"] = json!({ "status": "not_configured" });
+        let negative =
+            negative_for("find_references", &payload, &structural_ready_envelope()).unwrap();
+        assert_eq!(negative["trust"], json!("authoritative"), "{negative}");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(true),
+            "{negative}"
+        );
+        assert!(
+            !negative["trust_reason"]
+                .as_str()
+                .unwrap()
+                .contains("cross_repo_not_configured"),
+            "{negative}"
+        );
+        let note = note_matching(&negative, "cross_repo_not_configured")
+            .unwrap_or_else(|| panic!("the state is still reported: {negative}"));
+        assert!(
+            note.contains("scoped to this repository"),
+            "and it says what it means rather than naming a failure: {note}"
+        );
+    }
+
+    /// The control that stops this fix becoming "never report cross-repo", for
+    /// both tools and every code that describes a spine which IS configured.
+    ///
+    /// Suppressing all cross-repo gaps would pass every assertion above and lose
+    /// a real one. These are the qualifiers that must stay gaps.
+    #[test]
+    fn a_configured_spine_that_did_not_answer_still_limits_the_answer() {
+        for status in [
+            json!({ "status": "unavailable", "code": "spine_root_stale", "reason": "root has advanced" }),
+            json!({ "status": "unavailable", "reason": "malformed spine xref response" }),
+            json!({ "status": "mystery" }),
+            json!({}),
+        ] {
+            for qualifier in [
+                cross_repo_references_qualifier(&json!({ "cross_repo": status.clone() })),
+                cross_repo_bulk_qualifier(&json!({ "cross_repo": status.clone() })),
+            ] {
+                assert!(
+                    matches!(qualifier, CrossRepoQualifier::Gap(_)),
+                    "a configured spine that did not answer is a real gap: {status}"
+                );
+            }
+        }
+    }
+
+    /// The same table from the other side: the two states that are NOT gaps, on
+    /// both tools. The bulk twin shares the classification and is asserted here
+    /// rather than left to be assumed from the `find_references` cases above.
+    #[test]
+    fn an_unconfigured_spine_is_a_note_on_both_reference_tools() {
+        for status in [
+            json!({ "status": "not_configured" }),
+            json!({
+                "status": "unavailable",
+                "code": "spine_repo_unregistered",
+                "reason": "no registered spine root",
+            }),
+        ] {
+            for qualifier in [
+                cross_repo_references_qualifier(&json!({ "cross_repo": status.clone() })),
+                cross_repo_bulk_qualifier(&json!({ "cross_repo": status.clone() })),
+            ] {
+                assert!(
+                    matches!(qualifier, CrossRepoQualifier::Note(_)),
+                    "an unconfigured spine states itself and limits nothing: {status}"
+                );
+            }
+        }
     }
 
     /// A reason with no computed code behind it keeps the catch-all label rather
@@ -4869,10 +5071,9 @@ mod tests {
     fn find_references_missing_or_unknown_cross_repo_authority_is_inconclusive() {
         for (cross_repo, expected_reason) in [
             (None, "cross_repo_authority_missing"),
-            (
-                Some(json!({ "status": "not_configured" })),
-                "cross_repo_not_configured",
-            ),
+            // `not_configured` is deliberately absent here: it is the one
+            // status that reports a spine which was never configured, so it is
+            // a note rather than a gap and is asserted as one above (FIR-2633).
             (
                 Some(json!({ "status": "mystery" })),
                 "cross_repo_authority_unknown",
