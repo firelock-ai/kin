@@ -33,6 +33,71 @@ use kin_model::LanguageId;
 
 use crate::adapter::LanguageAdapter;
 
+/// Every `LanguageId` this crate knows, as one list other code can iterate.
+///
+/// Rust cannot enumerate an enum without a macro, and this workspace has no
+/// `strum`, so a hand-written list is unavoidable. What IS avoidable is the
+/// list going stale silently, and that is what [`language_ordinal`] below is
+/// for: it matches every variant with no wildcard arm, so adding a variant to
+/// `LanguageId` fails to COMPILE there rather than quietly producing a shorter
+/// list here.
+///
+/// Be exact about what that does and does not close, because a guard whose
+/// name promises more than it detects is worse than no guard, which is the
+/// defect this constant exists to fix:
+///
+/// * Add a variant and forget everything else: **compile error**, at
+///   `language_ordinal`.
+/// * Add a variant and its ordinal arm, register no adapter: **test failure**,
+///   at `registry_covers_every_language_id`.
+/// * Add a variant, its ordinal arm and an adapter, and forget
+///   `adapter_conformance.rs`: **test failure**, at
+///   `conformance_list_covers_every_language_id`.
+/// * Add a variant, its ordinal arm, and forget THIS list: not caught. No
+///   hand-written list can catch its own omission. It is the one residual hole
+///   and it is stated rather than papered over.
+pub const ALL_LANGUAGE_IDS: &[LanguageId] = &[
+    LanguageId::TypeScript,
+    LanguageId::JavaScript,
+    LanguageId::Python,
+    LanguageId::Go,
+    LanguageId::Java,
+    LanguageId::Rust,
+    LanguageId::C,
+    LanguageId::Cpp,
+    LanguageId::CSharp,
+    LanguageId::Ruby,
+    LanguageId::Php,
+    LanguageId::Swift,
+    LanguageId::Kotlin,
+    LanguageId::Hcl,
+];
+
+/// A stable index per language, and the tripwire that makes the list above
+/// maintainable.
+///
+/// The body is an exhaustive match with **no wildcard arm**. That is the whole
+/// point: `_ => 0` would make this compile forever and turn every guard built
+/// on it into a guard that cannot fail. Do not add one.
+pub fn language_ordinal(id: LanguageId) -> usize {
+    match id {
+        LanguageId::TypeScript => 0,
+        LanguageId::JavaScript => 1,
+        LanguageId::Python => 2,
+        LanguageId::Go => 3,
+        LanguageId::Java => 4,
+        LanguageId::Rust => 5,
+        LanguageId::C => 6,
+        LanguageId::Cpp => 7,
+        LanguageId::CSharp => 8,
+        LanguageId::Ruby => 9,
+        LanguageId::Php => 10,
+        LanguageId::Swift => 11,
+        LanguageId::Kotlin => 12,
+        LanguageId::Hcl => 13,
+    }
+}
+
 /// Registry of all built-in language adapters.
 pub struct AdapterRegistry {
     adapters: Vec<Box<dyn LanguageAdapter>>,
@@ -212,25 +277,67 @@ fn cpp_class_declaration_present(source: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// The registry carries an adapter for every `LanguageId`, and nothing else.
+    ///
+    /// This replaces a guard that could not fail. The previous version read
+    /// `registry.supported_languages()`, asserted its length was 14, and then
+    /// asserted that same Vec contained each of 14 named variants.
+    /// `supported_languages()` is `self.adapters.iter().map(|a| a.language_id())`,
+    /// so **it compared the registry to itself**: add a fifteenth `LanguageId`
+    /// and register no adapter, and the Vec stays at fourteen, the length
+    /// assertion passes, all fourteen `contains` pass, green. A test named
+    /// "registry has all languages" could not detect a language the registry
+    /// lacked, which is the only thing it existed to catch. Filed as FIR-2704.
+    ///
+    /// The fix is to compare against something that is not the registry.
+    /// [`ALL_LANGUAGE_IDS`] is that something, and [`language_ordinal`] is what
+    /// keeps it honest: a new variant is a compile error there.
+    ///
+    /// Both directions are asserted, because either alone is half a guard. A
+    /// language with no adapter is a hole; an adapter for a language the
+    /// enumeration does not know means the two lists have drifted and the
+    /// coverage claims built on them are measuring different sets.
     #[test]
-    fn registry_has_all_languages() {
+    fn registry_covers_every_language_id() {
         let registry = AdapterRegistry::new();
-        let langs = registry.supported_languages();
-        assert_eq!(langs.len(), 14);
-        assert!(langs.contains(&LanguageId::TypeScript));
-        assert!(langs.contains(&LanguageId::JavaScript));
-        assert!(langs.contains(&LanguageId::Python));
-        assert!(langs.contains(&LanguageId::Go));
-        assert!(langs.contains(&LanguageId::Java));
-        assert!(langs.contains(&LanguageId::Rust));
-        assert!(langs.contains(&LanguageId::C));
-        assert!(langs.contains(&LanguageId::Cpp));
-        assert!(langs.contains(&LanguageId::CSharp));
-        assert!(langs.contains(&LanguageId::Ruby));
-        assert!(langs.contains(&LanguageId::Php));
-        assert!(langs.contains(&LanguageId::Swift));
-        assert!(langs.contains(&LanguageId::Kotlin));
-        assert!(langs.contains(&LanguageId::Hcl));
+        let mut registered: Vec<usize> = registry
+            .supported_languages()
+            .into_iter()
+            .map(language_ordinal)
+            .collect();
+        let mut expected: Vec<usize> = ALL_LANGUAGE_IDS
+            .iter()
+            .copied()
+            .map(language_ordinal)
+            .collect();
+        registered.sort_unstable();
+        expected.sort_unstable();
+
+        let missing: Vec<usize> = expected
+            .iter()
+            .copied()
+            .filter(|o| !registered.contains(o))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these LanguageId ordinals have no registered adapter: {missing:?}"
+        );
+
+        let extra: Vec<usize> = registered
+            .iter()
+            .copied()
+            .filter(|o| !expected.contains(o))
+            .collect();
+        assert!(
+            extra.is_empty(),
+            "the registry holds adapters the enumeration does not know: {extra:?}"
+        );
+
+        assert_eq!(
+            registered.len(),
+            ALL_LANGUAGE_IDS.len(),
+            "one language must have exactly one adapter; duplicates hide a language behind another"
+        );
     }
 
     #[test]

@@ -20,6 +20,7 @@
 //! 10. Deterministic: same input produces same output
 
 use kin_model::{FilePathId, ParseState};
+use kin_parser::{language_ordinal, ALL_LANGUAGE_IDS};
 use kin_parser::{
     AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, HclAdapter, JavaAdapter,
     JavaScriptAdapter, KotlinAdapter, LanguageAdapter, ParseOutput, PhpAdapter, PythonAdapter,
@@ -76,6 +77,63 @@ fn parse_fixture(adapter: &dyn LanguageAdapter, source: &[u8]) -> ParseOutput {
 }
 
 // ---- Conformance Requirement 1: language_id is valid ----
+
+/// `all_adapters()` covers every `LanguageId`, and nothing else.
+///
+/// Every conformance test in this file iterates `all_adapters()`, a list
+/// maintained by hand, and the module comment asks whoever adds an adapter to
+/// remember it. An adapter missing from that list is not tested by ANY of them,
+/// and the suite stays green while saying nothing about it. That is the same
+/// shape as the registry guard this lane replaced (FIR-2704): a list checked
+/// only against itself.
+///
+/// So the list is compared against `ALL_LANGUAGE_IDS`, whose companion
+/// `language_ordinal` is a wildcard-free match and therefore a compile error
+/// when a `LanguageId` variant is added. Both directions matter: a language
+/// with no entry here is untested, and an entry for a language the enumeration
+/// does not know means the two have drifted and every "all adapters" claim in
+/// this file is measuring a different set than it reads.
+#[test]
+fn conformance_list_covers_every_language_id() {
+    let mut listed: Vec<usize> = all_adapters()
+        .iter()
+        .map(|a| language_ordinal(a.language_id()))
+        .collect();
+    let mut expected: Vec<usize> = ALL_LANGUAGE_IDS
+        .iter()
+        .copied()
+        .map(language_ordinal)
+        .collect();
+    listed.sort_unstable();
+    expected.sort_unstable();
+
+    let missing: Vec<usize> = expected
+        .iter()
+        .copied()
+        .filter(|o| !listed.contains(o))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "these LanguageId ordinals are absent from all_adapters(), so every conformance test in \
+         this file silently skips them: {missing:?}"
+    );
+
+    let extra: Vec<usize> = listed
+        .iter()
+        .copied()
+        .filter(|o| !expected.contains(o))
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "all_adapters() lists languages the enumeration does not know: {extra:?}"
+    );
+
+    assert_eq!(
+        listed.len(),
+        ALL_LANGUAGE_IDS.len(),
+        "one language, one adapter entry; a duplicate hides a language behind another"
+    );
+}
 
 #[test]
 fn conformance_language_id_is_set() {
