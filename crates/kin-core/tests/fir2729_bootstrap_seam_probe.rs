@@ -111,14 +111,12 @@ fn topological(changes: &[SemanticChange]) -> Vec<SemanticChange> {
     ordered
 }
 
-#[test]
-fn an_empty_replica_admits_the_bootstrap_transaction_a_git_admitted_store_would_send() {
-    let repository_id = hosted_shaped_id();
-
-    // --- the publisher: a real Git worktree with real content, adopting the
-    // hosted identity, exactly as the FIR-2724 fix made possible.
-    let source_root = tempfile::tempdir().unwrap();
-    let working = source_root.path().join("work");
+/// Build a Git worktree of `commits` commits. The first carries the probe
+/// path and its marker bytes; each later one ADDS a new path, so the change
+/// closure is a real chain rather than one change repeated.
+fn build_publisher(root: &std::path::Path, commits: usize) -> std::path::PathBuf {
+    assert!(commits >= 1, "a publisher needs at least one commit");
+    let working = root.join("work");
     std::fs::create_dir_all(working.join("service")).unwrap();
     std::fs::write(working.join(PROBE_PATH), PROBE_BYTES).unwrap();
     git(&working, &["init", "--initial-branch=main"]);
@@ -126,6 +124,44 @@ fn an_empty_replica_admits_the_bootstrap_transaction_a_git_admitted_store_would_
     git(&working, &["config", "user.name", "FIR-2729 Probe"]);
     git(&working, &["add", "--all"]);
     git(&working, &["commit", "-s", "-m", "payload for the probe"]);
+    for index in 1..commits {
+        let path = format!("service/added-{index:03}.txt");
+        std::fs::write(
+            working.join(&path),
+            format!("fir2729 probe payload for commit {index}\n"),
+        )
+        .unwrap();
+        git(&working, &["add", "--all"]);
+        git(&working, &["commit", "-s", "-m", &format!("add {path}")]);
+    }
+    working
+}
+
+#[test]
+fn an_empty_replica_admits_the_bootstrap_transaction_a_git_admitted_store_would_send() {
+    bootstrap_probe(1);
+}
+
+/// The same probe over a real chain of commits.
+///
+/// The single-commit arm exercises no ordering at all: one change is
+/// trivially parent-before-child, so the closure ordering, the alias set, the
+/// growing external-object closure and the ref target's distance from the root
+/// are all untested by it. This arm is what says a history rather than a
+/// snapshot bootstraps, which is the difference between "adoption at tip" and
+/// "full history under the ceilings" in the sizing tables.
+#[test]
+fn an_empty_replica_admits_a_multi_commit_history_in_one_bootstrap_transaction() {
+    bootstrap_probe(12);
+}
+
+fn bootstrap_probe(commits: usize) {
+    let repository_id = hosted_shaped_id();
+
+    // --- the publisher: a real Git worktree with real content, adopting the
+    // hosted identity, exactly as the FIR-2724 fix made possible.
+    let source_root = tempfile::tempdir().unwrap();
+    let working = build_publisher(source_root.path(), commits);
 
     let init = kin_core::init_from_git_adopting(&working, &repository_id)
         .expect("a Git-admitted store may adopt a hosted repository identity");
@@ -181,8 +217,13 @@ fn an_empty_replica_admits_the_bootstrap_transaction_a_git_admitted_store_would_
         "the publisher's changes carry no tree deltas; this probe exists to test the PAYLOAD and there is none"
     );
 
+    assert_eq!(
+        ordered_changes.len(),
+        commits,
+        "the publisher must admit one change per commit, or this arm is not testing the history it thinks it is"
+    );
     eprintln!(
-        "PROBE publisher: repository={repository_id} generation={source_generation} \
+        "PROBE publisher: commits={commits} repository={repository_id} generation={source_generation} \
          changes={} external_objects={} git_closure_objects={} aliases={} distinct_bodies={source_body_count}",
         ordered_changes.len(),
         metadata.external_objects.len(),
