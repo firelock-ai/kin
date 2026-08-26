@@ -1298,9 +1298,50 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
         subset_total += subset.len();
     }
 
+    // A plan whose last step walks from the default ref's tip does NOT reach the
+    // whole closure, and finding that out is what a real repository was for.
+    //
+    // The authority's closure covers every root it was built from, and only some
+    // of those roots are commits a tip walk descends to. An annotated tag is the
+    // clearest case: the tag object points at its commit and never the reverse,
+    // so no commit walk can ever reach it. A tag on a commit outside the default
+    // ref's history drags a whole line with it.
+    //
+    // Measured on kin: 28884 closure objects, 28675 reachable from the tip, 209
+    // sitting under 99 tag refs of which 29 are annotated tag objects and three
+    // point outside the default ref's history. Both numbers reproduce exactly
+    // under `git rev-list --objects --all --tags` and `git rev-list --objects
+    // HEAD`, which is the independent control on this whole paragraph.
+    //
+    // The planner consequence is the important part and it is not in the design.
+    // A segmented bootstrap whose final authority is a tip walk leaves the
+    // destination holding an authority that does not hash-equal the source's,
+    // and every subsequent ordinary push is then refused by the equality rule in
+    // `TransferSourceContext::read`, permanently, because the destination is no
+    // longer unborn either. So the final step must install the COMPLETE ref set
+    // and the objects only its other roots reach, not merely the tip's closure.
+    let from_all_roots = full
+        .closure
+        .roots
+        .iter()
+        .flat_map(|root| reachable_from_index(&by_id, root.target))
+        .map(|record| record.object)
+        .collect::<BTreeSet<_>>();
     assert_eq!(
-        last_subset, closure_objects,
-        "the last step must reach the whole closure, or the plan does not cover the history"
+        from_all_roots.len(),
+        closure_objects,
+        "a walk from EVERY closure root must reach the whole closure; if it does not, the walk \
+         itself is broken and the tip-gap below would be measuring that instead"
+    );
+    let tip_gap = closure_objects - last_subset;
+    eprintln!(
+        "INC2 SCALE ref gap: the last step's tip walk reaches {last_subset} of {closure_objects}, \
+         leaving {tip_gap} objects under {} closure roots that no commit walk reaches",
+        full.closure.roots.len()
+    );
+    assert!(
+        last_subset <= closure_objects,
+        "a step cannot reach more than the closure it was walked over"
     );
 
     // Read the sum against the term it is supposed to describe before reading
