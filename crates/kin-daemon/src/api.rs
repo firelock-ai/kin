@@ -17484,6 +17484,24 @@ mod tests {
              byte-verification is vacuous"
         );
 
+        // A path the fixture never wrote must be refused too, and this arm is
+        // here because falsification said so: without it, the missing-path
+        // guard was never reached, so a mutation removing it changed nothing
+        // and the guard could not be shown to do anything at all.
+        let mut absent = fixture.source_digests.clone();
+        absent.insert(
+            "payload/never-written.bin".to_string(),
+            hex::encode(Sha256::digest(b"a body no replica holds")),
+        );
+        let refused_absent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_payload_reassembles(&authority, &absent)
+        }));
+        assert!(
+            refused_absent.is_err(),
+            "an expected path the replica does not project must be refused, or a \
+             reassembly that dropped a file entirely would verify clean"
+        );
+
         drop(authority);
         std::fs::remove_dir_all(&fixture.working).ok();
     }
