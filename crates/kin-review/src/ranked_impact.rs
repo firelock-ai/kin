@@ -8,7 +8,7 @@
 //! and captured source evidence. The existing [`crate::impact::ImpactReport`]
 //! remains the compatibility surface for review policy; this module is additive.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use kin_index::RelationResolution;
 use kin_model::entity::{Entity, EntityRole};
@@ -213,8 +213,8 @@ pub fn rank_impact_at<I: ImpactGraph>(
         if frontier.hop >= bounded_depth {
             continue;
         }
-        let mut relations = graph.get_all_relations_for_entity(&frontier.entity_id)?;
-        relations.retain(|relation| is_impact_relation(relation.kind));
+        let all_relations = graph.get_all_relations_for_entity(&frontier.entity_id)?;
+        let mut relations = inbound_impact_relations(&all_relations, &frontier.entity_id);
         relations.sort_by_key(relation_sort_key);
 
         for relation in relations {
@@ -369,6 +369,49 @@ pub fn is_impact_relation(kind: RelationKind) -> bool {
             | RelationKind::Covers
             | RelationKind::DerivedFrom
     )
+}
+
+/// Inbound impact edges into `id`, with its declaring parent's non-call edges
+/// removed.
+///
+/// [`is_impact_relation`] drops the `Contains` edge a declaration carries to its
+/// members, and on a real graph that is not enough. The declaring parent carries
+/// a SECOND edge to the same member, `UsesType`, which does carry impact for
+/// every other pair, so the pair is joined twice and dropping one kind leaves the
+/// row standing. Measured on psf/requests: `BaseAdapter.send` holds both
+/// `<- Contains BaseAdapter` and `<- UsesType BaseAdapter`, and the class kept
+/// printing under a header that reads "direct callers" after the containment
+/// exclusion landed. A four-file Python fixture reproduces it, so this is the
+/// shape a graph actually delivers rather than an exotic one.
+///
+/// A `Calls` edge from a declaring parent is KEPT. A module really does call its
+/// own function at import time, and that caller is one a developer means.
+///
+/// `all` must be every relation touching `id`, not a pre-filtered set. The
+/// `Contains` edge that identifies the declaring parent is itself not an impact
+/// relation, so filtering by kind first destroys the evidence this needs.
+///
+/// Both walks call this, rather than each applying the per-kind predicate
+/// separately, so their agreement is structural instead of conventional.
+pub fn inbound_impact_relations(all: &[Relation], id: &EntityId) -> Vec<Relation> {
+    let node = GraphNodeId::Entity(*id);
+    let declaring: HashSet<EntityId> = all
+        .iter()
+        .filter(|relation| relation.dst == node && relation.kind == RelationKind::Contains)
+        .filter_map(|relation| relation.src.as_entity())
+        .collect();
+    all.iter()
+        .filter(|relation| relation.dst == node)
+        .filter(|relation| is_impact_relation(relation.kind))
+        .filter(|relation| {
+            relation.kind == RelationKind::Calls
+                || relation
+                    .src
+                    .as_entity()
+                    .is_none_or(|src| !declaring.contains(&src))
+        })
+        .cloned()
+        .collect()
 }
 
 fn impact_bucket(entity: &Entity, relation: RelationKind) -> ImpactBucket {
