@@ -317,6 +317,7 @@ fn plan_step(
     all_aliases: &[kin_model::ExternalChangeAlias],
     default_ref: &kin_model::RefName,
     repository_id: &RepositoryId,
+    from: usize,
     upto: usize,
     already_objects: &BTreeSet<kin_model::ExternalObjectId>,
 ) -> Step {
@@ -348,7 +349,13 @@ fn plan_step(
     )
     .expect("a step authority derives from the manifest walk");
 
-    let changes: Vec<SemanticChange> = ordered[..upto].to_vec();
+    // This step's OWN changes, and the aliases for exactly those. Slicing the
+    // two by the same index would pair the wrong ones: aliases keep the
+    // envelope's order and changes keep parent-before-child order, and nothing
+    // makes those agree. `RepositoryTransaction::validate` refuses a Git-origin
+    // change whose alias is not in the same transaction, so this has to be a
+    // filter over the carried set rather than a positional slice.
+    let changes: Vec<SemanticChange> = ordered[from..upto].to_vec();
     let carried_ids: BTreeSet<_> = changes.iter().map(|c| c.id).collect();
     Step {
         authority,
@@ -402,7 +409,7 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
 
     let first = plan_step(
         &source, &full, &ordered, &all_aliases, &default_ref, &repository_id,
-        STEP_ONE, &BTreeSet::new(),
+        0, STEP_ONE, &BTreeSet::new(),
     );
     let after_first: BTreeSet<_> = first
         .external_objects
@@ -411,7 +418,7 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
         .collect();
     let second = plan_step(
         &source, &full, &ordered, &all_aliases, &default_ref, &repository_id,
-        STEP_TWO, &after_first,
+        STEP_ONE, STEP_TWO, &after_first,
     );
 
     // The property that makes chunking work at all: a later step ships only
@@ -420,6 +427,12 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
     assert!(
         second.external_objects.len() < first.external_objects.len() + second.external_objects.len(),
         "the second step must carry fewer objects than the union, or nothing is being reused"
+    );
+    assert_eq!(
+        second.aliases.len(),
+        second.changes.len(),
+        "a step carries one alias per change it publishes; the model refuses a Git-origin \
+         change whose alias is not in the same transaction"
     );
     eprintln!(
         "INC2 STEPS: step1 objects={} changes={} | step2 NEW objects={} changes={}",
@@ -490,16 +503,8 @@ fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
             reason: format!("segmented bootstrap step publishing {}", step.head_object.oid),
             external_objects: step.external_objects.clone(),
             git_authority_delta: Some(delta),
-            changes: if previous.is_none() {
-                step.changes.clone()
-            } else {
-                step.changes[STEP_ONE..].to_vec()
-            },
-            aliases: if previous.is_none() {
-                step.aliases.clone()
-            } else {
-                step.aliases[STEP_ONE..].to_vec()
-            },
+            changes: step.changes.clone(),
+            aliases: step.aliases.clone(),
             ref_mutations: vec![RefMutation {
                 name: default_ref.clone(),
                 expected,
