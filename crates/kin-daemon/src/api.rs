@@ -17185,16 +17185,34 @@ mod tests {
     /// for bound one, because bound two would keep it failing. Pinning WHICH
     /// bound answered is what makes this go red at the right moment, and going
     /// red is what it is for: when Git-authority bootstrap lands, the under-cap
-    /// arm should publish and the over-cap arm should move to
-    /// `decoded body closure exceeds`, and both of those are this test failing.
+    /// arm should publish and the over-cap arm should refuse on size, and both
+    /// of those are this test failing.
     ///
-    /// It also establishes the ORDER, which nothing had measured. `validate_pack`
-    /// enforces the byte cap on the destination's side of a pack that the
-    /// source only builds after `TransferSourceContext::read` has already
-    /// compared the two replicas' Git authority, so the authority bound is
-    /// reached first and the size bound is unobservable end to end until it
-    /// moves. The over-cap arm proves that by observing the authority refusal
-    /// while being, on its own arithmetic, half again too large to ever fit.
+    /// **The tell is the STATUS, not a sentence, and the first draft of this
+    /// test got that wrong in a way that could not fail.** It asserted the
+    /// over-cap arm must not report `decoded body closure exceeds`, which is
+    /// `validate_pack`'s wording. A source-built pack never reaches that line.
+    /// The source's own byte check returns `Assembled::OverNegotiatedBound`
+    /// (`repository_transfer.rs:949`), which is SEGMENTATION rather than
+    /// refusal: the segment builder halves the change budget and rebuilds. It
+    /// only refuses when the step is indivisible, and a one-commit fixture is,
+    /// so it refuses at `:601` with a different sentence naming
+    /// `over negotiated limit`. The original assertion was keyed on a string
+    /// that can never appear, so it would have stayed green through exactly the
+    /// change it was written to catch.
+    ///
+    /// `RepositoryTransferError::Invalid` maps to 422 and `Conflict` to 409
+    /// (`repository_transfer_error`, `api.rs:10046`), so the status separates
+    /// the two bounds with nothing to spell: 409 today, 422 once authority
+    /// bootstrap lands. The message assertions are kept beside it as the
+    /// second, weaker reading.
+    ///
+    /// It also establishes the ORDER, which nothing had measured.
+    /// `build_repository_transfer_segment` reads the source context, and its
+    /// Git-authority comparison, before any byte is counted, so the authority
+    /// bound is reached first and the size bound is unobservable end to end
+    /// until it moves. The over-cap arm proves that by observing the authority
+    /// refusal while being, on its own arithmetic, half again too large to fit.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_payload_bearing_push_meets_the_authority_bound_before_the_size_cap() {
@@ -17241,14 +17259,21 @@ mod tests {
                 "the {label} arm must name the authority bound: {message}"
             );
             // The half that makes this a pin rather than a restatement. The
-            // size cap refuses with a different variant and a different
-            // sentence, and an over-cap push that started reporting THAT would
-            // mean bound one had moved.
+            // size bound is a different error variant and therefore a different
+            // status, so the 409 above already excludes it; these name the two
+            // sentences the size bound can actually produce, so a reader who
+            // hits this failure is told which wording to look for.
             assert!(
-                !message.contains("decoded body closure exceeds"),
-                "the {label} arm must not be reporting the size cap yet; if it is, \
+                !message.contains("over negotiated limit"),
+                "the {label} arm must not be reporting the size bound yet; if it is, \
                  Git-authority bootstrap has landed and this pin has to be \
                  rewritten rather than relaxed: {message}"
+            );
+            assert!(
+                !message.contains("cannot be split across continuation packs"),
+                "the {label} arm must not be reporting the indivisible-step refusal \
+                 yet, which is how an over-cap one-commit history is refused once \
+                 the authority bound moves: {message}"
             );
             assert!(
                 !message.contains("does not match destination repository"),
@@ -17332,6 +17357,134 @@ mod tests {
              reports the authority bound then the pin beside it is measuring \
              refusal-in-general rather than that bound: {message}"
         );
+        std::fs::remove_dir_all(&fixture.working).ok();
+    }
+
+    /// Byte-verify a replica's admitted content against the bytes a fixture
+    /// wrote, by content hash and never by count.
+    ///
+    /// Counts survive every corruption that matters. A replica holding the
+    /// right number of artifacts with the wrong bytes in them, or the right
+    /// bytes under the wrong paths, passes any count and fails this.
+    ///
+    /// The comparison deliberately shares no machinery with the store. The
+    /// expected side is a SHA-256 taken of the bytes at the moment they were
+    /// written to the working tree; the actual side is a SHA-256 taken of what
+    /// `load_source_blob` hands back. Hashing both sides with Kin's own digest
+    /// function would compare the store to itself and hold under any error that
+    /// affected the digest and the content together.
+    ///
+    /// It is route-agnostic on purpose. It takes an authority and a digest map,
+    /// so the day a route lands the payload on a hosted replica this is pointed
+    /// at THAT authority with the same map and asserts the same thing. Until
+    /// then it runs against the source replica, which is what proves the
+    /// comparator can answer at all rather than being written and never run.
+    ///
+    /// Returns how many paths it verified, so a caller can refuse a run that
+    /// verified nothing.
+    #[cfg(unix)]
+    fn assert_payload_reassembles(
+        authority: &ActiveApiRepositoryAuthority,
+        expected: &std::collections::BTreeMap<String, String>,
+    ) -> usize {
+        assert!(
+            !expected.is_empty(),
+            "an empty expectation makes every assertion below vacuously true"
+        );
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .expect("the replica projects a workspace")
+            .clone();
+
+        let mut verified = 0_usize;
+        for (path, want) in expected {
+            let artifact = workspace
+                .tree
+                .artifacts_by_path()
+                .find(|artifact| artifact.path.as_bytes() == path.as_bytes())
+                .unwrap_or_else(|| {
+                    panic!("the replica projects no artifact at {path}, so its bytes cannot be compared")
+                });
+            let digest = artifact.entry.blob_identity().unwrap_or_else(|| {
+                panic!("the artifact at {path} carries no blob identity, so it has no bytes")
+            });
+            let bytes = authority
+                .manager
+                .load_source_blob(digest)
+                .unwrap_or_else(|error| panic!("reading {path} failed: {error}"))
+                .unwrap_or_else(|| panic!("the replica holds no body for {path}"));
+            let got = hex::encode(Sha256::digest(&bytes));
+            assert_eq!(
+                &got, want,
+                "the bytes the replica serves for {path} are not the bytes the fixture wrote"
+            );
+            verified += 1;
+        }
+        // The half that stops a silent pass. A loop that found nothing to
+        // compare exits exactly like one that compared everything.
+        assert_eq!(
+            verified,
+            expected.len(),
+            "every expected path must have been verified"
+        );
+        verified
+    }
+
+    /// The reassembly comparator, exercised today against the replica that
+    /// wrote the payload.
+    ///
+    /// The destination half cannot be written yet, because no route puts this
+    /// payload on a hosted replica. What CAN be established now is that the
+    /// comparator answers correctly at all: that the digest map is a true
+    /// record of the bytes, that `load_source_blob` reaches them by path, and
+    /// that a mismatch is detected rather than skipped. A comparator first run
+    /// on the day a route lands is a comparator whose first result nobody can
+    /// distinguish from a bug in the comparator.
+    ///
+    /// The negative half runs here too, in-process: a deliberately wrong
+    /// expectation must panic. Without it this test would pass on a comparator
+    /// that verified nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_reassembly_comparator_verifies_bytes_and_refuses_a_mismatch() {
+        let hosted_id = hosted_repository_id();
+        let hosted_repository = RepositoryId::new(hosted_id).unwrap();
+        let fixture = payload_fixture("reassembly", PAYLOAD_BLOBS_UNDER_CAP, &hosted_repository);
+        let authority =
+            ActiveApiRepositoryAuthority::open_layout_for_test(&fixture.layout).unwrap();
+
+        let verified = assert_payload_reassembles(&authority, &fixture.source_digests);
+        assert_eq!(
+            verified, PAYLOAD_BLOBS_UNDER_CAP,
+            "the comparator must have verified every blob the fixture wrote"
+        );
+
+        // A comparator that cannot fail is not a comparator. One byte of the
+        // expectation is flipped and the same call must panic, which is the
+        // control that the equality above is load-bearing.
+        let mut corrupted = fixture.source_digests.clone();
+        let (path, digest) = corrupted
+            .iter()
+            .next()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .unwrap();
+        let flipped = format!("{}0{}", &digest[..0], &digest[1..]);
+        assert_ne!(flipped, digest, "the corruption must change the digest");
+        corrupted.insert(path.clone(), flipped);
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_payload_reassembles(&authority, &corrupted)
+        }));
+        assert!(
+            refused.is_err(),
+            "a wrong expected digest for {path} must be refused, or every future \
+             byte-verification is vacuous"
+        );
+
+        drop(authority);
         std::fs::remove_dir_all(&fixture.working).ok();
     }
 
