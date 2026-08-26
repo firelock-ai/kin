@@ -201,7 +201,7 @@ pub async fn run(
     //
     // Runs before the result is printed so what a reader is told about their
     // repository is true of the repository they now have.
-    if !no_enrich {
+    let cross_file = if !no_enrich {
         // Isolated on its own task so a panic inside it cannot decide init's
         // exit status. `kin init 2>&1 | head -1` closes both streams after one
         // line and every advisory write after that panics; init's contract is
@@ -211,15 +211,25 @@ pub async fn run(
         // forever is a worse guarantee than making the phase structurally unable
         // to matter.
         let kin_root = result.layout.root().to_path_buf();
-        if let Err(error) = tokio::spawn(async move { enrich_after_init(&kin_root).await }).await {
-            note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
+        match tokio::spawn(async move { enrich_after_init(&kin_root).await }).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
+                CrossFileEnrichment::unreadable()
+            }
         }
-    }
+    } else {
+        CrossFileEnrichment::Withheld {
+            pending: "`--no-enrich` skipped the language-server sweep, so cross-file reference \
+                      and override edges are not in this graph; `kin daemon sweep` runs it"
+                .to_string(),
+        }
+    };
 
     if json {
         print_json_result(&result, boundary, enrichment)?;
     } else {
-        print_human_result(&result, boundary, &enrichment)?;
+        print_human_result(&result, boundary, &enrichment, &cross_file)?;
     }
     Ok(())
 }
@@ -289,6 +299,61 @@ async fn stop_conversion_daemon(borrowed_existing: bool, kin_root: &Path) {
 /// there and fails with a version error naming a layout nothing wrote, which is
 /// exactly how this read as "no daemon could be started" on a repository whose
 /// store had just been created successfully.
+/// What the conversion's enrichment phase produced, as the summary has to
+/// describe it.
+///
+/// `kin init` reported "Semantic enrichment: present" on a repository whose
+/// graph held no cross-file reference edge at all, because presence is scored
+/// from entity and relation counts and a single-file parse fills both. The
+/// containment edges are real, so the counts are right; the word over them is
+/// what claimed a graph the run did not build. FIR-2787 is the reader who was
+/// told four separate times, on four surfaces, what this one word had already
+/// said wrongly.
+///
+/// The phase already knows the answer at no extra cost. It watches the sweep it
+/// started, so it sees a daemon that could not sweep, a sweep that walked files
+/// and enriched none, and a sweep cut short by its own budget, and each of the
+/// three is a run that produced no complete cross-file graph. Nothing here
+/// re-reads the store to find that out, which matters on the repository this
+/// ticket came from, where a `graph status` costs half a minute.
+///
+/// The claim is deliberately about THIS RUN and not about the store. The phase
+/// watched one sweep; it did not count the graph's edges, and saying it had
+/// would be the same overreach in the other direction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CrossFileEnrichment {
+    /// A sweep finished having enriched files, so this run produced cross-file
+    /// edges.
+    Produced,
+    /// This run produced no complete cross-file graph, with what is pending and
+    /// what would finish it.
+    Withheld { pending: String },
+}
+
+impl CrossFileEnrichment {
+    /// The phase reached the daemon and could not learn what the sweep did.
+    ///
+    /// Withheld rather than `Produced`, because the summary's word is a claim
+    /// and an unread sweep supports no claim. It says so plainly instead of
+    /// borrowing the confident word from a run nobody watched.
+    fn unreadable() -> Self {
+        Self::Withheld {
+            pending: "this run could not read what the cross-file sweep did, so whether it \
+                      produced any cross-file edge is unknown; run `kin doctor` to read this \
+                      store's reference-edge coverage"
+                .to_string(),
+        }
+    }
+
+    /// What is still owed, when something is.
+    fn pending(&self) -> Option<&str> {
+        match self {
+            Self::Withheld { pending } => Some(pending),
+            Self::Produced => None,
+        }
+    }
+}
+
 /// Run the conversion phase and ALWAYS clean up after it.
 ///
 /// The cleanup used to sit after the happy-path wait, so every early return
@@ -301,10 +366,10 @@ async fn stop_conversion_daemon(borrowed_existing: bool, kin_root: &Path) {
 ///
 /// The phase runs on its own task and the cleanup runs after the join, so it is
 /// reached on success, on refusal, on timeout and on panic alike.
-async fn enrich_after_init(kin_root: &Path) {
+async fn enrich_after_init(kin_root: &Path) -> CrossFileEnrichment {
     let Some(layout) = kin_core::KinLayout::discover(kin_root) else {
         note!("note: cross-file reference enrichment was skipped: no Kin layout at this path");
-        return;
+        return CrossFileEnrichment::unreadable();
     };
 
     // Whether a daemon was already serving this repository. If not, anything
@@ -317,11 +382,16 @@ async fn enrich_after_init(kin_root: &Path) {
     let root = kin_root.to_path_buf();
     let phase_layout = layout.clone();
     let phase = tokio::spawn(async move { enrich_phase(&root, &phase_layout).await });
-    if let Err(error) = phase.await {
-        note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
-    }
+    let outcome = match phase.await {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            note!("note: the cross-file enrichment phase did not finish cleanly: {error}");
+            CrossFileEnrichment::unreadable()
+        }
+    };
 
     stop_conversion_daemon(borrowed_existing, kin_root).await;
+    outcome
 }
 
 /// The sentence `kin init` prints when a run produced no cross-file edges.
@@ -388,7 +458,7 @@ fn enrichment_unavailable_note(reason: &str, detail: Option<&str>) -> String {
     }
 }
 
-async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
+async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFileEnrichment {
     let url = match crate::daemon_client::ensure_daemon_running(kin_root).await {
         Ok(url) => url,
         Err(error) => {
@@ -396,7 +466,7 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
                 "note: cross-file reference enrichment was skipped because no daemon could be \
                  started ({error}); run `kin doctor` to see what is missing"
             );
-            return;
+            return CrossFileEnrichment::unreadable();
         }
     };
     // FOR_LAYOUT, not the plain constructor. The plain one resolves the
@@ -410,7 +480,7 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
         Ok(client) => client,
         Err(error) => {
             note!("note: cross-file reference enrichment was skipped: {error:#}");
-            return;
+            return CrossFileEnrichment::unreadable();
         }
     };
 
@@ -418,7 +488,7 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
         Ok(value) => value,
         Err(error) => {
             note!("note: cross-file reference enrichment could not be started: {error:#}");
-            return;
+            return CrossFileEnrichment::unreadable();
         }
     };
     // A daemon with no language server never sweeps. Saying so, with the
@@ -440,7 +510,12 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
             .and_then(|value| value.get("detail"))
             .and_then(|value| value.as_str());
         note!("{}", enrichment_unavailable_note(reason, detail));
-        return;
+        return CrossFileEnrichment::Withheld {
+            pending: "no language-server sweep ran for this repository, so cross-file reference \
+                      and override edges are not in this graph; the note above names what would \
+                      let it run"
+                .to_string(),
+        };
     }
     let baseline = queued
         .get("sweeps_completed")
@@ -456,7 +531,7 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
             Ok(status) => status,
             Err(error) => {
                 note!("note: enrichment progress could not be read: {error:#}");
-                return;
+                return CrossFileEnrichment::unreadable();
             }
         };
         let done = status
@@ -501,10 +576,16 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
                      files it walked ({blocked} blocked); reference and import edges will be \
                      missing until it can run"
                 );
-            } else {
-                note!("  cross-file enrichment complete ({done}/{total} files)");
+                return CrossFileEnrichment::Withheld {
+                    pending: format!(
+                        "the sweep walked {total} files and enriched none of them, so cross-file \
+                         reference and override edges are not in this graph; `kin daemon sweep` \
+                         retries it"
+                    ),
+                };
             }
-            return;
+            note!("  cross-file enrichment complete ({done}/{total} files)");
+            return CrossFileEnrichment::Produced;
         }
         if std::time::Instant::now() >= deadline {
             note!(
@@ -512,7 +593,14 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) {
                  resumes from where it stopped on the next daemon start",
                 ENRICH_BUDGET.as_secs()
             );
-            return;
+            return CrossFileEnrichment::Withheld {
+                pending: format!(
+                    "the sweep reached {last_reported} files and did not finish within {}s, so \
+                     the cross-file edges it has not got to are not in this graph; it resumes on \
+                     the next daemon start",
+                    ENRICH_BUDGET.as_secs()
+                ),
+            };
         }
     }
 }
@@ -825,8 +913,14 @@ fn print_human_result(
     result: &kin_core::InitResult,
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
+    cross_file: &CrossFileEnrichment,
 ) -> Result<()> {
-    emit(&render_human_result(result, boundary, semantic_enrichment)?)
+    emit(&render_human_result(
+        result,
+        boundary,
+        semantic_enrichment,
+        cross_file,
+    )?)
 }
 
 /// Hand a finished result to stdout, tolerating a reader that already left.
@@ -852,6 +946,7 @@ fn render_human_result(
     result: &kin_core::InitResult,
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
+    cross_file: &CrossFileEnrichment,
 ) -> Result<String> {
     let default_ref = initialized_default_ref(result);
     let mut out = String::new();
@@ -904,10 +999,13 @@ fn render_human_result(
     writeln!(
         out,
         "  Semantic enrichment: {}",
-        render_semantic_enrichment(semantic_enrichment, daemon_death.as_ref())
+        render_semantic_enrichment(semantic_enrichment, daemon_death.as_ref(), cross_file)
     )?;
     if let Some(warning) = enrichment_kill_warning(daemon_death.as_ref()) {
         writeln!(out, "{warning}")?;
+    }
+    if let Some(notice) = cross_file_pending_notice(semantic_enrichment, cross_file) {
+        writeln!(out, "{notice}")?;
     }
     if let Some(notice) = semantic_absence_notice(semantic_enrichment) {
         writeln!(out, "{notice}")?;
@@ -1084,10 +1182,20 @@ fn semantic_absence_notice(enrichment: &SemanticEnrichmentStatus) -> Option<Stri
 fn render_semantic_enrichment(
     enrichment: &SemanticEnrichmentStatus,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    cross_file: &CrossFileEnrichment,
 ) -> String {
-    let presence = match enrichment.presence {
-        SemanticEnrichmentPresence::Absent => "absent",
-        SemanticEnrichmentPresence::Present => "present",
+    // "partial" and not "present", on a run that built the within-file half of
+    // the graph and not the cross-file half. The counts under the word are
+    // unchanged and still exact; only the word moves, because the word is the
+    // part that was claiming a graph this run did not build.
+    //
+    // `absent` is left alone. A store with no entity and no relation is not
+    // partially enriched, and downgrading a word that is already the weakest
+    // one would say less than the truth rather than more.
+    let presence = match (&enrichment.presence, cross_file.pending().is_some()) {
+        (SemanticEnrichmentPresence::Absent, _) => "absent",
+        (SemanticEnrichmentPresence::Present, true) => "partial",
+        (SemanticEnrichmentPresence::Present, false) => "present",
     };
     format!(
         "{presence} ({} entities, {} relations, {} changes in durable authority generation {}; {})",
@@ -1097,6 +1205,25 @@ fn render_semantic_enrichment(
         enrichment.authority_generation,
         crate::daemon_death::enrichment_clause(death)
     )
+}
+
+/// What the word "partial" is short for, on the line beneath it.
+///
+/// Beneath rather than inside, matching every other qualifier on this summary,
+/// and because the sentence names a next action and the counts line does not.
+/// It is emitted only when the counts line actually said `partial`, so the two
+/// can never disagree: an `absent` store keeps its own notice and gets no
+/// second one, and a run that produced cross-file edges prints nothing here at
+/// all. A line that appeared after every conversion would be read once and
+/// skipped forever.
+fn cross_file_pending_notice(
+    enrichment: &SemanticEnrichmentStatus,
+    cross_file: &CrossFileEnrichment,
+) -> Option<String> {
+    if matches!(enrichment.presence, SemanticEnrichmentPresence::Absent) {
+        return None;
+    }
+    Some(format!("  ⚠ {}", cross_file.pending()?))
 }
 
 /// The warning line a store whose daemon was killed carries beneath its

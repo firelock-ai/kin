@@ -21,9 +21,69 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     let result = run_daemon_commit(&layout, &message, quiet).await?;
     if !quiet {
-        println!("{}", render_commit_summary(&result));
+        println!(
+            "{}",
+            render_commit_summary(&result, pending_enrichment(&layout).await.as_deref())
+        );
     }
     Ok(())
+}
+
+/// What this store's cross-file sweep still owes, when it owes anything.
+///
+/// `kin commit` printed `(0 entities, 0 relations, 2 artifacts)` for a fully
+/// parseable new module, because the counts are the change's own deltas and the
+/// sweep that derives cross-file edges had not reached the file yet. The next
+/// `kin diff` then showed `Relations: +123` on a tree with no file change. Both
+/// readings are correct and neither one says the word "yet", so the surface
+/// that reports success is the surface that leaves out the part that is still
+/// moving. FIR-2776.
+///
+/// Read after the commit and not before it, because the question is what is
+/// outstanding for the store the reader now has. Every failure answers `None`:
+/// an enrichment probe must never be able to turn a landed commit into an
+/// error, and a commit that already succeeded is not made wrong by a daemon
+/// that would not say how its sweep is going.
+async fn pending_enrichment(layout: &kin_core::KinLayout) -> Option<String> {
+    let url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout).ok()?;
+    let status = client.lsp_sweep_status().await.ok()?;
+    let field = |name: &str| status.get(name).and_then(|value| value.as_u64());
+    let done = field("files_done")?;
+    let total = field("files_total")?;
+    let running = status
+        .get("running")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    pending_enrichment_line(running, done, total)
+}
+
+/// The sentence, split from the probe so both branches are testable without a
+/// daemon.
+///
+/// Two conditions, not one. `running` alone goes quiet on a sweep that was cut
+/// short and never resumed, which is a store with work outstanding and nothing
+/// in flight to finish it. An unwalked file count alone goes quiet in the
+/// window between a sweep being queued and its first file landing.
+///
+/// A store whose sweep has walked everything it has prints nothing, and a store
+/// that has never had a file to walk prints nothing either, because both
+/// counters are zero and zero is not behind zero. That silence is the point: a
+/// line under every commit is a line nobody reads by the third one.
+fn pending_enrichment_line(running: bool, done: u64, total: u64) -> Option<String> {
+    if !running && done >= total {
+        return None;
+    }
+    if total == 0 {
+        return None;
+    }
+    Some(format!(
+        "Cross-file enrichment is still catching up ({done} of {total} files). The counts above \
+         are this change's own deltas, so edges the sweep has not reached are not in it; they \
+         reach durable authority at your next commit. Until then they live only in this daemon, \
+         and a daemon that exits loses them from its live graph; its next start resumes the sweep \
+         from where it stopped."
+    ))
 }
 
 /// The announcement this command publishes for as long as it runs.
@@ -63,8 +123,8 @@ impl Drop for CommitAnnouncement {
 /// working tree this change came from stays dirty and `git log` never moves.
 /// Without it a brownfield user commits all day and reads `git status` as proof
 /// that nothing happened.
-fn render_commit_summary(result: &DaemonCommitResult) -> String {
-    format!(
+fn render_commit_summary(result: &DaemonCommitResult, pending: Option<&str>) -> String {
+    let summary = format!(
         "Created semantic change {} on branch '{}' ({} entities, {} relations, {} artifacts)\n{}",
         result.change_id,
         result.branch,
@@ -72,7 +132,11 @@ fn render_commit_summary(result: &DaemonCommitResult) -> String {
         result.relation_count,
         result.file_count,
         AUTHORITY_NOT_GIT_NOTE,
-    )
+    );
+    match pending {
+        Some(pending) => format!("{summary}\n{pending}"),
+        None => summary,
+    }
 }
 
 /// Result from the daemon-owned native commit transaction.
@@ -693,7 +757,7 @@ mod tests {
             .expect("a commit with no reply deadline waits for the daemon");
         let result: DaemonCommitResult = response.json().await.unwrap();
         assert_eq!(result.change_id, "5b8ca7b7");
-        assert_eq!(render_commit_summary(&result).lines().count(), 2);
+        assert_eq!(render_commit_summary(&result, None).lines().count(), 2);
 
         serving.abort();
     }
