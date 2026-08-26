@@ -369,12 +369,30 @@ fn human_bytes(bytes: u64) -> String {
 /// in that message names memory, the model that needs it, or the fact that
 /// lexical and graph retrieval never did.
 ///
-/// Two grades are produced and they are labelled differently on purpose. A
-/// cgroup that recorded a kill is the kernel's own statement and is reported as
-/// observed. A ceiling below what an embed needs is a strong prior and nothing
-/// more, so it is reported as likely. A disconnect with neither is left alone:
-/// a daemon that died for another reason on a large machine keeps its own
-/// error rather than being told it ran out of memory.
+/// Three grades are produced and they are labelled differently on purpose, in
+/// descending order of how much the machine actually proved.
+///
+/// A kill the cgroup recorded WHILE THIS PASS RAN is the kernel's own statement
+/// about this pass and is reported as observed. That window is the fix for
+/// FIR-1823: the counter is cumulative for the container's whole life, so the
+/// same number also counts a kill from an unrelated run an hour ago, and
+/// reading it without a baseline reported those as this embed's cause. The
+/// evidence carries the difference between two readings now, so a pass that
+/// killed nothing reads zero however violent the container's history was.
+///
+/// A charge that hit the ceiling during the pass without anything being killed
+/// is real pressure and a strong prior, so it is reported as likely. Nothing
+/// read this before: kin took only the kill count out of `memory.events` and
+/// ignored `max` beside it, so a run that spent its life pinned against the cap
+/// and a run that never came near it produced identical diagnoses. The 4 GiB
+/// container arm on 2026-08-25 hit its ceiling 6344 times, survived, and had
+/// nothing to show for it.
+///
+/// A ceiling below what an embed needs is a prior about the machine rather than
+/// an observation of the run, so it grades last and is also reported as likely.
+/// A disconnect with none of the three is left alone: a daemon that died for
+/// another reason on a large machine keeps its own error rather than being told
+/// it ran out of memory.
 fn embed_resource_exhaustion(
     rendered: &str,
     evidence: &crate::capability::MemoryEvidence,
@@ -383,18 +401,29 @@ fn embed_resource_exhaustion(
         return None;
     }
     let observed_kills = evidence.cgroup_oom_kills.filter(|count| *count > 0);
+    let observed_ceiling_hits = evidence.cgroup_ceiling_hits.filter(|count| *count > 0);
     let under_recommendation = evidence.limit_bytes < RECOMMENDED_EMBED_MEMORY_BYTES;
-    let cause = match (observed_kills, under_recommendation) {
-        (Some(count), _) => format!(
+    let cause = match (observed_kills, observed_ceiling_hits, under_recommendation) {
+        (Some(count), _, _) => format!(
             "the daemon was lost during this embed pass and this container's kernel recorded \
-             {count} out-of-memory kill(s), so the embed ran out of memory"
+             {count} out-of-memory kill(s) while it ran, so the embed ran out of memory"
         ),
-        (None, true) => format!(
+        // No byte figure in this sentence, deliberately. The ceiling count and
+        // `limit_bytes` are resolved by two separate walks up the cgroup tree,
+        // and `limit_bytes` falls back to host RAM whenever no cap below it is
+        // tighter, so pairing them would let a host-RAM number be quoted as the
+        // ceiling a container hit. The count is what is new here; the ceiling
+        // worth aiming at is named in the guidance below.
+        (None, Some(hits), _) => format!(
+            "the daemon was lost during this embed pass and this container's memory charge was \
+             held at its ceiling {hits} time(s) while it ran, so it most likely ran out of memory"
+        ),
+        (None, None, true) => format!(
             "the daemon was lost during this embed pass and only {} of memory is available to \
              it, so it most likely ran out of memory",
             human_bytes(evidence.limit_bytes)
         ),
-        (None, false) => return None,
+        (None, None, false) => return None,
     };
     Some(format!(
         "{cause}.\n\
@@ -468,6 +497,14 @@ pub async fn run(
     .entered();
     let layout = crate::commands::require_repository_layout()?;
 
+    // Taken before the first pass, and reused by every pass, because the
+    // counters it holds are cumulative for the container's whole life. A
+    // reading taken only after a failure cannot say whether the kill it counts
+    // happened during this embed or during something else an hour ago, and
+    // FIR-1823 is what saying so anyway looked like: an unhedged "the embed ran
+    // out of memory" for a daemon that died of something else entirely.
+    let memory_baseline = crate::capability::memory_baseline();
+
     if !json {
         if let Some(notice) = constrained_memory_notice(&crate::capability::memory_evidence()) {
             println!("{notice}");
@@ -484,6 +521,7 @@ pub async fn run(
                 rebuild,
                 cap_batch_size: true,
             },
+            memory_baseline,
         )
         .await?;
         if json {
@@ -527,6 +565,7 @@ pub async fn run(
                 rebuild: rebuild && pass == 1,
                 cap_batch_size: false,
             },
+            memory_baseline,
         )
         .await?;
         let result = response.result;
@@ -615,6 +654,7 @@ pub async fn run(
 async fn run_daemon_embed(
     layout: &kin_core::KinLayout,
     request: &EmbedRequest,
+    memory_baseline: crate::capability::MemoryBaseline,
 ) -> Result<EmbedResponse> {
     let daemon_url = std::env::var("KIN_DAEMON_URL")
         .ok()
@@ -634,7 +674,10 @@ async fn run_daemon_embed(
         // needs to see what the connection actually did still can, and a
         // failure this cannot attribute to memory is passed through untouched
         // rather than being given a diagnosis nobody proved.
-        match embed_resource_exhaustion(&rendered, &crate::capability::memory_evidence()) {
+        match embed_resource_exhaustion(
+            &rendered,
+            &crate::capability::memory_evidence_since(memory_baseline),
+        ) {
             Some(guidance) => anyhow::anyhow!("daemon embed failed: {rendered}\n\n{guidance}"),
             None => anyhow::anyhow!("daemon embed failed: {rendered}"),
         }
@@ -825,9 +868,10 @@ mod tests {
     use super::{
         constrained_memory_notice, effective_batch_size, embed_completion_line,
         embed_pass_should_continue, embed_resource_exhaustion, eta_suffix, format_duration_secs,
-        resolve_total_budget, should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult,
-        PassCoverage, DEFAULT_BATCH_SIZE, DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD,
-        EMBED_MODEL_ID, RECOMMENDED_EMBED_MEMORY_BYTES,
+        lost_the_daemon_mid_request, resolve_total_budget, should_queue_missing_embedding_pass,
+        throughput_per_sec, EmbedResult, PassCoverage, DEFAULT_BATCH_SIZE,
+        DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD, EMBED_MODEL_ID,
+        RECOMMENDED_EMBED_MEMORY_BYTES,
     };
 
     fn result_with(pending_entities: usize, pending_artifacts: usize) -> EmbedResult {
@@ -1177,6 +1221,7 @@ mod tests {
             limit_bytes,
             limit_source: crate::capability::MemoryLimitSource::HostRam,
             cgroup_oom_kills: oom_kills,
+            cgroup_ceiling_hits: None,
         }
     }
 
@@ -1229,6 +1274,139 @@ mod tests {
         assert!(
             !guidance.contains("kernel recorded"),
             "nothing may claim a kill this host could not observe: {guidance}"
+        );
+    }
+
+    /// A container reading, for an arm that has to place a history before the
+    /// pass it is judging.
+    fn cgroup(
+        limit_bytes: u64,
+        oom_kills: u64,
+        ceiling_hits: u64,
+    ) -> kin_daemon_spawn::CgroupMemory {
+        kin_daemon_spawn::CgroupMemory {
+            limit_bytes: Some(limit_bytes),
+            oom_kills: Some(oom_kills),
+            ceiling_hits: Some(ceiling_hits),
+            ..kin_daemon_spawn::CgroupMemory::default()
+        }
+    }
+
+    /// The evidence one embed pass produces, from the readings that bracket it.
+    fn across_pass(
+        start: kin_daemon_spawn::CgroupMemory,
+        end: kin_daemon_spawn::CgroupMemory,
+    ) -> crate::capability::MemoryEvidence {
+        crate::capability::evidence_from(
+            64 * 1024 * 1024 * 1024,
+            end,
+            Some(crate::capability::MemoryBaseline::from_reading(start)),
+        )
+    }
+
+    /// A ceiling with room to spare, so nothing but the counters can produce a
+    /// diagnosis and an arm that stays silent stayed silent for the right
+    /// reason.
+    const ROOMY: u64 = 8 * 1024 * 1024 * 1024;
+
+    /// FIR-1823, end to end: two passes identical except for when the kill
+    /// happened.
+    ///
+    /// Arm one is a container that was killed three times before this pass ever
+    /// started and killed nothing during it. The counter reads three both
+    /// times. Before the fix that three was read as this pass's own and the
+    /// caller was told, flatly, that the embed ran out of memory.
+    ///
+    /// Arm two is the control that proves the first arm can fail. Same history,
+    /// same everything, one more kill by the end. Without it, code that simply
+    /// deleted the branch would pass arm one and nobody would know.
+    #[test]
+    fn a_kill_from_before_the_pass_is_not_this_passs_kill() {
+        assert!(
+            lost_the_daemon_mid_request(OOM_KILLED_MID_PASS),
+            "both arms below are about a daemon that was lost; if this stops being one, they \
+             pass for the wrong reason"
+        );
+
+        let unmoved = across_pass(cgroup(ROOMY, 3, 900), cgroup(ROOMY, 3, 900));
+        assert_eq!(
+            embed_resource_exhaustion(OOM_KILLED_MID_PASS, &unmoved),
+            None,
+            "a container with three historical kills and none during this pass has no memory \
+             diagnosis to offer about this pass"
+        );
+
+        let moved = across_pass(cgroup(ROOMY, 3, 900), cgroup(ROOMY, 4, 1_100));
+        let guidance = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &moved)
+            .expect("a kill during the pass is the kernel's own statement about the pass");
+        assert!(
+            guidance.contains("recorded 1 out-of-memory kill(s)"),
+            "the count reported must be the pass's one, not the container's four: {guidance}"
+        );
+        assert!(
+            guidance.contains("so the embed ran out of memory"),
+            "a kill during the pass is reported as observed, not hedged: {guidance}"
+        );
+    }
+
+    /// The same historical kill must not upgrade the grade on a small machine
+    /// either.
+    ///
+    /// A ceiling under the recommendation already earns a hedged diagnosis on
+    /// its own, so the arm above cannot see this: silence there proves nothing
+    /// about whether the kill was consulted. Here the diagnosis is present and
+    /// the question is which sentence it is.
+    #[test]
+    fn a_historical_kill_does_not_promote_a_ceiling_inference_to_an_observation() {
+        let small = 512 * 1024 * 1024;
+        let unmoved = across_pass(cgroup(small, 3, 900), cgroup(small, 3, 900));
+        let guidance = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &unmoved)
+            .expect("a ceiling under the recommendation is still a memory diagnosis");
+        assert!(
+            !guidance.contains("kernel recorded"),
+            "three kills that predate the pass are not evidence about the pass: {guidance}"
+        );
+        assert!(
+            guidance.contains("most likely"),
+            "with nothing observed during the pass, the ceiling is a prior and says so: \
+             {guidance}"
+        );
+    }
+
+    /// The ceiling-hit counter, which nothing in kin read until now.
+    ///
+    /// A container held against its cap for the whole pass, reclaiming on every
+    /// allocation and never killed, used to leave a diagnosis with nothing to
+    /// say: `oom_kill` reads zero and the ceiling is generous, so the pass came
+    /// back as an unexplained disconnect. The 4 GiB arm on 2026-08-25 recorded
+    /// 6344 of these beside a single kill, and no kin surface read one.
+    #[test]
+    fn a_charge_pinned_at_the_ceiling_during_the_pass_is_reported_as_likely() {
+        let pinned = across_pass(cgroup(ROOMY, 2, 900), cgroup(ROOMY, 2, 7_244));
+        let guidance = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &pinned)
+            .expect("a charge held at the ceiling through the pass is memory pressure");
+        assert!(
+            guidance.contains("6344 time(s)"),
+            "the count reported must be the pass's own advance: {guidance}"
+        );
+        assert!(
+            guidance.contains("ceiling") && guidance.contains("most likely"),
+            "reaching the ceiling is pressure the kernel absorbed, not a kill it performed: \
+             {guidance}"
+        );
+        assert!(
+            !guidance.contains("kernel recorded"),
+            "nothing was killed during this pass and nothing may say one was: {guidance}"
+        );
+
+        // The control. Same generous ceiling, same violent history, and a
+        // counter that did not move during the pass. Without this, a fix that
+        // reported the lifetime total would pass the arm above.
+        let untouched = across_pass(cgroup(ROOMY, 2, 6_344), cgroup(ROOMY, 2, 6_344));
+        assert_eq!(
+            embed_resource_exhaustion(OOM_KILLED_MID_PASS, &untouched),
+            None,
+            "6344 ceiling hits that all predate the pass say nothing about the pass"
         );
     }
 

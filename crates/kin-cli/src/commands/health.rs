@@ -4561,6 +4561,7 @@ mod tests {
             limit_bytes,
             limit_source: crate::capability::MemoryLimitSource::HostRam,
             cgroup_oom_kills: None,
+            cgroup_ceiling_hits: None,
         }
     }
 
@@ -4570,6 +4571,7 @@ mod tests {
             limit_bytes,
             limit_source: crate::capability::MemoryLimitSource::ContainerLimit,
             cgroup_oom_kills: None,
+            cgroup_ceiling_hits: None,
         }
     }
 

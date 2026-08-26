@@ -133,11 +133,25 @@ async fn run_daemon_commit(
     // Opened before the request so the first phase the daemon enters is already
     // inside the window this reads.
     let mut tail = PhaseTail::open(&kin_root);
+    // Taken here for the same reason and over the same window as the phase
+    // tail. The cgroup's kill and ceiling counters are cumulative for the
+    // container's whole life, so the reading that matters is the difference
+    // across this request rather than the total after it. FIR-1823: without a
+    // before-reading, a kill from any earlier process in the same container
+    // made this commit report itself as the thing that ran out of memory.
+    let memory_baseline = crate::capability::memory_baseline();
     let response = stream_phases_while(quiet, &mut tail, request.send()).await;
     let response = match response {
         Ok(response) => response,
         Err(error) => {
-            return resolve_commit_after_lost_reply(layout, &kin_root, operation_id, error, quiet);
+            return resolve_commit_after_lost_reply(
+                layout,
+                &kin_root,
+                operation_id,
+                error,
+                quiet,
+                memory_baseline,
+            );
         }
     };
     if !response.status().is_success() {
@@ -289,6 +303,7 @@ fn resolve_commit_after_lost_reply(
     operation_id: kin_model::OperationId,
     error: reqwest::Error,
     quiet: bool,
+    memory_baseline: crate::capability::MemoryBaseline,
 ) -> Result<DaemonCommitResult> {
     let lookup = landed_commit_for_operation(layout, operation_id);
     let unreadable_authority = lookup.as_ref().err().map(|error| format!("{error:#}"));
@@ -332,7 +347,7 @@ fn resolve_commit_after_lost_reply(
                     abandoned.as_deref(),
                     daemon_alive,
                     unix_now(),
-                    &crate::capability::memory_evidence(),
+                    &crate::capability::memory_evidence_since(memory_baseline),
                 )
             });
             let error = match cause {
