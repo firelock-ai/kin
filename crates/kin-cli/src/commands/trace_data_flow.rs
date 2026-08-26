@@ -2566,6 +2566,171 @@ mod tests {
         );
     }
 
+    /// The stranger run's own fan-out, rebuilt from the tiers the linker really
+    /// stamps.
+    ///
+    /// `Session.send` in `psf/requests` offers fifteen callees. Eleven sit in
+    /// `sessions.py` and are parser-certain, because a call whose destination is
+    /// defined in the calling file is stamped 1.0. Three leave the module: two
+    /// through an explicit import (0.9), and `HTTPAdapter.send` through the
+    /// declared `BaseAdapter` return type and the override edge beneath it
+    /// (`INHERITED_METHOD_CONFIDENCE`, 0.85). One is a builtin the repository
+    /// does not define.
+    ///
+    /// The confidences are not decoration. They are what makes this fixture a
+    /// statement about the product rather than about itself: a same-file call
+    /// outranking a module-crossing one is not an accident of the fan-out order,
+    /// it is the ladder in `kin_index::resolution`, and a fixture that stamped
+    /// every edge 1.0 would have proven nothing about which term did the
+    /// clipping.
+    fn requests_send_graph() -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Session.send", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+
+        let mut edges: Vec<(Entity, f32)> = Vec::new();
+        for name in [
+            "Session.get_adapter",
+            "Session.prepare_request",
+            "SessionRedirectMixin.resolve_redirects",
+            "Session.merge_environment_settings",
+            "Session.rebuild_auth",
+            "Session.rebuild_proxies",
+            "Session.rebuild_method",
+            "Session.get_redirect_target",
+            "Session.should_strip_auth",
+            "Session.mount",
+            "Session.close",
+        ] {
+            edges.push((make_entity(name, "src/requests/sessions.py"), 1.0));
+        }
+        edges.push((
+            make_entity("extract_cookies_to_jar", "src/requests/cookies.py"),
+            0.9,
+        ));
+        edges.push((make_entity("dispatch_hook", "src/requests/hooks.py"), 0.9));
+        edges.push((
+            make_entity("HTTPAdapter.send", "src/requests/adapters.py"),
+            0.85,
+        ));
+        edges.push((make_external_entity("preferred_clock"), 0.7));
+
+        for (entity, confidence) in &edges {
+            graph.upsert_entity(entity).unwrap();
+            let mut relation = make_relation(focal_id, entity.id, RelationKind::Calls);
+            relation.confidence = *confidence;
+            graph.upsert_relation(&relation).unwrap();
+        }
+        (graph, focal_id)
+    }
+
+    /// What the stranger measured, pinned so the fix has something to move.
+    ///
+    /// Not an assertion that the product is correct. It is the falsification of
+    /// every check below it: a fixture that did not reproduce the loss could not
+    /// prove the fix removed it, and this one reproduces the reported clip
+    /// exactly, eleven dropped callees at a four-wide cap.
+    #[test]
+    fn the_measured_fan_out_loses_its_module_crossing_hop_to_the_files_own_callees() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 4),
+        )
+        .unwrap();
+
+        let kept = step_names(&response);
+        assert_eq!(kept.len(), 4, "the four-wide cap kept four: {kept:?}");
+        assert_eq!(
+            response.clipped_steps[0].dropped_callees, 11,
+            "the stranger's own number: fifteen callees under a four-wide cap"
+        );
+        assert!(
+            kept.iter()
+                .all(|name| name.starts_with("Session") || name.starts_with("SessionRedirect")),
+            "every surviving callee is in the focal's own file, which is the defect: {kept:?}"
+        );
+    }
+
+    /// A fan-out the size of a real one, so a change to how the cap chooses can
+    /// be timed rather than guessed at.
+    ///
+    /// Every node below the focal offers the same fifteen-wide fan-out the
+    /// measured `Session.send` did, at the same tiers, four levels deep. That is
+    /// roughly fifty thousand entities and as many edges, which is the scale at
+    /// which a per-candidate cost shows up as time instead of as noise.
+    fn deep_requests_shaped_graph(levels: usize) -> (InMemoryGraph, EntityId, String) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Session.send", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+
+        let mut frontier = vec![(focal_id, 0usize)];
+        let mut serial = 0usize;
+        let mut deepest = String::new();
+        for level in 0..levels {
+            let mut next = Vec::new();
+            for (parent, _) in frontier.drain(..) {
+                for index in 0..15usize {
+                    serial += 1;
+                    let (file, confidence) = match index {
+                        0..=10 => ("src/requests/sessions.py", 1.0),
+                        11 => ("src/requests/cookies.py", 0.9),
+                        12 => ("src/requests/hooks.py", 0.9),
+                        13 => ("src/requests/adapters.py", 0.85),
+                        _ => ("src/requests/utils.py", 0.7),
+                    };
+                    let name = format!("n{level}_{serial}_{index}");
+                    let entity = make_entity(&name, file);
+                    graph.upsert_entity(&entity).unwrap();
+                    let mut relation = make_relation(parent, entity.id, RelationKind::Calls);
+                    relation.confidence = confidence;
+                    graph.upsert_relation(&relation).unwrap();
+                    if level + 1 < levels {
+                        next.push((entity.id, level + 1));
+                    } else if index == 13 {
+                        deepest = name;
+                    }
+                }
+            }
+            frontier = next;
+        }
+        (graph, focal_id, deepest)
+    }
+
+    /// Wall time of the walk itself, printed rather than asserted.
+    ///
+    /// Ignored by default because it is a measurement, not a gate: a threshold
+    /// on a shared machine fails on load rather than on the diff. Run it with
+    /// `--ignored --nocapture` on both sides of a change and read the numbers.
+    #[test]
+    #[ignore = "timing measurement: cargo test -p kin-cli --lib measure_walk_wall_time -- --ignored --nocapture"]
+    fn measure_walk_wall_time_on_a_requests_shaped_fan_out() {
+        let (graph, focal_id, target) = deep_requests_shaped_graph(4);
+        let (_t, binding) = empty_binding();
+        let authority = RequestRepositoryAuthority::pinned(binding.clone());
+
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let request = trace_request(&focal_id, 5, TraceDirection::Calls, 4);
+            let started = std::time::Instant::now();
+            let response =
+                build_trace_data_flow_response(&authority, &graph, &request).unwrap();
+            samples.push(started.elapsed());
+            assert!(!response.chain.is_empty());
+        }
+        samples.sort();
+        println!(
+            "WALK_MEDIAN_MS untargeted {:.3}",
+            samples[samples.len() / 2].as_secs_f64() * 1000.0
+        );
+        println!("WALK_TARGET_NAME {target}");
+    }
+
     #[test]
     fn compact_mode_keeps_every_edge_and_span_while_inlining_no_body() {
         let (graph, focal_id) = redirect_graph();
