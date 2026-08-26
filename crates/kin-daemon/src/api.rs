@@ -17346,6 +17346,25 @@ mod tests {
                 fixture.payload_bytes
             );
 
+            // The destination's BEFORE, which is the half that makes the after
+            // a statement about the destination. Falsification caught this:
+            // pointed at the source, the after-only check still passed, because
+            // a Git-admitted store names its own bodies from the moment it is
+            // created. Only an empty replica can name none and then name all.
+            let before = repository_authority_snapshot(&hosted_state, &hosted_id)
+                .await
+                .expect("an empty hosted replica is readable before anything is pushed");
+            let named_before = before
+                .repository_authority
+                .as_ref()
+                .map(|authority| authority.external_objects.len())
+                .unwrap_or(0);
+            assert_eq!(
+                named_before, 0,
+                "the hosted replica must name no external object before the push, or the \
+                 after-reading proves nothing about what crossed"
+            );
+
             let source_state =
                 Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
             let request = kin_cli::commands::transfer::CommandTransferRequest {
@@ -17414,6 +17433,17 @@ mod tests {
                 let snapshot = repository_authority_snapshot(&hosted_state, &hosted_id)
                     .await
                     .expect("the replica that admitted a bootstrap must be readable after it");
+                let named_after = snapshot
+                    .repository_authority
+                    .as_ref()
+                    .map(|authority| authority.external_objects.len())
+                    .unwrap_or(0);
+                assert!(
+                    named_after > named_before,
+                    "the destination must name MORE external objects after the push than \
+                     before it; naming the same set is what a snapshot of the SOURCE would \
+                     show, and that is the reading this pair exists to exclude"
+                );
                 let verified = assert_destination_committed_payload(&snapshot, &source_bodies);
                 assert_eq!(
                     verified, blobs,
