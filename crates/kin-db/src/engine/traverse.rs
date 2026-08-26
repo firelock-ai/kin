@@ -426,10 +426,17 @@ pub fn has_incoming_of_kinds(
                 let Some(src_id) = rel.src.as_entity() else {
                     continue;
                 };
-                if let Some(src_entity) = entities.get(&src_id) {
-                    if src_entity.file_origin == entity.file_origin {
-                        continue;
-                    }
+                // A source the entity map does not carry is a stranded edge, and
+                // it cannot be shown to come from another file, so it must not
+                // be read as one. Falling through to `return true` here kept an
+                // entity alive on an edge from nowhere, in the mode written to
+                // be the stricter of the two; `has_cross_file_incoming` skips
+                // the same case five lines up.
+                let Some(src_entity) = entities.get(&src_id) else {
+                    continue;
+                };
+                if src_entity.file_origin == entity.file_origin {
+                    continue;
                 }
             }
             return true;
@@ -482,6 +489,56 @@ mod tests {
             import_source: None,
             evidence: Vec::new(),
         }
+    }
+
+    /// `has_incoming_of_kinds` used to fall through to `return true` when the
+    /// entity map did not carry the source, so an edge from nowhere kept an
+    /// entity alive in the mode written to be the stricter of the two, while
+    /// `has_cross_file_incoming` five lines up skipped the same case. Both
+    /// halves are asserted here: the strand must not count, and a real
+    /// cross-file source must still count, or "skip everything" would pass.
+    #[test]
+    fn has_incoming_of_kinds_does_not_read_a_stranded_source_as_cross_file() {
+        let target_id = EntityId::new();
+        let target = make_entity(target_id, "target", "src/b.rs");
+        let stranded_src = EntityId::new();
+        let strand_id = RelationId::new();
+        let strand = make_relation(strand_id, stranded_src, target_id, RelationKind::Calls);
+
+        let mut relations = HashMap::new();
+        relations.insert(strand_id, strand);
+        let mut incoming = HashMap::new();
+        incoming.insert(target_id, vec![strand_id]);
+        let mut entities = HashMap::new();
+        entities.insert(target_id, target.clone());
+
+        assert!(
+            !has_incoming_of_kinds(
+                &target_id,
+                &target,
+                &[RelationKind::Calls],
+                true,
+                &incoming,
+                &relations,
+                &entities,
+            ),
+            "an edge whose source the graph does not carry cannot be shown to \
+             come from another file, so it must not be read as one"
+        );
+
+        // Control: give the same edge a real source in a different file and the
+        // answer must flip, so the fix skips strands rather than everything.
+        let real_src = make_entity(stranded_src, "caller", "src/a.rs");
+        entities.insert(stranded_src, real_src);
+        assert!(has_incoming_of_kinds(
+            &target_id,
+            &target,
+            &[RelationKind::Calls],
+            true,
+            &incoming,
+            &relations,
+            &entities,
+        ));
     }
 
     #[test]

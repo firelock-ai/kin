@@ -2679,7 +2679,18 @@ pub trait StorageBackend: Send + Sync {
 
         // GC pass: remove orphaned cross-references accumulated over deltas
         let mut snapshot = recovered.snapshot;
-        snapshot.compact();
+        let compaction = snapshot.compact();
+        if compaction.orphaned_relations_removed > 0 {
+            // Compaction deletes strands silently and this was the only place
+            // kin-db ever counted them, so discarding the stats made the number
+            // unrecoverable from the graph afterwards by any key.
+            tracing::warn!(
+                repo_id,
+                orphaned_relations_removed = compaction.orphaned_relations_removed,
+                relations_before = compaction.relations_before,
+                "compaction dropped relations whose endpoint was not admitted"
+            );
+        }
 
         let merged_bytes = snapshot.to_bytes()?;
         let new_gen = self.save_snapshot(repo_id, &merged_bytes, recovered.generation)?;

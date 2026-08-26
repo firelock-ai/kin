@@ -262,8 +262,13 @@ mod tests {
         assert!(graph.get_entity(&e2.id).unwrap().is_some());
     }
 
+    /// This pass used to keep a cross-file incoming edge on purpose, with a
+    /// dangling destination. That is the strand every persist gate refuses a
+    /// whole snapshot over, which is how deleting one file could take an
+    /// unrelated commit down later. The edge now leaves with the endpoint it
+    /// can no longer reach, and the surviving caller is untouched.
     #[test]
-    fn remove_entities_keeps_incoming_from_other_files() {
+    fn remove_entities_for_file_removes_incoming_from_other_files() {
         let graph = InMemoryGraph::new();
         let e1 = test_entity("caller", "src/a.rs"); // external caller
         let e2 = test_entity("callee", "src/b.rs"); // will be removed
@@ -281,9 +286,16 @@ mod tests {
         assert!(graph.get_entity(&e2.id).unwrap().is_none());
         // e1 is still there.
         assert!(graph.get_entity(&e1.id).unwrap().is_some());
-        // The relation from e1→e2 is kept (dangling dst) — it's an incoming relation
-        // from another file.
-        assert_eq!(graph.relation_count(), 1);
+        assert_eq!(
+            graph.relation_count(),
+            0,
+            "the edge into the removed entity must not survive as a strand"
+        );
+        assert_eq!(
+            graph.stranded_relation_count(),
+            0,
+            "and the store must be left with nothing for a persist gate to refuse"
+        );
     }
 
     #[test]
