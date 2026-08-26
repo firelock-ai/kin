@@ -2021,6 +2021,21 @@ async fn resolve_session_source_scope(
 }
 
 const XREF_STABLE_READ_ATTEMPTS: usize = 3;
+
+/// Attempts a stable read makes before it will serve a superseded answer.
+///
+/// One more than [`XREF_STABLE_READ_ATTEMPTS`], and the extra one is the whole
+/// point. `settle_graph_authority_writer` skips the wait after the final
+/// attempt because nothing would read its result; that made the last thing the
+/// loop did a read taken without ever letting the writer drain, and the answer
+/// it produced was served labelled-superseded. Running one attempt beyond the
+/// resample budget turns that skipped wait into a real one and gives the answer
+/// it protects a reader.
+///
+/// A current answer is worth more than a correctly labelled stale one, and on
+/// this path the only thing between them is one bounded wait: 350 ms in total
+/// across the four settles, against a contended read measured at 0.21 s.
+const XREF_CURRENCY_ATTEMPTS: usize = XREF_STABLE_READ_ATTEMPTS + 1;
 const GRAPH_STATUS_STABLE_READ_ATTEMPTS: usize = 3;
 const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
 /// How long a contended status attempt waits before trying again.
@@ -2451,6 +2466,11 @@ async fn xref_graph_read_is_still_current(
 /// because a check asserts on exactly them.
 const GRAPH_AUTHORITY_COMPONENT: &str = "graph_authority";
 const MUTATION_IN_FLIGHT_REASON: &str = "mutation_in_flight";
+/// Pairs with [`GRAPH_AUTHORITY_COMPONENT`] to compose `graph_authority:retry`,
+/// for an answer that became current only because an earlier attempt was thrown
+/// away. A constant for the same reason the two above are: a check asserts on
+/// exactly this string.
+const GRAPH_AUTHORITY_RETRY_REASON: &str = "retry";
 
 /// Which writer this daemon can actually name as the one that was moving.
 ///
@@ -2488,7 +2508,7 @@ fn graph_authority_writer_sentence(state: &DaemonState) -> &'static str {
 /// surface over.
 fn xref_authority_unsettled_message(state: &DaemonState, surface: &str) -> String {
     format!(
-        "no settled graph authority for {surface}: {}. All {XREF_STABLE_READ_ATTEMPTS} attempts \
+        "no settled graph authority for {surface}: {}. All {XREF_CURRENCY_ATTEMPTS} attempts \
          were spent, each waiting longer than the last, and none could be certified against a \
          graph that held still. This says nothing about whether the queried entity exists: it is \
          an in-flight write window, not an absent or unresolved symbol. What changes the outcome \
@@ -2563,6 +2583,106 @@ fn disclose_mutation_in_flight(
     })
 }
 
+/// Attach the retry disclosure to an answer that is current only because an
+/// earlier attempt was thrown away.
+///
+/// [`mcp_find_references_with_stable_authority`] retries when a graph-authority
+/// write lands mid-read, and when a later attempt comes back current it returns
+/// that answer and says nothing at all. The rows are right and the graph did
+/// settle, which is exactly why the silence is the defect rather than a
+/// harmless omission: nothing in the response separates an answer that read a
+/// quiet graph from one that raced a writer and won on its third try, and an
+/// agent deciding whether to trust an absence it just measured would want to
+/// know the store was under contention while it was measured.
+///
+/// Absent on the first attempt on purpose. Nothing was retried there, and a
+/// disclosure stamped on every answer would report contention where there was
+/// none, which is the fabricated-`false` failure in a different costume.
+///
+/// Refuses rather than serving an answer it could not label, like
+/// [`disclose_mutation_in_flight`]. The asymmetry between the two is worth
+/// naming: a superseded answer is stale, so refusing it costs nothing, while
+/// this answer is current and correct, so refusing throws away something good.
+/// It refuses anyway. A disclosure that is present when it happens to be
+/// possible and absent when it is not cannot be reasoned from, and the payload
+/// shapes that reach the refusal (a non-text block, unparseable JSON, a
+/// non-object) each mean this surface is already broken in a way the caller
+/// needs told rather than smoothed over.
+///
+/// A handler error passes through unchanged, for the reason
+/// [`serve_superseded_xref_answer`] gives: it is the handler's own error, and
+/// replacing it with an authority message would hide a real fault.
+fn disclose_graph_authority_retry(
+    result: kin_mcp::Result<kin_mcp::ToolCallResult>,
+    attempt_number: usize,
+) -> kin_mcp::Result<kin_mcp::ToolCallResult> {
+    if attempt_number == 0 {
+        return result;
+    }
+    let answer = result?;
+    if answer.is_error == Some(true) {
+        return Ok(answer);
+    }
+    match stamp_graph_authority_retry(&answer, attempt_number) {
+        Some(disclosed) => Ok(disclosed),
+        None => Err(kin_mcp::McpError::Other(format!(
+            "find_references settled after {} retried attempt(s) but its payload could not carry \
+             the graph_authority:retry disclosure, so this daemon will not publish it as though \
+             it had read a quiet graph",
+            attempt_number
+        ))),
+    }
+}
+
+/// The payload half of [`disclose_graph_authority_retry`], separated so the
+/// refusal above reads as one decision rather than a chain of `?`.
+fn stamp_graph_authority_retry(
+    result: &kin_mcp::ToolCallResult,
+    attempt_number: usize,
+) -> Option<kin_mcp::ToolCallResult> {
+    let kin_mcp::ContentBlock::Text { text } = result.content.first()?;
+    let mut payload = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    if !payload.is_object() {
+        return None;
+    }
+    let entry = serde_json::json!({
+        "component": GRAPH_AUTHORITY_COMPONENT,
+        "reason": GRAPH_AUTHORITY_RETRY_REASON,
+        "attempt_number": attempt_number,
+        "detail": format!(
+            "a graph-authority write landed while this answer was being read, so the read was \
+             abandoned and retried; the answer served here is the {} attempt and was confirmed \
+             current before it was returned. Every row in it is settled. What it also says is \
+             that this store was being written while it was queried, so an absence measured here \
+             is an absence measured under contention.",
+            ordinal_attempt(attempt_number)
+        ),
+    });
+    match payload
+        .get_mut("degradations")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        Some(existing) => existing.push(entry),
+        None => payload["degradations"] = serde_json::Value::Array(vec![entry]),
+    }
+    let rendered = serde_json::to_string_pretty(&payload).ok()?;
+    Some(kin_mcp::ToolCallResult {
+        content: vec![kin_mcp::ContentBlock::Text { text: rendered }],
+        is_error: result.is_error,
+    })
+}
+
+/// `attempt_number` is zero-based and the disclosure is read by people, so it
+/// is rendered one-based and in words a reader does not have to decode.
+fn ordinal_attempt(attempt_number: usize) -> String {
+    match attempt_number {
+        1 => "second".to_string(),
+        2 => "third".to_string(),
+        3 => "fourth".to_string(),
+        other => format!("{}th", other + 1),
+    }
+}
+
 /// What an MCP reference read returns once every attempt has been superseded.
 ///
 /// Three outcomes, kept apart because collapsing them is how the window got
@@ -2609,9 +2729,9 @@ where
     // Initialize once outside the stamped interval: lazy spine hydration and
     // registration can be expensive, but it is not part of the graph read.
     let spine = state.ensure_spine();
-    for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
+    for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
-            settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
+            settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
             continue;
         };
         after_root(attempt_number);
@@ -2632,7 +2752,7 @@ where
             attempt = attempt_number + 1,
             "graph authority changed during command xref; retrying"
         );
-        settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
+        settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
     }
     // This surface refuses where the MCP twins serve. `XrefResponse` carries
     // `lines` and a spine body and no disclosure channel, so a labelled answer
@@ -2674,9 +2794,9 @@ where
     let spine = state.ensure_spine();
     let repository_authority = mcp_repository_authority_source(state)?;
     let mut superseded = None;
-    for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
+    for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
-            settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
+            settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
             continue;
         };
         after_root(attempt_number);
@@ -2694,14 +2814,17 @@ where
         if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
             .await
         {
-            return result;
+            // Current, and on any attempt after the first it is current only
+            // because an earlier one was thrown away. That is the fact this
+            // return used to swallow.
+            return disclose_graph_authority_retry(result, attempt_number);
         }
         tracing::warn!(
             attempt = attempt_number + 1,
             "graph authority changed during MCP find_references; retrying"
         );
         superseded = Some(result);
-        settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
+        settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
     }
     serve_superseded_xref_answer(superseded, state, "find_references")
 }
@@ -2824,9 +2947,9 @@ where
 {
     let spine = state.ensure_spine();
     let mut superseded = None;
-    for attempt_number in 0..XREF_STABLE_READ_ATTEMPTS {
+    for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
-            settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
+            settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
             continue;
         };
         after_root(attempt_number);
@@ -2842,14 +2965,17 @@ where
         if xref_graph_read_is_still_current(state, session_id, &selected_graph, authority, &attempt)
             .await
         {
-            return result;
+            // Current, and on any attempt after the first it is current only
+            // because an earlier one was thrown away. That is the fact this
+            // return used to swallow.
+            return disclose_graph_authority_retry(result, attempt_number);
         }
         tracing::warn!(
             attempt = attempt_number + 1,
             "graph authority changed during MCP bulk_check_references; retrying"
         );
         superseded = Some(result);
-        settle_graph_authority_writer(attempt_number, XREF_STABLE_READ_ATTEMPTS).await;
+        settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
     }
     serve_superseded_xref_answer(superseded, state, "bulk_check_references")
 }
@@ -30179,6 +30305,150 @@ mod tests {
     fn supersede_every_attempt(state: &Arc<DaemonState>) -> impl FnMut(usize) {
         let state = Arc::clone(state);
         move |_| state.bump_version()
+    }
+
+    /// The `after_root` hook that supersedes the first `attempts` reads and then
+    /// lets the graph hold still.
+    ///
+    /// The writer that drains while the loop is still willing to look.
+    /// [`supersede_every_attempt`] proves the disclosure fires when nothing
+    /// settles; this proves the loop now waits long enough to stop needing it.
+    fn supersede_until(state: &Arc<DaemonState>, attempts: usize) -> impl FnMut(usize) {
+        let state = Arc::clone(state);
+        move |attempt| {
+            if attempt < attempts {
+                state.bump_version();
+            }
+        }
+    }
+
+    /// A writer that drains before the last attempt is answered CURRENT, not
+    /// served a labelled stale answer.
+    ///
+    /// This is the currency upgrade. Before it the loop spent its whole budget
+    /// on reads and skipped the wait after the final one, so its last act was a
+    /// read taken without ever letting the writer drain, and that answer was
+    /// published superseded. One attempt past the resample budget turns the
+    /// skipped wait into a real one and gives the answer it protects a reader.
+    ///
+    /// The two assertions are separate claims and both are needed. The retry
+    /// label says the loop contended and recovered. The ABSENCE of the
+    /// mutation-in-flight label says it recovered into currency rather than
+    /// giving up, and without it a test asserting only the retry label would
+    /// pass on an answer that was still stale.
+    #[tokio::test]
+    async fn a_writer_that_drains_before_the_last_attempt_is_answered_current() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+
+        let settled = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("an uncontended reference read is served");
+        let settled_body: serde_json::Value =
+            serde_json::from_str(&mcp_result_text(&settled)).unwrap();
+
+        // Supersede every attempt the resample budget pays for, and let the one
+        // the currency upgrade added read a graph that holds still.
+        let recovered = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            supersede_until(&state, XREF_CURRENCY_ATTEMPTS - 1),
+        )
+        .await
+        .expect("a read whose writer drains is served");
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&recovered)).unwrap();
+
+        assert_eq!(body["focal_entity"], settled_body["focal_entity"]);
+        assert_eq!(body["references"], settled_body["references"]);
+
+        let labels = degradation_labels(&body);
+        assert!(
+            labels.contains(&"graph_authority:retry".to_string()),
+            "a read that only became current after retries must say so: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"graph_authority:mutation_in_flight".to_string()),
+            "this answer is CURRENT; publishing it as superseded is the thing the extra \
+             attempt exists to stop: {:?}",
+            labels
+        );
+    }
+
+    /// A writer that never drains still gets the superseded answer, unchanged.
+    ///
+    /// The cap arm. The currency upgrade widens the window; it must not soften
+    /// the verdict, and a store under continuous churn must still be told its
+    /// answer lost currency rather than being made to wait forever for one that
+    /// did not.
+    #[tokio::test]
+    async fn a_writer_that_never_drains_still_serves_the_superseded_answer() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+
+        let contended = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            supersede_every_attempt(&state),
+        )
+        .await
+        .expect("a superseded read with rows is served, never refused");
+        let body: serde_json::Value = serde_json::from_str(&mcp_result_text(&contended)).unwrap();
+
+        assert!(
+            degradation_labels(&body).contains(&"graph_authority:mutation_in_flight".to_string()),
+            "continuous churn must still be published as a mutation in flight: {:?}",
+            degradation_labels(&body)
+        );
+    }
+
+    /// The healthy-path tripwire: the labelled paths are exercised ZERO times on
+    /// a graph nothing is writing.
+    ///
+    /// Without this, both disclosures could become the steady state and every
+    /// assertion above would still pass. A label that is always present says
+    /// nothing, and an agent reading it would learn to ignore it, which is worse
+    /// than not having it.
+    #[tokio::test]
+    async fn an_uncontended_read_carries_neither_the_retry_nor_the_superseded_label() {
+        let (state, target) = reference_fixture();
+        let arguments = find_references_arguments(&target);
+
+        let quiet = mcp_find_references_with_stable_authority(
+            &state,
+            None,
+            Arc::clone(&state.graph),
+            RequestGraphAuthority::Head,
+            &arguments,
+            |_| {},
+        )
+        .await
+        .expect("an uncontended reference read is served");
+        let labels = degradation_labels(&serde_json::from_str(&mcp_result_text(&quiet)).unwrap());
+
+        assert!(
+            !labels.contains(&"graph_authority:retry".to_string()),
+            "nothing retried, so nothing may claim it did: {:?}",
+            labels
+        );
+        assert!(
+            !labels.contains(&"graph_authority:mutation_in_flight".to_string()),
+            "nothing was written, so nothing may claim a write was in flight: {:?}",
+            labels
+        );
     }
 
     /// The `component:reason` labels a payload's own `degradations[]` publishes,
