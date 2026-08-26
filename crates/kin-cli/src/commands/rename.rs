@@ -211,14 +211,15 @@ where
                 source_id
             )
         })?;
-        let expected = relation_occurrence_count(&relation)?;
+        let (unspanned, spanned) = relation_occurrence_split(&relation)?;
         let group = grouped
             .entry(source_id)
             .or_insert_with(|| ReferenceGroup::new(source));
         group.expected = group
             .expected
-            .checked_add(expected)
+            .checked_add(unspanned)
             .ok_or_else(|| anyhow::anyhow!("rename reference occurrence count overflow"))?;
+        group.scoped.extend(spanned);
         group
             .kinds
             .insert(format!("{:?}", relation.kind).to_ascii_lowercase());
@@ -262,17 +263,6 @@ where
         }
         require_complete_layout(graph, file)?;
         let body = load_cached_body(&tree, file, &mut bodies, &mut load_source)?;
-        let occurrences = find_token_occurrences(body, &target.name, span, group.entity.language)?;
-        if occurrences.len() != group.expected {
-            bail!(
-                "rename authority is incomplete for entity {} in {}: graph relations plus declaration require {} '{}' occurrence(s) inside the exact source span, but repository CAS contains {}; refusing a partial or over-broad edit",
-                group.entity.id,
-                file,
-                group.expected,
-                target.name,
-                occurrences.len()
-            );
-        }
         let reason = if group.declaration && group.kinds.is_empty() {
             "declaration".to_string()
         } else if group.declaration {
@@ -280,10 +270,51 @@ where
         } else {
             relation_reason(&group.kinds)
         };
-        for (occurrence_index, occurrence) in occurrences.into_iter().enumerate() {
-            let key = (file.clone(), occurrence.start_byte, occurrence.end_byte);
-            if let Some(other_entity) = seen.insert(key, group.entity.id) {
+
+        // One search per span the group expects occurrences in, rather than one
+        // search over the source entity. The entity-wide pass runs only when
+        // some evidence asked for it, so an edge whose evidence named its own
+        // span is never searched across the whole entity.
+        //
+        // The entity pass keeps `declaration: true` for its first occurrence
+        // and a scoped pass never claims it: the declaration is a site in the
+        // entity's own span by definition, and a scoped span is a reference
+        // somewhere else.
+        let mut passes: Vec<(&kin_model::SourceSpan, usize, bool)> = Vec::new();
+        if group.expected > 0 || group.declaration {
+            passes.push((span, group.expected, true));
+        }
+        for (scoped_span, scoped_expected) in &group.scoped {
+            if scoped_span.file != *file {
                 bail!(
+                    "graph-linked rename evidence for entity {} names a span in {} but the entity's origin is {}",
+                    group.entity.id,
+                    scoped_span.file,
+                    file
+                );
+            }
+            passes.push((scoped_span, *scoped_expected, false));
+        }
+
+        for (search_span, expected, is_entity_span) in passes {
+            let occurrences =
+                find_token_occurrences(body, &target.name, search_span, group.entity.language)?;
+            if occurrences.len() != expected {
+                bail!(
+                "rename authority is incomplete for entity {} in {}: graph relations plus declaration require {} '{}' occurrence(s) inside the exact source span {}..{}, but repository CAS contains {}; refusing a partial or over-broad edit",
+                group.entity.id,
+                file,
+                expected,
+                target.name,
+                search_span.start_byte,
+                search_span.end_byte,
+                occurrences.len()
+            );
+            }
+            for (occurrence_index, occurrence) in occurrences.into_iter().enumerate() {
+                let key = (file.clone(), occurrence.start_byte, occurrence.end_byte);
+                if let Some(other_entity) = seen.insert(key, group.entity.id) {
+                    bail!(
                     "rename occurrence {}:{}..{} is claimed by overlapping graph source entities {} and {}; refusing to count one token as two relation sites",
                     file,
                     occurrence.start_byte,
@@ -291,20 +322,21 @@ where
                     other_entity,
                     group.entity.id
                 );
+                }
+                edits.push(RenameEdit {
+                    file: file.clone(),
+                    start_byte: occurrence.start_byte,
+                    end_byte: occurrence.end_byte,
+                    start_line: occurrence.start_line,
+                    start_col: occurrence.start_col,
+                    end_line: occurrence.end_line,
+                    end_col: occurrence.end_col,
+                    old_text: target.name.clone(),
+                    new_text: request.new_name.clone(),
+                    reason: reason.clone(),
+                    declaration: is_entity_span && group.declaration && occurrence_index == 0,
+                });
             }
-            edits.push(RenameEdit {
-                file: file.clone(),
-                start_byte: occurrence.start_byte,
-                end_byte: occurrence.end_byte,
-                start_line: occurrence.start_line,
-                start_col: occurrence.start_col,
-                end_line: occurrence.end_line,
-                end_col: occurrence.end_col,
-                old_text: target.name.clone(),
-                new_text: request.new_name.clone(),
-                reason: reason.clone(),
-                declaration: group.declaration && occurrence_index == 0,
-            });
         }
     }
     edits.sort_by(|left, right| {
@@ -470,11 +502,38 @@ where
             })
         });
         if imported_target {
-            bail!(
-                "{} imports '{}', but graph import evidence has no exact source span; refusing to skip or guess at that edit site",
-                importer_file,
-                target.name
-            );
+            // The parser sees this file importing the target. That used to be
+            // an automatic refusal, and the refusal was right at the time: an
+            // import edge is sourced at the importing file's module entity,
+            // whose span is the whole file, so the planner's only reachable
+            // span found every mention of the name rather than the import site
+            // and could not satisfy any count. FIR-1825 gave call sites spans
+            // and left import sites without; this is its residual, FIR-2690.
+            //
+            // The question is no longer "is it imported" but "did the site
+            // survive into the graph". Refuse only when it did not, so a store
+            // indexed before import spans existed still refuses loudly rather
+            // than renaming against evidence it does not have.
+            let spanned_here = graph
+                .get_all_relations_for_entity(&target.id)?
+                .into_iter()
+                .any(|relation| {
+                    relation.dst == GraphNodeId::Entity(target.id)
+                        && relation.kind == RelationKind::Imports
+                        && relation.evidence.iter().any(|evidence| {
+                            evidence
+                                .source_span
+                                .as_ref()
+                                .is_some_and(|span| span.file == importer_file)
+                        })
+                });
+            if !spanned_here {
+                bail!(
+                    "{} imports '{}', but graph import evidence has no exact source span; refusing to skip or guess at that edit site",
+                    importer_file,
+                    target.name
+                );
+            }
         }
         source_languages.insert(importer_file, indexed.language);
     }
@@ -521,7 +580,17 @@ fn prove_repository_occurrence_accounting(
         if entity_leaf(&relation_target.name) != target.name {
             continue;
         }
-        let count = relation_occurrence_count(relation)?;
+        // The repository-wide accounting wants the TOTAL, span or no span. Its
+        // observed side attributes every occurrence to the smallest entity span
+        // containing it, so a top-level import statement lands on the module
+        // entity, which is the same entity the import edge is sourced at. The
+        // split matters to the planner, which searches per span; it does not
+        // matter here, where both sides count whole entities.
+        let (unspanned, spanned) = relation_occurrence_split(relation)?;
+        let count = spanned
+            .iter()
+            .try_fold(unspanned, |total, (_, scoped)| total.checked_add(*scoped))
+            .ok_or_else(|| anyhow::anyhow!("repository rename occurrence count overflow"))?;
         let entry = expected.entry(source_id).or_default();
         *entry = entry
             .checked_add(count)
@@ -613,7 +682,19 @@ fn entity_leaf(name: &str) -> &str {
 
 struct ReferenceGroup {
     entity: Entity,
+    /// Occurrences expected inside the SOURCE ENTITY's own span, from evidence
+    /// that named no span of its own. This is every edge's behaviour before
+    /// FIR-2690 and stays exactly that.
     expected: usize,
+    /// Occurrences expected inside a span the evidence named itself.
+    ///
+    /// An entity-level import edge is sourced at the importing file's module
+    /// entity, whose span is the whole file. Searching that span finds every
+    /// mention of the name rather than the import site, so the count can never
+    /// match and `kin rename` refused outright. Evidence that carries its own
+    /// span is searched inside THAT span instead, which turns one impossible
+    /// whole-file check into one exact check per import statement.
+    scoped: Vec<(kin_model::SourceSpan, usize)>,
     kinds: BTreeSet<String>,
     relation_ids: BTreeSet<kin_model::RelationId>,
     declaration: bool,
@@ -624,6 +705,7 @@ impl ReferenceGroup {
         Self {
             entity,
             expected: 0,
+            scoped: Vec::new(),
             kinds: BTreeSet::new(),
             relation_ids: BTreeSet::new(),
             declaration: false,
@@ -631,26 +713,46 @@ impl ReferenceGroup {
     }
 }
 
-fn relation_occurrence_count(relation: &Relation) -> Result<usize> {
+/// Split a relation's expected occurrences into the ones searched inside the
+/// SOURCE ENTITY's span and the ones searched inside a span the evidence named.
+///
+/// Evidence that names no span behaves exactly as it always did: its count is
+/// added to the entity-wide expectation. Evidence that names one is checked
+/// inside that span alone, which is what makes an import edge renameable. An
+/// import edge is sourced at a module entity spanning the whole file, so the
+/// entity-wide search finds every mention of the name and the count can never
+/// match; the import statement's own span contains exactly the occurrences the
+/// evidence counted.
+///
+/// A relation with no evidence at all still expects one occurrence in the
+/// entity span, unchanged.
+fn relation_occurrence_split(
+    relation: &Relation,
+) -> Result<(usize, Vec<(kin_model::SourceSpan, usize)>)> {
     if relation.evidence.is_empty() {
-        return Ok(1);
+        return Ok((1, Vec::new()));
     }
-    relation
-        .evidence
-        .iter()
-        .try_fold(0_usize, |total, evidence| {
-            let count = usize::try_from(evidence.occurrence_count)
-                .context("rename relation occurrence count does not fit usize")?;
-            if count == 0 {
-                bail!(
-                    "rename relation {} carries a zero occurrence evidence record",
-                    relation.id
-                );
+    let mut unspanned = 0_usize;
+    let mut spanned = Vec::new();
+    for evidence in &relation.evidence {
+        let count = usize::try_from(evidence.occurrence_count)
+            .context("rename relation occurrence count does not fit usize")?;
+        if count == 0 {
+            bail!(
+                "rename relation {} carries a zero occurrence evidence record",
+                relation.id
+            );
+        }
+        match evidence.source_span.as_ref() {
+            Some(span) => spanned.push((span.clone(), count)),
+            None => {
+                unspanned = unspanned
+                    .checked_add(count)
+                    .ok_or_else(|| anyhow::anyhow!("rename relation occurrence count overflow"))?
             }
-            total
-                .checked_add(count)
-                .ok_or_else(|| anyhow::anyhow!("rename relation occurrence count overflow"))
-        })
+        }
+    }
+    Ok((unspanned, spanned))
 }
 
 fn require_complete_layout(graph: &impl GraphStore, file: &FilePathId) -> Result<()> {
@@ -1193,7 +1295,7 @@ mod tests {
                 ..kin_model::RelationEvidence::default()
             }],
         };
-        assert!(relation_occurrence_count(&relation)
+        assert!(relation_occurrence_split(&relation)
             .unwrap_err()
             .to_string()
             .contains("zero occurrence"));

@@ -570,7 +570,25 @@ struct LanguageFixture {
     target_source: &'static str,
     caller_path: &'static str,
     caller_source: &'static str,
-    has_named_import_without_span: bool,
+    /// This language's fixture imports the target by name.
+    ///
+    /// It used to be `has_named_import_without_span`, and the refusal it drove
+    /// was correct while `FileImport` carried no span. FIR-2690 gave every
+    /// adapter one, so a named import is now a renameable SITE rather than a
+    /// reason to refuse, and these fixtures assert the edit instead of the
+    /// error. The spanless case still has a test: a hand-built graph whose
+    /// import evidence names no span, below, which must still refuse.
+    has_named_import: bool,
+    /// This language emits a MODULE entity for an ordinary source file.
+    ///
+    /// An entity-level import edge is sourced at the importing file's module
+    /// entity. JavaScript and TypeScript emit one only for index files
+    /// (FIR-2675), so for them there is no source entity to hang the edge on,
+    /// no edge, and therefore no spanned evidence however good the parser's
+    /// span is. Their refusal is real and is asserted below rather than hidden,
+    /// because a suite that quietly skips the languages it cannot serve reports
+    /// coverage it does not have.
+    emits_module_entity_per_file: bool,
     /// Whether this language's adapter records a call site, so its `Calls`
     /// evidence carries a `source_span` (FIR-1825). The planner does not read
     /// spans, so its behavior below is the same either way; this keeps the
@@ -592,7 +610,8 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         target_source: "pub fn target() -> u32 { 1 }\n",
         caller_path: "caller.rs",
         caller_source: "pub fn caller() -> u32 { target() + target() }\n",
-        has_named_import_without_span: false,
+        has_named_import: false,
+        emits_module_entity_per_file: true,
         records_call_sites: false,
     },
     LanguageFixture {
@@ -601,7 +620,8 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         target_source: "export function target(): number { return 1; }\n",
         caller_path: "caller.ts",
         caller_source: "import { target } from './defs';\nexport function caller(): number { return target() + target(); }\n",
-        has_named_import_without_span: true,
+        has_named_import: true,
+        emits_module_entity_per_file: false,
         records_call_sites: true,
     },
     LanguageFixture {
@@ -610,7 +630,8 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         target_source: "export function target() { return 1; }\n",
         caller_path: "caller.js",
         caller_source: "import { target } from './defs';\nexport function caller() { return target() + target(); }\n",
-        has_named_import_without_span: true,
+        has_named_import: true,
+        emits_module_entity_per_file: false,
         records_call_sites: true,
     },
     LanguageFixture {
@@ -619,7 +640,8 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         target_source: "def target():\n    return 1\n",
         caller_path: "caller.py",
         caller_source: "from defs import target\n\ndef caller():\n    return target() + target()\n",
-        has_named_import_without_span: true,
+        has_named_import: true,
+        emits_module_entity_per_file: true,
         records_call_sites: true,
     },
     LanguageFixture {
@@ -628,7 +650,8 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         target_source: "package main\n\nfunc target() int { return 1 }\n",
         caller_path: "caller.go",
         caller_source: "package main\n\nfunc caller() int { return target() + target() }\n",
-        has_named_import_without_span: false,
+        has_named_import: false,
+        emits_module_entity_per_file: true,
         records_call_sites: false,
     },
     LanguageFixture {
@@ -637,7 +660,8 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         target_source: "class Defs { static int target() { return 1; } }\n",
         caller_path: "Caller.java",
         caller_source: "class Caller { int caller() { return target() + target(); } }\n",
-        has_named_import_without_span: false,
+        has_named_import: false,
+        emits_module_entity_per_file: true,
         records_call_sites: false,
     },
     LanguageFixture {
@@ -646,7 +670,8 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         target_source: "int target(void) { return 1; }\n",
         caller_path: "caller.c",
         caller_source: "int caller(void) { return target() + target(); }\n",
-        has_named_import_without_span: false,
+        has_named_import: false,
+        emits_module_entity_per_file: true,
         records_call_sites: false,
     },
     LanguageFixture {
@@ -655,7 +680,8 @@ const LANGUAGE_FIXTURES: &[LanguageFixture] = &[
         target_source: "int target() { return 1; }\n",
         caller_path: "caller.cpp",
         caller_source: "int caller() { return target() + target(); }\n",
-        has_named_import_without_span: false,
+        has_named_import: false,
+        emits_module_entity_per_file: true,
         records_call_sites: false,
     },
 ];
@@ -787,13 +813,52 @@ fn real_linker_spanless_relations_are_exact_or_refused_across_eight_languages() 
                 Ok(bodies.get(path).unwrap().clone())
             },
         );
-        if fixture.has_named_import_without_span {
+        if fixture.has_named_import && !fixture.emits_module_entity_per_file {
+            // FIR-2675, not FIR-2690. The parser records this language's import
+            // span correctly; there is simply no module entity to source the
+            // edge at, so no entity-level import edge exists and no evidence
+            // carries the span. The refusal is right and stays asserted, so
+            // this suite says out loud which languages the import fix does not
+            // reach yet.
             let error = result.unwrap_err();
             assert!(
                 error
                     .to_string()
                     .contains("graph import evidence has no exact source span"),
-                "{} must refuse its unspanned named import: {error:#}",
+                "{} has no per-file module entity, so its import edge cannot exist yet: {error:#}",
+                fixture.name
+            );
+        } else if fixture.has_named_import {
+            // FIR-2690. This branch asserted the refusal until every adapter
+            // recorded an import span. It now asserts the thing the refusal was
+            // standing in for: the import statement is edited like any other
+            // reference site.
+            let plan = result.unwrap_or_else(|error| {
+                panic!(
+                    "{} imports the target by name and every adapter now records the site, so \
+                     the rename must reach it: {error:#}",
+                    fixture.name
+                )
+            });
+            let import_edits: Vec<&_> = plan
+                .edits
+                .iter()
+                .filter(|edit| edit.reason.contains("imports"))
+                .collect();
+            assert_eq!(
+                import_edits.len(),
+                1,
+                "{} must edit its import site exactly once, got {:?}",
+                fixture.name,
+                plan.edits
+            );
+            // The count is the assertion that matters. Three edits is what this
+            // fixture produced while the import site was unreachable, so a plan
+            // that still holds three is one where the span changed nothing.
+            assert_eq!(
+                plan.edits.len(),
+                4,
+                "{} expects the declaration, two call sites and the import site",
                 fixture.name
             );
         } else if target.name != "target" {
