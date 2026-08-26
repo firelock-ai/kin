@@ -16983,22 +16983,41 @@ mod tests {
     #[cfg(unix)]
     const PAYLOAD_BLOB_BYTES: usize = 1024 * 1024;
 
-    /// Mirrors `kin`'s own tip tree, which FIR-2746 measured at 842 unique
-    /// blobs and 27.77 MiB decoded and which DOES NOT FIT. The property that
-    /// matters is the decoded total, not the blob count, so this carries the
-    /// total in far fewer blobs: 24 keeps it three orders of magnitude clear of
-    /// `MAX_TRANSFER_BODIES` (4096) and `MAX_TRANSFER_EXTERNAL_OBJECTS` (4096),
-    /// which is what makes a refusal here attributable to the byte cap alone.
+    /// How many of those blobs the decoded-closure ceiling holds.
+    ///
+    /// Derived from the product constant rather than written down, and the
+    /// history is the reason. These arms were originally sized to MIRROR real
+    /// repositories against a 16 MiB ceiling: the over arm carried kin's own
+    /// tip tree, which FIR-2746 measured at 27.77 MiB decoded and which did not
+    /// fit, and the under arm carried kin-db at 4.30 MiB, which did. Raising the
+    /// ceiling to 64 MiB made the first of those claims false, because kin's tip
+    /// now fits comfortably, and the straddle self-check below said so by
+    /// failing on every speculative merge. That is the harness working rather
+    /// than breaking: the bound moved and the pin noticed.
+    ///
+    /// The arms cannot mirror a repository any more, because the ceiling now
+    /// sits above every hosted repository's tip closure, which is exactly what
+    /// raising it bought. So they mirror the BOUND instead and follow it, and a
+    /// future change to the ceiling moves them rather than stranding them.
     #[cfg(unix)]
-    const PAYLOAD_BLOBS_OVER_CAP: usize = 24;
+    const CAP_BLOBS: usize = (kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES
+        / PAYLOAD_BLOB_BYTES as u64) as usize;
 
-    /// Mirrors the four hosted repositories FIR-2746 measured as fitting, the
-    /// largest of which is kin-db at 4.30 MiB. Same generator, same blob size,
-    /// same commit shape; the only variable between this and the fixture above
-    /// is how many blobs there are, which is what makes the pair a comparison
-    /// rather than two separate observations.
+    /// One blob past the ceiling, which is the smallest fixture that can exceed
+    /// it. Exceeding a decoded-byte cap means shipping that many bytes, so the
+    /// cost of this arm is the ceiling itself and no construction avoids it;
+    /// the minimum overshoot is what keeps it off the transport's own limit.
     #[cfg(unix)]
-    const PAYLOAD_BLOBS_UNDER_CAP: usize = 4;
+    const PAYLOAD_BLOBS_OVER_CAP: usize = CAP_BLOBS + 1;
+
+    /// Comfortably under the ceiling and deliberately cheap, since this arm has
+    /// to publish rather than be refused. Still derived, so a LOWERED ceiling
+    /// cannot leave it stranded above the bound it is supposed to sit under.
+    /// Same generator, same blob size, same commit shape as the arm above; the
+    /// only variable between them is how many blobs there are, which is what
+    /// makes the pair a comparison rather than two separate observations.
+    #[cfg(unix)]
+    const PAYLOAD_BLOBS_UNDER_CAP: usize = if CAP_BLOBS / 2 < 4 { CAP_BLOBS / 2 } else { 4 };
 
     /// Deterministic, distinct-per-blob, and not compressible into nothing.
     ///
@@ -17164,6 +17183,22 @@ mod tests {
             PAYLOAD_BLOBS_OVER_CAP < max_bodies,
             "the over-cap arm must stay clear of the body-count cap: \
              {PAYLOAD_BLOBS_OVER_CAP} vs {max_bodies}"
+        );
+        // The third isolation check, and the one nothing asserted until the
+        // ceiling moved. Bodies travel base64, so an over-cap arm can be large
+        // enough that the TRANSPORT refuses it with a 413 before the decoded
+        // closure check ever runs, and that refusal reads like a refusal this
+        // harness is about. It fits today with room to spare, and it is one
+        // legal edit from not fitting: raising PAYLOAD_BLOB_BYTES to 8 MiB is
+        // allowed by the per-body cap above and would put the over arm's wire
+        // size past this limit while every other assertion here still passed.
+        let wire = (over + 2) / 3 * 4;
+        let http_limit =
+            kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT as u64;
+        assert!(
+            wire < http_limit,
+            "the over-cap arm must be refused by the decoded-closure cap, not by the \
+             transport: {wire} base64 bytes on the wire against a {http_limit} byte limit"
         );
         // A const block, because both sides are constants and clippy is right
         // that a runtime assertion over them proves nothing at runtime. Moved
