@@ -86,7 +86,11 @@ substitutions:
   _KIN_DB_REF: 'main'
 
 options:
-  machineType: 'E2_HIGHCPU_8'
+  # E2_HIGHCPU_8 carries 8 GB, and rustc was SIGKILLed at the fat-LTO link of
+  # the kin-daemon binary on every push to main from 2026-08-25 19:33Z, with no
+  # log to say so until the deployer account could write one. E2_HIGHCPU_32
+  # carries 32 GB; the same Dockerfile builds green on kin's own 16 GB CI runner.
+  machineType: 'E2_HIGHCPU_32'
   logging: CLOUD_LOGGING_ONLY
 
 timeout: '1800s'
