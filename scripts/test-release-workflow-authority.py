@@ -493,24 +493,103 @@ DOCS_ONLY_CHECK_JOB = textwrap.dedent(
           run: echo "documentation-only diff; build and test validation not applicable"
     """
 ).rstrip()
+# The ubuntu shards publish `Check & Test ubuntu shard (1)` and `(2)`, which no
+# ruleset requires, and `check-aggregate` is what publishes the required
+# `Check & Test (ubuntu-latest)`. The job id stays `check` rather than becoming
+# `check-ubuntu` for two reasons neither of which is visible from this file:
+# `bin/kin-precheck` in the umbrella enumerates this job's gate list by that id,
+# and `rust-cache` composes its key from the job id when no shared key is given,
+# so `feature-tests` reaches this job's warm dependency graph by asking for
+# `check`. Renaming it would cost the ubuntu permutations their cache exactly
+# the way the macOS leg lost its own.
 REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
     """\
     check:
-      name: Check & Test
+      name: Check & Test ubuntu shard
       needs: changes
       if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
-      runs-on: ${{ matrix.os }}
+      runs-on: ubuntu-latest
       timeout-minutes: 60
       env:
         CARGO_INCREMENTAL: "0"
         CARGO_PROFILE_DEV_DEBUG: "0"
         CARGO_PROFILE_TEST_DEBUG: "0"
       strategy:
+        fail-fast: false
+        matrix:
+          shard: [1, 2]
+      steps:
+    """
+).rstrip()
+# The ubuntu counterpart of MACOS_SHARD_AGGREGATE_AUTHORITY, pinned for the same
+# two reasons: the one-value matrix keeps a skipped aggregate from publishing the
+# expanded required name beside the documentation-only stub's, and admitting only
+# `success` from the shard roll-up keeps a skipped or cancelled shard from
+# leaving half the ubuntu suite unrun behind a green required context.
+UBUNTU_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
+    """\
+    check-aggregate:
+      name: Check & Test
+      needs: [changes, check]
+      if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+      runs-on: ubuntu-latest
+      timeout-minutes: 5
+      strategy:
         matrix:
           os: [ubuntu-latest]
       steps:
     """
 ).rstrip()
+# Indented as `classifier_active_job_source` renders a dedented job block.
+UBUNTU_SHARD_RUNNER = "  runs-on: ubuntu-latest"
+UBUNTU_SHARD_INDEPENDENT_LEGS = "    fail-fast: false"
+UBUNTU_SHARD_MATRIX = "      shard: [1, 2]"
+UBUNTU_SHARD_PARTITION = (
+    "      run: cargo nextest run --locked --partition count:${{ matrix.shard }}/2"
+)
+UBUNTU_SHARD_DOCTESTS = "      run: cargo test --doc --locked"
+UBUNTU_SHARD_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
+# The gates this job runs and the macOS shards deliberately do not. Each reads
+# source and cannot answer differently on a second runner, so each is pinned to
+# shard 1 by an explicit condition. They are named individually rather than
+# counted: a bar set from a count is crossed by any twenty of them, and the one
+# that goes missing is the one nobody named. This is the ladder-coverage lesson
+# in docs/traps.md applied to a step list.
+UBUNTU_SHARD_ONE_ONLY_GATES = (
+    "Check the README language count against the adapter registry",
+    "Install runtime guard tools",
+    "Validate installer checksum fixtures",
+    "Validate that every release gate assertion still runs",
+    "Validate mandatory Homebrew release outcome gate",
+    "Validate automatic release policy",
+    "Check the RC build mirrors the release build",
+    "Verify Kin/kin-vfs compatibility at the pinned release input",
+    "Check formatting",
+    "Check Zero File-Search Invariant",
+    "Check Zero File-Search Invariant (answer modules)",
+    "Check Hydration Replay Semantics",
+    "Falsify Hydration Replay Semantics guard",
+    "Falsify the release policy and Windows leg gates",
+    "Clippy",
+    "Check Runtime Boundaries",
+    "Check Private Repo Coupling",
+    "Test Private Repo Coupling Guard",
+    "Check home-reading test isolation",
+    "Check the Linux release target (musl)",
+    "Check the aarch64 Linux release target (musl)",
+    "Doc tests",
+)
+# What a partition consumes, and therefore what neither shard may skip. A
+# partition that ran without one of these is not a partition of the suite.
+UBUNTU_SHARD_BOTH_LEGS_STEPS = (
+    "Install Rust toolchain",
+    "Verify kin cargo registry config",
+    "Cache cargo registry and build",
+    "Build",
+    "Install nextest",
+    "Install language servers for the enrichment proof",
+    "Test",
+)
 # The macOS shards publish `Check & Test macOS shard (1)` and `(2)`, which no
 # ruleset requires, and the aggregate is what publishes the required
 # `Check & Test (macos-latest)`. Two properties make that safe and both are
@@ -554,7 +633,15 @@ CI_JOB_DISPLAY_NAMES = {
     "windows-installer": "Windows installer + vector release build",
     "changes": "Classify diff scope",
     "check-docs-only": "Check & Test",
-    "check": "Check & Test",
+    # The ubuntu half of Check & Test, split so its 14.98-minute test step can
+    # run as two nextest partitions. The shard job keeps the id `check`, which
+    # bin/kin-precheck and rust-cache both key on, and publishes a name of its
+    # own that is required by nothing; `check-aggregate` publishes
+    # `Check & Test` with a one-value matrix, which expands to the
+    # release-required `Check & Test (ubuntu-latest)` and is what the ruleset
+    # names.
+    "check": "Check & Test ubuntu shard",
+    "check-aggregate": "Check & Test",
     # The macOS half of Check & Test, split so its 14.2-minute test step can run
     # as two nextest partitions. The shard job publishes a name of its own and
     # is required by nothing; the aggregate publishes `Check & Test` with a
@@ -747,14 +834,17 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
 }
 REQUIRED_CHECK_JOB_PRODUCERS = {
     # Three producers, one per required expansion plus the documentation-only
-    # stub. `check` carries ubuntu-latest, `check-macos-aggregate` carries
-    # macos-latest and is green only when every `check-macos` shard succeeded,
-    # and `check-docs-only` publishes both names on a documentation-only diff.
-    # The real jobs and the stub stay mutually exclusive by condition, so no two
-    # of them ever publish the same expanded name on one event.
+    # stub. `check-aggregate` carries ubuntu-latest and is green only when every
+    # `check` shard succeeded, `check-macos-aggregate` carries macos-latest on
+    # the same terms, and `check-docs-only` publishes both names on a
+    # documentation-only diff. `check` and `check-macos` publish names of their
+    # own that no ruleset requires, which is what keeps a shard from being a
+    # second check run under a required name. The real jobs and the stub stay
+    # mutually exclusive by condition, so no two of them ever publish the same
+    # expanded name on one event.
     "Check & Test": {
         (".github/workflows/ci.yml", "check-docs-only"),
-        (".github/workflows/ci.yml", "check"),
+        (".github/workflows/ci.yml", "check-aggregate"),
         (".github/workflows/ci.yml", "check-macos-aggregate"),
     },
     "Falsify guards": {
@@ -4679,6 +4769,104 @@ def assert_macos_shard_authority(workflow: str) -> None:
         MACOS_SHARD_SUCCESS_GATE,
         "macOS shard authority",
     )
+
+
+def shard_step_conditions(job: str) -> dict[str, str]:
+    """Map each named step of a job block to its `if:` condition, or "".
+
+    Read from the rendered active source rather than by regex over the raw file,
+    because a step's condition is decided by which step it sits under and a
+    line-oriented search cannot see that. A step that carries no condition maps
+    to the empty string, which is what makes "runs on both legs" an assertion
+    rather than the absence of one.
+    """
+
+    conditions: dict[str, str] = {}
+    name = None
+    for line in classifier_active_job_source(job).splitlines():
+        indent = len(line) - len(line.lstrip())
+        if line.startswith("    - "):
+            name = None
+            body = line[len("    - ") :]
+            if body.startswith("name: "):
+                name = body[len("name: ") :].strip()
+                conditions[name] = ""
+        elif name is not None and indent == 6 and line.lstrip().startswith("if: "):
+            conditions[name] = line.lstrip()[len("if: ") :].strip()
+        elif indent <= 4 and not line.startswith("    - "):
+            name = None
+    return conditions
+
+
+def assert_ubuntu_shard_authority(workflow: str) -> None:
+    """Pin the sharded ubuntu producer of `Check & Test (ubuntu-latest)`.
+
+    The macOS docstring above states why sharding a required context needs its
+    own authority, and every word of it applies here. What is different is that
+    the ubuntu job is also where every source-reading gate in this repository
+    runs, so splitting it can lose a gate as well as half a suite, and the two
+    failures look identical from outside: a faster green run.
+
+    So the gate list is pinned by NAME rather than by count. A count is crossed
+    by any twenty of twenty-one, and the one that goes missing is the one nobody
+    named. Each gate must carry an explicit shard-1 condition, and each step a
+    partition consumes must carry no shard condition at all, because a partition
+    that ran without its build or its nextest install is not a partition of the
+    suite.
+    """
+
+    blocks = workflow_job_blocks(workflow)
+    shards = blocks.get("check")
+    aggregate = blocks.get("check-aggregate")
+    if shards is None or aggregate is None:
+        raise AssertionError(
+            "ubuntu shard authority requires both the shard job and its aggregate"
+        )
+    if real_check_job_authority_source(aggregate) != UBUNTU_SHARD_AGGREGATE_AUTHORITY:
+        raise AssertionError(
+            "ubuntu shard authority requires the exact reviewed aggregate admission "
+            "and matrix contract"
+        )
+
+    active_shards = classifier_active_job_source(shards)
+    for policy in (
+        UBUNTU_SHARD_RUNNER,
+        UBUNTU_SHARD_INDEPENDENT_LEGS,
+        UBUNTU_SHARD_MATRIX,
+        UBUNTU_SHARD_PARTITION,
+        UBUNTU_SHARD_DOCTESTS,
+    ):
+        require(active_shards, policy, "ubuntu shard authority")
+    require(
+        classifier_active_job_source(aggregate),
+        UBUNTU_SHARD_SUCCESS_GATE,
+        "ubuntu shard authority",
+    )
+
+    conditions = shard_step_conditions(shards)
+    for gate in UBUNTU_SHARD_ONE_ONLY_GATES:
+        if gate not in conditions:
+            raise AssertionError(
+                f"ubuntu shard authority requires the gate {gate!r} to still run in "
+                "this job; a gate that left it is a gate nothing runs"
+            )
+        if "matrix.shard == 1" not in conditions[gate]:
+            raise AssertionError(
+                f"ubuntu shard authority requires {gate!r} to be pinned to shard 1; "
+                "a source-reading gate on both legs pays twice for one answer, and "
+                "one on neither is a gate nothing runs"
+            )
+    for step in UBUNTU_SHARD_BOTH_LEGS_STEPS:
+        if step not in conditions:
+            raise AssertionError(
+                f"ubuntu shard authority requires the step {step!r}, which a "
+                "partition consumes"
+            )
+        if "matrix.shard" in conditions[step]:
+            raise AssertionError(
+                f"ubuntu shard authority requires {step!r} on both legs; a shard "
+                "that ran without it did not run a partition of the suite"
+            )
 
 
 def execute_docs_only_classifier(
@@ -12526,6 +12714,7 @@ def main() -> None:
     )
     assert_check_consumer_authority(ci_workflow)
     assert_macos_shard_authority(ci_workflow)
+    assert_ubuntu_shard_authority(ci_workflow)
     consumer_blocks = workflow_job_blocks(ci_workflow)
     docs_only_check = consumer_blocks["check-docs-only"]
     real_check = consumer_blocks["check"]
@@ -12612,6 +12801,116 @@ def main() -> None:
             ),
         )
 
+    ubuntu_shards = consumer_blocks["check"]
+    ubuntu_aggregate = consumer_blocks["check-aggregate"]
+
+    for label, old, new in (
+        (
+            "the ubuntu aggregate accepts a shard result that is not success",
+            'if [ "$SHARDS" != "success" ]; then',
+            'if [ "$SHARDS" = "failure" ]; then',
+        ),
+        (
+            "the ubuntu aggregate loses the matrix that keeps a skip from expanding",
+            "        os: [ubuntu-latest]",
+            "        os: []",
+        ),
+        (
+            "the ubuntu aggregate stops waiting on the shards",
+            "    needs: [changes, check]",
+            "    needs: changes",
+        ),
+        (
+            "the ubuntu aggregate takes the display name of the shard job",
+            "    name: Check & Test",
+            "    name: Check & Test ubuntu aggregate",
+        ),
+    ):
+        if ubuntu_aggregate.count(old) != 1:
+            raise AssertionError(
+                f"ubuntu shard falsification could not identify {label}"
+            )
+        mutant_workflow = ci_workflow.replace(
+            ubuntu_aggregate, ubuntu_aggregate.replace(old, new, 1), 1
+        )
+        expect_assertion(
+            label,
+            "ubuntu shard authority",
+            lambda mutant_workflow=mutant_workflow: assert_ubuntu_shard_authority(
+                mutant_workflow
+            ),
+        )
+
+    for label, old, new in (
+        (
+            "a shard stops partitioning and both legs run the whole suite",
+            "        run: cargo nextest run --locked "
+            "--partition count:${{ matrix.shard }}/2",
+            "        run: cargo nextest run --locked",
+        ),
+        (
+            "the doctest pass nextest cannot run disappears",
+            "        run: cargo test --doc --locked",
+            "        run: echo doctests skipped",
+        ),
+        (
+            "one red ubuntu shard is allowed to cancel its passing sibling",
+            "      fail-fast: false",
+            "      fail-fast: true",
+        ),
+        (
+            "the ubuntu shards leave ubuntu",
+            "    runs-on: ubuntu-latest",
+            "    runs-on: macos-latest",
+        ),
+        (
+            "the ubuntu shard count changes without the partition denominator",
+            "        shard: [1, 2]",
+            "        shard: [1, 2, 3]",
+        ),
+        # The two that a count of steps cannot see, and the reason the gate list
+        # above is a list of names. A gate that loses its pin runs on both legs
+        # and pays macOS-shaped minutes twice for one source read; a gate that is
+        # renamed off the list runs nowhere, and both arrive as a faster green.
+        (
+            "a source-reading gate loses its shard pin and runs on both legs",
+            "      - name: Clippy\n        if: matrix.shard == 1\n",
+            "      - name: Clippy\n",
+        ),
+        (
+            "a source-reading gate is renamed off the pinned list",
+            "      - name: Check Runtime Boundaries\n",
+            "      - name: Check Runtime Boundaries (moved)\n",
+        ),
+        # The mirror image: a step a partition consumes is not optional on either
+        # leg, and a shard that skipped its own build never ran a partition.
+        (
+            "a step the partition consumes is pinned to one shard",
+            "      - name: Build\n        run: cargo build --all-targets --locked\n",
+            "      - name: Build\n        if: matrix.shard == 1\n"
+            "        run: cargo build --all-targets --locked\n",
+        ),
+        (
+            "a step the partition consumes leaves the job",
+            "      - name: Install nextest\n",
+            "      - name: Install nextest (moved)\n",
+        ),
+    ):
+        if ubuntu_shards.count(old) != 1:
+            raise AssertionError(
+                f"ubuntu shard falsification could not identify {label}"
+            )
+        mutant_workflow = ci_workflow.replace(
+            ubuntu_shards, ubuntu_shards.replace(old, new, 1), 1
+        )
+        expect_assertion(
+            label,
+            "ubuntu shard authority",
+            lambda mutant_workflow=mutant_workflow: assert_ubuntu_shard_authority(
+                mutant_workflow
+            ),
+        )
+
     docs_only_condition = (
         "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}"
     )
@@ -12692,9 +12991,13 @@ def main() -> None:
 
     for label, old, new in (
         (
+            # The sharp regression now that the aggregate owns the required
+            # name: a shard claiming `Check & Test` publishes
+            # `Check & Test (ubuntu-latest, 1)` and `(2)`, and its bare name
+            # collides with the aggregate's on a skip.
             "real Check & Test display name changed",
+            "    name: Check & Test ubuntu shard",
             "    name: Check & Test",
-            "    name: Check & Test trusted",
         ),
         (
             "real Check & Test dependency changed",
@@ -12702,17 +13005,17 @@ def main() -> None:
             "    needs: dco",
         ),
         (
-            "real Check & Test runner detached from its matrix",
-            "    runs-on: ${{ matrix.os }}",
+            "real Check & Test runner detached from its shard matrix",
             "    runs-on: ubuntu-latest",
+            "    runs-on: ${{ matrix.os }}",
         ),
         (
-            # Restoring the two-platform matrix is the specific regression to
-            # catch: `check` would publish `Check & Test (macos-latest)` again,
-            # beside the aggregate's, and put two check runs under one required
-            # context name.
+            # Restoring a platform matrix is the specific regression to catch:
+            # `check` would publish expanded platform names again, beside the
+            # aggregates', and put two check runs under one required context
+            # name.
             "real Check & Test matrix changed",
-            "        os: [ubuntu-latest]",
+            "        shard: [1, 2]",
             "        os: [ubuntu-latest, macos-latest]",
         ),
     ):
