@@ -336,6 +336,14 @@ pub struct LocalOutcome {
     pub is_error: bool,
     /// The repository-relative path that changed, when one did.
     pub changed: Option<String>,
+    /// The file's complete new text, as this tool left it.
+    ///
+    /// Repository authority admits a source change from the whole file, so the harness
+    /// has to hand it those bytes. It carries them out of the tool that produced them
+    /// rather than reading the file back: the text is already in hand here, a read would
+    /// put a filesystem access on the runtime path, and between the write and the read
+    /// the file could be something else.
+    pub body: Option<String>,
 }
 
 /// Resolve a model-supplied path inside the repository, refusing every escape.
@@ -482,6 +490,7 @@ pub fn run_edit(repo: &Path, arguments: &Value) -> LocalOutcome {
         ),
         is_error: false,
         changed: Some(raw_path.to_string()),
+        body: Some(updated),
     }
 }
 
@@ -513,6 +522,7 @@ pub fn run_write(repo: &Path, arguments: &Value) -> LocalOutcome {
         ),
         is_error: false,
         changed: Some(raw_path.to_string()),
+        body: Some(content.to_string()),
     }
 }
 
@@ -534,6 +544,7 @@ pub fn published_create(arguments: &Value) -> LocalOutcome {
         ),
         is_error: false,
         changed: Some(raw_path.to_string()),
+        body: Some(content.to_string()),
     }
 }
 
@@ -545,6 +556,7 @@ impl LocalOutcome {
             text: message,
             is_error: true,
             changed: None,
+            body: None,
         }
     }
 }
