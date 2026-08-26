@@ -30032,7 +30032,20 @@ mod tests {
     /// that was never built read identically. The two completeness fields are
     /// what separate them, and this asserts both are present and typed, on a
     /// healthy single-repo daemon where the answer is a real zero.
+    ///
+    /// Serialized because the sibling below sets `KIN_REGISTRY_PATH`, which is
+    /// process-global, and `serial_test::serial` only serializes a test against
+    /// OTHER serial tests. That sibling carries the attribute; without it here
+    /// the two run concurrently, the sibling installs its deliberately
+    /// unbindable registry while this test's daemon is opening, and this test
+    /// reads the other one's world: `startup_authority_complete` comes back
+    /// false and the assertion below fails for a reason unrelated to the code
+    /// under test.
+    ///
+    /// It passes alone and fails in company, so a solo run is not a control for
+    /// it. `cargo test -p kin-daemon --lib -- spine_health` is.
     #[tokio::test]
+    #[serial_test::serial]
     async fn spine_health_reports_both_completeness_readings_beside_the_edge_count() {
         let state = test_state();
         let startup_complete = state.startup_authority_complete();
