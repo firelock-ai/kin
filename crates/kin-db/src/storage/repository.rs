@@ -3930,6 +3930,8 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     let current = workspaces.get(&mutation.workspace_id);
     #[cfg(test)]
     let resolutions_before = WORKSPACE_BASE_RESOLUTIONS.with(|count| count.get());
+    #[cfg(test)]
+    let base_changes_before = WORKSPACE_BASE_CHANGES.with(|count| count.get());
 
     // One workspace mutation reached for a resolved base graph four times: for
     // the workspace it starts from, for the overlay it derives against the
@@ -3943,21 +3945,35 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // that leaves the base where it was makes the starting workspace's target
     // that same target again, which is the shape every forced tree admission
     // takes.
+    // Each holder below opens its own span so the heap attribution probe
+    // charges the transient to the structure that caused it rather than to
+    // this whole lap. The lap is the largest single term in a full-history
+    // conversion and which of these produces it was never measured.
     let next_base_change = workspace_base_change_id(metadata, mutation.new_base_target.as_ref())?;
-    let next_base = resolve_workspace_base_graph_snapshot(
-        snapshot,
-        metadata,
-        mutation.new_base_target.as_ref(),
-        None,
-    )?;
+    let next_base = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.next_base").entered();
+        resolve_workspace_base_graph_snapshot(
+            snapshot,
+            metadata,
+            mutation.new_base_target.as_ref(),
+            WorkspaceBaseHistory::Omitted,
+        )?
+    };
 
     let current_base_target = current.and_then(|workspace| workspace.base_target.as_ref());
-    let current_base =
+    let current_base = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.current_base").entered();
         if workspace_base_change_id(metadata, current_base_target)? == next_base_change {
             next_base.clone()
         } else {
-            resolve_workspace_base_graph_snapshot(snapshot, metadata, current_base_target, None)?
-        };
+            resolve_workspace_base_graph_snapshot(
+                snapshot,
+                metadata,
+                current_base_target,
+                WorkspaceBaseHistory::Omitted,
+            )?
+        }
+    };
     let current_graph = match current {
         Some(workspace) => {
             materialize_workspace_graph_snapshot_from_base(current_base, workspace, None)?
@@ -3966,22 +3982,28 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     };
     let mut incremental_delta = mutation.semantic_delta.transaction_delta();
     incremental_delta.tree_deltas = mutation.tree_deltas.clone();
-    let desired_graph = InMemoryGraph::from_snapshot_without_text_index(current_graph)?;
-    desired_graph.apply_transaction_delta(&incremental_delta)?;
-    // The delta is the mutation's own semantic delta plus a copy of its tree
-    // deltas, and the graph has absorbed both. On a conversion that is the
-    // whole published state a second time, held for the rest of a function
-    // that never reads it again.
-    drop(incremental_delta);
     // Only the four compared domains leave this graph, and the export
     // consumes it. Exporting a whole snapshot here copied the entire change
     // map to be read by nobody, because the two steps below consult entities,
     // relations, external references and the resolved tree and no other
     // domain, and it then left the graph itself bound for the rest of a
-    // function whose last reader of it is this line.
-    let desired = desired_graph.into_workspace_graph_facts();
+    // function whose last reader of it is that export.
+    let desired = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.desired_graph").entered();
+        let desired_graph = InMemoryGraph::from_snapshot_without_text_index(current_graph)?;
+        desired_graph.apply_transaction_delta(&incremental_delta)?;
+        // The delta is the mutation's own semantic delta plus a copy of its
+        // tree deltas, and the graph has absorbed both. On a conversion that
+        // is the whole published state a second time, held for the rest of a
+        // function that never reads it again.
+        drop(incremental_delta);
+        desired_graph.into_workspace_graph_facts()
+    };
 
-    let derived_semantic_overlay = derive_workspace_semantic_overlay(&next_base, &desired)?;
+    let derived_semantic_overlay = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.semantic_overlay").entered();
+        derive_workspace_semantic_overlay(&next_base, &desired)?
+    };
     let next = mutation.validate_against(
         &transaction.repository_id,
         current,
@@ -3990,7 +4012,10 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // The successor's own materialization follows immediately and is compared
     // against the desired graph, which subsumes the materialize-and-discard
     // check the validating entry point ends with.
-    validate_workspace_state_without_materialization(replay, snapshot, metadata, &next)?;
+    {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.validate_successor").entered();
+        validate_workspace_state_without_materialization(replay, snapshot, metadata, &next)?;
+    }
     // The successor takes its base target from the mutation, so the base
     // resolved above is the one it materializes over. Reuse is refused rather
     // than assumed: a successor pointing somewhere else must resolve its own
@@ -4004,9 +4029,12 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     // Narrowed at the call for the same reason the desired graph is: the exact
     // comparison below reads four domains, and holding the rest of a
     // whole-history snapshot beside them buys nothing.
-    let rematerialized = WorkspaceGraphFacts::from_snapshot(
-        materialize_workspace_graph_snapshot_from_base(next_base, &next, None)?,
-    );
+    let rematerialized = {
+        let _holder = tracing::info_span!("kindb.prepare.workspace.rematerialize").entered();
+        WorkspaceGraphFacts::from_snapshot(materialize_workspace_graph_snapshot_from_base(
+            next_base, &next, None,
+        )?)
+    };
     validate_exact_workspace_graph(&desired, &rematerialized, &next)?;
     validate_workspace_symbolic_head_at_mutation(metadata, &next)?;
     validate_shared_policy_bodies(
@@ -4026,6 +4054,10 @@ fn apply_workspace<B: StorageBackend + ?Sized>(
     #[cfg(test)]
     WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| {
         count.set(WORKSPACE_BASE_RESOLUTIONS.with(|total| total.get()) - resolutions_before)
+    });
+    #[cfg(test)]
+    WORKSPACE_MUTATION_BASE_CHANGES.with(|count| {
+        count.set(WORKSPACE_BASE_CHANGES.with(|total| total.get()) - base_changes_before)
     });
     Ok(())
 }
@@ -4979,7 +5011,7 @@ fn materialize_workspace_graph_snapshot(
         authority_snapshot,
         metadata,
         workspace.base_target.as_ref(),
-        admitted,
+        WorkspaceBaseHistory::Carried(admitted),
     )?;
     materialize_workspace_graph_snapshot_from_base(base, workspace, admitted)
 }
@@ -5183,13 +5215,65 @@ thread_local! {
     /// runs on its own thread, so a test reads this without another test's
     /// transactions reaching it.
     static WORKSPACE_MUTATION_BASE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Changes carried by every base graph resolved on this thread, summed.
+    ///
+    /// Read only as the endpoints of a span, for the same reason the
+    /// resolution total is.
+    static WORKSPACE_BASE_CHANGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Changes carried by the base graphs the last workspace mutation to
+    /// complete on this thread resolved, summed.
+    ///
+    /// A workspace mutation compares entities, relations, external references
+    /// and the resolved tree, and reaches no change through a base, so this is
+    /// zero. It sums the maps that were actually built rather than flagging
+    /// what was asked for, so it moves both when a call site asks for the
+    /// history back and when the resolver starts carrying it whatever it was
+    /// asked. Each test runs on its own thread, so a test reads this without
+    /// another test's transactions reaching it.
+    static WORKSPACE_MUTATION_BASE_CHANGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether a resolved workspace base carries the repository's change map.
+///
+/// A base is read two ways. A daemon serving a workspace graph queries it, so
+/// it needs every domain the repository has. A workspace mutation compares four
+/// domains, entities, relations, external references and the resolved tree, and
+/// reads no change through its base at all: `derive_workspace_semantic_overlay`
+/// consults three of those four, `WorkspaceGraphFacts` keeps exactly those four,
+/// and `apply_transaction_delta` touches no history domain.
+///
+/// Carrying the map into the second kind costs a whole copy of it per
+/// resolution, and on a full-history conversion the change map IS the
+/// repository. It costs a second time through the graph built over that base,
+/// which derives an entity revision timeline across the entire history because
+/// the derivation is gated on the map being non-empty, and then drops every one
+/// of them at the export that keeps four domains.
+///
+/// Omitting it removes no proof. A base sets `repository_authority` to `None`,
+/// and the envelope is the only part of storage admission that reads the change
+/// map for anything beyond admitting the map itself, so a base's copy re-proves
+/// a map this same preparation admitted at `kindb.prepare.admit` and proves
+/// again over the authority's own map at `kindb.prepare.history_replay`. A
+/// relation endpoint is an entity, artifact, test, contract, work item,
+/// verification run or external reference and never a change, so the endpoint
+/// pass cannot weaken either.
+enum WorkspaceBaseHistory<'a> {
+    /// Carry the change map, with a witness when the caller holds one this
+    /// base's copy can carry instead of repeating.
+    Carried(Option<&'a AdmittedChangeMap<'a>>),
+    /// Leave the change map out. A witness is unrepresentable here on purpose:
+    /// carrying one onto an empty map would satisfy pointer identity while
+    /// attesting nothing.
+    Omitted,
 }
 
 fn resolve_workspace_base_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
     base_target: Option<&RefTarget>,
-    admitted: Option<&AdmittedChangeMap<'_>>,
+    history: WorkspaceBaseHistory<'_>,
 ) -> Result<GraphSnapshot, KinDbError> {
     #[cfg(test)]
     WORKSPACE_BASE_RESOLUTIONS.with(|count| count.set(count.get() + 1));
@@ -5238,8 +5322,14 @@ fn resolve_workspace_base_graph_snapshot(
         relations,
         outgoing: HashMap::new(),
         incoming: HashMap::new(),
-        changes: authority_snapshot.changes.clone(),
-        change_children: authority_snapshot.change_children.clone(),
+        changes: match history {
+            WorkspaceBaseHistory::Carried(_) => authority_snapshot.changes.clone(),
+            WorkspaceBaseHistory::Omitted => HashMap::new(),
+        },
+        change_children: match history {
+            WorkspaceBaseHistory::Carried(_) => authority_snapshot.change_children.clone(),
+            WorkspaceBaseHistory::Omitted => HashMap::new(),
+        },
         work_items: authority_snapshot.work_items.clone(),
         annotations: authority_snapshot.annotations.clone(),
         work_links: authority_snapshot.work_links.clone(),
@@ -5273,13 +5363,16 @@ fn resolve_workspace_base_graph_snapshot(
     rebuild_snapshot_adjacency(&mut base);
     let adjacency_ms = timer.lap_ms();
     // CARRY SITE: `base.changes` is `authority_snapshot.changes.clone()`, made
-    // in the struct literal above, and `admitted` witnesses that same map.
-    match admitted {
-        Some(admitted) => {
+    // in the struct literal above, and `admitted` witnesses that same map. It
+    // is reachable only under `Carried`, where that clone happened.
+    match history {
+        WorkspaceBaseHistory::Carried(Some(admitted)) => {
             let carried = AdmittedChangeMap::carried_from_clone(&base.changes, admitted);
             base.validate_storage_admission_carrying(GitProjectionTreeReplay::Required, &carried)?;
         }
-        None => base.validate_storage_admission()?,
+        WorkspaceBaseHistory::Carried(None) | WorkspaceBaseHistory::Omitted => {
+            base.validate_storage_admission()?
+        }
     }
     let admission_ms = timer.lap_ms();
     tracing::debug!(
@@ -5300,6 +5393,8 @@ fn resolve_workspace_base_graph_snapshot(
             ("admission_ms", admission_ms),
         ],
     );
+    #[cfg(test)]
+    WORKSPACE_BASE_CHANGES.with(|count| count.set(count.get() + base.changes.len()));
     Ok(base)
 }
 
@@ -15176,6 +15271,20 @@ mod tests {
         )
     }
 
+    /// Bases resolved by one workspace mutation, and the changes they carried.
+    fn mutation_base_resolutions_and_changes_during<T>(
+        work: impl FnOnce() -> T,
+    ) -> (T, usize, usize) {
+        WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| count.set(0));
+        WORKSPACE_MUTATION_BASE_CHANGES.with(|count| count.set(0));
+        let value = work();
+        (
+            value,
+            WORKSPACE_MUTATION_BASE_RESOLUTIONS.with(|count| count.get()),
+            WORKSPACE_MUTATION_BASE_CHANGES.with(|count| count.get()),
+        )
+    }
+
     /// One workspace overlay staged on top of the synthetic head, leaving the
     /// base where it is.
     fn overlay_transaction_at_unchanged_base(
@@ -15230,6 +15339,79 @@ mod tests {
             advanced_resolutions, 2,
             "a mutation that advances its base names two distinct base graphs and must \
              resolve both, never fewer"
+        );
+    }
+
+    /// A workspace mutation compares four domains and reads no change through
+    /// the bases it compares over, so the bases it resolves carry no change
+    /// map. On a full-history conversion that map IS the repository, and each
+    /// base carrying one was a whole extra copy of it live at the point where
+    /// the preparation reaches its peak.
+    ///
+    /// This counts the changes the resolutions actually built rather than the
+    /// mode they were asked for, so it goes red three separate ways: a call
+    /// site asking for the history back, either one of them independently, and
+    /// a resolver that starts carrying the map whatever it was asked. The
+    /// peak-ratio guard in `tests/workspace_prepare_memory.rs` cannot do that
+    /// job: on its fixture one of the two copies fits entirely under a mark
+    /// another term has already set, so restoring that copy alone moves the
+    /// ratio by nothing at all.
+    ///
+    /// The resolution counts are asserted beside the change counts because zero
+    /// changes across zero resolutions is what a mutation that stopped resolving
+    /// anything would also report, and that is a different bug wearing this
+    /// one's passing costume. Those two lines are defensive rather than proven,
+    /// and that is worth saying rather than leaving someone to assume otherwise.
+    /// Every mutation tried against them, forcing one base to serve for two and
+    /// returning from `apply_workspace` before it resolves anything, is refused
+    /// by the product at the fixture's own bootstrap commit, so the test fails
+    /// on that `unwrap` and never reaches its own assertions. The change counts
+    /// below are the part of this test that has been shown to fail on demand.
+    #[test]
+    fn a_workspace_mutation_resolves_no_base_carrying_the_history() {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let history_changes = {
+            let lease = store.manager.read_authority();
+            let count = lease.snapshot().changes.len();
+            drop(lease);
+            count
+        };
+        assert!(
+            history_changes > 1,
+            "the fixture must carry a history worth not copying, got {history_changes} changes"
+        );
+
+        let unchanged_base = overlay_transaction_at_unchanged_base(&store, 0xf2_6510_0001, 0);
+        let (receipt, resolutions, base_changes) =
+            mutation_base_resolutions_and_changes_during(|| {
+                store
+                    .manager
+                    .commit_repository_transaction(unchanged_base)
+                    .unwrap()
+            });
+        receipt.validate().unwrap();
+        assert_eq!(
+            resolutions, 1,
+            "a mutation that leaves its base where it was resolves one base"
+        );
+        assert_eq!(
+            base_changes, 0,
+            "the base this mutation resolved carried {base_changes} changes out of the              repository's {history_changes}, which a workspace comparison never reads"
+        );
+
+        let advanced = advance_synthetic_base(&store);
+        let (advanced_receipt, advanced_resolutions, advanced_base_changes) =
+            mutation_base_resolutions_and_changes_during(|| {
+                store.manager.commit_repository_transaction(advanced)
+            });
+        advanced_receipt.unwrap().validate().unwrap();
+        assert_eq!(
+            advanced_resolutions, 2,
+            "a mutation that advances its base resolves two"
+        );
+        assert_eq!(
+            advanced_base_changes, 0,
+            "the two bases this mutation resolved carried {advanced_base_changes} changes              between them out of the repository's {history_changes}"
         );
     }
 
@@ -17715,7 +17897,7 @@ mod fir2334_attribution {
             snapshot,
             metadata,
             workspace.base_target.as_ref(),
-            None,
+            WorkspaceBaseHistory::Carried(None),
         )
         .expect("resolve workspace base");
         println!(

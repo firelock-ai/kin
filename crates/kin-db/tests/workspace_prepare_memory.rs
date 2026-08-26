@@ -229,11 +229,29 @@ fn history_chain(
     chain
 }
 
+/// What one bootstrap arm cost and what it actually published.
+///
+/// The cost alone is not enough to judge. The guard below charges a difference
+/// between two arms, so an arm whose workspace mutation quietly did nothing
+/// makes that difference small and the guard pass. The published counts are
+/// here so the ratio can refuse to be read until each arm is shown to have
+/// done the thing it is named for.
+struct BootstrapArm {
+    /// Peak live heap the commit itself added, in bytes.
+    peak_growth: usize,
+    /// Workspaces the committed authority carries.
+    workspaces: usize,
+    /// Artifacts in the first workspace's tree, zero when there is none.
+    workspace_artifacts: usize,
+}
+
 /// Commit one whole-history bootstrap and report the peak live heap it reached.
 ///
 /// The store, the blobs and the transaction are all built before the peak is
-/// armed, so the number is the commit's own growth and not the fixture's.
-fn peak_growth_of_one_bootstrap(with_workspace: bool) -> usize {
+/// armed, so the number is the commit's own growth and not the fixture's. The
+/// authority is read back after the growth is captured, so reading it cannot
+/// move the number it is reported beside.
+fn peak_growth_of_one_bootstrap(with_workspace: bool) -> BootstrapArm {
     let directory = tempfile::tempdir().expect("tempdir");
     let backend = Arc::new(LocalFileBackend::new(directory.path()));
     let repository = RepositoryId::new("fir2648-measurement").expect("repository id");
@@ -325,9 +343,21 @@ fn peak_growth_of_one_bootstrap(with_workspace: bool) -> usize {
     );
     let growth = peak_growth_since(floor);
 
+    let lease = manager.read_authority();
+    let published = &lease.metadata().workspaces;
+    let arm = BootstrapArm {
+        peak_growth: growth,
+        workspaces: published.len(),
+        workspace_artifacts: published
+            .first()
+            .map(|workspace| workspace.tree.artifacts().count())
+            .unwrap_or(0),
+    };
+    drop(lease);
+
     drop(manager);
     drop(directory);
-    growth
+    arm
 }
 
 // --- the guard ------------------------------------------------------------
@@ -337,17 +367,25 @@ fn peak_growth_of_one_bootstrap(with_workspace: bool) -> usize {
 ///
 /// Set from measurement on this fixture, not from taste. Release, this
 /// fixture, one copy of the history at 2,833,178 bytes: the shape that carried
-/// whole snapshots for four-domain comparisons measured 8.81 copies, and the
-/// shape that replaced it measures 4.56. A ceiling of 6.0 fails the first and
-/// passes the second, with room on both sides for a different allocator and a
-/// different host, since the number is a ratio of two live-heap readings taken
-/// in the same process.
+/// whole snapshots for four-domain comparisons measured 8.81 copies, the shape
+/// that replaced it measured 4.56 and had drifted to 4.07, and the shape that
+/// stops a comparison base carrying the change map measures 3.67. A ceiling of
+/// 3.9 fails the 4.07 and passes the 3.67, and the readings it separates jitter
+/// by about half a percent across runs, because the number is a ratio of two
+/// live-heap readings taken in the same process.
 ///
-/// The remaining 4.56 is not slack: `apply_workspace` still resolves two base
-/// graphs that each carry a copy of the authority's change map, and the shared
-/// replay decode is forced while the second of them is alive. Lowering this
-/// ceiling is the way to record that when it is fixed.
-const WORKSPACE_PEAK_HISTORY_COPIES: f64 = 6.0;
+/// What this ceiling does NOT price is the second of the two copies, and that
+/// is worth writing down rather than leaving for someone to rediscover.
+/// Restoring the `next_base` copy alone takes the ratio to 4.07 and this fails.
+/// Restoring the `current_base` copy alone leaves it at 3.67 and this passes,
+/// because on a 300-commit fixture that copy fits entirely under a high-water
+/// mark another term has already set. Peak growth is measured against a running
+/// mark and overlapping terms are not additive, so a ratio cannot see a term
+/// that never reaches the top. The per-holder job belongs to
+/// `a_workspace_mutation_resolves_no_base_carrying_the_history`, which counts
+/// the changes each resolved base actually carried and goes red for either
+/// copy on its own.
+const WORKSPACE_PEAK_HISTORY_COPIES: f64 = 3.9;
 
 /// A workspace mutation must not hold the repository's whole change map more
 /// than about twice while it prepares a successor.
@@ -372,14 +410,42 @@ fn a_workspace_mutation_does_not_hold_the_whole_history_four_times() {
 
     let without_workspace = peak_growth_of_one_bootstrap(false);
     let with_workspace = peak_growth_of_one_bootstrap(true);
-    let workspace_cost = with_workspace.saturating_sub(without_workspace);
+
+    // The ratio below is a difference between two arms taken through
+    // `saturating_sub`, so an arm that skipped its workspace mutation reads
+    // 0.00 copies and passes. That is a check that cannot fail. Each arm has
+    // to show what it published before the difference is allowed to mean
+    // anything, and the evidence is the committed authority rather than the
+    // transaction that was handed in.
+    assert_eq!(
+        without_workspace.workspaces, 0,
+        "the arm without a workspace mutation published {} workspaces",
+        without_workspace.workspaces
+    );
+    assert_eq!(
+        with_workspace.workspaces, 1,
+        "the arm with a workspace mutation published {} workspaces, so the difference below \
+         would charge the mutation for work it never did",
+        with_workspace.workspaces
+    );
+    assert_eq!(
+        with_workspace.workspace_artifacts, FILES,
+        "the published workspace carries {} artifacts rather than the {FILES} the fixture \
+         commits, so its mutation did not do what this guard prices",
+        with_workspace.workspace_artifacts
+    );
+
+    let workspace_cost = with_workspace
+        .peak_growth
+        .saturating_sub(without_workspace.peak_growth);
     let copies = workspace_cost as f64 / history_bytes as f64;
 
     println!(
         "one history copy: {history_bytes} bytes\n\
-         bootstrap peak growth without a workspace mutation: {without_workspace} bytes\n\
-         bootstrap peak growth with a workspace mutation:    {with_workspace} bytes\n\
-         charged to the workspace mutation: {workspace_cost} bytes, {copies:.2} copies of the history"
+         bootstrap peak growth without a workspace mutation: {} bytes\n\
+         bootstrap peak growth with a workspace mutation:    {} bytes\n\
+         charged to the workspace mutation: {workspace_cost} bytes, {copies:.2} copies of the history",
+        without_workspace.peak_growth, with_workspace.peak_growth
     );
 
     assert!(
