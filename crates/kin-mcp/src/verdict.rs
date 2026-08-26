@@ -1961,6 +1961,7 @@ mod tests {
     /// answer on every machine a lower bound.
     #[test]
     fn the_ordinary_states_of_a_healthy_install_limit_nothing() {
+        let mut broken: Vec<String> = Vec::new();
         for (case, cross_repo) in [
             (
                 "no spine configured",
@@ -1996,22 +1997,30 @@ mod tests {
             .expect("a retrieval payload carries a verdict")
             .to_value();
 
-            assert_eq!(
-                verdict["state"],
-                json!(CERTIFIED),
-                "{case} is a fact about the install, not a limit on the answer: {verdict}"
-            );
-            assert_eq!(
-                verdict["limiting_factor"],
-                Value::Null,
-                "{case} must contribute no clause: {verdict}"
-            );
-            assert_eq!(
-                verdict["inputs"]["cross_repo"],
-                json!(NOT_APPLICABLE),
-                "{case} must read silent rather than certifying: {verdict}"
-            );
+            // Collected rather than asserted in place. A bare assert aborts the
+            // loop on the first case, so a break confined to a later one is
+            // invisible behind an earlier one failing first, and the mutation
+            // written for it reads as covered while proving nothing.
+            if verdict["state"] != json!(CERTIFIED) {
+                broken.push(format!(
+                    "{case} is a fact about the install, not a limit on the answer: {verdict}"
+                ));
+            }
+            if verdict["limiting_factor"] != Value::Null {
+                broken.push(format!("{case} must contribute no clause: {verdict}"));
+            }
+            if verdict["inputs"]["cross_repo"] != json!(NOT_APPLICABLE) {
+                broken.push(format!(
+                    "{case} must read silent rather than certifying: {verdict}"
+                ));
+            }
         }
+        assert!(
+            broken.is_empty(),
+            "{} of the ordinary install states limited an answer:\n{}",
+            broken.len(),
+            broken.join("\n")
+        );
     }
 
     /// A complete spine certifies rather than staying silent, so the input
