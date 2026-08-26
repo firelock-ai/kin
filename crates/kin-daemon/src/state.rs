@@ -1329,6 +1329,22 @@ pub struct DaemonState {
     /// each; it costs no lock the embed path needs and no work proportional to
     /// the graph, which is the constraint FIR-2416 put on this surface.
     pub(crate) graph_status_settled: crate::api::GraphStatusSettledCache,
+    /// Consecutive `kin_graph_status` calls that could not complete a live
+    /// sample of the selected graph, reset by the first one that does.
+    ///
+    /// FIR-2136. A daemon can enter a state where the tool that exists to
+    /// report ill health is the one that stops answering, and before this the
+    /// health surface could not see it: a daemon serving nothing but stale
+    /// replays for hours reported `status: "ok"`.
+    ///
+    /// Consecutive, rather than a lifetime total or the age of the last settled
+    /// reading, because only a consecutive count reset on success separates the
+    /// three states that matter. A daemon nobody has asked reads zero, which is
+    /// the same as a daemon whose samples all succeed, and both are healthy. A
+    /// lifetime total cannot tell a store that recovered from one that never
+    /// did, and an age-of-last-settled cannot tell a wedged daemon from one no
+    /// caller has ever queried, since neither holds a settled reading.
+    pub graph_status_live_sample_failures: AtomicU64,
     /// Serializes derived-index and hosted snapshot persistence so the
     /// persistence loop, idle-shutdown flush, and embedding worker can never
     /// interleave writes. Local repository-v6 authority is committed before
@@ -1793,6 +1809,33 @@ impl DaemonState {
             .saturating_add(1);
         self.coordination_events.persist_failure_count(count);
         warn!(reason = %reason, "coordination evidence is incomplete; stream is not claim-eligible");
+    }
+
+    /// Record that a status call completed a live sample, clearing any streak.
+    ///
+    /// Called at the one site that records a settled reading, so the reset and
+    /// the success are the same event and cannot drift apart.
+    pub(crate) fn graph_status_live_sample_settled(&self) {
+        self.graph_status_live_sample_failures
+            .store(0, Ordering::Relaxed);
+    }
+
+    /// Record that a status call gave up on a live sample, and return the
+    /// streak length including this one.
+    pub(crate) fn graph_status_live_sample_abandoned(&self) -> u64 {
+        self.graph_status_live_sample_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// Whether this daemon can still answer a live question about itself.
+    ///
+    /// False once the streak crosses the bound, which is what puts the repo
+    /// health surface into `attention` while the condition lasts.
+    pub fn graph_status_is_answerable(&self) -> bool {
+        self.graph_status_live_sample_failures
+            .load(Ordering::Relaxed)
+            < crate::api::GRAPH_STATUS_UNANSWERABLE_STREAK
     }
 
     /// Load a persisted vector-index sidecar into a graph that was NOT built
@@ -2595,6 +2638,7 @@ impl DaemonState {
             embedding_work: Mutex::new(()),
             embed_batch_size: AtomicUsize::new(0),
             graph_status_settled: crate::api::GraphStatusSettledCache::default(),
+            graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
@@ -2848,6 +2892,7 @@ impl DaemonState {
             embedding_work: Mutex::new(()),
             embed_batch_size: AtomicUsize::new(0),
             graph_status_settled: crate::api::GraphStatusSettledCache::default(),
+            graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),

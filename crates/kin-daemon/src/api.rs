@@ -795,6 +795,16 @@ pub struct HealthResponse {
     /// admits nothing. These are the outcomes.
     #[serde(default)]
     pub reconcile: kin_cli::commands::resources::ReconcileHealth,
+    /// Consecutive `kin_graph_status` calls that could not sample this daemon
+    /// live, reset by the first that does. Past
+    /// [`GRAPH_STATUS_UNANSWERABLE_STREAK`] it drives `status: "attention"`.
+    ///
+    /// FIR-2136: a daemon can stop being able to answer a live question about
+    /// itself while every other term here stays healthy, and the surface that
+    /// exists to report ill health was the one that could not see it. Additive
+    /// and defaulted, so a client on either side of this change still parses.
+    #[serde(default)]
+    pub status_live_sample_failures: u64,
     pub build: BuildResponse,
 }
 
@@ -1024,6 +1034,21 @@ pub struct RepoHealthResponse {
     /// refresh then failed; absent means they match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_views_stale: Option<String>,
+    /// Consecutive status calls that could not sample this repo's graph live.
+    /// FIR-2136; the same tally `/health` grades, carried here because this is
+    /// the repo-scoped surface the ticket names.
+    #[serde(default)]
+    pub status_live_sample_failures: u64,
+    /// Whether this daemon can still answer a live question about itself.
+    /// False is the wedged reading, and it is the one a supervisor acts on.
+    #[serde(default = "default_true")]
+    pub status_answerable: bool,
+}
+
+/// Serde default for a boolean whose healthy value is `true`, so a payload from
+/// a daemon that predates the field does not read as the unhealthy case.
+fn default_true() -> bool {
+    true
 }
 
 /// Repo entities search response.
@@ -2049,6 +2074,28 @@ const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
 /// so a backoff there would buy the writer no time and cost the caller 100 ms.
 const GRAPH_STATUS_ATTEMPT_BACKOFF: Duration = Duration::from_millis(25);
 
+/// How many consecutive status calls must fail to sample live before this
+/// daemon reports itself unable to answer a live question about itself.
+///
+/// FIR-2136. A judgement rather than a measurement, so it is written here where
+/// a reader can find and argue with it, the way the derived memory budget's
+/// ceiling is.
+///
+/// One failed CALL already means three revalidations were lost inside it,
+/// across 75 ms of backoff, so five consecutive means fifteen lost across five
+/// separate asks. A store mid-embed can lose a few: the embedding fence is held
+/// for the length of a batch and a caller polling through one legitimately gets
+/// replays. A store that has lost fifteen in a row is not merely busy. The
+/// wedge this exists to catch failed eleven consecutive calls over hours.
+///
+/// Duration was considered as the second axis and deliberately left out. It
+/// would separate a long embed from a wedge more sharply, but the streak is
+/// already driven by how often a caller asks rather than by a poll, since
+/// `kin_graph_status` is a user and agent tool and `/health` is what supervisors
+/// poll. Adding a clock here would buy specificity this signal does not need
+/// and cost every test a time source.
+pub(crate) const GRAPH_STATUS_UNANSWERABLE_STREAK: u64 = 5;
+
 /// The last settled `kin_graph_status` observation of one selected graph.
 ///
 /// The graph is held as a [`std::sync::Weak`] for two reasons: a temporal
@@ -2236,12 +2283,32 @@ async fn mcp_graph_status_with_stable_authority(
         state
             .graph_status_settled
             .record(scope, selected_graph, observation);
+        // Same event as the record above, deliberately at the same site: a
+        // reading that survived revalidation IS this daemon answering a live
+        // question about itself, so the streak clears exactly when that is true
+        // and never on a replay that merely looked like an answer.
+        state.graph_status_live_sample_settled();
         return kin_mcp::handlers::entities::handle_daemon_graph_status_observation(
             scope,
             observation,
         );
     }
 
+    // Reaching here is the failure, whichever of the two answers follows. Both
+    // the no-settled-reading error below and the stale replay after it are a
+    // call that could not sample this daemon live, so the streak advances once
+    // here rather than twice in two arms that could drift apart.
+    let streak = state.graph_status_live_sample_abandoned();
+    if streak == GRAPH_STATUS_UNANSWERABLE_STREAK {
+        // Once, on the crossing, rather than on every call past it. A daemon in
+        // this state is asked repeatedly and a line per call would bury the
+        // transition that matters.
+        tracing::warn!(
+            streak,
+            "this daemon has not completed a live status sample in {streak} consecutive \
+             calls; its repo health surface reports attention until one succeeds"
+        );
+    }
     let attempts = u32::try_from(GRAPH_STATUS_STABLE_READ_ATTEMPTS).unwrap_or(u32::MAX);
     let observed_authority_epoch = state.stable_graph_authority_epoch();
     let Some((observation, age)) = state.graph_status_settled.get(scope, selected_graph) else {
@@ -3098,6 +3165,16 @@ async fn health(
     let background_pass_stopped = state.background_work.any_stopped();
     let reconcile = state.background_work.reconcile_report(sampled_at);
     let reconcile_degraded = reconcile.degraded();
+    // FIR-2136. The term that was missing entirely: whether this daemon can
+    // still answer a live question about itself. Every other term here reports
+    // some subsystem's outcome, and a daemon can be healthy by all of them
+    // while the tool that exists to report ill health has stopped answering.
+    // The wedge that produced this failed eleven consecutive status calls over
+    // hours and reported `ok` throughout.
+    let status_live_sample_failures = state
+        .graph_status_live_sample_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let status_unanswerable = !state.graph_status_is_answerable();
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
@@ -3128,6 +3205,7 @@ async fn health(
         || coordination_event_persist_failures > 0
         || background_pass_stopped
         || reconcile_degraded
+        || status_unanswerable
     {
         "attention"
     } else {
@@ -3178,6 +3256,7 @@ async fn health(
         daemon_cpu_seconds: state.background_work.daemon_cpu_seconds(),
         background_passes,
         reconcile,
+        status_live_sample_failures,
         build: current_build_response(),
     }))
 }
@@ -10815,6 +10894,10 @@ async fn repo_health(
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
         derived_views_stale: state.derived_views_stale.read().await.clone(),
+        status_live_sample_failures: state
+            .graph_status_live_sample_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        status_answerable: state.graph_status_is_answerable(),
     }))
 }
 
@@ -25701,6 +25784,115 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    /// FIR-2136: a daemon that can no longer answer a live question about
+    /// itself says so on the surface supervisors poll.
+    ///
+    /// The wedge that produced this ticket failed every status call for hours
+    /// while `/health` reported `ok` throughout, because health graded eight
+    /// subsystem outcomes and none of them was "can I still answer". The cure
+    /// was a restart nobody knew to perform.
+    ///
+    /// Three arms, and the first is the one that decides the SHAPE of the
+    /// signal rather than merely testing it. A daemon nobody has queried holds
+    /// no settled reading, exactly like a wedged one, so an age-of-last-settled
+    /// probe cannot tell them apart and would report every idle daemon as sick.
+    /// A lifetime failure total cannot tell a store that recovered from one
+    /// that never did. Only a consecutive count reset on success separates all
+    /// three, which is why the counter has that shape and why arm one is not
+    /// decoration.
+    ///
+    /// Every arm reports independently rather than aborting at the first, so a
+    /// falsification grid cannot read a row as green that was never reached.
+    #[tokio::test]
+    async fn a_daemon_that_cannot_sample_itself_live_reports_attention() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        state
+            .graph
+            .upsert_entity(&test_entity("handler", "src/lib.py"))
+            .unwrap();
+
+        let mut failed: Vec<String> = Vec::new();
+        let mut check = |ok: bool, arm: &str, why: String| {
+            if !ok {
+                failed.push(format!("[{arm}] {why}"));
+            }
+        };
+
+        // Arm 1. Nobody has asked. Healthy, and it must stay healthy.
+        let quiet = health_json(Arc::clone(&state)).await;
+        check(
+            quiet.status == "ok",
+            "nobody-asked-is-ok",
+            format!(
+                "a daemon nobody has queried is not wedged: {}",
+                quiet.status
+            ),
+        );
+        check(
+            quiet.status_live_sample_failures == 0,
+            "nobody-asked-counts-zero",
+            format!(
+                "no call, no failures: {}",
+                quiet.status_live_sample_failures
+            ),
+        );
+
+        // Arm 2. Asked, and every call loses its live sample. Holding the
+        // embedding fence is what a real embed pass does to this path.
+        {
+            let _wedge = state
+                .embedding_work
+                .lock()
+                .expect("the fixture takes the embedding fence");
+            for _ in 0..GRAPH_STATUS_UNANSWERABLE_STREAK {
+                let _ = head_graph_status(&state, &graph).await;
+            }
+            let wedged = health_json(Arc::clone(&state)).await;
+            check(
+                wedged.status == "attention",
+                "wedged-is-attention",
+                format!(
+                    "{GRAPH_STATUS_UNANSWERABLE_STREAK} consecutive failed live samples must \
+                     reach the surface: status={} failures={}",
+                    wedged.status, wedged.status_live_sample_failures
+                ),
+            );
+            check(
+                wedged.status_live_sample_failures >= GRAPH_STATUS_UNANSWERABLE_STREAK,
+                "wedged-counts-the-streak",
+                format!(
+                    "the streak is what the verdict rests on: {}",
+                    wedged.status_live_sample_failures
+                ),
+            );
+        }
+
+        // Arm 3. The fence is released and one call samples live again. The
+        // reset lives at the record site, so recovery is the same event as the
+        // reading that proves it.
+        let _ = head_graph_status(&state, &graph).await;
+        let recovered = health_json(Arc::clone(&state)).await;
+        check(
+            recovered.status == "ok",
+            "recovery-clears-attention",
+            format!(
+                "one successful live sample ends the condition: {}",
+                recovered.status
+            ),
+        );
+        check(
+            recovered.status_live_sample_failures == 0,
+            "recovery-clears-the-streak",
+            format!(
+                "a streak that survived its own recovery would wedge forever: {}",
+                recovered.status_live_sample_failures
+            ),
+        );
+
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
     }
 
     fn parse_graph_status(
