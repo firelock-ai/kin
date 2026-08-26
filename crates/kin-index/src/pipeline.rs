@@ -868,7 +868,23 @@ mod tests {
         let result = pipeline.index_file(&ts_file, &blob_store).unwrap();
         assert_eq!(result.language, LanguageId::TypeScript);
         assert!(!result.entities.is_empty());
-        assert_eq!(result.entities[0].name, "hello");
+        // By kind and name, the way `index_python_file` below already does it.
+        // Since FIR-2675 every TypeScript file carries a Module entity and it is
+        // emitted first, so `entities[0]` is the module: this assertion read
+        // "test" for the file stem rather than the function it names.
+        assert!(
+            result
+                .entities
+                .iter()
+                .any(|entity| entity.kind == kin_model::EntityKind::Function
+                    && entity.name == "hello"),
+            "expected the exported function, got {:?}",
+            result
+                .entities
+                .iter()
+                .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
         assert!(matches!(result.parse_state, ParseState::Valid));
     }
 

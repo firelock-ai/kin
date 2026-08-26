@@ -51,21 +51,28 @@ impl LanguageAdapter for JavaScriptAdapter {
         let root = tree.root_node();
         let mut cursor = root.walk();
 
-        // Emit Module entity for index.js/index.jsx files (JS packages).
-        // This makes the module searchable by its directory name, e.g.,
-        // `src/plugin/customParseFormat/index.js` → entity "customParseFormat".
-        if is_js_index_file(&file_id.0) {
-            if let Some(module_name) = extract_module_name_from_path(&file_id.0) {
-                entities.push(ExtractedEntity {
-                    kind: EntityKind::Module,
-                    name: module_name,
-                    signature: format!("module {}", file_id.0),
-                    visibility: Visibility::Public,
-                    doc_summary: None,
-                    fingerprint: compute_fingerprint(&root, source),
-                    span: span_from_node(&root, file_id),
-                });
-            }
+        // Emit a Module entity for every JavaScript source file, as Python does.
+        // Previously only index files produced one, and only when their directory
+        // was not `src` or `lib`, so one of the 58 JS/TS files kin itself tracks
+        // carried a module entity. A file with no module entity cannot SOURCE an
+        // entity-level import edge, because the linker anchors those on the
+        // importing file's module, so every import in every other file stayed
+        // invisible to `find_references`.
+        let (module_name, is_package) = js_module_identity(&file_id.0, JS_SUFFIXES);
+        if !module_name.is_empty() {
+            entities.push(ExtractedEntity {
+                kind: EntityKind::Module,
+                name: module_name,
+                signature: if is_package {
+                    format!("package {}", file_id.0)
+                } else {
+                    format!("module {}", file_id.0)
+                },
+                visibility: Visibility::Public,
+                doc_summary: None,
+                fingerprint: compute_fingerprint(&root, source),
+                span: span_from_node(&root, file_id),
+            });
         }
 
         // Read the file's property-defining helpers before walking it.
@@ -1926,32 +1933,83 @@ fn extract_js_tests_from_node(
 }
 
 /// Check if a file is a JS index file (index.js, index.jsx, index.mjs, index.cjs).
-fn is_js_index_file(path: &str) -> bool {
-    let basename = path.rsplit('/').next().unwrap_or(path);
-    matches!(
-        basename,
-        "index.js" | "index.jsx" | "index.mjs" | "index.cjs"
-    )
-}
+/// The JavaScript file suffixes, longest first.
+///
+/// Order is load-bearing in `js_module_identity`, which strips the first suffix
+/// that matches. None of these is a suffix of another today, so the order costs
+/// nothing and stops a later addition from silently shadowing an existing one.
+pub(super) const JS_SUFFIXES: &[&str] = &[".jsx", ".mjs", ".cjs", ".js"];
 
-/// Extract the module name from a file path for index files.
-/// `src/plugin/customParseFormat/index.js` → `"customParseFormat"`
-/// `themes/index.js` → `"themes"`
-fn extract_module_name_from_path(path: &str) -> Option<String> {
-    let without_basename = path.rsplit_once('/')?.0;
-    let dir_name = without_basename
-        .rsplit('/')
-        .next()
-        .unwrap_or(without_basename);
-    if dir_name.is_empty() || dir_name == "src" || dir_name == "lib" {
-        return None;
+/// The TypeScript file suffixes, longest first.
+///
+/// `.d.ts` leads because it must: `foo.d.ts` stripped of `.ts` is `foo.d`, a
+/// name no source ever writes. The old `is_ts_index_file` never matched
+/// `index.d.ts` at all, which is the drift the shared helper exists to stop.
+pub(super) const TS_SUFFIXES: &[&str] = &[".d.ts", ".tsx", ".ts"];
+
+/// The module identity of a JavaScript or TypeScript source file: its name, and
+/// whether the file is a package index.
+///
+/// This mirrors `python_module_identity` deliberately, including the guard that
+/// decides nothing. Python emits a Module for every source file, names an
+/// ordinary module after its own stem and a package's `__init__.py` after the
+/// directory it marks, and carries no directory blocklist. An index file is the
+/// JS/TS `__init__.py`: `require('./customParseFormat')` names the directory, so
+/// the index takes the directory's name and every other file takes its own stem.
+///
+/// The empty return IS the guard, and it is the reason to mirror Python rather
+/// than invent a rule. A path carrying none of the language's suffixes yields an
+/// empty name and the caller emits nothing for it, which is what keeps an
+/// extension-less `FilePathId` from producing a whole-file module entity that
+/// would swallow every other entity in a round-trip region.
+///
+/// The old helper refused the directory names `src` and `lib` outright, which
+/// landed on exactly the directories a real library keeps its code in: express's
+/// own `lib/` was unreachable twice over, once for not being an index file and
+/// once for the directory name. Python has no such blocklist and neither does
+/// this. `lib/index.js` is named `lib`, because `require('./lib')` is what the
+/// source calls it.
+pub(super) fn js_module_identity(path: &str, suffixes: &[&str]) -> (String, bool) {
+    let basename = path.rsplit('/').next().unwrap_or(path);
+    let Some(stem) = suffixes
+        .iter()
+        .find_map(|suffix| basename.strip_suffix(suffix))
+    else {
+        return (String::new(), false);
+    };
+    if stem == "index" {
+        let directory = match path.rsplit_once('/') {
+            Some((head, _)) => head.rsplit('/').next().unwrap_or(head),
+            // A root-level `index.js` has no directory to be named after, so it
+            // has no identity, exactly as it had none before this change.
+            None => "",
+        };
+        return (directory.to_string(), true);
     }
-    Some(dir_name.to_string())
+    (stem.to_string(), false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every entity except the file's own Module.
+    ///
+    /// Every JS/TS file now carries a Module entity, as every Python file has
+    /// since `python.rs:301`. A test whose subject is a class binding or an
+    /// export rule is not about that module, and asserting the whole list would
+    /// make every such test carry it. This drops exactly the file's own module
+    /// and nothing else, so an unexpected extra entity still fails the assertion
+    /// it was written for. The module entity has its own tests.
+    fn entities_besides_the_files_own_module(
+        entities: &[ExtractedEntity],
+    ) -> Vec<(EntityKind, &str)> {
+        entities
+            .iter()
+            .filter(|e| e.kind != EntityKind::Module)
+            .map(|e| (e.kind, e.name.as_str()))
+            .collect()
+    }
 
     #[test]
     fn parse_javascript_function() {
@@ -2121,11 +2179,7 @@ mod tests {
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
 
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert!(
             named.contains(&(EntityKind::Class, "View")),
             "a constructor carrying prototype methods is class-like, got {named:?}"
@@ -2213,7 +2267,7 @@ exports.static = require('serve-static');
         let output = adapter.extract(&tree, source, &file_id).unwrap();
 
         assert!(
-            output.entities.is_empty(),
+            entities_besides_the_files_own_module(&output.entities).is_empty(),
             "require bindings must not produce entities, got {:?}",
             output
                 .entities
@@ -2263,13 +2317,18 @@ exports.static = require('serve-static');
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert_eq!(named, vec![(EntityKind::Constant, "Router")]);
-        assert_eq!(output.entities[0].visibility, Visibility::Public);
+        // By name, for the same reason as the call-result test below.
+        assert_eq!(
+            output
+                .entities
+                .iter()
+                .find(|e| e.name == "Router")
+                .expect("the exported constant")
+                .visibility,
+            Visibility::Public
+        );
     }
 
     #[test]
@@ -2281,17 +2340,22 @@ exports.static = require('serve-static');
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let named: Vec<(EntityKind, &str)> = output
+        let named = entities_besides_the_files_own_module(&output.entities);
+        assert_eq!(named, vec![(EntityKind::Constant, "etag")]);
+        // Looked up by name, not by index. The file's own module entity is
+        // emitted first now, so `entities[0]` is the module: the visibility
+        // assertion below would have kept passing against it, because a module
+        // is Public too, while no longer testing the constant it names.
+        let etag = output
             .entities
             .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
-        assert_eq!(named, vec![(EntityKind::Constant, "etag")]);
-        assert_eq!(output.entities[0].visibility, Visibility::Public);
+            .find(|e| e.name == "etag")
+            .expect("the exported constant");
+        assert_eq!(etag.visibility, Visibility::Public);
         assert!(
-            output.entities[0].signature.contains("createETagGenerator"),
+            etag.signature.contains("createETagGenerator"),
             "the assignment is the body of a call-result export, got {:?}",
-            output.entities[0].signature
+            etag.signature
         );
         let calls: Vec<(&str, &str)> = output
             .relations
@@ -2311,11 +2375,7 @@ exports.static = require('serve-static');
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert_eq!(named, vec![(EntityKind::Constant, "wetag")]);
     }
 
@@ -2326,11 +2386,7 @@ exports.static = require('serve-static');
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert_eq!(named, vec![(EntityKind::Class, "Router")]);
     }
 
@@ -2346,7 +2402,7 @@ exports.static = require('serve-static');
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
         assert!(
-            output.entities.is_empty(),
+            entities_besides_the_files_own_module(&output.entities).is_empty(),
             "a require re-export is a dependency line, got {:?}",
             output
                 .entities
@@ -2379,7 +2435,7 @@ exports.static = require('serve-static');
             let file_id = FilePathId::new("test.js");
             let output = adapter.extract(&tree, source, &file_id).unwrap();
             assert!(
-                output.entities.is_empty(),
+                entities_besides_the_files_own_module(&output.entities).is_empty(),
                 "{:?} is not an exported property, got {:?}",
                 std::str::from_utf8(source).unwrap(),
                 output
@@ -2530,11 +2586,7 @@ exports.static = require('serve-static');
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
 
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert_eq!(
             named,
             vec![
@@ -2717,11 +2769,7 @@ exports.static = require('serve-static');
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        let named: Vec<(EntityKind, &str)> = output
-            .entities
-            .iter()
-            .map(|e| (e.kind, e.name.as_str()))
-            .collect();
+        let named = entities_besides_the_files_own_module(&output.entities);
         assert_eq!(
             named,
             vec![
@@ -2810,6 +2858,9 @@ exports.static = require('serve-static');
         let file_id = FilePathId::new("lib/router/index.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
 
+        // The full list on purpose. This test's subject IS the module entity,
+        // so the helper that drops modules would strip exactly what is being
+        // asserted and the test would pass while measuring nothing.
         let named: Vec<(EntityKind, &str)> = output
             .entities
             .iter()
