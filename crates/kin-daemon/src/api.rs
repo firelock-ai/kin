@@ -30106,6 +30106,34 @@ mod tests {
             contended_body["degradations"]
         );
 
+        // What the disclosure says, not only that one exists. FIR-2633's open
+        // question is whether a replayed reference answer is honest at all,
+        // "a stale reference set can be actively wrong about code that just
+        // moved", and the reason serving one is defensible here is that the
+        // sentence promises currency to nobody. A detail that called the counts
+        // a lower bound would be making the sweep-only argument on a path where
+        // a reconcile can be the writer, and no reader could tell.
+        let detail = contended_body["degradations"]
+            .as_array()
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry["reason"] == "mutation_in_flight")
+            })
+            .and_then(|entry| entry["detail"].as_str())
+            .expect("the disclosure carries a detail")
+            .to_string();
+        assert!(
+            detail.contains("a row may name code that has since changed"),
+            "the disclosure must name the direction a replayed answer can be wrong in, not only \
+             the one where it is short: {detail}"
+        );
+        assert!(
+            !detail.contains("lower bound"),
+            "a superseded reference set can be actively wrong about code that just moved \
+             (FIR-2633), so this may not promise a lower bound: {detail}"
+        );
+
         // Through the real annotation chokepoint, that disclosure is what turns
         // the response's one verdict. A degradation nothing consumes would be
         // decoration.
