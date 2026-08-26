@@ -7967,6 +7967,126 @@ mod tests {
         );
     }
 
+    /// The one case pinning still refuses: two registry rows resolving to one
+    /// repository identity.
+    ///
+    /// Two paths holding the same repository, a copied checkout being the usual
+    /// cause, would register twice under one spine key and let the second
+    /// overwrite the first's graph authority. Refusing the later row and marking
+    /// the authority set incomplete is the conservative answer, and it is the
+    /// only refusal left in a pass that used to refuse everything.
+    ///
+    /// Exercised against `pin_registered_local_repository_authorities` directly
+    /// rather than through the spine, because both halves of what it decides,
+    /// which rows pinned and whether the set is complete, are its return value
+    /// and nothing downstream reports the second one on its own.
+    #[test]
+    #[serial_test::serial]
+    fn two_registry_rows_for_one_repository_pin_once_and_report_incomplete() {
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("sibling-checkout");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        kin_core::init(&sibling_root).unwrap();
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        // One repository, two rows. Distinct ids on purpose: `upsert` dedupes on
+        // id, so this is the shape a registry actually reaches when the same
+        // repository is registered from two paths.
+        kin_core::registry::KinRegistry {
+            repos: vec![
+                kin_core::registry::RegisteredRepo {
+                    id: "sibling-checkout".to_string(),
+                    path: sibling_root.clone(),
+                    entities: 1,
+                    last_commit: String::new(),
+                    dependencies: vec![],
+                },
+                kin_core::registry::RegisteredRepo {
+                    id: "sibling-checkout-copy".to_string(),
+                    path: sibling_root.clone(),
+                    entities: 1,
+                    last_commit: String::new(),
+                    dependencies: vec![],
+                },
+            ],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let (pinned, incomplete) =
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout);
+
+        assert_eq!(
+            pinned.len(),
+            1,
+            "one repository must pin once however many registry rows point at it: {:?}",
+            pinned.iter().map(|p| p.repo_id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            incomplete,
+            "a refused duplicate row must leave the authority set reported incomplete"
+        );
+    }
+
+    /// The healthy control for the refusal above: two rows naming two genuinely
+    /// different repositories both pin, and the set reports complete.
+    ///
+    /// Without it the refusal could be tightened into refusing every second
+    /// sibling and nothing would notice, because the test above only ever asserts
+    /// that fewer than two pinned.
+    #[test]
+    #[serial_test::serial]
+    fn two_registry_rows_for_two_repositories_both_pin_and_report_complete() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut roots = Vec::new();
+        for name in ["sibling-one", "sibling-two"] {
+            let root = parent.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            kin_core::init(&root).unwrap();
+            roots.push(root);
+        }
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        kin_core::registry::KinRegistry {
+            repos: roots
+                .iter()
+                .map(|root| kin_core::registry::RegisteredRepo {
+                    id: root.file_name().unwrap().to_string_lossy().to_string(),
+                    path: root.clone(),
+                    entities: 1,
+                    last_commit: String::new(),
+                    dependencies: vec![],
+                })
+                .collect(),
+        }
+        .save_to(&registry_path)
+        .unwrap();
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let (pinned, incomplete) =
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout);
+
+        assert_eq!(
+            pinned.len(),
+            2,
+            "two distinct repositories must both pin: {:?}",
+            pinned.iter().map(|p| p.repo_id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            !incomplete,
+            "two distinct repositories pinning cleanly must not report the set incomplete"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn ingest_repo_into_spine_serves_non_empty_xref_from_storage_only() {
