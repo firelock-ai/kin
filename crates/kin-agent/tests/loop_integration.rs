@@ -181,13 +181,22 @@ def call(name, args):
     if name == "kin_transaction_begin":
         return payload({"transaction_id": "txn-fixture-1", "_kin": ENVELOPE})
     if name == "kin_transaction_stage":
-        # The daemon refuses a create whose path repository authority already tracks.
-        # TRACKED stands for the fixture graph's contents, so the refusal is the graph's
-        # answer rather than a look at the working tree.
+        # The daemon refuses a create whose path repository authority already tracks, and
+        # the mirror of it: a replace whose path authority does not track. TRACKED stands
+        # for the fixture graph's contents, so both refusals are the graph's answer rather
+        # than a look at the working tree.
         TRACKED = ("src/greet.py", "README.md")
         for op in args.get("operations", []):
-            if op.get("target") in TRACKED:
-                return payload({"error": "path " + op.get("target") + " is already tracked",
+            verb = op.get("verb")
+            target = op.get("target")
+            if verb in ("replace", "overwrite"):
+                if target not in TRACKED:
+                    return payload({"error": "path " + str(target) + " is not tracked by "
+                                             "repository authority, so there is nothing to "
+                                             "replace", "_kin": ENVELOPE}, is_error=True)
+                continue
+            if target in TRACKED:
+                return payload({"error": "path " + str(target) + " is already tracked",
                                 "_kin": ENVELOPE}, is_error=True)
         STAGED.setdefault(args.get("transaction_id"), []).extend(args.get("operations", []))
         return payload({"staged": len(args.get("operations", [])),
@@ -208,7 +217,7 @@ def call(name, args):
                                 "_kin": ENVELOPE}, is_error=True)
         for op in operations:
             target = op.get("target")
-            if op.get("verb") in ("create", "add", "insert"):
+            if op.get("verb") in ("create", "add", "insert", "replace", "overwrite"):
                 parent = os.path.dirname(target)
                 if parent:
                     os.makedirs(parent, exist_ok=True)
@@ -394,7 +403,7 @@ fn mcp_log(path: &Path) -> Vec<Value> {
 }
 
 #[test]
-fn a_tool_call_reaches_kin_and_an_in_place_edit_records_why_it_stages_nothing() {
+fn a_tool_call_reaches_kin_and_an_in_place_edit_is_staged_as_a_replace() {
     let dir = tempfile::tempdir().unwrap();
     let repo = fixture_repo(dir.path());
     let out = dir.path().join("out");
@@ -445,9 +454,9 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_records_why_it_stages_nothing() 
         "the docstring must be in the file: {edited}"
     );
 
-    // The call reached the graph server. The edit itself opens no transaction: the stage
-    // surface has no shape keyed on a path for an in-place edit, and a transaction with
-    // nothing staged in it can only end in the daemon's refusal of an empty commit.
+    // The call reached the graph server, and the edit was bracketed and published: the
+    // stage surface's `replace` shape is keyed on a repository-relative path plus the
+    // file's complete new text, which is exactly what an edit leaves the harness holding.
     let calls = mcp_log(&log);
     let names: Vec<&str> = calls
         .iter()
@@ -455,10 +464,39 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_records_why_it_stages_nothing() 
         .collect();
     assert_eq!(
         names,
-        vec!["kin_session_start", "semantic_locate", "kin_session_end"],
-        "an unstageable edit must not open a transaction it cannot stage into"
+        vec![
+            "kin_session_start",
+            "semantic_locate",
+            "kin_transaction_begin",
+            "kin_transaction_stage",
+            "kin_transaction_commit",
+            "kin_session_end"
+        ],
+        "an edit must be staged as a replace and committed, not left unbracketed"
     );
     assert_eq!(calls[1]["args"]["query"], "greet");
+
+    // The staged operation carries the file's WHOLE new text, not the fragment the model
+    // sent as `replace`. A body built from the fragment would satisfy every assertion
+    // above and destroy the file at commit, so the untouched line is asserted too.
+    let staged_op = &calls
+        .iter()
+        .find(|call| call["tool"] == "kin_transaction_stage")
+        .expect("the edit is staged")["args"]["operations"][0];
+    assert_eq!(staged_op["verb"], "replace");
+    assert_eq!(staged_op["target"], "src/greet.py");
+    let staged_body = staged_op["body"]
+        .as_str()
+        .expect("the replace carries a body");
+    assert!(
+        staged_body.contains("\"\"\"Return a greeting for name.\"\"\""),
+        "the staged body must carry the edit: {staged_body}"
+    );
+    assert!(
+        staged_body.contains("return f\"hello {name}\""),
+        "the staged body must be the file's complete new text, keeping the lines the edit \
+         did not touch: {staged_body}"
+    );
 
     // The transcript records it in the shape the analyzers read.
     let records = read_jsonl(&outcome.transcript_path);
@@ -512,13 +550,24 @@ fn a_tool_call_reaches_kin_and_an_in_place_edit_records_why_it_stages_nothing() 
         .iter()
         .find(|row| row["surface"] == "local" && row["tool"] == "edit_file")
         .expect("the local edit is traced");
-    assert_eq!(edit["provenance"]["bracketed"], false);
-    assert_eq!(edit["provenance"]["staged"], Value::Null);
-    let reason = edit["provenance"]["reason"].as_str().unwrap();
-    assert!(
-        reason.contains("entity uuid or an exact entity name"),
-        "the provenance must name why the edit could not be staged: {reason}"
+    assert_eq!(edit["provenance"]["bracketed"], true);
+    assert_eq!(edit["provenance"]["staged"]["verb"], "replace");
+    assert_eq!(edit["provenance"]["staged"]["target"], "src/greet.py");
+    assert_eq!(edit["provenance"]["staged"]["accepted"], true);
+    assert_eq!(
+        edit["provenance"]["closed_with"], "kin_transaction_commit",
+        "a staged edit is committed, never aborted"
     );
+    assert_eq!(edit["provenance"]["closed_cleanly"], true);
+    // The stage row is in the sidecar under the verb it actually used.
+    let staged_row = trace
+        .iter()
+        .find(|row| row["tool"] == "kin_transaction_stage")
+        .expect("the stage call is traced");
+    assert_eq!(staged_row["verb"], "replace");
+    assert_eq!(staged_row["target"], "src/greet.py");
+    assert_eq!(staged_row["is_error"], false);
+    assert!(staged_row["body_bytes"].as_u64().unwrap() > 0);
     // The whole written body stays out of the trace row; the transcript already has it.
     assert!(edit["args"]["replace"]
         .as_str()
