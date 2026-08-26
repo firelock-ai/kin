@@ -2297,8 +2297,22 @@ fn decide_sweep_on_start(state: &DaemonState) -> SweepStartDecision {
 /// to publish: a file that yielded no relations has nothing that can be lost, so
 /// re-sweeping it forever would be waste rather than safety. Everything else
 /// stays unmarked and is swept again.
-fn sweep_marker_is_durable(total_relations: usize, published: bool) -> bool {
-    total_relations == 0 || published
+///
+/// Losing a relation is the third case, and it used to be invisible here.
+/// `published` says the snapshot reached disk, not that every relation the
+/// sweep offered reached the graph, and marking a file enriched is what stops
+/// it ever being swept again: `file_already_enriched` skips it from then on. So
+/// a pass that offered a relation the graph does not hold and then saved
+/// cleanly would have written off the loss permanently, with the marker
+/// asserting the file was done.
+///
+/// This is the repair. There is nothing to fix in place, because the pass
+/// cannot know why the graph declined; what it can do is decline to say the
+/// file is finished, so the next sweep offers those relations again. A sweep
+/// that lost nothing marks and moves on, and one that lost something leaves the
+/// work where the next pass will find it.
+fn sweep_marker_is_durable(written: EnrichmentWrite, published: bool) -> bool {
+    written.lost() == 0 && (written.published == 0 || published)
 }
 
 /// How long a cold sweep waits for the embedding backfill before starting
@@ -5312,7 +5326,7 @@ pub async fn run_with_authority_on(
                                  marker no longer describes this sweep"
                             );
                         }
-                        if sweep_marker_is_durable(total_relations.published, published) {
+                        if sweep_marker_is_durable(total_relations, published) {
                             mark_files_enriched(&lsp_state, &enriched_this_sweep);
                         } else {
                             warn!(
@@ -8466,7 +8480,7 @@ mod lsp_query_column_tests {
 mod sweep_tally_tests {
     use super::{
         file_definitions_within_budget, next_interruption_count, sweep_circuit_open,
-        sweep_marker_is_durable, SweepTally, SWEEP_INTERRUPTION_LIMIT,
+        sweep_marker_is_durable, EnrichmentWrite, SweepTally, SWEEP_INTERRUPTION_LIMIT,
     };
     use std::time::Duration;
 
@@ -8642,13 +8656,45 @@ mod sweep_tally_tests {
     #[test]
     fn a_sweep_that_did_not_publish_records_nothing() {
         assert!(
-            !sweep_marker_is_durable(4231, false),
+            !sweep_marker_is_durable(EnrichmentWrite::all_published(4231), false),
             "a sweep with relations that failed to publish must leave its files unmarked, \
              so the next sweep redoes them instead of skipping them forever"
         );
         assert!(
-            sweep_marker_is_durable(4231, true),
+            sweep_marker_is_durable(EnrichmentWrite::all_published(4231), true),
             "a sweep that published records what it enriched"
+        );
+    }
+
+    /// A sweep that published its snapshot but lost relations records nothing.
+    ///
+    /// The case the durability check could not see before. `published` says the
+    /// snapshot reached disk; it says nothing about whether every relation the
+    /// sweep offered reached the graph. A pass that offered 600 and got 588 in
+    /// used to mark its files enriched on the strength of that clean save, and
+    /// `file_already_enriched` would skip them from then on, so the twelve were
+    /// written off permanently under a marker asserting the file was done.
+    ///
+    /// Leaving them unmarked is the repair: the pass cannot fix what the graph
+    /// declined, but it can decline to call the file finished, and the next
+    /// sweep offers those relations again.
+    #[test]
+    fn a_sweep_that_published_but_lost_relations_records_nothing() {
+        let lossy = EnrichmentWrite {
+            published: 588,
+            offered: 600,
+            vector_stale: 0,
+        };
+        assert_eq!(lossy.lost(), 12);
+        assert!(
+            !sweep_marker_is_durable(lossy, true),
+            "a snapshot that saved cleanly does not make a lost relation durable, and marking \
+             these files would skip them forever"
+        );
+        assert!(
+            sweep_marker_is_durable(EnrichmentWrite::all_published(600), true),
+            "a pass that lost nothing still marks, or the fix trades a permanent skip for a \
+             permanent re-sweep"
         );
     }
 
@@ -8660,7 +8706,7 @@ mod sweep_tally_tests {
     #[test]
     fn a_sweep_with_nothing_to_publish_still_records_its_files() {
         assert!(
-            sweep_marker_is_durable(0, false),
+            sweep_marker_is_durable(EnrichmentWrite::all_published(0), false),
             "no relations means nothing could be lost, so the visit is worth recording"
         );
     }
