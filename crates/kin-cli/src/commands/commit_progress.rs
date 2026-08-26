@@ -235,6 +235,7 @@ pub fn daemon_loss_explanation(
     daemon_alive: bool,
     now_unix: u64,
     evidence: &crate::capability::MemoryEvidence,
+    others: &[ResidentDaemon],
 ) -> Option<String> {
     // No marker is no evidence. The daemon may never have opened a transaction
     // at all, and inventing a phase for it would be worse than the socket error
@@ -269,7 +270,7 @@ pub fn daemon_loss_explanation(
         None => format!("{state} published no memory reading"),
     };
     sentence.push('.');
-    if let Some(memory) = memory_attribution(open, evidence) {
+    if let Some(memory) = memory_attribution(open, evidence, others) {
         sentence.push(' ');
         sentence.push_str(&memory);
     }
@@ -301,6 +302,7 @@ fn render_rss(open: &kin_daemon_spawn::OpenTransaction, observed: u64) -> String
 fn memory_attribution(
     open: &kin_daemon_spawn::OpenTransaction,
     evidence: &crate::capability::MemoryEvidence,
+    others: &[ResidentDaemon],
 ) -> Option<String> {
     let observed_kills = evidence.cgroup_oom_kills.filter(|count| *count > 0);
     let observed_ceiling_hits = evidence.cgroup_ceiling_hits.filter(|count| *count > 0);
@@ -327,7 +329,13 @@ fn memory_attribution(
         ),
         (None, None, false) => return None,
     };
-    Some(format!("{cause} {COMMIT_MEMORY_REMEDY}"))
+    // The remedy is left exactly as it stands and the census is appended after
+    // it. `kin doctor` prints the same constant, and a clause about processes
+    // on this machine has no meaning on a surface that runs before any commit.
+    Some(match resident_daemon_clause(others, evidence.limit_bytes) {
+        Some(census) => format!("{cause} {COMMIT_MEMORY_REMEDY} {census}"),
+        None => format!("{cause} {COMMIT_MEMORY_REMEDY}"),
+    })
 }
 
 /// What a caller can do about a commit that ran out of memory.
@@ -350,6 +358,132 @@ pub const COMMIT_MEMORY_REMEDY: &str =
      the one measurement that separated the terms found a small edit costing far less than the \
      store size suggests. Re-run it with more memory available, or make the edit smaller; \
      `kin doctor` reports the headroom it can measure before a commit is attempted.";
+
+/// One other `kin-daemon` process resident on this machine.
+///
+/// The rc060n stranger's OOM kill was not the commit's cost alone. A second
+/// repository's daemon was resident from an earlier task, and the retry that
+/// succeeded changed nothing about the edit: it ran `kin daemon stop --all`
+/// first and the same command then exited 0. The remedy below told them to find
+/// more memory or shrink the edit, and neither is what worked. The memory that
+/// was sitting there to be reclaimed had no surface naming it, so a reader had
+/// to already know that another repository's daemon was holding gigabytes
+/// before they could think to stop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResidentDaemon {
+    pub pid: u32,
+    /// The repository this daemon serves, when its own argv named one.
+    pub repo_root: Option<PathBuf>,
+    /// Whether this is the machine-wide supervisor rather than a repo worker.
+    pub supervisor: bool,
+    /// Resident set right now, read from the OS process table.
+    ///
+    /// Now, not at the moment of the kill. The daemon that died is already
+    /// gone when this is sampled, and what a reader can act on is what is
+    /// still held, so the sentence says "now" and means it. Claiming these
+    /// figures were the ones in play during the commit would be a measurement
+    /// nobody took.
+    pub rss_bytes: u64,
+}
+
+impl ResidentDaemon {
+    /// How one daemon reads inside the sentence, sized.
+    fn describe(&self) -> String {
+        let size = human_bytes(self.rss_bytes);
+        if self.supervisor {
+            return format!("supervisor pid {}, {size}", self.pid);
+        }
+        match &self.repo_root {
+            Some(root) => format!("pid {} serving {}, {size}", self.pid, root.display()),
+            None => format!("pid {}, {size}", self.pid),
+        }
+    }
+}
+
+/// The share of the ceiling other daemons must hold before this names them.
+///
+/// Below the line, stopping them cannot change whether a commit that reached
+/// the ceiling fits, and a remedy that cannot work is worse than no remedy: it
+/// spends the reader's attention and their next few minutes. The stranger's
+/// case sits well above it, two daemons holding 1.2 GiB against a 12 GiB
+/// ceiling, a tenth of the box. A lone supervisor at 17 MiB on the same box is
+/// under a seventh of one percent, and telling someone to stop it would be
+/// pointing at memory that is not there.
+const RESIDENT_DAEMON_NOTICE_FRACTION: f64 = 0.05;
+
+/// The sentence naming what else on this machine is holding memory.
+///
+/// Pure, and separate from the sampling above it, because this is the half that
+/// has to be falsified: the census reads a live process table and a test cannot
+/// stand up two daemons to prove a rendering.
+fn resident_daemon_clause(others: &[ResidentDaemon], limit_bytes: u64) -> Option<String> {
+    if others.is_empty() {
+        return None;
+    }
+    let total: u64 = others.iter().map(|daemon| daemon.rss_bytes).sum();
+    if (total as f64) < limit_bytes as f64 * RESIDENT_DAEMON_NOTICE_FRACTION {
+        return None;
+    }
+    let named = others
+        .iter()
+        .map(ResidentDaemon::describe)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let holding = match others.len() {
+        1 => format!(
+            "One other kin daemon is resident on this machine now, holding {}",
+            human_bytes(total)
+        ),
+        count => format!(
+            "{count} other kin daemons are resident on this machine now, holding {} between them",
+            human_bytes(total)
+        ),
+    };
+    Some(format!(
+        "{holding}: {named}. Stopping what you are not using frees that memory for a retry, \
+         with `kin daemon stop --all`."
+    ))
+}
+
+/// Every other `kin-daemon` on this machine, with what it currently holds.
+///
+/// Matched on the executable's file name, never on the command line. An agent
+/// process carries its whole prompt in argv, so a substring search over it
+/// reports strangers as daemons, and this sentence is read by someone deciding
+/// what to stop. A process whose executable cannot be read is skipped rather
+/// than guessed at.
+pub fn other_resident_daemons(dead_pid: u32) -> Vec<ResidentDaemon> {
+    let mut system = sysinfo::System::new_all();
+    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    let mut found: Vec<ResidentDaemon> = system
+        .processes()
+        .iter()
+        .filter_map(|(pid, process)| {
+            let pid = pid.as_u32();
+            if pid == dead_pid || pid == std::process::id() {
+                return None;
+            }
+            let name = process.exe()?.file_name()?.to_str()?.to_owned();
+            if name != crate::daemon_client::DAEMON_BINARY_FILE_NAME {
+                return None;
+            }
+            let args = process
+                .cmd()
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            Some(ResidentDaemon {
+                pid,
+                supervisor: args.iter().any(|arg| arg == "--supervisor"),
+                repo_root: super::daemon::command_argument(&args, "--repo").map(PathBuf::from),
+                rss_bytes: process.memory(),
+            })
+        })
+        .collect();
+    // Largest first: the one worth stopping is the one worth reading first.
+    found.sort_by_key(|daemon| (std::cmp::Reverse(daemon.rss_bytes), daemon.pid));
+    found
+}
 
 /// The words both the commit line and `kin commit --help` are built from.
 ///
@@ -497,6 +631,7 @@ mod tests {
             false,
             1_006,
             &evidence(12 * GIB, Some(2)),
+            &[],
         )
         .expect("a dead daemon holding a marker must be explained");
 
@@ -526,6 +661,199 @@ mod tests {
         );
     }
 
+    fn worker(pid: u32, repo: &str, rss_bytes: u64) -> ResidentDaemon {
+        ResidentDaemon {
+            pid,
+            repo_root: Some(PathBuf::from(repo)),
+            supervisor: false,
+            rss_bytes,
+        }
+    }
+
+    /// The half of the rc060n OOM kill that no surface named.
+    ///
+    /// A 1.5 KB docstring commit was killed on a 12 GiB box. The retry that
+    /// worked did not shrink the edit and did not grow the box: it ran `kin
+    /// daemon stop --all`, freeing a second repository's resident daemon, and
+    /// then ran the identical command to exit 0. Everything the failure printed
+    /// pointed at the two remedies that were not the one that worked.
+    ///
+    /// Falsify by returning `None` from `resident_daemon_clause` unconditionally:
+    /// the phase, the pid and the kill still report, every assertion in the
+    /// older tests still passes, and only the four assertions below go red,
+    /// which is the whole of what this adds.
+    #[test]
+    fn a_commit_killed_beside_other_daemons_names_them_and_what_they_hold() {
+        let marker = abandoned_marker(Some(8 * GIB), Some(10 * GIB));
+        let others = vec![
+            worker(3701, "/work/express", GIB + GIB / 8),
+            ResidentDaemon {
+                pid: 3678,
+                repo_root: None,
+                supervisor: true,
+                rss_bytes: 82 * 1024 * 1024,
+            },
+        ];
+        let explained = daemon_loss_explanation(
+            marker.as_deref(),
+            false,
+            1_006,
+            &evidence(12 * GIB, Some(1)),
+            &others,
+        )
+        .expect("a dead daemon holding a marker must be explained");
+
+        assert!(
+            explained.contains("2 other kin daemons are resident on this machine now"),
+            "the count of what else is holding memory must be stated: {explained}"
+        );
+        assert!(
+            explained.contains("pid 3701 serving /work/express"),
+            "the other repository's daemon must be named so it can be stopped: {explained}"
+        );
+        assert!(
+            explained.contains("1.1 GiB") && explained.contains("82 MiB"),
+            "each daemon must carry its own size, not just a total: {explained}"
+        );
+        assert!(
+            explained.contains("`kin daemon stop --all`"),
+            "the remedy that actually worked must be spelled: {explained}"
+        );
+
+        // The praised message is additive, never replaced. FIR-2782 asks for
+        // this clause and asks in the same breath that nothing above it move.
+        assert!(
+            explained.contains("out-of-memory kill")
+                && explained.contains("reconcile_workspace_and_commit_authority")
+                && explained.contains("`kin doctor`"),
+            "the existing diagnosis must survive the addition: {explained}"
+        );
+    }
+
+    /// The control: the same commit with nothing else resident says nothing
+    /// about other daemons.
+    ///
+    /// This is the assertion that makes the one above mean something. A clause
+    /// that renders whatever it is handed would pass every check there and
+    /// still print "0 other kin daemons" onto a machine running one process.
+    ///
+    /// Falsify by dropping the `others.is_empty()` guard: this goes red on the
+    /// `stop --all` assertion while the test above stays green.
+    #[test]
+    fn a_commit_killed_with_no_other_daemon_resident_names_none() {
+        let marker = abandoned_marker(Some(8 * GIB), Some(10 * GIB));
+        let explained = daemon_loss_explanation(
+            marker.as_deref(),
+            false,
+            1_006,
+            &evidence(12 * GIB, Some(1)),
+            &[],
+        )
+        .expect("a dead daemon holding a marker must be explained");
+
+        assert!(
+            explained.contains("out-of-memory kill"),
+            "the control must still be a memory diagnosis, or it grades nothing: {explained}"
+        );
+        assert!(
+            !explained.contains("`kin daemon stop --all`"),
+            "with nothing else resident there is nothing to stop: {explained}"
+        );
+        assert!(
+            !explained.contains("resident on this machine now"),
+            "no census sentence may appear with an empty census: {explained}"
+        );
+    }
+
+    /// Memory too small to change the outcome is not offered as a remedy.
+    ///
+    /// A lone supervisor holds tens of megabytes. Telling someone whose commit
+    /// peaked at 10 GiB against a 12 GiB ceiling to go stop it sends them after
+    /// a fix that cannot work, and costs them the minutes it takes to find that
+    /// out. The line is [`RESIDENT_DAEMON_NOTICE_FRACTION`].
+    ///
+    /// Falsify by setting the fraction to 0.0: this goes red and the test above
+    /// stays green, which is what proves the two are grading different things.
+    #[test]
+    fn other_daemons_too_small_to_matter_are_not_offered_as_a_remedy() {
+        let marker = abandoned_marker(Some(8 * GIB), Some(10 * GIB));
+        let trivial = vec![ResidentDaemon {
+            pid: 3678,
+            repo_root: None,
+            supervisor: true,
+            rss_bytes: 17 * 1024 * 1024,
+        }];
+        let explained = daemon_loss_explanation(
+            marker.as_deref(),
+            false,
+            1_006,
+            &evidence(12 * GIB, Some(1)),
+            &trivial,
+        )
+        .expect("a dead daemon holding a marker must be explained");
+
+        assert!(
+            explained.contains("out-of-memory kill"),
+            "the diagnosis must still be a memory one: {explained}"
+        );
+        assert!(
+            !explained.contains("`kin daemon stop --all`"),
+            "17 MiB against a 12 GiB ceiling cannot change the outcome: {explained}"
+        );
+
+        // Positive control on the same census: raise the ceiling's share by
+        // shrinking the ceiling and the identical list does get named, so the
+        // silence above is the fraction talking and not a dead renderer.
+        let named = daemon_loss_explanation(
+            marker.as_deref(),
+            false,
+            1_006,
+            &evidence(64 * 1024 * 1024, Some(1)),
+            &trivial,
+        )
+        .expect("a dead daemon holding a marker must be explained");
+        assert!(
+            named.contains("`kin daemon stop --all`"),
+            "the same census must be reported when it is material: {named}"
+        );
+    }
+
+    /// A daemon that died for a reason nobody attributed to memory is not
+    /// handed a memory remedy, census or not.
+    ///
+    /// The existing design is explicit that a death with no memory evidence
+    /// gets no memory sentence. A census appended outside that gate would
+    /// reintroduce exactly the diagnosis-nobody-measured this file refuses.
+    ///
+    /// Falsify by appending the clause in `daemon_loss_explanation` rather than
+    /// inside `memory_attribution`: this goes red while every other test here
+    /// stays green.
+    #[test]
+    fn a_death_with_no_memory_evidence_is_not_handed_a_daemon_census() {
+        let marker = abandoned_marker(Some(GIB), Some(GIB));
+        let explained = daemon_loss_explanation(
+            marker.as_deref(),
+            false,
+            1_006,
+            &evidence(64 * GIB, Some(0)),
+            &[worker(3701, "/work/express", 8 * GIB)],
+        )
+        .expect("a dead daemon holding a marker must still be explained");
+
+        assert!(
+            explained.contains("reconcile_workspace_and_commit_authority"),
+            "the phase reports whatever killed it, or this grades nothing: {explained}"
+        );
+        assert!(
+            !explained.contains("ran out of memory"),
+            "no memory cause was observed, so none may be stated: {explained}"
+        );
+        assert!(
+            !explained.contains("`kin daemon stop --all`"),
+            "a census must not smuggle in a memory remedy: {explained}"
+        );
+    }
+
     /// A resident set at the ceiling with no kernel accounting is reported as
     /// likely, never as observed. The two are different claims and a reader
     /// acts on them differently.
@@ -533,7 +861,7 @@ mod tests {
     fn a_resident_set_at_the_ceiling_without_kernel_accounting_is_only_likely() {
         let marker = abandoned_marker(Some(11 * GIB + GIB / 2), None);
         let explained =
-            daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(12 * GIB, None))
+            daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(12 * GIB, None), &[])
                 .expect("a dead daemon holding a marker must be explained");
         assert!(
             explained.contains("most likely ran out of memory"),
@@ -558,6 +886,7 @@ mod tests {
             false,
             1_006,
             &evidence(64 * GIB, Some(0)),
+            &[],
         )
         .expect("a dead daemon holding a marker must still be explained");
         assert!(
@@ -609,7 +938,7 @@ mod tests {
         let marker = abandoned_marker(Some(2 * GIB), Some(2 * GIB));
 
         let unmoved = across_commit(cgroup(64 * GIB, 2, 40), cgroup(64 * GIB, 2, 40));
-        let explained = daemon_loss_explanation(marker.as_deref(), false, 1_006, &unmoved)
+        let explained = daemon_loss_explanation(marker.as_deref(), false, 1_006, &unmoved, &[])
             .expect("a dead daemon holding a marker is still explained by its phase");
         assert!(
             !explained.contains("ran out of memory"),
@@ -622,7 +951,7 @@ mod tests {
 
         // The control that proves the arm above can fail.
         let moved = across_commit(cgroup(64 * GIB, 2, 40), cgroup(64 * GIB, 3, 40));
-        let killed = daemon_loss_explanation(marker.as_deref(), false, 1_006, &moved)
+        let killed = daemon_loss_explanation(marker.as_deref(), false, 1_006, &moved, &[])
             .expect("a kill during the commit must be explained in memory terms");
         assert!(
             killed.contains("recorded 1 out-of-memory kill(s)"),
@@ -644,7 +973,7 @@ mod tests {
         let marker = abandoned_marker(Some(2 * GIB), Some(2 * GIB));
 
         let pinned = across_commit(cgroup(12 * GIB, 1, 100), cgroup(12 * GIB, 1, 1_071));
-        let explained = daemon_loss_explanation(marker.as_deref(), false, 1_006, &pinned)
+        let explained = daemon_loss_explanation(marker.as_deref(), false, 1_006, &pinned, &[])
             .expect("a dead daemon holding a marker must be explained");
         assert!(
             explained.contains("971 time(s)"),
@@ -661,7 +990,7 @@ mod tests {
 
         // The control. Same history, and a counter that did not move.
         let untouched = across_commit(cgroup(12 * GIB, 1, 1_071), cgroup(12 * GIB, 1, 1_071));
-        let quiet = daemon_loss_explanation(marker.as_deref(), false, 1_006, &untouched)
+        let quiet = daemon_loss_explanation(marker.as_deref(), false, 1_006, &untouched, &[])
             .expect("the phase still explains itself");
         assert!(
             !quiet.contains("ran out of memory"),
@@ -673,7 +1002,7 @@ mod tests {
     #[test]
     fn a_lost_reply_with_no_marker_at_all_invents_no_diagnosis() {
         assert!(
-            daemon_loss_explanation(None, false, 1_006, &evidence(GIB, Some(9))).is_none(),
+            daemon_loss_explanation(None, false, 1_006, &evidence(GIB, Some(9)), &[]).is_none(),
             "a kill count alone says nothing about a commit that published no transaction"
         );
     }
@@ -684,7 +1013,7 @@ mod tests {
     fn a_live_daemon_whose_beat_went_quiet_is_reported_as_wedged_rather_than_gone() {
         let marker = abandoned_marker(Some(3 * GIB), Some(3 * GIB));
         let explained =
-            daemon_loss_explanation(marker.as_deref(), true, 1_400, &evidence(64 * GIB, None))
+            daemon_loss_explanation(marker.as_deref(), true, 1_400, &evidence(64 * GIB, None), &[])
                 .expect("a marker with a live pid still explains itself");
         assert!(
             explained.contains("still running but stopped beating 400s ago"),
@@ -698,7 +1027,7 @@ mod tests {
     fn an_unsampled_resident_set_reads_as_absent_and_never_as_zero() {
         let marker = abandoned_marker(None, None);
         let explained =
-            daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(12 * GIB, None))
+            daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(12 * GIB, None), &[])
                 .expect("a dead daemon holding a marker must be explained");
         assert!(
             explained.contains("published no memory reading"),

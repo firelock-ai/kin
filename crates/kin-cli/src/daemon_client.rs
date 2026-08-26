@@ -4089,9 +4089,9 @@ enum DaemonBinaryDiscoveryError {
 }
 
 #[cfg(windows)]
-const DAEMON_BINARY_FILE_NAME: &str = "kin-daemon.exe";
+pub(crate) const DAEMON_BINARY_FILE_NAME: &str = "kin-daemon.exe";
 #[cfg(not(windows))]
-const DAEMON_BINARY_FILE_NAME: &str = "kin-daemon";
+pub(crate) const DAEMON_BINARY_FILE_NAME: &str = "kin-daemon";
 
 fn daemon_binary_candidates_for_executable(exe: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![exe.with_file_name(DAEMON_BINARY_FILE_NAME)];

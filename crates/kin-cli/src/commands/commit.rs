@@ -348,6 +348,14 @@ fn resolve_commit_after_lost_reply(
                     daemon_alive,
                     unix_now(),
                     &crate::capability::memory_evidence_since(memory_baseline),
+                    // Sampled here rather than inside the explanation so the
+                    // sentence stays a pure rendering of what was observed.
+                    // The dead daemon is excluded by its own marker pid: it is
+                    // already gone, and a pid the OS has reused would otherwise
+                    // be reported as memory a reader could reclaim.
+                    &super::commit_progress::other_resident_daemons(
+                        abandoned.as_ref().map_or(0, |open| open.pid),
+                    ),
                 )
             });
             let error = match cause {
