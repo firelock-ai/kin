@@ -1429,7 +1429,18 @@ fn fallback_shell() -> &'static str {
 }
 
 pub(crate) fn shell_rc(shell: &str) -> Result<PathBuf> {
-    let home = home_dir()?;
+    shell_rc_in(&home_dir()?, shell)
+}
+
+/// [`shell_rc`] against a home the caller already resolved.
+///
+/// The home is a parameter so that one plan cannot straddle two of them. Every
+/// path in an rc plan has to describe the same home, and the only way to
+/// guarantee that is to resolve it once and pass it down; resolving it again
+/// per path makes the plan's shape depend on whether anything moved `HOME` in
+/// between (FIR-2714).
+pub(crate) fn shell_rc_in(home: &Path, shell: &str) -> Result<PathBuf> {
+    let home = home.to_path_buf();
     match shell {
         "zsh" => Ok(home.join(".zshrc")),
         "bash" => Ok(home.join(".bashrc")),
@@ -1525,10 +1536,15 @@ fn bash_login_rc_in(home: &Path) -> PathBuf {
 /// them, and the arms below mirror that function's exactly, including its
 /// treatment of an unrecognized shell as zsh.
 pub(crate) fn shell_path_rcs(shell: &str) -> Result<Vec<PathBuf>> {
-    let home = home_dir()?;
+    shell_path_rcs_in(&home_dir()?, shell)
+}
+
+/// [`shell_path_rcs`] against a home the caller already resolved. Same reason as
+/// [`shell_rc_in`].
+pub(crate) fn shell_path_rcs_in(home: &Path, shell: &str) -> Result<Vec<PathBuf>> {
     Ok(match shell {
-        "bash" => vec![home.join(".bashrc"), bash_login_rc_in(&home)],
-        "fish" | "powershell" => vec![shell_rc(shell)?],
+        "bash" => vec![home.join(".bashrc"), bash_login_rc_in(home)],
+        "fish" | "powershell" => vec![shell_rc_in(home, shell)?],
         _ => vec![home.join(".zshenv")],
     })
 }
@@ -2529,13 +2545,24 @@ fn install_shell_hook(shell_name: &str) -> Result<(PathBuf, String)> {
 /// PATH line a second time, because bash reads one or the other and never both
 /// unless the login file says so.
 fn rc_write_plan(shell_name: &str) -> Result<Vec<RcTarget>> {
-    let hook_rc = shell_rc(shell_name)?;
+    // Resolved ONCE, and passed down. This function decides whether one file
+    // carries both blocks by comparing the hook path against each PATH path, and
+    // it used to resolve the home separately for each side. For fish and
+    // PowerShell those are the same expression, so they agreed and the plan was
+    // one target, until something moved `HOME` between the two reads: then the
+    // two sides described different homes, the comparison failed, and the plan
+    // grew a second target pointing at a home the caller never asked about. A
+    // plan that straddles two homes is wrong whatever produced the move, so the
+    // move is made impossible here rather than guarded against by its callers
+    // (FIR-2714).
+    let home = home_dir()?;
+    let hook_rc = shell_rc_in(&home, shell_name)?;
     let mut plan = vec![RcTarget {
         path: hook_rc.clone(),
         blocks: RcBlocks::HookOnly,
         seed_when_absent: None,
     }];
-    for path_rc in shell_path_rcs(shell_name)? {
+    for path_rc in shell_path_rcs_in(&home, shell_name)? {
         if path_rc == hook_rc {
             plan[0].blocks = RcBlocks::HookAndPath;
             continue;
