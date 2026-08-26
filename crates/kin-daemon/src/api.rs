@@ -17351,7 +17351,14 @@ mod tests {
             // pointed at the source, the after-only check still passed, because
             // a Git-admitted store names its own bodies from the moment it is
             // created. Only an empty replica can name none and then name all.
-            let before = repository_authority_snapshot(&hosted_state, &hosted_id)
+            // ONE binding for both readings, deliberately. Falsification pointed
+            // the after-reading at the source while the before-reading stayed on
+            // the peer, and the pair passed: before from an empty replica, after
+            // from a full one, no single replica described. Naming the observed
+            // replica once means a change of target moves both halves, so the
+            // before assertion below refuses it. The join, not the endpoints.
+            let observed_replica = Arc::clone(&hosted_state);
+            let before = repository_authority_snapshot(&observed_replica, &hosted_id)
                 .await
                 .expect("an empty hosted replica is readable before anything is pushed");
             let named_before = before
@@ -17430,7 +17437,7 @@ mod tests {
                 let source_bodies =
                     source_payload_bodies(&source_authority, &fixture.source_digests);
                 drop(source_authority);
-                let snapshot = repository_authority_snapshot(&hosted_state, &hosted_id)
+                let snapshot = repository_authority_snapshot(&observed_replica, &hosted_id)
                     .await
                     .expect("the replica that admitted a bootstrap must be readable after it");
                 let named_after = snapshot
