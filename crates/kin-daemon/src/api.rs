@@ -17525,9 +17525,25 @@ mod tests {
     /// This runs it today by removing the one thing that stops it. The
     /// expectation is built from the SOURCE store's own transfer status, so its
     /// `git_authority_hash` is the source's own and `TransferSourceContext::read`
-    /// agrees with itself; the destination is set unborn, which is what an empty
-    /// hosted store looks like. Everything downstream of the authority
-    /// comparison then runs for real against a real payload.
+    /// agrees with itself, and the ref state is set unborn. Everything
+    /// downstream of the authority comparison then runs for real against a real
+    /// payload.
+    ///
+    /// **This is deliberately NOT an empty hosted replica, and the difference is
+    /// worth stating because it would be easy to read it as one.** An empty
+    /// replica's `repository_transfer_status` reports five things together
+    /// (`repository_transfer.rs:387`): `destination_target: None`,
+    /// `destination_head: None`, `default_ref: None`, `git_authority_hash: None`
+    /// and `roots.generation == 0`. This probe sets the first two and keeps the
+    /// last three from the source, because the authority hash agreeing is the
+    /// whole mechanism by which the bound in front of the size bound is removed.
+    /// So what runs here is an authority-agreeing replica with an unborn ref,
+    /// which is the smallest world in which the size bound answers, and not a
+    /// simulation of the hosted destination.
+    ///
+    /// The precondition is asserted rather than described, so the day the
+    /// bootstrap keys its compare-and-swap on all five, this test says which
+    /// ones it was holding fixed instead of quietly drifting.
     ///
     /// What it establishes, and none of it was measured before:
     ///
@@ -17565,10 +17581,24 @@ mod tests {
             let mut expectation =
                 kin_remote::repository_transfer::RepositoryTransferExpectation::try_from(status)
                     .unwrap();
-            // An empty hosted store's ref is unborn. Both fields move together
-            // because `validate_expectation` requires them both present or both
-            // absent, and a half-set destination would be refused for a reason
-            // that is not the one under test.
+            // Record what this probe holds fixed, against the five fields an
+            // empty replica reports together. Asserted rather than assumed:
+            // these are the source's own values, and the day the bootstrap keys
+            // its compare-and-swap on all five, a reader needs to know which
+            // ones this test was never varying.
+            assert!(
+                expectation.git_authority_hash.is_some(),
+                "the probe keeps the SOURCE's Git authority, which is how the bound \
+                 in front of the size bound is removed; an empty replica reports None"
+            );
+            assert_eq!(
+                expectation.repository_id, hosted_repository,
+                "the probe must be about the hosted identity it adopted"
+            );
+            // The ref state, and only the ref state, is moved to unborn. Both
+            // fields move together because `validate_expectation` requires them
+            // both present or both absent, and a half-set destination would be
+            // refused for a reason that is not the one under test.
             expectation.destination_target = None;
             expectation.destination_head = None;
 
