@@ -45,11 +45,14 @@ use kin_model::{ArtifactId, FilePathId, Relation, RelationEvidence, RelationId};
 /// has something to resolve, and every fixture repeats at least one call so
 /// multi-site edges are exercised rather than assumed away.
 ///
-/// The calls are written cross-file on purpose: a bare call to a qualified
+/// The calls are written cross-file on purpose. A bare call to a qualified
 /// sibling in the *same* file (`render()` calling `compute()` inside one class)
-/// resolves to no edge at all, in every language checked. That is a separate
-/// gap from this one and would make a fixture look span-less when it was really
-/// edge-less.
+/// used to resolve to no edge at all in every language checked, which would make
+/// a fixture look span-less when it was really edge-less. FIR-1826 closed that
+/// for the languages where a bare call carries an implicit receiver, so the Java
+/// and C# fixtures below now yield that edge too and their `min_calls` floors
+/// count it. The cross-file shape stays because it is the one every language
+/// resolves, so a fixture's span rate is never confounded by a binding rule.
 struct Fixture {
     language: &'static str,
     /// Fewest relations this fixture must yield. A language that silently stops
@@ -203,7 +206,9 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         language: "Java",
         min_relations: 4,
-        min_calls: 1,
+        // Two: the cross-file `compute()` every language resolves, and the
+        // same-file `render()` -> `compute()` sibling FIR-1826 added.
+        min_calls: 2,
         min_calls_with_span: 0,
         files: &[
             (
@@ -228,7 +233,8 @@ const FIXTURES: &[Fixture] = &[
     Fixture {
         language: "CSharp",
         min_relations: 5,
-        min_calls: 1,
+        // Two, for the same reason as Java above.
+        min_calls: 2,
         min_calls_with_span: 0,
         files: &[
             (
@@ -682,14 +688,37 @@ fn print_table(rows: &[(String, Counts)], title: &str) {
 ///
 /// This total is a whole-fleet check. The per-language floors above are what
 /// keeps a language from silently losing its sites.
-const MEASURED_RELATIONS_WITH_SPAN: usize = 9;
+///
+/// FIR-2690 moved it from 9 to 10. That ticket is FIR-1825's residual: call
+/// sites got spans, import sites did not, and `kin rename` refused on any
+/// symbol another file imports because the only span it could reach was the
+/// importing file's MODULE entity, whose span is the whole file. Entity-level
+/// import edges now carry the import statement's own site, so one more relation
+/// in these fixtures is span-backed.
+///
+/// One, not thirteen, and the reason is worth knowing before the next author
+/// reads this number as coverage. These fixtures are call-resolution fixtures;
+/// they contain a single cross-file import edge between them. The claim "every
+/// language records an import span" is proven where it can be proven, in
+/// `kin-parser/tests/import_span_coverage.rs`, which parses a fixture per
+/// language and asserts each span is non-empty, inside the file, over bytes
+/// that mention the module path, and on a line that agrees with its own byte
+/// offset. This constant proves something different and narrower: that the
+/// linker carries a site the parser recorded all the way onto persisted
+/// evidence.
+const MEASURED_RELATIONS_WITH_SPAN: usize = 10;
 
 /// Span-backed evidence RECORDS, which exceed span-backed relations whenever one
 /// caller reaches one callee at more than one site. Each fixture calls `compute`
 /// twice from `run`, so the three site-recording languages contribute four
 /// records across three edges apiece. That surplus is the point: it is what
 /// `find_references` turns into more than one entry in `reference_lines`.
-const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 12;
+/// FIR-2690 moved it from 12 to 13, in step with the relation count above: the
+/// one new span-backed relation is an entity-level import edge, and an import
+/// edge carries exactly one evidence record because a specifier binds once.
+/// The surplus of records over relations is unchanged, since it comes from
+/// repeat CALL sites and this edge adds none.
+const MEASURED_EVIDENCE_RECORDS_WITH_SPAN: usize = 13;
 
 #[test]
 fn relation_evidence_span_population_per_language() {

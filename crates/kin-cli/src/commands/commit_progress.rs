@@ -220,14 +220,16 @@ fn human_bytes(bytes: u64) -> String {
 /// that survive a SIGKILL: the transaction marker the daemon published on its
 /// own beat, and this host's memory accounting read after the fact.
 ///
-/// Memory is attributed in two grades and they are labelled differently on
+/// Memory is attributed in three grades and they are labelled differently on
 /// purpose, the same way [`super::embed`] grades an embed that lost its daemon.
-/// A cgroup that recorded a kill is the kernel's own statement and is reported
-/// as observed. A resident set that had climbed to within
-/// [`NEAR_CEILING_FRACTION`] of the ceiling is a strong prior and nothing more,
-/// so it is reported as likely. With neither, the phase and the process death
-/// are still reported and memory is not mentioned at all: a daemon that died
-/// for another reason must not be handed a diagnosis nobody measured.
+/// A kill the cgroup recorded while this commit ran is the kernel's own
+/// statement and is reported as observed. A charge that hit the container's
+/// ceiling during the commit without anything being killed, and a resident set
+/// that had climbed to within [`NEAR_CEILING_FRACTION`] of the ceiling, are
+/// both strong priors and nothing more, so both are reported as likely. With
+/// none of the three, the phase and the process death are still reported and
+/// memory is not mentioned at all: a daemon that died for another reason must
+/// not be handed a diagnosis nobody measured.
 pub fn daemon_loss_explanation(
     abandoned: Option<&kin_daemon_spawn::OpenTransaction>,
     daemon_alive: bool,
@@ -301,20 +303,29 @@ fn memory_attribution(
     evidence: &crate::capability::MemoryEvidence,
 ) -> Option<String> {
     let observed_kills = evidence.cgroup_oom_kills.filter(|count| *count > 0);
+    let observed_ceiling_hits = evidence.cgroup_ceiling_hits.filter(|count| *count > 0);
     let near_ceiling = observed_rss(open)
         .is_some_and(|rss| rss as f64 >= evidence.limit_bytes as f64 * NEAR_CEILING_FRACTION);
-    let cause = match (observed_kills, near_ceiling) {
-        (Some(count), _) => format!(
+    let cause = match (observed_kills, observed_ceiling_hits, near_ceiling) {
+        (Some(count), _, _) => format!(
             "This machine's kernel recorded {count} out-of-memory kill(s) against the {} \
-             available here, so the commit ran out of memory.",
+             available here while this commit ran, so the commit ran out of memory.",
             human_bytes(evidence.limit_bytes)
         ),
-        (None, true) => format!(
+        // No byte figure here, for the reason [`super::embed`] gives at the
+        // same grade: the ceiling count and `limit_bytes` come from two
+        // separate walks up the cgroup tree, and pairing them would let a
+        // host-RAM figure be quoted as a ceiling a container reached.
+        (None, Some(hits), _) => format!(
+            "This container's memory charge was held at its ceiling {hits} time(s) while this \
+             commit ran, so it most likely ran out of memory."
+        ),
+        (None, None, true) => format!(
             "That is within {}% of the {} available here, so it most likely ran out of memory.",
             (100.0 - NEAR_CEILING_FRACTION * 100.0).round(),
             human_bytes(evidence.limit_bytes)
         ),
-        (None, false) => return None,
+        (None, None, false) => return None,
     };
     Some(format!("{cause} {COMMIT_MEMORY_REMEDY}"))
 }
@@ -434,6 +445,7 @@ mod tests {
             limit_bytes,
             limit_source: crate::capability::MemoryLimitSource::HostRam,
             cgroup_oom_kills: oom_kills,
+            cgroup_ceiling_hits: None,
         }
     }
 
@@ -555,6 +567,105 @@ mod tests {
         assert!(
             !explained.contains("ran out of memory"),
             "no measurement supports a memory diagnosis here: {explained}"
+        );
+    }
+
+    /// A container reading, for an arm that has to place a history before the
+    /// commit it is judging.
+    fn cgroup(
+        limit_bytes: u64,
+        oom_kills: u64,
+        ceiling_hits: u64,
+    ) -> kin_daemon_spawn::CgroupMemory {
+        kin_daemon_spawn::CgroupMemory {
+            limit_bytes: Some(limit_bytes),
+            oom_kills: Some(oom_kills),
+            ceiling_hits: Some(ceiling_hits),
+            ..kin_daemon_spawn::CgroupMemory::default()
+        }
+    }
+
+    /// The evidence one commit produces, from the readings that bracket it.
+    fn across_commit(
+        start: kin_daemon_spawn::CgroupMemory,
+        end: kin_daemon_spawn::CgroupMemory,
+    ) -> crate::capability::MemoryEvidence {
+        crate::capability::evidence_from(
+            64 * GIB,
+            end,
+            Some(crate::capability::MemoryBaseline::from_reading(start)),
+        )
+    }
+
+    /// FIR-1823 on the commit path, which carried the same defect as the embed
+    /// one and for the same reason.
+    ///
+    /// The daemon here died holding 2 GiB against a 64 GiB ceiling, which is no
+    /// memory failure by any reading. The only thing that ever made it look
+    /// like one was a kill counter that had been sitting at two since long
+    /// before this commit started.
+    #[test]
+    fn a_kill_from_before_this_commit_is_not_this_commits_kill() {
+        let marker = abandoned_marker(Some(2 * GIB), Some(2 * GIB));
+
+        let unmoved = across_commit(cgroup(64 * GIB, 2, 40), cgroup(64 * GIB, 2, 40));
+        let explained = daemon_loss_explanation(marker.as_deref(), false, 1_006, &unmoved)
+            .expect("a dead daemon holding a marker is still explained by its phase");
+        assert!(
+            !explained.contains("ran out of memory"),
+            "two kills that predate this commit are not evidence about this commit: {explained}"
+        );
+        assert!(
+            explained.contains("reconcile_workspace_and_commit_authority"),
+            "the phase is still worth reporting whatever killed it: {explained}"
+        );
+
+        // The control that proves the arm above can fail.
+        let moved = across_commit(cgroup(64 * GIB, 2, 40), cgroup(64 * GIB, 3, 40));
+        let killed = daemon_loss_explanation(marker.as_deref(), false, 1_006, &moved)
+            .expect("a kill during the commit must be explained in memory terms");
+        assert!(
+            killed.contains("recorded 1 out-of-memory kill(s)"),
+            "the count reported must be this commit's one, not the container's three: {killed}"
+        );
+        assert!(
+            killed.contains("so the commit ran out of memory"),
+            "a kill during the commit is the kernel's own statement: {killed}"
+        );
+    }
+
+    /// The ceiling-hit counter on the commit path.
+    ///
+    /// A commit whose container was held against its cap the whole time, with
+    /// a resident set nowhere near it because the kernel kept reclaiming, used
+    /// to produce no memory sentence at all.
+    #[test]
+    fn a_charge_pinned_at_the_ceiling_during_the_commit_is_reported_as_likely() {
+        let marker = abandoned_marker(Some(2 * GIB), Some(2 * GIB));
+
+        let pinned = across_commit(cgroup(12 * GIB, 1, 100), cgroup(12 * GIB, 1, 1_071));
+        let explained = daemon_loss_explanation(marker.as_deref(), false, 1_006, &pinned)
+            .expect("a dead daemon holding a marker must be explained");
+        assert!(
+            explained.contains("971 time(s)"),
+            "the count reported must be this commit's own advance: {explained}"
+        );
+        assert!(
+            explained.contains("most likely ran out of memory"),
+            "a ceiling the kernel absorbed is a prior, not a kill it performed: {explained}"
+        );
+        assert!(
+            !explained.contains("out-of-memory kill"),
+            "nothing was killed during this commit and nothing may say one was: {explained}"
+        );
+
+        // The control. Same history, and a counter that did not move.
+        let untouched = across_commit(cgroup(12 * GIB, 1, 1_071), cgroup(12 * GIB, 1, 1_071));
+        let quiet = daemon_loss_explanation(marker.as_deref(), false, 1_006, &untouched)
+            .expect("the phase still explains itself");
+        assert!(
+            !quiet.contains("ran out of memory"),
+            "1071 ceiling hits that all predate this commit say nothing about it: {quiet}"
         );
     }
 

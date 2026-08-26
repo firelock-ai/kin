@@ -520,6 +520,7 @@ fn parse_php_use_declaration(node: &tree_sitter::Node, source: &[u8]) -> Option<
             };
 
             return Some(FileImport {
+                site: crate::adapter::site_from_node(node),
                 module_path: full_path,
                 specifiers: vec![ImportedName {
                     local_name,

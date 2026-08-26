@@ -713,6 +713,7 @@ fn extract_swift_import(node: &tree_sitter::Node, source: &[u8]) -> Option<FileI
         .to_string();
 
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers: vec![ImportedName {
             local_name,

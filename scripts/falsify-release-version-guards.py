@@ -42,7 +42,18 @@ VERSION = "scripts/check-release-version.mjs"
 VERSION_SUITE = "scripts/check-release-version.test.mjs"
 PREPARE = "scripts/prepare-release.mjs"
 PREPARE_SUITE = "scripts/prepare-release.test.mjs"
-COPIED = (INTENT, INTENT_SUITE, VERSION, VERSION_SUITE, PREPARE, PREPARE_SUITE)
+PROOF = "scripts/check-release-proof-artifacts.mjs"
+PROOF_SUITE = "scripts/check-release-proof-artifacts.test.mjs"
+COPIED = (
+    INTENT,
+    INTENT_SUITE,
+    VERSION,
+    VERSION_SUITE,
+    PREPARE,
+    PREPARE_SUITE,
+    PROOF,
+    PROOF_SUITE,
+)
 
 
 class FalsificationError(RuntimeError):
@@ -233,6 +244,21 @@ PROBES: tuple[tuple[str, str, str, Callable[[Path], None]], ...] = (
         lambda tree: poison(
             tree,
             PREPARE,
+            "  try {\n"
+            "    return realpathSync(entry) === realpathSync(self);\n"
+            "  } catch {\n"
+            "    return true;\n"
+            "  }",
+            "  return false;",
+        ),
+    ),
+    (
+        "the proof-artifact gate's entry point goes back to unresolved paths",
+        PROOF_SUITE,
+        "the gate runs from a copy reached through a symlinked directory",
+        lambda tree: poison(
+            tree,
+            PROOF,
             "  try {\n"
             "    return realpathSync(entry) === realpathSync(self);\n"
             "  } catch {\n"

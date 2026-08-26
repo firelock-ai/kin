@@ -58,10 +58,10 @@ pub use extract::{
     FILE_SURFACE_CONTEXT_KEY,
 };
 pub use languages::{
-    attach_go_command_effect_contract_metadata, is_python_builtin_name, AdapterRegistry, CAdapter,
-    CSharpAdapter, CppAdapter, GoAdapter, HclAdapter, JavaAdapter, JavaScriptAdapter,
-    KotlinAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter, SwiftAdapter,
-    TypeScriptAdapter, PYTHON_BUILTIN_NAMES,
+    attach_go_command_effect_contract_metadata, is_python_builtin_name, language_ordinal,
+    AdapterRegistry, CAdapter, CSharpAdapter, CppAdapter, GoAdapter, HclAdapter, JavaAdapter,
+    JavaScriptAdapter, KotlinAdapter, PhpAdapter, PythonAdapter, RubyAdapter, RustAdapter,
+    SwiftAdapter, TypeScriptAdapter, ALL_LANGUAGE_IDS, PYTHON_BUILTIN_NAMES,
 };
 pub use shallow::{
     extract_shallow, get_shallow_grammar, parse_shallow_file, ShallowDecl, ShallowDeclKind,

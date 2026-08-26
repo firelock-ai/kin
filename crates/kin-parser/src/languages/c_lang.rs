@@ -514,6 +514,7 @@ fn extract_c_include(
                 .to_string();
 
             imports.push(FileImport {
+                site: crate::adapter::site_from_node(node),
                 module_path,
                 specifiers: vec![ImportedName {
                     local_name,

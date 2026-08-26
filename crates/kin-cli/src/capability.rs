@@ -407,19 +407,134 @@ pub struct MemoryEvidence {
     /// Which of those two `limit_bytes` came from, so a surface quoting it can
     /// name what it read instead of leaving a reader to guess.
     pub limit_source: MemoryLimitSource,
-    /// Kernel OOM kills accounted to this cgroup. `None` means no accounting
-    /// was readable, which is "not observed" and never "did not happen".
+    /// Kernel OOM kills the cgroup recorded BETWEEN the baseline this evidence
+    /// was measured against and the moment it was taken.
+    ///
+    /// Not a lifetime total, and that distinction is the whole of FIR-1823.
+    /// The kernel's counter only ever counts upwards for as long as the cgroup
+    /// exists, so a container that killed something an hour ago answers the
+    /// question "have you ever" with a number, and a surface that reads it as
+    /// "did this run" hands a caller an unhedged wrong cause for a failure that
+    /// had nothing to do with memory. Two readings can tell those apart; one
+    /// cannot.
+    ///
+    /// `Some(0)` is the kernel saying nothing was killed while this run was
+    /// going on. `None` is this process being unable to say: no accounting was
+    /// readable, no baseline was taken, or the counter moved backwards because
+    /// the cgroup was not the same one both times. All three are "not
+    /// observed", and none of them is "did not happen".
     pub cgroup_oom_kills: Option<u64>,
+    /// Times the cgroup's charge was held at its own ceiling over that same
+    /// window, graded exactly as the kills above are.
+    ///
+    /// This is the evidence a run that was never killed used to leave nowhere a
+    /// reader could find it. A container that spends its life pinned against
+    /// the cap, reclaiming on every allocation, is in obvious memory trouble
+    /// and reports `oom_kills` of zero; before this field the only honest thing
+    /// any diagnosis could say about it was nothing at all. The 4 GiB arm on
+    /// 2026-08-25 recorded 6344 ceiling hits, and no kin surface read one of
+    /// them.
+    pub cgroup_ceiling_hits: Option<u64>,
 }
 
-/// Read what this host will say about memory pressure right now.
+/// The cumulative cgroup counters as they stood before a piece of work began.
+///
+/// Taken by a caller that intends to diagnose its own failure later, because
+/// the counters it will want are cumulative and a single reading of a
+/// cumulative counter cannot be attributed to anything. This is the same shape
+/// `kin_daemon_spawn` already grades a daemon's death with, for the same
+/// reason: the reading taken before is what makes the reading taken after mean
+/// something.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryBaseline {
+    oom_kills: Option<u64>,
+    ceiling_hits: Option<u64>,
+}
+
+impl MemoryBaseline {
+    /// The counters out of a reading already taken.
+    pub(crate) fn from_reading(cgroup: kin_daemon_spawn::CgroupMemory) -> Self {
+        Self {
+            oom_kills: cgroup.oom_kills,
+            ceiling_hits: cgroup.ceiling_hits,
+        }
+    }
+}
+
+/// Take the counters as they stand now, to compare a later reading against.
+pub fn memory_baseline() -> MemoryBaseline {
+    MemoryBaseline::from_reading(kin_daemon_spawn::cgroup_memory())
+}
+
+/// How far a cumulative counter advanced between two readings.
+///
+/// `None` unless both readings exist and the second is not behind the first. A
+/// counter that went backwards belongs to a cgroup that is not the one the
+/// baseline described, and a difference taken across two different scopes is
+/// not a measurement of anything.
+fn counter_advance(before: Option<u64>, after: Option<u64>) -> Option<u64> {
+    match (before, after) {
+        (Some(before), Some(after)) if after >= before => Some(after - before),
+        _ => None,
+    }
+}
+
+/// Read the ceiling this process runs under, attributing no counter movement.
+///
+/// For a caller that wants the ceiling and nothing else: a notice printed
+/// before any work starts, or a health row scoring the machine. Both counter
+/// fields come back `None`, because without a baseline there is no window to
+/// attribute movement to and reporting a lifetime total in a field documented
+/// as a per-run one is the defect this signature exists to make impossible.
+/// A caller that has to explain a failure it just saw takes
+/// [`memory_baseline`] first and calls [`memory_evidence_since`] instead.
 pub fn memory_evidence() -> MemoryEvidence {
-    let (limit_bytes, limit_source) =
-        resolve_memory_limit(host_ram_bytes(), cgroup_memory_limit_bytes());
+    evidence_from(host_ram_bytes(), kin_daemon_spawn::cgroup_memory(), None)
+}
+
+/// Read the ceiling, plus what the cgroup's counters did since `baseline`.
+pub fn memory_evidence_since(baseline: MemoryBaseline) -> MemoryEvidence {
+    evidence_from(
+        host_ram_bytes(),
+        kin_daemon_spawn::cgroup_memory(),
+        Some(baseline),
+    )
+}
+
+/// Core of both readers with every input passed in, so each branch is testable
+/// on any host.
+///
+/// The seam is here rather than one layer up because the branch that matters is
+/// the one no macOS developer can reach: a container with a violent history,
+/// judged against a baseline. A test that can only reach it through
+/// `/sys/fs/cgroup` is a test that never runs on the machine the code is
+/// written on.
+pub(crate) fn evidence_from(
+    host_ram_bytes: u64,
+    cgroup: kin_daemon_spawn::CgroupMemory,
+    baseline: Option<MemoryBaseline>,
+) -> MemoryEvidence {
+    let (limit_bytes, limit_source) = resolve_memory_limit(host_ram_bytes, cgroup.limit_bytes);
+    // No baseline is no window, and no window is no attribution. Falling back
+    // to the raw lifetime totals here is exactly FIR-1823, so the absent case
+    // reports nothing rather than reporting the container's whole history as
+    // though it belonged to whatever just failed.
+    let baseline = match baseline {
+        Some(baseline) => baseline,
+        None => {
+            return MemoryEvidence {
+                limit_bytes,
+                limit_source,
+                cgroup_oom_kills: None,
+                cgroup_ceiling_hits: None,
+            };
+        }
+    };
     MemoryEvidence {
         limit_bytes,
         limit_source,
-        cgroup_oom_kills: cgroup_oom_kill_count(),
+        cgroup_oom_kills: counter_advance(baseline.oom_kills, cgroup.oom_kills),
+        cgroup_ceiling_hits: counter_advance(baseline.ceiling_hits, cgroup.ceiling_hits),
     }
 }
 
@@ -494,17 +609,6 @@ fn cgroup_memory_limit_bytes() -> Option<u64> {
     kin_daemon_spawn::cgroup_memory().limit_bytes
 }
 
-/// How many times the kernel OOM-killed a process accounted to this cgroup, or
-/// `None` when no accounting is readable (off Linux, or neither hierarchy's
-/// file is present).
-///
-/// The distinction that matters to a caller is `Some(0)` against `None`: the
-/// first is the kernel saying nothing was killed, the second is this process
-/// being unable to ask.
-fn cgroup_oom_kill_count() -> Option<u64> {
-    kin_daemon_spawn::cgroup_memory().oom_kills
-}
-
 /// Whole-core count for a cgroup v2 `cpu.max` value ("<quota> <period>" in µs,
 /// or "max <period>"). Rounds a fractional quota up to one core; `None` when
 /// unlimited or unparsable.
@@ -539,6 +643,102 @@ fn parse_v1_cpu_quota(quota_us: i64, period_us: i64) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A container reading with a history: killed before, pinned before.
+    fn cgroup(oom_kills: Option<u64>, ceiling_hits: Option<u64>) -> kin_daemon_spawn::CgroupMemory {
+        kin_daemon_spawn::CgroupMemory {
+            limit_bytes: Some(4 * 1024 * 1024 * 1024),
+            oom_kills,
+            ceiling_hits,
+            ..kin_daemon_spawn::CgroupMemory::default()
+        }
+    }
+
+    const HOST_RAM: u64 = 64 * 1024 * 1024 * 1024;
+
+    /// FIR-1823, at the layer that decides it. Both counters are cumulative for
+    /// the container's whole life, so the number that answers "did this run"
+    /// is the difference across the run and never the total after it.
+    ///
+    /// The two arms are identical except for when the kill happened. A run that
+    /// began and ended at three killed nothing, however loudly the container's
+    /// history reads; a run that began at three and ended at four killed one.
+    /// Before the fix both of these reported three.
+    #[test]
+    fn counters_are_the_advance_across_the_run_not_the_containers_lifetime() {
+        let before = MemoryBaseline::from_reading(cgroup(Some(3), Some(900)));
+
+        let quiet = evidence_from(HOST_RAM, cgroup(Some(3), Some(900)), Some(before));
+        assert_eq!(
+            quiet.cgroup_oom_kills,
+            Some(0),
+            "a counter that did not move means this run killed nothing, not that three kills \
+             belong to it"
+        );
+        assert_eq!(quiet.cgroup_ceiling_hits, Some(0));
+
+        let killed = evidence_from(HOST_RAM, cgroup(Some(4), Some(1_244)), Some(before));
+        assert_eq!(
+            killed.cgroup_oom_kills,
+            Some(1),
+            "one kill during the run is one kill, not the four the container has ever seen"
+        );
+        assert_eq!(
+            killed.cgroup_ceiling_hits,
+            Some(344),
+            "the ceiling counter is graded the same way, for the same reason"
+        );
+    }
+
+    /// The reading with no baseline attributes nothing, whatever the container
+    /// has been through.
+    ///
+    /// This is the property the fix rests on. A caller that never took a
+    /// before-reading cannot be handed a per-run number, so the worst a future
+    /// edit reverting to this reader can produce is a hedged diagnosis, never a
+    /// confident wrong one.
+    #[test]
+    fn a_reading_with_no_baseline_attributes_no_counter_movement() {
+        let violent = evidence_from(HOST_RAM, cgroup(Some(9), Some(6_344)), None);
+        assert_eq!(
+            violent.cgroup_oom_kills, None,
+            "nine lifetime kills belong to no particular run and must be reported as belonging \
+             to none"
+        );
+        assert_eq!(violent.cgroup_ceiling_hits, None);
+        assert_eq!(
+            violent.limit_bytes,
+            4 * 1024 * 1024 * 1024,
+            "the ceiling is still read; it is the attribution that is withheld"
+        );
+    }
+
+    /// The three ways an advance is not measurable, each distinct from zero.
+    #[test]
+    fn an_unaskable_or_incoherent_counter_is_not_an_advance_of_zero() {
+        let unreadable = MemoryBaseline::from_reading(cgroup(None, None));
+        let now = evidence_from(HOST_RAM, cgroup(Some(4), Some(10)), Some(unreadable));
+        assert_eq!(
+            now.cgroup_oom_kills, None,
+            "a baseline nobody could read cannot be subtracted from"
+        );
+        assert_eq!(now.cgroup_ceiling_hits, None);
+
+        let readable = MemoryBaseline::from_reading(cgroup(Some(4), Some(10)));
+        let gone = evidence_from(HOST_RAM, cgroup(None, None), Some(readable));
+        assert_eq!(
+            gone.cgroup_oom_kills, None,
+            "a host that stopped answering reports nothing, not that nothing happened"
+        );
+
+        let backwards = evidence_from(HOST_RAM, cgroup(Some(1), Some(2)), Some(readable));
+        assert_eq!(
+            backwards.cgroup_oom_kills, None,
+            "a counter behind its own baseline belongs to a different cgroup, and the difference \
+             across two scopes measures nothing"
+        );
+        assert_eq!(backwards.cgroup_ceiling_hits, None);
+    }
 
     #[test]
     fn tier_names_match_env_override_tokens() {

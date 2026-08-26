@@ -373,6 +373,7 @@ fn extract_csharp_import(node: &Node, source: &[u8]) -> Option<FileImport> {
         .unwrap_or(module_path.as_str())
         .to_string();
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path,
         specifiers: vec![ImportedName {
             local_name,
@@ -782,6 +783,7 @@ fn extract_ruby_require(node: &Node, source: &[u8]) -> Option<FileImport> {
         .unwrap_or(trimmed)
         .to_string();
     Some(FileImport {
+        site: crate::adapter::site_from_node(node),
         module_path: trimmed.to_string(),
         specifiers: vec![ImportedName {
             local_name,

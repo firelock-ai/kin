@@ -169,6 +169,7 @@ impl Verdict {
             ("withheld_candidates", withheld_candidates_reading(payload)),
             ("degradations", degradations_reading(payload)),
             ("completeness", completeness_reading(envelope)),
+            ("graph_freshness", graph_freshness_reading(envelope)),
         ];
 
         if readings
@@ -234,6 +235,54 @@ impl Verdict {
     /// reader acts on, so they follow the one verdict; `status`, `classes`,
     /// `decided_by` and `limits` are the observation the verdict was computed
     /// from and stay exactly as measured.
+    /// The qualifiers that stop the `edge_coverage` block licensing a
+    /// certification on its own, named by the input that limits it.
+    ///
+    /// The block reports what a scan observed. It does not, and must not, report
+    /// whether the answer around it can be trusted as whole, and a reader with
+    /// only the block in hand cannot tell those apart: "every requested class is
+    /// present" and "this answer's completeness is unknown" are both true at
+    /// once, and the block renders only the first. A suite reading it alone
+    /// therefore graded it as certifying beside a completeness that refused, and
+    /// that is one response with two verdicts.
+    ///
+    /// This never re-derives another block's state. It reads the states this
+    /// verdict already computed, which is why it lives here: `compute` is the
+    /// one place holding every input, so the block's self-presentation and the
+    /// verdict cannot drift. An empty list means the block licenses on its own.
+    ///
+    /// The class states themselves are left alone. A class that is present IS
+    /// present, and reporting it otherwise to settle a disagreement would make a
+    /// true fact read false, which is the failure this envelope exists to stop.
+    /// The list is DERIVED from `self.inputs` rather than written out, because
+    /// "every input except `edge_coverage`" spelled as four names is only
+    /// correct until a fifth arrives. A name this function has never heard of
+    /// yields a shorter list, not an error, so the block would go on presenting
+    /// itself as licensing on its own while a reading nobody enumerated here
+    /// refused. That is the edge-class trap in its other form: the hazard is not
+    /// a consumer that counts a class, it is a producer that enumerates the
+    /// classes it knows.
+    ///
+    /// Sorted so the stamp is byte-stable. `Map` is a `BTreeMap` unless
+    /// serde_json's `preserve_order` is enabled, and a wire field's order should
+    /// not depend on a feature flag in a transitive dependency.
+    pub fn edge_coverage_limits(&self) -> Vec<String> {
+        if self.inputs.get("edge_coverage").and_then(Value::as_str) != Some(CERTIFIED) {
+            // The block already qualifies itself; nothing to add.
+            return Vec::new();
+        }
+        let mut limits: Vec<String> = self
+            .inputs
+            .iter()
+            .filter(|(name, state)| {
+                name.as_str() != "edge_coverage" && state.as_str() == Some(INCONCLUSIVE)
+            })
+            .map(|(name, _)| format!("{name}:inconclusive"))
+            .collect();
+        limits.sort();
+        limits
+    }
+
     pub fn project_onto_completeness(
         &self,
         completeness: &mut Option<crate::envelope::Completeness>,
@@ -523,6 +572,41 @@ fn degradations_reading(payload: &Value) -> Reading {
 }
 
 /// The completeness signal's own reading of the substrate and the numbers.
+/// Graph freshness as a verdict input: wired, and deliberately weighing nothing
+/// until the durable marker reaches the health wire.
+///
+/// The clock reaches the envelope now (see [`crate::envelope::GraphFreshness`]),
+/// which is the half of FIR-2226 that could be done honestly here. This is the
+/// seam that will carry it into the verdict, and it reports [`Reading::Silent`]
+/// in every state on purpose, contributing neither agreement nor refusal.
+///
+/// **Why not refuse when no admission is recorded.** The wire's clock is the
+/// daemon's in-memory record, set only by a completed exact-tree admission pass,
+/// so a freshly initialized store whose daemon has not yet run one carries
+/// nothing. Absence is therefore the ordinary state of a healthy new store, not
+/// evidence of staleness, and refusing on it puts a floor under every answer on
+/// every such store. That is the regression `crate::negative`'s own gate comment
+/// warns about, and the acceptance suite's anti-vacuity control caught this
+/// module doing it.
+///
+/// **Why not certify when one IS recorded.** A present clock proves an admission
+/// completed at some time. It does not prove the store is current, and the
+/// verdict's note asserts agreement of every input, so certifying here would
+/// state exactly the false all-clear for the case this cannot see: a months-stale
+/// store under a daemon that has been up the whole time and admitted once.
+///
+/// Both halves need the same missing fact, a reading the daemon does not
+/// publish: the durable last-admission marker, which survives a restart and
+/// carries `tracked_artifacts` beside its timestamp. With it, absence and
+/// staleness separate and this becomes a real input. Until then, silence is the
+/// only honest reading, and a silent input never contributes agreement, so
+/// nothing here can license an answer either.
+fn graph_freshness_reading(envelope: &Envelope) -> Reading {
+    // Read so the field is provably consumed and the seam is not decorative.
+    let _ = envelope.freshness.as_ref();
+    Reading::Silent
+}
+
 fn completeness_reading(envelope: &Envelope) -> Reading {
     let Some(completeness) = &envelope.completeness else {
         return Reading::Silent;
@@ -713,6 +797,40 @@ pub fn disagreements(response: &Value) -> Vec<String> {
         }
     }
 
+    // The five arms above all read one direction: a surface claiming
+    // certification under an inconclusive verdict. Nothing read the other way,
+    // which is why a shipped envelope could carry a CERTIFIED verdict over a
+    // completeness that refused and still grade clean. A contradiction does not
+    // care which side is the optimistic one.
+    if certified {
+        if let Some(completeness) = response
+            .get(crate::envelope::ENVELOPE_KEY)
+            .and_then(|envelope| envelope.get("completeness"))
+        {
+            let bound = completeness.get("bound").and_then(Value::as_str);
+            if matches!(bound, Some("at_least")) {
+                found.push(
+                    "_kin.completeness.bound reads at_least under a certified _kin.verdict"
+                        .to_string(),
+                );
+            }
+            if completeness.get("status").and_then(Value::as_str) == Some("unknown") {
+                found.push(
+                    "_kin.completeness.status reads unknown under a certified _kin.verdict"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(negative) = response.get(crate::negative::NEGATIVE_KEY) {
+            if matches!(
+                negative.get("trust").and_then(Value::as_str),
+                Some("inconclusive") | Some("unreliable")
+            ) {
+                found.push("negative.trust refuses under a certified _kin.verdict".to_string());
+            }
+        }
+    }
+
     found.extend(headline_count_disagreements(response));
     found
 }
@@ -779,6 +897,192 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FIR-2226 step 1. The clock reaches the envelope; the verdict seam is
+    /// wired and deliberately weighs nothing yet.
+    ///
+    /// The arms below assert exactly that and no more. An earlier version of
+    /// this change refused when no admission was recorded, and the acceptance
+    /// suite's anti-vacuity control caught it certifying nothing: absence of the
+    /// in-memory clock is the ordinary state of a healthy fresh store, so
+    /// refusing on it floors every answer on every such store. The arms are
+    /// written against what this can honestly claim rather than against what it
+    /// was hoped to do.
+    ///
+    /// Driven through `with_health` using the producer's own field names, and
+    /// both are `skip_serializing_if = "Option::is_none"` there, which is why the
+    /// no-clock arm omits the key rather than setting it null.
+    mod graph_freshness {
+        use super::*;
+
+        fn envelope_with(reconcile: Value) -> Envelope {
+            Envelope::daemon().with_health(&json!({
+                "graph_loaded": true,
+                "initialized": true,
+                "reconcile": reconcile,
+            }))
+        }
+
+        fn with_clock() -> Envelope {
+            envelope_with(json!({
+                "untracked_path_count": 0,
+                "last_admission_success_at": "2026-08-26T00:00:00Z",
+                "last_admission_success_age_seconds": 12,
+            }))
+        }
+
+        fn without_clock() -> Envelope {
+            envelope_with(json!({ "untracked_path_count": 0 }))
+        }
+
+        /// The disclosure, which is what step 1 actually delivers. Both stores
+        /// below hold zero unadmitted paths, so `behind` is silent by design and
+        /// used to take the clock down with it.
+        #[test]
+        fn the_clock_is_published_even_when_nothing_is_unadmitted() {
+            let recorded = with_clock();
+            assert!(
+                recorded.behind.is_none(),
+                "the count gate is what used to discard this: {:?}",
+                recorded.behind
+            );
+            assert!(
+                matches!(
+                    recorded.freshness,
+                    Some(crate::envelope::GraphFreshness::Recorded { .. })
+                ),
+                "a clean working copy must not hide a clock the daemon sent: {:?}",
+                recorded.freshness
+            );
+            assert!(
+                matches!(
+                    without_clock().freshness,
+                    Some(crate::envelope::GraphFreshness::NoAdmissionRecorded)
+                ),
+                "and the absence of one is itself a reading, not a parse failure"
+            );
+        }
+
+        /// A runtime that reported no reconcile block has nothing to publish.
+        /// Distinct from a block that carries no clock, and the two must not
+        /// collapse.
+        #[test]
+        fn a_runtime_reporting_no_reconcile_block_publishes_nothing() {
+            let envelope = Envelope::daemon().with_health(&json!({ "graph_loaded": true }));
+            assert!(envelope.freshness.is_none());
+        }
+
+        /// The seam weighs nothing, with a clock. Certifying here would state
+        /// agreement this cannot support: a present clock proves an admission
+        /// happened at some time, not that the store is current, and the
+        /// verdict's note asserts every input agreed.
+        #[test]
+        fn a_recorded_clock_does_not_certify() {
+            assert!(matches!(
+                graph_freshness_reading(&with_clock()),
+                Reading::Silent
+            ));
+        }
+
+        /// The seam weighs nothing, without one. Refusing here floors every
+        /// answer on every freshly initialized store, because the wire's clock is
+        /// the daemon's in-memory record and a daemon that has not yet completed
+        /// an admission pass carries none. This arm is the one the acceptance
+        /// control already proved can fail.
+        #[test]
+        fn an_unrecorded_clock_does_not_refuse() {
+            assert!(matches!(
+                graph_freshness_reading(&without_clock()),
+                Reading::Silent
+            ));
+        }
+
+        /// The readings array and the stamp's derivation agree on every name,
+        /// which neither side can prove on its own.
+        ///
+        /// kin#1123 asserts `edge_coverage_limits` picks up an input the
+        /// function was never told about, and it happens to use
+        /// `graph_freshness` as that unknown name, with the map built by hand.
+        /// The arms above assert `compute` puts `graph_freshness` into the map.
+        /// Both hardcode the string, so renaming the reading leaves both green
+        /// while the real behaviour breaks: the stamp would go on naming a key
+        /// nothing emits, and the emitted key would be one nothing names.
+        ///
+        /// So this asserts the join rather than either end. It reads the names
+        /// `compute` actually produced and requires the stamp to name each one
+        /// when that input refuses, which is a property over the real input set
+        /// and cannot be satisfied by a string written twice.
+        #[test]
+        fn every_input_compute_emits_is_one_the_stamp_can_name() {
+            let verdict = Verdict::compute(
+                "find_references",
+                &json!({ "references": [] }),
+                &with_clock(),
+                None,
+            )
+            .expect("the readings are not all silent");
+            let names: Vec<String> = verdict.inputs.keys().cloned().collect();
+            assert!(
+                names.iter().any(|name| name == "graph_freshness"),
+                "the seam must be in the stamp's input set at all: {names:?}"
+            );
+
+            for name in names {
+                if name == "edge_coverage" {
+                    continue;
+                }
+                let mut inputs = Map::new();
+                inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+                inputs.insert(name.clone(), json!(INCONCLUSIVE));
+                let refusing = Verdict {
+                    certified: false,
+                    safe_to_conclude_absent: false,
+                    limiting_factor: Some(format!("{name}: refusing")),
+                    inputs,
+                };
+                assert!(
+                    refusing
+                        .edge_coverage_limits()
+                        .contains(&format!("{name}:inconclusive")),
+                    "the stamp must name {name}, which compute emits, without being told about it"
+                );
+            }
+        }
+
+        /// End to end: neither store may pick up a freshness clause, and the
+        /// input is present in the stamp as `not_applicable` rather than absent,
+        /// so the seam is visible to a reader and to the next reading added.
+        #[test]
+        fn neither_store_puts_a_freshness_clause_in_the_verdict() {
+            for envelope in [with_clock(), without_clock()] {
+                let verdict = Verdict::compute(
+                    "find_references",
+                    &json!({ "references": [] }),
+                    &envelope,
+                    None,
+                );
+                let Some(verdict) = verdict else { continue };
+                assert_eq!(
+                    verdict
+                        .inputs
+                        .get("graph_freshness")
+                        .and_then(Value::as_str),
+                    Some(NOT_APPLICABLE),
+                    "the seam is wired and weighs nothing: {:?}",
+                    verdict.inputs
+                );
+                assert!(
+                    !verdict
+                        .limiting_factor
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("graph_admission"),
+                    "no freshness clause may reach the factor yet: {:?}",
+                    verdict.limiting_factor
+                );
+            }
+        }
+    }
 
     /// FIR-2672, second finding. A verdict with two independent reasons names
     /// both: the class gap decided the state and the failed embedding worker
@@ -1245,6 +1549,139 @@ mod tests {
     /// `negative` or `_kin.verdict` certifying an answer whose rows were removed
     /// is the same defect arriving through the one path that removes answers on
     /// purpose.
+    /// An input this function never heard of still limits the stamp.
+    ///
+    /// The list used to be four names written out, which is "every input except
+    /// `edge_coverage`" in a five-input world and silently wrong in a six-input
+    /// one. A reading added later would not appear, and the failure is the
+    /// quiet kind: a missing name yields a SHORTER list, never an error, so the
+    /// block goes on presenting itself as licensing on its own beside an input
+    /// that refuses.
+    ///
+    /// This test is shaped like the mutation that catches it. The name is
+    /// deliberately one no code in this file mentions, so it cannot pass by
+    /// being enumerated somewhere; the hardcoded version fails it, and any
+    /// future hardcoded version will fail it too. The pair of assertions is the
+    /// point: an unknown input that REFUSES must appear, and an unknown input
+    /// that certifies must not, or a function returning every input it sees
+    /// would pass the first assertion alone.
+    #[test]
+    fn an_input_this_function_has_never_heard_of_still_limits_the_stamp() {
+        let build = |unknown_state: &str| {
+            let mut inputs = Map::new();
+            inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+            inputs.insert("completeness".to_string(), json!(CERTIFIED));
+            inputs.insert("graph_freshness".to_string(), json!(unknown_state));
+            Verdict {
+                certified: false,
+                safe_to_conclude_absent: false,
+                limiting_factor: Some("graph_freshness: the store is stale".to_string()),
+                inputs,
+            }
+        };
+
+        let limits = build(INCONCLUSIVE).edge_coverage_limits();
+        assert!(
+            limits.contains(&"graph_freshness:inconclusive".to_string()),
+            "an input added after this function was written must still limit the block: {limits:?}"
+        );
+
+        assert!(
+            build(CERTIFIED).edge_coverage_limits().is_empty(),
+            "an unknown input that certifies limits nothing, or the function is just \
+             listing its inputs"
+        );
+    }
+
+    /// `edge_coverage` never limits itself, whatever the derivation does.
+    ///
+    /// The old hardcoded list excluded it by not mentioning it. Deriving from
+    /// the map means the exclusion is now a filter clause, which is a line
+    /// someone can delete, so it gets an assertion rather than a comment.
+    #[test]
+    fn the_edge_coverage_input_is_never_one_of_its_own_limits() {
+        let mut inputs = Map::new();
+        inputs.insert("edge_coverage".to_string(), json!(CERTIFIED));
+        inputs.insert("completeness".to_string(), json!(INCONCLUSIVE));
+        let verdict = Verdict {
+            certified: false,
+            safe_to_conclude_absent: false,
+            limiting_factor: Some("completeness: unknown".to_string()),
+            inputs,
+        };
+
+        let limits = verdict.edge_coverage_limits();
+        assert_eq!(limits, vec!["completeness:inconclusive".to_string()]);
+        assert!(
+            !limits
+                .iter()
+                .any(|limit| limit.starts_with("edge_coverage")),
+            "the block cannot cite itself as the reason it does not license: {limits:?}"
+        );
+    }
+
+    /// A CERTIFIED verdict over a completeness that refuses is a contradiction,
+    /// and until now nothing looked for it.
+    ///
+    /// The five arms that existed all read one direction: a surface claiming
+    /// certification under an inconclusive verdict. None read the reverse, so an
+    /// envelope whose verdict certified while its own completeness reported
+    /// `status: unknown` or `bound: at_least` graded clean.
+    ///
+    /// This is the only shape that can falsify the arm. Deleting a detector
+    /// cannot make anything go red, because a detector's absence is silence, so
+    /// the proof has to give it something to detect and confirm it speaks. The
+    /// end-to-end suite cannot do it either: `disagreements` is reached from a
+    /// `debug_assert!`, which a release build compiles out.
+    #[test]
+    fn a_certified_verdict_over_a_refusing_completeness_is_a_disagreement() {
+        let mut response = agreeing_response();
+        // Everything else still agrees; only completeness refuses.
+        response["_kin"]["completeness"]["status"] = json!("unknown");
+        response["_kin"]["completeness"]["bound"] = json!("at_least");
+
+        let found = disagreements(&response);
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("bound reads at_least under a certified")),
+            "a certified verdict over an at_least bound must be reported: {found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("status reads unknown under a certified")),
+            "a certified verdict over an unknown status must be reported: {found:?}"
+        );
+    }
+
+    /// The same arm on the negative block, and the control beside it.
+    ///
+    /// The control is the half that matters: an untouched agreeing response must
+    /// report NOTHING. Without it this pair would pass just as happily if the
+    /// arm reported a disagreement on every response it was handed, which is a
+    /// detector that fires always and is no more useful than one that never
+    /// fires.
+    #[test]
+    fn a_certified_verdict_over_a_refusing_negative_is_a_disagreement() {
+        let mut response = agreeing_response();
+        response["negative"]["trust"] = json!("inconclusive");
+        response["negative"]["safe_to_conclude_absent"] = json!(true);
+
+        let found = disagreements(&response);
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains("negative.trust refuses under a certified")),
+            "a certified verdict over a refusing negative must be reported: {found:?}"
+        );
+
+        assert!(
+            disagreements(&agreeing_response()).is_empty(),
+            "control: an agreeing response must report no disagreement at all"
+        );
+    }
+
     #[test]
     fn a_budget_cut_downgrades_the_verdict_and_the_absence_together() {
         let mut response = agreeing_response();

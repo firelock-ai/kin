@@ -920,6 +920,46 @@ fn should_flush_now(
 /// own after the first reconciliation cycle.
 pub(crate) const AUTO_EMBED_ENV: &str = "KIN_DAEMON_AUTO_EMBED";
 
+/// Fault injection, both off by default and both named for the state they
+/// create rather than for the test that wants it.
+///
+/// The acceptance estate cannot otherwise reach either state. Every suite in
+/// `scripts/acceptance/` runs a three-file fixture, so a daemon over it opens in
+/// under a second and the first query is never slow enough to be owed a
+/// disclosure; and with the embedding backfill trivially short the enrichment
+/// sweep never lags, so a reference answer is never thin. A check that cannot
+/// reach the state it grades passes on its trivial branch and proves nothing,
+/// which is what the first run of `first_query_readiness_repro.py` did.
+///
+/// These ship with their consumer. `scripts/acceptance/first_query_readiness_repro.py`
+/// sets both in CI, so neither is a branch that exists on every daemon and is
+/// exercised by nothing.
+pub(crate) const STARTUP_HOLD_ENV: &str = "KIN_DAEMON_TEST_STARTUP_HOLD_SECS";
+pub(crate) const HOLD_SWEEP_ENV: &str = "KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP";
+
+/// How long to hold the endpoint unpublished, from a raw value.
+///
+/// Pure so the rule is testable without a daemon. Unset, empty, zero and
+/// unparseable all disarm it: a fault injector that fires on a typo is a worse
+/// defect than the one it exists to expose.
+pub(crate) fn startup_hold_from(value: Option<&str>) -> Duration {
+    match value.map(str::trim) {
+        Some(raw) if !raw.is_empty() => raw
+            .parse::<u64>()
+            .map(Duration::from_secs)
+            .unwrap_or(Duration::ZERO),
+        _ => Duration::ZERO,
+    }
+}
+
+/// Whether to refuse the enrichment sweep, from a raw value.
+pub(crate) fn hold_sweep_from(value: Option<&str>) -> bool {
+    matches!(
+        value.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 /// Whether the daemon may queue and drain the embedding backlog without being
 /// asked. Default ON: unset, or any value other than the documented falsy set,
 /// keeps today's behavior exactly. A falsy value defers the pass until an
@@ -3297,7 +3337,20 @@ pub async fn run_with_authority_on(
     // does not: the sweep is handed to the gate below, which starts it once the
     // embedding backfill is out of the way.
     let mut sweep_admitted = false;
-    if enrichment_enabled && state.lsp_enrichment_tx.is_some() {
+    let hold_sweep = hold_sweep_from(std::env::var(HOLD_SWEEP_ENV).ok().as_deref());
+    if hold_sweep {
+        // The thin-answer state, on purpose. Until the sweep publishes, the
+        // cross-file edges a reference answer counts do not exist, so the
+        // surface answers promptly, successfully and with fewer upstreams than
+        // the repository holds. Logged as loudly as any refusal, so a daemon in
+        // this state can never be mistaken for a healthy one.
+        warn!(
+            lever = HOLD_SWEEP_ENV,
+            "refusing to admit the LSP enrichment sweep: fault injection is armed, so cross-file \
+             edges will not publish and reference answers will be thin. This is not a healthy \
+             daemon; unset the lever to restore it."
+        );
+    } else if enrichment_enabled && state.lsp_enrichment_tx.is_some() {
         // A store whose sweeps keep dying before enriching anything gets one
         // fewer, not another. Decided on EVERY daemon start, this is the point
         // the marker-discard loop turns at: a sweep dies, the daemon restarts,
@@ -3412,6 +3465,21 @@ pub async fn run_with_authority_on(
             "a daemon serving this store died without being watched, and this start counted it: {}",
             record.cause_sentence()
         );
+    }
+    // The still-starting state, on purpose. The endpoint file is the readiness
+    // signal a client keys on, so holding it keeps the launcher's startup
+    // binding PENDING, which is the only way a `tools/call` reaches the
+    // disclosure branch on a fixture small enough for CI.
+    let startup_hold = startup_hold_from(std::env::var(STARTUP_HOLD_ENV).ok().as_deref());
+    if !startup_hold.is_zero() {
+        warn!(
+            lever = STARTUP_HOLD_ENV,
+            seconds = startup_hold.as_secs(),
+            "holding the daemon endpoint unpublished: fault injection is armed, so clients will \
+             see a still-starting daemon for this long. This is not a healthy daemon; unset the \
+             lever to restore it."
+        );
+        tokio::time::sleep(startup_hold).await;
     }
     kin_daemon_spawn::publish_serving_daemon(state.layout.root(), std::process::id());
     crate::lifecycle::publish_daemon_endpoint(state.layout.root(), bound_port)
@@ -6150,6 +6218,40 @@ mod tests {
     /// Read `auto_embed_enabled` with `KIN_DAEMON_AUTO_EMBED` held at `value`
     /// (`None` removes it) for the duration of the read. The guard restores what
     /// the process had and serializes against every other env-mutating test.
+    /// Both levers must be off unless somebody deliberately armed them, and a
+    /// typo must disarm rather than arm. A fault injector that fires on a
+    /// malformed value is a worse defect than the one it exists to expose.
+    #[test]
+    fn the_startup_hold_is_disarmed_by_anything_but_a_positive_number() {
+        assert_eq!(super::startup_hold_from(None), Duration::ZERO);
+        assert_eq!(super::startup_hold_from(Some("")), Duration::ZERO);
+        assert_eq!(super::startup_hold_from(Some("   ")), Duration::ZERO);
+        assert_eq!(super::startup_hold_from(Some("0")), Duration::ZERO);
+        assert_eq!(super::startup_hold_from(Some("nonsense")), Duration::ZERO);
+        assert_eq!(super::startup_hold_from(Some("-5")), Duration::ZERO);
+        assert_eq!(
+            super::startup_hold_from(Some("20")),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            super::startup_hold_from(Some(" 20 ")),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn the_sweep_hold_is_off_unless_explicitly_armed() {
+        assert!(!super::hold_sweep_from(None));
+        assert!(!super::hold_sweep_from(Some("")));
+        assert!(!super::hold_sweep_from(Some("0")));
+        assert!(!super::hold_sweep_from(Some("false")));
+        assert!(!super::hold_sweep_from(Some("maybe")));
+        assert!(super::hold_sweep_from(Some("1")));
+        assert!(super::hold_sweep_from(Some("true")));
+        assert!(super::hold_sweep_from(Some("TRUE")));
+        assert!(super::hold_sweep_from(Some(" on ")));
+    }
+
     fn auto_embed_enabled_with(value: Option<&str>) -> bool {
         let _env = match value {
             Some(value) => kin_core::test_env::EnvVarGuard::set(super::AUTO_EMBED_ENV, value),

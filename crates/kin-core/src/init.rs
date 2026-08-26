@@ -1125,6 +1125,13 @@ fn publish_repository_layout_impl(
 ) -> Result<InitResult> {
     let final_kin_dir = prepared.final_kin_dir.clone();
     let final_kin_dir = final_kin_dir.as_path();
+    // Everything from here to the publication callback is a phase of the
+    // admission ladder that used to run unnamed. On a full-history conversion
+    // it is seconds of flushing and re-verifying a staged tree, and a profile
+    // that cannot name it reports the memory spent here against no phase at
+    // all: the peak of a 6,733-commit conversion landed in this gap and the
+    // ladder had nothing to attribute it to.
+    let staged_layout_span = info_span!("kin.init.verify_staged_layout").entered();
     validate_publish_destination(&prepared.layout, final_kin_dir)?;
     verify_metadata_seal(&prepared.layout, &prepared.metadata_seal)?;
     let bootstrap = prepared.bootstrap.clone().ok_or_else(|| {
@@ -1156,6 +1163,7 @@ fn publish_repository_layout_impl(
     // Verification may create or touch backend lock state. Flush the exact
     // verified namespace once more before the publication rename.
     sync_layout_recursively(prepared.layout.root())?;
+    drop(staged_layout_span);
     let published = Cell::new(false);
     let publication_result = verify_and_publish(RepositoryPublication {
         staged_path: prepared.layout.root(),
@@ -1171,6 +1179,12 @@ fn publish_repository_layout_impl(
             )),
         };
     }
+    // The stretch between the publication callback returning and the result
+    // being assembled: lease cleanup, the parent-namespace sync and the final
+    // verification of the published layout. Named for the same reason as the
+    // staged verification above, so the ladder has no unnamed stretch left for
+    // a peak to hide in.
+    let finalize_span = info_span!("kin.init.finalize_publication").entered();
     prepared.cleanup_armed = false;
     let owner_cleanup = prepared
         .stage_lease
@@ -1217,6 +1231,8 @@ fn publish_repository_layout_impl(
             });
         }
     };
+
+    drop(finalize_span);
 
     Ok(InitResult {
         layout,

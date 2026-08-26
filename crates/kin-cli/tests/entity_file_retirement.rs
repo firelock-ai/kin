@@ -11,6 +11,15 @@
 //! named the constraint outright with "absent from the staged tree"
 //! (FIR-2429).
 //!
+//! The rename half of FIR-2429 is here too, measured before it was written: a
+//! byte-identical `mv` of an entity-owning file left the repository unable to
+//! accept ANY further commit. The watcher refused the transition fourteen times
+//! over 59 seconds and went quiet, `kin locate` kept attributing the entity to
+//! a path no longer on disk, and every later `kin commit` answered HTTP 500
+//! with "transaction leaves entity ... absent from the staged tree". A control
+//! run on the same fixture without the rename committed cleanly and indexed a
+//! new symbol, which is what made that difference mean anything.
+//!
 //! A unit test on the planner cannot cover this, because the defect is in what
 //! survives one whole commit and reaches the next query. These drive `kin`
 //! itself and read `kin locate`, which is the surface the stale hit was found
@@ -179,5 +188,165 @@ fn deleting_a_file_that_owns_no_entity_still_commits() {
         "deleting a non-entity file must still commit: stdout={} stderr={}",
         String::from_utf8_lossy(&retired.stdout),
         String::from_utf8_lossy(&retired.stderr)
+    );
+}
+
+/// What `kin refs` prints for an entity, as one string.
+///
+/// Read as text on purpose: `--bulk-json` needs entity UUIDs the fixture does
+/// not hold, and the assertion below is about whether one known caller is still
+/// attributed, which the human rendering carries.
+fn references_text(runtime: &common::IsolatedDaemonRuntime, repo: &Path, entity: &str) -> String {
+    let output = require_kin(runtime, repo, &["refs", entity]);
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Renaming a committed entity-owning file with a bare `mv`, then committing.
+///
+/// The incoming-edge assertion is the point of this test, not decoration. A
+/// relocation implemented as a removal plus an addition would satisfy every
+/// path assertion here and still mint new entity ids, orphaning every reference
+/// into the moved function, which `mcp_commit.rs` argues against in the same
+/// words. Only the caller attribution can see that, so it is checked before and
+/// after and required to be unchanged.
+///
+/// The trailing commit is the wedge assertion. Before the fix the repository
+/// stopped accepting commits entirely once a rename had been refused, so a test
+/// that only checked the rename's own commit would pass on a store that was
+/// already dead.
+///
+/// Falsify by reverting `path_relocations_in`'s use in `exact_tree_admission`
+/// so the reconcile seam publishes its tree deltas with an empty
+/// `entity_deltas` again, which is the `TreeDelta::Removed`-only shape it had:
+/// the rename commit then fails with "absent from the staged tree".
+#[test]
+fn renaming_a_committed_entity_owning_file_relocates_it_rather_than_stranding_it() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize(&runtime, &repo);
+
+    fs::write(
+        repo.join("src/moved.py"),
+        b"def moved_target():\n    return 1\n",
+    )
+    .expect("add source");
+    fs::write(
+        repo.join("src/caller.py"),
+        b"from moved import moved_target\n\ndef moved_caller():\n    return moved_target()\n",
+    )
+    .expect("add caller");
+    require_kin(&runtime, &repo, &["commit", "-m", "publish movable source"]);
+
+    let before = located_paths(&runtime, &repo, "moved_target");
+    assert!(
+        before.iter().any(|path| path == "src/moved.py"),
+        "the fixture never made the file findable, so nothing below proves a relocation: \
+         {before:?}"
+    );
+    let references_before = references_text(&runtime, &repo, "moved_target");
+    assert!(
+        references_before.contains("src/caller.py"),
+        "the fixture never produced an incoming edge, so the half a remove-then-add pair \
+         destroys is not under test here: {references_before}"
+    );
+
+    // A bare filesystem move, which is what a person reorganizing a repository
+    // does. Nothing tells kin a rename happened.
+    fs::rename(repo.join("src/moved.py"), repo.join("src/renamed.py"))
+        .expect("rename the committed source");
+    let renamed = run_kin(&runtime, &repo, &["commit", "-m", "relocate the source"]);
+    assert!(
+        renamed.status.success(),
+        "committing a tree with an entity-owning file moved must succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&renamed.stdout),
+        String::from_utf8_lossy(&renamed.stderr)
+    );
+
+    let after = located_paths(&runtime, &repo, "moved_target");
+    assert!(
+        !after.iter().any(|path| path == "src/moved.py"),
+        "a moved file is still ranked at the path it left: {after:?}"
+    );
+    assert!(
+        after.iter().any(|path| path == "src/renamed.py"),
+        "the moved entity is not ranked at the path it arrived on: {after:?}"
+    );
+
+    let references_after = references_text(&runtime, &repo, "moved_target");
+    assert!(
+        references_after.contains("src/caller.py"),
+        "the caller lost its edge into the moved function, which is what a removal plus an \
+         addition does and what relocating in one delta exists to prevent: {references_after}"
+    );
+
+    // The repository still accepts work. This is the half that made the defect
+    // a blocker rather than a stale-path annoyance.
+    fs::write(
+        repo.join("src/later.py"),
+        b"def later_symbol():\n    return 2\n",
+    )
+    .expect("add a later file");
+    let later = run_kin(&runtime, &repo, &["commit", "-m", "work after the rename"]);
+    assert!(
+        later.status.success(),
+        "a rename must not leave the repository unable to accept further commits: \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&later.stdout),
+        String::from_utf8_lossy(&later.stderr)
+    );
+    let later_paths = located_paths(&runtime, &repo, "later_symbol");
+    assert!(
+        later_paths.iter().any(|path| path == "src/later.py"),
+        "work committed after a rename never reached the graph: {later_paths:?}"
+    );
+}
+
+/// The in-place edit arm, which must not be read as a relocation.
+///
+/// A `TreeDelta::Updated` whose path did not change is an edit, and treating it
+/// as a move would rewrite `file_origin` to the path it already has. Cheap to
+/// hold, and it is the obvious way for the relocation filter to be written
+/// wrong.
+#[test]
+fn editing_a_committed_file_in_place_is_not_treated_as_a_relocation() {
+    let root = tempdir().expect("temp root");
+    let repo = root.path().join("repo");
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    initialize(&runtime, &repo);
+
+    fs::write(
+        repo.join("src/edited.py"),
+        b"def edited_target():\n    return 1\n",
+    )
+    .expect("add source");
+    require_kin(
+        &runtime,
+        &repo,
+        &["commit", "-m", "publish editable source"],
+    );
+    let before = located_paths(&runtime, &repo, "edited_target");
+    assert!(
+        before.iter().any(|path| path == "src/edited.py"),
+        "the fixture never made the file findable: {before:?}"
+    );
+
+    fs::write(
+        repo.join("src/edited.py"),
+        b"def edited_target():\n    return 2\n",
+    )
+    .expect("edit source in place");
+    let edited = run_kin(&runtime, &repo, &["commit", "-m", "edit in place"]);
+    assert!(
+        edited.status.success(),
+        "an in-place edit must still commit: stdout={} stderr={}",
+        String::from_utf8_lossy(&edited.stdout),
+        String::from_utf8_lossy(&edited.stderr)
+    );
+
+    let after = located_paths(&runtime, &repo, "edited_target");
+    assert!(
+        after.iter().any(|path| path == "src/edited.py"),
+        "an edited file must keep ranking at its own path: {after:?}"
     );
 }

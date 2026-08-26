@@ -31,6 +31,21 @@ use kin_parser::{
     PythonAdapter, TypeScriptAdapter,
 };
 
+/// A well-formed but synthetic import site. This suite's subject is cross-file
+/// resolution, not spans; the span's own coverage lives in
+/// `crates/kin-parser/tests/import_span_coverage.rs`, which parses real source.
+fn synthetic_import_site() -> kin_parser::RelationSite {
+    kin_parser::RelationSite {
+        start_byte: 0,
+        end_byte: 1,
+        start_line: 1,
+        start_col: 0,
+        end_line: 1,
+        end_col: 1,
+        syntactic_role: None,
+    }
+}
+
 // ---- helpers: direct entity construction (mirrors linker.rs unit-test idiom) ----
 
 fn zero_fp() -> SemanticFingerprint {
@@ -274,6 +289,7 @@ fn receiver_fanout_call_count(n: usize) -> usize {
         // all, and this helper would measure the FIR-1581 gate instead of the cap
         // it exists to measure. A glob import is the stand-down that gate documents.
         imports: vec![FileImport {
+            site: synthetic_import_site(),
             module_path: "crate::impls".to_string(),
             specifiers: vec![],
         }],
