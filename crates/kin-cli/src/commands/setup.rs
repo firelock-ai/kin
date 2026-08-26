@@ -1438,7 +1438,7 @@ pub(crate) fn shell_rc(shell: &str) -> Result<PathBuf> {
 /// path in an rc plan has to describe the same home, and the only way to
 /// guarantee that is to resolve it once and pass it down; resolving it again
 /// per path makes the plan's shape depend on whether anything moved `HOME` in
-/// between (FIR-2714).
+/// between.
 pub(crate) fn shell_rc_in(home: &Path, shell: &str) -> Result<PathBuf> {
     let home = home.to_path_buf();
     match shell {
@@ -2560,8 +2560,7 @@ fn rc_write_plan(shell_name: &str) -> Result<Vec<RcTarget>> {
 /// about.
 ///
 /// Taking the home as an argument makes that straddle unrepresentable rather
-/// than unlikely. A plan describes one home because it cannot describe two
-/// (FIR-2714).
+/// than unlikely. A plan describes one home because it cannot describe two.
 fn rc_write_plan_in(home: &Path, shell_name: &str) -> Result<Vec<RcTarget>> {
     let hook_rc = shell_rc_in(home, shell_name)?;
     let mut plan = vec![RcTarget {
