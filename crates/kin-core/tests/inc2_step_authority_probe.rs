@@ -993,6 +993,49 @@ fn a_step_whose_head_is_a_merge_commits_over_a_step_that_never_saw_the_side_line
     eprintln!("INC2 MERGE-STEP RESULT: a merge-headed step COMMITS over a step that never saw the side line");
 }
 
+/// A body loader that keeps what it read, so a plan's second step does not
+/// re-read from CAS what its first step already loaded.
+///
+/// `from_raw_parts` calls `load_body` once per record and then decodes it
+/// (`kin-model git_authority.rs:967`, inside `load_and_decode_records`), so a
+/// segmented plan re-loads every object it re-derives. Whether that re-read is
+/// the cost or the decode is the cost cannot be settled by reading either one,
+/// and it decides whether a planner needs a body cache or a different API.
+/// `misses` is what proves the cache is answering rather than silently
+/// forwarding every call.
+struct CachingBodyLoader<'a> {
+    inner: ManagerBodyLoader<'a>,
+    cache: std::collections::HashMap<Hash256, Option<Vec<u8>>>,
+    misses: usize,
+    hits: usize,
+}
+
+impl<'a> CachingBodyLoader<'a> {
+    fn new(source: &'a kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>) -> Self {
+        Self {
+            inner: ManagerBodyLoader(source),
+            cache: std::collections::HashMap::new(),
+            misses: 0,
+            hits: 0,
+        }
+    }
+}
+
+impl kin_model::GitObjectBodyLoader for CachingBodyLoader<'_> {
+    type Error = String;
+
+    fn load_body(&mut self, body_hash: &Hash256) -> Result<Option<Vec<u8>>, Self::Error> {
+        if let Some(hit) = self.cache.get(body_hash) {
+            self.hits += 1;
+            return Ok(hit.clone());
+        }
+        self.misses += 1;
+        let loaded = self.inner.load_body(body_hash)?;
+        self.cache.insert(*body_hash, loaded.clone());
+        Ok(loaded)
+    }
+}
+
 /// Every object reachable from `root`, over an index built ONCE by the caller.
 ///
 /// The same walk as [`reachable_from`], with the whole-closure `HashMap` lifted
@@ -1158,10 +1201,14 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
         "the control must derive the same closure it was handed"
     );
 
-    eprintln!("INC2 SCALE  step |   upto |  subset | walk ms | hoisted ms | derive ms");
+    let mut cached_loader = CachingBodyLoader::new(&source);
+    eprintln!(
+        "INC2 SCALE  step |   upto |  subset | walk ms | hoisted ms | derive ms | cached ms"
+    );
     let mut walk_total = 0.0_f64;
     let mut hoisted_total = 0.0_f64;
     let mut derive_total = 0.0_f64;
+    let mut cached_total = 0.0_f64;
     let mut subset_total = 0_usize;
     let mut previous_subset = 0_usize;
     let mut last_subset = 0_usize;
@@ -1205,8 +1252,27 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
         .expect("a step authority derives from the manifest walk");
         let derive_ms = derive_started.elapsed().as_secs_f64() * 1000.0;
 
+        let cached_started = std::time::Instant::now();
+        kin_model::GitExternalAuthority::from_raw_parts(
+            repository_id.clone(),
+            full.object_format,
+            vec![kin_model::GitRawRef {
+                name: default_ref.clone(),
+                target: kin_model::GitRawTarget::Direct {
+                    object: head_object,
+                },
+            }],
+            kin_model::GitRawTarget::Symbolic {
+                target: default_ref.clone(),
+            },
+            subset.clone(),
+            &mut cached_loader,
+        )
+        .expect("a step authority derives over a cached body loader too");
+        let cached_ms = cached_started.elapsed().as_secs_f64() * 1000.0;
+
         eprintln!(
-            "INC2 SCALE  {step:>4} | {upto:>6} | {:>7} | {walk_ms:>7.1} | {hoisted_ms:>10.1} | {derive_ms:>9.1}",
+            "INC2 SCALE  {step:>4} | {upto:>6} | {:>7} | {walk_ms:>7.1} | {hoisted_ms:>10.1} | {derive_ms:>9.1} | {cached_ms:>9.1}",
             subset.len()
         );
         assert!(
@@ -1219,6 +1285,7 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
         walk_total += walk_ms;
         hoisted_total += hoisted_ms;
         derive_total += derive_ms;
+        cached_total += cached_ms;
         subset_total += subset.len();
     }
 
@@ -1230,14 +1297,33 @@ fn scale_of_the_manifest_walk_and_step_derivation() {
     // Read the sum against the term it is supposed to describe before reading
     // any row: a per-step table whose total does not reconcile is decoration.
     let mean_subset = subset_total as f64 / steps as f64;
+    // The cache must actually be answering. A loader that forwarded every call
+    // would time identically to the uncached arm and read as "caching does not
+    // help", which is the wrong conclusion from a cache that never ran.
+    assert!(
+        cached_loader.hits > cached_loader.misses,
+        "the caching loader must serve more hits than misses across a segmented plan, \
+         got {} hits and {} misses",
+        cached_loader.hits,
+        cached_loader.misses
+    );
+    assert_eq!(
+        cached_loader.misses, closure_objects,
+        "a cache over a whole plan loads each closure object exactly once"
+    );
+
     eprintln!(
         "INC2 SCALE totals: walk {walk_total:.1} ms, hoisted {hoisted_total:.1} ms, \
-         derive {derive_total:.1} ms over {steps} steps\n\
+         derive {derive_total:.1} ms, cached derive {cached_total:.1} ms over {steps} steps\n\
+         INC2 SCALE body loads: {} misses, {} hits, so CAS reads fall {:.1}x under a cache\n\
          INC2 SCALE control: one whole-history derivation {whole_ms:.1} ms over \
          {closure_objects} objects\n\
          INC2 SCALE shape: mean subset {mean_subset:.0} objects ({:.2} of the closure), \
          segmented derive is {:.1}x the whole-history control\n\
          INC2 SCALE per-object: whole {:.1} us/object, segmented derive {:.1} us/object-visited",
+        cached_loader.misses,
+        cached_loader.hits,
+        (cached_loader.hits + cached_loader.misses) as f64 / cached_loader.misses as f64,
         mean_subset / closure_objects as f64,
         derive_total / whole_ms,
         whole_ms * 1000.0 / closure_objects as f64,
