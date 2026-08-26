@@ -1281,6 +1281,12 @@ async fn handle_tools_call_daemon(
     // and a set that is not whole, and nothing in the payload can tell the two
     // apart.
     base_env = base_env.with_relation_census_loss(daemon_delegate::relation_census_hold().as_ref());
+    // Stamped on every answer for the same reason as the three above, and it
+    // qualifies the same kind of answer the census-loss flag does: one that came
+    // back looking complete. A sweep that offered relations the graph does not
+    // hold leaves an absence an agent may certify, and nothing in the payload
+    // distinguishes it from an absence that is simply true.
+    base_env = base_env.with_enrichment_shortfall(daemon_delegate::enrichment_shortfall().as_ref());
 
     // `kin_graph_status` already reports the exact graph view selected by the
     // daemon, including temporal-session scope. Generic `/health` is HEAD-only:
