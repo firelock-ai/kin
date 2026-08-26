@@ -292,3 +292,259 @@ fn a_step_authority_for_a_mid_history_commit_validates_from_the_manifest_alone()
         }
     }
 }
+
+/// Everything one step of a segmented bootstrap would carry.
+struct Step {
+    authority: kin_model::GitExternalAuthority,
+    changes: Vec<SemanticChange>,
+    aliases: Vec<kin_model::ExternalChangeAlias>,
+    external_objects: Vec<kin_model::ExternalObjectRecord>,
+    head_object: kin_model::ExternalObjectId,
+}
+
+/// Plan the step that publishes `ordered[..upto]`, carrying only what steps
+/// before it did not already admit.
+///
+/// The `already` sets are what make this a step rather than a whole bootstrap:
+/// external objects and aliases accumulate in the envelope across
+/// transactions, so a later step names the ones an earlier step admitted
+/// without re-shipping them.
+#[allow(clippy::too_many_arguments)]
+fn plan_step(
+    source: &kin_db::RepositoryAuthorityManager<kin_db::LocalFileBackend>,
+    full: &kin_model::GitExternalAuthority,
+    ordered: &[SemanticChange],
+    all_aliases: &[kin_model::ExternalChangeAlias],
+    default_ref: &kin_model::RefName,
+    repository_id: &RepositoryId,
+    upto: usize,
+    already_objects: &BTreeSet<kin_model::ExternalObjectId>,
+) -> Step {
+    let head_change = ordered[upto - 1].id;
+    let head_oid = all_aliases
+        .iter()
+        .find(|alias| alias.change_id == head_change)
+        .map(|alias| alias.oid)
+        .expect("every Git-origin change has an alias");
+    let head_object =
+        kin_model::ExternalObjectId::new(kin_model::ExternalObjectKind::Commit, head_oid);
+
+    let reachable = reachable_from(full, head_object);
+    let mut loader = ManagerBodyLoader(source);
+    let authority = kin_model::GitExternalAuthority::from_raw_parts(
+        repository_id.clone(),
+        full.object_format,
+        vec![kin_model::GitRawRef {
+            name: default_ref.clone(),
+            target: kin_model::GitRawTarget::Direct {
+                object: head_object,
+            },
+        }],
+        kin_model::GitRawTarget::Symbolic {
+            target: default_ref.clone(),
+        },
+        reachable.clone(),
+        &mut loader,
+    )
+    .expect("a step authority derives from the manifest walk");
+
+    let changes: Vec<SemanticChange> = ordered[..upto].to_vec();
+    let carried_ids: BTreeSet<_> = changes.iter().map(|c| c.id).collect();
+    Step {
+        authority,
+        external_objects: reachable
+            .into_iter()
+            .filter(|record| !already_objects.contains(&record.object))
+            .collect(),
+        aliases: all_aliases
+            .iter()
+            .filter(|alias| carried_ids.contains(&alias.change_id))
+            .cloned()
+            .collect(),
+        changes,
+        head_object,
+    }
+}
+
+/// Does a segmented bootstrap actually COMMIT, and does the compare-and-swap
+/// between consecutive steps hold?
+///
+/// The probe above builds a step authority and validates its SHAPE. It never
+/// hands one to kin-db, so the projection validation and the between-steps
+/// swap were both untested. This commits step one as an initialize, then step
+/// two as an update over it, which is the whole mechanism increment 2 rests on.
+#[test]
+fn two_consecutive_steps_commit_and_the_second_swaps_over_the_first() {
+    const COMMITS: usize = 12;
+    const STEP_ONE: usize = 4;
+    const STEP_TWO: usize = 8;
+
+    let repository_id = hosted_shaped_id();
+    let source_root = tempfile::tempdir().unwrap();
+    let working = build_publisher(source_root.path(), COMMITS);
+    let init = kin_core::init_from_git_adopting(&working, &repository_id).unwrap();
+    let source = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout)
+        .unwrap()
+        .open_manager()
+        .unwrap();
+
+    let (full, all_aliases, changes, default_ref) = {
+        let lease = source.read_authority();
+        let metadata = lease.metadata();
+        (
+            metadata.git_external_authority.clone().expect("Git-admitted"),
+            metadata.aliases.clone(),
+            lease.snapshot().changes.values().cloned().collect::<Vec<_>>(),
+            metadata.ref_state.default_ref.clone().expect("default ref"),
+        )
+    };
+    let ordered = topological(&changes);
+
+    let first = plan_step(
+        &source, &full, &ordered, &all_aliases, &default_ref, &repository_id,
+        STEP_ONE, &BTreeSet::new(),
+    );
+    let after_first: BTreeSet<_> = first
+        .external_objects
+        .iter()
+        .map(|record| record.object)
+        .collect();
+    let second = plan_step(
+        &source, &full, &ordered, &all_aliases, &default_ref, &repository_id,
+        STEP_TWO, &after_first,
+    );
+
+    // The property that makes chunking work at all: a later step ships only
+    // what earlier steps did not. Without this each step re-sends the whole
+    // closure and segmentation buys nothing.
+    assert!(
+        second.external_objects.len() < first.external_objects.len() + second.external_objects.len(),
+        "the second step must carry fewer objects than the union, or nothing is being reused"
+    );
+    eprintln!(
+        "INC2 STEPS: step1 objects={} changes={} | step2 NEW objects={} changes={}",
+        first.external_objects.len(),
+        first.changes.len(),
+        second.external_objects.len(),
+        second.changes.len()
+    );
+
+    let destination_root = tempfile::tempdir().unwrap();
+    let destination = RepositoryAuthorityManager::open(
+        repository_id.clone(),
+        Arc::new(LocalFileBackend::new(destination_root.path().to_path_buf())),
+    )
+    .unwrap();
+
+    // Stage every body both steps name. Content addressed, grants nothing.
+    for record in first.external_objects.iter().chain(second.external_objects.iter()) {
+        let bytes = source
+            .load_source_blob(record.body_hash)
+            .unwrap()
+            .expect("the publisher holds every body its manifest names");
+        destination.save_source_blob(record.body_hash, &bytes).unwrap();
+    }
+    for change in ordered.iter() {
+        for delta in &change.tree_deltas {
+            if let Some(state) = delta.new_state() {
+                if let Some(hash) = state.entry.blob_identity() {
+                    if let Some(bytes) = source.load_source_blob(hash).unwrap() {
+                        destination.save_source_blob(hash, &bytes).unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    let commit_step = |step: &Step, previous: Option<&kin_model::GitExternalAuthority>, op: u128| {
+        let lease = destination.read_authority();
+        let delta = match previous {
+            None => GitExternalAuthorityDelta::initialize(step.authority.clone()),
+            Some(old) => GitExternalAuthorityDelta::update(old.clone(), step.authority.clone()),
+        };
+        let expected = match previous {
+            None => RefExpectation::MustNotExist,
+            Some(_) => RefExpectation::MustEqual {
+                target: kin_model::RefTarget::external_object(
+                    lease
+                        .metadata()
+                        .ref_state
+                        .refs
+                        .iter()
+                        .find(|entry| entry.name == default_ref)
+                        .and_then(|entry| match entry.target {
+                            kin_model::RefTarget::ExternalObject { object } => Some(object),
+                            _ => None,
+                        })
+                        .expect("the previous step published an external-object ref"),
+                ),
+            },
+        };
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::from_uuid(uuid::Uuid::from_u128(op)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("inc2-step-probe"),
+            reason: format!("segmented bootstrap step publishing {}", step.head_object.oid),
+            external_objects: step.external_objects.clone(),
+            git_authority_delta: Some(delta),
+            changes: if previous.is_none() {
+                step.changes.clone()
+            } else {
+                step.changes[STEP_ONE..].to_vec()
+            },
+            aliases: if previous.is_none() {
+                step.aliases.clone()
+            } else {
+                step.aliases[STEP_ONE..].to_vec()
+            },
+            ref_mutations: vec![RefMutation {
+                name: default_ref.clone(),
+                expected,
+                new_target: Some(kin_model::RefTarget::external_object(step.head_object)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: previous.is_none().then(|| DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(default_ref.clone()),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        drop(lease);
+        transaction.validate().expect("the step transaction is well formed");
+        destination.commit_repository_transaction(transaction)
+    };
+
+    match commit_step(&first, None, 401) {
+        Ok(receipt) => eprintln!("INC2 STEP 1: committed, generation {}", receipt.generation),
+        Err(error) => panic!("INC2 STEP 1 REFUSED: {error}"),
+    }
+    match commit_step(&second, Some(&first.authority), 402) {
+        Ok(receipt) => eprintln!("INC2 STEP 2: committed, generation {}", receipt.generation),
+        Err(error) => panic!("INC2 STEP 2 REFUSED (the between-steps swap is the suspect): {error}"),
+    }
+
+    let lease = destination.read_authority();
+    let metadata = lease.metadata();
+    assert_eq!(
+        metadata.git_external_authority.as_ref().map(|a| a.closure.objects.len()),
+        Some(second.authority.closure.objects.len()),
+        "the destination must end on step two's authority, not step one's"
+    );
+    assert_eq!(
+        lease.snapshot().changes.len(),
+        STEP_TWO,
+        "the destination must hold every change both steps carried and nothing else"
+    );
+    eprintln!(
+        "INC2 STEPS RESULT: segmented bootstrap COMMITS. destination at {} changes, \
+         authority closure {} objects",
+        lease.snapshot().changes.len(),
+        metadata.git_external_authority.as_ref().unwrap().closure.objects.len()
+    );
+}
