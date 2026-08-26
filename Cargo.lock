@@ -3235,6 +3235,7 @@ dependencies = [
  "kin-infer",
  "kin-lsp",
  "kin-mcp",
+ "kin-migrate",
  "kin-model",
  "kin-parser",
  "kin-projection",

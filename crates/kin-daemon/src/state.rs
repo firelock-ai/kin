@@ -7745,6 +7745,167 @@ mod tests {
         );
     }
 
+    /// The join between the two producers of repository identity, over the real
+    /// set rather than over two strings a fixture wrote itself.
+    ///
+    /// `spine_init_materializes_cross_repo_edges` above registers its sibling by
+    /// hand, taking the id from `kin_core::init`'s minted manifest identity. That
+    /// makes both sides of the daemon's startup identity comparison agree because
+    /// one fixture wrote both, so the test passes on a tree where the two real
+    /// producers disagree and no sibling can ever be pinned.
+    ///
+    /// This test registers the sibling the way `kin init` registers it, by
+    /// calling the same `kin_migrate::update_registry` that `kin init` calls, and
+    /// then asks for the consequence: cross-repo edges. No repository identity is
+    /// written twice here, so the assertion is about the agreement between the
+    /// registry writer and the daemon's startup check rather than about either
+    /// one alone.
+    #[test]
+    #[serial_test::serial]
+    fn spine_pins_the_sibling_that_kin_init_actually_registered() {
+        use kin_db::InMemoryGraph;
+        use kin_model::{
+            GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+        };
+
+        let external_id = kin_model::EntityId::new();
+        let imported_symbol = "remote_call";
+
+        // A sibling under a directory whose name is deliberately NOT the shape of
+        // a minted repository identity, so a check that compares the two
+        // identities cannot pass by coincidence of naming.
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("sibling-checkout");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        let sibling_init = kin_core::init(&sibling_root).unwrap();
+        let sibling_graph = InMemoryGraph::new();
+        let sibling_blobs =
+            kin_blobs::BlobStore::new(sibling_init.layout.ingest_cas_dir()).unwrap();
+        let sibling_source = b"pub fn remote_call() {}\n";
+        let sibling_digest = sibling_blobs.write(sibling_source).unwrap();
+        sibling_graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_bytes(b"src/lib.rs".to_vec()).unwrap(),
+                        kin_model::TreeEntry::blob(Hash256::from_bytes(sibling_digest.0), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            })
+            .unwrap();
+        sibling_graph
+            .batch_upsert_entities(&[test_entity(imported_symbol, "src/lib.rs")])
+            .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &sibling_graph,
+            &sibling_blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap(),
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("spine-fixture"),
+            "publish sibling semantic authority".to_string(),
+        )
+        .unwrap();
+        crate::repository_commit::commit_native_plan(
+            &sibling_blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap(),
+            plan,
+        )
+        .unwrap();
+
+        // Register through the production writer. `kin init` calls exactly this
+        // (kin-cli `commands/init.rs`), so whatever identity the registry ends up
+        // carrying is the identity a real install carries.
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        kin_migrate::update_registry(&sibling_root, 1).unwrap();
+
+        // The sibling id the spine will key on is whatever the production writer
+        // just recorded. Reading it back rather than restating it is what keeps
+        // this test honest about the join: nothing here asserts what that string
+        // should be.
+        let registered = kin_core::registry::KinRegistry::load_from(&registry_path).unwrap();
+        let sibling_entry = registered
+            .repos
+            .iter()
+            .find(|repo| {
+                repo.path
+                    .canonicalize()
+                    .ok()
+                    .zip(sibling_root.canonicalize().ok())
+                    .is_some_and(|(registered, expected)| registered == expected)
+            })
+            .expect("the production registry writer must record the sibling it was given")
+            .clone();
+        let sibling_id = sibling_entry.id.clone();
+
+        // The primary repo: a caller entity plus an unresolved cross-repo call
+        // tagged with the registered sibling as its import source.
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let state = test_state(primary_init.layout, primary_dir.path());
+        let caller = test_entity("caller", "src/main.rs");
+        state
+            .graph
+            .batch_upsert_entities(std::slice::from_ref(&caller))
+            .unwrap();
+        state
+            .graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(external_id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some(sibling_id.clone()),
+                evidence: vec![RelationEvidence {
+                    token: Some(imported_symbol.to_string()),
+                    ..RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+
+        let (repo_count, edge_count, registered_sibling_root) = {
+            let spine = state.ensure_spine().expect("spine must be enabled");
+            (
+                spine.repo_count(),
+                spine.edge_count(),
+                spine.root_hash(&sibling_id),
+            )
+        };
+
+        assert_eq!(
+            repo_count, 2,
+            "the sibling `kin init` registered must be pinned beside the primary \
+             (registry id {sibling_id:?}); a repo_count of 1 means the daemon refused it at startup"
+        );
+        assert!(
+            registered_sibling_root.is_some(),
+            "the pinned sibling must be registered in the spine under the identity the \
+             registry carries ({sibling_id:?})"
+        );
+        assert!(
+            edge_count > 0,
+            "cross-repo edges must materialize for a sibling registered the way `kin init` \
+             registers one (got {edge_count})"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn ingest_repo_into_spine_serves_non_empty_xref_from_storage_only() {
