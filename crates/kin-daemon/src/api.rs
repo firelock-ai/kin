@@ -9682,32 +9682,59 @@ async fn repository_authority_snapshot(
     state: &DaemonState,
     repo_id: &str,
 ) -> Result<kin_db::GraphSnapshot, (StatusCode, String)> {
+    // Capability decides which authority answers, never identity. A daemon with
+    // a storage backend reaches every repository it serves through that
+    // backend, the one it advertises included; a daemon without one has only
+    // the local binding it opened at startup. This is the selection
+    // [`repository_transfer_authority`] already makes, and the two now agree.
+    //
+    // Deciding by identity instead is what made these routes unservable on a
+    // hosted daemon. `DaemonState::open_with_backend` leaves
+    // `cached_workspace_id` and `local_repository_backend` unset, so routing
+    // the advertised repository into the local branch reached a binding that
+    // cannot exist there and answered "local daemon is missing its startup
+    // workspace binding" for the repository the daemon was built to serve.
+    //
+    // The other branch could not answer either. It read the envelope off
+    // `InMemoryGraph::to_snapshot()`, which sets `repository_authority` to
+    // `None` unconditionally because repository authority belongs to the
+    // immutable publication manager and never to the mutable graph. Asserting
+    // on a field the value's own type erases is a check that cannot pass, so
+    // that branch refused every sibling whatever storage held. Authority is
+    // read from the manager here for the same reason the local branch always
+    // did: it is the only thing that owns one.
+    if let Some(backend) = &state.storage_backend {
+        // Addressability and absence stay decided where they already were, and
+        // before authority is opened. An unserved id is a 404 naming the served
+        // identity, and a served id storage holds nothing for is a 404 too.
+        // Opening the manager first would answer both by minting a fresh empty
+        // authority, turning two distinct refusals into one 200 carrying no
+        // refs.
+        repo_scoped_graph(state, repo_id).await?;
+        let repository_id = RepositoryId::new(repo_id.to_string()).map_err(|error| {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("invalid repository identity: {error}"),
+            )
+        })?;
+        // The manager's own open refuses a snapshot with no envelope and one
+        // whose envelope belongs to another repository, so neither check is
+        // repeated here; repeating them would assert over bytes that already
+        // passed the same validator.
+        let authority = RepositoryAuthorityManager::open(repository_id, Arc::clone(backend))
+            .map_err(repository_authority_error)?;
+        return Ok(authority.read_authority().snapshot().clone());
+    }
+
     if repo_id == state.cached_repo_id {
         let authority = ActiveApiRepositoryAuthority::open(state)?;
         return Ok(authority.manager.read_authority().snapshot().clone());
     }
 
-    let graph = repo_scoped_graph(state, repo_id).await?;
-    let snapshot = graph.to_snapshot();
-    let metadata = snapshot.repository_authority.as_ref().ok_or_else(|| {
-        (
-            StatusCode::FAILED_DEPENDENCY,
-            format!("repository {repo_id} has no repository-v6 authority envelope"),
-        )
-    })?;
-    if metadata.repository_id.as_str() != repo_id {
-        return Err((
-            StatusCode::FAILED_DEPENDENCY,
-            format!(
-                "requested repository {repo_id} but durable authority belongs to {}",
-                metadata.repository_id
-            ),
-        ));
-    }
-    metadata
-        .validate_against_snapshot(&snapshot)
-        .map_err(repository_authority_error)?;
-    Ok(snapshot)
+    Err((
+        StatusCode::NOT_FOUND,
+        format!("repository {repo_id} is unavailable in local daemon mode"),
+    ))
 }
 
 fn repository_metadata(
@@ -15611,6 +15638,110 @@ mod tests {
             .await
             .unwrap();
         (status, body.to_vec())
+    }
+
+    /// A hosted daemon answers for the repository it advertises out of its own
+    /// backend.
+    ///
+    /// This is the shape the hosted pod runs: `open_with_backend`, so
+    /// `cached_workspace_id` and `local_repository_backend` are both unset, and
+    /// the advertised repo id equal to the one being asked for. Selecting the
+    /// authority by identity sent exactly this request into the local branch
+    /// and answered "local daemon is missing its startup workspace binding" for
+    /// the repository the daemon exists to serve.
+    #[tokio::test]
+    async fn hosted_daemon_serves_the_advertised_repository_authority_from_its_backend() {
+        let repo_id = format!("hosted-advertised-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        seed_replica_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8051,
+            "publish the advertised repository's head",
+        );
+
+        let snapshot = repository_authority_snapshot(&state, &repo_id)
+            .await
+            .expect("a hosted daemon must serve the authority its own backend holds");
+        let metadata = snapshot
+            .repository_authority
+            .as_ref()
+            .expect("the served snapshot carries the envelope the backend published");
+        assert_eq!(metadata.repository_id.as_str(), repo_id);
+        assert!(
+            !metadata.ref_state.refs.is_empty(),
+            "the published ref must be served, not an empty ref set"
+        );
+    }
+
+    /// The same daemon answers for a sibling it serves but does not advertise.
+    ///
+    /// This branch read the envelope off `InMemoryGraph::to_snapshot()`, which
+    /// sets `repository_authority` to `None` unconditionally, so it refused
+    /// every sibling with "has no repository-v6 authority envelope" no matter
+    /// what storage held. The assertion could not pass, which is why no amount
+    /// of republishing the backend ever changed the answer.
+    #[tokio::test]
+    async fn hosted_daemon_serves_a_sibling_repository_authority_from_its_backend() {
+        let advertised = format!("hosted-advertised-{}", Uuid::new_v4());
+        let sibling = format!("hosted-sibling-{}", Uuid::new_v4());
+        let sibling_id = RepositoryId::new(sibling.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&advertised);
+        seed_replica_change(
+            storage.path(),
+            &sibling_id,
+            None,
+            0x8052,
+            "publish a sibling's head into the shared backend",
+        );
+
+        let snapshot = repository_authority_snapshot(&state, &sibling)
+            .await
+            .expect("a hosted daemon must serve a sibling it holds");
+        let metadata = snapshot
+            .repository_authority
+            .as_ref()
+            .expect("the served snapshot carries the sibling's envelope");
+        assert_eq!(metadata.repository_id.as_str(), sibling);
+        assert!(
+            !metadata.ref_state.refs.is_empty(),
+            "the sibling's published ref must be served"
+        );
+    }
+
+    /// A backend snapshot with no envelope is still refused, and loudly.
+    ///
+    /// This is the inverse of the two above and the half that matters: without
+    /// it, the checks they make would also pass against an authority minted
+    /// empty on the spot, which is a 200 carrying no refs where a refusal
+    /// belongs. It is also the exact state the hosted bucket is in, reached the
+    /// same way: a snapshot exported from the derived graph, which erases the
+    /// envelope by construction, then persisted as if it were a publication.
+    #[tokio::test]
+    async fn hosted_daemon_refuses_a_backend_snapshot_carrying_no_authority_envelope() {
+        let repo_id = format!("hosted-envelopeless-{}", Uuid::new_v4());
+        let (state, _working, storage) = replica_state(&repo_id);
+
+        let exported = kin_db::GraphSnapshot::empty();
+        assert!(
+            exported.repository_authority.is_none(),
+            "the fixture must reproduce an export, not a publication"
+        );
+        let backend = kin_db::LocalFileBackend::new(storage.path().to_path_buf());
+        backend
+            .save_snapshot(&repo_id, &exported.to_bytes().unwrap(), 0)
+            .expect("persisting a graph-only snapshot is what produced the hosted state");
+
+        let (status, detail) = repository_authority_snapshot(&state, &repo_id)
+            .await
+            .expect_err("a snapshot with no envelope has no authority to serve");
+        assert_eq!(status, StatusCode::FAILED_DEPENDENCY);
+        assert!(
+            detail.contains("authority envelope"),
+            "the refusal must name the missing envelope, got: {detail}"
+        );
     }
 
     #[tokio::test]
