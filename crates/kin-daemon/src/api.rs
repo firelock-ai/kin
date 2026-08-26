@@ -17165,10 +17165,16 @@ mod tests {
             "the over-cap arm must stay clear of the body-count cap: \
              {PAYLOAD_BLOBS_OVER_CAP} vs {max_bodies}"
         );
-        assert!(
-            PAYLOAD_BLOBS_UNDER_CAP < PAYLOAD_BLOBS_OVER_CAP,
-            "the two arms must differ in blob count and nothing else"
-        );
+        // A const block, because both sides are constants and clippy is right
+        // that a runtime assertion over them proves nothing at runtime. Moved
+        // rather than allowed: this way the two arms differing is a compile
+        // error the moment somebody edits them to agree.
+        const {
+            assert!(
+                PAYLOAD_BLOBS_UNDER_CAP < PAYLOAD_BLOBS_OVER_CAP,
+                "the two arms must differ in blob count and nothing else"
+            );
+        }
     }
 
     /// The pre-fix pin, carrying a payload, on both sides of the transfer cap.
@@ -17602,8 +17608,7 @@ mod tests {
                     .iter()
                     .map(|body| {
                         hex::encode(Sha256::digest(
-                            &body
-                                .decode()
+                            body.decode()
                                 .expect("a pack body decodes to its declared length"),
                         ))
                     })
