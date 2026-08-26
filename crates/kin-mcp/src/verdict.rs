@@ -477,19 +477,36 @@ fn absence_gate_reading(tool: &str, payload: &Value, negative: Option<&Value>) -
         // rows inconclusive on its own success.
         return match negative.get("trust").and_then(Value::as_str) {
             Some("authoritative") => Reading::Certified,
-            // `trust_reason` arrives as one string off the wire, composed by
-            // the negative block from its own gaps. It is taken as ONE clause
-            // rather than split on the separator: parsing it back would infer
-            // boundaries from prose exactly as this change removes elsewhere,
-            // and the clauses it was built from are not published beside it. The
-            // remaining half of that fix, having the negative block carry its
-            // gaps as a list through `push_gap` and render `trust_reason` once,
-            // is recorded on FIR-2723.
-            Some(_) => Reading::Inconclusive(vec![negative
-                .get("trust_reason")
-                .and_then(Value::as_str)
-                .unwrap_or("the absence gate refused and reported no reason")
-                .to_string()]),
+            // `trust_reason` arrives as one string off the wire, and it is a
+            // JOIN of clauses: `push_gap` builds it by repeated
+            // `format!("{trust_reason}; {gap}")` across seven call sites. So it
+            // is split back into clauses here, and that is NOT the boundary
+            // inference this change removed elsewhere.
+            //
+            // The difference is which side owns the string. Splitting a factor
+            // Kin had just joined itself was inventing a boundary; splitting a
+            // wire string that IS a join recovers one, and it is safe now
+            // because no clause carries the separator, which
+            // `no_clause_carries_the_separator_that_divides_clauses` asserts on
+            // the producer.
+            //
+            // Taking it as one clause instead was a real regression, caught by
+            // the `two_reasons` acceptance check on a live payload rather than
+            // by any unit test: `trust_reason` carries a `retrieval_degraded`
+            // clause of its own, and as one opaque blob it stopped deduplicating
+            // against the `degradations` reading's, so one answer named that gap
+            // twice. The dedupe was doing real work on this path.
+            Some(_) => Reading::Inconclusive(
+                negative
+                    .get("trust_reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the absence gate refused and reported no reason")
+                    .split(CLAUSE_SEPARATOR)
+                    .map(str::trim)
+                    .filter(|clause| !clause.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
             None => Reading::Silent,
         };
     }
@@ -1281,6 +1298,56 @@ mod tests {
                 .expect("a note")
                 .contains("absence in it is authoritative"),
             "{verdict}"
+        );
+    }
+
+    /// The absence gate's `trust_reason` is a JOIN, and its clauses must
+    /// deduplicate against the later readings' like any others.
+    ///
+    /// This is the regression a unit test did not have. Taking `trust_reason`
+    /// as one opaque clause looked conservative and was not: the negative block
+    /// composes it by repeated concatenation, so it carries a
+    /// `retrieval_degraded` clause of its own, and as one blob that clause
+    /// stopped matching the `degradations` reading's. One live answer then named
+    /// the same gap twice, and the `two_reasons` acceptance check caught it on a
+    /// real payload after every unit test here passed.
+    ///
+    /// Splitting a wire string that IS a join recovers a boundary; splitting a
+    /// factor Kin had just joined itself invented one. Same operation, opposite
+    /// sides of the same seam, and only one of them is parsing prose.
+    #[test]
+    fn a_trust_reason_that_repeats_a_later_reading_says_that_gap_once() {
+        let negative = json!({
+            "trust": "inconclusive",
+            "trust_reason": "response_bounded: the response budget withheld part of this answer; \
+                             retrieval_degraded: this query reported degradations \
+                             [embed_worker:failed], so it did not run at full capability",
+        });
+        let readings = [
+            (
+                "absence_gate",
+                absence_gate_reading("find_references", &json!({}), Some(&negative)),
+            ),
+            (
+                "degradations",
+                Reading::Inconclusive(vec![
+                    "retrieval_degraded: this query reported degradations \
+                                            [embed_worker:failed], so it did not run at full \
+                                            capability"
+                        .to_string(),
+                ]),
+            ),
+        ];
+        let factor = compose_limiting_factor(&readings).expect("two inputs refused");
+        assert_eq!(
+            factor.matches("retrieval_degraded:").count(),
+            1,
+            "the gap the trust_reason and the degradations reading both carry is said once: \
+             {factor}"
+        );
+        assert!(
+            factor.contains("response_bounded:"),
+            "and the trust_reason's other clause survives rather than being swallowed: {factor}"
         );
     }
 
