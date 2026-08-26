@@ -2035,6 +2035,21 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "cross_repo": cross_repo,
     });
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    // Whether a caller could have reached this focal through a call site the
+    // linker recorded no edge for (FIR-2775). `edge_coverage` above answers
+    // whether the graph holds the CLASS of edge this query reads; this answers
+    // whether the files that can reach this focal had their own call sites
+    // accounted for. A graph can pass the first and fail the second, and that is
+    // the state in which an empty reference list came back certified for a
+    // function a test calls.
+    //
+    // Published on every answer rather than only on empty ones, for the reason
+    // stated above `edge_coverage`: an answer that returned rows proved nothing
+    // about the caller it missed. The gate in `crate::negative` reads it back
+    // from here so the verdict and the evidence a reader audits it against are
+    // the same object.
+    result[crate::caller_arrival::CALLER_ARRIVAL_KEY] =
+        crate::caller_arrival::observe_caller_arrival(store, &target).to_json();
     disclose_withheld_candidates(&mut result);
 
     // Say that a bare name was resolved, and to how many candidates.

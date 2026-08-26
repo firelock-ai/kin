@@ -2,6 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 pub mod budget;
+pub mod caller_arrival;
 pub mod daemon_delegate;
 pub mod edge_coverage;
 pub mod envelope;

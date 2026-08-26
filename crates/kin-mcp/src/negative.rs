@@ -2202,6 +2202,27 @@ pub fn negative_for(
         }
     }
 
+    // Whether a caller could have arrived through a call the graph does not hold
+    // (FIR-2775). Scoped to answers that claim an absence, like the cross-repo
+    // gate below and for the same reason: a shortfall in the arrival paths
+    // bounds what "nothing calls this" can mean, and says nothing about whether
+    // the rows a populated answer did return are real.
+    //
+    // This is the gap that had no input at all. `storage.note_body` was called
+    // once, from a test that reached the module through `from notekeeper import
+    // storage`, and the linker declined to bind the call. Every other gate here
+    // read a healthy store and agreed, so the answer certified: state
+    // `certified`, `absence_claim: authoritative`, `safe_to_conclude_absent:
+    // true`, `limiting_factor: null`, about a function one grep proves is used.
+    // The file that called it had produced 15 entities, so the
+    // file-produced-nothing warning did not apply, and no other signal in the
+    // envelope could see a call site that became no edge.
+    if tool == "find_references" && claims_absence {
+        if let Some(gap) = crate::caller_arrival::arrival_gap(payload) {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
+    }
+
     // The enumeration's own gate, and the only one that can certify it. Every
     // other signal here describes the store; this describes the file, and a
     // file no adapter parsed holds no entities in a graph of any health at all.
@@ -2843,7 +2864,138 @@ mod tests {
                 "matched": "exact_focal_name",
                 "other_candidates": [],
             },
+            // Every real answer carries this block too (FIR-2775), for the same
+            // reason the resolution block above is here: a fixture without one
+            // is not a smaller response, it is a shape the handler cannot
+            // produce, and leaving it out would exercise the absence gates
+            // against a payload that never says whether a caller could have
+            // arrived through an edge the graph does not hold.
+            //
+            // Healthy by default, which is what makes this fixture a control:
+            // the gate below has to leave an accounted arrival alone, or every
+            // absence in this module goes inconclusive and the envelope stops
+            // meaning anything.
+            crate::caller_arrival::CALLER_ARRIVAL_KEY: {
+                "state": "accounted",
+                "family_files": 2,
+                "family_measured": 2,
+                "unaccounted_files": [],
+                "unmeasured_reason": null,
+            },
         })
+    }
+
+    /// FIR-2775, the reproduction. A Python package under `src/` whose test
+    /// reached a module through `from notekeeper import storage` and called
+    /// `storage.note_body(db, note.id)`. The parser read the call, the linker
+    /// declined to bind it, and nothing recorded the decline, so this answer
+    /// came back `certified` / `safe_to_conclude_absent: true` about a function
+    /// one grep proves is used. Every other gate in this module read a healthy
+    /// store and agreed, which is why the reading had to be added rather than
+    /// tightened.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_a_caller_could_arrive_unaccounted() {
+        let mut payload = authoritative_empty_references("function");
+        payload[crate::caller_arrival::CALLER_ARRIVAL_KEY] = json!({
+            "state": "unaccounted",
+            "family_files": 1,
+            "family_measured": 0,
+            "unaccounted_files": [{
+                "file": "tests/test_storage.py",
+                "parsed_call_sites": null,
+                "resolved_call_edges": 2,
+                "unaccounted_call_sites": null,
+            }],
+            "unmeasured_reason": null,
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(crate::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+            "the limiting factor must lead the reason: {reason}"
+        );
+        assert!(
+            reason.contains("tests/test_storage.py"),
+            "the reason names the file whose calls became no edge: {reason}"
+        );
+    }
+
+    /// The control the ticket demands beside it. Flooring every absence destroys
+    /// the envelope's value in the other direction, so the accounted arrival the
+    /// shared fixture carries must leave an authoritative absence alone.
+    #[test]
+    fn find_references_absence_stays_authoritative_when_every_arrival_is_accounted() {
+        let payload = authoritative_empty_references("function");
+        assert_eq!(
+            payload[crate::caller_arrival::CALLER_ARRIVAL_KEY]["state"],
+            json!("accounted"),
+            "the control is only a control while the fixture is healthy"
+        );
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    /// An arrival the reading could not take is not an arrival it cleared. The
+    /// two states are one word apart in the payload and opposite in consequence,
+    /// so each gets its own arm.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_arrival_could_not_be_measured() {
+        let mut payload = authoritative_empty_references("function");
+        payload[crate::caller_arrival::CALLER_ARRIVAL_KEY] = json!({
+            "state": "unmeasured",
+            "family_files": 0,
+            "family_measured": 0,
+            "unaccounted_files": [],
+            "unmeasured_reason": "the graph holds no import or include edge into this file",
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(crate::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR),
+            "an unmeasured arrival names itself rather than borrowing the unresolved id: {reason}"
+        );
+    }
+
+    /// The gate is scoped to answers that claim an absence, like the cross-repo
+    /// one below it. An answer holding rows asserts nothing about what is not
+    /// there, and putting a floor under it would report every populated answer
+    /// on every repository with one unresolvable call as limited.
+    #[test]
+    fn an_answer_with_rows_is_not_limited_by_an_unaccounted_arrival() {
+        let mut payload = authoritative_empty_references("function");
+        payload["total_upstream"] = json!(1);
+        payload["references"] = json!([{ "name": "caller", "file_path": "app.py" }]);
+        payload[crate::caller_arrival::CALLER_ARRIVAL_KEY] = json!({
+            "state": "unaccounted",
+            "family_files": 1,
+            "family_measured": 1,
+            "unaccounted_files": [{
+                "file": "tests/test_storage.py",
+                "parsed_call_sites": 3,
+                "resolved_call_edges": 2,
+                "unaccounted_call_sites": 1,
+            }],
+            "unmeasured_reason": null,
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("a populated reference answer is still qualified");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "no absence is claimed by an answer with rows"
+        );
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains(crate::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+            "the arrival gate must not fire on an answer that claims no absence: {reason}"
+        );
     }
 
     /// FIR-2475, the verdict half. `find_references` published a
