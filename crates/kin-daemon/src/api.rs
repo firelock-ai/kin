@@ -2619,10 +2619,7 @@ fn disclose_graph_authority_retry(
     if attempt_number == 0 {
         return result;
     }
-    let answer = match result {
-        Ok(answer) => answer,
-        Err(error) => return Err(error),
-    };
+    let answer = result?;
     if answer.is_error == Some(true) {
         return Ok(answer);
     }
