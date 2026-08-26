@@ -2392,6 +2392,215 @@ mod tests {
         }
     }
 
+    /// Build the bootstrap pack a Git-admitted publisher would send into a
+    /// replica that has never held anything.
+    ///
+    /// The publisher here is the fixture's source, whose imported baseline is a
+    /// real two-commit Git history. The destination is a THIRD replica of the
+    /// same repository rather than the fixture's own, because the fixture
+    /// installs the identical baseline on both of its replicas, which is
+    /// exactly the state a bootstrap does not apply to.
+    fn bootstrap_pack_from(
+        fixture: &TransferFixture,
+        destination: &TestManager,
+        operation: u128,
+    ) -> RepositoryTransferPack {
+        // The lease the pack binds to is the DESTINATION's own, read from its
+        // storage rather than assumed, which is what makes the receiver's
+        // compare-and-swap a real check rather than a restatement.
+        let destination_roots = destination.read_authority().roots().clone();
+        let lease = fixture.source.read_authority();
+        let metadata = lease.metadata();
+        let authority = metadata
+            .git_external_authority
+            .clone()
+            .expect("the fixture source carries an imported Git baseline");
+        let external_objects = metadata.external_objects.clone();
+        let aliases = metadata.aliases.clone();
+        // Only the Git-origin half of the publisher's history. The fixture also
+        // holds a native child, and a bootstrap carries the imported baseline.
+        let mut git_changes: Vec<SemanticChange> = lease
+            .snapshot()
+            .changes
+            .values()
+            .filter(|change| matches!(change.origin, ChangeOrigin::GitCommit { .. }))
+            .cloned()
+            .collect();
+        git_changes.sort_by_key(|change| change.parents.len());
+        let head = git_changes
+            .last()
+            .expect("the imported baseline has at least one change")
+            .clone();
+        let store = TransferChangeStore::new(git_changes.iter().cloned());
+        let trees: Vec<RepositoryTransferTreeIdentity> = git_changes
+            .iter()
+            .map(|change| {
+                let tree = store.resolve_tree_at(&change.id).unwrap();
+                RepositoryTransferTreeIdentity {
+                    change_id: change.id,
+                    tree_hash: compute_resolved_tree_hash(&tree).unwrap(),
+                }
+            })
+            .collect();
+        let source_tree_hash = compute_resolved_tree_hash(&store.resolve_tree_at(&head.id).unwrap())
+            .unwrap();
+
+        // Every external object ships its own bytes: a pack is self-validating
+        // and refuses a record whose body it does not carry.
+        let mut body_hashes = BTreeSet::new();
+        for record in &external_objects {
+            body_hashes.insert(record.body_hash);
+        }
+        for change in &git_changes {
+            for delta in &change.tree_deltas {
+                if let Some(state) = delta.new_state() {
+                    if let Some(hash) = state.entry.blob_identity() {
+                        body_hashes.insert(hash);
+                    }
+                }
+            }
+        }
+        let bodies: Vec<RepositoryTransferBody> = body_hashes
+            .iter()
+            .map(|hash| {
+                let bytes = fixture
+                    .source
+                    .load_source_blob(*hash)
+                    .unwrap()
+                    .expect("the publisher holds every body its authority names");
+                RepositoryTransferBody::from_bytes(*hash, &bytes).unwrap()
+            })
+            .collect();
+
+        let mut pack = RepositoryTransferPack {
+            schema_version: REPOSITORY_TRANSFER_SCHEMA_VERSION,
+            protocol: REPOSITORY_TRANSFER_PROTOCOL.to_string(),
+            transfer_id: Hash256::from_bytes([0; 32]),
+            operation_id: OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: fixture.repository_id.clone(),
+            source_ref: fixture.main.clone(),
+            destination_ref: fixture.main.clone(),
+            source_head: head.id,
+            transfer_target_head: head.id,
+            source_tree_hash,
+            expected_destination_target: None,
+            expected_destination_head: None,
+            expected_destination_roots: destination_roots,
+            expected_destination_default_ref: None,
+            source_git_authority_hash: hash_git_authority(Some(&authority)).unwrap(),
+            expected_destination_git_authority_hash: None,
+            git_authority_bootstrap: Some(authority),
+            required_features: required_features(),
+            changes: git_changes,
+            trees,
+            external_objects,
+            aliases,
+            bodies,
+        };
+        pack.transfer_id = compute_transfer_id(&pack).unwrap();
+        pack
+    }
+
+    /// The gate this closes: a Git-admitted publisher can put its history into
+    /// a replica that has never held anything.
+    ///
+    /// Before this, transfer v1 carried a fast-forward only between replicas
+    /// whose imported-Git authority already matched, and no push could
+    /// establish one, so a repository that came from Git had no route into an
+    /// empty hosted store at all.
+    #[test]
+    fn a_bootstrap_pack_establishes_git_authority_on_a_replica_that_had_none() {
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+        let pack = bootstrap_pack_from(&fixture, &empty, 91);
+
+        let receipt = apply_repository_transfer_pack(
+            &empty,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("bootstrap-test"),
+            &pack,
+        )
+        .expect("an empty replica admits a bootstrap");
+        assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+
+        let lease = empty.read_authority();
+        let metadata = lease.metadata();
+        assert!(
+            metadata.git_external_authority.is_some(),
+            "the replica must hold imported-Git authority after the bootstrap"
+        );
+        assert_eq!(
+            hash_git_authority(metadata.git_external_authority.as_ref()).unwrap(),
+            pack.source_git_authority_hash,
+            "the replica's authority must be exactly the one the pack shipped, not a re-derivation"
+        );
+        assert_eq!(
+            metadata.ref_state.default_ref.as_ref(),
+            Some(&fixture.main),
+            "the replica must adopt the published default ref"
+        );
+        assert_eq!(
+            lease.snapshot().changes.len(),
+            pack.changes.len(),
+            "the replica must hold every change the bootstrap carried"
+        );
+    }
+
+    /// The control that makes the test above mean something: a replica that
+    /// already holds authority refuses a second publisher, so a bootstrap is
+    /// a first publication and never a rebinding.
+    #[test]
+    fn a_replica_that_already_holds_git_authority_refuses_a_second_bootstrap() {
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+
+        apply_repository_transfer_pack(
+            &empty,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("bootstrap-test"),
+            &bootstrap_pack_from(&fixture, &empty, 92),
+        )
+        .expect("the first bootstrap is admitted");
+
+        // A DIFFERENT operation id, so this is a genuine second publication
+        // rather than the idempotent replay of the first.
+        let error = apply_repository_transfer_pack(
+            &empty,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("second-publisher"),
+            &bootstrap_pack_from(&fixture, &empty, 93),
+        )
+        .expect_err("a replica that already holds authority is not bootstrappable");
+        assert!(
+            matches!(error, RepositoryTransferError::Conflict(_)),
+            "rebinding is a conflict, not a validation error: {error}"
+        );
+    }
+
+    /// A bootstrap whose shipped authority is not the one it advertised is
+    /// refused, because the negotiation and the payload would then describe
+    /// different repositories and only one of them was agreed to.
+    #[test]
+    fn a_bootstrap_whose_authority_does_not_match_its_declared_hash_is_refused() {
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+        let mut pack = bootstrap_pack_from(&fixture, &empty, 94);
+        pack.source_git_authority_hash = Some(Hash256::from_bytes([0x11; 32]));
+        pack.transfer_id = compute_transfer_id(&pack).unwrap();
+
+        let error = validate_pack(&pack).expect_err("a mismatched bootstrap hash is refused");
+        assert!(
+            error.to_string().contains("does not hash to the source Git authority"),
+            "the refusal must name the mismatch: {error}"
+        );
+    }
+
     #[test]
     fn exact_fast_forward_transfers_every_repository_member_and_retries_idempotently() {
         let fixture = fixture();
