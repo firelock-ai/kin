@@ -169,6 +169,7 @@ impl Verdict {
             ("withheld_candidates", withheld_candidates_reading(payload)),
             ("degradations", degradations_reading(payload)),
             ("completeness", completeness_reading(envelope)),
+            ("graph_freshness", graph_freshness_reading(envelope)),
         ];
 
         if readings
@@ -571,6 +572,41 @@ fn degradations_reading(payload: &Value) -> Reading {
 }
 
 /// The completeness signal's own reading of the substrate and the numbers.
+/// Whether graph truth was ever brought level with the repository, as an input
+/// the one verdict weighs.
+///
+/// Freshness used to reach the verdict only through `absence_gate`, which picked
+/// it up from the absence module, which read `envelope.behind`, which
+/// `GraphBehind::from_health` returns `None` for whenever nothing on disk is
+/// unadmitted. Three gates, and the outermost closed on exactly the case the
+/// ticket is about: a store with a clean working copy whose graph was built long
+/// ago certified with no qualifier at all (FIR-2226).
+///
+/// What it refuses on is deliberately narrow. A daemon reporting no complete
+/// admission is refusing, because an answer taken over a graph nothing in this
+/// process ever brought level cannot be read as covering current code. A daemon
+/// that named one certifies, because this surface holds no second number to
+/// compare that clock against: the durable marker's `tracked_artifacts`, which
+/// is the comparison worth making, is not on the health wire, and a bare
+/// wall-clock threshold ages against whatever repository the next user brings.
+/// So this does NOT catch a months-stale store under a daemon that has been up
+/// the whole time and admitted once. That case waits for the durable marker to
+/// reach the wire, and saying so here is cheaper than having someone infer a
+/// guarantee this never made.
+///
+/// Silent, never certified, when the runtime reported no reconcile block at all:
+/// a silent input contributes no agreement, so a runtime with nothing to say
+/// cannot license anything.
+fn graph_freshness_reading(envelope: &Envelope) -> Reading {
+    let Some(freshness) = envelope.freshness.as_ref() else {
+        return Reading::Silent;
+    };
+    match freshness.limiting_factor() {
+        Some(factor) => Reading::Inconclusive(factor),
+        None => Reading::Certified,
+    }
+}
+
 fn completeness_reading(envelope: &Envelope) -> Reading {
     let Some(completeness) = &envelope.completeness else {
         return Reading::Silent;
@@ -861,6 +897,142 @@ fn headline_count_disagreements(response: &Value) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FIR-2226. Freshness has to be an input the one verdict weighs. It used to
+    /// reach the verdict only through `absence_gate`, which read
+    /// `envelope.behind`, which `GraphBehind::from_health` returns `None` for
+    /// whenever nothing on disk is unadmitted, so a clean working copy over an
+    /// old graph certified with no qualifier.
+    ///
+    /// Driven through `with_health` rather than by building the state by hand,
+    /// because the question these arms have to answer is whether the reading
+    /// survives the shape the daemon actually sends. The field names below are
+    /// the producer's own (`crates/kin-cli/src/commands/resources.rs`), and both
+    /// are `skip_serializing_if = "Option::is_none"` there, which is why arm 2
+    /// omits the key rather than setting it null.
+    mod graph_freshness {
+        use super::*;
+
+        fn envelope_with(reconcile: Value) -> Envelope {
+            Envelope::daemon().with_health(&json!({
+                "graph_loaded": true,
+                "initialized": true,
+                "reconcile": reconcile,
+            }))
+        }
+
+        /// Arm 1, the positive control. A daemon that named an admission must
+        /// carry no freshness limit at all. Without this arm an implementation
+        /// that qualifies unconditionally passes arm 2 and is wrong.
+        #[test]
+        fn a_daemon_that_named_an_admission_is_not_limited_by_freshness() {
+            let envelope = envelope_with(json!({
+                "untracked_path_count": 0,
+                "last_admission_success_at": "2026-08-26T00:00:00Z",
+                "last_admission_success_age_seconds": 12,
+            }));
+            assert!(
+                matches!(graph_freshness_reading(&envelope), Reading::Certified),
+                "{:?}",
+                envelope.freshness
+            );
+        }
+
+        /// Arm 2, the case the ticket is about. Zero unadmitted paths, so
+        /// `behind` is silent by design, and no admission recorded, so the
+        /// answer is over a graph nothing in this process brought level.
+        #[test]
+        fn a_daemon_with_no_recorded_admission_refuses_on_a_clean_working_copy() {
+            let envelope = envelope_with(json!({ "untracked_path_count": 0 }));
+            assert!(
+                envelope.behind.is_none(),
+                "the count gate is what used to discard this reading: {:?}",
+                envelope.behind
+            );
+            let Reading::Inconclusive(factor) = graph_freshness_reading(&envelope) else {
+                panic!(
+                    "a graph nothing admitted cannot certify: {:?}",
+                    envelope.freshness
+                );
+            };
+            assert!(
+                factor.starts_with("graph_admission_unrecorded"),
+                "the factor names the condition that held: {factor}"
+            );
+        }
+
+        /// Arm 3. A runtime that reported no reconcile block has nothing to say,
+        /// and a silent input contributes no agreement, so it can neither refuse
+        /// nor license.
+        #[test]
+        fn a_runtime_reporting_no_reconcile_block_is_silent_rather_than_current() {
+            let envelope = Envelope::daemon().with_health(&json!({ "graph_loaded": true }));
+            assert!(envelope.freshness.is_none());
+            assert!(matches!(
+                graph_freshness_reading(&envelope),
+                Reading::Silent
+            ));
+        }
+
+        /// The reading has to reach the composed factor, not merely exist. This
+        /// is the arm that catches a sixth entry left out of the readings array,
+        /// and it asserts on the named factor rather than on `certified == false`
+        /// because a reading that silently returns `Silent` still leaves the
+        /// response reading certified.
+        #[test]
+        fn the_freshness_factor_reaches_the_one_verdict() {
+            let envelope = envelope_with(json!({ "untracked_path_count": 0 }));
+            let verdict = Verdict::compute(
+                "find_references",
+                &json!({ "references": [] }),
+                &envelope,
+                None,
+            )
+            .expect("a refusing input yields a verdict");
+            assert_eq!(
+                verdict
+                    .inputs
+                    .get("graph_freshness")
+                    .and_then(Value::as_str),
+                Some(INCONCLUSIVE),
+                "{:?}",
+                verdict.inputs
+            );
+            assert!(
+                verdict
+                    .limiting_factor
+                    .as_deref()
+                    .is_some_and(|factor| factor.contains("graph_admission_unrecorded")),
+                "the factor a reader acts on has to name it: {:?}",
+                verdict.limiting_factor
+            );
+            assert!(!verdict.certified);
+        }
+
+        /// The same call on a store that named an admission keeps the freshness
+        /// input out of the factor entirely, so the arm above cannot be passed
+        /// by a build that always refuses.
+        #[test]
+        fn a_named_admission_leaves_the_factor_alone() {
+            let envelope = envelope_with(json!({
+                "untracked_path_count": 0,
+                "last_admission_success_at": "2026-08-26T00:00:00Z",
+            }));
+            let verdict = Verdict::compute(
+                "find_references",
+                &json!({ "references": [] }),
+                &envelope,
+                None,
+            );
+            let factor = verdict.as_ref().and_then(|v| v.limiting_factor.as_deref());
+            assert!(
+                !factor
+                    .unwrap_or_default()
+                    .contains("graph_admission_unrecorded"),
+                "{factor:?}"
+            );
+        }
+    }
 
     /// FIR-2672, second finding. A verdict with two independent reasons names
     /// both: the class gap decided the state and the failed embedding worker
