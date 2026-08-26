@@ -1258,7 +1258,7 @@ jobs:
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
       && github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: kin-16core
     timeout-minutes: 60
     # The all-features clippy/build/test sequence can otherwise retain more
     # than a hosted runner's available disk in incremental objects and debug
@@ -2254,7 +2254,7 @@ jobs:
     # sha release-tag.yml sweeps, where a non-required failure is terminal even
     # though nothing gated on it. A job that never starts cannot conclude.
     if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
-    runs-on: ubuntu-latest
+    runs-on: kin-16core
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -2315,7 +2315,7 @@ jobs:
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
       && github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: kin-16core
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

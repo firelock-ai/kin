@@ -104,7 +104,7 @@ jobs:
     # mint refuses a sha whose required checks are not green, so what this
     # proves still has to be true before a tag, only later than it used to be.
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: kin-16core
     timeout-minutes: 60
     steps:
       - name: Checkout
