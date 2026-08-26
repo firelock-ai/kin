@@ -1035,14 +1035,20 @@ fn extract_js_assignment_target(
         // than an unresolved reference: an export sweep run from the graph over
         // `lib/utils.js` returns six of its nine exports and reports nothing
         // missing, because from the graph's side there is nothing to hedge about.
+        // A `require(...)` re-export is an export of this module, and the import
+        // specifier it also produces is not a substitute for the entity. The two
+        // live on different surfaces: `list_file_entities`, `find_references` and
+        // every dead-code sweep read the entity set, and none of them can see an
+        // import specifier, so `exports.static = require('serve-static')` reached
+        // an agent as a file whose enumeration certified itself complete without
+        // holding one of express's most-used exports. The 451-constant bloat that
+        // bought the exclusion came from LOCAL bindings (`var etag = require(..)`)
+        // and those stay filtered where they are declared; the export namespace is
+        // a different and much smaller set, one statement in the whole of express.
+        let reexported_dependency = js_require_target(value, source).is_some();
         if matches!(receiver_path.as_str(), "exports" | "module.exports")
             && !property.is_empty()
             && !is_js_function_like_node(value)
-            // A `require(...)` re-export already reaches the graph as a
-            // `FileImport` specifier under this same name. Emitting a constant
-            // beside it would double every re-exported dependency, which is the
-            // shape that buried express's functions under 451 constants.
-            && js_require_target(value, source).is_none()
         {
             entities.push(ExtractedEntity {
                 kind: if value.kind() == "class" {
@@ -1061,7 +1067,16 @@ fn extract_js_assignment_target(
             // it reachable: `exports.etag` calls `createETagGenerator`. The
             // statement is what gets walked rather than the value, because the
             // walk tests a node's children and the value here IS the call.
-            extract_calls_from_context(stmt, source, property, None, relations);
+            //
+            // Skipped for a re-exported dependency, where the only call in the
+            // statement is `require` itself. That is a module load rather than a
+            // call to anything this repository owns, it can never resolve to an
+            // entity, and counting it would charge the file a parsed call site
+            // that no resolver could ever satisfy, which is the denominator
+            // `edge_coverage` reports call resolution against.
+            if !reexported_dependency {
+                extract_calls_from_context(stmt, source, property, None, relations);
+            }
         }
 
         // `module.exports = { parse() {}, print() {} }` is the CommonJS way of
@@ -2264,10 +2279,17 @@ mod tests {
 
     #[test]
     fn parse_js_require_binding_is_an_import_not_a_constant() {
-        // A `require(...)` binding is a dependency line, already carried as a
-        // FileImport. Emitting a Constant beside it doubled every dependency
+        // A LOCAL `require(...)` binding is a dependency line, already carried as
+        // a FileImport. Emitting a Constant beside it doubled every dependency
         // into the entity set: on express those bindings were the bulk of the
         // 451 constants that buried 133 functions.
+        //
+        // The export namespace is the exception and it rides in this fixture on
+        // purpose, because the distinction is the whole rule and a test that only
+        // showed the local side would pass just as well if the export side were
+        // filtered too. That is what shipped: five local bindings and one export
+        // all filtered together, and `express.static` absent from a certified
+        // enumeration as a result.
         let adapter = JavaScriptAdapter;
         let source = br#"
 var contentDisposition = require('content-disposition');
@@ -2281,13 +2303,30 @@ exports.static = require('serve-static');
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
 
-        assert!(
-            entities_besides_the_files_own_module(&output.entities).is_empty(),
-            "require bindings must not produce entities, got {:?}",
+        assert_eq!(
+            entities_besides_the_files_own_module(&output.entities),
+            vec![(EntityKind::Constant, "static")],
+            "five local require bindings produce no entity and the one export \
+             produces exactly one, got {:?}",
             output
                 .entities
                 .iter()
                 .map(|e| (e.kind, e.name.as_str()))
+                .collect::<Vec<_>>()
+        );
+        // The module load is not a call this repository could ever resolve, so it
+        // must not be charged to the file as a parsed call site.
+        assert!(
+            !output
+                .relations
+                .iter()
+                .any(|r| r.kind == kin_model::RelationKind::Calls && r.dst_name == "require"),
+            "a re-export must not record a Calls edge to `require`, got {:?}",
+            output
+                .relations
+                .iter()
+                .filter(|r| r.kind == kin_model::RelationKind::Calls)
+                .map(|r| (r.src_name.as_str(), r.dst_name.as_str()))
                 .collect::<Vec<_>>()
         );
 
@@ -2406,25 +2445,32 @@ exports.static = require('serve-static');
     }
 
     #[test]
-    fn parse_js_exports_require_reexport_stays_an_import() {
-        // `exports.static = require('serve-static')` already reaches the graph
-        // as an import specifier named `static`. A constant beside it would
-        // double every re-exported dependency, which is the shape that buried
-        // express's functions under 451 constants.
+    fn parse_js_exports_require_reexport_is_an_export_and_an_import() {
+        // `exports.static = require('serve-static')` is express's line 79 and it
+        // is both things at once: an import of `serve-static` and an export of
+        // this module named `static`. It has to reach BOTH surfaces, because an
+        // import specifier is invisible to every surface that reads the entity
+        // set. Answering only the import side is how `list_file_entities` came to
+        // certify `lib/express.js` as an exact and complete enumeration of eleven
+        // entities that did not include one of the Express API's most-used names,
+        // and how `find_references("express.static")` had no focal to resolve.
         let adapter = JavaScriptAdapter;
         let source = b"exports.static = require('serve-static');";
         let tree = adapter.parse(source).unwrap();
         let file_id = FilePathId::new("test.js");
         let output = adapter.extract(&tree, source, &file_id).unwrap();
-        assert!(
-            entities_besides_the_files_own_module(&output.entities).is_empty(),
-            "a require re-export is a dependency line, got {:?}",
+        assert_eq!(
+            entities_besides_the_files_own_module(&output.entities),
+            vec![(EntityKind::Constant, "static")],
+            "a re-export is an export of this module, got {:?}",
             output
                 .entities
                 .iter()
                 .map(|e| (e.kind, e.name.as_str()))
                 .collect::<Vec<_>>()
         );
+        // The import side is unchanged. Both readings are true and the entity is
+        // not a replacement for the specifier.
         let specifiers: Vec<&str> = output
             .imports
             .iter()

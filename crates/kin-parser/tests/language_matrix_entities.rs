@@ -713,12 +713,13 @@ fn assert_export_surface(out: &ParseOutput, lang: &str) {
         );
     }
 
-    // `exports.static = require('serve-static')` is a re-exported dependency.
-    // It reaches the graph as an import specifier under that name, so a
-    // constant beside it would count the same dependency line twice.
+    // `exports.static = require('serve-static')` is a re-exported dependency AND
+    // an export of this module. It has to reach both surfaces, because the
+    // enumeration, the reference index and every dead-code sweep read the entity
+    // set and none of them can see an import specifier.
     assert!(
-        !named.iter().any(|(_, n)| *n == "static"),
-        "{lang}: a require re-export must stay an import; have {named:?}"
+        named.contains(&(EntityKind::Constant, "static")),
+        "{lang}: a require re-export is still an export of this module; have {named:?}"
     );
     let static_specifiers: Vec<&str> = out
         .imports
@@ -751,8 +752,14 @@ fn assert_export_surface(out: &ParseOutput, lang: &str) {
         );
     }
 
-    // Nine exports in, nine reachable out. Reverting the rule that admits a
-    // non-function right-hand side drops this to six.
+    // Nine exports in, nine ENTITIES out. Reverting the rule that admits a
+    // non-function right-hand side drops this to six; reverting the rule that
+    // admits a re-export drops it to eight.
+    //
+    // The reachability test used to accept an import specifier in place of an
+    // entity, which is why `static` could vanish from the entity set with this
+    // assertion still green: the specifier stood in for the entity it was not.
+    // An enumeration reads entities, so this counts entities.
     let exported = [
         "methods",
         "etag",
@@ -764,20 +771,15 @@ fn assert_export_surface(out: &ParseOutput, lang: &str) {
         "compileETag",
         "compileQueryParser",
     ];
-    let reachable = exported
+    let missing: Vec<&str> = exported
         .iter()
-        .filter(|name| {
-            named.iter().any(|(_, n)| n == *name)
-                || out
-                    .imports
-                    .iter()
-                    .any(|i| i.specifiers.iter().any(|s| s.local_name == **name))
-        })
-        .count();
-    assert_eq!(
-        reachable,
-        exported.len(),
-        "{lang}: {reachable} of {} exports reachable; have {named:?}",
+        .copied()
+        .filter(|name| !named.iter().any(|(_, n)| n == name))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{lang}: {} of {} exports have no entity ({missing:?}); have {named:?}",
+        missing.len(),
         exported.len()
     );
 }
