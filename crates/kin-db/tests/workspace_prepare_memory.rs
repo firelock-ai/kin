@@ -365,19 +365,42 @@ fn peak_growth_of_one_bootstrap(with_workspace: bool) -> BootstrapArm {
 /// Peak growth a workspace mutation may add, in copies of the history it
 /// commits.
 ///
-/// Set from measurement on this fixture, not from taste. Release, this
-/// fixture, one copy of the history at 2,833,178 bytes: the shape that carried
-/// whole snapshots for four-domain comparisons measured 8.81 copies, the shape
-/// that replaced it measured 4.56 and had drifted to 4.07, and the shape that
-/// stops a comparison base carrying the change map measures 3.67. A ceiling of
-/// 3.9 fails the 4.07 and passes the 3.67, and the readings it separates jitter
-/// by about half a percent across runs, because the number is a ratio of two
-/// live-heap readings taken in the same process.
+/// Set from measurement on this fixture, not from taste. One copy of the
+/// history at 2,833,178 bytes: the shape that carried whole snapshots for
+/// four-domain comparisons measured 8.81 copies, the shape that replaced it
+/// measured 4.56 and had drifted to 4.07, and the shape that stops a comparison
+/// base carrying the change map measured 3.67 against a ceiling of 3.9. The
+/// readings jitter by about half a percent across runs, because the number is a
+/// ratio of two live-heap readings taken in the same process.
+///
+/// **The ceiling moved to 4.4 when the write path stopped holding copies, and
+/// the reason is worth reading before touching it again.** This number is a
+/// DIFFERENCE between two bootstrap peaks, one with a workspace mutation and one
+/// without, so anything that lowers either arm moves it. Installing a snapshot
+/// used to read the whole staged and promoted file back into memory three times
+/// to check it, and removing that lowered BOTH arms while lowering the arm
+/// WITHOUT a mutation proportionally more, because that arm has no high-water
+/// mark above the write for the copies to hide under. Measured, one variable,
+/// same fixture and host:
+///
+/// ```text
+///   before  without 10,794,798  with 21,185,516  ratio 3.67
+///   after   without  8,683,082  with 20,239,073  ratio 4.08
+/// ```
+///
+/// Both peaks fell and the ratio rose. A ratio between two peaks is not a
+/// memory measurement; it is a measurement of how two peaks relate, and an
+/// unrelated improvement can move it in either direction. So the ceiling was
+/// re-derived on the new baseline with the same mutations it was calibrated
+/// against, rather than nudged until the intact reading passed: intact 4.08,
+/// `next_base` carrying again 4.82, both bases carrying again 4.82. 4.4 sits
+/// 0.32 above the intact reading and 0.42 below the smallest failure, which is
+/// a wider margin on both sides than the 3.9 it replaces had.
 ///
 /// What this ceiling does NOT price is the second of the two copies, and that
 /// is worth writing down rather than leaving for someone to rediscover.
-/// Restoring the `next_base` copy alone takes the ratio to 4.07 and this fails.
-/// Restoring the `current_base` copy alone leaves it at 3.67 and this passes,
+/// Restoring the `next_base` copy alone takes the ratio to 4.82 and this fails.
+/// Restoring the `current_base` copy alone leaves it at 4.08 and this passes,
 /// because on a 300-commit fixture that copy fits entirely under a high-water
 /// mark another term has already set. Peak growth is measured against a running
 /// mark and overlapping terms are not additive, so a ratio cannot see a term
@@ -385,7 +408,7 @@ fn peak_growth_of_one_bootstrap(with_workspace: bool) -> BootstrapArm {
 /// `a_workspace_mutation_resolves_no_base_carrying_the_history`, which counts
 /// the changes each resolved base actually carried and goes red for either
 /// copy on its own.
-const WORKSPACE_PEAK_HISTORY_COPIES: f64 = 3.9;
+const WORKSPACE_PEAK_HISTORY_COPIES: f64 = 4.4;
 
 /// A workspace mutation must not hold the repository's whole change map more
 /// than about twice while it prepares a successor.

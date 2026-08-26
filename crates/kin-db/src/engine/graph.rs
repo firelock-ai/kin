@@ -17762,6 +17762,18 @@ mod tests {
     /// here is therefore the number of degradation-producing keys the store
     /// would hand every query.
     #[cfg(feature = "vector")]
+    /// Counts index keys that RESOLVE to an entity the graph no longer holds.
+    ///
+    /// Read the name literally, because since FIR-2727 it is narrower than it
+    /// sounds. A retired entity's revision key now resolves to `None`, which
+    /// falls to the `_` arm and is not counted, so a zero from this helper says
+    /// "retrieval cannot be handed a dead entity" and says NOTHING about
+    /// whether the key is still in the index. Those were the same fact before
+    /// resolution learned to refuse; they are two facts now.
+    ///
+    /// So a post-prune zero here is not evidence that a prune evicted anything.
+    /// Assert `contains_retrievable` directly for that, as the retirement test
+    /// below does on both sides of its prune.
     fn count_index_keys_resolving_to_dead_entities(graph: &InMemoryGraph) -> usize {
         let vi = graph
             .vector_index
@@ -17914,6 +17926,29 @@ mod tests {
         // head and the store returns to a zero-drop steady state.
         assert_eq!(graph.prune_orphaned_vectors(), 1);
         assert_eq!(count_index_keys_resolving_to_dead_entities(&graph), 0);
+        // The settled store, asserted on the index rather than through a proxy.
+        //
+        // Neither line above can see this. The count helper stopped being able
+        // to when FIR-2727 made a retired revision key resolve to `None`, which
+        // its `_` arm does not count, so its zero now holds whether or not the
+        // key was evicted. And the prune's return value is the number it
+        // REPORTS evicting, which is the thing under test rather than
+        // independent evidence about it.
+        //
+        // This is the negative half of the positive control above: the same key,
+        // the same question, on the other side of the reconcile. That pairing is
+        // what lets the remediation `kin embed` names be believed, because
+        // "embed settles the store" is a claim about the index being clean, not
+        // about resolution being polite.
+        assert!(
+            !graph
+                .vector_index
+                .lock()
+                .clone()
+                .expect("vector index installed")
+                .contains_retrievable(&retired_head_key),
+            "prune reported evicting the retired revision key but the index still holds it"
+        );
         let status = graph.embedding_status();
         assert_eq!((status.indexed, status.pending, status.total), (2, 0, 2));
 

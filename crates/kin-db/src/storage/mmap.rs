@@ -465,6 +465,179 @@ fn windows_metadata_is_reparse(metadata: &std::fs::Metadata) -> bool {
     metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
+/// The content a staged or promoted entry is required to carry, expressed the
+/// way a recovery marker already expresses it: a length and a sha256 over the
+/// exact bytes.
+///
+/// Every question the promotion sequence asks about a file is content
+/// identity, and answering it by reading the file into a `Vec` costs one whole
+/// copy of whatever was written. On a converted repository that is the
+/// repository: `kindb.commit.persist_successor` grew 1,268.0 MiB with 0.0
+/// retained on psf/requests at full history, measured on kin-db 0.7.65, and it
+/// is the last phase in the ladder, so a transient there sets the whole run's
+/// high-water mark (FIR-2683).
+///
+/// sha256 is the identity this store already trusts for exactly this question.
+/// The recovery marker records it, `LocalAuthorityRecord::snapshot_sha256` is
+/// the durable name of a snapshot, and a promotion already refuses when the two
+/// disagree. Comparing digests rather than bytes asks the same question of the
+/// same authority, in a fixed buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpectedContent {
+    byte_len: u64,
+    sha256: [u8; 32],
+}
+
+impl ExpectedContent {
+    /// What a caller holding the bytes expects the file to carry.
+    fn of(bytes: &[u8]) -> Self {
+        Self {
+            byte_len: bytes.len() as u64,
+            sha256: Sha256::digest(bytes).into(),
+        }
+    }
+
+    /// What the recovery marker says its candidate carries.
+    fn from_marker(marker: &RecoveryMarker) -> Self {
+        Self {
+            byte_len: marker.byte_len,
+            sha256: marker.sha256,
+        }
+    }
+}
+
+/// Bytes read at a time while proving content identity. Large enough that the
+/// syscall count stays small on a gigabyte-scale frame, small enough that the
+/// buffer never shows up in a memory guard.
+const CONTENT_VERIFY_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Whether an open regular file carries exactly `expected`, without retaining
+/// it.
+///
+/// This proves what `read_regular_bounded` proved about a file it read whole:
+/// the length declared before the read is the length delivered, nothing grew
+/// past it while the read was in flight, and the bytes hash to what was
+/// promised. It re-reads the metadata at the end for the same reason that
+/// function does, and it refuses to keep reading past the declared length so a
+/// file growing underneath it cannot turn into an unbounded read.
+fn file_carries_expected(
+    file: &mut File,
+    display: &Path,
+    role: &str,
+    expected: ExpectedContent,
+) -> Result<bool, KinDbError> {
+    let len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to inspect {role} {}: {error}",
+                display.display()
+            ))
+        })?
+        .len();
+    if len != expected.byte_len {
+        return Ok(false);
+    }
+    run_read_regular_after_metadata_hook();
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CONTENT_VERIFY_CHUNK_BYTES];
+    let mut hashed: u64 = 0;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read {role} {} for content verification: {error}",
+                display.display()
+            ))
+        })?;
+        if read == 0 {
+            break;
+        }
+        hashed = hashed.saturating_add(read as u64);
+        if hashed > expected.byte_len {
+            return Ok(false);
+        }
+        hasher.update(&buffer[..read]);
+    }
+    if hashed != expected.byte_len {
+        return Ok(false);
+    }
+    let final_len = file
+        .metadata()
+        .map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to verify the final length of {role} {}: {error}",
+                display.display()
+            ))
+        })?
+        .len();
+    if final_len != expected.byte_len {
+        return Ok(false);
+    }
+    Ok(<[u8; 32]>::from(hasher.finalize()) == expected.sha256)
+}
+
+/// The leading bytes of a regular file, for a caller that needs a magic
+/// prefix and nothing else. Reads at most `N` bytes and keeps at most `N`.
+fn leading_bytes<const N: usize>(
+    file: &mut File,
+    display: &Path,
+    role: &str,
+) -> Result<Option<[u8; N]>, KinDbError> {
+    let mut prefix = [0u8; N];
+    let mut filled = 0usize;
+    while filled < N {
+        let read = file.read(&mut prefix[filled..]).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "failed to read the leading bytes of {role} {}: {error}",
+                display.display()
+            ))
+        })?;
+        if read == 0 {
+            return Ok(None);
+        }
+        filled += read;
+    }
+    Ok(Some(prefix))
+}
+
+/// What the file at an ambient path currently carries, without retaining it.
+///
+/// This is the read half of a compare-and-swap: a caller learns the content
+/// identity of an entry now, and later requires the entry it claims to still
+/// carry it. Reading the bytes to hold them for that later comparison is what
+/// this avoids, which matters because on a recovery path the entry can be a
+/// staged snapshot frame.
+fn path_expected_content(path: &Path, role: &str) -> Result<ExpectedContent, KinDbError> {
+    let mut file = open_regular_nofollow(path, role)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; CONTENT_VERIFY_CHUNK_BYTES];
+    let mut byte_len: u64 = 0;
+    loop {
+        let read = file.read(&mut buffer).map_err(|error| {
+            KinDbError::StorageError(format!("failed to read {role} {}: {error}", path.display()))
+        })?;
+        if read == 0 {
+            break;
+        }
+        byte_len = byte_len.saturating_add(read as u64);
+        hasher.update(&buffer[..read]);
+    }
+    Ok(ExpectedContent {
+        byte_len,
+        sha256: hasher.finalize().into(),
+    })
+}
+
+/// Whether the file at an ambient path carries exactly `expected`.
+fn path_carries_expected(
+    path: &Path,
+    role: &str,
+    expected: ExpectedContent,
+) -> Result<bool, KinDbError> {
+    let mut file = open_regular_nofollow(path, role)?;
+    file_carries_expected(&mut file, path, role, expected)
+}
+
 pub(crate) fn read_regular_bounded(
     path: &Path,
     role: &str,
@@ -618,7 +791,7 @@ impl ExactPathClaim {
 
 pub(crate) fn claim_exact_path(
     path: &Path,
-    expected: Option<&[u8]>,
+    expected: Option<ExpectedContent>,
     role: &str,
 ) -> Result<ExactPathClaim, KinDbError> {
     let exists = match std::fs::symlink_metadata(path) {
@@ -660,14 +833,20 @@ pub(crate) fn claim_exact_path(
         let _ = claim.restore();
         return Err(error);
     }
-    let actual = match read_regular_file(&held, role) {
-        Ok(actual) => actual,
-        Err(error) => {
-            let _ = claim.restore();
-            return Err(error);
-        }
+    // As in the capability twin: a claim with no expectation over an entry that
+    // exists never matched, because the old comparison was
+    // `expected != Some(actual)`, which is true for every `None`.
+    let carries_expected = match expected {
+        Some(expected) => match path_carries_expected(&held, role, expected) {
+            Ok(carries_expected) => carries_expected,
+            Err(error) => {
+                let _ = claim.restore();
+                return Err(error);
+            }
+        },
+        None => false,
     };
-    if expected != Some(actual.as_slice()) {
+    if !carries_expected {
         claim.restore()?;
         return Err(KinDbError::StorageError(format!(
             "{role} {} changed before its CAS claim",
@@ -681,9 +860,12 @@ pub(crate) fn claim_exact_path(
 /// time without unlinking a racing replacement. This is used only after an
 /// independent authoritative snapshot has been verified and projected.
 pub(crate) fn discard_recovery_artifacts_if_unchanged(path: &Path) -> Result<(), KinDbError> {
-    fn read_optional(path: &Path, role: &str) -> Result<Option<Vec<u8>>, KinDbError> {
+    // What each entry carries now, as a length and a digest rather than as its
+    // bytes. A recovery candidate can be a staged snapshot frame, so holding it
+    // to compare against later is a whole copy of the repository for a cleanup.
+    fn expected_if_present(path: &Path, role: &str) -> Result<Option<ExpectedContent>, KinDbError> {
         match std::fs::symlink_metadata(path) {
-            Ok(_) => read_regular_file(path, role).map(Some),
+            Ok(_) => path_expected_content(path, role).map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(KinDbError::StorageError(format!(
                 "failed to inspect {role} {}: {error}",
@@ -694,16 +876,17 @@ pub(crate) fn discard_recovery_artifacts_if_unchanged(path: &Path) -> Result<(),
 
     let marker_path = recovery_marker_path(path);
     let candidate_path = recovery_tmp_path(path);
-    let marker_bytes = read_optional(&marker_path, "recovery marker cleanup source")?;
-    let candidate_bytes = read_optional(&candidate_path, "recovery candidate cleanup source")?;
+    let marker_expected = expected_if_present(&marker_path, "recovery marker cleanup source")?;
+    let candidate_expected =
+        expected_if_present(&candidate_path, "recovery candidate cleanup source")?;
     let marker_claim = claim_exact_path(
         &marker_path,
-        marker_bytes.as_deref(),
+        marker_expected,
         "recovery marker cleanup source",
     )?;
     let candidate_claim = match claim_exact_path(
         &candidate_path,
-        candidate_bytes.as_deref(),
+        candidate_expected,
         "recovery candidate cleanup source",
     ) {
         Ok(claim) => claim,
@@ -833,7 +1016,7 @@ pub(crate) fn confirm_installed_write(path: &Path) -> Result<bool, KinDbError> {
     run_confirm_before_marker_claim_hook();
     match claim_exact_path(
         &marker_path,
-        Some(&marker_bytes),
+        Some(ExpectedContent::of(&marker_bytes)),
         "installed-write recovery marker cleanup",
     ) {
         Ok(marker_claim) => {
@@ -1045,22 +1228,23 @@ fn promote_recovery_candidate_with_magic_outcome(
             marker.version
         )));
     }
-    let candidate = read_regular_bounded(&tmp_path, "recovery candidate", marker.byte_len)?;
-    if candidate.len() as u64 != marker.byte_len
-        || <[u8; 32]>::from(Sha256::digest(&candidate)) != marker.sha256
-    {
+    let expected = ExpectedContent::from_marker(&marker);
+    if !path_carries_expected(&tmp_path, "recovery candidate", expected)? {
         return Err(KinDbError::StorageError(format!(
             "recovery candidate {} no longer matches marker {}",
             tmp_path.display(),
             marker_path.display()
         )));
     }
-    if let Some(expected) = expected_magic {
-        if candidate.get(..expected.len()) != Some(expected.as_slice()) {
+    if let Some(expected_magic) = expected_magic {
+        let mut candidate = open_regular_nofollow(&tmp_path, "recovery candidate")?;
+        let carries_magic = leading_bytes::<4>(&mut candidate, &tmp_path, "recovery candidate")?
+            .is_some_and(|prefix| prefix == *expected_magic);
+        if !carries_magic {
             return Err(KinDbError::StorageError(format!(
                 "recovery candidate {} does not carry expected magic {:?}",
                 tmp_path.display(),
-                expected
+                expected_magic
             )));
         }
     }
@@ -1068,7 +1252,7 @@ fn promote_recovery_candidate_with_magic_outcome(
 
     let candidate_claim = claim_exact_path(
         &tmp_path,
-        Some(&candidate),
+        Some(expected),
         "recovery candidate selected for promotion",
     )?;
     let claimed_candidate_path = candidate_claim
@@ -1110,13 +1294,11 @@ fn promote_recovery_candidate_with_magic_outcome(
         return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error));
     }
 
-    let installed = match read_regular_bounded(path, "promoted destination", marker.byte_len) {
+    let installed = match path_carries_expected(path, "promoted destination", expected) {
         Ok(installed) => installed,
         Err(error) => return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error)),
     };
-    if installed.len() as u64 != marker.byte_len
-        || <[u8; 32]>::from(Sha256::digest(&installed)) != marker.sha256
-    {
+    if !installed {
         return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(
             KinDbError::StorageError(format!(
                 "promoted destination {} does not match the claimed recovery candidate",
@@ -1132,7 +1314,7 @@ fn promote_recovery_candidate_with_magic_outcome(
 
     match claim_exact_path(
         &marker_path,
-        Some(&marker_bytes),
+        Some(ExpectedContent::of(&marker_bytes)),
         "durable recovery marker cleanup",
     ) {
         Ok(marker_claim) => {
@@ -1413,6 +1595,20 @@ pub(crate) fn open_regular_nofollow_at(
 }
 
 /// Capability-relative counterpart of [`read_regular_bounded`].
+/// Whether a regular file beneath a retained repository directory capability
+/// carries exactly `expected`, without retaining it.
+fn capability_file_carries_expected(
+    directory: &cap_std::fs::Dir,
+    relative: &Path,
+    display_root: &Path,
+    role: &str,
+    expected: ExpectedContent,
+) -> Result<bool, KinDbError> {
+    let display = capability_display_path(display_root, relative);
+    let mut file = open_regular_nofollow_at(directory, relative, display_root, role)?;
+    file_carries_expected(&mut file, &display, role, expected)
+}
+
 pub(crate) fn read_regular_bounded_at(
     directory: &cap_std::fs::Dir,
     relative: &Path,
@@ -1624,7 +1820,7 @@ fn capability_claim_exact_path<'a>(
     directory: &'a cap_std::fs::Dir,
     relative: &Path,
     display_root: &'a Path,
-    expected: Option<&[u8]>,
+    expected: Option<ExpectedContent>,
     role: &str,
 ) -> Result<CapabilityExactPathClaim<'a>, KinDbError> {
     let display = capability_display_path(display_root, relative);
@@ -1673,14 +1869,24 @@ fn capability_claim_exact_path<'a>(
         let _ = claim.restore();
         return Err(error);
     }
-    let actual = match read_regular_file_at(directory, &held, display_root, role) {
-        Ok(actual) => actual,
-        Err(error) => {
-            let _ = claim.restore();
-            return Err(error);
+    // A claim with no expectation over an entry that exists never matched: the
+    // old comparison was `expected != Some(actual)`, which is true for every
+    // `None`. That is preserved rather than tidied, because the callers that
+    // reach here all name an expectation and the no-expectation case belongs to
+    // the entry-absent arm above.
+    let carries_expected = match expected {
+        Some(expected) => {
+            match capability_file_carries_expected(directory, &held, display_root, role, expected) {
+                Ok(carries_expected) => carries_expected,
+                Err(error) => {
+                    let _ = claim.restore();
+                    return Err(error);
+                }
+            }
         }
+        None => false,
     };
-    if expected != Some(actual.as_slice()) {
+    if !carries_expected {
         claim.restore()?;
         return Err(KinDbError::StorageError(format!(
             "{role} {} changed before its CAS claim",
@@ -1785,7 +1991,7 @@ pub(crate) fn confirm_installed_write_at(
         directory,
         &marker_path,
         display_root,
-        Some(&marker_bytes),
+        Some(ExpectedContent::of(&marker_bytes)),
         "installed-write recovery marker cleanup",
     ) {
         Ok(marker_claim) => {
@@ -1885,16 +2091,14 @@ fn capability_promote_recovery_candidate_outcome(
             marker.version
         )));
     }
-    let candidate = read_regular_bounded_at(
+    let expected = ExpectedContent::from_marker(&marker);
+    if !capability_file_carries_expected(
         directory,
         &tmp_path,
         display_root,
         "recovery candidate",
-        marker.byte_len,
-    )?;
-    if candidate.len() as u64 != marker.byte_len
-        || <[u8; 32]>::from(Sha256::digest(&candidate)) != marker.sha256
-    {
+        expected,
+    )? {
         return Err(KinDbError::StorageError(format!(
             "recovery candidate {} no longer matches marker {}",
             capability_display_path(display_root, &tmp_path).display(),
@@ -1907,7 +2111,7 @@ fn capability_promote_recovery_candidate_outcome(
         directory,
         &tmp_path,
         display_root,
-        Some(&candidate),
+        Some(expected),
         "recovery candidate selected for promotion",
     )?;
     let claimed_candidate_path = candidate_claim
@@ -1956,19 +2160,17 @@ fn capability_promote_recovery_candidate_outcome(
         return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error));
     }
 
-    let installed = match read_regular_bounded_at(
+    let installed = match capability_file_carries_expected(
         directory,
         relative,
         display_root,
         "promoted destination",
-        marker.byte_len,
+        expected,
     ) {
         Ok(installed) => installed,
         Err(error) => return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(error)),
     };
-    if installed.len() as u64 != marker.byte_len
-        || <[u8; 32]>::from(Sha256::digest(&installed)) != marker.sha256
-    {
+    if !installed {
         return Ok(AtomicWriteOutcome::InstalledButUnconfirmed(
             KinDbError::StorageError(format!(
                 "promoted destination {} does not match the claimed recovery candidate",
@@ -1981,7 +2183,7 @@ fn capability_promote_recovery_candidate_outcome(
         directory,
         &marker_path,
         display_root,
-        Some(&marker_bytes),
+        Some(ExpectedContent::of(&marker_bytes)),
         "durable recovery marker cleanup",
     ) {
         Ok(marker_claim) => {
