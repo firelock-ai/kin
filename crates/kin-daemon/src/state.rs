@@ -798,6 +798,26 @@ pub struct SpineIngestOutcome {
 /// Operator lever for how many siblings the spine loads eagerly. Registered in
 /// `kin-core`'s env registry, which is the surface that decides whether a
 /// `KIN_*` name is a lever or an unrecognized read.
+/// What the spine's sibling capture actually did, kept rather than only logged.
+///
+/// A log line discloses to an operator reading logs. This discloses to the
+/// process: a test can assert it, and a health surface can report it, which is
+/// what makes "bounded" a claim the product carries rather than a sentence it
+/// once printed.
+///
+/// `bounded` and `authority_incomplete` are deliberately separate booleans over
+/// one inequality. A capture the bound stopped is expected and its captures are
+/// sound; a sibling that failed to load is neither. Collapsing them into one
+/// flag is what would let a real failure hide behind a configured cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SiblingCaptureReport {
+    pub bounded: bool,
+    pub captured: usize,
+    pub registered: usize,
+    pub bound: usize,
+    pub authority_incomplete: bool,
+}
+
 pub(crate) const EAGER_SIBLING_BOUND_ENV: &str = "KIN_SPINE_MAX_EAGER_SIBLINGS";
 
 /// Returned by [`DaemonState::refresh_all_cross_repo_edges`] and surfaced by the
@@ -1234,6 +1254,9 @@ pub struct DaemonState {
     /// state that every other test in this binary shares, which is a race
     /// rather than a fixture.
     eager_sibling_bound: usize,
+    /// Set once, when the spine publishes. Absent until then, which is itself
+    /// the honest answer to "what did the capture do" before it has run.
+    sibling_capture: std::sync::OnceLock<SiblingCaptureReport>,
     /// Frozen startup policy for deployments whose graph backend is the only
     /// write authority. When true, no filesystem/session/VFS compatibility
     /// surface may reconcile bytes back into graph truth.
@@ -2677,6 +2700,7 @@ impl DaemonState {
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
             eager_sibling_bound: Self::eager_sibling_load_bound(),
+            sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(false),
             ),
@@ -2932,6 +2956,7 @@ impl DaemonState {
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
             eager_sibling_bound: Self::eager_sibling_load_bound(),
+            sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(true),
             ),
@@ -3566,6 +3591,13 @@ impl DaemonState {
                  answers over a bounded capture set, not an incomplete one"
             );
         }
+        let _ = self.sibling_capture.set(SiblingCaptureReport {
+            bounded: bounded_out > 0,
+            captured: registered_sibling_count.saturating_sub(bounded_out),
+            registered: registered_sibling_count,
+            bound: eager_bound,
+            authority_incomplete,
+        });
         let _ = self.spine.get_or_init(move || backend);
     }
 
@@ -3600,6 +3632,14 @@ impl DaemonState {
                 DEFAULT
             }
         }
+    }
+
+    /// What the spine's sibling capture did, once it has run.
+    ///
+    /// `None` before the spine publishes, which is not the same claim as a
+    /// complete capture and is deliberately not collapsed into one.
+    pub(crate) fn sibling_capture_report(&self) -> Option<SiblingCaptureReport> {
+        self.sibling_capture.get().copied()
     }
 
     fn create_spine_backend(&self) -> Arc<dyn kin_spine::SpineBackend> {
@@ -7900,6 +7940,158 @@ mod tests {
     /// written twice here, so the assertion is about the agreement between the
     /// registry writer and the daemon's startup check rather than about either
     /// one alone.
+    /// One registered sibling, registered through the production writer, so both
+    /// checks below start from a state a real install produces.
+    #[cfg(test)]
+    struct SiblingFixture {
+        _sibling_parent: tempfile::TempDir,
+        _registry_dir: tempfile::TempDir,
+        sibling_root: std::path::PathBuf,
+        _spine_env: kin_core::test_env::EnvVarGuard,
+    }
+
+    /// One registered sibling, registered through the production writer, so both
+    /// checks below start from a state a real install produces.
+    ///
+    /// The registry guard is installed BEFORE `update_registry` runs and is
+    /// returned so it outlives the fixture. Setting it afterwards writes the
+    /// entry to this host's real registry and pins nothing, which is how the
+    /// first draft of these checks failed: at their own precondition, which is
+    /// what that precondition is for.
+    #[cfg(test)]
+    fn registered_sibling_fixture() -> SiblingFixture {
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("sibling-checkout");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        kin_core::init(&sibling_root).unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        kin_migrate::update_registry(&sibling_root, 1).unwrap();
+        SiblingFixture {
+            _sibling_parent: sibling_parent,
+            _registry_dir: registry_dir,
+            sibling_root,
+            _spine_env: spine_env,
+        }
+    }
+
+    /// FIR-2763's bound, and FIR-2772's scoping, from the BOUNDED side.
+    ///
+    /// A capture the configured bound stopped is not an incomplete authority. It
+    /// is a deliberate partial whose captures are sound, and the two are
+    /// different claims about the same inequality. This pins that a cap
+    /// discloses itself, leaves `authority_incomplete` alone, and does not cost
+    /// the primary its own registration.
+    ///
+    /// Falsified by the other state's mechanism: make the sibling FAIL to load
+    /// instead of capping it, and `bounded` must go false while
+    /// `authority_incomplete` goes true. Two producers of one inequality is the
+    /// trap class this defect came from, so neither arm may assert on the
+    /// inequality itself.
+    #[test]
+    #[serial_test::serial]
+    fn a_capture_stopped_at_its_bound_is_bounded_rather_than_incomplete() {
+        // Held, not dropped: the fixture owns the registry guard, and dropping it
+        // early would unset KIN_REGISTRY_PATH before the daemon reads it.
+        let _fixture = registered_sibling_fixture();
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let mut state = test_state(primary_init.layout, primary_dir.path());
+        assert_eq!(
+            state.registered_local_repository_authorities.len(),
+            1,
+            "the fixture must pin exactly one sibling before the bound can mean anything"
+        );
+
+        // Injected, not set through the environment. The lever is resolved once
+        // at construction precisely so a test can do this without mutating
+        // process-global state every other test in this binary shares.
+        state.eager_sibling_bound = 0;
+
+        let repo_count = {
+            let spine = state.ensure_spine().expect("spine must be enabled");
+            spine.repo_count()
+        };
+        let report = state
+            .sibling_capture_report()
+            .expect("a published spine must report what its sibling capture did");
+
+        assert!(
+            report.bounded,
+            "a capture stopped at its bound must say so: {report:?}"
+        );
+        assert_eq!(
+            report.captured, 0,
+            "bound of zero captures no sibling: {report:?}"
+        );
+        assert_eq!(
+            report.registered, 1,
+            "one sibling was registered: {report:?}"
+        );
+        assert!(
+            !report.authority_incomplete,
+            "a deliberate cap is not an incomplete authority; conflating them is what \
+             lets a real failure hide behind a configured bound: {report:?}"
+        );
+        assert_eq!(
+            repo_count, 1,
+            "the primary must still be captured and registered when siblings are capped: {report:?}"
+        );
+    }
+
+    /// The same inequality from the INCOMPLETE side, which is the falsification
+    /// of the check above and is why both live here rather than one.
+    ///
+    /// A sibling that pinned at startup and then could not be loaded is a shape
+    /// nobody chose. It must report incomplete and must NOT report bounded, or a
+    /// real failure reads as a configured cap.
+    #[test]
+    #[serial_test::serial]
+    fn a_sibling_that_fails_to_load_is_incomplete_and_never_bounded() {
+        let fixture = registered_sibling_fixture();
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let mut state = test_state(primary_init.layout, primary_dir.path());
+        assert_eq!(
+            state.registered_local_repository_authorities.len(),
+            1,
+            "the sibling must pin at startup, so that what fails below is the LOAD \
+             rather than the pin; otherwise this arm tests the wrong layer"
+        );
+
+        // A bound high enough that the sibling is attempted. The failure has to
+        // come from the load, not from the cap, or this arm proves nothing about
+        // the difference between them.
+        state.eager_sibling_bound = 16;
+
+        // Break the sibling AFTER it pinned. Pinning reads the manifest at
+        // startup; loading reads the graph later, and only the second happens
+        // inside the capture loop.
+        std::fs::remove_dir_all(fixture.sibling_root.join(".kin")).unwrap();
+
+        let _ = state.ensure_spine();
+        let report = state
+            .sibling_capture_report()
+            .expect("a published spine must report what its sibling capture did");
+
+        assert!(
+            !report.bounded,
+            "a sibling that failed to load was not capped, and must not claim it was: {report:?}"
+        );
+        assert!(
+            report.authority_incomplete,
+            "a sibling that pinned and then failed to load leaves the authority incomplete: {report:?}"
+        );
+        assert_eq!(
+            report.registered, 1,
+            "the sibling was registered whether or not it loaded: {report:?}"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn spine_pins_the_sibling_that_kin_init_actually_registered() {
