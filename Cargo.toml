@@ -125,7 +125,7 @@ pretty_assertions = "1"
 serial_test = "3"
 
 # Internal crates
-kin-model = { version = "=0.7.19", registry = "kin" }
+kin-model = { version = "=0.7.20", registry = "kin" }
 kin-blobs = { version = "=0.1.5", registry = "kin" }
 kin-core = { path = "crates/kin-core" }
 kin-parser = { path = "crates/kin-parser" }
@@ -155,7 +155,7 @@ kin-lsp = { version = "=0.7.0", registry = "kin" }
 # backend on every target (incl. Linux, where it cannot compile). Metal is re-enabled
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
-kin-db = { version = "=0.7.59", registry = "kin", default-features = false }
+kin-db = { version = "=0.7.60", registry = "kin", default-features = false }
 kin-vfs-core = { version = "=0.4.14", registry = "kin" }
 
 [profile.release]
