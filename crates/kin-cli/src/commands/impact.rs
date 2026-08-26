@@ -504,14 +504,21 @@ fn empty_impact_context(
 /// listing disagreeing with the count printed above it.
 ///
 /// The edge set is entity-to-entity relations pointing at the entity being
-/// expanded, with the relation's source as the dependent, kept only when
-/// [`kin_review::is_impact_relation`] says the edge carries impact. That
-/// predicate is the ranked report's own, imported rather than restated, so the
-/// two walks this command runs over one target cannot answer differently
-/// (FIR-2478). `impact_hop_walk_reaches_what_the_ranked_report_ranks` pins the
-/// agreement, and `impact_hop_walk_matches_the_impact_filtered_graph_walk` pins
-/// the remaining equivalence with `GraphStore::get_downstream_impact`, which
-/// applies no such filter and so is the wider set.
+/// expanded, with the relation's source as the dependent, selected by
+/// [`kin_review::inbound_impact_relations`]. That function is the ranked
+/// report's own, called rather than restated, so the two walks this command runs
+/// over one target cannot answer differently (FIR-2478). Sharing a whole
+/// selection rather than a per-kind predicate is deliberate: while each side
+/// applied `is_impact_relation` for itself they still diverged, because the rule
+/// that matters needs the `Contains` edge to identify a declaring parent and
+/// that edge is not itself an impact relation.
+///
+/// `both_impact_walks_name_the_same_entities_on_one_graph` pins the agreement by
+/// reading what each walk actually returned and requiring the sets to match,
+/// rather than checking each against its own expectation.
+/// `impact_hop_walk_matches_the_impact_filtered_graph_walk` pins the remaining
+/// equivalence with `GraphStore::get_downstream_impact`, which applies no such
+/// filter and so is the wider set.
 /// The two graph reads the hop walk performs, named so a test can count them.
 trait ImpactWalkGraph {
     /// Entity-to-entity relations that point at `id`.
@@ -546,14 +553,13 @@ fn downstream_impact_by_hop<G: ImpactWalkGraph>(
     for hop in 1..=depth {
         let mut next = Vec::new();
         for current in frontier {
-            for relation in graph.inbound_relations(&current)? {
-                // One policy, both walks. Containment is the edge this exists to
-                // drop: without it a method's own containing class is reached at
-                // hop 1 and printed under "direct callers", and every sibling
-                // member the class contains follows at hop 2.
-                if !kin_review::is_impact_relation(relation.kind) {
-                    continue;
-                }
+            // One policy, both walks, and one function rather than one predicate
+            // each side applies for itself. Dropping the `Contains` KIND was not
+            // enough on a real graph: a declaring class carries a `UsesType` edge
+            // to the same member as well, so the pair is joined twice and the
+            // class kept printing under "direct callers".
+            let inbound = graph.inbound_relations(&current)?;
+            for relation in kin_review::inbound_impact_relations(&inbound, &current) {
                 let Some(dependent) = relation.src.as_entity() else {
                     continue;
                 };
@@ -1904,6 +1910,203 @@ mod tests {
                 "  2 hops:".to_string(),
                 "    - indirect_caller (Function) @ src/indirect.rs:31".to_string(),
             ]
+        );
+    }
+
+    /// The same member, with the edge a real graph actually delivers.
+    ///
+    /// A declaring class carries TWO edges to its own member, not one:
+    /// `Contains`, which states the declaration, and `UsesType`, which
+    /// [`kin_review::is_impact_relation`] admits because it carries impact for
+    /// every other pair. Measured on psf/requests, `BaseAdapter.send` holds both
+    /// from `BaseAdapter`, and a four-file Python fixture reproduces it, so this
+    /// is the shape a corpus delivers rather than an exotic one.
+    ///
+    /// The sibling test above builds only the `Contains` edge. It passed while
+    /// the class kept printing under "1 hop (direct callers)" on every real
+    /// repository, because dropping a kind does not drop a row when the pair is
+    /// joined twice.
+    #[tokio::test]
+    async fn a_declaring_class_is_not_a_direct_caller_through_its_uses_type_edge() {
+        let graph = kin_db::InMemoryGraph::new();
+        let holder = entity("Holder", "src/holder.rs");
+        let member = entity("Holder.send", "src/holder.rs");
+        let sibling = entity("Holder.close", "src/holder.rs");
+        for e in [&holder, &member, &sibling] {
+            graph.upsert_entity(e).unwrap();
+        }
+        // Both edges on both pairs, which is what the linker and the enrichment
+        // sweep produce together.
+        relate(&graph, &holder, &member, RelationKind::Contains);
+        relate(&graph, &holder, &member, RelationKind::UsesType);
+        relate(&graph, &holder, &sibling, RelationKind::Contains);
+        relate(&graph, &holder, &sibling, RelationKind::UsesType);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Holder.send".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+
+        let rendered = response.lines.join("\n");
+        assert!(
+            !rendered.contains("1 hop (direct callers)"),
+            "a class is not a caller of its own method, whatever second edge kind \
+             also joins the pair: {rendered}"
+        );
+        assert!(
+            listed_names(&response.lines).is_empty(),
+            "no entity may be listed as impacted through a declaring parent: {rendered}"
+        );
+        assert_eq!(
+            response
+                .ranked
+                .as_ref()
+                .expect("structured callers get a ranked report")
+                .candidates
+                .len(),
+            0,
+            "the ranked walk applies the same rule: {rendered}"
+        );
+    }
+
+    /// A module that CALLS its own function is a real caller and stays.
+    ///
+    /// The declaring-source rule drops a parent's structural edges, and a
+    /// blanket exclusion would cost real recall: a Python module really does
+    /// call its own function at import time, and that caller is one a developer
+    /// means. `Calls` is therefore the exception, and this is the guard that
+    /// stops the rule from over-suppressing.
+    #[tokio::test]
+    async fn a_declaring_module_that_calls_its_own_function_stays_a_direct_caller() {
+        let graph = kin_db::InMemoryGraph::new();
+        let module = entity("search", "src/search.py");
+        let func = entity("run_search", "src/search.py");
+        for e in [&module, &func] {
+            graph.upsert_entity(e).unwrap();
+        }
+        relate(&graph, &module, &func, RelationKind::Contains);
+        relate(&graph, &module, &func, RelationKind::UsesType);
+        // The import-time call. This is the edge the exception exists for.
+        relate(&graph, &module, &func, RelationKind::Calls);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "run_search".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+
+        let rendered = response.lines.join("\n");
+        assert!(
+            listed_names(&response.lines).contains(&"search".to_string()),
+            "a module-level call is a real caller and the structural rule must not \
+             swallow it: {rendered}"
+        );
+        assert_eq!(
+            response
+                .ranked
+                .as_ref()
+                .expect("structured callers get a ranked report")
+                .candidates
+                .len(),
+            1,
+            "exactly the calling module, once, not once per edge kind: {rendered}"
+        );
+    }
+
+    /// The two walks agree, asserted over what they actually returned.
+    ///
+    /// Each walk being correct against its own fixture is not the property that
+    /// matters. The property lives in their agreement, and neither endpoint can
+    /// see it: two tests can each pin a real behavior and jointly guard nothing.
+    /// So this reads the human listing's names back out of the rendered lines
+    /// and requires the ranked report to name exactly that set, rather than
+    /// checking each against a hardcoded expectation that would drift together.
+    ///
+    /// The fixture deliberately mixes all three cases the policy separates: a
+    /// real cross-file caller, a declaring parent joined twice, and a declaring
+    /// module that also calls.
+    #[tokio::test]
+    async fn both_impact_walks_name_the_same_entities_on_one_graph() {
+        let graph = kin_db::InMemoryGraph::new();
+        let holder = entity("Holder", "src/holder.rs");
+        let member = entity("Holder.send", "src/holder.rs");
+        let caller = entity("real_caller", "src/caller.rs");
+        let module = entity("holder", "src/holder.rs");
+        for e in [&holder, &member, &caller, &module] {
+            graph.upsert_entity(e).unwrap();
+        }
+        relate(&graph, &holder, &member, RelationKind::Contains);
+        relate(&graph, &holder, &member, RelationKind::UsesType);
+        relate(&graph, &module, &member, RelationKind::Contains);
+        relate(&graph, &module, &member, RelationKind::Calls);
+        relate(&graph, &caller, &member, RelationKind::Calls);
+
+        let dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::KinLayout::new(dir.path().join(".kin"));
+        let response = build_impact_response(
+            &layout,
+            &graph,
+            &ImpactRequest {
+                entity: "Holder.send".to_string(),
+                depth: 3,
+                file: None,
+                kind: None,
+                signature: None,
+                require_unique: true,
+            },
+            &healthy_test_envelope(),
+        )
+        .await
+        .unwrap();
+
+        let listed: std::collections::BTreeSet<String> =
+            listed_names(&response.lines).into_iter().collect();
+        let ranked: std::collections::BTreeSet<String> = response
+            .ranked
+            .as_ref()
+            .expect("structured callers get a ranked report")
+            .candidates
+            .iter()
+            .map(|candidate| candidate.identity.name.clone())
+            .collect();
+
+        // Two empty sets agree vacuously, so the join proves nothing unless the
+        // walks actually returned something. This is the half that makes the
+        // assertion able to fail.
+        assert!(
+            !listed.is_empty(),
+            "a fixture where both walks return nothing cannot demonstrate agreement: {:?}",
+            response.lines
+        );
+        assert_eq!(
+            listed, ranked,
+            "one relation policy, two walks: the human listing and the ranked report \
+             must name the same entities, read from what each actually returned"
         );
     }
 

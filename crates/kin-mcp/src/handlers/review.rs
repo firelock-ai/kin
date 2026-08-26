@@ -39,12 +39,15 @@ relation graph to find every entity that could be affected. Target it four ways 
 a time): base/head change IDs, entity_ids, file paths, or a list of change_ids to \
 combine. Optionally include active agent traffic on the impacted entities so you can see \
 who else is working nearby. Reach for it before merging or refactoring to gauge blast \
-radius — \"if I change this, what else might break?\" — answered from the graph in one \
+radius, answering \"if I change this, what else might break?\", from the graph in one \
 call instead of hand-tracing callers. Pair it with semantic_diff (what changed) or use \
 semantic_review when you want diff + impact + risk together in a single report. \
 Per-entity counts separate `consumer_count` (every inbound edge) from \
-`proven_consumer_count` (only edges resolved above `name_only`), and each ranked path \
-step carries its own `resolution`. Read a used/unused claim against the proven count: a \
+`proven_consumer_count` (only edges resolved above `name_only`). This response carries \
+counts and buckets rather than ranked paths: the per-hop ranked report, where every step \
+carries its own `resolution` and a confidence score, is produced only by \
+`kin impact --json` on the CLI and is not reachable from here. Read a used/unused claim \
+against the proven count: a \
 call edge matched by bare method name is a candidate, not a fact. The response also \
 carries an additive `negative` object whose `safe_to_conclude_absent` flag says whether \
 this graph could have seen the impact it reports missing: the verdicts are read off \
