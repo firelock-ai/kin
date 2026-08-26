@@ -26,7 +26,8 @@
 // that merely also exists. Two independent existence checks would not.
 
 import process from 'node:process';
-import { pathToFileURL } from 'node:url';
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
 // Records live on an orphan branch rather than on main: they are per-candidate
 // evidence, they arrive after the commit they describe, and writing them to
@@ -432,7 +433,34 @@ export async function main({
   return { sha, archives, archive };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+// Run only when this file IS the entry point, comparing REAL paths.
+//
+// The usual idiom compares `import.meta.url` against
+// `pathToFileURL(process.argv[1])`. Node resolves symlinks for the first and
+// not the second, so invoking this file through a symlinked directory makes the
+// two disagree and the gate reads nothing, judges nothing, and exits 0.
+// release-tag.yml copies it to $RUNNER_TEMP and runs it from there, which is
+// exactly that shape; $RUNNER_TEMP is not a symlink today, and that is the only
+// reason the naive form has held. Measured on this file: run from the checkout
+// it exits 1 with `::error::no repository given`, and run from a symlinked copy
+// it exits 0 having written nothing at all.
+//
+// Unresolvable paths fall to running, not skipping. A proof gate that silently
+// declines to judge is worse than one that fails; a test that runs `main()` by
+// mistake fails loudly on the spot.
+function isDirectRun() {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  const self = fileURLToPath(import.meta.url);
+  if (entry === self) return true;
+  try {
+    return realpathSync(entry) === realpathSync(self);
+  } catch {
+    return true;
+  }
+}
+
+if (isDirectRun()) {
   main().catch((error) => {
     console.error(`::error::${error.message}`);
     process.exit(1);
