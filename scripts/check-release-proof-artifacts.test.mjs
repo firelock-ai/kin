@@ -2,7 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import {
   BUMP_BRANCH,
@@ -593,4 +598,46 @@ test('main holds on absence when no commit to bridge from is given', async () =>
     /the proof loop has not recorded this candidate/,
   );
   assert.equal(bridged, false);
+});
+
+test('the gate runs from a copy reached through a symlinked directory', () => {
+  // release-tag.yml copies this file to $RUNNER_TEMP and runs it there. The
+  // entry-point test used to compare `import.meta.url` against
+  // `pathToFileURL(process.argv[1])`, and Node resolves symlinks for the first
+  // and not the second, so a copy invoked through one exited 0 having judged
+  // nothing. Measured before the fix: run from the checkout the gate exits 1
+  // with `::error::no repository given`, and run from a symlinked copy it exits
+  // 0 with zero bytes on both streams.
+  //
+  // Run with no repository so `main()` is reached and refuses on its own
+  // missing input. The distinction being drawn is between a process that ran
+  // and one that never started, and only the second is silent. This file
+  // imports nothing relative, so a lone copy resolves and the entry point is
+  // the only variable; a module-resolution error would otherwise write to
+  // stderr and satisfy the assertion without proving anything.
+  const gate = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    'check-release-proof-artifacts.mjs',
+  );
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-proof-gate-'));
+  const link = `${real}-link`;
+  fs.symlinkSync(real, link, 'dir');
+  const copy = path.join(link, 'check-release-proof-artifacts.mjs');
+  fs.copyFileSync(gate, copy);
+
+  const env = { ...process.env };
+  delete env.GITHUB_REPOSITORY;
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [copy], {
+      cwd: real,
+      encoding: 'utf8',
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+  }
+  assert.notEqual(output, '', 'the gate produced no output, so it never ran');
+  assert.match(output, /no repository given/);
 });
