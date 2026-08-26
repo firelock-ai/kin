@@ -477,6 +477,60 @@ fn a_bare_call_naming_the_caller_itself_mints_no_self_edge() {
     );
 }
 
+/// The Rust half of the same question, cross-file, which had no test anywhere.
+///
+/// `rust_bare_call_may_reach_owned` is one of the two gates the same-owner tier
+/// had to leave standing, and a mutation that made it always answer true
+/// survived every suite in this crate: nothing exercised it. That is the defect
+/// class this repository keeps finding, a guard whose absence looks exactly like
+/// its success, so the gate gets its own case here in both directions.
+///
+/// The refusal is the `Ok(self.width())` shape: a bare Rust call reaching a
+/// repository entity spelled with the same leaf, in a module the caller never
+/// names. The control beside it is the binding Rust does allow, a `use` of that
+/// exact name, and without it the refusal would be indistinguishable from a tier
+/// that had stopped resolving Rust calls at all.
+#[test]
+fn a_bare_rust_call_reaches_an_owned_entity_only_through_a_use() {
+    const DEFS: &str =
+        "pub enum Status { Ready(u32) }\npub struct S;\nimpl S { pub fn width(&self) -> u32 { 1 } }\n";
+
+    // Refusal: no `use` binds `width` here, and `width()` in Rust is not
+    // `self.width()`.
+    let files = vec![
+        parse("rust", "shapes.rs", DEFS),
+        parse("rust", "caller.rs", "pub fn run() -> u32 { width() }\n"),
+    ];
+    assert_parser_emitted_bare_call(&files[1], "run", "width");
+    let relations = link_both(&files);
+    let caller = entity_id(&files, "caller.rs", "run");
+    let owned = entity_id(&files, "shapes.rs", "S::width");
+    assert!(
+        !calls_from(&relations, caller).contains(&owned),
+        "a bare Rust call must not reach an owner-qualified entity this file never names"
+    );
+
+    // CONTROL: the binding Rust does allow. Without this the refusal above would
+    // pass just as well on a build that had stopped resolving Rust entirely.
+    let files = vec![
+        parse("rust", "shapes.rs", DEFS),
+        parse(
+            "rust",
+            "user.rs",
+            "use crate::shapes::Status::Ready;\npub fn run() -> u32 { Ready(1); 0 }\n",
+        ),
+    ];
+    assert_parser_emitted_bare_call(&files[1], "run", "Ready");
+    let relations = link_both(&files);
+    let caller = entity_id(&files, "user.rs", "run");
+    let variant = entity_id(&files, "shapes.rs", "Status::Ready");
+    assert!(
+        calls_from(&relations, caller).contains(&variant),
+        "CONTROL: a `use` of the exact name is what Rust does bind, and it must still resolve, \
+         or the refusal above proves nothing"
+    );
+}
+
 #[test]
 fn a_free_function_in_the_file_is_not_treated_as_an_owner_sibling() {
     // The caller has no owner, so there is no sibling to compose. C++ free
