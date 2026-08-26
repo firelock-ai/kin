@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (496 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (495 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -125,7 +125,6 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_SHUTDOWN_GRACE_SECS` | seconds>=0 | 25 | operational | grace before the shutdown watchdog force-exits; 0 escalates immediately |
 | `KIN_DAEMON_STARTUP_LOCK_TIMEOUT_SECS` | seconds>=0 | *(unset)* | operational | how long to wait for the daemon startup lock |
 | `KIN_DAEMON_STOP_TIMEOUT_SECS` | seconds>=0 | 30 | operational | ceiling in seconds kin daemon stop waits for a signaled daemon to exit |
-| `KIN_DAEMON_TEST_GRAPH_AUTHORITY_HOLD_MS` | usize | *(unset)* | diagnostic | daemon fault injection: every graph-authority mutation guard holds its window open this many extra milliseconds before closing, so an acceptance check can place a reference read inside a real write window on demand instead of racing an enrichment sweep for one; unset or zero disarms it. Test IO only: it changes how long a window stays open, never what any answer says |
 | `KIN_DAEMON_URL` | url | *(unset)* | operational | explicit daemon endpoint URL (skip local discovery) |
 | `KIN_DAEMON_WATCH_PID` | usize | *(unset)* | operational | pid the daemon watches; it exits when that process dies |
 

@@ -935,68 +935,8 @@ pub(crate) struct LocalRepositoryFinalization {
     pub generation_advanced: bool,
 }
 
-/// How long a graph-authority mutation guard is asked to hold its window open
-/// past the work it was taken for, read once at process start.
-///
-/// Zero for every shipped daemon, and the read is a `OnceLock` load rather than
-/// an environment lookup, so the production path pays one relaxed atomic read
-/// and never touches the environment on a hot path.
-///
-/// It exists because FIR-2468's class, a reference read taken while a writer
-/// holds graph authority, has no other lever. The window is opened by the
-/// enrichment sweep on its own schedule, so an acceptance check racing a real
-/// sweep discriminates only on the runs it wins, and a second sweep over an
-/// already-enriched store barely opens the window at all because
-/// `install_lsp_relations` returns before taking a guard when every relation it
-/// is offered is already held. Holding the window on demand is what turns that
-/// class into a check that can fail.
-///
-/// This is test IO and never a semantic authority. It changes how long a window
-/// stays open, never what any answer says, and every disclosure it lets a check
-/// observe is one the same code path produces without it.
-fn graph_authority_test_hold() -> std::time::Duration {
-    static HOLD: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *HOLD.get_or_init(|| {
-        let raw = std::env::var(kin_core::env_registry::GRAPH_AUTHORITY_TEST_HOLD_MS_VAR).ok();
-        let hold = parse_graph_authority_test_hold(raw.as_deref());
-        if !hold.is_zero() {
-            tracing::warn!(
-                hold_ms = hold.as_millis() as u64,
-                var = kin_core::env_registry::GRAPH_AUTHORITY_TEST_HOLD_MS_VAR,
-                "graph-authority test hold is ARMED; every mutation window stays open this long \
-                 past its work. This is test IO and must never be set on a real store."
-            );
-        }
-        hold
-    })
-}
-
-/// The parse, split out from the [`std::sync::OnceLock`] that caches it.
-///
-/// The cache is the right production shape, one read at process start and a
-/// relaxed load forever after, and it is also why the read cannot be unit
-/// tested: whichever test ran first fixes the value for the whole binary. So
-/// the rule lives here, where it is pure and every disarming input can be
-/// asserted. Anything that is not a positive integer disarms, because a lever
-/// that silently armed on a typo would hold real windows open on a real store.
-fn parse_graph_authority_test_hold(raw: Option<&str>) -> std::time::Duration {
-    let ms = raw
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(0);
-    std::time::Duration::from_millis(ms)
-}
-
 impl Drop for GraphAuthorityMutationGuard {
     fn drop(&mut self) {
-        // Before the counters move, so the window this guard published is still
-        // the one a reader observes while it elapses. Sleeping after the
-        // decrement would hold nothing open.
-        let hold = graph_authority_test_hold();
-        if !hold.is_zero() {
-            std::thread::sleep(hold);
-        }
         self.clock.epoch.fetch_add(1, Ordering::SeqCst);
         self.clock
             .active_writers
@@ -6068,44 +6008,6 @@ mod tests {
     };
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
-
-    /// The lever disarms on everything that is not a positive integer.
-    ///
-    /// It is read by a guard that every graph write takes, so a typo that armed
-    /// it would hold real windows open on a real store and slow every write on
-    /// the machine that made the typo. Every arm below is a way to get that
-    /// wrong, and each must yield zero.
-    #[test]
-    fn the_graph_authority_test_hold_disarms_on_anything_but_a_positive_integer() {
-        use std::time::Duration;
-        for disarming in [
-            None,
-            Some(""),
-            Some("   "),
-            Some("0"),
-            Some("no"),
-            Some("true"),
-            Some("-5"),
-            Some("12.5"),
-            Some("250ms"),
-            Some("1e3"),
-        ] {
-            assert_eq!(
-                parse_graph_authority_test_hold(disarming),
-                Duration::ZERO,
-                "{disarming:?} must disarm the hold, not arm it"
-            );
-        }
-        // And it does arm, or the disarm assertions above are vacuous.
-        assert_eq!(
-            parse_graph_authority_test_hold(Some("250")),
-            Duration::from_millis(250)
-        );
-        assert_eq!(
-            parse_graph_authority_test_hold(Some(" 4000 ")),
-            Duration::from_millis(4000)
-        );
-    }
 
     #[test]
     fn directory_metadata_sync_is_portable() {
