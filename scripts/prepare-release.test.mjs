@@ -2,7 +2,12 @@
 // Copyright 2026 Firelock, LLC
 
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 
 import {
   removeChangelogSection,
@@ -141,4 +146,46 @@ checksum = "keep"
   // A fuzz target pinned at 0.0.0 and a registry dependency are untouched.
   assert.match(result.lock, /name = "kin-parser-fuzz"\nversion = "0.0.0"/);
   assert.match(result.lock, /name = "kin-model"\nversion = "0.7.1"/);
+});
+
+test('the generator runs from a copy reached through a symlinked directory', () => {
+  // release-train.yml runs this file from a copy in $RUNNER_TEMP/release-policy.
+  // The entry-point test used to compare `import.meta.url` against
+  // `pathToFileURL(process.argv[1])`, and Node resolves symlinks for the first
+  // and not the second, so a copy invoked through one generated nothing, wrote
+  // no $GITHUB_OUTPUT, and exited 0. The train would then read an empty version.
+  //
+  // Run with no arguments and no repository, so `main()` is reached and fails on
+  // its own missing input. The distinction being drawn is between a process that
+  // ran and one that never started, and only the second is silent.
+  const generator = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    'prepare-release.mjs',
+  );
+  const real = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prepare-policy-'));
+  const link = `${real}-link`;
+  fs.symlinkSync(real, link, 'dir');
+  const policy = path.join(link, 'prepare-release.mjs');
+  fs.copyFileSync(generator, policy);
+  // The sibling this file imports has to come too, exactly as release-train.yml
+  // copies all three policy scripts into one directory. Without it node fails on
+  // module resolution and writes to stderr, and this test would then pass on
+  // that error no matter what the entry point did.
+  fs.copyFileSync(
+    path.join(path.dirname(generator), 'check-release-version.mjs'),
+    path.join(link, 'check-release-version.mjs'),
+  );
+  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'kin-prepare-cwd-'));
+
+  let output = '';
+  try {
+    output = execFileSync(process.execPath, [policy], {
+      cwd: empty,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+  } catch (error) {
+    output = `${error.stdout ?? ''}${error.stderr ?? ''}`;
+  }
+  assert.notEqual(output, '', 'the generator produced no output, so it never ran');
 });

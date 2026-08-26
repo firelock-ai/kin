@@ -96,6 +96,12 @@ INSTALLER_BINARY_GUARD = ROOT / "scripts" / "verify-installer-archive-binaries.p
 INSTALLER_BINARY_GUARD_POLICY = "scripts/verify-installer-archive-binaries.py"
 INSTALLER_BINARY_FALSIFIER = ROOT / "scripts" / "falsify-installer-archive-binaries.py"
 INSTALLER_BINARY_FALSIFIER_POLICY = "scripts/falsify-installer-archive-binaries.py"
+RELEASE_VERSION_GUARD = ROOT / "scripts" / "check-release-version.mjs"
+RELEASE_VERSION_GUARD_POLICY = "scripts/check-release-version.mjs"
+RELEASE_VERSION_SUITE_POLICY = "scripts/check-release-version.test.mjs"
+RELEASE_INTENT_SUITE_POLICY = "scripts/release-intent.test.mjs"
+RELEASE_VERSION_FALSIFIER = ROOT / "scripts" / "falsify-release-version-guards.py"
+RELEASE_VERSION_FALSIFIER_POLICY = "scripts/falsify-release-version-guards.py"
 TRUSTED_POLICY_PREFIX = "refs/remotes/origin/main:"
 TAG_LISTING_FORMAT = (
     "--format='%(refname:strip=2) "
@@ -540,6 +546,7 @@ MACOS_SHARD_DOCTESTS = "      run: cargo test --doc --locked"
 MACOS_SHARD_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
 CI_JOB_DISPLAY_NAMES = {
     "dco": "DCO Sign-off",
+    "release-version": "Release version gate",
     "npm-launchers": "npm launcher tests",
     "windows-authority-tests": "Windows authority tests",
     "windows-authority-cli-tests": "Windows authority CLI tests",
@@ -954,6 +961,54 @@ def workflow_active_header_source(workflow: str) -> str:
     return classifier_active_job_source(workflow.split(marker, 1)[0])
 
 
+# Block comment delimiters, longest opener first so `<!--` is tried before any
+# prefix of it could match.
+BLOCK_COMMENTS = (("<!--", "-->"), ("<#", "#>"), ("/*", "*/"))
+
+
+def strip_block_comments(lines: list[str]) -> list[str]:
+    """Drop block comments written as block comments, and nothing else.
+
+    A block comment is recognized only where one is actually written: the
+    opener begins a line, and the closer ends that line or a later one.
+
+    This used to be three DOTALL regexes over the whole text, which cannot tell
+    a comment from a pair of shell globs. In ci.yml the `docs/*)` pattern in a
+    `case` arm opened one and `hashFiles('**/Cargo.lock')` closed it, and 46,138
+    characters, 48% of the file, vanished from every assertion built on the
+    result; release-train.yml lost 24% the same way. No workflow contains a real
+    block comment at all, so that stripping has only ever produced silent false
+    negatives, and an assertion that cannot see the line it names passes exactly
+    like one that checked it.
+    """
+
+    kept: list[str] = []
+    closer: str | None = None
+    for line in lines:
+        stripped = line.strip()
+        if closer is not None:
+            if stripped.endswith(closer):
+                closer = None
+            continue
+        consumed = False
+        for opener, end in BLOCK_COMMENTS:
+            if not stripped.startswith(opener):
+                continue
+            # A complete one-line comment closes itself; anything else opens a
+            # span that the next line ending in the closer will end.
+            if not (
+                stripped.endswith(end) and len(stripped) >= len(opener) + len(end)
+            ):
+                closer = end
+            consumed = True
+            break
+        # Blank lines pass through. `active_lines` drops them, and counting them
+        # here would make every file look like it had lost a comment.
+        if not consumed:
+            kept.append(line)
+    return kept
+
+
 def active_lines(source: str) -> list[str]:
     """Return a block's non-blank, non-comment lines, stripped of indentation.
 
@@ -964,13 +1019,9 @@ def active_lines(source: str) -> list[str]:
     user-facing warning become a valid no-op block while satisfying a guard.
     """
 
-    uncommented = source
-    for pattern in (r"<#.*?#>", r"/\*.*?\*/", r"<!--.*?-->"):
-        uncommented = re.sub(pattern, "", uncommented, flags=re.DOTALL)
-
     return [
         line.strip()
-        for line in uncommented.splitlines()
+        for line in strip_block_comments(source.splitlines())
         if line.strip()
         and not line.strip().startswith("#")
         and not line.strip().startswith("//")
@@ -4382,6 +4433,173 @@ def assert_installer_archive_binary_guard_wired(ci: str) -> None:
             "ci.yml must run " + " and ".join(missing) + "; without both, the "
             "installer can abort on a complete archive and no pull request "
             "would go red"
+        )
+
+
+# A fixture in the exact shape ci.yml carries: a `case` arm whose glob ends in
+# `/*`, a cache key holding `**/`, and a line between them that every assertion
+# reading this file depends on being able to see.
+ACTIVE_LINES_FIXTURE = """\
+case "$path" in
+  *.md | docs/*) ;;
+esac
+run: python3 ./scripts/the-line-between.py
+key: ${{ hashFiles('**/Cargo.lock') }}
+/* a real block comment
+   spanning two lines */
+const kept = 1;
+/* a one-line block comment */
+const alsoKept = 2;
+"""
+ACTIVE_LINES_SURVIVOR = "run: python3 ./scripts/the-line-between.py"
+
+
+def assert_active_lines_cannot_span_unrelated_shell(workflows: dict[Path, str]) -> None:
+    """Keep the comment stripper from eating the lines every assertion reads.
+
+    `active_lines` used to strip `<# #>`, `/* */` and `<!-- -->` with three
+    DOTALL regexes over the whole text, which cannot tell a comment from a pair
+    of shell globs. In ci.yml the `docs/*)` arm of a `case` opened one and
+    `hashFiles('**/Cargo.lock')` closed it: 46,138 characters, 48% of the file,
+    were removed before any assertion saw them, and release-train.yml lost 24%
+    the same way. An assertion that cannot see the line it names passes exactly
+    like one that checked it, which is the shape this whole suite exists to
+    prevent.
+
+    No workflow contains a real block comment, so that stripping never removed
+    one. The last check below is what keeps that true: if a workflow ever does
+    open a block comment, this fails and asks for the decision to be reviewed
+    here rather than discovered as a silent hole later.
+    """
+
+    kept = active_lines(ACTIVE_LINES_FIXTURE)
+    if ACTIVE_LINES_SURVIVOR not in kept:
+        raise AssertionError(
+            "active_lines dropped a line between two unrelated shell globs; a "
+            "glob is not a block comment and an assertion reading past one "
+            "would pass without seeing what it names"
+        )
+    for survivor in ("const kept = 1;", "const alsoKept = 2;"):
+        if survivor not in kept:
+            raise AssertionError(f"active_lines dropped live source: {survivor}")
+    for comment in ("a real block comment", "spanning two lines */", "a one-line block comment"):
+        if any(comment in line for line in kept):
+            raise AssertionError(
+                f"active_lines kept a real block comment: {comment}; a commented-out "
+                "validator would then satisfy a guard"
+            )
+
+    # The fixture has to be able to tell the two implementations apart. Without
+    # this, a fixture that both forms handle identically would report a fix
+    # that is not there.
+    superseded = ACTIVE_LINES_FIXTURE
+    for pattern in (r"<#.*?#>", r"/\*.*?\*/", r"<!--.*?-->"):
+        superseded = re.sub(pattern, "", superseded, flags=re.DOTALL)
+    if ACTIVE_LINES_SURVIVOR in {line.strip() for line in superseded.splitlines()}:
+        raise AssertionError(
+            "the active_lines fixture cannot distinguish the DOTALL form from "
+            "the line-oriented one, so it proves nothing"
+        )
+
+    for workflow, content in sorted(workflows.items()):
+        lines = content.splitlines()
+        dropped = len(lines) - len(strip_block_comments(lines))
+        if dropped:
+            raise AssertionError(
+                f"{workflow.relative_to(ROOT).as_posix()} opens a block comment "
+                f"and loses {dropped} line(s) before any assertion reads it. If "
+                "that comment is real, review this census; if it is a glob, the "
+                "stripper is wrong again"
+            )
+
+
+def assert_release_version_gate_wired(ci: str) -> None:
+    """Keep the version gate running on the pull request that carries a release.
+
+    `scripts/check-release-version.mjs` has carried the right refusal since
+    before the release train existed, and until this job it ran on no pull
+    request at all. Its one real invocation sits inside the train's own
+    branch-writer step, against a tree that step has just regenerated, so it
+    passes once and never re-runs on the head that merges. A release pull
+    request could therefore lose its version bump after that step and every
+    check would stay green, after which the mint reads a workspace version
+    whose tag already exists, reports nothing to release, and exits 0 on a
+    fifteen-minute cron with no tag cut and nothing raised.
+
+    Every clause below is load-bearing. The event restriction is what keeps the
+    job off the merge queue, where there is no pull request to read a base sha
+    from. The branch and label conditions are what scope it to releases: the
+    gate refuses a release-affecting diff that does not move the version, and
+    asking that of every pull request is a policy change wearing a bug fix's
+    clothes. `fetch-depth: 0` is what lets it read the base commit's manifest
+    at all. And the base and labels reach the script through the environment,
+    never interpolated into a command line, because a pull-request label is
+    text an outside contributor writes.
+    """
+
+    for path, policy in (
+        (RELEASE_VERSION_GUARD, RELEASE_VERSION_GUARD_POLICY),
+        (RELEASE_VERSION_FALSIFIER, RELEASE_VERSION_FALSIFIER_POLICY),
+    ):
+        if not path.is_file():
+            raise AssertionError(
+                f"{policy} is missing; a release pull request could drop its "
+                "version bump and no check would go red"
+            )
+
+    job = workflow_job_blocks(ci).get("release-version")
+    if job is None:
+        raise AssertionError(
+            "ci.yml must run the release version gate on pull requests; without "
+            "that job the gate's only invocation is the release train's own "
+            "branch writer, which never sees the head that merges"
+        )
+
+    # Comment-aware, but line by line rather than through `active_lines`.
+    # That helper strips `/* ... */` with DOTALL, and ci.yml carries a `/*` and
+    # a `*/` about 46,000 characters apart in unrelated shell, so running it
+    # over the whole workflow deletes roughly a third of the file and every
+    # assertion built on the result passes without ever seeing the lines it
+    # names.
+    job_lines = {
+        line.strip()
+        for line in job.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    }
+    for clause in (
+        "github.event_name == 'pull_request' &&",
+        "(github.head_ref == 'automation/release-next' ||",
+        "contains(github.event.pull_request.labels.*.name, 'release:automated'))",
+        "fetch-depth: 0",
+        "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
+        "PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}",
+        f"run: node {RELEASE_VERSION_GUARD_POLICY}",
+    ):
+        if clause not in job_lines:
+            raise AssertionError(
+                "ci.yml must run the release version gate against the release "
+                f"pull request's own base and labels; missing `{clause}`"
+            )
+
+    # Match whole invocations rather than searching for the path, which a
+    # commented-out line would still satisfy.
+    ci_lines = {line.strip() for line in ci.splitlines()}
+    missing = sorted(
+        command
+        for command in (
+            f"run: python3 ./{RELEASE_VERSION_FALSIFIER_POLICY}",
+            f"./{RELEASE_INTENT_SUITE_POLICY} \\",
+            f"{RELEASE_INTENT_SUITE_POLICY} \\",
+            f"./{RELEASE_VERSION_SUITE_POLICY} \\",
+            f"{RELEASE_VERSION_SUITE_POLICY} \\",
+        )
+        if command not in ci_lines
+    )
+    if missing:
+        raise AssertionError(
+            "ci.yml must run " + " and ".join(missing) + "; the guards' own "
+            "suites and the run that watches them fail are the only evidence "
+            "that either gate can refuse anything"
         )
 
 
@@ -12201,6 +12419,82 @@ def main() -> None:
         "ci.yml must run",
         lambda: assert_installer_archive_binary_guard_wired(
             ci_workflow.replace(INSTALLER_BINARY_FALSIFIER_POLICY, "scripts/absent.py")
+        ),
+    )
+    assert_active_lines_cannot_span_unrelated_shell(workflow_sources)
+    assert_release_version_gate_wired(ci_workflow)
+    expect_assertion(
+        "ci.yml drops the job that runs the version gate on a release PR",
+        "ci.yml must run the release version gate on pull requests",
+        lambda: assert_release_version_gate_wired(
+            ci_workflow.replace("  release-version:\n", "  release-version-disabled:\n")
+        ),
+    )
+    expect_assertion(
+        "the version gate job survives with its command commented out",
+        "missing `run: node",
+        lambda: assert_release_version_gate_wired(
+            ci_workflow.replace(
+                f"run: node {RELEASE_VERSION_GUARD_POLICY}",
+                f"run: # node {RELEASE_VERSION_GUARD_POLICY}",
+            )
+        ),
+    )
+    expect_assertion(
+        "the version gate stops reading the release PR's own base commit",
+        "missing `BASE_SHA",
+        lambda: assert_release_version_gate_wired(
+            ci_workflow.replace(
+                "BASE_SHA: ${{ github.event.pull_request.base.sha }}",
+                "BASE_SHA: ''",
+            )
+        ),
+    )
+    expect_assertion(
+        "the version gate loses the deep fetch its base manifest needs",
+        "missing `fetch-depth: 0`",
+        lambda: assert_release_version_gate_wired(
+            ci_workflow.replace(
+                "          # The gate reads Cargo.toml out of the base commit. A shallow\n"
+                "          # pull-request checkout does not carry it, and `git show` would fail\n"
+                "          # in a way that reads like a broken gate rather than a missing fetch.\n"
+                "          fetch-depth: 0\n",
+                "",
+            )
+        ),
+    )
+    expect_assertion(
+        "the version gate stops being scoped to the release branch",
+        "missing `(github.head_ref",
+        lambda: assert_release_version_gate_wired(
+            ci_workflow.replace(
+                "      (github.head_ref == 'automation/release-next' ||\n"
+                "      contains(github.event.pull_request.labels.*.name, 'release:automated'))\n",
+                "      true\n",
+            )
+        ),
+    )
+    expect_assertion(
+        "ci.yml keeps both version guards but drops their falsification",
+        "ci.yml must run",
+        lambda: assert_release_version_gate_wired(
+            ci_workflow.replace(
+                RELEASE_VERSION_FALSIFIER_POLICY, "scripts/absent.py"
+            )
+        ),
+    )
+    expect_assertion(
+        "ci.yml stops running the release-intent gate's own suite",
+        "ci.yml must run",
+        lambda: assert_release_version_gate_wired(
+            ci_workflow.replace(RELEASE_INTENT_SUITE_POLICY, "scripts/absent.test.mjs")
+        ),
+    )
+    expect_assertion(
+        "ci.yml stops running the version gate's own suite",
+        "ci.yml must run",
+        lambda: assert_release_version_gate_wired(
+            ci_workflow.replace(RELEASE_VERSION_SUITE_POLICY, "scripts/absent.test.mjs")
         ),
     )
     expect_assertion(
