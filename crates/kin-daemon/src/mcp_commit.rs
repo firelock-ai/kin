@@ -1817,6 +1817,81 @@ fn plan_retired_source_files(
 /// The layout and the non-entity facets carry the path in their key rather than
 /// in their body, so they are re-keyed rather than rebuilt: the bytes did not
 /// move, so every byte range in them is still correct.
+/// The entity relocations one path change requires, returned rather than
+/// applied.
+///
+/// Returned, because the caller's transaction is the only place they may land.
+/// kin-db refuses a tree transition that leaves an entity on a path the staged
+/// tree no longer carries, in those words, so a relocation published as a
+/// second transaction beside the tree move is refused exactly as a stranded
+/// entity is. Applying these here would work only where the caller is staging a
+/// prospective graph it publishes later, and the reconcile seam is not.
+///
+/// FIR-2429: a bare filesystem `mv` reached the reconcile seam with no entity
+/// relocation at all, and the repository stopped accepting commits.
+/// Typed rather than stringly: every failure here is the graph refusing a read
+/// or a write, so the daemon's reconcile seam can map it to `DaemonError::Graph`
+/// and the commit seam can add its own context. A `String` crossing this
+/// boundary would force one of the two to invent an error class.
+pub(crate) fn plan_entity_relocations(
+    graph: &kin_db::InMemoryGraph,
+    from_id: &FilePathId,
+    to_id: &FilePathId,
+) -> std::result::Result<Vec<EntityDelta>, kin_db::KinDbError> {
+    Ok(graph
+        .query_entities(&kin_model::EntityFilter {
+            file_path: Some(from_id.clone()),
+            ..Default::default()
+        })?
+        .into_iter()
+        .map(|old| {
+            let mut new = old.clone();
+            new.file_origin = Some(to_id.clone());
+            EntityDelta::Modified { old, new }
+        })
+        .collect())
+}
+
+/// Re-key the per-file records a path change moves: layout, shallow,
+/// structured and opaque.
+///
+/// These are not part of a [`TransactionDelta`], so they are applied here and
+/// stay outside the caller's transaction, which is where they already sat. Run
+/// after the transaction publishes, in the order the MCP seam has always used.
+pub(crate) fn relocate_file_records(
+    graph: &kin_db::InMemoryGraph,
+    from_id: &FilePathId,
+    to_id: &FilePathId,
+    layouts: &mut Vec<FileLayout>,
+) -> std::result::Result<(), kin_db::KinDbError> {
+    if let Some(layout) = graph.get_file_layout(from_id)? {
+        let mut moved = layout;
+        moved.file_id = to_id.clone();
+        graph.delete_file_layout(from_id)?;
+        graph.upsert_file_layout(&moved)?;
+        layouts.push(moved);
+    }
+    if let Some(shallow) = graph.get_shallow_file(from_id)? {
+        let mut moved = shallow;
+        moved.file_id = to_id.clone();
+        graph.delete_shallow_file(from_id)?;
+        graph.upsert_shallow_file(&moved)?;
+    }
+    if let Some(structured) = graph.get_structured_artifact(from_id)? {
+        let mut moved = structured;
+        moved.file_id = to_id.clone();
+        graph.delete_structured_artifact(from_id)?;
+        graph.upsert_structured_artifact(&moved)?;
+    }
+    if let Some(opaque) = graph.get_opaque_artifact(from_id)? {
+        let mut moved = opaque;
+        moved.file_id = to_id.clone();
+        graph.delete_opaque_artifact(from_id)?;
+        graph.upsert_opaque_artifact(&moved)?;
+    }
+    Ok(())
+}
+
 fn plan_renamed_source_files(
     prospective: &kin_db::InMemoryGraph,
     relocations: BTreeMap<String, (FilePathId, FilePathId)>,
@@ -1835,23 +1910,12 @@ fn plan_renamed_source_files(
                 format!("renamed source artifact disappeared during planning: {from_id}")
             })?;
 
-        let entity_deltas = prospective
-            .query_entities(&kin_model::EntityFilter {
-                file_path: Some(from_id.clone()),
-                ..Default::default()
-            })
-            .map_err(|error| format!("load entities on {from_id}: {error}"))?
-            .into_iter()
-            .map(|old| {
-                let mut new = old.clone();
-                new.file_origin = Some(to_id.clone());
-                EntityDelta::Modified { old, new }
-            })
-            .collect::<Vec<_>>();
-
+        // One transaction, entity relocation and tree move together. This is
+        // the shape the reconcile seam was missing.
         prospective
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas,
+                entity_deltas: plan_entity_relocations(prospective, &from_id, &to_id)
+                    .map_err(|error| format!("load entities on {from_id}: {error}"))?,
                 tree_deltas: vec![TreeDelta::Updated {
                     artifact_id: artifact.artifact_id,
                     old: artifact.located_entry(),
@@ -1861,59 +1925,8 @@ fn plan_renamed_source_files(
             })
             .map_err(|error| format!("relocate {from_id} to {to_id}: {error}"))?;
 
-        if let Some(layout) = prospective
-            .get_file_layout(&from_id)
-            .map_err(|error| format!("load layout for {from_id}: {error}"))?
-        {
-            let mut moved = layout;
-            moved.file_id = to_id.clone();
-            prospective
-                .delete_file_layout(&from_id)
-                .map_err(|error| format!("drop layout at {from_id}: {error}"))?;
-            prospective
-                .upsert_file_layout(&moved)
-                .map_err(|error| format!("install layout at {to_id}: {error}"))?;
-            layouts.push(moved);
-        }
-        if let Some(shallow) = prospective
-            .get_shallow_file(&from_id)
-            .map_err(|error| format!("load shallow record for {from_id}: {error}"))?
-        {
-            let mut moved = shallow;
-            moved.file_id = to_id.clone();
-            prospective
-                .delete_shallow_file(&from_id)
-                .map_err(|error| format!("drop shallow record at {from_id}: {error}"))?;
-            prospective
-                .upsert_shallow_file(&moved)
-                .map_err(|error| format!("install shallow record at {to_id}: {error}"))?;
-        }
-        if let Some(structured) = prospective
-            .get_structured_artifact(&from_id)
-            .map_err(|error| format!("load structured record for {from_id}: {error}"))?
-        {
-            let mut moved = structured;
-            moved.file_id = to_id.clone();
-            prospective
-                .delete_structured_artifact(&from_id)
-                .map_err(|error| format!("drop structured record at {from_id}: {error}"))?;
-            prospective
-                .upsert_structured_artifact(&moved)
-                .map_err(|error| format!("install structured record at {to_id}: {error}"))?;
-        }
-        if let Some(opaque) = prospective
-            .get_opaque_artifact(&from_id)
-            .map_err(|error| format!("load opaque record for {from_id}: {error}"))?
-        {
-            let mut moved = opaque;
-            moved.file_id = to_id.clone();
-            prospective
-                .delete_opaque_artifact(&from_id)
-                .map_err(|error| format!("drop opaque record at {from_id}: {error}"))?;
-            prospective
-                .upsert_opaque_artifact(&moved)
-                .map_err(|error| format!("install opaque record at {to_id}: {error}"))?;
-        }
+        relocate_file_records(prospective, &from_id, &to_id, layouts)
+            .map_err(|error| format!("relocate records {from_id} to {to_id}: {error}"))?;
     }
     Ok(())
 }
