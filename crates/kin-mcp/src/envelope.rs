@@ -2234,18 +2234,74 @@ fn annotate_block(
     };
     let mut annotated = annotated;
     apply_response_budget(&mut annotated, tool_name, budget);
-    // The invariant that keeps the collapse from being undone one block at a
-    // time. It reads what a client will read, after the budget has had its say,
-    // so a block added later cannot reintroduce a second verdict without this
-    // firing in every debug build and every test.
-    debug_assert!(
-        crate::verdict::disagreements(&annotated).is_empty(),
-        "response for {tool_name} contradicts its own verdict: {:?}",
-        crate::verdict::disagreements(&annotated)
-    );
+    disclose_self_contradictions(&mut annotated, tool_name);
     let rendered =
         serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
+}
+
+/// Run the contradiction checker against what a client will actually read, and
+/// publish what it finds.
+///
+/// It used to be reached only from a `debug_assert!`, which a release build
+/// compiles out, so no shipped envelope was ever checked (FIR-2697). The v0.5.52
+/// response that certified an answer over an edge class its own completeness
+/// recorded as absent shipped with this checker present and inert, and the lane
+/// that found the hole found it because a falsification arm which DELETED the
+/// checker came back green under a release build: a removed detector and a
+/// silent one are the same run in that profile.
+///
+/// It discloses rather than panics. A contradiction is a defect in Kin, not in
+/// the caller's repository, and killing the response denies the caller both the
+/// answer and the warning. `_kin.self_check` names each disagreement in the
+/// words the checker uses, so a client, an acceptance run and a bug report all
+/// read the same sentence.
+///
+/// It does NOT feed the verdict. By this point the verdict is computed and the
+/// budget has been applied, so a refusing input arriving here would be a second
+/// verdict rather than an input to the one. The block says the response
+/// disagrees with itself and leaves the verdict as the thing it disagrees with.
+///
+/// The debug assertion it replaced is GONE rather than kept underneath, and that
+/// is deliberate. A panic in debug makes the disclosure untestable, because
+/// every test that constructs a contradiction dies before reaching the block it
+/// is meant to read, and tests are debug builds. A payload a test can assert on
+/// is the stronger guard anyway: `self_check` absent is a positive statement
+/// that nothing disagreed, where a panic that did not fire says only that
+/// nothing reached it.
+///
+/// **This does not close the certified-over-nothing hole (FIR-2723).** A checker
+/// catches a response that contradicts itself. A verdict that certifies over one
+/// input while five are silent contradicts nothing, so no arm here can see it.
+fn disclose_self_contradictions(annotated: &mut Value, tool_name: &str) {
+    let found = crate::verdict::disagreements(annotated);
+    if found.is_empty() {
+        return;
+    }
+    tracing::warn!(
+        tool = tool_name,
+        disagreements = ?found,
+        "response contradicts its own verdict"
+    );
+    let Some(envelope) = annotated
+        .get_mut(ENVELOPE_KEY)
+        .and_then(Value::as_object_mut)
+    else {
+        // No envelope to disclose into. `disagreements` reads the verdict out of
+        // that same envelope, so it cannot have found anything without one, and
+        // this arm is unreachable rather than a silent drop.
+        return;
+    };
+    envelope.insert(
+        "self_check".to_string(),
+        json!({
+            "status": "contradicted",
+            "disagreements": found,
+            "note": "This response contradicts its own verdict, which is a defect in Kin rather \
+                     than a fact about the repository. Trust the most pessimistic reading of the \
+                     blocks named here, and report this.",
+        }),
+    );
 }
 
 /// Bound the fully annotated payload and record what that cost under
@@ -3672,6 +3728,85 @@ mod tests {
         assert!(
             !json.contains("relation_census_loss"),
             "an unobserved flag is absent from the wire, not false: {json}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod self_check_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A response whose blocks all agree, so nothing may be disclosed.
+    fn agreeing() -> Value {
+        json!({
+            "_kin": {
+                "verdict": {
+                    "state": "certified",
+                    "absence_claim": "authoritative",
+                    "safe_to_conclude_absent": true,
+                    "limiting_factor": Value::Null,
+                },
+                "completeness": {
+                    "status": "complete",
+                    "bound": "exact",
+                    "counted": {"reported": 2, "exact": true},
+                    "note": "the counts here are the whole set.",
+                },
+            },
+            "negative": {
+                "safe_to_conclude_absent": true,
+                "trust": "authoritative",
+            },
+        })
+    }
+
+    /// FIR-2697. The checker was reached only from a `debug_assert!`, so a
+    /// release binary never ran it and the v0.5.52 envelope that certified over
+    /// an absent edge class shipped with it present and inert.
+    ///
+    /// It runs unconditionally now and publishes what it finds, so this asserts
+    /// on the block a client reads rather than on a panic a release build
+    /// deletes.
+    #[test]
+    fn a_response_that_contradicts_itself_says_so_where_a_client_reads_it() {
+        let mut value = agreeing();
+        // The completeness refuses while the verdict certifies: the exact shape
+        // that shipped, and the one the certified-direction arms were added for.
+        value["_kin"]["completeness"]["status"] = json!("unknown");
+        value["_kin"]["completeness"]["bound"] = json!("at_least");
+
+        disclose_self_contradictions(&mut value, "find_references");
+
+        let check = &value["_kin"]["self_check"];
+        assert_eq!(check["status"], json!("contradicted"), "{value}");
+        let found = check["disagreements"]
+            .as_array()
+            .expect("the disagreements are named");
+        assert!(
+            found.iter().any(|line| line
+                .as_str()
+                .is_some_and(|line| line.contains("bound reads at_least under a certified"))),
+            "the disclosure names what disagreed: {found:?}"
+        );
+        assert!(
+            check["note"]
+                .as_str()
+                .is_some_and(|note| note.contains("defect in Kin")),
+            "and says whose fault it is, since a caller cannot fix it: {check}"
+        );
+    }
+
+    /// The control, and the half that stops the fix being "disclose always".
+    /// A response whose blocks agree must carry no `self_check` at all, so its
+    /// absence is a positive statement rather than a field nobody set.
+    #[test]
+    fn an_agreeing_response_carries_no_self_check() {
+        let mut value = agreeing();
+        disclose_self_contradictions(&mut value, "find_references");
+        assert!(
+            value["_kin"].get("self_check").is_none(),
+            "an agreeing response disclosed a contradiction: {value}"
         );
     }
 }
