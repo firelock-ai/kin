@@ -34,6 +34,15 @@ KIN_HEAP_PHASES
 # and no runtime behaviour keys on it. It exists because the synthetic fixtures
 # price a shape rather than a repository.
 KIN_HEAP_REPO
+# Size and target the FIR-2729 increment-2 scale measurement, which is #[ignore]d
+# and reports rather than asserting a ceiling. REPO names a real Git worktree to
+# clone and admit, and COMMITS and STEPS size the synthetic arm it falls back to.
+# Nothing runs without the test being asked for by name, no runtime behaviour
+# keys on any of them, and none is an operator-facing lever. Same shape as
+# KIN_HEAP_REPO and KIN_HEAP_PHASES above.
+KIN_INC2_SCALE_COMMITS
+KIN_INC2_SCALE_REPO
+KIN_INC2_SCALE_STEPS
 KIN_INIT_INTERRUPTED_TEST_BARRIER
 KIN_INIT_INTERRUPTED_TEST_SOURCE
 KIN_INIT_STAGING_SIGNAL_TEST_PARENT
