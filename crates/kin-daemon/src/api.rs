@@ -8117,6 +8117,30 @@ fn locate_entity_identity(entity: &kin_cli::commands::locate::LocateEntity) -> L
     }
 }
 
+/// Did this unresolved ranked key name an entity that was RETIRED, rather than
+/// one the graph has never held?
+///
+/// FIR-2727. kin-db refuses to resolve a revision key whose entity is gone,
+/// which is correct: nothing may be handed back as live when it is not. But
+/// "retired" and "never held" then arrive identically as `None`, and they take
+/// OPPOSITE remediations. Reporting the first as the second sends an operator
+/// to `kin admit` for a retirement, which does nothing at all.
+///
+/// Asked only on the `None` path and only for revision keys, so a healthy
+/// ranking where every key resolves pays nothing for it.
+///
+/// `entity_id_for_revision` is liveness-blind on purpose and exists for exactly
+/// this question. Do not "simplify" this by inferring retirement from the
+/// failed resolution: that inference is what printed the wrong remediation.
+fn unresolved_key_is_retired(graph: &kin_db::InMemoryGraph, key: &kin_db::RetrievalKey) -> bool {
+    match key {
+        kin_db::RetrievalKey::EntityRevision(revision_id) => graph
+            .entity_id_for_revision(revision_id)
+            .is_some_and(|entity_id| graph.get_entity(&entity_id).ok().flatten().is_none()),
+        _ => false,
+    }
+}
+
 fn build_semantic_locate_result(
     state: &DaemonState,
     graph: &kin_db::InMemoryGraph,
@@ -8304,7 +8328,25 @@ fn build_semantic_locate_result(
             break;
         }
         let Some(item) = graph.resolve_retrieval_key(&key) else {
-            unresolved_keys += 1;
+            // FIR-2727. A key that resolves to nothing is TWO different facts
+            // and they take opposite remediations, so they are separated here
+            // rather than collapsed into one count.
+            //
+            // kin-db refuses a revision key whose entity was retired, which is
+            // correct: nothing may be handed back as live when it is gone. But
+            // "retired" and "never held" arrive identically as `None`, and
+            // reporting the first as the second sends an operator to `kin
+            // admit` for a retirement, which does nothing.
+            //
+            // `entity_id_for_revision` is liveness-blind on purpose and exists
+            // for exactly this question. It is asked only on the `None` path
+            // and only for revision keys, so it costs nothing on a healthy
+            // ranking where every key resolves.
+            if unresolved_key_is_retired(graph, &key) {
+                retired_entity_keys += 1;
+            } else {
+                unresolved_keys += 1;
+            }
             continue;
         };
         // Entity-centric projection: the ENTITY (kind + name + signature) is the
@@ -8312,6 +8354,15 @@ fn build_semantic_locate_result(
         // below already dropped retired entities, but only when snippets were
         // on; under `include_snippet: false` or file granularity nothing
         // filtered them at all.
+        //
+        // FIR-2727: kin-db's resolve arm now enforces liveness upstream, so a
+        // retired entity should never reach this check at all. It stays anyway,
+        // as the SECOND layer the tripwire watches. Do not delete it as
+        // redundant: the tripwire's zero is what will prove the redundancy
+        // empirically, and a later cleanup can cite that measured zero rather
+        // than an argument. Deleting a working guard as a side effect of fixing
+        // what it guarded against is how the guard's absence gets discovered by
+        // a user instead of by a test.
         let entity_is_live = match &item {
             kin_db::ResolvedRetrievalItem::Entity(entity) => {
                 graph.get_entity(&entity.id).ok().flatten().is_some()
@@ -8473,7 +8524,22 @@ fn build_semantic_locate_result(
                      to entities the graph no longer holds, so they were dropped rather than \
                      served as ids no graph tool can take"
                 ),
-                remediation: "run 'kin embed' to re-index this graph's current entities"
+                // `kin embed`, and the reason is a chain worth writing down
+                // because the obvious guess is wrong twice over. A revision key
+                // outliving its entity is a normal pre-prune transient:
+                // retirement evicts the live Entity key immediately and the
+                // immutable revision keys stay until something prunes them.
+                //
+                // Nothing in kin calls `prune_orphaned_vectors` directly. kin-db
+                // calls it itself, and the path a user can reach is the embed
+                // one: `kin embed` -> `process_embedding_queue` ->
+                // `persist_embedded_batch` -> `persist_embedded_batch_inner(..,
+                // prune_on_empty = true)`, which prunes once the queue drains.
+                // `kin admit` is for content the graph never held, and
+                // `kin reconcile` republishes workspace changes into graph truth
+                // without touching the retrieval index.
+                remediation: "run 'kin embed' to drain the embedding queue, which prunes \
+                              retired revision keys from the retrieval index once it empties"
                     .to_string(),
             },
         );
@@ -17767,6 +17833,107 @@ mod tests {
         assert!(
             class_gap < worker,
             "the structural gap leads and the run degradation follows: {rendered}"
+        );
+    }
+
+    /// FIR-2727. A ranked key that resolves to nothing is two different facts,
+    /// and they take opposite remediations.
+    ///
+    /// kin-db refuses a revision key whose entity was retired, so "retired" and
+    /// "never held" both arrive as `None`. Counting them together sends an
+    /// operator to `kin admit` for a retirement, which does nothing. This pins
+    /// that the classification separates them, and the three FALSE arms are
+    /// what stop it from simply answering true.
+    #[test]
+    fn a_retired_revision_key_is_classified_apart_from_a_key_the_graph_never_held() {
+        let graph = kin_db::InMemoryGraph::new();
+        let retired = test_entity("retired_fn", "src/retired.rs");
+        let live = test_entity("live_fn", "src/live.rs");
+        graph.upsert_entity(&retired).unwrap();
+        graph.upsert_entity(&live).unwrap();
+
+        let change = kin_model::SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0x77; 32])),
+            parents: Vec::new(),
+            timestamp: kin_model::Timestamp::now(),
+            author: kin_model::AuthorId::new("tester"),
+            message: "record revisions for both".into(),
+            entity_deltas: vec![
+                kin_model::EntityDelta::Added {
+                    new: retired.clone(),
+                },
+                kin_model::EntityDelta::Added { new: live.clone() },
+            ],
+            relation_deltas: Vec::new(),
+            tree_deltas: Vec::new(),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            origin: kin_model::ChangeOrigin::Native,
+            admission_policy_delta: None,
+            external_reference_deltas: Vec::new(),
+        };
+        // The id is the change's computed identity, not a chosen constant: the
+        // graph recomputes it on admission and refuses a mismatch. Naming a
+        // placeholder here fails with the hash it should have been, which is a
+        // good error and still a wasted round trip.
+        let change = kin_model::SemanticChange {
+            id: kin_core::compute_semantic_change_id(&change).unwrap(),
+            ..change
+        };
+        graph.create_change(&change).unwrap();
+
+        let revision_of = |id| {
+            graph
+                .to_snapshot()
+                .entity_revisions
+                .get(&id)
+                .and_then(|revisions| revisions.first().map(|rev| rev.revision_id))
+                .expect("the change must record a revision")
+        };
+        let retired_revision = revision_of(retired.id);
+        let live_revision = revision_of(live.id);
+
+        graph.remove_entity(&retired.id).unwrap();
+        assert!(
+            graph.get_entity(&retired.id).unwrap().is_none(),
+            "the entity must actually be retired, or the TRUE arm below is vacuous"
+        );
+
+        // TRUE: the key names an entity that WAS held and is now retired.
+        assert!(
+            unresolved_key_is_retired(
+                &graph,
+                &kin_db::RetrievalKey::EntityRevision(retired_revision)
+            ),
+            "a revision key whose entity was retired must classify as retired, or the \
+             operator is told to run kin admit for a retirement"
+        );
+
+        // FALSE, and each arm blocks a different way of answering true.
+        assert!(
+            !unresolved_key_is_retired(
+                &graph,
+                &kin_db::RetrievalKey::EntityRevision(live_revision)
+            ),
+            "a revision of a LIVE entity is not a retirement"
+        );
+        assert!(
+            !unresolved_key_is_retired(
+                &graph,
+                &kin_db::RetrievalKey::EntityRevision(kin_model::EntityRevisionId::from_hash(
+                    Hash256::from_bytes([0xAB; 32])
+                ))
+            ),
+            "a revision id no entity ever carried is a key the graph never held, not a \
+             retirement; this is the arm that fails if the check answers true on any \
+             unresolvable revision key"
+        );
+        assert!(
+            !unresolved_key_is_retired(&graph, &kin_db::RetrievalKey::Entity(retired.id)),
+            "a plain Entity key is already refused by resolution and is not this \
+             classification's business"
         );
     }
 
