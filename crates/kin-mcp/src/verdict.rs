@@ -60,6 +60,14 @@ const NOT_APPLICABLE: &str = "not_applicable";
 /// counts being called whole.
 const VERDICT_LIMIT: &str = "verdict_inconclusive";
 
+/// What separates two clauses when the factor is rendered as one sentence.
+///
+/// The rendering only. Nothing parses it back: clauses are carried as a list
+/// from the reading that produced them to the single join at serialization,
+/// because this string is also ordinary punctuation inside a clause's prose and
+/// a boundary inferred from it is a boundary a human never chose.
+pub(crate) const CLAUSE_SEPARATOR: &str = "; ";
+
 /// The limiting factor a response bounded by the size budget carries.
 const RESPONSE_BOUNDED_FACTOR: &str = "response_bounded: the response budget withheld part of \
                                        this answer, so its counts are a lower bound and its \
@@ -78,23 +86,32 @@ const RESPONSE_BOUNDED_FACTOR: &str = "response_bounded: the response budget wit
 /// label appears once, because the absence gate already composes the class gap
 /// and the degradations that the later readings repeat as named inputs.
 fn compose_limiting_factor(readings: &[(&str, Reading)]) -> Option<String> {
+    Some(compose_clauses(readings))
+        .filter(|clauses| !clauses.is_empty())
+        .map(|clauses| clauses.join(CLAUSE_SEPARATOR))
+}
+
+/// The factor's clauses, deduplicated by label, in the readings' order.
+///
+/// Each refusing reading hands over the clauses it built. Nothing is split back
+/// out of a joined string here, which is the whole change: the separator is also
+/// ordinary punctuation inside a clause's prose, so a boundary parsed from it is
+/// a boundary no author chose. `cross_file_edges_absent` and
+/// `name_filter_narrowed_to_zero` both carry one, and each used to arrive as a
+/// labelled clause plus a bare fragment that reached the reader with no label at
+/// all.
+fn compose_clauses(readings: &[(&str, Reading)]) -> Vec<String> {
     let mut labels: Vec<String> = Vec::new();
     let mut clauses: Vec<String> = Vec::new();
     for (_, reading) in readings {
-        let Reading::Inconclusive(reason) = reading else {
+        let Reading::Inconclusive(reasons) = reading else {
             continue;
         };
-        for clause in reason
-            .split("; ")
-            .map(str::trim)
-            .filter(|clause| !clause.is_empty())
-        {
-            let label = clause
-                .split(':')
-                .next()
-                .unwrap_or(clause)
-                .trim()
-                .to_string();
+        for clause in reasons.iter().map(|clause| clause.trim()) {
+            if clause.is_empty() {
+                continue;
+            }
+            let label = clause_label(clause);
             if labels.contains(&label) {
                 continue;
             }
@@ -102,15 +119,36 @@ fn compose_limiting_factor(readings: &[(&str, Reading)]) -> Option<String> {
             clauses.push(clause.to_string());
         }
     }
-    (!clauses.is_empty()).then(|| clauses.join("; "))
+    clauses
+}
+
+/// The gap a clause names, which is the text before its first colon.
+///
+/// Two readings that notice the same gap say it once (FIR-2672), and this is
+/// how they are recognised as the same. It is still inferred rather than stated,
+/// which is a known limit recorded on FIR-2723: nothing enforces that two
+/// readings sharing a prefix describe the same gap. What it no longer does is
+/// invent clause boundaries, so a label is always a label an author wrote.
+fn clause_label(clause: &str) -> String {
+    clause
+        .split(':')
+        .next()
+        .unwrap_or(clause)
+        .trim()
+        .to_string()
 }
 
 /// One input's reading of the same answer.
 enum Reading {
     /// The input observed nothing that stops this answer being acted on.
     Certified,
-    /// The input refuses, and says why in the reason it carries.
-    Inconclusive(String),
+    /// The input refuses, and says why in the clauses it carries.
+    ///
+    /// A list rather than one string, so the factor is never parsed back out of
+    /// a joined sentence. Most readings build exactly one clause; the absence
+    /// gate composes several, and it is the one whose prose contains the same
+    /// separator the renderer uses.
+    Inconclusive(Vec<String>),
     /// The input has nothing to say about this response, which is different from
     /// saying it is fine. A silent input never certifies anything.
     Silent,
@@ -373,21 +411,34 @@ fn absence_gate_reading(tool: &str, payload: &Value, negative: Option<&Value>) -
         // rows inconclusive on its own success.
         return match negative.get("trust").and_then(Value::as_str) {
             Some("authoritative") => Reading::Certified,
-            Some(_) => Reading::Inconclusive(
-                negative
-                    .get("trust_reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("the absence gate refused and reported no reason")
-                    .to_string(),
-            ),
+            // `trust_reason` arrives as one string off the wire, composed by
+            // the negative block from its own gaps. It is taken as ONE clause
+            // rather than split on the separator: parsing it back would infer
+            // boundaries from prose exactly as this change removes elsewhere,
+            // and the clauses it was built from are not published beside it. The
+            // remaining half of that fix, having the negative block carry its
+            // gaps as a list through `push_gap` and render `trust_reason` once,
+            // is recorded on FIR-2723.
+            Some(_) => Reading::Inconclusive(vec![negative
+                .get("trust_reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the absence gate refused and reported no reason")
+                .to_string()]),
             None => Reading::Silent,
         };
     }
-    match crate::negative::absence_coverage_gap(tool, payload) {
-        Some(gap) => Reading::Inconclusive(gap),
-        None if crate::negative::declares_absence_dependency(tool, payload) => Reading::Certified,
-        None => Reading::Silent,
+    // The clauses, never the joined rendering. This is the path the probe on
+    // FIR-2723 caught: `cross_file_edges_absent`'s text carries a semicolon, so
+    // joining here and splitting in the composer cut it into a labelled clause
+    // and a bare fragment that reached the reader with no label at all.
+    let clauses = crate::negative::absence_coverage_clauses(tool, payload);
+    if !clauses.is_empty() {
+        return Reading::Inconclusive(clauses);
     }
+    if crate::negative::declares_absence_dependency(tool, payload) {
+        return Reading::Certified;
+    }
+    Reading::Silent
 }
 
 /// The raw `edge_coverage` observation's own reading, independent of whichever
@@ -424,31 +475,31 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     {
         "available" => {}
         "unsupported" => {
-            return Reading::Inconclusive(format!(
+            return Reading::Inconclusive(vec![format!(
                 "reference_enrichment_unsupported: this build wires no language-server adapter \
                  for {language}, so cross-file reference and override edges cannot exist for it \
                  at all"
-            ))
+            )])
         }
         "no_language_server" => {
-            return Reading::Inconclusive(format!(
+            return Reading::Inconclusive(vec![format!(
                 "reference_enrichment_no_language_server: an adapter is wired for {language} but \
                  no language server for it is installed on this host"
-            ))
+            )])
         }
         _ => {}
     }
     if coverage.get("scope_entities").and_then(Value::as_u64) == Some(0) {
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "absence_scope_empty: the graph holds no entity at all under the filter this query \
              applied for {language}"
-        ));
+        )]);
     }
     if coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true) {
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "edge_coverage_budget_exhausted: the coverage scan for {language} stopped before it \
              could establish what the graph holds"
-        ));
+        )]);
     }
 
     let requested = crate::negative::absence_cross_file_classes(tool, payload);
@@ -468,10 +519,10 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         // sharper reason. Read from the gate's own function so the input's
         // reading and the refusal can never disagree about one observation.
         if crate::negative::coverage_classes_unmeasured(coverage, &requested) {
-            return Reading::Inconclusive(format!(
+            return Reading::Inconclusive(vec![format!(
                 "absence_coverage_unmeasured: this answer measured no coverage class for \
                  {language}, so nothing established what the extractor admitted for it"
-            ));
+            )]);
         }
         return Reading::Certified;
     }
@@ -496,21 +547,21 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
     let unproduced = in_state("unproduced");
     if !unproduced.is_empty() {
         let missing = unproduced.join(", ");
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "cross_file_edges_unproduced: this build produced no entity-level {missing} edge for \
              {language} although the source carries {missing} sites the linker resolved, so a \
              use that reaches the target through {missing} could not have been found, and the gap \
              is in the linker, not in the code"
-        ));
+        )]);
     }
     let absent = in_state("absent");
     if !absent.is_empty() {
         let missing = absent.join(", ");
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "cross_file_edges_absent: the graph was not observed to hold cross-file \
              {missing} edges for {language}, so a use that reaches the target through {missing} \
              could not have been found"
-        ));
+        )]);
     }
     let unhealthy: Vec<&str> = deciding
         .iter()
@@ -521,11 +572,11 @@ fn edge_coverage_reading(tool: &str, payload: &Value) -> Reading {
         Reading::Certified
     } else {
         let missing = unhealthy.join(", ");
-        Reading::Inconclusive(format!(
+        Reading::Inconclusive(vec![format!(
             "edge_coverage_unknown: whether the graph holds cross-file {missing} edges for \
              {language} could not be established, so a use that reaches the target through \
              {missing} may not have been found"
-        ))
+        )])
     }
 }
 
@@ -546,11 +597,11 @@ fn withheld_candidates_reading(payload: &Value) -> Reading {
         // verdict about nothing.
         None => Reading::Silent,
         Some(0) => Reading::Certified,
-        Some(withheld) => Reading::Inconclusive(format!(
+        Some(withheld) => Reading::Inconclusive(vec![format!(
             "withheld_candidates: {withheld} same-name candidate(s) are carried in `candidates` \
              and are not in the counts here, so the headline is a floor and each withheld row \
              may belong in it"
-        )),
+        )]),
     }
 }
 
@@ -563,11 +614,11 @@ fn degradations_reading(payload: &Value) -> Reading {
     if labels.is_empty() {
         Reading::Certified
     } else {
-        Reading::Inconclusive(format!(
+        Reading::Inconclusive(vec![format!(
             "retrieval_degraded: this query reported degradations [{}], so it did not run at \
              full capability",
             labels.join(", ")
-        ))
+        )])
     }
 }
 
@@ -612,19 +663,19 @@ fn completeness_reading(envelope: &Envelope) -> Reading {
         return Reading::Silent;
     };
     if completeness.status != "complete" {
-        return Reading::Inconclusive(format!(
+        return Reading::Inconclusive(vec![format!(
             "substrate_{}: the coverage classes this answer depended on were not all observed \
              present ({})",
             completeness.status,
             completeness.decided_by.join(", ")
-        ));
+        )]);
     }
     if completeness.bound != "exact" {
-        return Reading::Inconclusive(
+        return Reading::Inconclusive(vec![
             "counts_are_a_floor: this answer's own accounting reports its numbers as a lower \
              bound"
                 .to_string(),
-        );
+        ]);
     }
     Reading::Certified
 }
@@ -1084,6 +1135,46 @@ mod tests {
         }
     }
 
+    /// No clause may contain the string that separates clauses.
+    ///
+    /// The invariant the FIR-2723 fix rests on, asserted rather than assumed.
+    /// Clauses are carried as a list now, so Kin no longer mis-parses its own
+    /// factor, but the rendered sentence is still one string, and any reader
+    /// that splits it on the separator sees whatever the prose contains. Two
+    /// gap texts used to carry one, `cross_file_edges_absent` and
+    /// `name_filter_narrowed_to_zero`, and each arrived at the reader as a
+    /// labelled clause plus a bare fragment with no label at all.
+    ///
+    /// This drives the real producer over the shapes that reach it rather than
+    /// re-listing the texts, because a test that restates the strings is a
+    /// second copy of them and goes stale the day one is edited.
+    #[test]
+    fn no_clause_carries_the_separator_that_divides_clauses() {
+        let shapes = [
+            ("find_references", populated_reference_payload("absent")),
+            ("find_references", populated_reference_payload("unproduced")),
+            ("find_references", populated_reference_payload("unknown")),
+            ("impact_analysis", populated_reference_payload("absent")),
+            ("trace_data_flow", populated_reference_payload("absent")),
+        ];
+        let mut seen = 0;
+        for (tool, payload) in &shapes {
+            for clause in crate::negative::absence_coverage_clauses(tool, payload) {
+                seen += 1;
+                assert!(
+                    !clause.contains(CLAUSE_SEPARATOR),
+                    "{tool}: a clause carries the separator, so any reader that splits the \
+                     rendered factor will cut it into a labelled clause and an unlabelled \
+                     fragment: {clause}"
+                );
+            }
+        }
+        assert!(
+            seen > 0,
+            "no clause was produced by any shape, so this asserted nothing"
+        );
+    }
+
     /// FIR-2672, second finding. A verdict with two independent reasons names
     /// both: the class gap decided the state and the failed embedding worker
     /// stayed in the sentence after it, and the gap the absence gate and the
@@ -1094,27 +1185,27 @@ mod tests {
         let readings = [
             (
                 "absence_gate",
-                Reading::Inconclusive(
+                Reading::Inconclusive(vec![
                     "cross_file_edges_absent: the graph holds no cross-file imports edges for \
                      python"
                         .to_string(),
-                ),
+                ]),
             ),
             (
                 "edge_coverage",
-                Reading::Inconclusive(
+                Reading::Inconclusive(vec![
                     "cross_file_edges_absent: the graph was not observed to hold imports edges"
                         .to_string(),
-                ),
+                ]),
             ),
             ("withheld_candidates", Reading::Certified),
             (
                 "degradations",
-                Reading::Inconclusive(
+                Reading::Inconclusive(vec![
                     "retrieval_degraded: this query reported degradations [embed_worker_failed], \
                      so it did not run at full capability"
                         .to_string(),
-                ),
+                ]),
             ),
             ("completeness", Reading::Silent),
         ];

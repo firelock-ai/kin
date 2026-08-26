@@ -567,10 +567,29 @@ pub(crate) fn deciding_classes(requested: &[String], references_producible: bool
 /// [`crate::edge_coverage`] can then be retired, since it is called from exactly
 /// three payload builders.
 pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String> {
+    let clauses = absence_coverage_clauses(tool, payload);
+    (!clauses.is_empty()).then(|| clauses.join(crate::verdict::CLAUSE_SEPARATOR))
+}
+
+/// The same gaps as [`absence_coverage_gap`], as the list they are built as.
+///
+/// The verdict takes this and never the joined string. The two used to be one
+/// function returning `Option<String>`, and `compose_limiting_factor` split it
+/// back apart on the same `"; "` this file joins with, which made the separator
+/// carry two jobs at once: the boundary between clauses, and ordinary
+/// punctuation inside one clause's prose. Two gap texts contain a semicolon,
+/// `cross_file_edges_absent` and `name_filter_narrowed_to_zero`, so each was cut
+/// into a labelled clause and a bare fragment with no label at all, and the
+/// fragment reached the reader inside `limiting_factor`.
+///
+/// A joined string is a rendering. `negative.trust_reason` is a string on the
+/// wire and takes one; the verdict composes from the list, so no boundary is
+/// ever inferred from text a human wrote.
+pub(crate) fn absence_coverage_clauses(tool: &str, payload: &Value) -> Vec<String> {
     let requested = absence_cross_file_classes(tool, payload);
     let language_scoped = absence_is_language_scoped(tool);
     if requested.is_empty() && !language_scoped {
-        return None;
+        return Vec::new();
     }
     let named = requested.join(", ");
     let claims_absence = answer_claims_absence(tool, payload);
@@ -579,7 +598,7 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
         .get(crate::edge_coverage::EDGE_COVERAGE_KEY)
         .and_then(Value::as_object)
     else {
-        return Some(if !requested.is_empty() {
+        return vec![if !requested.is_empty() {
             format!(
                 "edge_coverage_unreported: this answer did not report whether the graph holds \
                  cross-file {named} edges, so an empty result cannot be distinguished from a graph \
@@ -603,7 +622,7 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
              span or whether this build can resolve their programs, so the rows here are a floor \
              and a declaration the extractor never admitted could not be among them"
                 .to_string()
-        });
+        }];
     };
     let language = coverage
         .get("language")
@@ -674,8 +693,8 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
                 "cross_file_edges_absent: the graph holds no cross-file {missing} edges for \
                  {language}{observed}, so a use that reaches the target through {missing} could \
                  not have been found and an empty result says nothing about whether the target is \
-                 used; the gap is in extraction/enrichment for that language, not in the \
-                 code{producible}"
+                 used, and the gap is in extraction/enrichment for that language rather than in \
+                 the code{producible}"
             ));
         } else if !unknown.is_empty()
             || coverage.get("budget_exhausted").and_then(Value::as_bool) == Some(true)
@@ -745,7 +764,7 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
                 "name_filter_narrowed_to_zero: this query's name pattern selects {declarations} \
                  on its own and the {narrowed} filter removed every one of them, so this answer \
                  observed that no candidate survived those filters rather than that the \
-                 repository holds no such declaration; the name resolves, so do not read this as \
+                 repository holds no such declaration. The name resolves, so do not read this as \
                  the target being absent, and re-run without the narrowing filter to see what it \
                  matched"
             ));
@@ -870,7 +889,7 @@ pub(crate) fn absence_coverage_gap(tool: &str, payload: &Value) -> Option<String
         });
     }
 
-    (!gaps.is_empty()).then(|| gaps.join("; "))
+    gaps
 }
 
 /// Whether this response asserts that something is NOT there, as opposed to
