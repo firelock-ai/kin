@@ -855,15 +855,42 @@ fn exact_tree_admission(
         // while its entities keep ranking is the exposure this ordering exists
         // to prevent.
         evict_enrichment_for_removed_paths(state, &deltas)?;
+        // A path change is not a removal, so the eviction above skips it and
+        // the entities on the old path have to move instead. They move in THIS
+        // transaction, beside the tree delta that carries them, because kin-db
+        // refuses a transition that leaves an entity on a path the staged tree
+        // no longer holds, and a relocation published as a second transaction
+        // is refused exactly as a stranded entity is (FIR-2429).
+        let relocations = path_relocations_in(&deltas);
+        let mut relocated_entities = Vec::new();
+        for (from_id, to_id) in &relocations {
+            relocated_entities.extend(
+                crate::mcp_commit::plan_entity_relocations(state.graph.as_ref(), from_id, to_id)
+                    .map_err(DaemonError::Graph)?,
+            );
+        }
         state
             .graph
             .apply_transaction_delta(&TransactionDelta {
-                entity_deltas: Vec::new(),
+                entity_deltas: relocated_entities,
                 relation_deltas: Vec::new(),
                 tree_deltas: deltas.clone(),
                 ..TransactionDelta::default()
             })
             .map_err(|error| name_stranded_endpoint_refusal(DaemonError::Graph(error), &deltas))?;
+        // After the transaction, in the order the MCP seam has always used.
+        // These records are not part of a TransactionDelta, so they were never
+        // inside one.
+        let mut moved_layouts = Vec::new();
+        for (from_id, to_id) in &relocations {
+            crate::mcp_commit::relocate_file_records(
+                state.graph.as_ref(),
+                from_id,
+                to_id,
+                &mut moved_layouts,
+            )
+            .map_err(DaemonError::Graph)?;
+        }
     }
 
     if observation.is_none() {
@@ -1299,6 +1326,31 @@ pub(crate) fn name_stranded_endpoint_refusal(
 /// Artifact-class edges go with it. They have no entity endpoint, so the entity
 /// cleanup below cannot see them, and kin-db refuses the tree transition that
 /// strands one exactly as it refuses a stranded entity.
+/// The `(from, to)` file ids of every tree delta that moved a path.
+///
+/// A byte-identical `mv` plans as [`TreeDelta::Updated`] with the same artifact
+/// id at a new path (`kin_core::exact_tree`), never as a removal plus an
+/// arrival, which is deliberate: the pair would mint new entity ids and orphan
+/// every incoming reference. So this reads the planner's own answer rather than
+/// inferring a rename from a removal and an addition that happen to match.
+///
+/// An `Updated` whose path did not change is an edit in place and is skipped;
+/// its entities keep the file origin they have.
+fn path_relocations_in(deltas: &[TreeDelta]) -> Vec<(FilePathId, FilePathId)> {
+    deltas
+        .iter()
+        .filter_map(|delta| {
+            let TreeDelta::Updated { old, new, .. } = delta else {
+                return None;
+            };
+            if old.path == new.path {
+                return None;
+            }
+            Some((semantic_file_id(&old.path)?, semantic_file_id(&new.path)?))
+        })
+        .collect()
+}
+
 pub(crate) fn evict_enrichment_for_removed_paths(
     state: &DaemonState,
     deltas: &[TreeDelta],
