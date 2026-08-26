@@ -18,7 +18,7 @@ semantic authority to query and review. What a change touches shows up before
 it merges, and agents work from exact context instead of re-reading the
 repository.
 
-Kin is the semantic system of record for AI-written software. It is a public
+Kin is the semantic system of record for AI-written software. It is an early
 alpha, usable today as a local CLI, daemon, MCP server, review surface, and
 graph-backed filesystem projection. It is pre-1.0, so expect rough edges and
 breaking changes. See the [latest stable release](https://github.com/firelock-ai/kin/releases/latest)
@@ -469,6 +469,34 @@ across its supported runner matrix. The workflow itself is public:
 A green release establishes those exact artifacts and environments; it is not a
 claim that every distribution, tool, or repository shape is already covered.
 
+## FAQ
+
+### Does Kin replace Git?
+
+Beside Git today. Repository authority over time. Git stays an explicit
+import/export interoperability boundary during brownfield adoption, so a team
+can migrate an existing repository without giving up its editor, compiler,
+build system, or Git interoperability.
+
+### Does my code leave my machine?
+
+Kin keeps local repository work in your environment, so repository ingestion,
+graph storage, and local queries all run there. KinLab is a separate product
+that adds hosted collaboration under explicit access and early-access
+agreements.
+
+### Which agents does it work with?
+
+Working with Claude Code, Codex, Cursor, Gemini and anything else that speaks MCP
+stays first class. `kin setup --intent agent` configures every client it detects
+in one pass.
+
+### Does it block a merge?
+
+Review is advisory, so it flags risk without blocking and the merge decision
+stays with your team. `kin review shadow` hands evidence to a human or a CI
+policy and stops there.
+
 ## Proof posture
 
 The published preregistered Multi-SWE-Bench Go proof package is pinned to an
@@ -479,6 +507,15 @@ here pending independent verification.
 Read the methodology, task set, build identity, and artifacts in the
 [public proof package](https://firelock.ai/labs/kin-proof). Treat claims outside
 that measured scope as hypotheses until they have their own reproducible proof.
+
+## Writing
+
+Engineering notes from building Kin, written down so a stranger can reuse them,
+live at [kinlab.ai/blog](https://kinlab.ai/blog) with a feed at
+[kinlab.ai/rss.xml](https://kinlab.ai/rss.xml).
+
+- [The check that passed because it measured nothing](https://kinlab.ai/blog/checks-that-cannot-fail)
+- [Your code search says nothing uses it. Can you delete it?](https://kinlab.ai/blog/empty-answer-safe-to-delete)
 
 ## Learn and contribute
 

@@ -3,6 +3,7 @@
   "name": "ai.kinlab/kin",
   "title": "Kin",
   "description": "The system of record for AI-written software.",
+  "websiteUrl": "https://kinlab.ai",
   "repository": {
     "url": "https://github.com/firelock-ai/kin",
     "source": "github"
