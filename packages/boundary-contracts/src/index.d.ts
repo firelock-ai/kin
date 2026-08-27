@@ -499,7 +499,7 @@ export interface RepositoryTransferLimits {
 }
 
 export interface RepositoryTransferStatus {
-  schema_version: 3;
+  schema_version: 4;
   protocol: "kin-repository-v6-fast-forward";
   repository_id: string;
   destination_ref: RepositoryTransferRefName;
@@ -523,7 +523,7 @@ export interface RepositoryTransferBody {
 }
 
 export interface RepositoryTransferPack {
-  schema_version: 3;
+  schema_version: 4;
   protocol: "kin-repository-v6-fast-forward";
   transfer_id: string;
   operation_id: string;
@@ -561,7 +561,7 @@ export interface RepositoryTransferPack {
 }
 
 export interface RepositoryTransferReceipt {
-  schema_version: 3;
+  schema_version: 4;
   protocol: "kin-repository-v6-fast-forward";
   transfer_id: string;
   repository_id: string;
