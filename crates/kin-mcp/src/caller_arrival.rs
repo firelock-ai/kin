@@ -221,6 +221,14 @@ impl CallerArrival {
                         ),
                     })
                     .collect();
+                // Joined with ", " and never with "; ", which is
+                // `crate::verdict::CLAUSE_SEPARATOR`. The rendered limiting
+                // factor is one string that a reader splits back into clauses on
+                // that separator, so a clause carrying it arrives as a labelled
+                // clause plus a bare fragment with no label at all. Two gap texts
+                // shipped that defect before; this one would have been the third,
+                // and the guard that asserts the invariant drives one producer by
+                // name and cannot see a new one.
                 let more = self.unaccounted.len().saturating_sub(named.len());
                 let tail = if more > 0 {
                     format!(" and {more} more")
@@ -234,7 +242,7 @@ impl CallerArrival {
                      set: {}{tail}",
                     self.unaccounted.len(),
                     self.family_files,
-                    named.join("; ")
+                    named.join(", ")
                 ))
             }
         }
@@ -530,7 +538,7 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
                  this focal may be among them and an empty reference list here is a floor rather \
                  than proof of disuse: {}",
                 files.len(),
-                files.join("; ")
+                files.join(", ")
             ))
         }
         "unmeasured" => {
@@ -957,6 +965,90 @@ mod tests {
             1
         );
         assert_eq!(small_block["unaccounted_files_truncated"], json!(false));
+    }
+
+    #[test]
+    fn no_factor_this_module_produces_carries_the_clause_separator() {
+        // `crate::verdict` renders the one limiting factor as a single string and
+        // a reader splits it back into clauses on "; ". A clause carrying that
+        // separator arrives as a labelled clause plus a bare fragment with no
+        // label at all, and the reader handed `limiting_factor` gets the
+        // fragment. Two gap texts shipped that defect before this module existed.
+        //
+        // Mine would have been the third: both producers joined their file list
+        // with "; ", and the guard that asserts this invariant drives
+        // `negative::absence_coverage_clauses` by name, so it could not see a new
+        // producer at all. This drives MY producers over the shapes that reach
+        // them rather than restating their text, for the same reason that one
+        // does: a test that restates the strings is a second copy of them.
+        let mut seen = 0;
+        for (label, arrival) in arrival_shapes() {
+            if let Some(factor) = arrival.limiting_factor() {
+                seen += 1;
+                assert!(
+                    !factor.contains(crate::verdict::CLAUSE_SEPARATOR),
+                    "{label}: limiting_factor carries the clause separator, so any reader that \
+                     splits the rendered factor cuts it into a labelled clause and an unlabelled \
+                     fragment: {factor}"
+                );
+            }
+            if let Some(gap) = arrival_gap(&json!({ CALLER_ARRIVAL_KEY: arrival.to_json() })) {
+                seen += 1;
+                assert!(
+                    !gap.contains(crate::verdict::CLAUSE_SEPARATOR),
+                    "{label}: arrival_gap carries the clause separator: {gap}"
+                );
+            }
+        }
+        assert!(
+            seen > 0,
+            "no factor was produced by any shape, so this asserted nothing"
+        );
+    }
+
+    /// Every shape whose factor a reader can end up splitting, including the
+    /// multi-file ones, which are the only ones that join anything at all and so
+    /// the only ones that can carry a separator.
+    fn arrival_shapes() -> Vec<(&'static str, CallerArrival)> {
+        let one = UnaccountedFile {
+            file: "tests/test_storage.py".to_string(),
+            parsed_call_sites: Some(3),
+            resolved_call_edges: 2,
+            unaccounted_call_sites: Some(1),
+        };
+        let withheld = UnaccountedFile {
+            file: "tests/test_linkgraph.py".to_string(),
+            parsed_call_sites: None,
+            resolved_call_edges: 4,
+            unaccounted_call_sites: None,
+        };
+        let many: Vec<UnaccountedFile> = (0..8)
+            .map(|index| UnaccountedFile {
+                file: format!("tests/test_{index}.py"),
+                parsed_call_sites: Some(index + 2),
+                resolved_call_edges: 1,
+                unaccounted_call_sites: Some(index + 1),
+            })
+            .collect();
+        let build = |unaccounted: Vec<UnaccountedFile>| CallerArrival {
+            state: ArrivalState::Unaccounted,
+            family_files: unaccounted.len().max(1),
+            family_measured: 0,
+            unaccounted,
+            unmeasured_reason: None,
+        };
+        vec![
+            ("one shortfall file", build(vec![one.clone()])),
+            ("one withheld-count file", build(vec![withheld.clone()])),
+            ("both kinds joined", build(vec![one, withheld])),
+            ("more files than the factor names", build(many)),
+            (
+                "unmeasured",
+                CallerArrival::unmeasured(
+                    "this language links no imports across files in this graph",
+                ),
+            ),
+        ]
     }
 
     #[test]
