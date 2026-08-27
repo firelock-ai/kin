@@ -36,6 +36,11 @@ use crate::repository_transfer_negotiation::RepositoryTransferTransport;
 pub const REPOSITORY_TRANSFER_HTTP_BODY_LIMIT: usize =
     http_body_limit_for(crate::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES);
 
+/// Error prose is diagnostic, not a second transfer envelope. Bound it
+/// separately so a refusing peer cannot make the client allocate the normal
+/// pack ceiling merely to explain one status code.
+const REPOSITORY_TRANSFER_HTTP_ERROR_BODY_LIMIT: usize = 64 * 1024;
+
 /// Room for everything in a pack envelope that is not a body.
 ///
 /// Changes, trees, external-object records, aliases, refs, roots and the JSON
@@ -90,10 +95,14 @@ impl std::fmt::Debug for RepositoryTransferEndpoint {
 
 impl RepositoryTransferEndpoint {
     pub fn new(base_url: impl Into<String>) -> Self {
+        let timeout_secs = std::env::var("KIN_REMOTE_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth_token: None,
-            timeout_secs: 120,
+            timeout_secs,
         }
     }
 
@@ -128,6 +137,11 @@ impl HttpRepositoryTransferTransport {
     pub fn new(endpoint: RepositoryTransferEndpoint) -> Self {
         let agent: Agent = Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(endpoint.timeout_secs)))
+            // A repository-v6 refusal carries the violated invariant in its
+            // response body. Keep the response available so this layer can
+            // preserve that reason while mapping the status to the right
+            // transfer error class.
+            .http_status_as_error(false)
             .build()
             .into();
         Self { endpoint, agent }
@@ -158,7 +172,7 @@ impl HttpRepositoryTransferTransport {
         let response = request
             .call()
             .map_err(|error| peer_error(error, what, repository_id))?;
-        read_json(response, what)
+        read_json(response, what, repository_id)
     }
 
     fn post_json<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -175,14 +189,37 @@ impl HttpRepositoryTransferTransport {
         let response = request
             .send_json(body)
             .map_err(|error| peer_error(error, what, repository_id))?;
-        read_json(response, what)
+        read_json(response, what, repository_id)
     }
 }
 
 fn read_json<R: serde::de::DeserializeOwned>(
     response: ureq::http::Response<ureq::Body>,
     what: &str,
+    repository_id: &RepositoryId,
 ) -> Result<R> {
+    let status = response.status().as_u16();
+    if !(200..300).contains(&status) {
+        let body = response
+            .into_body()
+            .into_with_config()
+            .limit(REPOSITORY_TRANSFER_HTTP_ERROR_BODY_LIMIT as u64 + 1)
+            .read_to_string();
+        return Err(match body {
+            Ok(body) => peer_status_error(status, &body, what, repository_id),
+            Err(ureq::Error::BodyExceedsLimit(_)) => peer_status_error(
+                status,
+                &format!(
+                    "response body exceeds the {REPOSITORY_TRANSFER_HTTP_ERROR_BODY_LIMIT} byte diagnostic limit"
+                ),
+                what,
+                repository_id,
+            ),
+            Err(error) => RepositoryTransferError::Storage(format!(
+                "failed to read remote {what} refusal body (HTTP {status}): {error}"
+            )),
+        });
+    }
     let body = response
         .into_body()
         .into_with_config()
@@ -229,38 +266,58 @@ fn body_error(error: ureq::Error, what: &str) -> RepositoryTransferError {
 /// team usage, and "this repository" gives the caller nothing to compare their
 /// spelling against. Every other class is the peer refusing on the state of a
 /// repository it does serve, where the id is not what the caller would correct.
+fn peer_status_error(
+    code: u16,
+    body: &str,
+    what: &str,
+    repository_id: &RepositoryId,
+) -> RepositoryTransferError {
+    let detail = body.trim();
+    let with_detail = |message: String| {
+        if detail.is_empty() {
+            message
+        } else {
+            format!("{message}: {detail}")
+        }
+    };
+    match code {
+        409 => RepositoryTransferError::Conflict(with_detail(format!(
+            "remote refused {what} with a repository-v6 conflict (HTTP 409)"
+        ))),
+        422 => RepositoryTransferError::Invalid(with_detail(format!(
+            "remote rejected {what} as an invalid repository-v6 envelope (HTTP 422)"
+        ))),
+        424 => RepositoryTransferError::Storage(with_detail(format!(
+            "remote {what} failed on storage (HTTP 424)"
+        ))),
+        404 => RepositoryTransferError::Invalid(with_detail(format!(
+            "remote does not serve {what} for repository {:?} (HTTP 404); check the \
+             repository id, or that the peer serves it",
+            repository_id.as_str()
+        ))),
+        // The peer is intact and answered; the envelope is too large for
+        // the bound both sides declare. That is the same refusal the
+        // client raises on an oversized body it reads, not a peer failure.
+        413 => RepositoryTransferError::Invalid(with_detail(format!(
+            "remote refused {what} as larger than the \
+             {REPOSITORY_TRANSFER_HTTP_BODY_LIMIT} byte repository-v6 transfer body limit (HTTP 413)"
+        ))),
+        other => RepositoryTransferError::Storage(with_detail(format!(
+            "remote {what} failed with HTTP {other}"
+        ))),
+    }
+}
+
 fn peer_error(
     error: ureq::Error,
     what: &str,
     repository_id: &RepositoryId,
 ) -> RepositoryTransferError {
     match error {
-        ureq::Error::StatusCode(code) => match code {
-            409 => RepositoryTransferError::Conflict(format!(
-                "remote refused {what} with a repository-v6 conflict (HTTP 409)"
-            )),
-            422 => RepositoryTransferError::Invalid(format!(
-                "remote rejected {what} as an invalid repository-v6 envelope (HTTP 422)"
-            )),
-            424 => RepositoryTransferError::Storage(format!(
-                "remote {what} failed on storage (HTTP 424)"
-            )),
-            404 => RepositoryTransferError::Invalid(format!(
-                "remote does not serve {what} for repository {:?} (HTTP 404); check the \
-                 repository id, or that the peer serves it",
-                repository_id.as_str()
-            )),
-            // The peer is intact and answered; the envelope is too large for
-            // the bound both sides declare. That is the same refusal the
-            // client raises on an oversized body it reads, not a peer failure.
-            413 => RepositoryTransferError::Invalid(format!(
-                "remote refused {what} as larger than the \
-                 {REPOSITORY_TRANSFER_HTTP_BODY_LIMIT} byte repository-v6 transfer body limit (HTTP 413)"
-            )),
-            other => {
-                RepositoryTransferError::Storage(format!("remote {what} failed with HTTP {other}"))
-            }
-        },
+        // Defensive fallback for an Agent supplied by a future constructor
+        // that restores status-as-error. The standard constructor above keeps
+        // the body and routes statuses through `read_json`.
+        ureq::Error::StatusCode(code) => peer_status_error(code, "", what, repository_id),
         other => {
             RepositoryTransferError::Storage(format!("remote {what} transport failed: {other}"))
         }
@@ -332,15 +389,19 @@ mod tests {
         HttpRepositoryTransferTransport::new(RepositoryTransferEndpoint::new(base_url))
     }
 
-    fn json_response(payload: String) -> ureq::http::Response<ureq::Body> {
+    fn response(status: u16, payload: String) -> ureq::http::Response<ureq::Body> {
         ureq::http::Response::builder()
-            .status(200)
+            .status(status)
             .body(
                 ureq::Body::builder()
                     .mime_type("application/json")
                     .data(payload),
             )
             .unwrap()
+    }
+
+    fn json_response(payload: String) -> ureq::http::Response<ureq::Body> {
+        response(200, payload)
     }
 
     #[test]
@@ -373,25 +434,43 @@ mod tests {
     fn peer_status_codes_keep_their_refusal_class() {
         let asked_for = asked_for();
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(409), "transfer receive", &asked_for),
+            peer_status_error(409, "", "transfer receive", &asked_for),
             RepositoryTransferError::Conflict(_)
         ));
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(422), "transfer receive", &asked_for),
+            peer_status_error(422, "", "transfer receive", &asked_for),
             RepositoryTransferError::Invalid(_)
         ));
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(424), "transfer receive", &asked_for),
+            peer_status_error(424, "", "transfer receive", &asked_for),
             RepositoryTransferError::Storage(_)
         ));
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(413), "transfer receive", &asked_for),
+            peer_status_error(413, "", "transfer receive", &asked_for),
             RepositoryTransferError::Invalid(_)
         ));
         assert!(matches!(
-            peer_error(ureq::Error::StatusCode(500), "transfer receive", &asked_for),
+            peer_status_error(500, "", "transfer receive", &asked_for),
             RepositoryTransferError::Storage(_)
         ));
+    }
+
+    #[test]
+    fn peer_refusal_preserves_the_receivers_exact_reason() {
+        let reason = "invalid repository transfer: transfer identity declared recomputes to actual";
+        let error = read_json::<serde_json::Value>(
+            response(422, reason.to_string()),
+            "transfer receive",
+            &asked_for(),
+        )
+        .expect_err("the receiver refused the pack");
+        let RepositoryTransferError::Invalid(message) = error else {
+            panic!("an HTTP 422 is an invalid envelope, not a storage failure");
+        };
+        assert!(
+            message.contains(reason),
+            "the caller must see the invariant the receiver named: {message}"
+        );
     }
 
     #[test]
@@ -407,7 +486,7 @@ mod tests {
             "transfer export",
             "transfer receive",
         ] {
-            let error = peer_error(ureq::Error::StatusCode(404), what, &asked_for);
+            let error = peer_status_error(404, "", what, &asked_for);
             let RepositoryTransferError::Invalid(message) = error else {
                 panic!("a repository the peer does not serve is not a storage failure");
             };
@@ -432,7 +511,8 @@ mod tests {
         assert!(payload.len() > 10 * 1024 * 1024);
 
         let value: serde_json::Value =
-            read_json(json_response(payload), "transfer export").expect("a body under the bound");
+            read_json(json_response(payload), "transfer export", &asked_for())
+                .expect("a body under the bound");
         assert_eq!(value["value"].as_str().unwrap().len(), 11 * 1024 * 1024);
     }
 
@@ -471,13 +551,15 @@ mod tests {
         let payload = format!(r#"{{"value":"{}"}}"#, "a".repeat(filler));
         assert_eq!(payload.len(), REPOSITORY_TRANSFER_HTTP_BODY_LIMIT);
         let value: serde_json::Value =
-            read_json(json_response(payload), "transfer export").expect("a body at the bound");
+            read_json(json_response(payload), "transfer export", &asked_for())
+                .expect("a body at the bound");
         assert_eq!(value["value"].as_str().unwrap().len(), filler);
 
         let payload = format!(r#"{{"value":"{}"}}"#, "a".repeat(filler + 1));
         assert_eq!(payload.len(), REPOSITORY_TRANSFER_HTTP_BODY_LIMIT + 1);
-        let error = read_json::<serde_json::Value>(json_response(payload), "transfer export")
-            .expect_err("a body one byte past the bound is refused");
+        let error =
+            read_json::<serde_json::Value>(json_response(payload), "transfer export", &asked_for())
+                .expect_err("a body one byte past the bound is refused");
         let RepositoryTransferError::Invalid(message) = error else {
             panic!("a local read bound is not a remote storage failure");
         };
