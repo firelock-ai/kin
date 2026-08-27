@@ -2212,8 +2212,14 @@ The Kin MCP server exposes 2 semantic tools to AI assistants.
             list.tools.iter().map(|t| t.name.as_str()).collect();
         let profile = agent_default_tool_names();
 
+        // The ceiling is a budget, not a fact about the current list, and it is
+        // raised deliberately rather than tracking whatever the list happens to
+        // hold. Every tool here costs its schema in every session on every
+        // client, which is the whole reason this profile exists. It went to 21
+        // for `bulk_check_references` (FIR-2825), which the profile's own
+        // `find_references` description already told callers to use.
         assert!(
-            profile.len() >= 10 && profile.len() <= 20,
+            profile.len() >= 10 && profile.len() <= 21,
             "agent-default should be small but cover the wedge; got {}",
             profile.len()
         );
