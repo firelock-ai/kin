@@ -2303,6 +2303,27 @@ pub trait StorageBackend: Send + Sync {
             }))
     }
 
+    /// Load the exact CAS cursor identifying the currently committed snapshot
+    /// authority.
+    ///
+    /// Cursor equality is sufficient to prove that a previously validated
+    /// recovered graph and repository envelope are still current: every
+    /// mutation that changes that recovered authority must allocate a new
+    /// backend generation. The probe must also preserve
+    /// every fail-closed condition of a coherent recovery read, including an
+    /// unbound journal that would make a full open refuse the repository.
+    /// Backends should override this with metadata-only reads when they can.
+    /// The default remains correct for simple and test backends by fully
+    /// recovering the authority and dropping the reconstructed graph.
+    ///
+    /// `Ok(None)` is an authoritative absence. Probe failures must be returned
+    /// as errors so a caller never serves cached authority after losing the
+    /// ability to establish its publication identity.
+    fn load_snapshot_cursor(&self, repo_id: &str) -> Result<Option<SnapshotCursor>, KinDbError> {
+        Ok(load_recovered_snapshot(self, repo_id)?
+            .map(|recovered| SnapshotCursor::from_backend_generation(recovered.generation)))
+    }
+
     /// Persist a full snapshot, optionally binding a durable record that these
     /// exact bytes already passed complete open-time validation.
     ///
@@ -8421,6 +8442,32 @@ mod tests {
         fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
             unreachable!("the coherent recovery fixture is read-only")
         }
+    }
+
+    #[test]
+    fn default_snapshot_cursor_probe_uses_the_coherent_recovery_read() {
+        let backend = RecoveryFixtureBackend {
+            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap(),
+            snapshot_generation: 9,
+            head_generation: 9,
+            deltas: Vec::new(),
+        };
+
+        assert_eq!(
+            backend.load_snapshot_cursor("coherent-cursor").unwrap(),
+            Some(SnapshotCursor::from_backend_generation(9))
+        );
+
+        let malformed = RecoveryFixtureBackend {
+            snapshot_bytes: GraphSnapshot::empty().to_bytes().unwrap(),
+            snapshot_generation: 7,
+            head_generation: 9,
+            deltas: Vec::new(),
+        };
+        assert!(
+            malformed.load_snapshot_cursor("broken-cursor").is_err(),
+            "the default probe must preserve full recovery validation errors"
+        );
     }
 
     fn recovered_payload_stats<B: StorageBackend + ?Sized>(

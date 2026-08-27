@@ -395,6 +395,29 @@ impl GcsBackend {
 }
 
 impl StorageBackend for GcsBackend {
+    fn load_snapshot_cursor(&self, repo_id: &str) -> Result<Option<SnapshotCursor>, KinDbError> {
+        let deltas = self.list_delta_objects(repo_id)?;
+        if !deltas.is_empty() {
+            return Err(KinDbError::StorageError(format!(
+                "GCS repo {repo_id} has {} unbound delta objects outside current authority",
+                deltas.len()
+            )));
+        }
+        let path = self.snapshot_path(repo_id);
+        let metadata = match self.block_on(self.store.head(&path)) {
+            Ok(metadata) => metadata,
+            Err(object_store::Error::NotFound { .. }) => return Ok(None),
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS snapshot metadata load failed for {path}: {error}"
+                )))
+            }
+        };
+        let generation =
+            Self::numeric_version(metadata.version.as_deref(), &format!("snapshot {path}"))?;
+        Ok(Some(SnapshotCursor::from_backend_generation(generation)))
+    }
+
     fn load_snapshot(&self, repo_id: &str) -> Result<Option<(Vec<u8>, Generation)>, KinDbError> {
         Ok(self
             .load_snapshot_authority(repo_id)?
@@ -1185,6 +1208,13 @@ pub(crate) mod tests {
         assert!(load_error
             .to_string()
             .contains("missing object meta.version"));
+
+        let cursor_error = backend
+            .load_snapshot_cursor("test-repo")
+            .expect_err("cursor probes must reject ETag-only authority too");
+        assert!(cursor_error
+            .to_string()
+            .contains("missing object meta.version"));
     }
 
     #[test]
@@ -1492,6 +1522,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gcs_snapshot_cursor_probe_is_metadata_only_and_tracks_publication() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
+        let repo_id = "gcs-cursor-probe";
+
+        assert_eq!(backend.load_snapshot_cursor(repo_id).unwrap(), None);
+        assert_eq!(store.body_get_count(), 0);
+
+        let base = GraphSnapshot::empty().to_bytes().unwrap();
+        let first = backend
+            .save_snapshot(repo_id, &base, GENERATION_INIT)
+            .unwrap();
+        assert_eq!(
+            backend.load_snapshot_cursor(repo_id).unwrap(),
+            Some(SnapshotCursor::from_backend_generation(first))
+        );
+        assert_eq!(
+            store.body_get_count(),
+            0,
+            "a publication identity probe must not download snapshot bytes"
+        );
+
+        let mut successor = GraphSnapshot::empty();
+        successor.admit_artifact_for_test(
+            "cursor.txt".to_string(),
+            crate::types::regular_tree_entry(1),
+        );
+        let second = backend
+            .save_snapshot(repo_id, &successor.to_bytes().unwrap(), first)
+            .unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            backend.load_snapshot_cursor(repo_id).unwrap(),
+            Some(SnapshotCursor::from_backend_generation(second))
+        );
+        assert_eq!(
+            store.body_get_count(),
+            0,
+            "the changed publication must still be detected by metadata alone"
+        );
+    }
+
+    #[test]
     fn gcs_versioned_fixture_fails_closed_on_post_authority_unbound_journal() {
         let store = Arc::new(VersionedMemoryStore::new());
         let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "fixture");
@@ -1514,6 +1587,14 @@ pub(crate) mod tests {
         let recovery_error = crate::storage::backend::load_recovered_snapshot(&backend, repo_id)
             .expect_err("post-authority unbound journal must fail closed");
         assert!(recovery_error.to_string().contains("unbound delta"));
+        assert!(
+            backend
+                .load_snapshot_cursor(repo_id)
+                .expect_err("a metadata-only cursor probe must preserve the same refusal")
+                .to_string()
+                .contains("unbound delta"),
+            "a cache probe must never hide state that makes a full open fail closed"
+        );
         backend
             .clear_deltas(repo_id)
             .expect_err("unbound journal must not be silently deleted");
@@ -1593,6 +1674,10 @@ pub(crate) mod tests {
         let gen1 = backend
             .save_snapshot(repo, &bytes, GENERATION_INIT)
             .expect("first save (Create) should succeed");
+        assert_eq!(
+            backend.load_snapshot_cursor(repo).unwrap(),
+            Some(SnapshotCursor::from_backend_generation(gen1))
+        );
         let stale_gen = stale.load_snapshot(repo).unwrap().unwrap().1;
         assert_eq!(stale_gen, gen1);
 
@@ -1604,6 +1689,10 @@ pub(crate) mod tests {
         let gen2 = backend
             .save_snapshot(repo, &current.to_bytes().unwrap(), gen1)
             .expect("second save (conditional Update) must succeed against real GCS");
+        assert_eq!(
+            backend.load_snapshot_cursor(repo).unwrap(),
+            Some(SnapshotCursor::from_backend_generation(gen2))
+        );
         stale
             .save_snapshot(repo, &bytes, stale_gen)
             .expect_err("stale real-GCS writer must fail its generation precondition");
@@ -1613,6 +1702,10 @@ pub(crate) mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(recovered.generation, gen2);
+        assert_eq!(
+            reopened.load_snapshot_cursor(repo).unwrap(),
+            Some(SnapshotCursor::from_backend_generation(gen2))
+        );
         assert_eq!(recovered.snapshot.resolved_tree, current.resolved_tree);
 
         eprintln!(
