@@ -550,6 +550,12 @@ enum Command {
         /// Max relations expanded per step (default 5, capped at 25).
         #[arg(long = "limit-per-step", value_name = "M")]
         limit_per_step: Option<usize>,
+        /// A symbol you are trying to reach. Neighbors from which it is still
+        /// reachable inside the requested depth survive the per-step cap ahead
+        /// of ones that are not, so the question decides what a narrow walk
+        /// keeps instead of proximity deciding it.
+        #[arg(long = "target", value_name = "ENTITY")]
+        target: Option<String>,
         /// Return the chain's shape — names, kinds, roles, spans, edges —
         /// without inlining any source body.
         #[arg(long = "no-bodies", default_value_t = false)]
@@ -3137,6 +3143,7 @@ fn main() -> Result<()> {
                     depth,
                     direction,
                     limit_per_step,
+                    target,
                     no_bodies,
                     max_response_chars,
                     include_type_edges,
@@ -3149,6 +3156,7 @@ fn main() -> Result<()> {
                         no_bodies.then_some(false),
                         max_response_chars,
                         include_type_edges.then_some(true),
+                        target,
                     )
                     .await
                 }

@@ -193,6 +193,19 @@ jobs:
       - name: Falsify the first-query readiness graders
         run: python3 scripts/acceptance/first_query_readiness_repro.py --self-test
 
+      # FIR-2781. The v0.6.0 stranger walked Session.send with limit_per_step 4
+      # and got a chain that stops two hops short of where verify goes: the cap
+      # discarded eleven of fifteen callees, HTTPAdapter.send among them, and
+      # ranked them by a same-file proximity term no question is an input to.
+      # The class is not that a hop was dropped, a cap has to drop something. It
+      # is that a chain missing its point reads exactly like a complete one,
+      # because "treat this as a lower bound" is the label a complete walk
+      # carries too. Each grader is handed the payload it must refuse, including
+      # a walk that counts the clip and never says it, and a walk that writes the
+      # spine key as zero rather than omitting it.
+      - name: Falsify the trace spine-clipping graders
+        run: python3 scripts/acceptance/trace_spine_clipping_repro.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 

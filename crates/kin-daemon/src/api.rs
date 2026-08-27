@@ -9392,6 +9392,11 @@ async fn mcp_tools_call_inner(
             .arguments
             .get("include_type_edges")
             .and_then(serde_json::Value::as_bool);
+        let target = request
+            .arguments
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
         let req = kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
             focal,
             depth,
@@ -9400,6 +9405,7 @@ async fn mcp_tools_call_inner(
             include_body,
             max_response_chars,
             include_type_edges,
+            target,
         };
         let repository_authority = match require_mcp_command_repository_authority(&state) {
             Ok(authority) => authority,

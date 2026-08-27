@@ -313,6 +313,21 @@ pub struct TraceDataFlowRequest {
     /// steps, to stay inside it, and says so in `degradations`.
     #[serde(default)]
     pub max_response_chars: Option<usize>,
+    /// A symbol the caller is trying to reach, and the only way the question
+    /// itself gets a vote on which hops survive.
+    ///
+    /// Without one, the per-step cap orders neighbors by proximity terms no
+    /// question is an input to, so on a wide node it discards by a rule
+    /// unrelated to what was asked. With one, every candidate from which the
+    /// target is still reachable inside the requested depth sorts ahead of
+    /// every candidate that is not, before the cap cuts anything.
+    ///
+    /// It changes only which neighbors survive the cap. No edge is invented,
+    /// no edge is hidden, and a walk whose target resolves to nothing is a walk
+    /// with a disclosure on it rather than an error, because the chain is still
+    /// the chain.
+    #[serde(default)]
+    pub target: Option<String>,
     /// Walk THROUGH a type-annotation edge to a type this repository defines
     /// (default false). A dataclass field typed with a repo class is a real
     /// flow into that class, so the hop is available; it is off by default
@@ -450,6 +465,23 @@ pub struct TraceFanoutClip {
     pub entity_name: String,
     pub dropped_callees: usize,
     pub dropped_callers: usize,
+    /// How many of the dropped neighbors lived outside this node's own file.
+    ///
+    /// The class of hop, not just the count. A node that dropped eleven
+    /// same-file callees lost breadth; a node that dropped the only hops that
+    /// leave its module lost the kind of edge a data-flow question is about,
+    /// and a single `dropped` number cannot tell those apart.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub dropped_crossing_file: usize,
+    /// Whether the walk went on beneath this node, so the chain reads as a
+    /// path that continues while a sibling branch was discarded.
+    ///
+    /// This is the shape that produced a wrong answer: a clip at a leaf costs
+    /// breadth the caller can see is missing, while a clip on the spine hands
+    /// back a chain that looks like a complete route and is one of several.
+    /// A reader deciding whether "X never reaches Y" is safe reads this.
+    #[serde(default)]
+    pub continued_below: bool,
     /// The cap that did the clipping, so the remedy is a number the caller can
     /// raise rather than a guess.
     pub limit_per_step: usize,
@@ -505,11 +537,29 @@ pub struct TraceDataFlowResponse {
     /// `response_budget` degradation report the cut. Steps dropped to fit the
     /// budget DO set it, because those are edges the caller did not receive.
     pub truncated: bool,
+    /// The target this walk ranked toward, echoed so a caller can see the
+    /// question was received. Null when none was named, and null when the one
+    /// that was named resolved to nothing, which the degradations say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_name: Option<String>,
     /// Every node whose fan-out the per-step cap clipped, with the count it
     /// dropped. Empty — and omitted — for a walk that expanded every neighbor it
     /// reached.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clipped_steps: Vec<TraceFanoutClip>,
+    /// How many clipped nodes the walk went on beneath, so a reader has the
+    /// one number that decides whether an absence in this chain means anything.
+    ///
+    /// Zero — and omitted — when no clip sits on the surviving chain's spine,
+    /// which is the only case where a hop this chain does not contain is a hop
+    /// the walk actually looked for and did not find.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spine_clipped_steps: usize,
+    /// How many neighbors the spine clips dropped that lived outside their
+    /// node's own file: the count of module-crossing hops this chain was never
+    /// offered. Zero — and omitted — when clipping cost only same-file breadth.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub spine_dropped_crossing_file: usize,
     /// Step bodies the response budget dropped, and steps it dropped after that.
     /// Both zero — and omitted — for a response that fit as built.
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -642,6 +692,7 @@ pub async fn run_seeded(
     include_body: Option<bool>,
     max_response_chars: Option<usize>,
     include_type_edges: Option<bool>,
+    target: Option<String>,
 ) -> Result<()> {
     let direction = match direction {
         Some(value) => Some(TraceDirection::parse(&value)?),
@@ -655,6 +706,7 @@ pub async fn run_seeded(
         include_body,
         max_response_chars,
         include_type_edges,
+        target,
     };
     let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_trace_data_flow(&layout, &request).await?;
@@ -790,6 +842,56 @@ pub fn build_trace_data_flow_response_within(
         .copied()
         .chain(std::iter::once(RelationKind::UsesType))
         .collect();
+
+    // The question, resolved once and consulted per candidate.
+    //
+    // A target that resolves to nothing is disclosed rather than fatal: the
+    // chain the caller asked for is still the chain, and failing the call would
+    // turn a typo in an optional hint into no answer at all.
+    let mut target_name: Option<String> = None;
+    let mut reach_set: Option<HashSet<EntityId>> = None;
+    if let Some(target) = request
+        .target
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    {
+        match resolve_trace_focal(graph, target)? {
+            Some(entity) => {
+                let (set, complete) =
+                    reach_set_toward(graph, &entity, direction, depth, &allowed, &mut meter)?;
+                if !complete {
+                    record_degradation(
+                        &mut degradations,
+                        RetrievalDegradation {
+                            component: "target_reachability".to_string(),
+                            reason: "reachability_bounded".to_string(),
+                            detail: format!(
+                                "the reverse walk from '{}' hit a work ceiling before it finished,                                  so some neighbors that do reach it were not recognized and                                  ranked as though they do not",
+                                entity.name
+                            ),
+                            remediation: "narrow the walk with a smaller depth, or name a target                                           closer to the focal"
+                                .to_string(),
+                        },
+                    );
+                }
+                target_name = Some(entity.name.clone());
+                reach_set = Some(set);
+            }
+            None => record_degradation(
+                &mut degradations,
+                RetrievalDegradation {
+                    component: "target_reachability".to_string(),
+                    reason: "target_not_resolved".to_string(),
+                    detail: format!(
+                        "no entity matches target '{target}', so this walk ranked its fan-out by                          relevance alone and the question had no vote in what the cap kept"
+                    ),
+                    remediation: "check the target's spelling, or find it first with                                   semantic_locate"
+                        .to_string(),
+                },
+            ),
+        }
+    }
 
     let mut chain: Vec<TraceStep> = Vec::new();
     let mut visited: HashSet<EntityId> = HashSet::new();
@@ -964,7 +1066,10 @@ pub fn build_trace_data_flow_response_within(
                         };
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
+                        let reaches_target =
+                            reach_set.as_ref().is_some_and(|set| set.contains(&next_id));
                         candidates.push(FanoutCandidate {
+                            reaches_target,
                             call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
                                 rel,
                             )),
@@ -997,10 +1102,10 @@ pub fn build_trace_data_flow_response_within(
                 candidates.into_iter().partition(|c| c.role == "callee");
             sort_by_relevance(&mut callees, &node);
             sort_by_relevance(&mut callers, &node);
-            let dropped_callees = callees.len().saturating_sub(limit_per_step);
-            let dropped_callers = callers.len().saturating_sub(limit_per_step);
-            callees.truncate(limit_per_step);
-            callers.truncate(limit_per_step);
+            let (dropped_callees, crossing_callees) =
+                apply_fanout_cap(&mut callees, node.file.as_deref(), limit_per_step);
+            let (dropped_callers, crossing_callers) =
+                apply_fanout_cap(&mut callers, node.file.as_deref(), limit_per_step);
 
             // Localize the cut on the node it happened at. A single top-level
             // flag names no node, so a caller cannot tell a complete step from a
@@ -1028,6 +1133,8 @@ pub fn build_trace_data_flow_response_within(
                     entity_name,
                     dropped_callees,
                     dropped_callers,
+                    dropped_crossing_file: crossing_callees + crossing_callers,
+                    continued_below: false,
                     limit_per_step,
                 });
             }
@@ -1175,7 +1282,10 @@ pub fn build_trace_data_flow_response_within(
         total_steps: chain.len(),
         chain,
         truncated,
+        target_name,
         clipped_steps,
+        spine_clipped_steps: 0,
+        spine_dropped_crossing_file: 0,
         bodies_omitted: 0,
         steps_omitted: 0,
         fanout_narrowed: 0,
@@ -1205,7 +1315,187 @@ pub fn build_trace_data_flow_response_within(
     enforce_response_budget(&mut response);
     record_unproven_steps(&mut response);
     record_terminal_steps(&mut response);
+    // After the budget, because a clip is on the spine only if the walk beneath
+    // it is in the response the caller receives. A branch the budget removed
+    // took its own evidence of continuation with it.
+    record_spine_clipping(&mut response);
     Ok(response)
+}
+
+/// Mark the clips the chain continued beneath, and count them once at the top.
+///
+/// The distinction is the whole point of the field. A clip at the end of a
+/// branch costs breadth a reader can see missing; a clip the walk went on
+/// beneath hands back a route that reads like the route, while the neighbors it
+/// dropped were never followed. Only the second makes "this chain does not
+/// contain X" mean nothing at all.
+fn record_spine_clipping(response: &mut TraceDataFlowResponse) {
+    let parents: HashSet<usize> = response.chain.iter().map(|step| step.parent_step).collect();
+    let mut spine_steps = 0usize;
+    let mut spine_crossing = 0usize;
+    for clip in &mut response.clipped_steps {
+        clip.continued_below = parents.contains(&clip.step);
+        if clip.continued_below {
+            spine_steps += 1;
+            spine_crossing += clip.dropped_crossing_file;
+        }
+    }
+    response.spine_clipped_steps = spine_steps;
+    response.spine_dropped_crossing_file = spine_crossing;
+    if spine_steps == 0 {
+        return;
+    }
+    let widest = response
+        .clipped_steps
+        .iter()
+        .filter(|clip| clip.continued_below)
+        .max_by_key(|clip| clip.dropped_callees + clip.dropped_callers);
+    let Some(widest) = widest else {
+        return;
+    };
+    let dropped = widest.dropped_callees + widest.dropped_callers;
+    let crossing = if spine_crossing > 0 {
+        format!(", {spine_crossing} of which lived outside the file of the node that offered them")
+    } else {
+        String::new()
+    };
+    record_degradation(
+        &mut response.degradations,
+        RetrievalDegradation {
+            component: "fanout_cap".to_string(),
+            reason: "spine_clipped".to_string(),
+            detail: format!(
+                "the walk continued beneath {spine_steps} node(s) whose fan-out limit_per_step                  {} had already cut, dropping {} neighbor(s) that were never followed{crossing};                  the widest was '{}', which offered {} more than the cap kept. This chain is one                  route among the ones the cap left, so a hop it does not contain was not looked                  for and its absence proves nothing",
+                widest.limit_per_step,
+                response
+                    .clipped_steps
+                    .iter()
+                    .filter(|clip| clip.continued_below)
+                    .map(|clip| clip.dropped_callees + clip.dropped_callers)
+                    .sum::<usize>(),
+                widest.entity_name,
+                dropped,
+            ),
+            remediation: format!(
+                "name the symbol you are looking for as `target` so the cap ranks toward it, or                  re-query '{}' with limit_per_step above {}",
+                widest.entity_name, widest.limit_per_step
+            ),
+        },
+    );
+}
+
+/// Entities from which `target` is reachable, walking the requested direction
+/// backwards, bounded by the same depth and the same work meter as the chain.
+///
+/// Returns the set and whether the reverse walk finished. An unfinished one is
+/// a SUBSET, so a candidate that does reach the target can be missing from it,
+/// which is why the caller discloses rather than trusts it silently.
+///
+/// The depth bound is deliberately the walk's whole depth rather than the
+/// remaining depth at each candidate, which makes the set a superset in that
+/// direction: a candidate is preferred when the target is reachable from it
+/// within `depth` hops, not only within the hops it has left. Preferring a
+/// neighbor that might reach the target costs a cap slot; missing one costs the
+/// answer.
+fn reach_set_toward(
+    graph: &kin_db::InMemoryGraph,
+    target: &Entity,
+    direction: TraceDirection,
+    depth: usize,
+    allowed: &HashSet<RelationKind>,
+    meter: &mut TraceMeter,
+) -> Result<(HashSet<EntityId>, bool)> {
+    let want_callees = matches!(direction, TraceDirection::Calls | TraceDirection::Both);
+    let want_callers = matches!(direction, TraceDirection::Callers | TraceDirection::Both);
+    let mut seen: HashSet<EntityId> = HashSet::new();
+    seen.insert(target.id);
+    let mut frontier = vec![target.id];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for node in frontier.drain(..) {
+            if meter.should_stop().is_some() {
+                return Ok((seen, false));
+            }
+            let relations = graph
+                .get_all_relations_for_entity(&node)
+                .context("read relations for target reachability")?;
+            for rel in &relations {
+                if meter.charge_edge().is_some() {
+                    return Ok((seen, false));
+                }
+                if !allowed.contains(&rel.kind) {
+                    continue;
+                }
+                let src = rel.src.as_entity();
+                let dst = match rel.dst {
+                    GraphNodeId::Entity(id) => Some(id),
+                    _ => None,
+                };
+                // One step back along whichever sense the forward walk takes:
+                // a `calls` chain reaches the target through outgoing edges, so
+                // whoever reaches it is on the incoming side.
+                let prior = if want_callees && dst == Some(node) {
+                    src
+                } else if want_callers && src == Some(node) {
+                    dst
+                } else {
+                    None
+                };
+                let Some(prior) = prior else { continue };
+                if prior != node && seen.insert(prior) {
+                    next.push(prior);
+                }
+            }
+        }
+        if next.is_empty() {
+            return Ok((seen, true));
+        }
+        frontier = next;
+    }
+    Ok((seen, true))
+}
+
+/// Apply the per-step cap to one side of a node's ranked fan-out.
+///
+/// Returns how many candidates were dropped, and how many of those lived
+/// outside the expanding node's own file. The keep rule itself is
+/// [`kin_ranking::entity_ranking::fanout_cap_keeps`], shared with the
+/// GraphStore walker in `kin_mcp` so the two cannot answer differently.
+fn apply_fanout_cap(
+    candidates: &mut Vec<FanoutCandidate>,
+    node_file: Option<&str>,
+    limit: usize,
+) -> (usize, usize) {
+    let locality: Vec<kin_ranking::entity_ranking::FanoutLocality> = candidates
+        .iter()
+        .map(|candidate| match candidate.entity.file_origin.as_ref() {
+            None => kin_ranking::entity_ranking::FanoutLocality::Unlocated,
+            Some(file) if node_file == Some(file.0.as_str()) => {
+                kin_ranking::entity_ranking::FanoutLocality::SameFile
+            }
+            Some(_) => kin_ranking::entity_ranking::FanoutLocality::OtherFile,
+        })
+        .collect();
+    let keep = kin_ranking::entity_ranking::fanout_cap_keeps(&locality, limit);
+    if keep.len() == candidates.len() {
+        return (0, 0);
+    }
+    let kept: HashSet<usize> = keep.iter().copied().collect();
+    let dropped_crossing = (0..candidates.len())
+        .filter(|index| {
+            !kept.contains(index)
+                && locality[*index] == kin_ranking::entity_ranking::FanoutLocality::OtherFile
+        })
+        .count();
+    let dropped = candidates.len() - keep.len();
+    let mut taken: Vec<FanoutCandidate> = Vec::with_capacity(keep.len());
+    for (index, candidate) in std::mem::take(candidates).into_iter().enumerate() {
+        if kept.contains(&index) {
+            taken.push(candidate);
+        }
+    }
+    *candidates = taken;
+    (dropped, dropped_crossing)
 }
 
 /// Give every node the walk did not continue through a reason, and publish the
@@ -1443,6 +1733,10 @@ struct FanoutCandidate {
     /// inverted the ordering could not tell the difference.
     call_edges: usize,
     raise_call_edges: usize,
+    /// Whether a named target is still reachable from this candidate inside the
+    /// requested depth. False for every candidate when no target was named, so
+    /// an untargeted walk orders exactly as it did before this existed.
+    reaches_target: bool,
 }
 
 impl FanoutCandidate {
@@ -1464,6 +1758,12 @@ impl FanoutCandidate {
 /// moves under the caller.
 fn sort_by_relevance(candidates: &mut [FanoutCandidate], node: &FrontierNode) {
     candidates.sort_by(|left, right| {
+        // The question first, when there is one. Every proximity term below is
+        // a guess about what the caller meant; reachability toward a named
+        // target is the one term that knows.
+        if left.reaches_target != right.reaches_target {
+            return right.reaches_target.cmp(&left.reaches_target);
+        }
         let left_score = kin_ranking::entity_ranking::trace_fanout_score(
             &left.entity,
             left.relation_kind,
@@ -1866,6 +2166,7 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            target: None,
         }
     }
 
@@ -1922,6 +2223,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap_err();
@@ -1946,6 +2248,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap_err();
@@ -1996,6 +2299,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -2054,6 +2358,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -2101,6 +2406,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -2161,6 +2467,7 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            target: None,
         }
     }
 
@@ -2349,6 +2656,7 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            target: None,
         };
 
         let uncancelled = build_trace_data_flow_response_within(
@@ -2566,6 +2874,370 @@ mod tests {
         );
     }
 
+    /// The stranger run's own fan-out, rebuilt from the tiers the linker really
+    /// stamps.
+    ///
+    /// `Session.send` in `psf/requests` offers fifteen callees. Eleven sit in
+    /// `sessions.py` and are parser-certain, because a call whose destination is
+    /// defined in the calling file is stamped 1.0. Three leave the module: two
+    /// through an explicit import (0.9), and `HTTPAdapter.send` through the
+    /// declared `BaseAdapter` return type and the override edge beneath it
+    /// (`INHERITED_METHOD_CONFIDENCE`, 0.85). One is a builtin the repository
+    /// does not define.
+    ///
+    /// The confidences are not decoration. They are what makes this fixture a
+    /// statement about the product rather than about itself: a same-file call
+    /// outranking a module-crossing one is not an accident of the fan-out order,
+    /// it is the ladder in `kin_index::resolution`, and a fixture that stamped
+    /// every edge 1.0 would have proven nothing about which term did the
+    /// clipping.
+    fn requests_send_graph() -> (InMemoryGraph, EntityId) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Session.send", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+
+        let mut edges: Vec<(Entity, f32)> = Vec::new();
+        for name in [
+            "Session.get_adapter",
+            "Session.prepare_request",
+            "SessionRedirectMixin.resolve_redirects",
+            "Session.merge_environment_settings",
+            "Session.rebuild_auth",
+            "Session.rebuild_proxies",
+            "Session.rebuild_method",
+            "Session.get_redirect_target",
+            "Session.should_strip_auth",
+            "Session.mount",
+            "Session.close",
+        ] {
+            edges.push((make_entity(name, "src/requests/sessions.py"), 1.0));
+        }
+        edges.push((
+            make_entity("extract_cookies_to_jar", "src/requests/cookies.py"),
+            0.9,
+        ));
+        edges.push((make_entity("dispatch_hook", "src/requests/hooks.py"), 0.9));
+        edges.push((
+            make_entity("HTTPAdapter.send", "src/requests/adapters.py"),
+            0.85,
+        ));
+        edges.push((make_external_entity("preferred_clock"), 0.7));
+
+        for (entity, confidence) in &edges {
+            graph.upsert_entity(entity).unwrap();
+            let mut relation = make_relation(focal_id, entity.id, RelationKind::Calls);
+            relation.confidence = *confidence;
+            graph.upsert_relation(&relation).unwrap();
+        }
+        (graph, focal_id)
+    }
+
+    /// What the stranger measured, and what it costs now.
+    ///
+    /// The premise is unchanged and still asserted: fifteen callees under a
+    /// four-wide cap drops eleven. What changed is which four survive. Every
+    /// one of them used to be in `sessions.py`, so the chain answered a
+    /// question about where a value goes without ever leaving the module the
+    /// value starts in.
+    #[test]
+    fn the_measured_fan_out_now_leaves_the_module_it_started_in() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 4),
+        )
+        .unwrap();
+
+        let kept = step_names(&response);
+        assert_eq!(
+            kept.len(),
+            4,
+            "the four-wide cap still keeps four: {kept:?}"
+        );
+        assert_eq!(
+            response.clipped_steps[0].dropped_callees, 11,
+            "and still drops eleven, because a floor is not extra breadth"
+        );
+        let crossed: Vec<&String> = kept
+            .iter()
+            .filter(|name| !name.starts_with("Session"))
+            .collect();
+        assert_eq!(
+            crossed.len(),
+            1,
+            "exactly one slot goes to a hop that leaves the file, no more: {kept:?}"
+        );
+        assert_eq!(
+            response.clipped_steps[0].dropped_crossing_file, 2,
+            "three callees live in another file, one now takes the reserved slot, \
+             so two module-crossing hops are still dropped"
+        );
+    }
+
+    /// The acceptance, first arm: name the hop and the cap keeps it.
+    ///
+    /// Same fifteen-callee node, same four-wide cap, same everything except
+    /// that the caller said what they were looking for. `HTTPAdapter.send` is
+    /// the worst-ranked hop in this fan-out by every proximity term the cap
+    /// consults, which is what makes it the right fixture: nothing but the
+    /// question can put it in the chain.
+    #[test]
+    fn naming_the_target_puts_the_asked_about_hop_in_the_chain() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let mut request = trace_request(&focal_id, 1, TraceDirection::Calls, 4);
+        request.target = Some("HTTPAdapter.send".to_string());
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+        )
+        .unwrap();
+
+        let kept = step_names(&response);
+        assert!(
+            kept.iter().any(|name| name == "HTTPAdapter.send"),
+            "the hop the caller named must survive the cap: {kept:?}"
+        );
+        assert_eq!(
+            response.target_name.as_deref(),
+            Some("HTTPAdapter.send"),
+            "and the response echoes the question it was given"
+        );
+        // The control on the control: without the target, this same walk does
+        // not contain it, so the assertion above is testing the target and not
+        // the floor that landed beside it.
+        let untargeted = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 4),
+        )
+        .unwrap();
+        assert!(
+            !step_names(&untargeted)
+                .iter()
+                .any(|name| name == "HTTPAdapter.send"),
+            "the untargeted walk must still miss it, or this check proves nothing"
+        );
+    }
+
+    /// A target that names nothing is a disclosure, not a failed call.
+    #[test]
+    fn an_unresolved_target_is_disclosed_and_the_chain_still_comes_back() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let mut request = trace_request(&focal_id, 1, TraceDirection::Calls, 4);
+        request.target = Some("HTTPAdapter.sendd".to_string());
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(response.chain.len(), 4, "the chain is still the chain");
+        assert!(response.target_name.is_none(), "nothing was ranked toward");
+        assert!(
+            response
+                .degradations
+                .iter()
+                .any(|degradation| degradation.reason == "target_not_resolved"),
+            "and the walk says the question had no vote: {:?}",
+            response.degradations
+        );
+    }
+
+    /// The acceptance, second arm: when nothing was named, say so loudly.
+    ///
+    /// The failure this exists for is not a missing hop, it is a chain that
+    /// reads like a route while eleven siblings were never followed. The
+    /// disclosure has to name the node, the parameter and the count, and it has
+    /// to say in words that an absence here proves nothing.
+    #[test]
+    fn a_clip_the_walk_continued_beneath_refuses_to_be_read_as_an_absence() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 4),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.spine_clipped_steps, 1,
+            "the focal was clipped and the chain continues beneath it"
+        );
+        assert_eq!(
+            response.spine_dropped_crossing_file, 2,
+            "two of the hops it never followed left the module"
+        );
+        assert!(
+            response.clipped_steps[0].continued_below,
+            "and the clip itself carries the distinction"
+        );
+        let disclosure = response
+            .degradations
+            .iter()
+            .find(|degradation| degradation.reason == "spine_clipped")
+            .expect("a spine clip must be disclosed");
+        assert!(
+            disclosure.detail.contains("Session.send")
+                && disclosure.detail.contains("limit_per_step"),
+            "the disclosure names the node and the parameter: {}",
+            disclosure.detail
+        );
+        assert!(
+            disclosure.detail.contains("absence proves nothing"),
+            "and says what a reader may not conclude: {}",
+            disclosure.detail
+        );
+        assert!(
+            disclosure.remediation.contains("target"),
+            "and names the lever that fixes it: {}",
+            disclosure.remediation
+        );
+    }
+
+    /// The control the acceptance asks for: a walk the cap never cut carries
+    /// none of this, so a complete answer is not qualified by machinery that
+    /// exists for incomplete ones.
+    #[test]
+    fn an_unclipped_walk_still_certifies_and_says_nothing_about_spines() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 25),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.total_steps, 15,
+            "a 25-wide cap expands all fifteen callees"
+        );
+        assert!(response.clipped_steps.is_empty());
+        assert_eq!(response.spine_clipped_steps, 0);
+        assert_eq!(response.spine_dropped_crossing_file, 0);
+        assert!(
+            !response
+                .degradations
+                .iter()
+                .any(|degradation| degradation.component == "fanout_cap"),
+            "no cap disclosure on a walk no cap cut: {:?}",
+            response.degradations
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        for absent in ["spine_clipped_steps", "spine_dropped_crossing_file"] {
+            assert!(
+                json.get(absent).is_none(),
+                "an unaffected walk must not carry {absent} at all"
+            );
+        }
+    }
+
+    /// A fan-out the size of a real one, so a change to how the cap chooses can
+    /// be timed rather than guessed at.
+    ///
+    /// Every node below the focal offers the same fifteen-wide fan-out the
+    /// measured `Session.send` did, at the same tiers, four levels deep. That is
+    /// roughly fifty thousand entities and as many edges, which is the scale at
+    /// which a per-candidate cost shows up as time instead of as noise.
+    fn deep_requests_shaped_graph(levels: usize) -> (InMemoryGraph, EntityId, String) {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("Session.send", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        graph.upsert_entity(&focal).unwrap();
+
+        let mut frontier = vec![(focal_id, 0usize)];
+        let mut serial = 0usize;
+        let mut deepest = String::new();
+        for level in 0..levels {
+            let mut next = Vec::new();
+            for (parent, _) in frontier.drain(..) {
+                for index in 0..15usize {
+                    serial += 1;
+                    let (file, confidence) = match index {
+                        0..=10 => ("src/requests/sessions.py", 1.0),
+                        11 => ("src/requests/cookies.py", 0.9),
+                        12 => ("src/requests/hooks.py", 0.9),
+                        13 => ("src/requests/adapters.py", 0.85),
+                        _ => ("src/requests/utils.py", 0.7),
+                    };
+                    let name = format!("n{level}_{serial}_{index}");
+                    let entity = make_entity(&name, file);
+                    graph.upsert_entity(&entity).unwrap();
+                    let mut relation = make_relation(parent, entity.id, RelationKind::Calls);
+                    relation.confidence = confidence;
+                    graph.upsert_relation(&relation).unwrap();
+                    if level + 1 < levels {
+                        next.push((entity.id, level + 1));
+                    } else if index == 13 {
+                        deepest = name;
+                    }
+                }
+            }
+            frontier = next;
+        }
+        (graph, focal_id, deepest)
+    }
+
+    /// Wall time of the walk itself, printed rather than asserted.
+    ///
+    /// Ignored by default because it is a measurement, not a gate: a threshold
+    /// on a shared machine fails on load rather than on the diff. Run it with
+    /// `--ignored --nocapture` on both sides of a change and read the numbers.
+    #[test]
+    #[ignore = "timing measurement: cargo test -p kin-cli --lib measure_walk_wall_time -- --ignored --nocapture"]
+    fn measure_walk_wall_time_on_a_requests_shaped_fan_out() {
+        let (graph, focal_id, target) = deep_requests_shaped_graph(4);
+        let (_t, binding) = empty_binding();
+        let authority = RequestRepositoryAuthority::pinned(binding.clone());
+
+        let mut samples = Vec::new();
+        for _ in 0..9 {
+            let request = trace_request(&focal_id, 5, TraceDirection::Calls, 4);
+            let started = std::time::Instant::now();
+            let response = build_trace_data_flow_response(&authority, &graph, &request).unwrap();
+            samples.push(started.elapsed());
+            assert!(!response.chain.is_empty());
+        }
+        samples.sort();
+        println!(
+            "WALK_MEDIAN_MS untargeted {:.3}",
+            samples[samples.len() / 2].as_secs_f64() * 1000.0
+        );
+
+        // What naming a target costs: one bounded reverse walk from it, plus a
+        // set lookup per candidate. The target is the deepest node in the
+        // fixture and it is reached through the module-crossing edge, which is
+        // the worst case for the reverse walk on this shape.
+        let mut targeted = Vec::new();
+        for _ in 0..9 {
+            let mut request = trace_request(&focal_id, 5, TraceDirection::Calls, 4);
+            request.target = Some(target.clone());
+            let started = std::time::Instant::now();
+            let response = build_trace_data_flow_response(&authority, &graph, &request).unwrap();
+            targeted.push(started.elapsed());
+            assert_eq!(response.target_name.as_deref(), Some(target.as_str()));
+        }
+        targeted.sort();
+        println!(
+            "WALK_MEDIAN_MS targeted {:.3}",
+            targeted[targeted.len() / 2].as_secs_f64() * 1000.0
+        );
+        println!("WALK_TARGET_NAME {target}");
+    }
+
     #[test]
     fn compact_mode_keeps_every_edge_and_span_while_inlining_no_body() {
         let (graph, focal_id) = redirect_graph();
@@ -2685,7 +3357,10 @@ mod tests {
             total_steps: chain.len(),
             chain,
             truncated: false,
+            target_name: None,
             clipped_steps: Vec::new(),
+            spine_clipped_steps: 0,
+            spine_dropped_crossing_file: 0,
             bodies_omitted: 0,
             steps_omitted: 0,
             fanout_narrowed: 0,
@@ -2752,6 +3427,8 @@ mod tests {
             entity_name: "step_199".to_string(),
             dropped_callees: 4,
             dropped_callers: 0,
+            dropped_crossing_file: 0,
+            continued_below: false,
             limit_per_step: 25,
         });
 
@@ -2964,6 +3641,8 @@ mod tests {
                 entity_name: format!("step_{step}"),
                 dropped_callees: 3,
                 dropped_callers: 0,
+                dropped_crossing_file: 0,
+                continued_below: false,
                 limit_per_step: 12,
             });
         }
@@ -3878,6 +4557,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -3911,6 +4591,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -3987,6 +4668,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4042,6 +4724,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4088,6 +4771,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4128,6 +4812,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4176,6 +4861,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4226,6 +4912,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
