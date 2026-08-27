@@ -39,8 +39,9 @@ file on disk, and an answer taken over a graph short of its own census must
 disclose that rather than presenting as clean. Each of the three runs its own
 control, and they share one experiment because the experiment is destructive.
 Check 22 covers FIR-2821. A function reached only through `from . import store`
-must not be listed, the one function nothing calls must be, and that row must
-carry no arrival caveat over a store where every call site became an edge. The
+must first resolve as a graph entity with the expected incoming `main` call,
+then must not be listed; the one function nothing calls must be listed under a
+confident verdict with an exactly empty label. The
 v0.6.1 stranger's scan listed eleven live functions with no caveat at all while
 hedging the one row it could resolve, and the first two arms are that finding in
 one assertion each. The gate that speaks up when the next edge kind goes missing

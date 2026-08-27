@@ -971,7 +971,6 @@ certify an enumeration of it.
 # them while the one row it could resolve carried a careful one.
 RELIMPORT_LIVE_FUNCTION = "connect"
 RELIMPORT_DEAD_FUNCTION = "orphaned_helper"
-RELIMPORT_ARRIVAL_FACTOR = "caller_arrival_unresolved"
 
 REEXPORT_BENIGN_FILE = "src/prelude.rs"
 REEXPORT_DEAD_FUNCTION = "legacy_shim"
@@ -2973,15 +2972,13 @@ def check_22(suite):
     carried none.
 
     Both halves are pinned here and each has its own control, because either
-    alone leaves a stranger deletable.
-
-    Arms 1 and 2 are the edge. `connect` is reached only through the relative
-    module import, so it must not be listed, and `orphaned_helper` is reached by
-    nothing, so it must be. Without arm 2 this check passes over a scan that
-    reports nothing at all. Arm 3 is the same row read for its label: on a
-    fixture where every call resolves, a dead row is a find rather than a
-    candidate and carries no caveat, which is what stops arm 4's gate from
-    passing by labelling everything.
+    alone leaves a stranger deletable. Before grading absence from dead-code,
+    the precondition resolves `connect` itself and its incoming `main @
+    pkg/cli.py` Calls edge. `connect` must then not be listed, and
+    `orphaned_helper` must be listed so a scan returning nothing cannot pass.
+    The clean scan must exit zero under a confident `Found` verdict, and the
+    dead row's label must be exactly empty. That exact silence stops a generic
+    refusal or a renamed arrival caveat from passing by labelling everything.
 
     Arm 1 asserts an OUTCOME and is not a falsification of the linker tier that
     produces it, which was measured rather than assumed. Reverting that tier and
@@ -2995,17 +2992,17 @@ def check_22(suite):
     exists, in `kin-index`'s `receiver_module_hop` arms and its corpus census,
     both linker-only with no daemon and no language server.
 
-    The gate's own arms are NOT here, and that is a finding rather than a
-    shortcut. The reading it keys on subtracts a file's resolved call edges from
-    the call sites the parser read there, and on a converted store the parse
-    side is not present to subtract: on this fixture's own shape `kin graph
-    status` reports the python parse side "measured on 1 of 14 files". So an
-    end-to-end arm here could only assert the absent-count branch, which fires
-    on every file and would pin the missing plumbing as correct. The gate is
-    falsified where its inputs can be set instead, in
+    The measured-gap gate's input arm is not here, and that is a finding rather
+    than a shortcut. The reading subtracts a file's resolved call edges from the
+    call sites the parser read there, and on a converted store the parse side is
+    not present to subtract: on this fixture's own shape `kin graph status`
+    reports the python parse side "measured on 1 of 14 files". So an end-to-end
+    positive-shortfall arm could only assert the absent-count branch, which
+    fires on every file and would pin the missing plumbing as correct. That arm
+    is falsified where its inputs can be set, in
     `dead_code::tests::a_row_whose_callers_could_arrive_unaccounted_says_so_on_the_row`
-    and its silent-control sibling. Arm 3 below is what this suite CAN say about
-    it end to end: over a store where nothing went missing, no row is labeled.
+    and its silent-control sibling. What this suite can say end to end is exact:
+    over a store where nothing went missing, no row is labelled.
     """
     res = Result("22", "FIR-2821",
                  "dead-code over a relative module import, and its arrival gate")
@@ -3030,7 +3027,48 @@ def check_22(suite):
                     found[match.group(2)] = (match.group(1) or "").strip()
         return scan, found
 
-    clean, listed = listed_rows(suite.fixture("relimport"))
+    repo = suite.fixture("relimport")
+
+    # Preconditions before absence. `connect` missing from the dead-code rows
+    # means something only after graph truth proves the subject exists and the
+    # expected caller reaches it through a Calls edge. Otherwise dropping the
+    # live entity during parsing satisfies the check for the wrong reason.
+    try:
+        live_refs = suite.references(
+            repo, RELIMPORT_LIVE_FUNCTION, relation_kinds=["calls"])
+    except McpError as exc:
+        res.unknown("find_references(%s) unreadable: %s"
+                    % (RELIMPORT_LIVE_FUNCTION, exc))
+        return res
+    miss = resolution_miss(live_refs, RELIMPORT_LIVE_FUNCTION)
+    if miss:
+        res.bad(miss)
+        return res
+    focal = live_refs.get("focal_entity") or {}
+    if (focal.get("name") != RELIMPORT_LIVE_FUNCTION
+            or not (focal.get("file_path") or "").endswith("pkg/store.py")):
+        res.bad("find_references(%s) resolved the wrong focal: %r"
+                % (RELIMPORT_LIVE_FUNCTION, focal))
+        return res
+    expected_callers = [
+        row for row in live_refs.get("references") or []
+        if row.get("name") == "main"
+        and (row.get("file_path") or "").endswith("pkg/cli.py")
+        and "calls" in (row.get("relation_kinds") or [])
+    ]
+    if not expected_callers:
+        res.bad("find_references(%s, calls) did not return main @ pkg/cli.py; "
+                "the live edge precondition is absent. Rows: %r"
+                % (RELIMPORT_LIVE_FUNCTION, live_refs.get("references") or []))
+        return res
+    res.ok("graph truth contains %s and its incoming main @ pkg/cli.py Calls edge"
+           % RELIMPORT_LIVE_FUNCTION)
+
+    clean, listed = listed_rows(repo)
+    if clean["rc"] != 0:
+        res.bad("kin dead-code exited %d on the clean fixture: %s"
+                % (clean["rc"], clean["raw"].strip()[-300:] or "(no output)"))
+        return res
     verdict = ""
     for line in clean["raw"].splitlines():
         stripped = line.strip()
@@ -3043,9 +3081,10 @@ def check_22(suite):
         res.unknown("kin dead-code rc=%d printed no verdict sentence this suite can read: %s"
                     % (clean["rc"], excerpt[-300:] or "(no output)"))
         return res
+    confident_verdict = verdict.startswith("Found ")
 
-    # Arm 2 first, because it is what makes arm 1 mean anything. A scan that
-    # listed nothing satisfies "connect is not listed" for the wrong reason.
+    # The dead positive control. A scan that listed nothing satisfies
+    # "connect is not listed" for the wrong reason.
     if RELIMPORT_DEAD_FUNCTION not in listed:
         res.bad("%s is called by nothing in this fixture and was not listed, so this check "
                 "would pass over a scan that reports nothing at all. Verdict: %s. Listed: %s"
@@ -3055,7 +3094,7 @@ def check_22(suite):
     res.ok("the one function nothing calls is listed (%d row(s): %s)"
            % (len(listed), ", ".join(sorted(listed))))
 
-    # Arm 1. The whole finding, in one assertion.
+    # The whole finding, after the positive graph precondition above.
     if RELIMPORT_LIVE_FUNCTION in listed:
         res.bad("%s is called from pkg/cli.py through `from . import store` and dead-code "
                 "lists it as unreferenced; a stranger acting on this row deletes a live "
@@ -3065,16 +3104,23 @@ def check_22(suite):
         res.ok("%s is reached through the relative module import and is not listed"
                % RELIMPORT_LIVE_FUNCTION)
 
-    # Arm 3. The gate must be able to stay silent, or it is a gate that never
-    # certifies and a reader learns to skip its label.
+    # The gate must be able to stay exactly silent, or it is a gate that never
+    # certifies and a reader learns to skip its label. Exact emptiness catches a
+    # generic refusal and future factor renames as well as both current arrival
+    # spellings.
     clean_label = listed[RELIMPORT_DEAD_FUNCTION]
-    if RELIMPORT_ARRIVAL_FACTOR in clean_label:
+    if clean_label:
         res.bad("the row for %s is labeled %s over a fixture where every call site became an "
-                "edge, so the arrival gate cannot certify anything and its label carries no "
+                "edge, so the clean gate cannot certify exactly and its label carries no "
                 "information" % (RELIMPORT_DEAD_FUNCTION, clean_label))
     else:
         res.ok("on a fixture with no unresolved call site the dead row carries no arrival "
                "caveat (label: %r)" % clean_label)
+    if confident_verdict:
+        res.ok("the fully resolved fixture prints a confident verdict: %s" % verdict)
+    else:
+        res.bad("the fully resolved clean fixture did not print a confident Found verdict: %s"
+                % verdict)
 
     return res
 

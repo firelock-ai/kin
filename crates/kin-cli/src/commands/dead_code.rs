@@ -23,9 +23,11 @@ pub struct DeadCodeResponse {
     pub lines: Vec<String>,
     /// Whether the graph this scan read can support an absence claim at all.
     ///
-    /// False means every row is a candidate the graph cannot stand behind, and
-    /// the rendered lines say so on each row. Defaulted so a new CLI reading an
-    /// older daemon's response does not read a missing field as a verdict.
+    /// False means at least one listed row is a candidate the graph cannot stand
+    /// behind. Each affected row carries its own rendered label so a mixed
+    /// response keeps the supported finds distinct from the candidates.
+    /// Defaulted so a new CLI reading an older daemon's response does not read a
+    /// missing field as a verdict.
     #[serde(default)]
     pub verified: bool,
     /// Why the scan could not be verified, one reason per gap, in the same words
@@ -294,18 +296,19 @@ fn build_dead_code_report(
     // eleven live functions with no caveat at all while carefully hedging the
     // one row it could resolve.
     //
-    // Only a MEASURED shortfall gates a row here, and that is narrower than the
-    // state the MCP envelope keys on, deliberately. `ArrivalState::Unaccounted`
-    // also covers a family file that carries no parse-side call count at all,
-    // and on a converted store today that is nearly every file: measured on the
-    // stranger's own corpus, `kin graph status` reports the python parse side
-    // "measured on 1 of 14 files". A row label that fires on a count the store
-    // does not hold would land on every row of every scan, which is a label a
-    // reader learns to skip and the same inversion this ticket is about, one
-    // level down. So a row is gated when some file that can reach it parsed
-    // MORE call sites than the graph holds edges for, which is a fact, and the
-    // store-wide gap stays disclosed where it already is, in the reference-edge
-    // coverage block this scan prints below.
+    // Within `ArrivalState::Unaccounted`, only a MEASURED shortfall gates a row
+    // here. That state also covers a family file carrying no parse-side call
+    // count at all, and on a converted store today that is nearly every file:
+    // measured on the stranger's corpus, `kin graph status` reports the python
+    // parse side "measured on 1 of 14 files". A row label that fires on a count
+    // the store does not hold would land on every row of every scan, which is a
+    // label a reader learns to skip. A separate `Unmeasured` state means the
+    // reading itself declined, and that gates through its own branch below
+    // because a declined walk cannot certify absence either. So the positive
+    // shortfall branch gates only when some reachable file parsed MORE call
+    // sites than the graph holds edges for, which is a fact, while the
+    // store-wide absent-count gap stays disclosed in the reference-edge coverage
+    // block this scan prints below.
     //
     // Memoized per FILE rather than per row. `observe_caller_arrival` consults
     // the focal only through its file of origin and its language, and it walks
@@ -395,7 +398,20 @@ fn build_dead_code_report(
             || method_row(entity)
             || arrival_rows.contains_key(&entity.id)
     };
-    let unverified_rows = unreferenced.iter().filter(|e| row_is_unverified(e)).count();
+    // The unreferenced heading describes only that section, while the serialized
+    // verdict describes every row the response lists. Keep those populations
+    // separate: a test-only row still claims that no production caller exists,
+    // and an unverified one cannot coexist with `verified: true` merely because
+    // it prints under the second heading.
+    let unverified_unreferenced_rows = unreferenced
+        .iter()
+        .filter(|entity| row_is_unverified(entity))
+        .count();
+    let unverified_listed_rows = unreferenced
+        .iter()
+        .chain(test_only.iter())
+        .filter(|entity| row_is_unverified(entity))
+        .count();
     let mut unverified_reasons: Vec<String> = unsupportable.values().cloned().collect();
     let name_only_rows = unreferenced
         .iter()
@@ -442,7 +458,7 @@ fn build_dead_code_report(
     // was listed for is still disclosed below, but it does not make the listed
     // rows unverified: missing edges make this scan over-report, never
     // under-report, so a row whose own language resolved is unaffected by it.
-    let verified = unverified_rows == 0;
+    let verified = unverified_listed_rows == 0;
 
     if unreferenced.is_empty() && test_only.is_empty() {
         lines.push("No dead code found.".to_string());
@@ -464,26 +480,26 @@ fn build_dead_code_report(
         ));
     } else if unreferenced.is_empty() {
         lines.push("No unreferenced entities.".to_string());
-    } else if verified {
+    } else if unverified_unreferenced_rows == 0 {
         lines.push(format!(
             "Found {} unreferenced entities:",
             unreferenced.len()
         ));
-    } else if unverified_rows == unreferenced.len() {
+    } else if unverified_unreferenced_rows == unreferenced.len() {
         lines.push(format!(
             "UNVERIFIED: {} candidates. This graph cannot support a delete list:",
             unreferenced.len()
         ));
     } else {
         lines.push(format!(
-            "Found {} unreferenced entities, {unverified_rows} of them UNVERIFIED:",
-            unreferenced.len()
+            "Found {} unreferenced entities, {unverified_unreferenced_rows} of them UNVERIFIED:",
+            unreferenced.len(),
         ));
     }
     for reason in &unverified_reasons {
         lines.push(format!("  incomplete: {reason}"));
     }
-    if unverified_rows > 0 {
+    if unverified_listed_rows > 0 {
         lines.push(
             "  An UNVERIFIED row is a candidate this graph cannot stand behind: an entity with no \
              edge here may still be used. Do not delete on this evidence."
@@ -560,9 +576,10 @@ fn build_dead_code_report(
     if !test_only.is_empty() {
         lines.push(format!("Referenced only by tests: {}", test_only.len()));
         lines.push(
-            "  Every reference to a row below comes from a test-role entity, so no production \
-             caller reaches it. These rows are not unreferenced, and deleting one deletes the \
-             subject of a passing test."
+            "  Every proven reference recorded for a row below comes from a test-role entity, \
+             so the graph currently records no production caller. A labelled row says that \
+             this absence is not authoritative. These rows are not unreferenced, and deleting \
+             one deletes the subject of a passing test."
                 .to_string(),
         );
         for e in &test_only {
@@ -1201,6 +1218,41 @@ mod tests {
         entity
     }
 
+    /// Give a synthetic language an honest cross-file import-linking witness.
+    ///
+    /// Both endpoints are dedicated Module entities, which cannot enter the
+    /// dead-code candidate set. The importer records the one import statement
+    /// its edge represents. Nothing touches a subject file, so this establishes
+    /// only the language-wide capability without accidentally taking a focal's
+    /// cheap outgoing-import control.
+    fn add_cross_file_import_witness(
+        graph: &InMemoryGraph,
+        language: LanguageId,
+        importer_file: &str,
+        imported_file: &str,
+    ) {
+        let mut importer = measured(make_entity("__importer_module", importer_file), 0, 1);
+        importer.kind = EntityKind::Module;
+        importer.language = language;
+        let mut imported = measured(make_entity("__imported_module", imported_file), 0, 0);
+        imported.kind = EntityKind::Module;
+        imported.language = language;
+        assert_ne!(
+            importer.file_origin.as_ref(),
+            imported.file_origin.as_ref(),
+            "an import-linking witness must cross a file boundary"
+        );
+        graph.upsert_entity(&importer).unwrap();
+        graph.upsert_entity(&imported).unwrap();
+        graph
+            .upsert_relation(&make_relation(
+                importer.id,
+                imported.id,
+                RelationKind::Imports,
+            ))
+            .unwrap();
+    }
+
     fn scan(graph: &InMemoryGraph) -> DeadCodeResponse {
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(graph).unwrap();
@@ -1440,6 +1492,12 @@ mod tests {
                 0.9,
             ))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            caller.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         let output = response.lines.join("\n");
@@ -1490,6 +1548,12 @@ mod tests {
                 0.9,
             ))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            caller.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         let output = response.lines.join("\n");
@@ -1717,6 +1781,12 @@ mod tests {
                 RelationKind::Implements,
             ))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            orphan.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         assert!(
@@ -1841,6 +1911,12 @@ mod tests {
                 RelationKind::Calls,
             ))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            ingest_dir.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         assert!(
@@ -1957,9 +2033,12 @@ mod tests {
             .filter(|line| line.contains(" (Function, ") || line.contains(" (Method, "))
         {
             assert!(
-                row.contains("[unverified]"),
-                "every row carries its own label, because a row read alone is what gets acted \
-                 on: {row}"
+                row.contains(&format!(
+                    "[unverified: {}]",
+                    kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+                )),
+                "every row names the arrival reading this fixture deliberately leaves \
+                 unmeasured: {row}"
             );
         }
 
@@ -2013,10 +2092,19 @@ mod tests {
         ] {
             graph.upsert_entity(entity).unwrap();
         }
-        // Rust resolves a cross-file call; python resolves nothing.
+        // Rust resolves a cross-file call and has a genuine cross-file module
+        // import witness; python resolves neither. The Module destination is not
+        // a dead-code candidate, so this changes only whether Rust arrival was
+        // measured.
         graph
             .upsert_relation(&make_relation(caller.id, called.id, RelationKind::Calls))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            caller.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         let joined = response.lines.join("\n");
@@ -2029,11 +2117,15 @@ mod tests {
             joined.contains("  retired_task ("),
             "the rust row prints plainly, because rust cross-file edges resolved: {joined}"
         );
-        assert!(
-            joined.contains("[unverified] legacy_helper (")
-                && joined.contains("[unverified] legacy_import ("),
-            "the python rows carry the label: {joined}"
-        );
+        for name in ["legacy_helper", "legacy_import"] {
+            assert!(
+                joined.contains(&format!(
+                    "[unverified: {}] {name} (",
+                    kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+                )),
+                "the python row names the arrival reading that declined: {joined}"
+            );
+        }
         assert!(
             joined.contains("4 unreferenced entities, 2 of them UNVERIFIED"),
             "the header counts both, because a mixed answer is what this is: {joined}"
@@ -2048,6 +2140,12 @@ mod tests {
         let graph = InMemoryGraph::new();
         let orphan = measured(make_entity("never_called", "nk/legacy.py"), 0, 0);
         graph.upsert_entity(&orphan).unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            orphan.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
@@ -2082,6 +2180,12 @@ mod tests {
         let orphan = measured(make_entity("never_called", "nk/legacy.py"), 0, 0);
         graph.upsert_entity(&launcher).unwrap();
         graph.upsert_entity(&orphan).unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            launcher.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
@@ -2242,6 +2346,12 @@ mod tests {
                 0.9,
             ))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            cmd_ingest.language,
+            "__fixture__/importer.py",
+            "__fixture__/imported.py",
+        );
 
         let response = scan(&graph);
         let joined = response.lines.join("\n");
@@ -2326,9 +2436,11 @@ mod tests {
         // rather than dropping it upstream.
         let mut suite = measured(make_entity("renders_a_row", "src/report.rs"), 2, 0);
         suite.role = EntityRole::Test;
-        let format_row = measured(make_entity("format_row", "src/report.rs"), 0, 0);
-        let caller = measured(make_entity("print_report", "src/report.rs"), 0, 0);
-        let render_header = measured(make_entity("render_header", "src/report.rs"), 0, 0);
+        // Parse-side counts are file facts, so every entity in report.rs carries
+        // the same two calls this fixture inserts below.
+        let format_row = measured(make_entity("format_row", "src/report.rs"), 2, 0);
+        let caller = measured(make_entity("print_report", "src/report.rs"), 2, 0);
+        let render_header = measured(make_entity("render_header", "src/report.rs"), 2, 0);
         let orphan = measured(make_entity("legacy_row", "src/legacy.rs"), 0, 0);
 
         for entity in [&suite, &format_row, &caller, &render_header, &orphan] {
@@ -2353,6 +2465,16 @@ mod tests {
                 0.9,
             ))
             .unwrap();
+        // This fixture is about the test-only bucket, not about a graph that
+        // cannot establish caller arrival. Give the language a genuine
+        // cross-file module import witness whose destination cannot enter the
+        // dead-code candidate set.
+        add_cross_file_import_witness(
+            &graph,
+            caller.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         let joined = response.lines.join("\n");
@@ -2396,8 +2518,110 @@ mod tests {
             "an entity a production caller reaches is not reported at all: {joined}"
         );
         assert!(
-            joined.contains("no production caller reaches it"),
-            "the section says what the rows mean: {joined}"
+            joined.contains("the graph currently records no production caller"),
+            "the section states the graph evidence without overclaiming it: {joined}"
+        );
+        assert!(
+            !joined.contains("so no production caller reaches it"),
+            "recorded absence is not categorical absence: {joined}"
+        );
+        assert!(
+            response.verified,
+            "a fully measured test-only row remains a supported classification: {joined}"
+        );
+        assert!(
+            response.lines.iter().any(
+                |line| line == "  format_row (Function, rust) - src/report.rs"
+            ),
+            "the clean test-only row carries no blanket unverified label: {joined}"
+        );
+        assert!(
+            !joined.contains("Do not delete on this evidence"),
+            "the clean control does not print the refusal reserved for an unverified row: \
+             {joined}"
+        );
+    }
+
+    /// A test-only row still claims that no production caller exists. If a
+    /// production file that can reach it holds unresolved calls, the serialized
+    /// verdict and safety guidance must agree with its label without relabelling
+    /// a supported find in the unreferenced section.
+    #[test]
+    fn a_test_only_arrival_gap_does_not_relabel_a_supported_find() {
+        let graph = InMemoryGraph::new();
+
+        let mut suite = measured(make_entity("renders_a_row", "src/report.rs"), 1, 0);
+        suite.role = EntityRole::Test;
+        let format_row = measured(make_entity("format_row", "src/report.rs"), 1, 0);
+        let main = measured(make_entity("main", "src/main.rs"), 2, 1);
+        let orphan = measured(make_entity("legacy_row", "src/legacy.rs"), 0, 0);
+        let mut report_module = measured(make_entity("report", "src/report.rs"), 1, 0);
+        report_module.kind = EntityKind::Module;
+
+        for entity in [&suite, &format_row, &main, &orphan, &report_module] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // The same-file test call keeps `format_row` in the test-only bucket.
+        graph
+            .upsert_relation(&make_relation(
+                suite.id,
+                format_row.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+        // The production entry point can reach report.rs, but its two parsed
+        // calls produced no Calls edge. Either missing call could target
+        // `format_row`, so the graph cannot support the section's claim that no
+        // production caller reaches it. `main` is excluded as a conventional
+        // entry point, which keeps the fixture's listed populations exact.
+        graph
+            .upsert_relation(&make_relation(
+                main.id,
+                report_module.id,
+                RelationKind::Imports,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        let joined = response.lines.join("\n");
+
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line == "Found 1 unreferenced entities:"),
+            "the plain find keeps a confident unreferenced heading of its own: {joined}"
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line == "  legacy_row (Function, rust) - src/legacy.rs"),
+            "the supported unreferenced row stays unlabelled: {joined}"
+        );
+        assert!(
+            joined.contains("Referenced only by tests: 1"),
+            "the subject remains in the test-only bucket: {joined}"
+        );
+        assert!(
+            joined.contains("the graph currently records no production caller")
+                && !joined.contains("so no production caller reaches it"),
+            "the section must not contradict the row that says a caller may be missing: {joined}"
+        );
+        assert!(
+            joined.contains(&format!(
+                "[unverified: {}] format_row (",
+                kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR
+            )),
+            "the row names its measured arrival gap: {joined}"
+        );
+        assert!(
+            !response.verified,
+            "an unverified test-only row makes the complete response unverified: {joined}"
+        );
+        assert!(
+            joined.contains("Do not delete on this evidence"),
+            "the safety guidance follows every unverified listed row: {joined}"
         );
     }
 
