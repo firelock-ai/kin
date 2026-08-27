@@ -943,6 +943,22 @@ pub fn handle_get_context_pack<G: GraphStore>(
         ),
         None => serde_json::Value::Null,
     };
+    // Whether a caller could have reached this focal through a call the linker
+    // recorded no edge for (FIR-2775), read exactly as `find_references` reads
+    // it and published under the same key.
+    //
+    // A pack's `dependents` group is built by the same collector over the same
+    // edges, so it inherits the same gap and has to report it the same way. The
+    // method gate beside this one is shared for precisely that reason: gating a
+    // shared gap on the tool name alone was how two surfaces over one graph came
+    // to answer opposite things about one entity, the tool that refused to
+    // certify and the tool that published `[]` reading the identical incomplete
+    // call graph. Adding a new gap to one surface and not the other would
+    // rebuild that disagreement from scratch.
+    let caller_arrival = match &focal_entity {
+        Some(entity) => crate::caller_arrival::observe_caller_arrival(store, entity).to_json(),
+        None => serde_json::Value::Null,
+    };
 
     // The dependency section carries both directions, so it is served as two
     // groups named for what they are. Serving it as one list called
@@ -1061,6 +1077,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         // language rather than as a bare fact. Computed by the same observer
         // `find_references` uses, from the same witnesses.
         crate::edge_coverage::EDGE_COVERAGE_KEY: edge_coverage,
+        crate::caller_arrival::CALLER_ARRIVAL_KEY: caller_arrival,
         "token_budget": budget.max_tokens(),
         "tokens_used": pack.actual_tokens,
     });

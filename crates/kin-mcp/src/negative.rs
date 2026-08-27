@@ -2217,7 +2217,13 @@ pub fn negative_for(
     // The file that called it had produced 15 entities, so the
     // file-produced-nothing warning did not apply, and no other signal in the
     // envelope could see a call site that became no edge.
-    if tool == "find_references" && claims_absence {
+    // Shared with `get_context_pack` on purpose, exactly like the method gate
+    // below. A pack's `dependents` group is built by the same collector over the
+    // same edges, so it inherits the same gap; gating this on `find_references`
+    // alone would let the tool that refuses to certify and the tool that
+    // publishes `[]` read one incomplete call graph and answer opposite things,
+    // which is the disagreement the method gate was widened to end.
+    if matches!(tool, "find_references" | "get_context_pack") && claims_absence {
         if let Some(gap) = crate::caller_arrival::arrival_gap(payload) {
             push_gap(&mut trustworthy, &mut trust_reason, gap);
         }
@@ -4124,6 +4130,76 @@ mod tests {
             },
             "edge_coverage": coverage,
         })
+    }
+
+    /// FIR-2775's two-surface arm. The gate that refuses to certify a reference
+    /// absence a dropped call could be hiding in has to reach `get_context_pack`
+    /// too, because a pack's `dependents` group is built by the same collector
+    /// over the same edges. Gating a shared gap on the tool name alone is how
+    /// two surfaces over one graph came to answer opposite things about one
+    /// entity: the tool that refused to certify and the tool that published `[]`
+    /// were reading the identical incomplete call graph.
+    ///
+    /// So this asserts the AGREEMENT rather than each end separately. One block,
+    /// both tools, one verdict, and the healthy control beside it in the same
+    /// test so a fix that floors both surfaces cannot pass either.
+    #[test]
+    fn both_reference_surfaces_reach_one_verdict_on_one_arrival_reading() {
+        let unaccounted = json!({
+            "state": "unaccounted",
+            "family_files": 1,
+            "family_measured": 0,
+            "unaccounted_file_count": 1,
+            "unaccounted_files": [{
+                "file": "tests/test_storage.py",
+                "parsed_call_sites": null,
+                "resolved_call_edges": 2,
+                "unaccounted_call_sites": null,
+            }],
+            "unaccounted_files_truncated": false,
+            "unmeasured_reason": null,
+        });
+        let accounted = json!({
+            "state": "accounted",
+            "family_files": 2,
+            "family_measured": 2,
+            "unaccounted_file_count": 0,
+            "unaccounted_files": [],
+            "unaccounted_files_truncated": false,
+            "unmeasured_reason": null,
+        });
+
+        for (block, expected, label) in [
+            (&unaccounted, false, "an unaccounted arrival"),
+            (&accounted, true, "an accounted arrival"),
+        ] {
+            let mut references = authoritative_empty_references("function");
+            references[crate::caller_arrival::CALLER_ARRIVAL_KEY] = block.clone();
+            let mut pack = empty_pack_dependents("function", cross_file_edges_observed());
+            pack[crate::caller_arrival::CALLER_ARRIVAL_KEY] = block.clone();
+
+            let from_references =
+                negative_for("find_references", &references, &structural_ready_envelope())
+                    .expect("empty references yields a negative");
+            let from_pack = negative_for("get_context_pack", &pack, &structural_ready_envelope())
+                .expect("an empty dependents group yields a negative");
+
+            assert_eq!(
+                from_references["safe_to_conclude_absent"],
+                json!(expected),
+                "{label}: find_references answered the wrong way"
+            );
+            assert_eq!(
+                from_pack["safe_to_conclude_absent"],
+                json!(expected),
+                "{label}: get_context_pack answered the wrong way"
+            );
+            assert_eq!(
+                from_references["safe_to_conclude_absent"], from_pack["safe_to_conclude_absent"],
+                "{label}: the two surfaces disagreed over one reading, which is the exact \
+                 failure this gate is shared to prevent"
+            );
+        }
     }
 
     /// FIR-2474, the half an agent acts on. `get_context_pack` published
