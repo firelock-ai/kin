@@ -95,10 +95,14 @@ impl std::fmt::Debug for RepositoryTransferEndpoint {
 
 impl RepositoryTransferEndpoint {
     pub fn new(base_url: impl Into<String>) -> Self {
+        let timeout_secs = std::env::var("KIN_REMOTE_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600);
         Self {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth_token: None,
-            timeout_secs: 120,
+            timeout_secs,
         }
     }
 
