@@ -28,6 +28,14 @@ permissions:
 jobs:
   build-image:
     name: Docker Image Build (no push)
+    # Off the pull-request path as of FIR-2815. This job gates nothing on a pull
+    # request and never did, but `merge_pr_ready` in the umbrella refuses while
+    # ANY check is still pending, required or not, so an advisory leg sets the
+    # lane's clock exactly as a required one does. Moving only the required legs
+    # would have left the pull-request clock at this job's measured 20.1 minutes
+    # and read like the idea did not work. The `push: branches: [main]` trigger
+    # above is untouched, so every commit that reaches main still runs it.
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

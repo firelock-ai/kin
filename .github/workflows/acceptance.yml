@@ -25,9 +25,26 @@
 # (FIR-2593). An acceptance suite whose result depends on a profile nobody
 # releases is answering a question nobody asked.
 #
-# This workflow publishes no required context yet. It becomes one on main after
-# it has been green on five consecutive pull requests, which is a separate,
-# deliberate step (FIR-2591).
+# `Product Acceptance` IS a required context on main. It is one of the eleven on
+# ruleset 19746451, "Require status checks on main", read live from
+# `GET /repos/firelock-ai/kin/rules/branches/main` on 2026-08-27. The header
+# here used to say the opposite, that it "publishes no required context yet"
+# and would become one after five green pull requests under FIR-2591. That step
+# happened and the comment did not move.
+#
+# The correction matters beyond tidiness, because the required list is live
+# GitHub configuration no test in this repository can read, which is why the
+# release mint keeps a reviewed mirror of it. A comment claiming a context is
+# advisory when a ruleset is blocking on it is the kind of thing somebody reads
+# right before deciding a job is safe to skip.
+#
+# The job below is off the pull-request path as of FIR-2815, and that is a
+# separate question from whether the context is required. It still reports on a
+# pull request, as `skipped`, which satisfies the required context the same way
+# the Windows installer leg has satisfied it since before this file existed. It
+# runs for real in the merge queue and on every commit that reaches main, where
+# the concurrency group below gives each commit its own run and cancels
+# nothing, so acceptance is graded per commit rather than per window.
 
 name: Acceptance
 
@@ -68,6 +85,12 @@ env:
 jobs:
   acceptance:
     name: Product Acceptance
+    # Measured at 29.0 minutes on a pull request, the single largest required
+    # context, against a ten-minute open-to-merge bar. It reports `skipped` here
+    # and runs in full on the merge queue and on every main commit; the release
+    # mint refuses a sha whose required checks are not green, so what this
+    # proves still has to be true before a tag, only later than it used to be.
+    if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
