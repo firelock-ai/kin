@@ -1583,7 +1583,7 @@ impl ManagedDaemonProcess {
     }
 }
 
-fn command_argument(args: &[String], flag: &str) -> Option<String> {
+pub(crate) fn command_argument(args: &[String], flag: &str) -> Option<String> {
     let mut index = 0;
     while index < args.len() {
         if args[index] == flag {
