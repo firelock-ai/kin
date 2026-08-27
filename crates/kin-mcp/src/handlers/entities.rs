@@ -3486,22 +3486,26 @@ fn apply_trace_fanout_cap(
     node_file: Option<&str>,
     limit: usize,
 ) -> (usize, usize) {
-    let same_file: Vec<bool> = candidates
+    let locality: Vec<kin_ranking::entity_ranking::FanoutLocality> = candidates
         .iter()
-        .map(|candidate| {
-            node_file
-                .zip(candidate.entity.file_origin.as_ref())
-                .map(|(parent, file)| parent == file.0.as_str())
-                .unwrap_or(false)
+        .map(|candidate| match candidate.entity.file_origin.as_ref() {
+            None => kin_ranking::entity_ranking::FanoutLocality::Unlocated,
+            Some(file) if node_file == Some(file.0.as_str()) => {
+                kin_ranking::entity_ranking::FanoutLocality::SameFile
+            }
+            Some(_) => kin_ranking::entity_ranking::FanoutLocality::OtherFile,
         })
         .collect();
-    let keep = kin_ranking::entity_ranking::fanout_cap_keeps(&same_file, limit);
+    let keep = kin_ranking::entity_ranking::fanout_cap_keeps(&locality, limit);
     if keep.len() == candidates.len() {
         return (0, 0);
     }
     let kept: std::collections::HashSet<usize> = keep.iter().copied().collect();
     let dropped_crossing = (0..candidates.len())
-        .filter(|index| !kept.contains(index) && !same_file[*index])
+        .filter(|index| {
+            !kept.contains(index)
+                && locality[*index] == kin_ranking::entity_ranking::FanoutLocality::OtherFile
+        })
         .count();
     let dropped = candidates.len() - keep.len();
     let mut taken: Vec<TraceFanoutCandidate> = Vec::with_capacity(keep.len());
@@ -8902,6 +8906,109 @@ mod tests {
             .iter()
             .map(|step| step["entity_name"].as_str().unwrap_or_default().to_string())
             .collect()
+    }
+
+
+    /// The fan-out the stranger measured, on the arm that has its own copy of
+    /// the cap.
+    ///
+    /// Two walkers apply a per-step cap in this codebase, and a rule fixed in
+    /// one of them is a rule that reads as fixed on both while only one is. So
+    /// this fixture is the CLI walker's `requests_send_graph` again, at the
+    /// same tiers, asserted through the GraphStore handler.
+    fn requests_send_store() -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("Session.send", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut edges: Vec<(Entity, f32)> = Vec::new();
+        for index in 0..11 {
+            edges.push((
+                make_entity(&format!("Session.own_{index}"), "src/requests/sessions.py"),
+                1.0,
+            ));
+        }
+        edges.push((
+            make_entity("extract_cookies_to_jar", "src/requests/cookies.py"),
+            0.9,
+        ));
+        edges.push((make_entity("dispatch_hook", "src/requests/hooks.py"), 0.9));
+        edges.push((
+            make_entity("HTTPAdapter.send", "src/requests/adapters.py"),
+            0.85,
+        ));
+
+        for (entity, confidence) in &edges {
+            store.upsert_entity(entity).unwrap();
+            let mut relation = make_relation(focal_id, entity.id, RelationKind::Calls);
+            relation.confidence = *confidence;
+            store.upsert_relation(&relation).unwrap();
+        }
+        (store, focal_id)
+    }
+
+    #[test]
+    fn trace_data_flow_offline_cap_leaves_the_module_and_names_the_target() {
+        let (store, focal_id) = requests_send_store();
+        let untargeted = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(4)),
+            ],
+        );
+        let names = traced_step_names(&untargeted);
+        assert_eq!(names.len(), 4);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| !name.starts_with("Session."))
+                .count(),
+            1,
+            "one slot leaves the file, on this arm too: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "HTTPAdapter.send"),
+            "and the hop nobody asked for is still not the one it keeps: {names:?}"
+        );
+        assert_eq!(
+            untargeted["spine_clipped_steps"], 1,
+            "the walk continued beneath the clipped focal: {untargeted}"
+        );
+        assert_eq!(
+            untargeted["clipped_steps"][0]["dropped_crossing_file"], 2,
+            "two module-crossing hops were dropped: {untargeted}"
+        );
+        assert!(
+            untargeted["degradations"]
+                .as_array()
+                .is_some_and(|degradations| degradations
+                    .iter()
+                    .any(|degradation| degradation["reason"] == "spine_clipped")),
+            "and the disclosure fires: {untargeted}"
+        );
+
+        let targeted = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(4)),
+                ("target", serde_json::json!("HTTPAdapter.send")),
+            ],
+        );
+        assert!(
+            traced_step_names(&targeted)
+                .iter()
+                .any(|name| name == "HTTPAdapter.send"),
+            "naming the hop keeps it here too: {:?}",
+            traced_step_names(&targeted)
+        );
+        assert_eq!(targeted["target_name"], "HTTPAdapter.send");
     }
 
     /// Both arms of one tool have to answer the same way, so the offline arm

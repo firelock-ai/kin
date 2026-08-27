@@ -1473,22 +1473,26 @@ fn apply_fanout_cap(
     node_file: Option<&str>,
     limit: usize,
 ) -> (usize, usize) {
-    let same_file: Vec<bool> = candidates
+    let locality: Vec<kin_ranking::entity_ranking::FanoutLocality> = candidates
         .iter()
-        .map(|candidate| {
-            node_file
-                .zip(candidate.entity.file_origin.as_ref())
-                .map(|(parent, file)| parent == file.0.as_str())
-                .unwrap_or(false)
+        .map(|candidate| match candidate.entity.file_origin.as_ref() {
+            None => kin_ranking::entity_ranking::FanoutLocality::Unlocated,
+            Some(file) if node_file == Some(file.0.as_str()) => {
+                kin_ranking::entity_ranking::FanoutLocality::SameFile
+            }
+            Some(_) => kin_ranking::entity_ranking::FanoutLocality::OtherFile,
         })
         .collect();
-    let keep = kin_ranking::entity_ranking::fanout_cap_keeps(&same_file, limit);
+    let keep = kin_ranking::entity_ranking::fanout_cap_keeps(&locality, limit);
     if keep.len() == candidates.len() {
         return (0, 0);
     }
     let kept: HashSet<usize> = keep.iter().copied().collect();
     let dropped_crossing = (0..candidates.len())
-        .filter(|index| !kept.contains(index) && !same_file[*index])
+        .filter(|index| {
+            !kept.contains(index)
+                && locality[*index] == kin_ranking::entity_ranking::FanoutLocality::OtherFile
+        })
         .count();
     let dropped = candidates.len() - keep.len();
     let mut taken: Vec<FanoutCandidate> = Vec::with_capacity(keep.len());
@@ -2169,6 +2173,7 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            target: None,
         }
     }
 
@@ -2225,6 +2230,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap_err();
@@ -2249,6 +2255,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap_err();
@@ -2299,6 +2306,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -2357,6 +2365,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -2404,6 +2413,7 @@ mod tests {
                 include_body: None,
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -2464,6 +2474,7 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            target: None,
         }
     }
 
@@ -2652,6 +2663,7 @@ mod tests {
             include_body: None,
             max_response_chars: None,
             include_type_edges: None,
+            target: None,
         };
 
         let uncancelled = build_trace_data_flow_response_within(
@@ -2928,14 +2940,15 @@ mod tests {
         (graph, focal_id)
     }
 
-    /// What the stranger measured, pinned so the fix has something to move.
+    /// What the stranger measured, and what it costs now.
     ///
-    /// Not an assertion that the product is correct. It is the falsification of
-    /// every check below it: a fixture that did not reproduce the loss could not
-    /// prove the fix removed it, and this one reproduces the reported clip
-    /// exactly, eleven dropped callees at a four-wide cap.
+    /// The premise is unchanged and still asserted: fifteen callees under a
+    /// four-wide cap drops eleven. What changed is which four survive. Every
+    /// one of them used to be in `sessions.py`, so the chain answered a
+    /// question about where a value goes without ever leaving the module the
+    /// value starts in.
     #[test]
-    fn the_measured_fan_out_loses_its_module_crossing_hop_to_the_files_own_callees() {
+    fn the_measured_fan_out_now_leaves_the_module_it_started_in() {
         let (graph, focal_id) = requests_send_graph();
         let (_t, binding) = empty_binding();
 
@@ -2947,16 +2960,192 @@ mod tests {
         .unwrap();
 
         let kept = step_names(&response);
-        assert_eq!(kept.len(), 4, "the four-wide cap kept four: {kept:?}");
+        assert_eq!(kept.len(), 4, "the four-wide cap still keeps four: {kept:?}");
         assert_eq!(
             response.clipped_steps[0].dropped_callees, 11,
-            "the stranger's own number: fifteen callees under a four-wide cap"
+            "and still drops eleven, because a floor is not extra breadth"
+        );
+        let crossed: Vec<&String> = kept
+            .iter()
+            .filter(|name| !name.starts_with("Session"))
+            .collect();
+        assert_eq!(
+            crossed.len(),
+            1,
+            "exactly one slot goes to a hop that leaves the file, no more: {kept:?}"
+        );
+        assert_eq!(
+            response.clipped_steps[0].dropped_crossing_file, 2,
+            "three callees live in another file, one now takes the reserved slot, \
+             so two module-crossing hops are still dropped"
+        );
+    }
+
+    /// The acceptance, first arm: name the hop and the cap keeps it.
+    ///
+    /// Same fifteen-callee node, same four-wide cap, same everything except
+    /// that the caller said what they were looking for. `HTTPAdapter.send` is
+    /// the worst-ranked hop in this fan-out by every proximity term the cap
+    /// consults, which is what makes it the right fixture: nothing but the
+    /// question can put it in the chain.
+    #[test]
+    fn naming_the_target_puts_the_asked_about_hop_in_the_chain() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let mut request = trace_request(&focal_id, 1, TraceDirection::Calls, 4);
+        request.target = Some("HTTPAdapter.send".to_string());
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+        )
+        .unwrap();
+
+        let kept = step_names(&response);
+        assert!(
+            kept.iter().any(|name| name == "HTTPAdapter.send"),
+            "the hop the caller named must survive the cap: {kept:?}"
+        );
+        assert_eq!(
+            response.target_name.as_deref(),
+            Some("HTTPAdapter.send"),
+            "and the response echoes the question it was given"
+        );
+        // The control on the control: without the target, this same walk does
+        // not contain it, so the assertion above is testing the target and not
+        // the floor that landed beside it.
+        let untargeted = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 4),
+        )
+        .unwrap();
+        assert!(
+            !step_names(&untargeted)
+                .iter()
+                .any(|name| name == "HTTPAdapter.send"),
+            "the untargeted walk must still miss it, or this check proves nothing"
+        );
+    }
+
+    /// A target that names nothing is a disclosure, not a failed call.
+    #[test]
+    fn an_unresolved_target_is_disclosed_and_the_chain_still_comes_back() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let mut request = trace_request(&focal_id, 1, TraceDirection::Calls, 4);
+        request.target = Some("HTTPAdapter.sendd".to_string());
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &request,
+        )
+        .unwrap();
+
+        assert_eq!(response.chain.len(), 4, "the chain is still the chain");
+        assert!(response.target_name.is_none(), "nothing was ranked toward");
+        assert!(
+            response
+                .degradations
+                .iter()
+                .any(|degradation| degradation.reason == "target_not_resolved"),
+            "and the walk says the question had no vote: {:?}",
+            response.degradations
+        );
+    }
+
+    /// The acceptance, second arm: when nothing was named, say so loudly.
+    ///
+    /// The failure this exists for is not a missing hop, it is a chain that
+    /// reads like a route while eleven siblings were never followed. The
+    /// disclosure has to name the node, the parameter and the count, and it has
+    /// to say in words that an absence here proves nothing.
+    #[test]
+    fn a_clip_the_walk_continued_beneath_refuses_to_be_read_as_an_absence() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 4),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.spine_clipped_steps, 1,
+            "the focal was clipped and the chain continues beneath it"
+        );
+        assert_eq!(
+            response.spine_dropped_crossing_file, 2,
+            "two of the hops it never followed left the module"
         );
         assert!(
-            kept.iter()
-                .all(|name| name.starts_with("Session") || name.starts_with("SessionRedirect")),
-            "every surviving callee is in the focal's own file, which is the defect: {kept:?}"
+            response.clipped_steps[0].continued_below,
+            "and the clip itself carries the distinction"
         );
+        let disclosure = response
+            .degradations
+            .iter()
+            .find(|degradation| degradation.reason == "spine_clipped")
+            .expect("a spine clip must be disclosed");
+        assert!(
+            disclosure.detail.contains("Session.send")
+                && disclosure.detail.contains("limit_per_step"),
+            "the disclosure names the node and the parameter: {}",
+            disclosure.detail
+        );
+        assert!(
+            disclosure.detail.contains("absence proves nothing"),
+            "and says what a reader may not conclude: {}",
+            disclosure.detail
+        );
+        assert!(
+            disclosure.remediation.contains("target"),
+            "and names the lever that fixes it: {}",
+            disclosure.remediation
+        );
+    }
+
+    /// The control the acceptance asks for: a walk the cap never cut carries
+    /// none of this, so a complete answer is not qualified by machinery that
+    /// exists for incomplete ones.
+    #[test]
+    fn an_unclipped_walk_still_certifies_and_says_nothing_about_spines() {
+        let (graph, focal_id) = requests_send_graph();
+        let (_t, binding) = empty_binding();
+
+        let response = build_trace_data_flow_response(
+            &RequestRepositoryAuthority::pinned(binding.clone()),
+            &graph,
+            &trace_request(&focal_id, 1, TraceDirection::Calls, 25),
+        )
+        .unwrap();
+
+        assert_eq!(
+            response.total_steps, 15,
+            "a 25-wide cap expands all fifteen callees"
+        );
+        assert!(response.clipped_steps.is_empty());
+        assert_eq!(response.spine_clipped_steps, 0);
+        assert_eq!(response.spine_dropped_crossing_file, 0);
+        assert!(
+            !response
+                .degradations
+                .iter()
+                .any(|degradation| degradation.component == "fanout_cap"),
+            "no cap disclosure on a walk no cap cut: {:?}",
+            response.degradations
+        );
+        let json = serde_json::to_value(&response).unwrap();
+        for absent in ["spine_clipped_steps", "spine_dropped_crossing_file"] {
+            assert!(
+                json.get(absent).is_none(),
+                "an unaffected walk must not carry {absent} at all"
+            );
+        }
     }
 
     /// A fan-out the size of a real one, so a change to how the cap chooses can
@@ -3153,7 +3342,10 @@ mod tests {
             total_steps: chain.len(),
             chain,
             truncated: false,
+            target_name: None,
             clipped_steps: Vec::new(),
+            spine_clipped_steps: 0,
+            spine_dropped_crossing_file: 0,
             bodies_omitted: 0,
             steps_omitted: 0,
             fanout_narrowed: 0,
@@ -3220,6 +3412,8 @@ mod tests {
             entity_name: "step_199".to_string(),
             dropped_callees: 4,
             dropped_callers: 0,
+            dropped_crossing_file: 0,
+            continued_below: false,
             limit_per_step: 25,
         });
 
@@ -3432,6 +3626,8 @@ mod tests {
                 entity_name: format!("step_{step}"),
                 dropped_callees: 3,
                 dropped_callers: 0,
+                dropped_crossing_file: 0,
+                continued_below: false,
                 limit_per_step: 12,
             });
         }
@@ -4346,6 +4542,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4379,6 +4576,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4455,6 +4653,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4510,6 +4709,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4556,6 +4756,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4596,6 +4797,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4644,6 +4846,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();
@@ -4694,6 +4897,7 @@ mod boundary_and_ranking_tests {
                 include_body: Some(false),
                 max_response_chars: None,
                 include_type_edges: None,
+                target: None,
             },
         )
         .unwrap();

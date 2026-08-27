@@ -594,21 +594,38 @@ pub fn trace_constant_score(entity: &Entity, focal_dir: Option<&str>) -> (bool, 
 }
 
 
+/// Where one fan-out candidate sits relative to the node being expanded.
+///
+/// Three states, not two. A file-less candidate is neither in the node's file
+/// nor in another one: the graph owns no location for it, it is a leaf with no
+/// next hop, and reserving a cap slot for it would spend the reservation on a
+/// step that continues nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FanoutLocality {
+    /// Defined in the expanded node's own file.
+    SameFile,
+    /// Defined in a different file this repository owns. This is the hop a
+    /// data-flow question is about, and the one the cap used to discard first.
+    OtherFile,
+    /// The graph owns no file for this symbol: an import another repository
+    /// defines, a builtin, or an alias split off its definition.
+    Unlocated,
+}
+
 /// Which of a node's ranked neighbors a per-step fan-out cap keeps.
 ///
-/// `same_file` is one flag per candidate, in relevance order, saying whether
-/// that candidate lives in the expanded node's own file. The return is the
+/// `locality` is one entry per candidate, in relevance order. The return is the
 /// indices to keep, still in relevance order.
 ///
 /// The rule is the ordinary top-N, with one floor under it: a cap may not spend
-/// every slot inside the node's own file when the node has a neighbor outside
-/// it. A chain that never leaves the file it started in has not answered a
-/// data-flow question, and the ranking cannot help here, because the term that
-/// crowds the boundary out is a proximity term that no question is an input to.
-/// The measured case is `Session.send` in `psf/requests`: fifteen callees,
-/// eleven of them parser-certain same-file calls at confidence 1.0, and a
-/// four-wide cap that therefore kept four `sessions.py` functions and dropped
-/// every hop that leaves the module.
+/// every slot inside the node's own file when the node has a located neighbor
+/// outside it. A chain that never leaves the file it started in has not
+/// answered a data-flow question, and the ranking cannot help here, because the
+/// term that crowds the boundary out is a proximity term that no question is an
+/// input to. The measured case is `Session.send` in `psf/requests`: fifteen
+/// callees, eleven of them parser-certain same-file calls at confidence 1.0,
+/// and a four-wide cap that therefore kept four `sessions.py` functions and
+/// dropped every hop that leaves the module.
 ///
 /// The reservation takes at most one slot and never takes it before the node's
 /// own file has two, so a two-wide cap still keeps the two best neighbors it
@@ -616,18 +633,23 @@ pub fn trace_constant_score(entity: &Entity, focal_dir: Option<&str>) -> (bool, 
 /// relevance: it guarantees the chain crosses the boundary when it can, and it
 /// does not know which crossing the caller wanted. Naming a target is what
 /// answers that.
-pub fn fanout_cap_keeps(same_file: &[bool], limit: usize) -> Vec<usize> {
-    if same_file.len() <= limit {
-        return (0..same_file.len()).collect();
+pub fn fanout_cap_keeps(locality: &[FanoutLocality], limit: usize) -> Vec<usize> {
+    if locality.len() <= limit {
+        return (0..locality.len()).collect();
     }
     let mut kept: Vec<usize> = (0..limit).collect();
     if limit < 3 {
         return kept;
     }
-    if kept.iter().any(|&index| !same_file[index]) {
+    if kept
+        .iter()
+        .any(|&index| locality[index] == FanoutLocality::OtherFile)
+    {
         return kept;
     }
-    let Some(crossing) = (limit..same_file.len()).find(|&index| !same_file[index]) else {
+    let Some(crossing) = (limit..locality.len())
+        .find(|&index| locality[index] == FanoutLocality::OtherFile)
+    else {
         return kept;
     };
     // The lowest-ranked kept slot, so the reservation costs the least relevant
@@ -639,6 +661,71 @@ pub fn fanout_cap_keeps(same_file: &[bool], limit: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use FanoutLocality::{OtherFile, SameFile, Unlocated};
+
+    /// The measured shape: a node whose best neighbors are all in its own file,
+    /// and the one hop that leaves the module ranked below every one of them.
+    #[test]
+    fn a_cap_may_not_spend_every_slot_inside_the_nodes_own_file() {
+        let fanout = [SameFile, SameFile, SameFile, SameFile, OtherFile];
+        assert_eq!(
+            fanout_cap_keeps(&fanout, 4),
+            vec![0, 1, 2, 4],
+            "the reservation costs the lowest-ranked kept slot, not the best one"
+        );
+    }
+
+    /// The floor is a floor, not extra breadth. It never takes a second slot,
+    /// however many crossings are waiting.
+    #[test]
+    fn the_reservation_never_takes_more_than_one_slot() {
+        let fanout = [
+            SameFile, SameFile, SameFile, SameFile, OtherFile, OtherFile, OtherFile,
+        ];
+        assert_eq!(fanout_cap_keeps(&fanout, 4), vec![0, 1, 2, 4]);
+    }
+
+    /// A two-wide cap has room for the two best neighbors and nothing else, so
+    /// it is left exactly as it was. This is the case `the_per_step_cap_keeps_\
+    /// the_callees_that_continue_the_chain` pins on the walker.
+    #[test]
+    fn a_cap_too_narrow_to_afford_a_reservation_does_not_take_one() {
+        let fanout = [SameFile, SameFile, OtherFile];
+        assert_eq!(fanout_cap_keeps(&fanout, 2), vec![0, 1]);
+        // Three is where it can afford one: two slots stay with the node's own
+        // file, which is the promise the narrow case rests on.
+        assert_eq!(fanout_cap_keeps(&fanout, 3), vec![0, 1, 2]);
+    }
+
+    /// A file-less symbol is a leaf with no next hop, so reserving a slot for
+    /// one would spend the floor on a step that continues nothing.
+    #[test]
+    fn an_unlocated_candidate_never_takes_the_reserved_slot() {
+        let fanout = [SameFile, SameFile, SameFile, SameFile, Unlocated];
+        assert_eq!(
+            fanout_cap_keeps(&fanout, 4),
+            vec![0, 1, 2, 3],
+            "nothing crosses a file boundary here, so nothing is reserved"
+        );
+    }
+
+    /// A cap that already kept a crossing has nothing to fix, and must not
+    /// reshuffle what relevance chose.
+    #[test]
+    fn a_cap_that_already_crosses_is_left_alone() {
+        let fanout = [SameFile, OtherFile, SameFile, SameFile, SameFile];
+        assert_eq!(fanout_cap_keeps(&fanout, 4), vec![0, 1, 2, 3]);
+    }
+
+    /// And a fan-out inside the cap is untouched, so an unclipped walk is
+    /// byte-identical to the one before this rule existed.
+    #[test]
+    fn a_fan_out_that_fits_is_kept_whole() {
+        let fanout = [SameFile, OtherFile, Unlocated];
+        assert_eq!(fanout_cap_keeps(&fanout, 5), vec![0, 1, 2]);
+        assert_eq!(fanout_cap_keeps(&fanout, 3), vec![0, 1, 2]);
+    }
 
     #[test]
     fn declaration_kind_rank_function_highest() {
