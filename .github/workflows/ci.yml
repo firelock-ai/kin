@@ -189,16 +189,26 @@ jobs:
 
   windows-authority-tests:
     name: Windows authority tests
+    if: ${{ github.event_name != 'pull_request' }}
     # Split out of the installer job: the debug test compile and the release
     # build share no artifacts (separate target profiles), so serialising them
     # only added wall clock. They run concurrently now.
     #
-    # This job and the two Windows authority jobs below stay on every event on
-    # purpose, and the authority test enforces that none of them carries a
-    # job-level `if:`. Together they are the merge group's only proof of the
-    # native Windows admission contract, so taking them off the queue to reclaim
-    # runner minutes would trade a reviewable pre-landing signal for a required
-    # context that first fails on main.
+    # This job and the two Windows authority jobs below stay on the merge queue
+    # and on every commit that reaches main. Together they are the merge group's
+    # only proof of the native Windows admission contract, so taking them off
+    # the queue to reclaim runner minutes would trade a reviewable pre-landing
+    # signal for a required context that first fails on main. The authority test
+    # enforces that, and it now admits exactly one job-level condition, the
+    # pull-request filter below, and refuses any other.
+    #
+    # They came off pull requests with the rest of the heavy set. The longest of
+    # the three measured 11.7 minutes, which no admission gate can carry against
+    # a ten-minute open-to-merge bar, and they gate nothing on a pull request
+    # anyway: `merge_pr_ready` in the umbrella refuses while ANY check is still
+    # pending, required or not, so an advisory leg sets the lane's clock exactly
+    # as a required one does. The proof itself did not move. It runs in the
+    # queue, which is what the release mint reads.
     #
     # The legs were split three ways by compilation unit because one job could
     # not finish inside any cap worth setting. Across 119 sampled runs, 32 of
@@ -408,6 +418,7 @@ jobs:
 
   windows-authority-cli-tests:
     name: Windows authority CLI tests
+    if: ${{ github.event_name != 'pull_request' }}
     # Every leg here is `-p kin-cli --no-default-features --lib`, which is one
     # compilation unit and the single most expensive one in the Windows set.
     # Splitting on that boundary is why the three jobs do not duplicate each
@@ -480,6 +491,7 @@ jobs:
 
   windows-authority-runtime-tests:
     name: Windows authority runtime tests
+    if: ${{ github.event_name != 'pull_request' }}
     # The integration-test binaries: real daemons, real process trees, real
     # containment. These are the legs that spend their time running rather than
     # compiling, which is why they belong away from the unit legs instead of
@@ -826,22 +838,303 @@ jobs:
           fi
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
 
-  # A skipped matrix job never expands, so the required per-platform contexts
-  # would go missing instead of reporting skipped. This stub carries the same
-  # display name and matrix as the real job and succeeds instantly on
-  # documentation-only diffs, producing the exact required context names. The
-  # two jobs' conditions are mutually exclusive.
-  check-docs-only:
-    name: Check & Test
+  # ─── The admission core ─────────────────────────────────────────────────────
+  #
+  # Two jobs, both running on every event, and between them the whole of what
+  # blocks a pull request from landing. FIR-2815, on the founder's ruling that a
+  # serialized all-green-admission queue is the wrong shape for a ten-minute
+  # open-to-merge bar.
+  #
+  # The measurement that decided the split, over the 2026-08-23 to 2026-08-26
+  # window: a landing spent a measured 31.9 minutes of pull-request CI and a
+  # measured 32.5 minutes in the queue, and in 16 of 17 landings the tree the
+  # queue built was NOT the tree the pull request tested, because main moved
+  # under it while its checks ran. So the pull-request suite was proving a base
+  # that had already been replaced by the time it went green. That is the half
+  # whose result nothing downstream depends on, and it is the half that moved.
+  #
+  # What these two catch, measured over the same window: 31 of 64 distinct
+  # pull-request failures, 48 percent, were formatting, clippy or a policy
+  # script. The other 52 percent now arrive as a red main tip instead. That is
+  # the trade, it is deliberate, and it is safe for one reason: release-tag.yml
+  # refuses to mint a sha lacking either its proof records or its nine green
+  # required checks, per sha and failing closed, so an unproven main tip cannot
+  # be tagged. It can only be inconvenient.
+  #
+  # Neither job may be skipped on any event. A required context nobody reports
+  # blocks a merge forever with every visible check green, which is a silent
+  # hang rather than a failure, so the sharded test job publishes its required
+  # name from an aggregate that always runs and names which case it passed on.
+  # The three display names below carry no colon on purpose. A YAML scalar
+  # containing ": " has to be quoted, and the job-name census in
+  # scripts/test-release-workflow-authority.py reads the exact scalar text, so a
+  # quoted name would be registered with its quotes and would no longer be the
+  # string GitHub publishes or the string a ruleset has to name.
+  fast-gate-lint:
+    name: Fast gate lint and policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+        with:
+          components: rustfmt, clippy
+
+      # `save-if: false` and a shared key, for the same reason `feature-tests`
+      # carries them: this job must never write the entry `check` owns. `check`
+      # still runs on every main commit, so the entry keeps being written by the
+      # branch that is allowed to write it. Read the cache line in THIS step's
+      # log rather than the caches API listing, which is not an inventory.
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: check
+          save-if: false
+
+      - name: Check formatting
+        run: cargo fmt -- --check
+
+      # The quarantine's clock. `.config/nextest.toml` buys a flaky test two
+      # retries so it stops ejecting queue entries; this is what stops that
+      # becoming a place to park a real bug. It reads source and resolves no
+      # dependencies, and it lives here rather than in `check` because a script
+      # step in `check` is a gate `bin/kin-precheck` in the umbrella enumerates
+      # and must classify by name, and wiring one there without the matching
+      # umbrella entry makes precheck refuse with no tally, on this tree and on
+      # every lane still on an older base. Promoting it is this step moving one
+      # job and one name joining precheck's LOCAL list.
+      - name: Check the flake quarantine
+        run: python3 scripts/check-quarantine.py
+
+      # Byte-identical to the `check` job's clippy step, deliberately. The two
+      # run on different events now and there is no event on which neither runs,
+      # so the workspace is linted exactly once per event rather than twice.
+      - name: Clippy
+        shell: bash
+        run: |
+          set -euo pipefail
+          allows="$(grep -Ev '^(#|$)' .github/clippy-allowed-lints.txt | tr '\n' ' ')"
+          words="$(printf '%s\n' "$allows" | wc -w | tr -d ' ')"
+          if [ "$words" -lt 2 ]; then
+            echo "::error title=Empty clippy debt list::.github/clippy-allowed-lints.txt carries no allows"
+            echo "Clippy would run with the RUSTFLAGS -D warnings group and nothing" >&2
+            echo "overriding it, so every entry on the debt list would go red at once." >&2
+            exit 1
+          fi
+          echo "clippy debt allow-list: $((words / 2)) lints"
+          # The allow list is a word list, and splitting it is the point.
+          # shellcheck disable=SC2086
+          cargo clippy --all-targets --all-features -- $allows
+
+      # Nine of the window's 64 failures were release ordering and npm
+      # provenance policy and eight more were this gate, so a fifth of what a
+      # pull request used to learn in thirty minutes is learned here in under
+      # one. The wrapper routes its own failures by event: hard for anything
+      # reaching release machinery, for the release pull request, for a push and
+      # for a diff it cannot read, and a warning annotation otherwise.
+      - name: Validate automatic release policy
+        env:
+          GH_TOKEN: ${{ github.token }}
+          KIN_POLICY_EVENT: ${{ github.event_name }}
+          KIN_POLICY_HEAD_REF: ${{ github.head_ref }}
+          KIN_POLICY_REPOSITORY: ${{ github.repository }}
+          KIN_POLICY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          KIN_POLICY_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
+          python3 scripts/test-release-workflow-authority.py
+          node --test \
+            scripts/check-glibc-floor.test.mjs \
+            scripts/check-kin-vfs-compat.test.mjs \
+            scripts/check-rc-build-drift.test.mjs \
+            scripts/check-release-proof-artifacts.test.mjs \
+            scripts/release-train-body.test.mjs \
+            scripts/check-release-version.test.mjs \
+            scripts/release-intent.test.mjs \
+            scripts/extract-release-notes.test.mjs \
+            scripts/prepare-release.test.mjs \
+            scripts/release-archive-shape.test.cjs \
+            scripts/write-release-archive-docs.test.mjs
+          node --check scripts/check-release-version.mjs
+          node --check scripts/prepare-release.mjs
+          node --check scripts/release-intent.mjs
+          RELEASE_POLICY
+
+  # The build-and-test half of admission, sharded three ways over the packages
+  # the diff can have broken.
+  #
+  # Three shards each pay their own build, about ten runner minutes of
+  # duplicated compile. Building once and passing an artifact is cheaper in
+  # runner minutes and MORE expensive in wall clock, and the founder's ruling on
+  # 2026-08-26 was spend over the coverage trade, so the clock wins.
+  #
+  # The scope is the changed packages plus their reverse-dependency closure, and
+  # it widens to the whole workspace on anything it is unsure of. A selector
+  # that narrows too far exits 0 having graded nothing, which reads exactly like
+  # a clean pass, so the listing is asserted non-empty before the run: nextest
+  # over a filter matching nothing prints the summary a clean pass prints.
+  fast-gate-tests:
+    name: Fast gate test shard
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    strategy:
+      # A shard that dies must not take its siblings with it, for the reason
+      # `check` sets this: one red shard cancelling the others makes the
+      # aggregate report one cause where there may be three.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      # The scope read diffs a base against a head, so it needs both.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Verify kin cargo registry config
+        run: |
+          test -f .cargo/config.toml
+          grep -q '^\[registries\.kin\]' .cargo/config.toml
+          if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: check
+          save-if: false
+
+      - name: Install nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      # An event with no readable base produces no changed paths, and the
+      # selector widens on that rather than guessing, which is the same answer a
+      # failed diff gets. Those two must not be told apart.
+      - name: Choose the packages this diff can have broken
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          : > "$RUNNER_TEMP/changed.txt"
+          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            git diff --name-only "$BASE_SHA...$HEAD_SHA" -- > "$RUNNER_TEMP/changed.txt" || {
+              echo "::warning::could not diff $BASE_SHA...$HEAD_SHA; testing the whole workspace"
+              : > "$RUNNER_TEMP/changed.txt"
+            }
+          fi
+          python3 scripts/changed-crate-scope.py "$RUNNER_TEMP/metadata.json" \
+            < "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/scope.args"
+          if [ ! -s "$RUNNER_TEMP/scope.args" ]; then
+            echo "::error title=Empty test scope::the selector printed no arguments"
+            echo "An empty selection would run the whole suite or none of it, and" >&2
+            echo "cargo cannot tell you which. Refusing rather than guessing." >&2
+            exit 1
+          fi
+          echo "scope: $(tr '\n' ' ' < "$RUNNER_TEMP/scope.args")"
+
+      # A filter that matches nothing grades nothing and exits 0, printing the
+      # same summary a clean pass prints. Assert the listing before the run.
+      - name: Assert the selection lists tests before running any
+        run: |
+          set -euo pipefail
+          readarray -t SCOPE < "$RUNNER_TEMP/scope.args"
+          cargo nextest list --locked "${SCOPE[@]}" --message-format json \
+            > "$RUNNER_TEMP/listing.json"
+          python3 - "$RUNNER_TEMP/listing.json" <<'LISTING'
+          import json, sys
+          listing = json.load(open(sys.argv[1], encoding="utf-8"))
+          suites = listing.get("rust-suites", {})
+          total = sum(len(suite.get("testcases", {})) for suite in suites.values())
+          print(f"{total} test(s) across {len(suites)} binaries in the selection")
+          if total == 0:
+              print("::error title=Empty test selection::the scope lists zero tests")
+              raise SystemExit(1)
+          LISTING
+
+      - name: Test
+        run: |
+          set -euo pipefail
+          readarray -t SCOPE < "$RUNNER_TEMP/scope.args"
+          cargo nextest run --locked "${SCOPE[@]}" --partition count:${{ matrix.shard }}/3
+
+      # The reporting verdict. The run above graded a quarantined flake as
+      # passing, which is what keeps it off the critical path; this reads the
+      # same execution's JUnit record for what `--flaky-result fail` would have
+      # said, so a retry stays visible instead of going quiet.
+      - name: Report quarantined flakes
+        run: python3 scripts/check-quarantine.py --report-junit target/nextest/default/junit.xml
+
+  # The required context, and the only job that publishes it. It always runs, on
+  # every event, because a required context that is never reported is a silent
+  # hang. It names which case it passed on rather than passing quietly, and it
+  # admits `success` from the shards and nothing else: a skipped or cancelled
+  # shard left part of the selection unrun, and a required context that goes
+  # green on that is worse than no context at all.
+  fast-gate-tests-aggregate:
+    name: Fast gate build and tests
+    needs: [changes, fast-gate-tests]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every fast-gate shard to have succeeded
+        env:
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          SHARDS: ${{ needs.fast-gate-tests.result }}
+        run: |
+          set -euo pipefail
+          if [ "$DOCS_ONLY" = "true" ]; then
+            echo "documentation-only diff: no package changed, so there is nothing to build"
+            exit 0
+          fi
+          if [ "$SHARDS" != "success" ]; then
+            echo "::error title=fast gate shards did not pass::the sharded fast-gate legs reported '$SHARDS'"
+            echo "Every shard of the selection has to report success for this" >&2
+            echo "context to be evidence that the selection ran. 'skipped' and" >&2
+            echo "'cancelled' mean a shard did not run at all." >&2
+            exit 1
+          fi
+          echo "every fast-gate shard succeeded"
+
+  # A skipped matrix job never expands, so the required per-platform contexts
+  # would go missing instead of reporting skipped, and a required context nobody
+  # reports is a silent hang rather than a failure. This stub carries the same
+  # display name and matrix as the real job and produces the exact required
+  # context names instantly. Its condition and the real jobs' are mutually
+  # exclusive, so no two of them ever publish one expanded name on one event.
+  #
+  # It used to cover documentation-only diffs alone. It now covers every pull
+  # request, because the ubuntu and macOS suites moved off the pull-request path
+  # entirely: what admits a change is the fast gate below, and the full suite
+  # runs on the merge queue and on every commit that reaches main, where it is
+  # graded per commit and nothing cancels it. `release-tag.yml` still refuses to
+  # mint a sha whose nine required checks are not green, so the proof did not
+  # move, only the moment it is paid for.
+  check-pr-fast-path:
+    name: Check & Test
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - name: Report the documentation-only fast path
-        run: echo "documentation-only diff; build and test validation not applicable"
+      - name: Report the pull-request fast path
+        run: |
+          echo "Check & Test runs in the merge queue and on every main commit."
+          echo "Admission is the fast gate; see .github/workflows/ci.yml."
 
   # The ubuntu half of Check & Test, sharded, and the job every source-reading
   # gate in this repository runs in. The macOS half moved to `check-macos` +
@@ -873,7 +1166,10 @@ jobs:
   check:
     name: Check & Test ubuntu shard
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # The all-features clippy/build/test sequence can otherwise retain more
@@ -1316,14 +1612,17 @@ jobs:
   # The matrix is not decoration, for the same reason `check-macos-aggregate`
   # carries one: a skipped matrix job never expands, so on a documentation-only
   # diff this publishes the bare `Check & Test` name and leaves
-  # `check-docs-only` as the sole producer of the expanded one. Without the
+  # `check-pr-fast-path` as the sole producer of the expanded one. Without the
   # matrix, a skipped aggregate would publish `Check & Test (ubuntu-latest)` as
   # `skipped` beside the stub's success, and two check runs under one required
   # name is the ambiguity the release mint refuses on.
   check-aggregate:
     name: Check & Test
     needs: [changes, check]
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -1377,7 +1676,10 @@ jobs:
   check-macos:
     name: Check & Test macOS shard
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
     runs-on: macos-latest
     timeout-minutes: 60
     env:
@@ -1465,7 +1767,7 @@ jobs:
   #
   # The matrix is not decoration. A skipped matrix job never expands, so on a
   # documentation-only diff this publishes the bare `Check & Test` name and
-  # leaves `check-docs-only` as the sole producer of the expanded one, exactly
+  # leaves `check-pr-fast-path` as the sole producer of the expanded one, exactly
   # as the real and stub `check` jobs already behave. Without the matrix, a
   # skipped aggregate would publish `Check & Test (macos-latest)` as `skipped`
   # beside the stub's success, and two check runs under one required name is the
@@ -1477,7 +1779,10 @@ jobs:
   check-macos-aggregate:
     name: Check & Test
     needs: [changes, check-macos]
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     strategy:
@@ -1517,7 +1822,10 @@ jobs:
   falsify-guards:
     name: Falsify guards
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1677,28 +1985,32 @@ jobs:
       - name: Falsify the release version guards
         run: python3 ./scripts/falsify-release-version-guards.py
   # A skipped matrix job never expands, so its per-leg context names do not
-  # appear at all rather than appearing skipped. `check-docs-only` exists for
+  # appear at all rather than appearing skipped. `check-pr-fast-path` exists for
   # exactly that reason and this is its counterpart: once the branch ruleset
   # requires `Feature permutation tests (ubuntu-latest)` and its macOS leg, a
   # documentation-only diff would otherwise wait forever for two contexts that
   # were never going to be created. Both legs run here on one ubuntu runner
   # because the point is the name, not the work.
-  feature-tests-docs-only:
+  feature-tests-pr-fast-path:
     name: Feature permutation tests
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}
+    if: ${{ !cancelled() && github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - name: Report the documentation-only fast path
-        run: echo "documentation-only diff; feature permutation tests not applicable"
+      - name: Report the pull-request fast path
+        run: |
+          echo "The feature permutations run in the merge queue and on every"
+          echo "main commit. Admission is the fast gate."
 
   feature-tests:
     name: Feature permutation tests
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     # Same bounds as Check & Test: the feature permutations compile the same
@@ -1872,7 +2184,10 @@ jobs:
   install-proof-pr-build:
     name: Install Proof (PR) Build
     needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+    if: >-
+      ${{ !cancelled()
+      && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -1975,6 +2290,7 @@ jobs:
     if: >-
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
+      && github.event_name != 'pull_request'
       && needs.install-proof-pr-build.result == 'success' }}
     uses: ./.github/workflows/install-proof.yml
     with:
@@ -1999,11 +2315,18 @@ jobs:
     steps:
       - name: Require the pull request install proof
         env:
+          EVENT_NAME: ${{ github.event_name }}
           DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           BUILD_RESULT: ${{ needs.install-proof-pr-build.result }}
           PROOF_RESULT: ${{ needs.install-proof-pr.result }}
         run: |
           set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo "the install proof runs in the merge queue and on every main commit;"
+            echo "admission is the fast gate, and release-tag.yml still refuses a sha"
+            echo "whose required checks are not green"
+            exit 0
+          fi
           if [ "$DOCS_ONLY" = "true" ]; then
             echo "documentation-only diff: no binaries changed, so the install proof has nothing to install"
             exit 0
