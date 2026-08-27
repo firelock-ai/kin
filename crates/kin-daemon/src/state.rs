@@ -7993,8 +7993,8 @@ mod tests {
     #[serial_test::serial]
     #[ignore = "measurement against this host's real registry, not a guard"]
     fn measure_eager_sibling_capture_against_the_real_registry() {
-        let bounds = std::env::var("KIN_SPINE_MEASURE_BOUNDS")
-            .unwrap_or_else(|_| "0,1,2,4,8".to_string());
+        let bounds =
+            std::env::var("KIN_SPINE_MEASURE_BOUNDS").unwrap_or_else(|_| "0,1,2,4,8".to_string());
         let primary_dir = tempfile::tempdir().unwrap();
         let primary_init = kin_core::init(primary_dir.path()).unwrap();
 
@@ -8048,7 +8048,10 @@ mod tests {
         // cost is one-time initialization paid by whoever goes first, and if it
         // is fast the cost belongs to one pathological repository.
         let reverse = std::env::var("KIN_SPINE_ATTRIBUTE_REVERSE").is_ok();
-        let mut order: Vec<_> = state.registered_local_repository_authorities.iter().collect();
+        let mut order: Vec<_> = state
+            .registered_local_repository_authorities
+            .iter()
+            .collect();
         if reverse {
             order.reverse();
         }
