@@ -28,8 +28,8 @@
 use std::collections::HashMap;
 
 use kin_index::{
-    link_cross_file as link_cross_file_with_identities, link_cross_file_incremental,
-    FileParseData, IncrementalLinker,
+    link_cross_file as link_cross_file_with_identities, link_cross_file_incremental, FileParseData,
+    IncrementalLinker,
 };
 use kin_model::{ArtifactId, Entity, EntityId, FilePathId, GraphNodeId, Relation, RelationKind};
 use kin_parser::{JavaScriptAdapter, LanguageAdapter, PythonAdapter};
@@ -232,7 +232,10 @@ fn a_submodule_that_does_not_define_the_callee_reaches_nothing() {
     let files = vec![
         py("pkg/__init__.py", "__version__ = \"1\"\n"),
         py("pkg/mod.py", "def unrelated_helper():\n    return 1\n"),
-        py("elsewhere.py", "def note_body(conn, note_id):\n    return \"\"\n"),
+        py(
+            "elsewhere.py",
+            "def note_body(conn, note_id):\n    return \"\"\n",
+        ),
         py(
             "caller.py",
             "from pkg import mod\n\n\ndef run(db):\n    return mod.note_body(db, 1)\n",
@@ -356,7 +359,10 @@ fn a_real_repository_recovers_calls_through_a_package_index_receiver() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if path.is_dir() {
-                if name != ".kin" && name != ".git" && name != "node_modules" && name != "__pycache__"
+                if name != ".kin"
+                    && name != ".git"
+                    && name != "node_modules"
+                    && name != "__pycache__"
                 {
                     stack.push(path);
                 }
@@ -396,8 +402,7 @@ fn a_real_repository_recovers_calls_through_a_package_index_receiver() {
         if relation.kind != RelationKind::Calls {
             continue;
         }
-        let (GraphNodeId::Entity(src), GraphNodeId::Entity(dst)) =
-            (&relation.src, &relation.dst)
+        let (GraphNodeId::Entity(src), GraphNodeId::Entity(dst)) = (&relation.src, &relation.dst)
         else {
             continue;
         };
@@ -426,9 +431,7 @@ fn a_real_repository_recovers_calls_through_a_package_index_receiver() {
             .iter()
             .filter(|r| r.kind == RelationKind::Calls)
             .filter_map(|r| match (&r.src, &r.dst) {
-                (GraphNodeId::Entity(src), GraphNodeId::Entity(dst))
-                    if targets.contains(dst) =>
-                {
+                (GraphNodeId::Entity(src), GraphNodeId::Entity(dst)) if targets.contains(dst) => {
                     entity_files.get(src).cloned()
                 }
                 _ => None,
