@@ -9860,6 +9860,64 @@ mod tests {
         );
     }
 
+    /// FIR-2775. Both reference surfaces must actually EMIT the arrival reading,
+    /// not merely be able to read one.
+    ///
+    /// This exists because the falsification of the shared gate stayed green
+    /// under the mutation that deletes the pack's publication. The envelope test
+    /// injects the block into both payloads by hand, so it proves the gate reads
+    /// a block and proves nothing about whether either handler produces one. Two
+    /// tests, each correct, jointly guarding nothing: the property that matters
+    /// lives in the agreement between what one side emits and what the other
+    /// reads, and only this end asserts the emitting half.
+    #[tokio::test]
+    async fn both_reference_surfaces_publish_the_arrival_reading() {
+        let (store, focal_id) = wide_store(3);
+        let sessions = SessionRegistry::empty_for_test();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        )]);
+
+        let pack = parsed_response(&crate::finalize_with_envelope(
+            handle_get_context_pack(&args, &store, &sessions, None).unwrap(),
+            structurally_ready_envelope(),
+            "get_context_pack",
+        ));
+        let references = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        for (label, response) in [
+            ("get_context_pack", &pack),
+            ("find_references", &references),
+        ] {
+            let block = &response[crate::caller_arrival::CALLER_ARRIVAL_KEY];
+            assert!(
+                block.is_object(),
+                "{label} must publish the arrival reading the negative envelope gates on; got \
+                 {block}"
+            );
+            // A state the gate recognizes, so the block cannot be present and
+            // inert. `caller_arrival_state_unknown` is what an unrecognized one
+            // produces, and it would read as a gap for the wrong reason.
+            let state = block["state"].as_str().unwrap_or_default();
+            assert!(
+                matches!(state, "accounted" | "unaccounted" | "unmeasured"),
+                "{label} published an arrival state the gate does not recognize: {state:?}"
+            );
+            // The count the verdict rests on rides beside the rows on every
+            // answer, populated or not, so a reader never has to tell "checked
+            // and fine" from "not reported".
+            assert!(
+                block["unaccounted_file_count"].is_u64(),
+                "{label} must publish the unaccounted count beside the rows; got {block}"
+            );
+        }
+    }
+
     #[test]
     fn get_context_pack_response_fits_the_budget() {
         let (store, focal_id) = wide_store(0);
