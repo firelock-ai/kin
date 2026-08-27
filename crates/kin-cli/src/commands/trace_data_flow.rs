@@ -3226,8 +3226,7 @@ mod tests {
             let mut request = trace_request(&focal_id, 5, TraceDirection::Calls, 4);
             request.target = Some(target.clone());
             let started = std::time::Instant::now();
-            let response =
-                build_trace_data_flow_response(&authority, &graph, &request).unwrap();
+            let response = build_trace_data_flow_response(&authority, &graph, &request).unwrap();
             targeted.push(started.elapsed());
             assert_eq!(response.target_name.as_deref(), Some(target.as_str()));
         }
