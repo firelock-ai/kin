@@ -48,6 +48,8 @@ pub const BEHAVIOR_ENV_VARS: &[&str] = &[
     "KIN_DAEMON_AUTO_EMBED",
     "KIN_DAEMON_TEST_STARTUP_HOLD_SECS",
     "KIN_DAEMON_TEST_HOLD_ENRICHMENT_SWEEP",
+    "KIN_DISABLE_SPINE",
+    "KIN_SPINE_MAX_EAGER_SIBLINGS",
     "KIN_MEMORY_PRESSURE",
     "KIN_DAEMON_MEMORY_BUDGET_BYTES",
     "KIN_COCHANGE_MAX_FAN_OUT",
@@ -221,6 +223,16 @@ mod tests {
             assert!(
                 BEHAVIOR_ENV_VARS.contains(&name),
                 "daemon health must report resume-identity knob {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn spine_scope_knobs_are_reported() {
+        for name in ["KIN_DISABLE_SPINE", "KIN_SPINE_MAX_EAGER_SIBLINGS"] {
+            assert!(
+                BEHAVIOR_ENV_VARS.contains(&name),
+                "daemon health must report startup-captured spine scope knob {name}"
             );
         }
     }
