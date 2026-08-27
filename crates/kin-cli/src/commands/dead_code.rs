@@ -288,46 +288,73 @@ fn build_dead_code_report(
     // general. None of them asks the question a delete list actually turns on:
     // could a caller of THIS row have arrived through a call the linker
     // recorded no edge for? `find_references` has refused to certify an empty
-    // result on that ground since FIR-2775, reading
-    // `kin_mcp::caller_arrival`. This command read the same edges and applied
-    // none of it, so on a package whose CLI reached its modules through
-    // `from . import mod` the scan listed eleven live functions with no caveat
-    // at all while carefully hedging the one row it could resolve. The reading
-    // is the same one the MCP surface publishes, so the two surfaces cannot
-    // disagree about the same graph generation.
+    // result on that ground since FIR-2775, reading `kin_mcp::caller_arrival`.
+    // This command read the same edges and applied none of it, so on a package
+    // whose CLI reached its modules through `from . import mod` the scan listed
+    // eleven live functions with no caveat at all while carefully hedging the
+    // one row it could resolve.
+    //
+    // Only a MEASURED shortfall gates a row here, and that is narrower than the
+    // state the MCP envelope keys on, deliberately. `ArrivalState::Unaccounted`
+    // also covers a family file that carries no parse-side call count at all,
+    // and on a converted store today that is nearly every file: measured on the
+    // stranger's own corpus, `kin graph status` reports the python parse side
+    // "measured on 1 of 14 files". A row label that fires on a count the store
+    // does not hold would land on every row of every scan, which is a label a
+    // reader learns to skip and the same inversion this ticket is about, one
+    // level down. So a row is gated when some file that can reach it parsed
+    // MORE call sites than the graph holds edges for, which is a fact, and the
+    // store-wide gap stays disclosed where it already is, in the reference-edge
+    // coverage block this scan prints below.
     //
     // Memoized per FILE rather than per row. `observe_caller_arrival` consults
     // the focal only through its file of origin and its language, and it walks
     // up to `FAMILY_FILE_CAP` importing files per reading, so a scan listing
     // forty rows out of three files takes three readings and not forty.
-    let mut arrival_by_file: std::collections::HashMap<
-        kin_model::FilePathId,
-        Option<(&'static str, String)>,
-    > = std::collections::HashMap::new();
-    let mut arrival_rows: std::collections::HashMap<EntityId, &'static str> =
+    let mut arrival_by_file: std::collections::HashMap<kin_model::FilePathId, Option<String>> =
         std::collections::HashMap::new();
-    let mut arrival_reasons: std::collections::BTreeMap<&'static str, String> =
-        std::collections::BTreeMap::new();
+    let mut arrival_rows: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
+    let mut arrival_reasons: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for entity in unreferenced.iter().chain(test_only.iter()) {
         let Some(file) = entity.file_origin.clone() else {
             continue;
         };
         let gap = arrival_by_file.entry(file).or_insert_with(|| {
             let arrival = kin_mcp::caller_arrival::observe_caller_arrival(graph, entity);
-            let factor = match arrival.state {
-                kin_mcp::caller_arrival::ArrivalState::Accounted => return None,
-                kin_mcp::caller_arrival::ArrivalState::Unaccounted => {
-                    kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR
-                }
-                kin_mcp::caller_arrival::ArrivalState::Unmeasured => {
-                    kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
-                }
-            };
-            arrival.limiting_factor().map(|reason| (factor, reason))
+            // `unaccounted_call_sites` is `Some(n)` only where both sides of the
+            // subtraction were read. `None` is a file the store holds no parse
+            // count for, and that is a gap in this reading rather than evidence
+            // about the focal.
+            let measured: Vec<String> = arrival
+                .unaccounted
+                .iter()
+                .filter_map(|file| {
+                    file.unaccounted_call_sites
+                        .filter(|missing| *missing > 0)
+                        .map(|missing| {
+                            format!(
+                                "{} ({missing} of {} parsed call sites became no edge)",
+                                file.file,
+                                file.parsed_call_sites.unwrap_or(0)
+                            )
+                        })
+                })
+                .collect();
+            if measured.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "{}: {} of the {} file(s) that can reach it hold call sites the linker \
+                 recorded no edge for, so a caller may be among them: {}",
+                kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR,
+                measured.len(),
+                arrival.family_files,
+                measured.join(", ")
+            ))
         });
-        if let Some((factor, reason)) = gap.clone() {
-            arrival_rows.insert(entity.id, factor);
-            arrival_reasons.entry(factor).or_insert(reason);
+        if let Some(reason) = gap.clone() {
+            arrival_rows.insert(entity.id);
+            arrival_reasons.insert(reason);
         }
     }
     let row_is_unverified = |entity: &kin_model::Entity| {
@@ -335,7 +362,7 @@ fn build_dead_code_report(
             || name_only_ids.contains(&entity.id)
             || unsupportable.contains_key(&entity.language.to_string())
             || method_row(entity)
-            || arrival_rows.contains_key(&entity.id)
+            || arrival_rows.contains(&entity.id)
     };
     let unverified_rows = unreferenced.iter().filter(|e| row_is_unverified(e)).count();
     let mut unverified_reasons: Vec<String> = unsupportable.values().cloned().collect();
@@ -367,14 +394,14 @@ fn build_dead_code_report(
     // Counted across both lists for the same reason methods are: a test-only row
     // claims no PRODUCTION caller exists, and an unaccounted arrival is exactly
     // the shape a production caller goes missing in.
-    for (factor, reason) in &arrival_reasons {
-        let rows = unreferenced
-            .iter()
-            .chain(test_only.iter())
-            .filter(|entity| arrival_rows.get(&entity.id) == Some(factor))
-            .count();
+    let arrival_row_count = unreferenced
+        .iter()
+        .chain(test_only.iter())
+        .filter(|entity| arrival_rows.contains(&entity.id))
+        .count();
+    for reason in &arrival_reasons {
         unverified_reasons.push(format!(
-            "{rows} listed entities sit in a file where {reason}"
+            "{arrival_row_count} listed entities sit in a file where {reason}"
         ));
     }
     unverified_reasons.extend(manifest_gap.clone());
@@ -474,8 +501,11 @@ fn build_dead_code_report(
                 "  [unverified: {}] ",
                 kin_core::reference_coverage::METHOD_ABSENCE_LIMITING_FACTOR
             )
-        } else if let Some(factor) = arrival_rows.get(&entity.id) {
-            format!("  [unverified: {factor}] ")
+        } else if arrival_rows.contains(&entity.id) {
+            format!(
+                "  [unverified: {}] ",
+                kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR
+            )
         } else if row_is_unverified(entity) {
             "  [unverified] ".to_string()
         } else {
@@ -1193,6 +1223,111 @@ mod tests {
     /// `kin_db::find_dead_code` builds the candidate set by excluding anything
     /// with a cross-file inbound edge, at any resolution, so a cross-file
     /// name-only edge removes an entity before this filter ever sees it. That
+    /// A module entity for a file, which is what `from . import mod` binds.
+    ///
+    /// The arrival family is built from files that named the focal's file in
+    /// their own source, and a module binding names it by landing a `References`
+    /// edge on this entity rather than an `Imports` edge on any function in it.
+    fn make_module_entity(name: &str, file: &str) -> Entity {
+        Entity {
+            kind: EntityKind::Module,
+            ..make_entity(name, file)
+        }
+    }
+
+    /// The FIR-2821 shape as a graph: a file reached only by a module binding,
+    /// whose one caller parsed more call sites than the graph holds edges for.
+    ///
+    /// `caller_parsed` is what the parser read in `src/cli.rs`. One of those
+    /// became an edge in every arm, so the arm with a higher count is the one
+    /// where calls went missing and a caller of `dead_target` could be among
+    /// them.
+    fn graph_with_module_binding(caller_parsed: u64) -> (InMemoryGraph, Entity) {
+        let graph = InMemoryGraph::new();
+        let dead_target = measured(make_entity("dead_target", "src/store.rs"), 0, 0);
+        let store_module = measured(make_module_entity("store", "src/store.rs"), 0, 0);
+        let caller = measured(make_entity("caller", "src/cli.rs"), caller_parsed, 1);
+        let neighbour = measured(make_entity("neighbour", "src/cli.rs"), caller_parsed, 1);
+        for entity in [&dead_target, &store_module, &caller, &neighbour] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // The module binding: cli.rs named store.rs in its own source.
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                store_module.id,
+                RelationKind::References,
+                0.9,
+            ))
+            .unwrap();
+        // The one call of the caller's that the linker did bind.
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                neighbour.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+        (graph, dead_target)
+    }
+
+    #[test]
+    fn a_row_whose_callers_could_arrive_unaccounted_says_so_on_the_row() {
+        // THE ARM FIR-2821 BOUGHT. `src/cli.rs` parsed three call sites and the
+        // graph holds one edge from it, and cli.rs can reach store.rs, so a
+        // caller of `dead_target` may be among the two that went missing. The
+        // stranger's scan printed exactly this row with no caveat at all while
+        // hedging the one row it could resolve, and deleting on it would have
+        // taken out a live function.
+        let (graph, _) = graph_with_module_binding(3);
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("dead_target"),
+            "the scan must still list the row; a check over a scan that listed nothing \
+             would pass every assertion below for the wrong reason: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "[unverified: {}] dead_target",
+                kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR
+            )),
+            "a row is read alone, pasted into a ticket or acted on by an agent that never saw \
+             the reasons above it, so it names the factor rather than only that one applies: \
+             {output}"
+        );
+        assert!(
+            !response.verified,
+            "a delete list carrying a row whose callers may not all be visible is not a \
+             verified answer: {output}"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_callers_all_resolved_carries_no_arrival_caveat() {
+        // THE CONTROL, and it is the half that stops the gate from becoming a
+        // blanket refusal. Every call site cli.rs parsed became an edge, so an
+        // absence over those edges is the whole set and this row is a find
+        // rather than a candidate. A gate that cannot stay silent teaches a
+        // reader to skip its label, which is the FIR-2821 inversion one level
+        // down.
+        let (graph, _) = graph_with_module_binding(1);
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("dead_target"),
+            "the row must still be listed: {output}"
+        );
+        assert!(
+            !output.contains(kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+            "no call site went missing in this graph, so nothing licenses an arrival caveat \
+             on any row of it: {output}"
+        );
+    }
+
     /// bound lives in kin-db, not here.
     #[test]
     fn a_name_only_edge_does_not_rescue_an_entity_and_its_row_says_why() {

@@ -38,8 +38,19 @@ reference line a caller reports must still carry the call when read against the
 file on disk, and an answer taken over a graph short of its own census must
 disclose that rather than presenting as clean. Each of the three runs its own
 control, and they share one experiment because the experiment is destructive.
-Every check names the ticket it is about, so a failure is attributable without
-reading the code.
+Check 22 covers FIR-2821. A function reached only through `from . import store`
+must not be listed, the one function nothing calls must be, and that row must
+carry no arrival caveat over a store where every call site became an edge. The
+v0.6.1 stranger's scan listed eleven live functions with no caveat at all while
+hedging the one row it could resolve, and the first two arms are that finding in
+one assertion each. The gate that speaks up when the next edge kind goes missing
+is falsified in `dead_code`'s own unit tests rather than here, because the
+reading it keys on subtracts parsed call sites from resolved edges and a
+converted store does not carry the parse side: on this fixture's shape `kin
+graph status` reports it "measured on 1 of 14 files". An end-to-end arm could
+only assert the absent-count branch, which fires on every file and would pin
+that gap as correct. Every check names the ticket it is about, so a failure is
+attributable without reading the code.
 
 `parse_hole_repro.py` covers what the others cannot see: a file the
 repository admits that produced no entity at all. It builds a JavaScript library

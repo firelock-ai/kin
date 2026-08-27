@@ -224,8 +224,8 @@ impl CallerArrival {
                             file.parsed_call_sites.unwrap_or(0)
                         ),
                         None => format!(
-                            "{} (call extraction was incomplete, so its call sites were never \
-                             counted)",
+                            "{} (the store holds no parse-side call count for this file, so \
+                             its call sites could not be accounted for)",
                             file.file
                         ),
                     })
@@ -570,7 +570,7 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
                                     .and_then(serde_json::Value::as_u64)
                                 {
                                     Some(missing) => format!("{path} ({missing} unaccounted)"),
-                                    None => format!("{path} (call extraction incomplete)"),
+                                    None => format!("{path} (no parse-side count in store)"),
                                 },
                             )
                         })
@@ -931,8 +931,11 @@ mod tests {
             .limiting_factor()
             .expect("an unmeasured file limits the answer");
         assert!(
-            factor.contains("call extraction was incomplete"),
-            "the reason must say the count is absent rather than zero: {factor}"
+            factor.contains("no parse-side call count"),
+            "the reason must say the count is absent rather than zero, and must not name a \
+             cause it cannot know: a file reaches this branch both when the parser withheld \
+             the count and when the store simply does not hold one, and on a converted store \
+             today the second is the common case: {factor}"
         );
     }
 

@@ -396,6 +396,35 @@ class Suite(object):
             raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
         self._kin_init(repo)
 
+    def _build_relimport(self, repo):
+        """A package whose CLI reaches its modules by relative module import.
+
+        The stranger's own shape, trimmed to three files. `pkg/cli.py` writes
+        `from . import store` and then `store.connect(path)`, which is ordinary
+        Python and is the shape that produced no Calls edge at all before
+        kin#1181: the receiver resolved to `pkg/__init__.py` and the callee lives
+        in the sibling `pkg/store.py`.
+
+        Every call in this fixture resolves, deliberately. It is the arm that
+        says a genuinely dead function still reads dead and reads dead WITHOUT a
+        caveat, so the gate the sibling fixture exercises cannot pass here by
+        labelling everything.
+        """
+        self._relimport_files(repo)
+
+    def _relimport_files(self, repo):
+        self.git(["init", "-q", "."], repo)
+        self._write(repo, "pkg/__init__.py",
+                    '"""pkg: a tiny package reached through a relative module '
+                    'import."""\n\n__version__ = "0.1.0"\n')
+        self._write(repo, "pkg/store.py", RELIMPORT_STORE_PY)
+        self._write(repo, "pkg/cli.py", RELIMPORT_CLI_PY)
+        self.git(["add", "-A"], repo)
+        rc, out, err = self.git(["commit", "-q", "-m", "initial relimport fixture"], repo)
+        if rc != 0:
+            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+        self._kin_init(repo)
+
     def _build_venv(self, repo):
         self.git(["init", "-q", "."], repo)
         self._write(repo, ".gitignore", "*.log\n")
@@ -934,6 +963,16 @@ This file has no language adapter. Nothing can enumerate it, so nothing may
 certify an enumeration of it.
 """
 
+# FIR-2821. `from . import store` binds the MODULE and no name inside it, so the
+# graph records a References edge into store.py's Module entity and no Imports
+# edge into any of its entities. Every function reached that way looked
+# uncalled: the v0.6.1 stranger's `kin dead-code` listed eleven live functions,
+# two of which run on every invocation of the program, with no caveat on any of
+# them while the one row it could resolve carried a careful one.
+RELIMPORT_LIVE_FUNCTION = "connect"
+RELIMPORT_DEAD_FUNCTION = "orphaned_helper"
+RELIMPORT_ARRIVAL_FACTOR = "caller_arrival_unresolved"
+
 REEXPORT_BENIGN_FILE = "src/prelude.rs"
 REEXPORT_DEAD_FUNCTION = "legacy_shim"
 
@@ -967,6 +1006,30 @@ pub fn legacy_shim(text: &str) -> String {
 
 REEXPORT_PRELUDE_RS = '''pub use crate::core::load;
 '''
+
+RELIMPORT_STORE_PY = '''"""Storage helpers, reached only through a relative module import."""
+
+
+def connect(path):
+    """Open the store. Called from cli.py as `store.connect(path)`."""
+    return {"path": path}
+
+
+def orphaned_helper(value):
+    """Nothing in this repository calls this. It is the genuinely dead one."""
+    return value
+'''
+
+RELIMPORT_CLI_PY = '''"""The command line, which reaches its modules by relative module import."""
+
+from . import store
+
+
+def main(path):
+    """Every call here resolves, so this file leaves no arrival gap."""
+    return store.connect(path)
+'''
+
 
 # The verdict sentence `kin dead-code` opens with. A run whose output matches
 # none of these is unreadable rather than passing: the check cannot grade an
@@ -2896,6 +2959,114 @@ def check_21(suite):
     return res
 
 
+def check_22(suite):
+    """FIR-2821: a function reached by relative module import is not dead code.
+
+    The v0.6.1 stranger asked the one question a graph is supposed to answer
+    better than grep, and `kin dead-code` named twelve entities of which eleven
+    were live. `connect` and `ingest_directory` run on every invocation of the
+    program. The shape is `from . import store` then `store.connect(path)`: the
+    receiver resolves to the package `__init__` and the callee is defined in the
+    sibling module, so before kin#1181 no Calls edge was produced at all. What
+    made it the worst failure of that session was where the hedging went. The one
+    row the tool could resolve carried a careful caveat and the eleven wrong ones
+    carried none.
+
+    Both halves are pinned here and each has its own control, because either
+    alone leaves a stranger deletable.
+
+    Arms 1 and 2 are the edge. `connect` is reached only through the relative
+    module import, so it must not be listed, and `orphaned_helper` is reached by
+    nothing, so it must be. Without arm 2 this check passes over a scan that
+    reports nothing at all. Arm 3 is the same row read for its label: on a
+    fixture where every call resolves, a dead row is a find rather than a
+    candidate and carries no caveat, which is what stops arm 4's gate from
+    passing by labelling everything.
+
+    The gate's own arms are NOT here, and that is a finding rather than a
+    shortcut. The reading it keys on subtracts a file's resolved call edges from
+    the call sites the parser read there, and on a converted store the parse
+    side is not present to subtract: on this fixture's own shape `kin graph
+    status` reports the python parse side "measured on 1 of 14 files". So an
+    end-to-end arm here could only assert the absent-count branch, which fires
+    on every file and would pin the missing plumbing as correct. The gate is
+    falsified where its inputs can be set instead, in
+    `dead_code::tests::a_row_whose_callers_could_arrive_unaccounted_says_so_on_the_row`
+    and its silent-control sibling. Arm 3 below is what this suite CAN say about
+    it end to end: over a store where nothing went missing, no row is labeled.
+    """
+    res = Result("22", "FIR-2821",
+                 "dead-code over a relative module import, and its arrival gate")
+
+    def listed_rows(repo):
+        scan = suite.dead_code(repo)
+        found = {}
+        for line in scan["raw"].splitlines():
+            match = DEAD_CODE_ROW.match(line)
+            if match:
+                found[match.group(2)] = (match.group(1) or "").strip()
+        if not found:
+            # A conversion's enrichment lands asynchronously, so a scan fired
+            # straight after `kin init` can read a graph that has not resolved
+            # the fixture's cross-file call yet. Bounded, and a scan that
+            # withholds its answer keeps withholding it across the retry.
+            time.sleep(3)
+            scan = suite.dead_code(repo)
+            for line in scan["raw"].splitlines():
+                match = DEAD_CODE_ROW.match(line)
+                if match:
+                    found[match.group(2)] = (match.group(1) or "").strip()
+        return scan, found
+
+    clean, listed = listed_rows(suite.fixture("relimport"))
+    verdict = ""
+    for line in clean["raw"].splitlines():
+        stripped = line.strip()
+        if DEAD_CODE_VERDICT.match(stripped):
+            verdict = stripped
+            break
+    if not verdict:
+        excerpt = " / ".join(line.strip() for line in clean["raw"].splitlines()
+                             if line.strip() and "WARN" not in line)
+        res.unknown("kin dead-code rc=%d printed no verdict sentence this suite can read: %s"
+                    % (clean["rc"], excerpt[-300:] or "(no output)"))
+        return res
+
+    # Arm 2 first, because it is what makes arm 1 mean anything. A scan that
+    # listed nothing satisfies "connect is not listed" for the wrong reason.
+    if RELIMPORT_DEAD_FUNCTION not in listed:
+        res.bad("%s is called by nothing in this fixture and was not listed, so this check "
+                "would pass over a scan that reports nothing at all. Verdict: %s. Listed: %s"
+                % (RELIMPORT_DEAD_FUNCTION, verdict,
+                   ", ".join(sorted(listed)) or "(nothing)"))
+        return res
+    res.ok("the one function nothing calls is listed (%d row(s): %s)"
+           % (len(listed), ", ".join(sorted(listed))))
+
+    # Arm 1. The whole finding, in one assertion.
+    if RELIMPORT_LIVE_FUNCTION in listed:
+        res.bad("%s is called from pkg/cli.py through `from . import store` and dead-code "
+                "lists it as unreferenced; a stranger acting on this row deletes a live "
+                "function. Row label: %r"
+                % (RELIMPORT_LIVE_FUNCTION, listed[RELIMPORT_LIVE_FUNCTION]))
+    else:
+        res.ok("%s is reached through the relative module import and is not listed"
+               % RELIMPORT_LIVE_FUNCTION)
+
+    # Arm 3. The gate must be able to stay silent, or it is a gate that never
+    # certifies and a reader learns to skip its label.
+    clean_label = listed[RELIMPORT_DEAD_FUNCTION]
+    if RELIMPORT_ARRIVAL_FACTOR in clean_label:
+        res.bad("the row for %s is labeled %s over a fixture where every call site became an "
+                "edge, so the arrival gate cannot certify anything and its label carries no "
+                "information" % (RELIMPORT_DEAD_FUNCTION, clean_label))
+    else:
+        res.ok("on a fixture with no unresolved call site the dead row carries no arrival "
+               "caveat (label: %r)" % clean_label)
+
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -2919,6 +3090,7 @@ CHECKS = [
     ("19", check_19),
     ("20", check_20),
     ("21", check_21),
+    ("22", check_22),
 ]
 
 
