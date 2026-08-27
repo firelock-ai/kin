@@ -11268,6 +11268,14 @@ fn collect_active_managed_runtime_pids(
     let mut pids = Vec::new();
     for (pid, process) in system.processes() {
         let pid = pid.as_u32();
+        // A thread carries its owning process's executable and argv, so an
+        // unfiltered scan returns one serving process once per thread. This
+        // matcher feeds a fail-closed preflight and a drain scan, so the extra
+        // pids refuse an update that should proceed and send the drain after
+        // tids that were never processes (FIR-2823).
+        if process.thread_kind().is_some() {
+            continue;
+        }
         let command = process_command(process);
         let matched =
             process.exe().is_some_and(|executable| {

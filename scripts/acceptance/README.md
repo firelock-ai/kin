@@ -165,11 +165,31 @@ above it. Both checks are Linux, and both say so off it: the macOS reader
 `kin-daemon-spawn` and no end-to-end arm here, because there is no second kernel
 figure to grade it against without root.
 
-Those two run twice in CI, and the second run is the one that can fail. A runner
-has no memory cap, so check 10's cgroup arm has nothing to hold a published
-figure under and check 11's derived budget is gigabytes; the workflow therefore
-runs `--only 10 --only 11` again inside `docker run --memory=2g`, which is the
-shape the defect was found in. Against shipped 0.5.51 bytes in exactly that
+Check 12 grades the TREE that reading was taken over (FIR-2823). Linux lists a
+process's threads under `/proc/<pid>/task` and `sysinfo` returns them from
+`processes()` beside real processes, each with its own tid as a pid and its
+owning process as its parent, so a walk that does not exclude them counts one
+daemon once per thread. Threads share an address space, so each reads back the
+whole process's proportional set, and the v0.6.1 stranger was shown a 1.41 GiB
+daemon published at 10.35 GiB with `child_count: 11` against zero child
+processes. Check 11 could not catch it: when the published `child_count`
+disagrees with the descendants it reads, it declines to grade on the reasoning
+that the two readings are of different trees, and a daemon counting its threads
+produces that disagreement on every run, so the arm skipped and the suite passed.
+Check 12 grades that number, reading the descendant set before and after the
+standing is published and grading only where the two agree, so a short-lived
+child during init is an unreadable tree rather than a defect. Its control is the
+reason it can fail at all and is asserted rather than assumed: a single-threaded
+process counts its threads and its child processes to the same number, so a
+one-thread daemon is reported UNREADABLE and never banked as a pass. Linux, and
+it says so off it, for the same reason as the two above.
+
+Checks 10 and 11 run twice in CI, and the second run is the one that can fail. A
+runner has no memory cap, so check 10's cgroup arm has nothing to hold a
+published figure under and check 11's derived budget is gigabytes; the workflow
+therefore runs `--only 10 --only 11` again inside `docker run --memory=2g`, which
+is the shape the defect was found in. Check 12 needs no cap, because a thread
+count is not a budget, so it runs once with the rest. Against shipped 0.5.51 bytes in exactly that
 setup both checks FAIL, quoting a daemon and twenty-three children published as
 holding 1.45 GiB inside a container the kernel charged 283 MiB, and a rung of
 `critical` against a derived budget of 1 GiB while the tree held 62 MiB.

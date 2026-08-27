@@ -116,6 +116,9 @@ TICKET_DEATH = "FIR-2650"
 # The footprint READING is a third ticket in the same class: the back-off was
 # right and the number it read was impossible.
 TICKET_FOOTPRINT = "FIR-2653"
+# A fourth, and the same reading again: the tree the daemon measured was its own
+# threads, so the figure was itself repeated once per thread.
+TICKET_THREADS = "FIR-2823"
 
 # The doctor row and the durable record this suite is about.
 ROW_ID = "host_memory_pressure"
@@ -281,6 +284,74 @@ def descendants_of(pid):
                 found.add(child)
                 frontier.append(child)
     return sorted(found)
+
+
+def settle_descendants(read, attempts=20, gap=0.5, sleep_fn=time.sleep):
+    """The descendant set once two consecutive reads agree, else None.
+
+    Pure over the injected `read`, so the agreement rule is falsifiable
+    without a daemon. A freshly initialized daemon holds short-lived children,
+    and a single before/after pair taken half a second apart lands exactly in
+    that churn: the first hosted run of check 12 read 4 then 1 and refused.
+    Two consecutive equal reads bound the claim to a quiet tree; a tree that
+    never quiets inside `attempts` reads returns None and the caller refuses.
+    """
+    previous = read()
+    for _ in range(max(attempts - 1, 1)):
+        sleep_fn(gap)
+        current = read()
+        if current == previous:
+            return current
+        previous = current
+    return None
+
+
+def thread_count(pid):
+    """How many threads `pid` runs, out of `/proc/<pid>/status`.
+
+    The other half of FIR-2823's arithmetic. Linux lists these under
+    `/proc/<pid>/task` and they are not processes: they share one address
+    space, so each reads back the whole process's proportional set. A published
+    child count that tracks this number rather than the descendant count is the
+    thread count wearing a child count's name.
+    """
+    try:
+        with open("/proc/%d/status" % pid) as handle:
+            for line in handle:
+                if line.startswith("Threads:"):
+                    return int(line.split()[1])
+    except (IOError, OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def footprint_child_verdict(child_count, real_children, threads):
+    """Grade a published child count against the kernel's own two numbers.
+
+    Pure, so both cases are falsifiable without a daemon.
+
+    `cannot-grade` is not a pass. A single-threaded process cannot tell the two
+    accountings apart, because counting its threads and counting its child
+    processes give the same answer, so a match there is evidence of nothing and
+    the caller must say so rather than bank it.
+
+    `over` requires the thread-counting shape, `child_count >= threads - 1`,
+    because the defect this grades sums the task rows and those exclude the
+    main thread. A smaller disagreement is `drifted`: the record was minted at
+    a different instant than the tree reading, which a daemon holding
+    short-lived children produces honestly, and grading it as `over` is how
+    this check false-alarmed on its first hosted run (child_count 4 against a
+    settled tree of 1 under 12 threads). Drifted is refused, never banked.
+    """
+    if child_count is None or real_children is None or threads is None:
+        return "cannot-grade"
+    if threads < 2:
+        return "cannot-grade"
+    if child_count == real_children:
+        return "matches"
+    if child_count >= threads - 1:
+        return "over"
+    return "drifted"
 
 
 def binding_cgroup_dir(pid):
@@ -561,6 +632,7 @@ GRADERS = {
     "offers_the_idle_window": offers_the_idle_window,
     "enrichment_names_a_kill": enrichment_names_a_kill,
     "row_reports_a_kill": row_reports_a_kill,
+    "footprint_child_verdict": footprint_child_verdict,
 }
 
 
@@ -1802,9 +1874,165 @@ def check_11(suite):
     return result
 
 
+def check_12(suite):
+    """FIR-2823: the published child count is processes, never threads.
+
+    Check 11 grades the published total against the tree's two summed readings,
+    but it declines to grade at all when the record's `child_count` disagrees
+    with the descendants this reads, on the reasoning that the two readings must
+    then be of different trees. A daemon counting its own threads as children
+    produces exactly that disagreement on every run, so the arm that would have
+    caught this one skipped instead and the suite reported a pass. This check is
+    the one that grades that number.
+
+    What the v0.6.1 stranger measured: a daemon holding 1.41 GiB published
+    itself at 10.35 GiB, `child_count: 11` against zero child processes, and the
+    same figure repeated once per thread. Background embedding refused on that
+    reading and psf/requests sat at 0 of 2116 vectors for the life of the
+    container, on a box with room the whole time.
+
+    The control is the reason this can fail at all, and it is asserted rather
+    than assumed: a single-threaded daemon counts its threads and its children
+    to the same number, so a match would prove nothing. The check reports
+    UNREADABLE unless the daemon it measured was actually running more than one
+    thread.
+
+    The kernel tree is read until it settles, two consecutive equal reads
+    inside a bound, and graded only then. A daemon holds short-lived children
+    during `kin init`, and the record is minted on the daemon's own cadence, so
+    a sub-thread disagreement between the record and the settled tree is the
+    two instants differing rather than the defect; only the thread-counting
+    shape, `child_count >= threads - 1`, grades as over.
+    """
+    result = Result(
+        "12", TICKET_THREADS,
+        "the published child count counts processes, and a thread is not one",
+    )
+    if not sys.platform.startswith("linux"):
+        result.unknown(
+            "no /proc on %s, and this is the one platform that publishes /proc/<pid>/task, "
+            "so there are no thread rows here to miscount. The same accounting is asserted "
+            "over a synthetic process table in kin_daemon::daemon, where eleven threads "
+            "carry one address space" % sys.platform
+        )
+        return result
+
+    repo = suite.fixture("threads-are-not-children")
+    rc, out = suite.restart_daemon(repo, pressure="nominal")
+    if rc != 0:
+        result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
+        return result
+    published = suite.publish_standing(repo)
+    # The record names its own pid, and `publish_standing` will not return one
+    # that names a predecessor. Taking the pid from the record rather than
+    # asking again is what makes this read and that count the same process.
+    pid = published.get("pid") or suite.daemon_pid(repo)
+    if pid is None:
+        result.unknown("no daemon pid for %s: standing=%s" % (repo, json.dumps(published)))
+        return result
+
+    footprint = published.get("footprint") or {}
+    child_count = footprint.get("child_count")
+    threads = thread_count(pid)
+
+    # Settled, because a daemon holds short-lived children during a sweep and a
+    # single pair taken half a second apart lands exactly in that churn, which
+    # is how this check refused on its first hosted run (4 then 1). The claim
+    # is bound to a quiet tree: two consecutive equal reads, bounded, and a
+    # tree that never quiets is reported, never averaged away.
+    trail = []
+    after = settle_descendants(
+        lambda: trail.append(descendants_of(pid)) or trail[-1]
+    )
+    if after is None:
+        result.unknown(
+            "the daemon's child processes changed under the reading (%s), so the "
+            "published count and this one describe different trees"
+            % " then ".join(str(len(t)) for t in trail)
+        )
+        return result
+    if threads is None or child_count is None:
+        result.unknown(
+            "could not read both numbers: threads=%s published child_count=%s standing=%s"
+            % (threads, child_count, json.dumps(published))
+        )
+        return result
+
+    verdict = footprint_child_verdict(child_count, len(after), threads)
+    if verdict == "drifted":
+        result.unknown(
+            "the record's child_count %d disagrees with the settled tree's %d by less than "
+            "its %d threads, which is the shape of a record minted while short-lived "
+            "children came or went, not of thread-counting; a record and a tree from "
+            "different instants are not graded against each other"
+            % (child_count, len(after), threads)
+        )
+        return result
+    if verdict == "cannot-grade":
+        result.unknown(
+            "this daemon ran %s thread(s), and a process with one thread counts its threads "
+            "and its children to the same number, so this arm could not have failed and is "
+            "not reported as a pass" % threads
+        )
+        return result
+
+    result.ok(
+        "control: the daemon ran %d threads, so counting threads and counting child "
+        "processes are distinguishable here" % threads
+    )
+    if verdict == "over":
+        result.bad(
+            "the daemon publishes child_count %d against %d real child process(es) while "
+            "running %d threads. Threads share one address space, so each reads back the "
+            "whole process's proportional set and the total is the daemon repeated once per "
+            "thread: this is what published a 1.41 GiB daemon at 10.35 GiB and refused the "
+            "background embedding that left a repository at 0 of 2116 vectors"
+            % (child_count, len(after), threads)
+        )
+        return result
+    result.ok(
+        "child_count %d is the %d child process(es) this reads from /proc, not the %d "
+        "threads beside them" % (child_count, len(after), threads)
+    )
+
+    # The consequence, on the surface it had one. A daemon counted once per
+    # process fits its own derived budget; counted once per thread it does not,
+    # which is the whole of what this ticket cost.
+    own = _published_own_bytes(published)
+    total = (own or 0) + (footprint.get("children_bytes") or 0)
+    mine = proportional_bytes(pid)
+    if after:
+        # A real child holds real bytes, and separating them from a per-thread
+        # sum needs a per-process reading this arm does not take. Check 11
+        # already grades the tree total against its two summed readings, so the
+        # honest thing is to say which arm ran rather than to grade a number
+        # this one cannot attribute.
+        result.ok(
+            "bytes arm: not run, the daemon holds %d real child process(es) whose bytes this "
+            "arm cannot separate from a per-thread sum; check 11 grades that total" % len(after)
+        )
+    elif own is None or mine is None:
+        result.unknown("no published own figure or no /proc reading for pid %s" % pid)
+    elif total >= mine * 2:
+        result.bad(
+            "the daemon has no child processes and %d threads, yet publishes %d bytes against "
+            "its own /proc reading of %d. With nothing else in the tree the published total is "
+            "this process counted more than once, which is the summing this check exists to "
+            "catch" % (threads, total, mine)
+        )
+    else:
+        result.ok(
+            "with no child processes and %d threads, the published total of %d bytes stays "
+            "beside the daemon's own /proc reading of %d rather than a multiple of it"
+            % (threads, total, mine)
+        )
+    return result
+
+
 CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
           ("4", check_4), ("5", check_5), ("6", check_6), ("7", check_7),
-          ("8", check_8), ("9", check_9), ("10", check_10), ("11", check_11)]
+          ("8", check_8), ("9", check_9), ("10", check_10), ("11", check_11),
+          ("12", check_12)]
 
 
 # ------------------------------------------------------------------ self-test
@@ -2092,6 +2320,64 @@ def self_test():
             failures.append("total_fits_the_kernel_charge(%s, %s, %s) != %s"
                             % (total, charged, cap, want))
 
+    # FIR-2823. The two shapes that matter are the measured ones, and they must
+    # give opposite verdicts: a threaded daemon with no child processes, and the
+    # same daemon publishing its thread count as a child count.
+    child_cases = [
+        # the measured defect: eleven threads, no child processes, eleven
+        # children published.
+        ("over", (11, 0, 12)),
+        # the same daemon counted correctly.
+        ("matches", (0, 0, 12)),
+        # a daemon that really did start a language server, counted correctly.
+        ("matches", (1, 1, 12)),
+        # and the same one with its threads added on top.
+        ("over", (12, 1, 12)),
+        # a single-threaded process counts its threads and its children to the
+        # same number, so this arm cannot fail and must not be banked as a pass.
+        ("cannot-grade", (0, 0, 1)),
+        ("cannot-grade", (0, 0, None)),
+        ("cannot-grade", (None, 0, 12)),
+        ("cannot-grade", (5, None, 12)),
+        # the first hosted run: a record minted while four short-lived children
+        # lived, read against a settled tree of one, under twelve threads. The
+        # disagreement is smaller than the thread count, so it is two instants,
+        # not thread-counting, and it must refuse rather than false-alarm.
+        ("drifted", (4, 1, 12)),
+        # a record minted before a child spawned drifts the other way.
+        ("drifted", (0, 2, 12)),
+        # the boundary: task rows exclude the main thread, so the defect's
+        # smallest shape is threads minus one.
+        ("over", (11, 0, 12)),
+        ("drifted", (10, 0, 12)),
+    ]
+    for want, (child_count, real_children, threads) in child_cases:
+        got = footprint_child_verdict(child_count, real_children, threads)
+        if got != want:
+            failures.append("footprint_child_verdict(%s, %s, %s) = %s, wanted %s"
+                            % (child_count, real_children, threads, got, want))
+
+    # FIR-2823, the reading protocol. Pure over an injected reader, so the
+    # agreement rule is falsifiable here: a settle that returned its first
+    # read, or one that never gave up, fails these in seconds.
+    def scripted_reader(sequence):
+        reads = list(sequence)
+        return lambda: reads.pop(0) if len(reads) > 1 else reads[0]
+    settle_cases = [
+        # a quiet tree settles on the second read.
+        ([1], [[1], [1]], "stable"),
+        # churn first, then quiet: the first hosted run's shape, 4 then 1.
+        ([1], [[1, 2, 3, 4], [1], [1]], "late"),
+        # a tree that never quiets returns None inside the bound.
+        (None, [[1], [2], [1], [2], [1], [2]], "never"),
+    ]
+    for want, sequence, name in settle_cases:
+        got = settle_descendants(scripted_reader(sequence),
+                                 attempts=5, gap=0, sleep_fn=lambda _: None)
+        if got != want:
+            failures.append("settle_descendants(%s case) = %s, wanted %s"
+                            % (name, got, want))
+
     grade_cases = [
         (PASS, [(PASS, "a")]),
         (FAIL, [(PASS, "a"), (FAIL, "b")]),
@@ -2114,7 +2400,8 @@ def self_test():
              + len(memory_cases) + len(idle_cases) + len(enrichment_cases)
              + len(kill_row_cases) + len(warning_cases) + len(line_cases)
              + len(tail_cases) + len(grade_cases)
-             + len(proportional_cases) + len(charge_cases))
+             + len(proportional_cases) + len(charge_cases)
+             + len(child_cases) + len(settle_cases))
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0
