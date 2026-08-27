@@ -10029,84 +10029,13 @@ fn resolve_repository_ref_target(
     target: &kin_model::RefTarget,
 ) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
     let metadata = repository_metadata(snapshot)?;
-    let mut target = target.clone();
-    let mut seen = HashSet::new();
-    loop {
-        match target {
-            kin_model::RefTarget::Change { change_id } => return Ok(change_id),
-            kin_model::RefTarget::ExternalObject { object }
-                if object.kind == kin_model::ExternalObjectKind::Commit =>
-            {
-                return metadata
-                    .aliases
-                    .iter()
-                    .find(|alias| alias.oid == object.oid)
-                    .map(|alias| alias.change_id)
-                    .ok_or_else(|| {
-                        (
-                            StatusCode::FAILED_DEPENDENCY,
-                            format!(
-                                "external commit {} has no repository-v6 semantic alias",
-                                object.oid
-                            ),
-                        )
-                    });
-            }
-            kin_model::RefTarget::ExternalObject { object } => {
-                return Err((
-                    StatusCode::FAILED_DEPENDENCY,
-                    format!(
-                        "repository ref targets external {:?} {}; exact history requires a materializable commit target",
-                        object.kind, object.oid
-                    ),
-                ));
-            }
-            kin_model::RefTarget::Symbolic { target: name } => {
-                if !seen.insert(name.clone()) {
-                    return Err((
-                        StatusCode::FAILED_DEPENDENCY,
-                        format!("repository ref cycle reaches {name}"),
-                    ));
-                }
-                target = metadata
-                    .ref_state
-                    .refs
-                    .iter()
-                    .find(|repository_ref| repository_ref.name == name)
-                    .map(|repository_ref| repository_ref.target.clone())
-                    .ok_or_else(|| {
-                        (
-                            StatusCode::FAILED_DEPENDENCY,
-                            format!("symbolic repository ref target {name} is missing"),
-                        )
-                    })?;
-            }
-        }
-    }
+    crate::state::resolve_repository_target(metadata, target).map_err(repository_authority_error)
 }
 
 fn default_repository_ref(
     metadata: &kin_db::PersistedRepositoryAuthority,
-) -> Option<&kin_model::RepositoryRef> {
-    metadata
-        .ref_state
-        .default_ref
-        .as_ref()
-        .and_then(|name| {
-            metadata
-                .ref_state
-                .refs
-                .iter()
-                .find(|repository_ref| &repository_ref.name == name)
-        })
-        .or_else(|| {
-            metadata
-                .ref_state
-                .refs
-                .iter()
-                .find(|repository_ref| repository_ref.name.is_branch())
-        })
-        .or_else(|| metadata.ref_state.refs.first())
+) -> Result<Option<&kin_model::RepositoryRef>, (StatusCode, String)> {
+    crate::state::select_repository_default_ref(metadata).map_err(repository_authority_error)
 }
 
 fn repository_tree_at(
@@ -10945,7 +10874,7 @@ async fn repo_files(
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
     let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
     let metadata = repository_metadata(&snapshot)?;
-    let files = if let Some(repository_ref) = default_repository_ref(metadata) {
+    let files = if let Some(repository_ref) = default_repository_ref(metadata)? {
         let change_id = resolve_repository_ref_target(&snapshot, &repository_ref.target)?;
         repository_tree_at(snapshot, &change_id)?
             .into_artifacts()
@@ -10975,7 +10904,7 @@ async fn repo_refs(
             None
         }
     });
-    let selected = default_repository_ref(metadata);
+    let selected = default_repository_ref(metadata)?;
     let selected_head = selected.map(|repository_ref| match &repository_ref.target {
         kin_model::RefTarget::Change { change_id } => change_id.to_string(),
         kin_model::RefTarget::ExternalObject { object } => object.oid.to_string(),
@@ -11034,7 +10963,7 @@ async fn repo_history(
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
     let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
     let metadata = repository_metadata(&snapshot)?;
-    let Some(repository_ref) = default_repository_ref(metadata) else {
+    let Some(repository_ref) = default_repository_ref(metadata)? else {
         return Ok(Json(RepoHistoryResponse {
             repo_id,
             branch_name: metadata.ref_state.default_ref.as_ref().map(short_ref_name),
@@ -16992,6 +16921,311 @@ mod tests {
                 .is_some_and(|authority| !authority.ref_state.refs.is_empty()),
             "the hosted replica must publish the ref the bootstrap established"
         );
+    }
+
+    /// A schema-4 Git bootstrap persists repository authority, whose top-level
+    /// graph domains are empty by construction. Hosted entity and provenance
+    /// routes must resolve the default ref rather than mistake those empty
+    /// authority caches for the graph the ref names.
+    ///
+    /// Both hosted load paths are pinned here. The first query after receive is
+    /// a lazy reload because receive evicts the repository cache. The second is
+    /// a fresh daemon open against the exact persisted bytes. A restart cannot
+    /// be allowed to change the answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hosted_authority_materialization_survives_schema_four_receive_and_reopen() {
+        let repo_id = format!("hosted-materialize-{}", Uuid::new_v4().simple());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+
+        install_test_registry_override();
+        let source_working = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(source_working.path().join("src")).unwrap();
+        run_test_git(source_working.path(), ["init", "--initial-branch=main"]);
+        run_test_git(
+            source_working.path(),
+            ["config", "user.email", "kin@example.invalid"],
+        );
+        run_test_git(
+            source_working.path(),
+            ["config", "user.name", "Kin Materialization Test"],
+        );
+        std::fs::write(
+            source_working.path().join("src/lib.rs"),
+            b"pub fn greeting(name: &str) -> String { format!(\"hello {name}\") }\n\
+              pub fn greet_world() -> String { greeting(\"world\") }\n",
+        )
+        .unwrap();
+        run_test_git(source_working.path(), ["add", "--all"]);
+        run_test_git(
+            source_working.path(),
+            ["commit", "-s", "-m", "import semantic fixture"],
+        );
+
+        let initialized = kin_core::init_from_git_adopting(source_working.path(), &repository_id)
+            .expect("the source fixture must be admitted through the real Git import");
+        let source_backend = Arc::new(kin_db::LocalFileBackend::new(
+            initialized.layout.kindb_dir(),
+        ));
+        let source_authority =
+            RepositoryAuthorityManager::open(repository_id.clone(), Arc::clone(&source_backend))
+                .unwrap();
+        let source_state = Arc::new(
+            DaemonState::open_with_repo_id(initialized.layout, None)
+                .expect("the imported source daemon must open"),
+        );
+
+        let (status, body) = repo_route(
+            Arc::clone(&source_state),
+            &format!("/repos/{repo_id}/entities"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let source_entities: RepoEntitiesResponse = serde_json::from_slice(&body).unwrap();
+        assert!(
+            !source_entities.entities.is_empty(),
+            "the real Git import must bind semantic entities into its change"
+        );
+        let source_entity_facts = source_entities
+            .entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.id.clone(),
+                    (
+                        entity.name.clone(),
+                        entity.kind.clone(),
+                        entity.file_path.clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let (status, body) = repo_route(
+            Arc::clone(&source_state),
+            &format!("/repos/{repo_id}/provenance/verify"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let source_provenance: RepoProvenanceVerifyResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert!(source_provenance.valid);
+        assert_eq!(
+            source_provenance.checked_entities,
+            source_entity_facts.len()
+        );
+
+        let (destination_state, _destination_working, destination_storage) =
+            replica_state(&repo_id);
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+        let destination_authority = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(
+                destination_storage.path().to_path_buf(),
+            )),
+        )
+        .unwrap();
+        let status = kin_remote::repository_transfer::repository_transfer_status(
+            &destination_authority,
+            &repository_id,
+            &destination_ref,
+        )
+        .unwrap();
+        let expectation =
+            kin_remote::repository_transfer::RepositoryTransferExpectation::try_from(status)
+                .unwrap();
+        let segment = kin_remote::repository_transfer::build_repository_transfer_segment(
+            &source_authority,
+            &destination_ref,
+            &expectation,
+        )
+        .unwrap();
+        assert!(
+            segment.is_final(),
+            "the one-file fixture must fit one segment"
+        );
+        assert_eq!(
+            segment.pack.schema_version,
+            kin_remote::repository_transfer::REPOSITORY_TRANSFER_SCHEMA_VERSION
+        );
+        assert_eq!(segment.pack.schema_version, 4);
+        assert!(
+            segment
+                .pack
+                .changes
+                .iter()
+                .any(|change| !change.entity_deltas.is_empty()),
+            "schema 4 must carry the imported semantic entity deltas"
+        );
+
+        let response = router(Arc::clone(&destination_state))
+            .oneshot(
+                Request::post(format!("/repos/{repo_id}/transfer/receive"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({
+                            "destination_ref": destination_ref,
+                            "pack": segment.pack,
+                        }))
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let receive_status = response.status();
+        let receive_body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            receive_status,
+            StatusCode::OK,
+            "schema-4 receive must commit: {}",
+            String::from_utf8_lossy(&receive_body)
+        );
+        assert!(
+            !destination_state
+                .list_loaded_repos()
+                .await
+                .iter()
+                .any(|loaded| loaded == &repo_id),
+            "receive must evict the old graph so the next route is a lazy reload"
+        );
+
+        // This is the negative control for the incident. Repository-v6 stores
+        // the semantics in immutable changes and deliberately leaves the raw
+        // authority graph empty. Loading these top-level fields directly is
+        // therefore guaranteed to return the production symptom.
+        let recovered = kin_db::load_recovered_snapshot(
+            &kin_db::LocalFileBackend::new(destination_storage.path().to_path_buf()),
+            &repo_id,
+        )
+        .unwrap()
+        .expect("receive must persist repository authority");
+        assert!(
+            recovered.snapshot.entities.is_empty(),
+            "the regression must retain the raw-authority shape that falsifies direct loading"
+        );
+        assert!(
+            recovered
+                .snapshot
+                .changes
+                .values()
+                .any(|change| !change.entity_deltas.is_empty()),
+            "the raw authority must still carry the semantic graph in history"
+        );
+
+        // Post-commit finalization reopens authority independently of both
+        // query-load paths. Its durable read index must be built from the same
+        // materialized ref, not from repository-v6's empty top-level caches.
+        destination_state
+            .finalize_committed_generation_for_test(recovered.generation)
+            .expect("post-commit finalization must materialize the admitted default ref");
+        let read_index = kin_db::ReadIndex::load(
+            &destination_state
+                .layout
+                .kindb_snapshot_path()
+                .with_extension("kidx"),
+        )
+        .expect("finalization must publish the read index");
+        assert_eq!(
+            u64::from(read_index.entity_count),
+            source_provenance.checked_entities as u64,
+            "post-commit finalization must index the transferred entity set"
+        );
+
+        let (status, body) = repo_route(
+            Arc::clone(&destination_state),
+            &format!("/repos/{repo_id}/entities"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let received_entities: RepoEntitiesResponse = serde_json::from_slice(&body).unwrap();
+        let received_entity_facts = received_entities
+            .entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.id.clone(),
+                    (
+                        entity.name.clone(),
+                        entity.kind.clone(),
+                        entity.file_path.clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            received_entity_facts, source_entity_facts,
+            "the immediate lazy reload must serve the exact source entity set"
+        );
+        let (status, body) = repo_route(
+            Arc::clone(&destination_state),
+            &format!("/repos/{repo_id}/provenance/verify"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let received_provenance: RepoProvenanceVerifyResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            received_provenance.checked_entities,
+            source_provenance.checked_entities
+        );
+        assert_eq!(
+            received_provenance.verified_entities,
+            source_provenance.verified_entities
+        );
+        assert_eq!(
+            received_provenance.graph_root_hash,
+            source_provenance.graph_root_hash
+        );
+        assert_eq!(received_provenance.valid, source_provenance.valid);
+
+        drop(destination_state);
+        let (reopened, _reopened_working) =
+            reopen_hosted_daemon(destination_storage.path(), &repo_id);
+        let (status, body) =
+            repo_route(Arc::clone(&reopened), &format!("/repos/{repo_id}/entities")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let reopened_entities: RepoEntitiesResponse = serde_json::from_slice(&body).unwrap();
+        let reopened_entity_facts = reopened_entities
+            .entities
+            .iter()
+            .map(|entity| {
+                (
+                    entity.id.clone(),
+                    (
+                        entity.name.clone(),
+                        entity.kind.clone(),
+                        entity.file_path.clone(),
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            reopened_entity_facts, source_entity_facts,
+            "a full hosted reopen must serve the exact source entity set"
+        );
+        let (status, body) = repo_route(
+            Arc::clone(&reopened),
+            &format!("/repos/{repo_id}/provenance/verify"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let reopened_provenance: RepoProvenanceVerifyResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            reopened_provenance.checked_entities,
+            source_provenance.checked_entities
+        );
+        assert_eq!(
+            reopened_provenance.verified_entities,
+            source_provenance.verified_entities
+        );
+        assert_eq!(
+            reopened_provenance.graph_root_hash,
+            source_provenance.graph_root_hash
+        );
+        assert_eq!(reopened_provenance.valid, source_provenance.valid);
     }
 
     // ── FIR-2729 / FIR-2746: the payload-bearing transfer harness ──────────

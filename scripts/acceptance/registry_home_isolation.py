@@ -72,6 +72,9 @@ TICKET = "FIR-2467"
 # symptom FIR-2467 was filed on: a scratch-home daemon printing one of these for
 # every repository on the operator's machine.
 PIN_WARNING = "sibling repository authority could not be pinned at daemon startup"
+PIN_SUMMARY = "sibling repository authority pinning was incomplete"
+PIN_DETAIL_LIMIT = 8
+BULK_PIN_FAILURES = PIN_DETAIL_LIMIT + 5
 
 REGISTRY_ID = re.compile(r'^\s*id\s*=\s*"([^"]+)"', re.M)
 REGISTRY_PATH = re.compile(r'^\s*path\s*=\s*"([^"]+)"', re.M)
@@ -184,6 +187,27 @@ def listed_ids(output):
     return ids
 
 
+def pin_summary(output):
+    """One aggregate pin diagnostic with integer fields, or None.
+
+    A missing aggregate and two aggregates are both unreadable. One startup has
+    one complete count surface; accepting the first of several would let a
+    restart or one warning per row hide in the same log and still pass.
+    """
+    lines = [line for line in strip_ansi(output or "").splitlines()
+             if PIN_SUMMARY in line]
+    if len(lines) != 1:
+        return None
+    fields = {}
+    for name in ("registry_rows", "self_rows_skipped", "pinned", "refused",
+                 "duplicate_identities", "detailed", "suppressed"):
+        match = re.search(r"\b%s=(\d+)\b" % re.escape(name), lines[0])
+        if match is None:
+            return None
+        fields[name] = int(match.group(1))
+    return fields
+
+
 class Result(object):
     def __init__(self, check_id, ticket, title):
         self.id = check_id
@@ -253,6 +277,10 @@ class Suite(object):
         base["HOME"] = self.real_home
         base.pop("KIN_MCP_REPO", None)
         base.pop("KIN_DIR", None)
+        # This suite is explicitly about enabled sibling pinning. An inherited
+        # opt-out would make the foreign-home assertion look sealed and disable
+        # the unbindable-sibling control at the same time.
+        base.pop("KIN_DISABLE_SPINE", None)
         if daemon:
             base["KIN_DAEMON_BIN"] = daemon
 
@@ -273,6 +301,7 @@ class Suite(object):
 
         self.scratch_registry = os.path.join(self.scratch_home, "registry.toml")
         self.repos = {}
+        self.bulk_pin_failures = 0
 
     # -- fixture construction
 
@@ -332,8 +361,30 @@ class Suite(object):
         """The repositories this run registered under the scratch KIN_HOME."""
         return [self.probe, self.roommate, self.stranger]
 
+    def append_bulk_unbindable_rows(self, count):
+        """Append deterministic missing-path rows after product registration.
+
+        The registry writer is covered by the fixture repositories above. This
+        arm needs a large reader input, not repeated repository initialization,
+        so it adds rows only after every product writer and daemon has stopped.
+        """
+        with open(self.scratch_registry, "a") as handle:
+            for index in range(count):
+                repo_id = "bulk-unbindable-%02d" % index
+                path = os.path.join(self.workdir, repo_id)
+                handle.write(
+                    "\n[[repos]]\n"
+                    "id = %s\n"
+                    "path = %s\n"
+                    "entities = 0\n"
+                    "last_commit = \"\"\n"
+                    "dependencies = []\n"
+                    % (json.dumps(repo_id), json.dumps(path))
+                )
+        self.bulk_pin_failures = count
+
     def setup(self):
-        """Build both homes and leave the registries in their final state."""
+        """Build both homes and leave registries in product-written state."""
         self.probe = self.fixture("probe", self.env)
         self.roommate = self.fixture("roommate", self.env)
         self.stranger = self.fixture("stranger", self.env)
@@ -363,6 +414,12 @@ class Suite(object):
         this startup's and not an earlier one's.
         """
         self.stop_daemon(self.probe, self.env)
+        # Checks 0 and 1 exercise the product-written registry and must not see
+        # the synthetic reader fixture. Add it only after those checks and only
+        # after this daemon has stopped, immediately before the startup whose
+        # warning cardinality check 2 grades.
+        if self.bulk_pin_failures == 0:
+            self.append_bulk_unbindable_rows(BULK_PIN_FAILURES)
         try:
             with open(self.daemon_log(), "w"):
                 pass
@@ -539,6 +596,35 @@ def check_2(suite):
         res.unknown("control: the unbindable sibling in the SCRATCH home (%s) drew "
                     "no pin warning, so an absent warning above proves nothing "
                     "about isolation" % stranger_id)
+
+    expected_refused = suite.bulk_pin_failures + 1  # bulk rows plus `stranger`
+    expected_detailed = min(expected_refused, PIN_DETAIL_LIMIT)
+    detailed = log.count(PIN_WARNING)
+    if detailed == expected_detailed:
+        res.ok("the %d refused row(s) produced %d bounded detailed warning(s), "
+               "not one warning per row" % (expected_refused, detailed))
+    else:
+        res.bad("the %d refused row(s) produced %d detailed warning(s), wanted %d"
+                % (expected_refused, detailed, expected_detailed))
+
+    summary = pin_summary(log)
+    expected_summary = {
+        "registry_rows": len(suite.own_repos()) + suite.bulk_pin_failures,
+        "self_rows_skipped": 1,
+        "pinned": 1,
+        "refused": expected_refused,
+        "duplicate_identities": 0,
+        "detailed": expected_detailed,
+        "suppressed": expected_refused - expected_detailed,
+    }
+    if summary is None:
+        res.bad("the daemon log carries no single readable aggregate pin summary")
+    elif summary == expected_summary:
+        res.ok("one aggregate pin warning accounts for every registry row: %s"
+               % summary)
+    else:
+        res.bad("aggregate pin warning was %s, wanted %s"
+                % (summary, expected_summary))
     return res
 
 
@@ -651,6 +737,22 @@ def self_test():
 
     case("ansi stripped", strip_ansi("\x1b[31mrepo_id\x1b[0m=x"), "repo_id=x")
     case("tail keeps the end", tail("abcdef", limit=3), "..." + "def")
+
+    summary_line = (
+        "WARN sibling repository authority pinning was incomplete "
+        "registry_rows=16 self_rows_skipped=1 pinned=1 refused=14 "
+        "duplicate_identities=0 detailed=8 suppressed=6"
+    )
+    case("aggregate pin summary reads exact integer fields",
+         pin_summary(summary_line),
+         {"registry_rows": 16, "self_rows_skipped": 1, "pinned": 1,
+          "refused": 14, "duplicate_identities": 0, "detailed": 8,
+          "suppressed": 6})
+    case("a missing pin summary is unreadable", pin_summary("ordinary log"), None)
+    case("two pin summaries are unreadable",
+         pin_summary(summary_line + "\n" + summary_line), None)
+    case("a pin summary missing a field is unreadable",
+         pin_summary(summary_line.replace(" suppressed=6", "")), None)
 
     scratch = {"probe": "/w/probe", "roommate": "/w/roommate"}
     case("id for a known path", id_for_path(scratch, "/w/roommate"), "roommate")

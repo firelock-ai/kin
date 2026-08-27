@@ -12,7 +12,6 @@ use kin_core::KinLayout;
 use kin_db::{
     LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager, StorageBackend,
 };
-#[cfg(test)]
 use kin_model::ChangeStore;
 use kin_model::{
     EntityId, EntityStore, FilePathId, Hash256, OperationId, RepoPath, RepositoryCommitReceipt,
@@ -26,6 +25,252 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::session_registry::SessionCoordinator;
+
+/// Borrowed immutable history used to materialize a hosted repository ref.
+///
+/// Repository-v6 snapshots intentionally leave their top-level graph domains
+/// empty. `ChangeStore::resolve_graph_at` needs only `get_change`, so borrowing
+/// the admitted change map avoids cloning the payload-heavy history into a
+/// throwaway graph before every hosted load.
+struct HostedAuthorityHistory<'a> {
+    changes: &'a HashMap<SemanticChangeId, SemanticChange>,
+}
+
+impl HostedAuthorityHistory<'_> {
+    fn unsupported(operation: &str) -> kin_db::KinDbError {
+        kin_db::KinDbError::StorageError(format!(
+            "{operation} is unavailable through a hosted authority materialization view"
+        ))
+    }
+}
+
+impl ChangeStore for HostedAuthorityHistory<'_> {
+    type Error = kin_db::KinDbError;
+
+    fn get_change(
+        &self,
+        id: &SemanticChangeId,
+    ) -> std::result::Result<Option<SemanticChange>, Self::Error> {
+        Ok(self.changes.get(id).cloned())
+    }
+
+    fn get_entity_history(
+        &self,
+        _id: &EntityId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+        Err(Self::unsupported("entity history"))
+    }
+
+    fn find_merge_bases(
+        &self,
+        _a: &SemanticChangeId,
+        _b: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChangeId>, Self::Error> {
+        Err(Self::unsupported("merge-base search"))
+    }
+
+    fn create_change(&self, _change: &SemanticChange) -> std::result::Result<(), Self::Error> {
+        Err(Self::unsupported("change creation"))
+    }
+
+    fn get_changes_since(
+        &self,
+        _base: &SemanticChangeId,
+        _head: &SemanticChangeId,
+    ) -> std::result::Result<Vec<SemanticChange>, Self::Error> {
+        Err(Self::unsupported("change-range listing"))
+    }
+}
+
+fn hosted_materialization_error(detail: impl Into<String>) -> kin_db::KinDbError {
+    kin_db::KinDbError::StorageError(detail.into())
+}
+
+/// Choose the replicated query view for a hosted repository.
+///
+/// Hosted replicas do not transfer a source workspace. The explicit default
+/// ref is the one repository-scoped view every replica does share. An unborn
+/// repository has no refs and materializes empty; once any ref exists, missing
+/// or dangling default-ref authority is refused rather than replaced with an
+/// invented branch choice.
+pub(crate) fn select_repository_default_ref(
+    metadata: &kin_db::PersistedRepositoryAuthority,
+) -> std::result::Result<Option<&kin_model::RepositoryRef>, kin_db::KinDbError> {
+    if metadata.ref_state.refs.is_empty() {
+        return Ok(None);
+    }
+    let default_ref = metadata.ref_state.default_ref.as_ref().ok_or_else(|| {
+        hosted_materialization_error(format!(
+            "repository {} has refs but no persisted default ref",
+            metadata.repository_id
+        ))
+    })?;
+    metadata
+        .ref_state
+        .refs
+        .iter()
+        .find(|repository_ref| &repository_ref.name == default_ref)
+        .map(Some)
+        .ok_or_else(|| {
+            hosted_materialization_error(format!(
+                "repository {} default ref {} is absent from persisted refs",
+                metadata.repository_id, default_ref
+            ))
+        })
+}
+
+/// Resolve a persisted ref target using only the authority envelope admitted
+/// with the snapshot. No Git checkout, object directory, or file projection is
+/// consulted.
+pub(crate) fn resolve_repository_target(
+    metadata: &kin_db::PersistedRepositoryAuthority,
+    target: &kin_model::RefTarget,
+) -> std::result::Result<SemanticChangeId, kin_db::KinDbError> {
+    let mut target = target.clone();
+    let mut seen_refs = HashSet::new();
+    loop {
+        match target {
+            kin_model::RefTarget::Change { change_id } => return Ok(change_id),
+            kin_model::RefTarget::Symbolic { target: name } => {
+                if !seen_refs.insert(name.clone()) {
+                    return Err(hosted_materialization_error(format!(
+                        "hosted repository ref cycle reaches {name}"
+                    )));
+                }
+                target = metadata
+                    .ref_state
+                    .refs
+                    .iter()
+                    .find(|repository_ref| repository_ref.name == name)
+                    .map(|repository_ref| repository_ref.target.clone())
+                    .ok_or_else(|| {
+                        hosted_materialization_error(format!(
+                            "hosted symbolic repository ref target {name} is missing"
+                        ))
+                    })?;
+            }
+            kin_model::RefTarget::ExternalObject { object } => {
+                let mut current = object;
+                let mut seen_objects = HashSet::new();
+                while current.kind == kin_model::ExternalObjectKind::Tag {
+                    if !seen_objects.insert(current) {
+                        return Err(hosted_materialization_error(format!(
+                            "hosted Git authority contains an annotated-tag cycle through {}",
+                            current.oid
+                        )));
+                    }
+                    let authority = metadata.git_external_authority.as_ref().ok_or_else(|| {
+                        hosted_materialization_error(format!(
+                            "hosted external tag {} has no persisted Git authority for exact peeling",
+                            current.oid
+                        ))
+                    })?;
+                    let entry = authority
+                        .closure
+                        .objects
+                        .iter()
+                        .find(|entry| entry.record.object == current)
+                        .ok_or_else(|| {
+                            hosted_materialization_error(format!(
+                                "hosted external tag {} is absent from persisted Git authority",
+                                current.oid
+                            ))
+                        })?;
+                    let mut targets = entry.dependencies.iter().filter_map(|dependency| {
+                        (dependency.kind == kin_model::GitObjectDependencyKind::TagTarget)
+                            .then_some(dependency.target)
+                    });
+                    current = targets.next().ok_or_else(|| {
+                        hosted_materialization_error(format!(
+                            "hosted external tag {} has no exact target",
+                            entry.record.object.oid
+                        ))
+                    })?;
+                    if targets.next().is_some() {
+                        return Err(hosted_materialization_error(format!(
+                            "hosted external tag {} has multiple exact targets",
+                            entry.record.object.oid
+                        )));
+                    }
+                }
+                if current.kind != kin_model::ExternalObjectKind::Commit {
+                    return Err(hosted_materialization_error(format!(
+                        "hosted repository ref target {:?} {} does not peel to a commit",
+                        current.kind, current.oid
+                    )));
+                }
+                return metadata
+                    .aliases
+                    .iter()
+                    .find(|alias| alias.oid == current.oid)
+                    .map(|alias| alias.change_id)
+                    .ok_or_else(|| {
+                        hosted_materialization_error(format!(
+                            "hosted external commit {} has no semantic change alias",
+                            current.oid
+                        ))
+                    });
+            }
+        }
+    }
+}
+
+/// Convert one raw repository-v6 authority snapshot into the non-authoritative
+/// graph its default ref names.
+///
+/// The durable authority keeps immutable semantic history and deliberately
+/// requires its top-level entity, relation, tree, and revision caches to be
+/// empty. Every hosted authority-to-query conversion must pass through this
+/// helper, or a valid transfer presents as a zero-entity repository.
+fn materialize_hosted_repository_snapshot(
+    mut snapshot: kin_db::GraphSnapshot,
+) -> Result<(kin_db::GraphSnapshot, Option<SemanticChangeId>)> {
+    let Some(metadata) = snapshot.repository_authority.as_ref() else {
+        // Envelope-free hosted snapshots predate repository-v6 and own their
+        // top-level graph directly. Preserve that compatibility path exactly.
+        return Ok((snapshot, None));
+    };
+
+    let selected = select_repository_default_ref(metadata)
+        .map_err(DaemonError::Graph)?
+        .cloned();
+    let (resolved, head) = match selected {
+        Some(repository_ref) => {
+            let head = resolve_repository_target(metadata, &repository_ref.target)
+                .map_err(DaemonError::Graph)?;
+            let resolved = HostedAuthorityHistory {
+                changes: &snapshot.changes,
+            }
+            .resolve_graph_at(&head)
+            .map_err(DaemonError::Graph)?;
+            (Some(resolved), Some(head))
+        }
+        None => (None, None),
+    };
+
+    match resolved {
+        Some(resolved) => {
+            snapshot.entities = resolved.entities;
+            snapshot.relations = resolved.relations;
+            snapshot.entity_revisions = resolved.entity_revisions;
+            snapshot.resolved_tree = resolved.tree;
+            snapshot.external_references = resolved.external_references;
+        }
+        None => {
+            snapshot.entities.clear();
+            snapshot.relations.clear();
+            snapshot.entity_revisions.clear();
+            snapshot.resolved_tree = ResolvedTree::default();
+            snapshot.external_references.clear();
+        }
+    }
+    snapshot.outgoing.clear();
+    snapshot.incoming.clear();
+    // This is a derived ref view. Publication authority remains owned by the
+    // storage manager and must never be serialized back out of the query graph.
+    snapshot.repository_authority = None;
+    Ok((snapshot, head))
+}
 
 /// Read-only overlay used to resolve the complete source tree an incoming
 /// change would create without first inserting that change into graph
@@ -772,6 +1017,78 @@ struct RegisteredLocalRepositoryAuthority {
     binding: kin_core::LocalRepositoryAuthorityBinding,
 }
 
+/// Maximum number of per-row registry pin failures emitted during one daemon
+/// startup. The aggregate warning below still reports every refusal exactly;
+/// this bound keeps one stale registry from turning a routine start into
+/// thousands of repeated log records.
+const STARTUP_PIN_FAILURE_DETAIL_LIMIT: usize = 8;
+
+#[derive(Debug, Default)]
+struct StartupPinFailures {
+    refused: usize,
+    duplicate_identities: usize,
+    detailed: usize,
+}
+
+impl StartupPinFailures {
+    fn record_binding_failure(
+        &mut self,
+        repo_id: &str,
+        path: &std::path::Path,
+        error: &dyn std::fmt::Display,
+    ) {
+        self.refused += 1;
+        if self.detailed >= STARTUP_PIN_FAILURE_DETAIL_LIMIT {
+            return;
+        }
+        self.detailed += 1;
+        warn!(
+            repo_id = %repo_id,
+            path = %path.display(),
+            error = %error,
+            "sibling repository authority could not be pinned at daemon startup"
+        );
+    }
+
+    fn record_duplicate_identity(
+        &mut self,
+        repo_id: &str,
+        path: &std::path::Path,
+        manifest_repo_id: &str,
+    ) {
+        self.refused += 1;
+        self.duplicate_identities += 1;
+        if self.detailed >= STARTUP_PIN_FAILURE_DETAIL_LIMIT {
+            return;
+        }
+        self.detailed += 1;
+        warn!(
+            repo_id = %repo_id,
+            path = %path.display(),
+            manifest_repo_id = %manifest_repo_id,
+            already_pinned_as = %manifest_repo_id,
+            "two registry paths hold one repository identity; the later one is not pinned"
+        );
+    }
+
+    fn emit_summary(&self, registry_rows: usize, self_rows_skipped: usize, pinned: usize) {
+        if self.refused == 0 {
+            return;
+        }
+        warn!(
+            registry_rows,
+            self_rows_skipped,
+            pinned,
+            refused = self.refused,
+            duplicate_identities = self.duplicate_identities,
+            detailed = self.detailed,
+            suppressed = self.refused.saturating_sub(self.detailed),
+            remediation = "run `kin registry clean` to remove rows whose paths no longer contain .kin; review incompatible stores separately",
+            "sibling repository authority pinning was incomplete"
+        );
+    }
+}
+
 /// Outcome of ingesting one repo's graph into the spine from durable storage.
 ///
 /// Returned by [`DaemonState::ingest_repo_into_spine`] and surfaced by the
@@ -1247,6 +1564,10 @@ pub struct DaemonState {
     /// Startup registry/binding gaps prevent a complete local spine claim even
     /// when every retained sibling that remains can be loaded.
     registered_local_repository_authority_incomplete: bool,
+    /// Whether the federation layer was disabled when this daemon state was
+    /// constructed. Captured once so startup pinning and request-time spine
+    /// access cannot read different process environments.
+    spine_disabled: bool,
     /// Resolved once, here, rather than read inside the capture loop.
     ///
     /// A daemon captures its levers at process start; reading the environment
@@ -2119,7 +2440,7 @@ impl DaemonState {
         sync_directory_metadata(parent)
     }
 
-    fn spine_disabled() -> bool {
+    fn spine_disabled_from_env() -> bool {
         std::env::var("KIN_DISABLE_SPINE")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -2345,12 +2666,15 @@ impl DaemonState {
                 return (Vec::new(), true);
             }
         };
+        let registry_rows = registry.repos.len();
         let current_kin_root = layout
             .root()
             .canonicalize()
             .unwrap_or_else(|_| layout.root().to_path_buf());
         let mut pinned: Vec<RegisteredLocalRepositoryAuthority> = Vec::new();
-        let mut incomplete = false;
+        let mut pinned_identities = HashSet::new();
+        let mut failures = StartupPinFailures::default();
+        let mut self_rows_skipped = 0usize;
         let mut adopted_identities = 0usize;
 
         for repo in registry.repos {
@@ -2359,6 +2683,7 @@ impl DaemonState {
                 .canonicalize()
                 .unwrap_or_else(|_| repo.path.clone());
             if repo_root == current_kin_root || current_kin_root.starts_with(&repo_root) {
+                self_rows_skipped += 1;
                 continue;
             }
 
@@ -2367,29 +2692,13 @@ impl DaemonState {
                 match kin_core::LocalRepositoryAuthorityBinding::from_layout(&sibling_layout) {
                     Ok(binding) => binding,
                     Err(error) => {
-                        incomplete = true;
-                        warn!(
-                            repo_id = %repo.id,
-                            path = %repo.path.display(),
-                            error = %error,
-                            "sibling repository authority could not be pinned at daemon startup"
-                        );
+                        failures.record_binding_failure(&repo.id, &repo.path, &error);
                         continue;
                     }
                 };
             let manifest_repo_id = binding.repository_id().as_str().to_string();
-            if let Some(existing) = pinned
-                .iter()
-                .find(|pinned| pinned.repo_id == manifest_repo_id)
-            {
-                incomplete = true;
-                warn!(
-                    repo_id = %repo.id,
-                    path = %repo.path.display(),
-                    manifest_repo_id = %manifest_repo_id,
-                    already_pinned_as = %existing.repo_id,
-                    "two registry paths hold one repository identity; the later one is not pinned"
-                );
+            if !pinned_identities.insert(manifest_repo_id.clone()) {
+                failures.record_duplicate_identity(&repo.id, &repo.path, &manifest_repo_id);
                 continue;
             }
             if manifest_repo_id != repo.id {
@@ -2415,7 +2724,9 @@ impl DaemonState {
             );
         }
 
-        (pinned, incomplete)
+        failures.emit_summary(registry_rows, self_rows_skipped, pinned.len());
+
+        (pinned, failures.refused > 0)
     }
 
     /// Open local daemon state with a repository identity already resolved by
@@ -2503,10 +2814,15 @@ impl DaemonState {
             )))
         })?;
         let local_repository_backend = Arc::new(LocalFileBackend::new(layout.kindb_dir()));
+        let spine_disabled = Self::spine_disabled_from_env();
         let (
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
-        ) = Self::pin_registered_local_repository_authorities(&layout);
+        ) = if spine_disabled {
+            (Vec::new(), false)
+        } else {
+            Self::pin_registered_local_repository_authorities(&layout)
+        };
         // Startup is a reopen of an initialized repository, never construction
         // of an unpersisted generation-zero authority. Use the receipt from
         // this same recovery to refuse an intact namespace whose authority
@@ -2699,6 +3015,7 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
+            spine_disabled,
             eager_sibling_bound: Self::eager_sibling_load_bound(),
             sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
@@ -2842,8 +3159,10 @@ impl DaemonState {
                     // an envelope-free write would erase.
                     let hosted_authority_envelope =
                         recovered.snapshot.repository_authority.is_some();
+                    let (query_snapshot, materialized_head) =
+                        materialize_hosted_repository_snapshot(recovered.snapshot)?;
                     let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                        recovered.snapshot,
+                        query_snapshot,
                         text_index_path.clone(),
                     )
                     .map_err(DaemonError::from)?;
@@ -2852,6 +3171,7 @@ impl DaemonState {
                         generation = recovered.generation,
                         deltas_replayed = recovered.deltas_applied,
                         hosted_authority_envelope,
+                        materialized_head = ?materialized_head,
                         "loaded graph from storage backend"
                     );
                     (
@@ -2923,6 +3243,7 @@ impl DaemonState {
         // Baseline for the shutdown anti-wipe guard (entity count loaded from
         // the backend snapshot).
         let loaded_entity_count = graph.entity_count();
+        let spine_disabled = Self::spine_disabled_from_env();
 
         let coordination_events = CoordinationEventLog::open(&layout, repo_id)?;
         let coordination_event_persist_failures = coordination_events.persisted_failure_count();
@@ -2955,6 +3276,7 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
+            spine_disabled,
             eager_sibling_bound: Self::eager_sibling_load_bound(),
             sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
@@ -3086,7 +3408,7 @@ impl DaemonState {
     /// Every caller therefore re-resolves the primary watermark here rather than
     /// reading whatever root the daemon happened to start with.
     pub fn ensure_spine(&self) -> Option<&dyn kin_spine::SpineBackend> {
-        if Self::spine_disabled() {
+        if self.spine_disabled {
             return None;
         }
         if self.spine.get().is_none() {
@@ -3726,7 +4048,7 @@ impl DaemonState {
         F: FnMut(usize),
     {
         let Some(spine) = self.ensure_spine() else {
-            let reason = if Self::spine_disabled() {
+            let reason = if self.spine_disabled {
                 "spine disabled via KIN_DISABLE_SPINE"
             } else {
                 "spine initialization could not capture stable primary graph authority; retry"
@@ -3827,7 +4149,7 @@ impl DaemonState {
     /// existing edges are removed and re-materialized.
     pub async fn refresh_all_cross_repo_edges(&self) -> Result<SpineRefreshOutcome> {
         let Some(spine) = self.ensure_spine() else {
-            let reason = if Self::spine_disabled() {
+            let reason = if self.spine_disabled {
                 "spine disabled via KIN_DISABLE_SPINE"
             } else {
                 "spine initialization could not capture stable primary graph authority; retry"
@@ -4104,9 +4426,11 @@ impl DaemonState {
         {
             Some(recovered) => {
                 let text_index_path = self.layout.text_index_dir();
+                let (query_snapshot, materialized_head) =
+                    materialize_hosted_repository_snapshot(recovered.snapshot)?;
                 let graph = Arc::new(
                     kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                        recovered.snapshot,
+                        query_snapshot,
                         text_index_path,
                     )
                     .map_err(DaemonError::from)?,
@@ -4115,6 +4439,7 @@ impl DaemonState {
                     repo_id,
                     generation = recovered.generation,
                     deltas_replayed = recovered.deltas_applied,
+                    materialized_head = ?materialized_head,
                     "loaded repo graph from storage backend"
                 );
                 Ok(graph)
@@ -5437,6 +5762,11 @@ impl DaemonState {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn finalize_committed_generation_for_test(&self, generation: u64) -> Result<()> {
+        self.finalize_committed_generation(generation)
+    }
+
     /// Finish startup artifacts from the graph that was just loaded and
     /// validated before the state is exposed to any request or mutator.
     /// Reopening the same authority here doubles graph memory and repeats
@@ -5714,8 +6044,10 @@ impl DaemonState {
                             ),
                         )));
                     }
+                    let (query_snapshot, _) =
+                        materialize_hosted_repository_snapshot(recovered.snapshot)?;
                     Arc::new(
-                        kin_db::InMemoryGraph::from_snapshot(recovered.snapshot)
+                        kin_db::InMemoryGraph::from_snapshot(query_snapshot)
                             .map_err(DaemonError::from)?,
                     )
                 }
@@ -6345,6 +6677,80 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         sync_directory_metadata(directory.path())
             .expect("directory metadata sync must not reject a valid host directory");
+    }
+
+    fn empty_repository_metadata(label: &str) -> kin_db::PersistedRepositoryAuthority {
+        let storage = tempfile::tempdir().unwrap();
+        let repository_id =
+            RepositoryId::new(format!("{label}-{}", uuid::Uuid::new_v4().simple())).unwrap();
+        let authority = RepositoryAuthorityManager::open(
+            repository_id,
+            Arc::new(LocalFileBackend::new(storage.path().to_path_buf())),
+        )
+        .unwrap();
+        authority.read_authority().metadata().clone()
+    }
+
+    #[test]
+    fn hosted_authority_materialization_accepts_only_a_valid_unborn_repository() {
+        let mut metadata = empty_repository_metadata("unborn-default");
+        metadata.ref_state.default_ref = Some(kin_model::RefName::branch(b"main").unwrap());
+        assert!(
+            select_repository_default_ref(&metadata).unwrap().is_none(),
+            "an unborn default names no graph and materializes empty"
+        );
+    }
+
+    #[test]
+    fn hosted_authority_materialization_refuses_missing_or_dangling_default_ref() {
+        let mut metadata = empty_repository_metadata("invalid-default");
+        let repository_id = metadata.repository_id.clone();
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        let head = SemanticChangeId::from_hash(Hash256::from_bytes([7; 32]));
+        metadata.ref_state.refs.push(kin_model::RepositoryRef {
+            repository_id,
+            name: main.clone(),
+            target: kin_model::RefTarget::change(head),
+        });
+
+        let missing = select_repository_default_ref(&metadata)
+            .expect_err("refs without an explicit default must fail closed");
+        assert!(missing.to_string().contains("no persisted default ref"));
+
+        metadata.ref_state.default_ref = Some(kin_model::RefName::branch(b"absent").unwrap());
+        let dangling = select_repository_default_ref(&metadata)
+            .expect_err("a default name absent from the ref set must fail closed");
+        assert!(dangling.to_string().contains("absent from persisted refs"));
+    }
+
+    #[test]
+    fn hosted_authority_materialization_resolves_a_symbolic_chain_exactly() {
+        let mut metadata = empty_repository_metadata("symbolic-default");
+        let repository_id = metadata.repository_id.clone();
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        let selected = kin_model::RefName::branch(b"selected").unwrap();
+        let head = SemanticChangeId::from_hash(Hash256::from_bytes([9; 32]));
+        metadata.ref_state.refs = vec![
+            kin_model::RepositoryRef {
+                repository_id: repository_id.clone(),
+                name: main.clone(),
+                target: kin_model::RefTarget::symbolic(selected.clone()),
+            },
+            kin_model::RepositoryRef {
+                repository_id,
+                name: selected,
+                target: kin_model::RefTarget::change(head),
+            },
+        ];
+        metadata.ref_state.default_ref = Some(main);
+
+        let repository_ref = select_repository_default_ref(&metadata)
+            .unwrap()
+            .expect("the explicit default ref must be selected");
+        assert_eq!(
+            resolve_repository_target(&metadata, &repository_ref.target).unwrap(),
+            head
+        );
     }
 
     /// Both sides at the resolution layer. A client whose session outlasts the
@@ -7950,6 +8356,52 @@ mod tests {
         _spine_env: kin_core::test_env::EnvVarGuard,
     }
 
+    #[derive(Default)]
+    struct CapturedPinEvents {
+        rendered: Vec<String>,
+    }
+
+    struct PinCaptureLayer(Arc<Mutex<CapturedPinEvents>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PinCaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Render<'a>(&'a mut String);
+
+            impl tracing::field::Visit for Render<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{}={value:?} ", field.name());
+                }
+            }
+
+            let mut rendered = String::new();
+            event.record(&mut Render(&mut rendered));
+            self.0.lock().unwrap().rendered.push(rendered);
+        }
+    }
+
+    fn capture_pin_events<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = Arc::new(Mutex::new(CapturedPinEvents::default()));
+        let subscriber =
+            tracing_subscriber::registry().with(PinCaptureLayer(Arc::clone(&captured)));
+        let result = {
+            let _capture = crate::capture_events_on_this_thread(subscriber);
+            run()
+        };
+        let events = std::mem::take(&mut captured.lock().unwrap().rendered);
+        (result, events)
+    }
+
     /// One registered sibling, registered through the production writer, so both
     /// checks below start from a state a real install produces.
     ///
@@ -7975,6 +8427,160 @@ mod tests {
             sibling_root,
             _spine_env: spine_env,
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_pin_failures_emit_bounded_detail_and_complete_counts() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let failure_count = STARTUP_PIN_FAILURE_DETAIL_LIMIT + 5;
+        let mut repos = Vec::new();
+        for index in 0..failure_count {
+            let root = registry_dir.path().join(format!("stale-{index:02}"));
+            std::fs::create_dir_all(root.join(".kin")).unwrap();
+            std::fs::write(root.join(".kin/VERSION"), b"1").unwrap();
+            repos.push(kin_core::registry::RegisteredRepo {
+                id: format!("stale-{index:02}"),
+                path: root,
+                entities: 0,
+                last_commit: String::new(),
+                dependencies: vec![],
+            });
+        }
+        kin_core::registry::KinRegistry { repos }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let ((pinned, incomplete), events) = capture_pin_events(|| {
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout)
+        });
+        let detailed = events
+            .iter()
+            .filter(|event| {
+                event.contains("sibling repository authority could not be pinned at daemon startup")
+            })
+            .count();
+        let summaries = events
+            .iter()
+            .filter(|event| event.contains("sibling repository authority pinning was incomplete"))
+            .collect::<Vec<_>>();
+
+        assert!(pinned.is_empty());
+        assert!(
+            incomplete,
+            "suppressed detail must not suppress incompleteness"
+        );
+        assert_eq!(
+            detailed, STARTUP_PIN_FAILURE_DETAIL_LIMIT,
+            "one stale registry must not emit one detailed warning per row: {events:?}"
+        );
+        assert_eq!(
+            summaries.len(),
+            1,
+            "one startup gets one aggregate: {events:?}"
+        );
+        let summary = summaries[0];
+        for field in [
+            format!("registry_rows={failure_count}"),
+            "pinned=0".to_string(),
+            format!("refused={failure_count}"),
+            format!("detailed={STARTUP_PIN_FAILURE_DETAIL_LIMIT}"),
+            format!(
+                "suppressed={}",
+                failure_count - STARTUP_PIN_FAILURE_DETAIL_LIMIT
+            ),
+        ] {
+            assert!(
+                summary.contains(&field),
+                "aggregate warning must carry {field}: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_clean_sibling_pin_emits_no_failure_diagnostics() {
+        let _fixture = registered_sibling_fixture();
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+
+        let ((pinned, incomplete), events) = capture_pin_events(|| {
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout)
+        });
+
+        assert_eq!(pinned.len(), 1);
+        assert!(!incomplete);
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.contains("sibling repository authority")),
+            "a clean registry must not emit failure diagnostics: {events:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn disabling_the_spine_skips_the_registry_pin_pass_at_construction() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let stale_root = registry_dir.path().join("stale-sibling");
+        std::fs::create_dir_all(stale_root.join(".kin")).unwrap();
+        std::fs::write(stale_root.join(".kin/VERSION"), b"1").unwrap();
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: "stale-sibling".to_string(),
+                path: stale_root,
+                entities: 0,
+                last_commit: String::new(),
+                dependencies: vec![],
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+        let mut spine_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+                .with("KIN_DISABLE_SPINE", "1");
+
+        let (disabled, disabled_events) =
+            capture_pin_events(|| test_state(primary_init.layout.clone(), primary_dir.path()));
+        assert!(disabled.registered_local_repository_authorities.is_empty());
+        assert!(disabled.startup_authority_complete());
+        assert!(
+            disabled_events
+                .iter()
+                .all(|event| !event.contains("sibling repository authority")),
+            "a disabled subsystem must not inspect or warn about sibling authority: {disabled_events:?}"
+        );
+
+        // The process environment is not request scoped. Changing it after
+        // construction must not re-enable a state whose startup skipped the
+        // authority pass, or that state could publish a spine from a different
+        // scope than the one it captured.
+        spine_env.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+        assert!(
+            disabled.ensure_spine().is_none(),
+            "spine disable must be captured once at daemon-state construction"
+        );
+        drop(disabled);
+
+        // Falsification control: the same registry with federation enabled must
+        // still be inspected and must still report the unbindable row.
+        let (enabled, enabled_events) =
+            capture_pin_events(|| test_state(primary_init.layout.clone(), primary_dir.path()));
+        assert!(!enabled.startup_authority_complete());
+        assert!(enabled_events.iter().any(|event| {
+            event.contains("sibling repository authority could not be pinned at daemon startup")
+        }));
+        assert!(enabled_events.iter().any(|event| {
+            event.contains("sibling repository authority pinning was incomplete")
+        }));
     }
 
     /// FIR-2763's remaining acceptance: what the eager sibling pass costs on a
@@ -8528,6 +9134,20 @@ mod tests {
         let allowed: HashSet<String> = [primary_id.to_string(), sibling_id.to_string()]
             .into_iter()
             .collect();
+
+        // Spine must be enabled for this test regardless of ambient env. The
+        // state captures that choice at construction, so the guard belongs
+        // before the open. Point discovery at an explicitly empty registry:
+        // this hosted path proves storage-only sibling ingestion and must never
+        // scan a user's real global registry.
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
         let state = DaemonState::open_with_backend(
             init.layout,
             Box::new(LocalFileBackend::new(&v2_root)),
@@ -8561,18 +9181,6 @@ mod tests {
                 }],
             })
             .unwrap();
-
-        // Spine must be enabled for this test regardless of ambient env.
-        // Point discovery at an explicitly empty registry: this hosted path is
-        // proving storage-only sibling ingestion and must never scan a user's
-        // real global registry (which can contain multi-gigabyte graphs).
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
-        kin_core::registry::KinRegistry { repos: Vec::new() }
-            .save_to(&registry_path)
-            .unwrap();
-        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
-            .without("KIN_DISABLE_SPINE");
 
         // ── Drive the production ingest route logic ───────────────────────
         // Sibling first (metadata only), then the anchor with edge refresh —
