@@ -3539,10 +3539,29 @@ mod tests {
             !json.contains("\"body\": \""),
             "a shape query must carry no inlined body"
         );
+        // Keep the original compact-shape tripwire load-bearing rather than
+        // weakening it for the two uniform site-contract fields. Measure the
+        // old shape with exactly those fields removed, then bound their own
+        // incremental cost separately. A future unrelated per-step expansion
+        // still trips the original 20k ceiling, while the call-site contract
+        // gets a named allowance rather than silently consuming its margin.
+        let mut without_site_contract = serde_json::to_value(&response).unwrap();
+        for step in without_site_contract["chain"].as_array_mut().unwrap() {
+            let row = step.as_object_mut().unwrap();
+            row.remove("reference_lines");
+            row.remove("reference_lines_absent_reason");
+        }
+        let compact_shape = serde_json::to_string_pretty(&without_site_contract).unwrap();
         assert!(
-            json.len() < 20_000,
-            "25 steps of shape are small; {} chars means bodies or per-step bloat crept back in",
-            json.len()
+            compact_shape.len() < 20_000,
+            "25 steps without the site contract are small; {} chars means bodies or unrelated \
+             per-step bloat crept back in",
+            compact_shape.len()
+        );
+        let site_contract_chars = json.len().saturating_sub(compact_shape.len());
+        assert!(
+            site_contract_chars < 3_000,
+            "the two uniform site fields added {site_contract_chars} chars across 25 steps"
         );
     }
 
