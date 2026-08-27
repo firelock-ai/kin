@@ -730,15 +730,21 @@ mod tests {
         );
     }
 
-    /// The control: the same commit with nothing else resident says nothing
-    /// about other daemons.
+    /// The control the acceptance names: the same commit with nothing else
+    /// resident says nothing about other daemons.
     ///
-    /// This is the assertion that makes the one above mean something. A clause
-    /// that renders whatever it is handed would pass every check there and
-    /// still print "0 other kin daemons" onto a machine running one process.
+    /// Stated plainly, because it would be easy to read this as a defence it is
+    /// not: on any positive ceiling the fraction guard already refuses an empty
+    /// census, since zero is below a twentieth of anything, so dropping the
+    /// `others.is_empty()` early return leaves this green. It goes red only
+    /// when BOTH early returns in `resident_daemon_clause` are removed, which
+    /// is the mutation the driver runs for it. What it is here to pin is the
+    /// pairing the ticket asks for, one commit with a census and the same
+    /// commit without, and that the praised diagnosis is whole in the second
+    /// case as well as the first.
     ///
-    /// Falsify by dropping the `others.is_empty()` guard: this goes red on the
-    /// `stop --all` assertion while the test above stays green.
+    /// The input that isolates the empty-list guard on its own is the zero
+    /// ceiling, and it has its own test below.
     #[test]
     fn a_commit_killed_with_no_other_daemon_resident_names_none() {
         let marker = abandoned_marker(Some(8 * GIB), Some(10 * GIB));
@@ -851,6 +857,42 @@ mod tests {
         assert!(
             !explained.contains("`kin daemon stop --all`"),
             "a census must not smuggle in a memory remedy: {explained}"
+        );
+    }
+
+    /// An unreadable ceiling does not turn an empty census into a sentence.
+    ///
+    /// This exists because the other two silences are not proof that both
+    /// guards work. `resident_daemon_clause` refuses an empty list and then
+    /// refuses an immaterial total, and for any positive ceiling the second
+    /// catches everything the first would: a total of zero is below a
+    /// twentieth of anything. So the empty-list guard was covered by a check
+    /// that would have passed without it, which is a defence nothing can see.
+    ///
+    /// A zero ceiling is the input only the first guard catches. It is
+    /// reachable: `limit_bytes` is whatever memory accounting could read, and
+    /// at zero the near-ceiling grade fires for any resident set at all, so
+    /// this path really does render a memory sentence on such a host.
+    ///
+    /// Falsify by deleting the `others.is_empty()` early return: this goes red
+    /// on the census assertion and the other four stay green.
+    #[test]
+    fn an_unreadable_ceiling_still_reports_no_census_when_none_is_resident() {
+        let marker = abandoned_marker(Some(GIB), Some(GIB));
+        let explained = daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(0, None), &[])
+            .expect("a near-ceiling grade against a zero ceiling still explains itself");
+
+        assert!(
+            explained.contains("most likely ran out of memory"),
+            "the zero ceiling must still reach the memory grade, or this grades nothing: {explained}"
+        );
+        assert!(
+            !explained.contains("resident on this machine now"),
+            "an empty census must never render a sentence: {explained}"
+        );
+        assert!(
+            !explained.contains("0 other kin daemons"),
+            "counting nothing and saying so is the exact shape this refuses: {explained}"
         );
     }
 
