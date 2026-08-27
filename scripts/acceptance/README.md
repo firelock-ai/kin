@@ -62,8 +62,9 @@ the count would go red on most JavaScript repositories.
 recorded when a store is created. It builds one fresh repository and requires
 the control to stay silent on `kin graph status`, report a healthy
 `hydration_semantics` doctor row, and omit `hydration_semantics_stale` from the
-stdio MCP envelope. It then plants a stamp one version behind and removes the
-stamp entirely. Both gap arms must disclose on all three surfaces. The
+stdio MCP envelope. It then plants stamps one version behind and ahead, removes
+the stamp entirely, and plants an incompatible future-schema stamp. All four
+gap arms must disclose on all three surfaces with direction-safe advice. The
 current-store control is what prevents an always-warning comparator or a
 missing writer from satisfying the suite.
 

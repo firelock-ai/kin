@@ -118,8 +118,9 @@ jobs:
 
       # FIR-2829. A fresh store is the control that keeps a replay-version
       # comparator from satisfying the invariant by warning on every store, and
-      # the behind and absent arms are the two distinct gaps the product must
-      # disclose. Drive each grader against its inverse before building.
+      # behind, ahead, absent and unreadable are the four distinct standings the
+      # product must disclose. Drive each grader against its inverse before
+      # building.
       - name: Falsify the hydration-semantics disclosure graders
         run: python3 scripts/acceptance/hydration_semantics_repro.py --self-test
 

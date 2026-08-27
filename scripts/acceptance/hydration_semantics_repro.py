@@ -3,16 +3,17 @@
 # Copyright 2026 Firelock, LLC
 """NON-CITABLE acceptance suite for hydration-semantics disclosure (FIR-2829).
 
-This suite proves one control and two gaps against a store built by the binary
-under test. A fresh store must carry the creation-time stamp and stay silent on
-``kin graph status`` and the MCP degraded map while ``kin doctor`` reports a
-healthy row. A store stamped one replay version behind and a store with no
-stamp must both disclose on all three surfaces.
+This suite proves one current control and all four gap standings against a store
+built by the binary under test. A fresh store must carry the creation-time stamp
+and stay silent on ``kin graph status`` and the MCP degraded map while ``kin
+doctor`` reports a healthy row. Stores recorded behind or ahead, a store with no
+stamp, and a store with an incompatible future-schema stamp must all disclose on
+all three surfaces with direction-safe advice.
 
 The control is load-bearing. A writer that silently stopped writing would make
-every new store look legacy, and a comparator that always reported a gap would
-make both gap arms green. Requiring the fresh store to stay silent catches both
-defects.
+every new store look unverified, and a comparator that always reported a gap
+would make all four gap arms green. Requiring the fresh store to stay silent
+catches both defects.
 
 Each check prints:
 
@@ -93,11 +94,11 @@ class Result(object):
         return "; ".join(passed) if passed else "no assertion was reached"
 
 
-def status_problems(text, gap, created_under=None, derives=None):
+def status_problems(text, standing, created_under=None, derives=None):
     """Return problems in one ``kin graph status`` rendering."""
     lines = [line.strip() for line in (text or "").splitlines()]
     hits = [line for line in lines if "hydration semantics:" in line.lower()]
-    if not gap:
+    if standing == "current":
         return [] if not hits else ["a current store printed %r" % hits]
     if len(hits) != 1:
         return ["expected one hydration-semantics warning, got %d" % len(hits)]
@@ -105,20 +106,35 @@ def status_problems(text, gap, created_under=None, derives=None):
     problems = []
     if "Remedy:" not in line:
         problems.append("the warning carries no remedy")
-    if created_under is None:
+    if standing == "absent":
         if "records no hydration semantics version" not in line:
             problems.append("an unstamped store is not named as unstamped")
         if "Remedy: upgrade Kin before changing this store" not in line:
             problems.append("an unstamped store is not given upgrade-first advice")
+    elif standing == "unreadable":
+        if "hydration semantics record could not be read" not in line:
+            problems.append("an unreadable record is not named as unreadable")
+        if "Remedy: upgrade Kin before changing this store" not in line:
+            problems.append("an unreadable record is not given upgrade-first advice")
     else:
         if "records hydration semantics version %d at creation" % created_under not in line:
             problems.append("the warning does not name recorded version %d" % created_under)
+        if standing == "behind":
+            if "cannot certify" not in line:
+                problems.append("a behind store does not disclose the certification gap")
+            if "Remedy: re-ingest the repository" not in line:
+                problems.append("a behind store is not given re-ingest advice")
+        elif standing == "ahead":
+            if "this binary predates the store's recorded semantics" not in line:
+                problems.append("an ahead store does not say the binary predates it")
+            if "Remedy: upgrade this Kin build" not in line:
+                problems.append("an ahead store is not given binary-upgrade advice")
     if derives is not None and str(derives) not in line:
         problems.append("the warning does not name binary version %d" % derives)
     return problems
 
 
-def doctor_problems(report, gap, created_under=None, derives=None):
+def doctor_problems(report, standing, created_under=None, derives=None):
     """Return problems in the ``hydration_semantics`` doctor row."""
     rows = [
         row
@@ -128,6 +144,7 @@ def doctor_problems(report, gap, created_under=None, derives=None):
     if len(rows) != 1:
         return ["expected one hydration_semantics row, got %d" % len(rows)]
     row = rows[0]
+    gap = standing != "current"
     wanted = "stale" if gap else "healthy"
     problems = []
     if row.get("status") != wanted:
@@ -138,15 +155,37 @@ def doctor_problems(report, gap, created_under=None, derives=None):
         problems.append("a stale row carries no manual_fix")
     if not gap and fix is not None:
         problems.append("a current row manufactured a manual_fix")
-    if created_under is None and gap:
+    if standing == "absent":
         if "records no hydration semantics version" not in detail:
             problems.append("an unstamped row is not named as unstamped")
         if not isinstance(fix, str) or not fix.startswith(
             "upgrade Kin before changing this store"
         ):
             problems.append("an unstamped row is not given upgrade-first advice")
-    elif created_under is not None and str(created_under) not in detail:
-        problems.append("detail does not name recorded version %d" % created_under)
+    elif standing == "unreadable":
+        if "record could not be read" not in detail:
+            problems.append("an unreadable row is not named as unreadable")
+        if not isinstance(fix, str) or not fix.startswith(
+            "upgrade Kin before changing this store"
+        ):
+            problems.append("an unreadable row is not given upgrade-first advice")
+    else:
+        if created_under is None or str(created_under) not in detail:
+            problems.append("detail does not name recorded version %r" % created_under)
+        elif "records hydration semantics version %d at creation" % created_under not in detail:
+            problems.append("detail does not identify the number as a creation-time record")
+        if standing == "behind" and (
+            not isinstance(fix, str) or not fix.startswith("re-ingest the repository")
+        ):
+            problems.append("a behind row is not given re-ingest advice")
+        if standing == "behind" and "cannot certify" not in detail:
+            problems.append("a behind row does not disclose the certification gap")
+        if standing == "ahead" and (
+            not isinstance(fix, str) or not fix.startswith("upgrade this Kin build")
+        ):
+            problems.append("an ahead row is not given binary-upgrade advice")
+        if standing == "ahead" and "predates" not in detail:
+            problems.append("an ahead row does not say the binary predates the record")
     if derives is not None and str(derives) not in detail:
         problems.append("detail does not name binary version %d" % derives)
     return problems
@@ -301,17 +340,23 @@ class Suite(object):
         self.derives = derives
 
     def select_arm(self, name):
-        if name == "control":
+        if name == "current":
             body = dict(self.original_stamp)
         elif name == "behind":
             body = dict(self.original_stamp)
             body["created_under"] = self.derives - 1
+        elif name == "ahead":
+            body = dict(self.original_stamp)
+            body["created_under"] = self.derives + 1
         elif name == "absent":
             try:
                 os.unlink(self.stamp_path)
             except FileNotFoundError:
                 pass
             return
+        elif name == "unreadable":
+            body = dict(self.original_stamp)
+            body["schema"] = "kin.hydration-semantics.v2"
         else:
             raise ValueError("unknown arm %r" % name)
         staged = self.stamp_path + ".repro"
@@ -338,57 +383,84 @@ class Suite(object):
         return observation
 
 
-ARMS = (
-    ("control", False, None),
-    ("behind", True, "behind"),
-    ("absent", True, None),
-)
+ARMS = ("current", "behind", "ahead", "absent", "unreadable")
+
+
+def arm_created_under(suite, standing):
+    if standing == "current":
+        return suite.derives
+    if standing == "behind":
+        return suite.derives - 1
+    if standing == "ahead":
+        return suite.derives + 1
+    return None
 
 
 def check_status(suite):
     result = Result("status", "graph status stays silent on agreement and discloses every gap")
-    for name, gap, recorded in ARMS:
-        rc, out = suite.observe(name)["status"]
+    for standing in ARMS:
+        rc, out = suite.observe(standing)["status"]
         if rc != 0:
-            result.unknown("%s: graph status exited %d: %s" % (name, rc, tail(out)))
+            result.unknown(
+                "%s: graph status exited %d: %s" % (standing, rc, tail(out))
+            )
             continue
-        recorded_under = suite.derives - 1 if recorded == "behind" else None
-        problems = status_problems(out, gap, recorded_under, suite.derives)
+        recorded_under = arm_created_under(suite, standing)
+        problems = status_problems(out, standing, recorded_under, suite.derives)
         if problems:
-            result.bad("%s: %s; output: %s" % (name, "; ".join(problems), tail(out)))
+            result.bad(
+                "%s: %s; output: %s"
+                % (standing, "; ".join(problems), tail(out))
+            )
         else:
-            result.ok("%s: %s" % (name, "gap disclosed" if gap else "current and silent"))
+            result.ok(
+                "%s: %s"
+                % (
+                    standing,
+                    "current and silent" if standing == "current" else "gap disclosed",
+                )
+            )
     return result
 
 
 def check_doctor(suite):
     result = Result("doctor", "doctor separates current from stale creation-time semantics")
-    for name, gap, recorded in ARMS:
-        rc, report, error = suite.observe(name)["doctor"]
+    for standing in ARMS:
+        rc, report, error = suite.observe(standing)["doctor"]
         if report is None:
-            result.unknown("%s: doctor output unreadable (rc=%d): %s" % (name, rc, error))
+            result.unknown(
+                "%s: doctor output unreadable (rc=%d): %s"
+                % (standing, rc, error)
+            )
             continue
-        recorded_under = suite.derives - 1 if recorded == "behind" else None
-        problems = doctor_problems(report, gap, recorded_under, suite.derives)
+        recorded_under = arm_created_under(suite, standing)
+        problems = doctor_problems(report, standing, recorded_under, suite.derives)
         if problems:
-            result.bad("%s: %s" % (name, "; ".join(problems)))
+            result.bad("%s: %s" % (standing, "; ".join(problems)))
         else:
-            result.ok("%s: %s row" % (name, "stale" if gap else "healthy"))
+            result.ok(
+                "%s: %s row"
+                % (standing, "healthy" if standing == "current" else "stale")
+            )
     return result
 
 
 def check_envelope(suite):
     result = Result("envelope", "the stdio MCP envelope carries only affirmative gaps")
-    for name, gap, _recorded in ARMS:
-        payload, error = suite.observe(name)["envelope"]
+    for standing in ARMS:
+        payload, error = suite.observe(standing)["envelope"]
         if payload is None:
-            result.unknown("%s: MCP envelope unreadable: %s" % (name, error))
+            result.unknown("%s: MCP envelope unreadable: %s" % (standing, error))
             continue
+        gap = standing != "current"
         problems = envelope_problems(payload, gap)
         if problems:
-            result.bad("%s: %s; payload: %s" % (name, "; ".join(problems), tail(json.dumps(payload))))
+            result.bad(
+                "%s: %s; payload: %s"
+                % (standing, "; ".join(problems), tail(json.dumps(payload)))
+            )
         else:
-            result.ok("%s: flag %s" % (name, "true" if gap else "absent"))
+            result.ok("%s: flag %s" % (standing, "true" if gap else "absent"))
     return result
 
 
@@ -406,28 +478,222 @@ def self_test():
             failures.append("%s: got %r, wanted %r" % (label, got, want))
 
     current_line = "Graph healthy\n"
-    gap_line = (
+    behind_line = (
         "⚠ hydration semantics: this store records hydration semantics version 9 at creation "
-        "and this build derives version 10. Remedy: re-ingest the repository.\n"
+        "and this build derives version 10, so the store cannot certify the replay. "
+        "Remedy: re-ingest the repository.\n"
+    )
+    ahead_line = (
+        "⚠ hydration semantics: this store records hydration semantics version 11 at creation "
+        "and this build derives the older version 10, so this binary predates the store's "
+        "recorded semantics. Remedy: upgrade this Kin build.\n"
     )
     absent_line = (
-        "⚠ hydration semantics: this graph records no hydration semantics version, and this "
+        "⚠ hydration semantics: this store records no hydration semantics version, and this "
         "build derives version 10. Remedy: upgrade Kin before changing this store.\n"
     )
-    expect("status control", status_problems(current_line, False), [])
-    expect("status gap", status_problems(gap_line, True, 9, 10), [])
-    expect("status absent", status_problems(absent_line, True, None, 10), [])
-    expect("status unconditional warning fails", len(status_problems(gap_line, False)) > 0, True)
-    expect("status missing remedy fails", len(status_problems(gap_line.replace(" Remedy: re-ingest the repository.", ""), True, 9, 10)) > 0, True)
+    unreadable_line = (
+        "⚠ hydration semantics: this store's hydration semantics record could not be read "
+        "(future schema), so its creation-time version cannot be shown to match version 10. "
+        "Remedy: upgrade Kin before changing this store.\n"
+    )
+    expect("status current", status_problems(current_line, "current", 10, 10), [])
+    expect("status behind", status_problems(behind_line, "behind", 9, 10), [])
+    expect("status ahead", status_problems(ahead_line, "ahead", 11, 10), [])
+    expect("status absent", status_problems(absent_line, "absent", None, 10), [])
+    expect(
+        "status unreadable",
+        status_problems(unreadable_line, "unreadable", None, 10),
+        [],
+    )
+    expect(
+        "status unconditional warning fails",
+        len(status_problems(behind_line, "current", 10, 10)) > 0,
+        True,
+    )
+    expect(
+        "status missing remedy fails",
+        len(
+            status_problems(
+                behind_line.replace(" Remedy: re-ingest the repository.", ""),
+                "behind",
+                9,
+                10,
+            )
+        )
+        > 0,
+        True,
+    )
+    expect(
+        "status ahead re-ingest fails",
+        len(
+            status_problems(
+                ahead_line.replace(
+                    "Remedy: upgrade this Kin build.",
+                    "Remedy: re-ingest the repository.",
+                ),
+                "ahead",
+                11,
+                10,
+            )
+        )
+        > 0,
+        True,
+    )
+    expect(
+        "status absent re-ingest fails",
+        len(
+            status_problems(
+                absent_line.replace(
+                    "Remedy: upgrade Kin before changing this store.",
+                    "Remedy: re-ingest the repository.",
+                ),
+                "absent",
+                None,
+                10,
+            )
+        )
+        > 0,
+        True,
+    )
+    expect(
+        "status unreadable re-ingest fails",
+        len(
+            status_problems(
+                unreadable_line.replace(
+                    "Remedy: upgrade Kin before changing this store.",
+                    "Remedy: re-ingest the repository.",
+                ),
+                "unreadable",
+                None,
+                10,
+            )
+        )
+        > 0,
+        True,
+    )
 
-    current_row = {"checks": [{"id": "hydration_semantics", "status": "healthy", "detail": "version 10, which is what this build derives", "manual_fix": None}]}
-    stale_row = {"checks": [{"id": "hydration_semantics", "status": "stale", "detail": "records hydration semantics version 9 at creation, this build derives 10", "manual_fix": "re-ingest"}]}
-    absent_row = {"checks": [{"id": "hydration_semantics", "status": "stale", "detail": "records no hydration semantics version; derives 10", "manual_fix": "upgrade Kin before changing this store"}]}
-    expect("doctor control", doctor_problems(current_row, False, None, 10), [])
-    expect("doctor stale", doctor_problems(stale_row, True, 9, 10), [])
-    expect("doctor absent", doctor_problems(absent_row, True, None, 10), [])
-    expect("doctor false healthy fails", len(doctor_problems(current_row, True, 9, 10)) > 0, True)
-    expect("doctor missing row fails", len(doctor_problems({"checks": []}, False, None, 10)) > 0, True)
+    current_row = {
+        "checks": [
+            {
+                "id": "hydration_semantics",
+                "status": "healthy",
+                "detail": "records hydration semantics version 10 at creation, matching what this build derives",
+                "manual_fix": None,
+            }
+        ]
+    }
+    behind_row = {
+        "checks": [
+            {
+                "id": "hydration_semantics",
+                "status": "stale",
+                "detail": "records hydration semantics version 9 at creation, this build derives 10 and cannot certify the replay",
+                "manual_fix": "re-ingest the repository",
+            }
+        ]
+    }
+    ahead_row = {
+        "checks": [
+            {
+                "id": "hydration_semantics",
+                "status": "stale",
+                "detail": "records hydration semantics version 11 at creation, this build derives 10 and predates the record",
+                "manual_fix": "upgrade this Kin build",
+            }
+        ]
+    }
+    absent_row = {
+        "checks": [
+            {
+                "id": "hydration_semantics",
+                "status": "stale",
+                "detail": "records no hydration semantics version; derives 10",
+                "manual_fix": "upgrade Kin before changing this store",
+            }
+        ]
+    }
+    unreadable_row = {
+        "checks": [
+            {
+                "id": "hydration_semantics",
+                "status": "stale",
+                "detail": "hydration semantics record could not be read; derives 10",
+                "manual_fix": "upgrade Kin before changing this store",
+            }
+        ]
+    }
+    expect("doctor current", doctor_problems(current_row, "current", 10, 10), [])
+    expect("doctor behind", doctor_problems(behind_row, "behind", 9, 10), [])
+    expect("doctor ahead", doctor_problems(ahead_row, "ahead", 11, 10), [])
+    expect("doctor absent", doctor_problems(absent_row, "absent", None, 10), [])
+    expect(
+        "doctor unreadable",
+        doctor_problems(unreadable_row, "unreadable", None, 10),
+        [],
+    )
+    expect(
+        "doctor false healthy fails",
+        len(doctor_problems(current_row, "behind", 9, 10)) > 0,
+        True,
+    )
+    expect(
+        "doctor missing row fails",
+        len(doctor_problems({"checks": []}, "current", 10, 10)) > 0,
+        True,
+    )
+    expect(
+        "doctor ahead re-ingest fails",
+        len(
+            doctor_problems(
+                {
+                    "checks": [
+                        {
+                            "id": "hydration_semantics",
+                            "status": "stale",
+                            "detail": "records hydration semantics version 11 at creation, this build derives 10 and predates the record",
+                            "manual_fix": "re-ingest the repository",
+                        }
+                    ]
+                },
+                "ahead",
+                11,
+                10,
+            )
+        )
+        > 0,
+        True,
+    )
+    expect(
+        "doctor behind upgrade fails",
+        len(
+            doctor_problems(
+                {
+                    "checks": [
+                        {
+                            "id": "hydration_semantics",
+                            "status": "stale",
+                            "detail": "records hydration semantics version 9 at creation, this build derives 10 and cannot certify the replay",
+                            "manual_fix": "upgrade this Kin build",
+                        }
+                    ]
+                },
+                "behind",
+                9,
+                10,
+            )
+        )
+        > 0,
+        True,
+    )
+    for standing, row in (("absent", absent_row), ("unreadable", unreadable_row)):
+        wrong = json.loads(json.dumps(row))
+        wrong["checks"][0]["manual_fix"] = "re-ingest the repository"
+        expect(
+            "doctor %s re-ingest fails" % standing,
+            len(doctor_problems(wrong, standing, None, 10)) > 0,
+            True,
+        )
 
     clean_env = {"_kin": {"degraded": {}}}
     gap_env = {"_kin": {"degraded": {FLAG: True}}}
