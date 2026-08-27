@@ -3216,6 +3216,26 @@ mod tests {
             "WALK_MEDIAN_MS untargeted {:.3}",
             samples[samples.len() / 2].as_secs_f64() * 1000.0
         );
+
+        // What naming a target costs: one bounded reverse walk from it, plus a
+        // set lookup per candidate. The target is the deepest node in the
+        // fixture and it is reached through the module-crossing edge, which is
+        // the worst case for the reverse walk on this shape.
+        let mut targeted = Vec::new();
+        for _ in 0..9 {
+            let mut request = trace_request(&focal_id, 5, TraceDirection::Calls, 4);
+            request.target = Some(target.clone());
+            let started = std::time::Instant::now();
+            let response =
+                build_trace_data_flow_response(&authority, &graph, &request).unwrap();
+            targeted.push(started.elapsed());
+            assert_eq!(response.target_name.as_deref(), Some(target.as_str()));
+        }
+        targeted.sort();
+        println!(
+            "WALK_MEDIAN_MS targeted {:.3}",
+            targeted[targeted.len() / 2].as_secs_f64() * 1000.0
+        );
         println!("WALK_TARGET_NAME {target}");
     }
 
