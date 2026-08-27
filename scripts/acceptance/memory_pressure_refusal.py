@@ -1888,22 +1888,29 @@ def check_12(suite):
     if rc != 0:
         result.unknown("could not start a daemon, exit %d: %s" % (rc, tail(out)))
         return result
-    pid = suite.daemon_pid(repo)
+    published = suite.publish_standing(repo)
+    # The record names its own pid, and `publish_standing` will not return one
+    # that names a predecessor. Taking the pid from the record rather than
+    # asking again is what makes this read and that count the same process.
+    pid = published.get("pid") or suite.daemon_pid(repo)
     if pid is None:
-        result.unknown("no daemon pid for %s" % repo)
+        result.unknown("no daemon pid for %s: standing=%s" % (repo, json.dumps(published)))
         return result
 
-    before = descendants_of(pid)
-    published = suite.publish_standing(repo)
-    after = descendants_of(pid)
     footprint = published.get("footprint") or {}
     child_count = footprint.get("child_count")
     threads = thread_count(pid)
 
+    # Twice, because a daemon holds short-lived children during a sweep and one
+    # exiting between the record and this read is a different tree rather than a
+    # defect. Disagreement is reported, never averaged away.
+    before = descendants_of(pid)
+    time.sleep(0.5)
+    after = descendants_of(pid)
     if before != after:
         result.unknown(
-            "the daemon's child processes changed under the reading (%d before, %d after), "
-            "so the published count and this one describe different trees"
+            "the daemon's child processes changed under the reading (%d then %d), so the "
+            "published count and this one describe different trees"
             % (len(before), len(after))
         )
         return result
@@ -1948,18 +1955,30 @@ def check_12(suite):
     own = _published_own_bytes(published)
     total = (own or 0) + (footprint.get("children_bytes") or 0)
     mine = proportional_bytes(pid)
-    if own is None or mine is None:
-        result.unknown("no published own figure or no /proc reading for pid %d" % pid)
-    elif threads >= 2 and total >= mine * threads:
+    if after:
+        # A real child holds real bytes, and separating them from a per-thread
+        # sum needs a per-process reading this arm does not take. Check 11
+        # already grades the tree total against its two summed readings, so the
+        # honest thing is to say which arm ran rather than to grade a number
+        # this one cannot attribute.
+        result.ok(
+            "bytes arm: not run, the daemon holds %d real child process(es) whose bytes this "
+            "arm cannot separate from a per-thread sum; check 11 grades that total" % len(after)
+        )
+    elif own is None or mine is None:
+        result.unknown("no published own figure or no /proc reading for pid %s" % pid)
+    elif total >= mine * 2:
         result.bad(
-            "the published total of %d bytes is at least this daemon's own %d bytes times "
-            "its %d threads, which is the summing this check exists to catch"
-            % (total, mine, threads)
+            "the daemon has no child processes and %d threads, yet publishes %d bytes against "
+            "its own /proc reading of %d. With nothing else in the tree the published total is "
+            "this process counted more than once, which is the summing this check exists to "
+            "catch" % (threads, total, mine)
         )
     else:
         result.ok(
-            "the published total of %d bytes stays under one reading per thread of the "
-            "daemon's own %d bytes across %d threads" % (total, mine, threads)
+            "with no child processes and %d threads, the published total of %d bytes stays "
+            "beside the daemon's own /proc reading of %d rather than a multiple of it"
+            % (threads, total, mine)
         )
     return result
 
