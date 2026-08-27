@@ -2161,6 +2161,13 @@ fn enumerate_repo_daemons(sys: &mut sysinfo::System, self_pid: u32) -> Vec<Disco
         if pid == self_pid {
             continue;
         }
+        // A thread carries its owning process's name and argv, `--repo`
+        // included, so an unfiltered scan adopts one repo daemon into the
+        // registry once per thread and then heartbeats tids that are not
+        // processes (FIR-2823).
+        if process.thread_kind().is_some() {
+            continue;
+        }
         let args: Vec<&str> = process
             .cmd()
             .iter()

@@ -1641,6 +1641,14 @@ fn managed_daemon_processes(install_root: &Path) -> Vec<ManagedDaemonProcess> {
         if pid == std::process::id() {
             continue;
         }
+        // A thread carries its owning process's executable, so an unfiltered
+        // scan finds one managed daemon once per thread. Here that is not only
+        // a wrong count: the uninstall quiescence fence refuses on a non-empty
+        // result, so a daemon's own threads would report it as "processes
+        // appeared after shutdown" and block a clean uninstall (FIR-2823).
+        if process.thread_kind().is_some() {
+            continue;
+        }
         let args = process
             .cmd()
             .iter()

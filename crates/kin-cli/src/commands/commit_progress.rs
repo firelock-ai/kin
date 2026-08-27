@@ -463,6 +463,16 @@ pub fn other_resident_daemons(dead_pid: u32) -> Vec<ResidentDaemon> {
             if pid == dead_pid || pid == std::process::id() {
                 return None;
             }
+            // A thread is not a daemon. Linux lists a process's threads under
+            // `/proc/<pid>/task` and `sysinfo` returns them from `processes()`
+            // beside real processes, each carrying its owning process's
+            // executable and argv, so an unfiltered census reports one daemon
+            // once per thread and sums a resident set they all share. That is
+            // what showed the v0.6.1 stranger "13 kin daemons serving
+            // /work/express, 473 MiB each" for a single daemon (FIR-2823).
+            if process.thread_kind().is_some() {
+                return None;
+            }
             let name = process.exe()?.file_name()?.to_str()?.to_owned();
             if name != crate::daemon_client::DAEMON_BINARY_FILE_NAME {
                 return None;
