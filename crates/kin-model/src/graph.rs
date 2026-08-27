@@ -72,6 +72,37 @@ pub trait EntityStore: Send + Sync {
         &self,
         filter: &EntityFilter,
     ) -> std::result::Result<Vec<Entity>, Self::Error>;
+    /// Return one bounded window of the entities matching `filter`, together
+    /// with how many matched in total and where to continue.
+    ///
+    /// [`Self::query_entities`] answers a predicate and is bounded only by the
+    /// repository, so a caller with no filter set is asking for everything and
+    /// everything is what it gets. This is the same question asked so that the
+    /// answer's size is the caller's to choose.
+    ///
+    /// The default implementation runs `query_entities` and windows its result,
+    /// so every implementor gets a correct page without writing one. It is
+    /// correct exactly as far as `query_entities` is: a window over a sequence
+    /// only reaches each element once if that sequence is the SAME sequence on
+    /// the next call. An order that reshuffles between two pages hands back
+    /// duplicates and skips entities, and reports neither, because every
+    /// individual page is a perfectly well-formed page. An implementor whose
+    /// `query_entities` order is not stable across calls owes its callers an
+    /// override, not this default.
+    ///
+    /// Override it also to bound the WORK rather than only the answer. The
+    /// default still materializes every match before discarding all but one
+    /// window, so it fixes what crosses a wire and not what the engine spends.
+    fn query_entities_page(
+        &self,
+        filter: &EntityFilter,
+        page: &EntityPage,
+    ) -> std::result::Result<EntityPageResult, Self::Error> {
+        Ok(EntityPageResult::from_ordered(
+            self.query_entities(filter)?,
+            page,
+        ))
+    }
     fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error>;
     fn upsert_entity(&self, entity: &Entity) -> std::result::Result<(), Self::Error>;
     fn upsert_relation(&self, relation: &Relation) -> std::result::Result<(), Self::Error>;
@@ -758,6 +789,10 @@ pub struct ResolvedGraphState {
 }
 
 /// Filter for querying entities.
+///
+/// A predicate and nothing else. The window a caller wants over the matches is
+/// [`EntityPage`], deliberately a separate parameter of a separate method: see
+/// that type for why folding the two together is the shape that fails quietly.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EntityFilter {
     pub kinds: Option<Vec<EntityKind>>,
@@ -765,6 +800,129 @@ pub struct EntityFilter {
     pub name_pattern: Option<String>,
     pub file_path: Option<FilePathId>,
     pub roles: Option<Vec<EntityRole>>,
+}
+
+/// A bounded window over the order [`EntityStore::query_entities`] returns for
+/// a filter.
+///
+/// Kept out of [`EntityFilter`] on purpose, and the reason is a failure mode
+/// rather than a preference. A limit carried inside the filter reaches every
+/// existing implementation of `query_entities`, all of which ignore fields they
+/// were not written for, so a caller asking for fifty would receive forty-three
+/// thousand with no error anywhere: the answer is right for the predicate and
+/// wrong for the request, and the only way to notice is to count. Carrying the
+/// window in its own parameter of [`EntityStore::query_entities_page`] makes
+/// that state unreachable, because the method that takes a page is the method
+/// that honors one, and the method that takes only a filter cannot be handed a
+/// bound it will drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityPage {
+    /// How many matching entities to skip before this window starts.
+    pub offset: usize,
+    /// The most entities this window may contain.
+    pub limit: usize,
+}
+
+impl EntityPage {
+    /// A window of `limit` entities starting after `offset` matches.
+    pub const fn new(offset: usize, limit: usize) -> Self {
+        Self { offset, limit }
+    }
+
+    /// The first window of `limit` entities.
+    pub const fn first(limit: usize) -> Self {
+        Self::new(0, limit)
+    }
+
+    /// The half-open index range this window selects out of `total_matching`
+    /// entities in query order.
+    ///
+    /// Clamped at both ends, so an offset past the last match yields an empty
+    /// range rather than a panic. Paging past the end is what a caller does
+    /// when the repository shrank between two requests, which is ordinary and
+    /// not an error.
+    pub fn range(&self, total_matching: usize) -> std::ops::Range<usize> {
+        let start = self.offset.min(total_matching);
+        let end = self
+            .offset
+            .saturating_add(self.limit)
+            .min(total_matching)
+            .max(start);
+        start..end
+    }
+
+    /// The offset that continues this query, or `None` when this window already
+    /// reached the last match.
+    ///
+    /// `None` for a zero limit, because a zero-width window never advances: the
+    /// arithmetic answer would be the offset the caller just asked for, and a
+    /// continuation that returns the caller to where it already was is an
+    /// infinite loop wearing a cursor's costume. A zero limit is reachable from
+    /// any query string, so it is defined here rather than left to whoever
+    /// first types `limit=0`.
+    pub fn next_offset(&self, total_matching: usize) -> Option<usize> {
+        if self.limit == 0 {
+            return None;
+        }
+        let next = self.offset.saturating_add(self.limit);
+        (next < total_matching).then_some(next)
+    }
+}
+
+/// One bounded page of an entity query, and the total the page was taken from.
+///
+/// `total_matching` is the whole point of returning a struct rather than a
+/// `Vec`. A page length is not a count of anything a reader cares about, and a
+/// surface that shows one as a repository total reports a smaller repository
+/// every time somebody tunes the page size down.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct EntityPageResult {
+    /// The entities in this window, in the query's own order.
+    pub entities: Vec<Entity>,
+    /// How many entities matched the filter in total.
+    ///
+    /// Independent of `page.limit`, so narrowing a read never shrinks the
+    /// number a caller reports.
+    pub total_matching: usize,
+    /// The offset that continues this query, or `None` at the end of it.
+    pub next_offset: Option<usize>,
+}
+
+impl EntityPageResult {
+    /// Take one window out of a query's full, ordered result.
+    ///
+    /// The caller owes an order that is stable across calls; see
+    /// [`EntityStore::query_entities_page`] for what an unstable one costs.
+    pub fn from_ordered(mut ordered: Vec<Entity>, page: &EntityPage) -> Self {
+        let total_matching = ordered.len();
+        let range = page.range(total_matching);
+        ordered.truncate(range.end);
+        ordered.drain(..range.start);
+        Self {
+            entities: ordered,
+            total_matching,
+            next_offset: page.next_offset(total_matching),
+        }
+    }
+
+    /// Build the answer for an implementation that windowed the query itself
+    /// and counted its matches separately.
+    ///
+    /// The continuation is still computed here, from the same `total_matching`
+    /// the caller reports, so an engine that bounds its own work cannot drift
+    /// from [`Self::from_ordered`] on where a query ends.
+    pub fn from_window(entities: Vec<Entity>, total_matching: usize, page: &EntityPage) -> Self {
+        Self {
+            entities,
+            total_matching,
+            next_offset: page.next_offset(total_matching),
+        }
+    }
+
+    /// Whether anything follows this page.
+    pub fn has_more(&self) -> bool {
+        self.next_offset.is_some()
+    }
 }
 
 /// Success payload of [`collect_changes_topologically`]: the topologically
@@ -1704,6 +1862,19 @@ impl<G: EntityStore> EntityStore for &G {
         filter: &EntityFilter,
     ) -> std::result::Result<Vec<Entity>, Self::Error> {
         (**self).query_entities(filter)
+    }
+    // Forwarded rather than inherited on purpose. The trait default would be
+    // correct here, because it calls `query_entities`, which forwards. But it
+    // would run the DEFAULT windowing over `G`'s full result even where `G`
+    // overrode this method to bound its own work, so a reference to a store
+    // would silently lose the override and keep the answer. Losing only the
+    // cost is the kind of regression nothing fails on.
+    fn query_entities_page(
+        &self,
+        filter: &EntityFilter,
+        page: &EntityPage,
+    ) -> std::result::Result<EntityPageResult, Self::Error> {
+        (**self).query_entities_page(filter, page)
     }
     fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
         (**self).list_all_entities()
@@ -3844,5 +4015,510 @@ mod tests {
         assert_eq!(state.relations.get(&relation.id), Some(&relation));
         assert!(!state.entity_tombstones.contains_key(&entity_a.id));
         assert!(!state.relation_tombstones.contains_key(&relation.id));
+    }
+
+    // =======================================================================
+    // Bounded entity reads (FIR-2814)
+    // =======================================================================
+
+    /// A store that answers `query_entities` and refuses everything else.
+    ///
+    /// The refusals are `unimplemented!()` rather than empty successes on
+    /// purpose. A stub that answered a method these tests never meant to reach
+    /// would let one of them pass while grading a different code path, and an
+    /// empty `Ok` is the shape that hides best.
+    struct PagingStore {
+        entities: Vec<Entity>,
+    }
+
+    impl PagingStore {
+        /// `count` entities named `e000`, `e001`, and so on, so the query order
+        /// is the name order and a walk that repeats or skips one can say which
+        /// by name instead of by index.
+        fn of_size(count: usize) -> Self {
+            Self {
+                entities: (0..count)
+                    .map(|i| {
+                        make_entity(
+                            EntityId(uuid::Uuid::from_u128(i as u128 + 1)),
+                            &format!("e{i:03}"),
+                        )
+                    })
+                    .collect(),
+            }
+        }
+
+        /// The names this store answers a filter with, in query order. The
+        /// expected value every walk below is compared against, computed from
+        /// the unpaged path so a paging bug cannot move both sides at once.
+        fn expected_names(&self, filter: &EntityFilter) -> Vec<String> {
+            self.query_entities(filter)
+                .unwrap()
+                .into_iter()
+                .map(|entity| entity.name)
+                .collect()
+        }
+    }
+
+    impl EntityStore for PagingStore {
+        type Error = ModelError;
+
+        fn query_entities(
+            &self,
+            filter: &EntityFilter,
+        ) -> std::result::Result<Vec<Entity>, Self::Error> {
+            let mut matched: Vec<Entity> = self
+                .entities
+                .iter()
+                .filter(|entity| match &filter.name_pattern {
+                    Some(pattern) => entity.name.contains(pattern.as_str()),
+                    None => true,
+                })
+                .cloned()
+                .collect();
+            // The total order the paging default is owed. kin-db's own
+            // implementation earns the same property by sorting on match rank
+            // then entity id; this fixture sorts on the name it generated,
+            // which is the same guarantee in a shape a failed assertion prints
+            // legibly.
+            matched.sort_by(|a, b| a.name.cmp(&b.name));
+            Ok(matched)
+        }
+
+        fn get_entity(&self, _id: &EntityId) -> std::result::Result<Option<Entity>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_relations(
+            &self,
+            _id: &EntityId,
+            _kinds: &[RelationKind],
+        ) -> std::result::Result<Vec<Relation>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_all_relations_for_entity(
+            &self,
+            _id: &EntityId,
+        ) -> std::result::Result<Vec<Relation>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_downstream_impact(
+            &self,
+            _id: &EntityId,
+            _max_depth: u32,
+        ) -> std::result::Result<Vec<Entity>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_dependency_neighborhood(
+            &self,
+            _id: &EntityId,
+            _depth: u32,
+        ) -> std::result::Result<SubGraph, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn expand_neighborhood(
+            &self,
+            _entity_ids: &[EntityId],
+            _edge_kinds: &[RelationKind],
+            _depth: u32,
+        ) -> std::result::Result<SubGraph, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn traverse(
+            &self,
+            _start: &GraphNodeId,
+            _edge_kinds: &[RelationKind],
+            _depth: u32,
+        ) -> std::result::Result<SubGraph, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn find_dead_code(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn has_incoming_relation_kinds(
+            &self,
+            _id: &EntityId,
+            _kinds: &[RelationKind],
+            _exclude_same_file: bool,
+        ) -> std::result::Result<bool, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn list_all_entities(&self) -> std::result::Result<Vec<Entity>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn upsert_entity(&self, _entity: &Entity) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn upsert_relation(&self, _relation: &Relation) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn remove_entity(&self, _id: &EntityId) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn remove_relation(&self, _id: &RelationId) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn upsert_shallow_file(
+            &self,
+            _shallow: &crate::layout::ShallowTrackedFile,
+        ) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_shallow_file(
+            &self,
+            _file_id: &FilePathId,
+        ) -> std::result::Result<Option<crate::layout::ShallowTrackedFile>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn list_shallow_files(
+            &self,
+        ) -> std::result::Result<Vec<crate::layout::ShallowTrackedFile>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn upsert_structured_artifact(
+            &self,
+            _artifact: &crate::layout::StructuredArtifact,
+        ) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_structured_artifact(
+            &self,
+            _file_id: &FilePathId,
+        ) -> std::result::Result<Option<crate::layout::StructuredArtifact>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn list_structured_artifacts(
+            &self,
+        ) -> std::result::Result<Vec<crate::layout::StructuredArtifact>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn delete_structured_artifact(
+            &self,
+            _file_id: &FilePathId,
+        ) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn upsert_opaque_artifact(
+            &self,
+            _artifact: &crate::layout::OpaqueArtifact,
+        ) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_opaque_artifact(
+            &self,
+            _file_id: &FilePathId,
+        ) -> std::result::Result<Option<crate::layout::OpaqueArtifact>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn list_opaque_artifacts(
+            &self,
+        ) -> std::result::Result<Vec<crate::layout::OpaqueArtifact>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn delete_opaque_artifact(
+            &self,
+            _file_id: &FilePathId,
+        ) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn artifact_id_at_path(&self, _path: &crate::RepoPath) -> Option<crate::ArtifactId> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn upsert_file_layout(
+            &self,
+            _layout: &crate::layout::FileLayout,
+        ) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_file_layout(
+            &self,
+            _file_id: &FilePathId,
+        ) -> std::result::Result<Option<crate::layout::FileLayout>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn list_file_layouts(
+            &self,
+        ) -> std::result::Result<Vec<crate::layout::FileLayout>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn get_tree_entry(
+            &self,
+            _file_id: &FilePathId,
+        ) -> std::result::Result<Option<TreeEntry>, Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn delete_file_layout(
+            &self,
+            _file_id: &FilePathId,
+        ) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+        fn apply_transaction_delta(
+            &self,
+            _delta: &TransactionDelta,
+        ) -> std::result::Result<(), Self::Error> {
+            unimplemented!("PagingStore answers query_entities only")
+        }
+    }
+
+    /// Follow a query's continuation to the end, collecting the entity names in
+    /// the order the pages handed them back.
+    ///
+    /// Returns the names and how many pages it took. The round cap is a bound
+    /// and not a stop condition: a walk must end because the store said nothing
+    /// follows, and running out of rounds is asserted as a failure rather than
+    /// read as an ending, because a cursor that never advances would otherwise
+    /// look exactly like one that finished.
+    fn walk_pages(
+        store: &PagingStore,
+        filter: &EntityFilter,
+        limit: usize,
+    ) -> (Vec<String>, usize) {
+        const MAX_ROUNDS: usize = 1_000;
+        let mut names = Vec::new();
+        let mut cursor = Some(0usize);
+        let mut rounds = 0usize;
+
+        while let Some(offset) = cursor {
+            assert!(
+                rounds < MAX_ROUNDS,
+                "the continuation never ended: {rounds} pages read at limit {limit}, \
+                 last offset {offset}"
+            );
+            let page = store
+                .query_entities_page(filter, &EntityPage::new(offset, limit))
+                .unwrap();
+            names.extend(page.entities.iter().map(|entity| entity.name.clone()));
+            cursor = page.next_offset;
+            rounds += 1;
+        }
+
+        (names, rounds)
+    }
+
+    #[test]
+    fn a_repository_larger_than_one_page_returns_exactly_the_page_and_a_continuation() {
+        let store = PagingStore::of_size(130);
+
+        let page = store
+            .query_entities_page(&EntityFilter::default(), &EntityPage::first(50))
+            .unwrap();
+
+        assert_eq!(page.entities.len(), 50, "a page must be the size asked for");
+        assert_eq!(page.next_offset, Some(50), "there are 80 entities after it");
+        assert_eq!(page.total_matching, 130);
+    }
+
+    #[test]
+    fn the_paged_read_bounds_what_the_unpaged_read_returns() {
+        let store = PagingStore::of_size(130);
+        let filter = EntityFilter::default();
+
+        let unpaged = store.query_entities(&filter).unwrap();
+        let paged = store
+            .query_entities_page(&filter, &EntityPage::first(50))
+            .unwrap();
+
+        // The join between the two reads, asserted here rather than inferred
+        // from either side. A default that accepted a page and ignored it
+        // passes every arithmetic test below and fails only this one.
+        assert_eq!(unpaged.len(), 130);
+        assert_eq!(paged.entities.len(), 50);
+        assert_eq!(paged.total_matching, unpaged.len());
+    }
+
+    #[test]
+    fn walking_the_continuation_reaches_every_entity_exactly_once() {
+        let store = PagingStore::of_size(130);
+        let filter = EntityFilter::default();
+        let expected = store.expected_names(&filter);
+
+        let (seen, rounds) = walk_pages(&store, &filter, 50);
+
+        let distinct: HashSet<&String> = seen.iter().collect();
+        assert_eq!(distinct.len(), seen.len(), "the walk repeated an entity");
+        assert_eq!(seen.len(), expected.len(), "the walk skipped an entity");
+        assert_eq!(seen, expected, "the walk reordered the query");
+        // Three pages, not 130. A cursor advancing by one instead of by the
+        // limit still visits everything exactly once and is still wrong.
+        assert_eq!(rounds, 3);
+    }
+
+    #[test]
+    fn a_repository_smaller_than_one_page_returns_everything_and_no_continuation() {
+        let store = PagingStore::of_size(7);
+
+        let page = store
+            .query_entities_page(&EntityFilter::default(), &EntityPage::first(50))
+            .unwrap();
+
+        assert_eq!(page.entities.len(), 7);
+        assert_eq!(page.total_matching, 7);
+        // The control the whole check rests on. A continuation that is always
+        // present is a continuation nothing can falsify, and the walk above
+        // would still terminate against one, because the second page comes back
+        // empty and the caller cannot tell that from the end.
+        assert_eq!(page.next_offset, None);
+        assert!(!page.has_more());
+    }
+
+    #[test]
+    fn a_repository_exactly_one_page_long_offers_no_continuation() {
+        let store = PagingStore::of_size(50);
+
+        let page = store
+            .query_entities_page(&EntityFilter::default(), &EntityPage::first(50))
+            .unwrap();
+
+        assert_eq!(page.entities.len(), 50);
+        assert_eq!(page.total_matching, 50);
+        // The boundary the `<` in `next_offset` decides. A `<=` here offers a
+        // second page holding nothing, which reads to a browser as one more
+        // request and one more empty screen.
+        assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn the_reported_total_does_not_move_when_the_page_size_does() {
+        let store = PagingStore::of_size(130);
+        let filter = EntityFilter::default();
+
+        let totals: Vec<usize> = [1, 7, 50, 130, 500]
+            .into_iter()
+            .map(|limit| {
+                store
+                    .query_entities_page(&filter, &EntityPage::first(limit))
+                    .unwrap()
+                    .total_matching
+            })
+            .collect();
+
+        assert_eq!(totals, vec![130; 5]);
+    }
+
+    #[test]
+    fn a_zero_limit_returns_nothing_and_does_not_continue() {
+        let store = PagingStore::of_size(130);
+
+        let page = store
+            .query_entities_page(&EntityFilter::default(), &EntityPage::first(0))
+            .unwrap();
+
+        assert!(page.entities.is_empty());
+        assert_eq!(page.total_matching, 130, "the count survives a zero window");
+        // Not `Some(0)`. A continuation back to the offset just asked for is an
+        // infinite loop, and `limit=0` is reachable from any query string.
+        assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn an_offset_past_the_last_match_returns_an_empty_page_and_the_real_total() {
+        let store = PagingStore::of_size(130);
+
+        let page = store
+            .query_entities_page(&EntityFilter::default(), &EntityPage::new(1_000, 50))
+            .unwrap();
+
+        assert!(page.entities.is_empty());
+        assert_eq!(page.total_matching, 130);
+        assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn a_limit_that_overflows_the_offset_still_ends_the_query() {
+        let store = PagingStore::of_size(130);
+
+        let page = store
+            .query_entities_page(
+                &EntityFilter::default(),
+                &EntityPage::new(usize::MAX - 1, usize::MAX),
+            )
+            .unwrap();
+
+        assert!(page.entities.is_empty());
+        assert_eq!(page.total_matching, 130);
+        assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn paging_a_narrowed_query_counts_the_matches_and_not_the_repository() {
+        let store = PagingStore::of_size(130);
+        // e100 through e129: thirty of the hundred and thirty.
+        let filter = EntityFilter {
+            name_pattern: Some("e1".to_string()),
+            ..Default::default()
+        };
+        let expected = store.expected_names(&filter);
+        assert_eq!(expected.len(), 30, "the fixture's own arithmetic");
+
+        let page = store
+            .query_entities_page(&filter, &EntityPage::first(12))
+            .unwrap();
+        let (seen, rounds) = walk_pages(&store, &filter, 12);
+
+        assert_eq!(
+            page.total_matching, 30,
+            "the total counts matches, not rows"
+        );
+        assert_eq!(page.entities.len(), 12);
+        assert_eq!(seen, expected);
+        assert_eq!(rounds, 3);
+    }
+
+    #[test]
+    fn a_page_over_an_empty_query_is_empty_and_final() {
+        let store = PagingStore::of_size(130);
+        let filter = EntityFilter {
+            name_pattern: Some("nothing-is-named-this".to_string()),
+            ..Default::default()
+        };
+
+        let page = store
+            .query_entities_page(&filter, &EntityPage::first(50))
+            .unwrap();
+
+        assert!(page.entities.is_empty());
+        assert_eq!(page.total_matching, 0);
+        assert_eq!(page.next_offset, None);
+    }
+
+    #[test]
+    fn a_reference_to_a_store_pages_through_the_store_it_refers_to() {
+        let store = PagingStore::of_size(130);
+        let by_reference: &PagingStore = &store;
+
+        // The blanket `impl EntityStore for &G` forwards this rather than
+        // inheriting the default, so an override on `G` survives being reached
+        // through a reference. Nothing here can see the difference between
+        // forwarding and the default, because `PagingStore` does not override;
+        // what this asserts is that `&G` answers at all, which is the half a
+        // missing forward would break outright.
+        let page = by_reference
+            .query_entities_page(&EntityFilter::default(), &EntityPage::first(50))
+            .unwrap();
+
+        assert_eq!(page.entities.len(), 50);
+        assert_eq!(page.total_matching, 130);
+        assert_eq!(page.next_offset, Some(50));
+    }
+
+    #[test]
+    fn a_window_an_engine_took_itself_ends_where_the_default_would() {
+        // `from_window` is what an implementation that bounds its own work
+        // reports through, and it must agree with `from_ordered` about where a
+        // query ends or two engines answer the same repository differently.
+        let page = EntityPage::new(100, 50);
+
+        let windowed = EntityPageResult::from_window(Vec::new(), 130, &page);
+        let ordered = EntityPageResult::from_ordered(
+            (0..130)
+                .map(|i| make_entity(EntityId(uuid::Uuid::from_u128(i + 1)), &format!("e{i:03}")))
+                .collect(),
+            &page,
+        );
+
+        assert_eq!(windowed.next_offset, ordered.next_offset);
+        assert_eq!(windowed.total_matching, ordered.total_matching);
+        assert_eq!(ordered.entities.len(), 30, "the tail is short of a page");
+        assert_eq!(ordered.next_offset, None);
     }
 }

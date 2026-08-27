@@ -117,8 +117,8 @@ pub use git_authority::{
     GIT_EXTERNAL_AUTHORITY_SCHEMA_VERSION,
 };
 pub use graph::{
-    ChangeStore, EntityFilter, EntityStore, GraphStore, ProvenanceStore, ReviewStore, SessionStore,
-    SubGraph, VerificationStore, WorkStore,
+    ChangeStore, EntityFilter, EntityPage, EntityPageResult, EntityStore, GraphStore,
+    ProvenanceStore, ReviewStore, SessionStore, SubGraph, VerificationStore, WorkStore,
 };
 pub use identity::{
     compute_semantic_change_id, content_identity_from_deltas, validate_semantic_change_id,
