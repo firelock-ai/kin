@@ -8025,6 +8025,52 @@ mod tests {
         }
     }
 
+    /// Which sibling the eager pass actually spends its time on.
+    ///
+    /// The bound sweep showed a large first-sibling cost and a small marginal
+    /// one, which fits two different worlds: a one-time initialization on first
+    /// load, or one pathological sibling that happens to be first. The sweep
+    /// already argues against the first, because a second fresh `DaemonState`
+    /// in the same process paid the cost again. This settles it by timing each
+    /// sibling load separately and naming them.
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "measurement against this host's real registry, not a guard"]
+    fn attribute_the_eager_sibling_cost_per_sibling() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let state = test_state(primary_init.layout, primary_dir.path());
+
+        eprintln!("FIR2763 ATTRIBUTE seconds | repo_id");
+        let mut total = 0.0_f64;
+        // The discriminator. A first sibling is slow under BOTH hypotheses, so
+        // the order is reversed here: if the new first sibling is also slow the
+        // cost is one-time initialization paid by whoever goes first, and if it
+        // is fast the cost belongs to one pathological repository.
+        let reverse = std::env::var("KIN_SPINE_ATTRIBUTE_REVERSE").is_ok();
+        let mut order: Vec<_> = state.registered_local_repository_authorities.iter().collect();
+        if reverse {
+            order.reverse();
+        }
+        eprintln!("FIR2763 ATTRIBUTE order reversed: {reverse}");
+        for registered in order {
+            let binding = registered.binding.clone();
+            let started = std::time::Instant::now();
+            let loaded = DaemonState::load_registered_workspace_graph(&binding);
+            let seconds = started.elapsed().as_secs_f64();
+            total += seconds;
+            eprintln!(
+                "FIR2763 ATTRIBUTE {seconds:>7.2} | {} {}",
+                registered.repo_id,
+                if loaded.is_ok() { "" } else { "(load failed)" }
+            );
+        }
+        eprintln!(
+            "FIR2763 ATTRIBUTE total {total:.2}s over {} siblings",
+            state.registered_local_repository_authorities.len()
+        );
+    }
+
     /// FIR-2763's bound, and FIR-2772's scoping, from the BOUNDED side.
     ///
     /// A capture the configured bound stopped is not an incomplete authority. It
