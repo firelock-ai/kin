@@ -11,17 +11,18 @@ silently drop:
   1. Every step that runs an acceptance suite for real (a scripts/acceptance
      script writing --json into acceptance/) carries the suffix
      "(verdict comes from the gate step)" in its name.
-  2. Every such step still captures its exit code (`|| rc=$?`) and carries the
-     ::error annotation template, so a failing suite is loud in the log even
-     though the step ends green.
+  2. Every such step still captures its exit code (`|| rc=$?`) and carries a
+     ::warning annotation that says the nonzero result is deferred to the
+     verdict step. A suite step must not emit ::error or call itself failed,
+     because an explicitly allowed UNREADABLE is not a failed gate.
   3. Exactly one step name begins with "Acceptance verdict", and its run block
      invokes scripts/acceptance/gate.py. The verdict has one home.
 
 Self-test: --self-test drives the scanner over embedded mutants (a suite step
 with the suffix missing, a second verdict-named step, a suite step without the
-error annotation, and a clean control) and fails if any mutant passes or the
-control fails. Exit 0 all good, 1 a rule is violated, 2 the workflow could not
-be parsed, 64 usage.
+deferred warning, a suite step that emits a premature error, and a clean
+control) and fails if any mutant passes or the control fails. Exit 0 all good,
+1 a rule is violated, 2 the workflow could not be parsed, 64 usage.
 """
 from __future__ import annotations
 
@@ -30,6 +31,7 @@ import sys
 
 SUFFIX = "(verdict comes from the gate step)"
 VERDICT_PREFIX = "Acceptance verdict"
+DEFERRED_PHRASE = "verdict deferred to the Acceptance verdict step"
 WORKFLOW = ".github/workflows/acceptance.yml"
 
 STEP_RE = re.compile(r"^      - name: (?P<name>.+?)\s*$", re.M)
@@ -92,10 +94,15 @@ def check(text: str) -> list[str]:
                 "suite step %r no longer captures its exit code; a raw exit would "
                 "let an allowed UNREADABLE redden the job past the gate" % name
             )
-        if "::error title=" not in body:
+        if "::warning title=" not in body or DEFERRED_PHRASE not in body:
             problems.append(
-                "suite step %r carries no ::error annotation, so a failing suite "
-                "is quiet in the log" % name
+                "suite step %r carries no deferred ::warning annotation, so its "
+                "nonzero result can be mistaken for the verdict" % name
+            )
+        if "::error" in body or "suite failed" in body.lower():
+            problems.append(
+                "suite step %r claims failure before the acceptance gate has "
+                "applied its exact, reasoned UNREADABLE allowances" % name
             )
     return problems
 
@@ -108,7 +115,9 @@ def self_test() -> int:
     suite_body = [
         "run: |",
         "  python3 scripts/acceptance/example.py --json acceptance/example.json || rc=$?",
-        '  echo "::error title=Example suite failed::exit $rc"',
+        '  echo "::warning title=Example suite nonzero::exit $rc; '
+        + DEFERRED_PHRASE
+        + '"',
     ]
     gate_body = ["run: python3 scripts/acceptance/gate.py --report x=acceptance/x.json"]
     control = (
@@ -128,12 +137,26 @@ def self_test() -> int:
             + make_step("Acceptance verdict, gated", gate_body)
             + make_step("Acceptance verdict, again", gate_body)
         ),
-        "annotation missing": (
+        "deferred warning missing": (
             make_step(
                 "Example suite %s" % SUFFIX,
                 [
                     "run: |",
                     "  python3 scripts/acceptance/example.py --json acceptance/e.json || rc=$?",
+                ],
+            )
+            + make_step("Acceptance verdict, gated", gate_body)
+        ),
+        "premature failure annotation": (
+            make_step(
+                "Example suite %s" % SUFFIX,
+                [
+                    "run: |",
+                    "  python3 scripts/acceptance/example.py --json acceptance/e.json || rc=$?",
+                    '  echo "::error title=Example suite failed::exit $rc"',
+                    '  echo "::warning title=Example suite nonzero::exit $rc; '
+                    + DEFERRED_PHRASE
+                    + '"',
                 ],
             )
             + make_step("Acceptance verdict, gated", gate_body)
