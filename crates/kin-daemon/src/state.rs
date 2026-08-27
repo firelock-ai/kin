@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
+use std::collections::hash_map::RandomState;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::BuildHasher;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -20,7 +22,7 @@ use kin_model::{
 };
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
@@ -969,6 +971,39 @@ impl TemporalScope {
 /// straddling a graph mutation.
 const SPINE_GRAPH_CAPTURE_ATTEMPTS: usize = 3;
 
+/// Fixed upper bound for hosted repository reload coordination.
+///
+/// Repository ids can be supplied by a client when no allowlist is configured,
+/// so keeping one permanent mutex per observed id turns misses into an
+/// unbounded allocation. Randomly keyed stripes keep the coordination memory
+/// constant while still allowing unrelated repositories to reload in parallel.
+const HOSTED_REPO_RELOAD_GATE_SHARDS: usize = 64;
+const HOSTED_REPO_RELOAD_ATTEMPTS: usize = 3;
+const HOSTED_SPINE_CURSOR_CAS_REQUIRED: &str =
+    "hosted persistent spine is unavailable until its durable backend can stage rows and compare-and-swap a head bound to the exact source publication cursor";
+
+fn hosted_repo_reload_gates() -> [AsyncMutex<()>; HOSTED_REPO_RELOAD_GATE_SHARDS] {
+    std::array::from_fn(|_| AsyncMutex::new(()))
+}
+
+#[cfg(test)]
+struct RepoReloadWaiter<'a>(&'a AtomicUsize);
+
+#[cfg(test)]
+impl<'a> RepoReloadWaiter<'a> {
+    fn enter(waiters: &'a AtomicUsize) -> Self {
+        waiters.fetch_add(1, Ordering::SeqCst);
+        Self(waiters)
+    }
+}
+
+#[cfg(test)]
+impl Drop for RepoReloadWaiter<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// One internally coherent repo domain prepared for spine publication.
 ///
 /// Entities, relations, entries, and `root_hash` are all derived from the same
@@ -979,6 +1014,10 @@ struct SpineGraphCapture {
     repo_id: String,
     graph: Arc<kin_db::InMemoryGraph>,
     graph_authority_epoch: Option<u64>,
+    /// `Some(expected)` means this graph came from hosted storage and must
+    /// still match that exact backend publication before derived state commits.
+    /// The inner value is `None` for a proved-empty hosted publication.
+    hosted_publication_cursor: Option<Option<kin_db::SnapshotCursor>>,
     root_hash: String,
     entries: Vec<kin_spine::EntityEntry>,
     entities: Vec<kin_model::Entity>,
@@ -1449,6 +1488,36 @@ fn salvage_from_sidecar_outcome(
     })
 }
 
+/// One hosted repository generation as the daemon serves it.
+///
+/// Graph query state and repository metadata come from the same recovered
+/// snapshot and stay in one cache entry so a ref read cannot combine a newer
+/// graph with an older authority envelope. The envelope is small compared with
+/// the graph and is the only durable metadata the hosted refs route needs.
+struct HostedRepoCacheEntry {
+    graph: Arc<kin_db::InMemoryGraph>,
+    repository_authority: Option<Arc<kin_db::PersistedRepositoryAuthority>>,
+    publication_cursor: Option<kin_db::SnapshotCursor>,
+}
+
+impl HostedRepoCacheEntry {
+    fn new(
+        graph: Arc<kin_db::InMemoryGraph>,
+        repository_authority: Option<Arc<kin_db::PersistedRepositoryAuthority>>,
+        publication_cursor: Option<kin_db::SnapshotCursor>,
+    ) -> Self {
+        Self {
+            graph,
+            repository_authority,
+            publication_cursor,
+        }
+    }
+
+    fn is_current_at(&self, publication_cursor: Option<kin_db::SnapshotCursor>) -> bool {
+        self.publication_cursor == publication_cursor
+    }
+}
+
 pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
@@ -1622,6 +1691,19 @@ pub struct DaemonState {
     /// - `InMemorySpineBackend`: local dev / single daemon (default)
     /// - `FirestoreSpineBackend`: cloud / stateless daemon pool (when GOOGLE_CLOUD_PROJECT is set)
     pub spine: std::sync::OnceLock<Arc<dyn kin_spine::SpineBackend>>,
+    /// Counts backend factory entry for tests that must prove a fail-closed
+    /// hold occurs before construction, hydration, or any durable I/O.
+    #[cfg(test)]
+    spine_backend_constructions: AtomicUsize,
+    /// Counts entry into durable hydration separately from construction.
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "firestore"), allow(dead_code))]
+    spine_backend_hydrations: AtomicUsize,
+    /// Test-only escape hatch for process-local spine behavior. Production
+    /// hosted states have no corresponding field or bypass: they remain held
+    /// until the durable backend owns cursor-bound publication CAS.
+    #[cfg(test)]
+    hosted_in_memory_spine_allowed: AtomicBool,
     /// Serializes the complete lazy initialization pass. `OnceLock` serializes
     /// publication only; without this gate, multiple callers can concurrently
     /// perform the full O(graph) capture/load/build pass and one warm guard can
@@ -1652,7 +1734,15 @@ pub struct DaemonState {
     /// Maps repo_id to a lazily-loaded graph. Graphs are loaded from the
     /// storage backend on first access. Only active when `storage_backend`
     /// is `Some` (cloud / multi-repo mode).
-    pub repo_graphs: RwLock<HashMap<String, Arc<kin_db::InMemoryGraph>>>,
+    repo_graphs: RwLock<HashMap<String, Arc<HostedRepoCacheEntry>>>,
+    /// Fixed, randomly keyed reload-gate stripes. A publication movement may
+    /// make many concurrent requests miss the same generation at once; only
+    /// one task in the selected stripe downloads and validates a successor.
+    /// Fixed storage prevents unbounded growth from absent repository ids.
+    repo_graph_load_gates: [AsyncMutex<()>; HOSTED_REPO_RELOAD_GATE_SHARDS],
+    repo_graph_load_gate_hasher: RandomState,
+    #[cfg(test)]
+    repo_graph_load_waiters: AtomicUsize,
     /// Optional allowlist for cloud repo discovery. When present, only these
     /// repo IDs are visible through the multi-repo HTTP API.
     pub allowed_repo_ids: Option<HashSet<String>>,
@@ -3035,6 +3125,12 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            spine_backend_constructions: AtomicUsize::new(0),
+            #[cfg(test)]
+            spine_backend_hydrations: AtomicUsize::new(0),
+            #[cfg(test)]
+            hosted_in_memory_spine_allowed: AtomicBool::new(false),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
             background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
@@ -3045,6 +3141,10 @@ impl DaemonState {
             vector_checkpoint_reopen_test_hook: Mutex::new(None),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
             repo_graphs: RwLock::new(HashMap::new()),
+            repo_graph_load_gates: hosted_repo_reload_gates(),
+            repo_graph_load_gate_hasher: RandomState::new(),
+            #[cfg(test)]
+            repo_graph_load_waiters: AtomicUsize::new(0),
             allowed_repo_ids: None,
             dirty: AtomicBool::new(false),
             mutation_epoch: AtomicU64::new(0),
@@ -3096,10 +3196,14 @@ impl DaemonState {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             load_persisted_mcp_transactions(&state.layout);
-        state
-            .repo_graphs
-            .get_mut()
-            .insert(state.cached_repo_id.clone(), Arc::clone(&state.graph));
+        state.repo_graphs.get_mut().insert(
+            state.cached_repo_id.clone(),
+            Arc::new(HostedRepoCacheEntry::new(
+                Arc::clone(&state.graph),
+                None,
+                None,
+            )),
+        );
 
         // The loaded graph is the validated durable generation and the state
         // is not externally visible yet. Heal derived artifacts directly from
@@ -3146,55 +3250,72 @@ impl DaemonState {
         allowed_repo_ids: Option<HashSet<String>>,
     ) -> Result<Self> {
         let text_index_path = layout.text_index_dir();
-        let (graph, generation, loaded_snapshot, hosted_authority_envelope) =
-            match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
-                .map_err(DaemonError::from)?
-            {
-                Some(recovered) => {
-                    // Read before the move: `from_snapshot_with_text_index`
-                    // discards this field by design, because the envelope is
-                    // owned by the publication manager and never by the
-                    // in-place mutable graph. This is the last point at which
-                    // the daemon can see whether the object it opened is one
-                    // an envelope-free write would erase.
-                    let hosted_authority_envelope =
-                        recovered.snapshot.repository_authority.is_some();
-                    let (query_snapshot, materialized_head) =
-                        materialize_hosted_repository_snapshot(recovered.snapshot)?;
-                    let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                        query_snapshot,
-                        text_index_path.clone(),
-                    )
-                    .map_err(DaemonError::from)?;
-                    info!(
-                        repo_id,
-                        generation = recovered.generation,
-                        deltas_replayed = recovered.deltas_applied,
-                        hosted_authority_envelope,
-                        materialized_head = ?materialized_head,
-                        "loaded graph from storage backend"
-                    );
-                    (
-                        Arc::new(g),
+        let (
+            graph,
+            generation,
+            loaded_snapshot,
+            hosted_authority_envelope,
+            hosted_repository_authority,
+            hosted_publication_cursor,
+        ) = match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
+            .map_err(DaemonError::from)?
+        {
+            Some(recovered) => {
+                // Read before the move: `from_snapshot_with_text_index`
+                // discards this field by design, because the envelope is
+                // owned by the publication manager and never by the
+                // in-place mutable graph. This is the last point at which
+                // the daemon can see whether the object it opened is one
+                // an envelope-free write would erase.
+                let hosted_repository_authority = recovered
+                    .snapshot
+                    .repository_authority
+                    .as_ref()
+                    .cloned()
+                    .map(Arc::new);
+                let hosted_authority_envelope = hosted_repository_authority.is_some();
+                let (query_snapshot, materialized_head) =
+                    materialize_hosted_repository_snapshot(recovered.snapshot)?;
+                let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                    query_snapshot,
+                    text_index_path.clone(),
+                )
+                .map_err(DaemonError::from)?;
+                info!(
+                    repo_id,
+                    generation = recovered.generation,
+                    deltas_replayed = recovered.deltas_applied,
+                    hosted_authority_envelope,
+                    materialized_head = ?materialized_head,
+                    "loaded graph from storage backend"
+                );
+                (
+                    Arc::new(g),
+                    recovered.generation,
+                    true,
+                    hosted_authority_envelope,
+                    hosted_repository_authority,
+                    Some(kin_db::SnapshotCursor::from_backend_generation(
                         recovered.generation,
-                        true,
-                        hosted_authority_envelope,
-                    )
-                }
-                None => {
-                    info!(repo_id, "no snapshot found, starting with empty graph");
-                    // In cloud mode, an empty graph IS the valid initial state.
-                    // Mark as initialized so the readiness probe passes.
-                    (
-                        Arc::new(kin_db::InMemoryGraph::with_text_index(
-                            text_index_path.clone(),
-                        )),
-                        0,
-                        true,
-                        false,
-                    )
-                }
-            };
+                    )),
+                )
+            }
+            None => {
+                info!(repo_id, "no snapshot found, starting with empty graph");
+                // In cloud mode, an empty graph IS the valid initial state.
+                // Mark as initialized so the readiness probe passes.
+                (
+                    Arc::new(kin_db::InMemoryGraph::with_text_index(
+                        text_index_path.clone(),
+                    )),
+                    0,
+                    true,
+                    false,
+                    None,
+                    None,
+                )
+            }
+        };
 
         let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
         let backend: Arc<dyn StorageBackend> = Arc::from(backend);
@@ -3296,6 +3417,12 @@ impl DaemonState {
             event_tx: tokio::sync::broadcast::channel(256).0,
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            spine_backend_constructions: AtomicUsize::new(0),
+            #[cfg(test)]
+            spine_backend_hydrations: AtomicUsize::new(0),
+            #[cfg(test)]
+            hosted_in_memory_spine_allowed: AtomicBool::new(false),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
             background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
@@ -3306,6 +3433,10 @@ impl DaemonState {
             vector_checkpoint_reopen_test_hook: Mutex::new(None),
             spine_refresh_gate: tokio::sync::Mutex::new(()),
             repo_graphs: RwLock::new(HashMap::new()), // populated below
+            repo_graph_load_gates: hosted_repo_reload_gates(),
+            repo_graph_load_gate_hasher: RandomState::new(),
+            #[cfg(test)]
+            repo_graph_load_waiters: AtomicUsize::new(0),
             allowed_repo_ids,
             dirty: AtomicBool::new(false),
             mutation_epoch: AtomicU64::new(0),
@@ -3360,7 +3491,14 @@ impl DaemonState {
         // Pre-load repos into the map BEFORE any async context.
         // We use get_mut() since no one else has a reference yet.
         let graphs = state.repo_graphs.get_mut();
-        graphs.insert(repo_id.to_string(), graph);
+        graphs.insert(
+            repo_id.to_string(),
+            Arc::new(HostedRepoCacheEntry::new(
+                graph,
+                hosted_repository_authority,
+                hosted_publication_cursor,
+            )),
+        );
 
         // The recovered graph is already the exact validated authority view
         // and the state is not externally visible yet. Reuse it for startup
@@ -3401,14 +3539,15 @@ impl DaemonState {
     }
 
     /// Lazily initialize the spine and return a reference to it.
-    /// Returns `None` if spine is disabled or if the mutable primary graph could
-    /// not be captured stably yet; the latter leaves OnceLock empty for retry.
+    /// Returns `None` if spine is disabled, hosted persistence lacks a
+    /// cursor-bound head CAS, or the mutable local primary graph could not be
+    /// captured stably yet. Each case leaves OnceLock empty for retry.
     ///
     /// Registration is published once, but the graph it describes keeps moving.
     /// Every caller therefore re-resolves the primary watermark here rather than
     /// reading whatever root the daemon happened to start with.
     pub fn ensure_spine(&self) -> Option<&dyn kin_spine::SpineBackend> {
-        if self.spine_disabled {
+        if self.spine_disabled || self.hosted_persistent_spine_blocked() {
             return None;
         }
         if self.spine.get().is_none() {
@@ -3422,13 +3561,68 @@ impl DaemonState {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 if self.spine.get().is_none() {
-                    self.initialize_spine_lazy();
+                    if self.storage_backend.is_some() {
+                        // A hosted daemon's `self.graph` is the immutable graph
+                        // it opened at process start. Cross-pod publication can
+                        // replace the cursor-bearing cache entry without
+                        // mutating that Arc, so registering or re-registering
+                        // from `self.graph` could roll durable spine rows back
+                        // to startup authority. Hosted persistence starts empty
+                        // (or hydrated but explicitly incomplete for this repo)
+                        // and is populated only by the async cursor-bound ingest
+                        // and refresh paths below.
+                        let backend = self.create_spine_backend();
+                        backend.invalidate_cross_repo_edges(&self.cached_repo_id);
+                        let _ = self.spine.set(backend);
+                    } else {
+                        self.initialize_spine_lazy();
+                    }
                 }
             });
         }
         let spine = self.spine.get()?;
-        self.reregister_primary_at_current_root(spine.as_ref());
+        if self.storage_backend.is_none() {
+            self.reregister_primary_at_current_root(spine.as_ref());
+        }
         Some(spine.as_ref())
+    }
+
+    /// Refuse every cursorless spine backend in hosted mode.
+    ///
+    /// The production image currently compiles `gcs` without `firestore`, so
+    /// feature-gating this hold would silently select the process-local
+    /// in-memory backend and let hosted ingest claim durable success. Returning
+    /// no spine for every `StorageBackend` state is the only fail-closed
+    /// behavior until a persistent backend owns immutable staging plus a
+    /// cursor-bound compare-and-swap head. This check happens before backend
+    /// construction, so no cursorless fallback is constructed or served.
+    fn hosted_persistent_spine_blocked(&self) -> bool {
+        if self.storage_backend.is_none() {
+            return false;
+        }
+        #[cfg(test)]
+        if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
+            return false;
+        }
+        true
+    }
+
+    /// Enable process-local hosted spine behavior in tests that exercise the
+    /// in-memory algorithm itself. This method does not exist in production.
+    #[cfg(test)]
+    pub(crate) fn allow_hosted_in_memory_spine_for_test(&self) {
+        self.hosted_in_memory_spine_allowed
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn spine_unavailable_reason(&self) -> &'static str {
+        if self.spine_disabled {
+            "spine disabled via KIN_DISABLE_SPINE"
+        } else if self.hosted_persistent_spine_blocked() {
+            HOSTED_SPINE_CURSOR_CAS_REQUIRED
+        } else {
+            "spine initialization could not capture stable graph authority; retry"
+        }
     }
 
     /// Whether the spine's registered primary watermark is the live graph root.
@@ -3503,12 +3697,55 @@ impl DaemonState {
         });
     }
 
+    /// Bind a graph Arc to the exact hosted cache publication it came from.
+    ///
+    /// Local graphs return `None`. Hosted graphs return `Some(cursor)`, where
+    /// the cursor itself may be `None` only for a proved-empty publication.
+    /// A hosted Arc that is no longer the cache entry is rejected rather than
+    /// treated as immutable-current merely because its own root did not move.
+    fn hosted_publication_cursor_for_graph(
+        &self,
+        repo_id: &str,
+        graph: &Arc<kin_db::InMemoryGraph>,
+    ) -> std::result::Result<Option<Option<kin_db::SnapshotCursor>>, String> {
+        if self.storage_backend.is_none() {
+            return Ok(None);
+        }
+        let graphs = self.repo_graphs.try_read().map_err(|_| {
+            format!("hosted repo {repo_id} cache is changing while spine authority is captured")
+        })?;
+        let entry = graphs
+            .get(repo_id)
+            .ok_or_else(|| format!("hosted repo {repo_id} has no cursor-bound cache entry"))?;
+        if !Arc::ptr_eq(&entry.graph, graph) {
+            return Err(format!(
+                "hosted repo {repo_id} cache advanced beyond the graph being captured"
+            ));
+        }
+        Ok(Some(entry.publication_cursor))
+    }
+
     fn spine_capture_is_current(&self, capture: &SpineGraphCapture) -> bool {
         if capture
             .graph_authority_epoch
             .is_some_and(|epoch| !self.graph_authority_epoch_is_current(epoch))
         {
             return false;
+        }
+        let cache_binding =
+            match self.hosted_publication_cursor_for_graph(&capture.repo_id, &capture.graph) {
+                Ok(binding) => binding,
+                Err(_) => return false,
+            };
+        if cache_binding != capture.hosted_publication_cursor {
+            return false;
+        }
+        if let Some(expected_cursor) = capture.hosted_publication_cursor {
+            let current_cursor =
+                without_blocking_runtime_worker(|| self.probe_repo_publication(&capture.repo_id));
+            if current_cursor.ok() != Some(expected_cursor) {
+                return false;
+            }
         }
         if hex::encode(capture.graph.compute_root_hash()) != capture.root_hash {
             return false;
@@ -3551,6 +3788,14 @@ impl DaemonState {
             } else {
                 None
             };
+            let hosted_publication_cursor =
+                match self.hosted_publication_cursor_for_graph(repo_id, &graph) {
+                    Ok(cursor) => cursor,
+                    Err(reason) => {
+                        last_reason = reason;
+                        continue;
+                    }
+                };
 
             let snapshot = graph.to_snapshot();
             let root_hash = hex::encode(kin_db::compute_graph_root_hash(&snapshot));
@@ -3576,6 +3821,7 @@ impl DaemonState {
                 repo_id: repo_id.to_string(),
                 graph: Arc::clone(&graph),
                 graph_authority_epoch,
+                hosted_publication_cursor,
                 root_hash,
                 entries,
                 entities,
@@ -3965,6 +4211,9 @@ impl DaemonState {
     }
 
     fn create_spine_backend(&self) -> Arc<dyn kin_spine::SpineBackend> {
+        #[cfg(test)]
+        self.spine_backend_constructions
+            .fetch_add(1, Ordering::SeqCst);
         #[cfg(feature = "firestore")]
         {
             if let Ok(project_id) = std::env::var("GOOGLE_CLOUD_PROJECT") {
@@ -3976,6 +4225,8 @@ impl DaemonState {
                 );
                 let backend = kin_spine::FirestoreSpineBackend::new(project_id, database_id);
                 // Hydrate cache from Firestore (best-effort on startup).
+                #[cfg(test)]
+                self.spine_backend_hydrations.fetch_add(1, Ordering::SeqCst);
                 if let Err(e) = backend.hydrate() {
                     warn!(error = %e, "Firestore hydration failed, starting with empty cache");
                 }
@@ -4048,21 +4299,20 @@ impl DaemonState {
         F: FnMut(usize),
     {
         let Some(spine) = self.ensure_spine() else {
-            let reason = if self.spine_disabled {
-                "spine disabled via KIN_DISABLE_SPINE"
-            } else {
-                "spine initialization could not capture stable primary graph authority; retry"
-            };
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                reason.to_string(),
+                self.spine_unavailable_reason().to_string(),
             )));
         };
         let _spine_refresh = self.spine_refresh_gate.lock().await;
 
         // Load the repo's graph from durable storage (GCS in cloud). This is the
         // blob-store read boundary that replaces the local-disk `.kndb` lookup.
-        let graph = self.get_repo_graph(repo_id).await?;
-        let mut capture = match self.capture_spine_repo_with_hook(repo_id, graph, capture_hook) {
+        let entry = self.get_repo_cache_entry(repo_id).await?;
+        let mut capture = match self.capture_spine_repo_with_hook(
+            repo_id,
+            Arc::clone(&entry.graph),
+            capture_hook,
+        ) {
             Ok(capture) => capture,
             Err(capture_error) => {
                 spine.invalidate_cross_repo_edges(repo_id);
@@ -4074,6 +4324,17 @@ impl DaemonState {
         let entity_count = capture.entries.len();
         let relation_count = capture.relations.len();
         let root_hash = capture.root_hash.clone();
+
+        // The graph may be immutable while another pod advances durable
+        // authority. Re-probe the exact cursor immediately before every
+        // persistent spine mutation, not only after it, so a known-stale
+        // capture never begins a derived-state commit.
+        if !self.spine_capture_is_current(&capture) {
+            spine.invalidate_cross_repo_edges(repo_id);
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!("repo {repo_id} publication moved before spine registration; retry"),
+            )));
+        }
 
         // Write-through: register this repo's metadata into the spine store so a
         // freshly started (stateless) pod can hydrate it and resolve against it.
@@ -4099,6 +4360,12 @@ impl DaemonState {
         .len();
 
         if refresh_cross_repo_edges {
+            if !self.spine_capture_is_current(&capture) {
+                spine.invalidate_cross_repo_edges(repo_id);
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    format!("repo {repo_id} publication moved before cross-repo refresh; retry"),
+                )));
+            }
             // Re-resolve this repo's imports now that the sibling metadata is in
             // the spine, materializing (and write-through persisting) the
             // cross-repo edges that back `/spine/xref`.
@@ -4148,14 +4415,22 @@ impl DaemonState {
     /// its imports against the now-complete spine. It is idempotent: each repo's
     /// existing edges are removed and re-materialized.
     pub async fn refresh_all_cross_repo_edges(&self) -> Result<SpineRefreshOutcome> {
+        self.refresh_all_cross_repo_edges_with_before_commit_hook(|| {})
+            .await
+    }
+
+    /// Test seam immediately before a refresh pass tries to certify its
+    /// derived rows. Production uses the no-op wrapper above.
+    async fn refresh_all_cross_repo_edges_with_before_commit_hook<F>(
+        &self,
+        mut before_commit: F,
+    ) -> Result<SpineRefreshOutcome>
+    where
+        F: FnMut(),
+    {
         let Some(spine) = self.ensure_spine() else {
-            let reason = if self.spine_disabled {
-                "spine disabled via KIN_DISABLE_SPINE"
-            } else {
-                "spine initialization could not capture stable primary graph authority; retry"
-            };
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                reason.to_string(),
+                self.spine_unavailable_reason().to_string(),
             )));
         };
         let _spine_refresh = self.spine_refresh_gate.lock().await;
@@ -4180,68 +4455,29 @@ impl DaemonState {
             });
         };
 
-        struct PreparedSpineRepo {
-            repo_id: String,
-            graph: Arc<kin_db::InMemoryGraph>,
-            root_hash: String,
-            entries: Vec<kin_spine::EntityEntry>,
-            entities: Vec<kin_model::Entity>,
-            relations: Vec<kin_model::Relation>,
-        }
-
         // Phase 1: capture each entity/relation domain through one detached
         // graph snapshot. Computing the registered root from that same snapshot
         // prevents per-entity reads from straddling a reconcile. No spine state
         // is updated unless every repo in the pass has a stable capture.
         let mut prepared = Vec::with_capacity(registry_ids.len());
         for repo_id in &registry_ids {
-            let graph = match self.get_repo_graph(repo_id).await {
-                Ok(graph) => graph,
+            let entry = match self.get_repo_cache_entry(repo_id).await {
+                Ok(entry) => entry,
                 Err(e) => {
                     warn!(repo_id, error = %e, "skipping cross-repo refresh: graph load failed");
                     continue;
                 }
             };
-
-            let snapshot = graph.to_snapshot();
-            let root_hash = hex::encode(kin_db::compute_graph_root_hash(&snapshot));
-            let live_root = hex::encode(graph.compute_root_hash());
-            if root_hash != live_root {
-                warn!(
-                    repo_id,
-                    snapshot_root = %root_hash,
-                    live_root = %live_root,
-                    "skipping cross-repo refresh: graph changed while its detached state was captured"
-                );
-                continue;
+            match self.capture_spine_repo(repo_id, Arc::clone(&entry.graph)) {
+                Ok(capture) => prepared.push(capture),
+                Err(error) => {
+                    warn!(
+                        repo_id,
+                        error = %error,
+                        "skipping cross-repo refresh: graph authority capture failed"
+                    );
+                }
             }
-
-            let entity_ids = snapshot.entities.keys().copied().collect::<HashSet<_>>();
-            let mut entities = snapshot.entities.into_values().collect::<Vec<_>>();
-            entities.sort_by_key(|entity| entity.id);
-            let mut relations = snapshot
-                .relations
-                .into_values()
-                .filter(|relation| {
-                    matches!(
-                        relation.kind,
-                        kin_model::RelationKind::Calls | kin_model::RelationKind::References
-                    ) && relation
-                        .src
-                        .as_entity()
-                        .is_some_and(|source| entity_ids.contains(&source))
-                })
-                .collect::<Vec<_>>();
-            relations.sort_by_key(|relation| relation.id.to_string());
-            let entries = Self::entities_to_spine_entries(repo_id, &entities);
-            prepared.push(PreparedSpineRepo {
-                repo_id: repo_id.clone(),
-                graph,
-                root_hash,
-                entries,
-                entities,
-                relations,
-            });
         }
 
         if prepared.len() != registry_ids.len() {
@@ -4261,7 +4497,7 @@ impl DaemonState {
         if !self.graph_authority_epoch_is_current(graph_authority_epoch)
             || prepared
                 .iter()
-                .any(|repo| hex::encode(repo.graph.compute_root_hash()) != repo.root_hash)
+                .any(|repo| !self.spine_capture_is_current(repo))
         {
             warn!(
                 "cross-repo refresh remains incomplete because a graph changed before registration"
@@ -4286,7 +4522,7 @@ impl DaemonState {
         if !self.graph_authority_epoch_is_current(graph_authority_epoch)
             || prepared
                 .iter()
-                .any(|repo| hex::encode(repo.graph.compute_root_hash()) != repo.root_hash)
+                .any(|repo| !self.spine_capture_is_current(repo))
         {
             for repo_id in &registry_ids {
                 spine.invalidate_cross_repo_edges(repo_id);
@@ -4362,11 +4598,12 @@ impl DaemonState {
             );
         }
 
+        before_commit();
         let registry_unchanged =
             spine.registered_repo_ids() == registry_ids.iter().cloned().collect::<HashSet<_>>();
-        let roots_unchanged = prepared
+        let captures_current = prepared
             .iter()
-            .all(|repo| hex::encode(repo.graph.compute_root_hash()) == repo.root_hash);
+            .all(|repo| self.spine_capture_is_current(repo));
         let spine_roots_unchanged = authority_roots
             .iter()
             .all(|(repo_id, root)| spine.root_hash(repo_id).as_ref() == Some(root));
@@ -4374,14 +4611,14 @@ impl DaemonState {
             self.graph_authority_epoch_is_current(graph_authority_epoch);
         let pass_committed = pass.finish(
             registry_unchanged
-                && roots_unchanged
+                && captures_current
                 && spine_roots_unchanged
                 && graph_authority_unchanged,
         );
         if !pass_committed {
             warn!(
                 registry_unchanged,
-                roots_unchanged,
+                captures_current,
                 spine_roots_unchanged,
                 graph_authority_unchanged,
                 "cross-repo refresh completed against unstable authority; leaving every repo incomplete"
@@ -4415,7 +4652,7 @@ impl DaemonState {
     /// backend read succeeded and found neither snapshot authority nor
     /// deltas, so absence here is a complete answer and callers may route it
     /// as a missing repository instead of a broken daemon.
-    fn load_repo_graph(&self, repo_id: &str) -> Result<Arc<kin_db::InMemoryGraph>> {
+    fn load_repo_graph(&self, repo_id: &str) -> Result<Arc<HostedRepoCacheEntry>> {
         let Some(backend) = &self.storage_backend else {
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                 "no storage backend configured for multi-repo mode".to_string(),
@@ -4425,6 +4662,12 @@ impl DaemonState {
             .map_err(DaemonError::from)?
         {
             Some(recovered) => {
+                let repository_authority = recovered
+                    .snapshot
+                    .repository_authority
+                    .as_ref()
+                    .cloned()
+                    .map(Arc::new);
                 let text_index_path = self.layout.text_index_dir();
                 let (query_snapshot, materialized_head) =
                     materialize_hosted_repository_snapshot(recovered.snapshot)?;
@@ -4442,18 +4685,37 @@ impl DaemonState {
                     materialized_head = ?materialized_head,
                     "loaded repo graph from storage backend"
                 );
-                Ok(graph)
+                Ok(Arc::new(HostedRepoCacheEntry::new(
+                    graph,
+                    repository_authority,
+                    Some(kin_db::SnapshotCursor::from_backend_generation(
+                        recovered.generation,
+                    )),
+                )))
             }
             None => Err(DaemonError::RepoAbsentFromStorage(repo_id.to_string())),
         }
     }
 
-    fn cache_loaded_repo_graph(
-        graphs: &mut HashMap<String, Arc<kin_db::InMemoryGraph>>,
-        repo_id: &str,
-        loaded: Arc<kin_db::InMemoryGraph>,
-    ) -> Arc<kin_db::InMemoryGraph> {
-        Arc::clone(graphs.entry(repo_id.to_string()).or_insert(loaded))
+    fn repo_graph_load_gate(&self, repo_id: &str) -> &AsyncMutex<()> {
+        let shard = (self.repo_graph_load_gate_hasher.hash_one(repo_id) as usize)
+            % HOSTED_REPO_RELOAD_GATE_SHARDS;
+        &self.repo_graph_load_gates[shard]
+    }
+
+    async fn cached_repo_entry(&self, repo_id: &str) -> Option<Arc<HostedRepoCacheEntry>> {
+        self.repo_graphs.read().await.get(repo_id).map(Arc::clone)
+    }
+
+    fn probe_repo_publication(&self, repo_id: &str) -> Result<Option<kin_db::SnapshotCursor>> {
+        let backend = self.storage_backend.as_ref().ok_or_else(|| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(
+                "no storage backend configured for hosted publication probe".to_string(),
+            ))
+        })?;
+        backend
+            .load_snapshot_cursor(repo_id)
+            .map_err(DaemonError::from)
     }
 
     /// Whether `repo_id` belongs to the key space this daemon serves.
@@ -4475,7 +4737,7 @@ impl DaemonState {
         }
     }
 
-    /// Get or lazy-load a repo's graph from the storage backend.
+    /// Get or lazy-load one coherent hosted repository generation.
     ///
     /// Returns the cached graph if already loaded, otherwise loads from
     /// the storage backend and caches it. Only usable when a storage
@@ -4494,7 +4756,7 @@ impl DaemonState {
     /// route that did not pre-empt it with [`Self::serves_repo_id`], and left
     /// the ingest path reporting a request sent to the wrong pod as a broken
     /// daemon.
-    pub async fn get_repo_graph(&self, repo_id: &str) -> Result<Arc<kin_db::InMemoryGraph>> {
+    async fn get_repo_cache_entry(&self, repo_id: &str) -> Result<Arc<HostedRepoCacheEntry>> {
         if let Some(allowed_repo_ids) = &self.allowed_repo_ids {
             if !allowed_repo_ids.contains(repo_id) {
                 return Err(DaemonError::RepoNotServed {
@@ -4503,19 +4765,115 @@ impl DaemonState {
                 });
             }
         }
-        // Fast path: check if already loaded.
-        {
-            let graphs = self.repo_graphs.read().await;
-            if let Some(g) = graphs.get(repo_id) {
-                return Ok(Arc::clone(g));
+
+        // A local daemon has no external publication to revalidate. Its one
+        // startup entry remains the authority for the life of the process.
+        if self.storage_backend.is_none() {
+            if let Some(entry) = self.cached_repo_entry(repo_id).await {
+                return Ok(entry);
+            }
+            return self.load_repo_graph(repo_id);
+        }
+
+        // Warm path: one metadata-only backend read proves whether the exact
+        // generation this entry was built from is still current. A probe error
+        // fails the request instead of serving authority whose freshness can
+        // no longer be established.
+        if let Some(entry) = self.cached_repo_entry(repo_id).await {
+            let publication_cursor =
+                without_blocking_runtime_worker(|| self.probe_repo_publication(repo_id))?;
+            if entry.is_current_at(publication_cursor) {
+                return Ok(entry);
             }
         }
-        // Slow path: load from backend.
-        let graph = self.load_repo_graph(repo_id)?;
-        let mut graphs = self.repo_graphs.write().await;
-        // Double-check: another task may have loaded it while we were loading.
-        // Return that task's cached winner, not this task's losing generation.
-        Ok(Self::cache_loaded_repo_graph(&mut graphs, repo_id, graph))
+
+        // Cold and moved publications are single-flighted per repository. A
+        // waiter repeats the cheap probe after it acquires the gate so it can
+        // reuse the generation the winner installed rather than downloading
+        // and validating the same authority again.
+        let gate = self.repo_graph_load_gate(repo_id);
+        #[cfg(test)]
+        let waiting = RepoReloadWaiter::enter(&self.repo_graph_load_waiters);
+        let _reload = gate.lock().await;
+        #[cfg(test)]
+        drop(waiting);
+        if let Some(entry) = self.cached_repo_entry(repo_id).await {
+            let publication_cursor =
+                without_blocking_runtime_worker(|| self.probe_repo_publication(repo_id))?;
+            if entry.is_current_at(publication_cursor) {
+                return Ok(entry);
+            }
+        }
+
+        // The backend can move while a full recovery read is in flight. Bind
+        // every installed cache entry to a cursor re-probed after recovery, and
+        // retry a bounded number of times when another publisher wins during
+        // the read. A failed final probe installs and serves nothing stale.
+        for attempt in 1..=HOSTED_REPO_RELOAD_ATTEMPTS {
+            let loaded = without_blocking_runtime_worker(|| self.load_repo_graph(repo_id))?;
+            let current_cursor =
+                without_blocking_runtime_worker(|| self.probe_repo_publication(repo_id))?;
+            if loaded.is_current_at(current_cursor) {
+                self.repo_graphs
+                    .write()
+                    .await
+                    .insert(repo_id.to_string(), Arc::clone(&loaded));
+                return Ok(loaded);
+            }
+            warn!(
+                repo_id,
+                attempt,
+                attempts = HOSTED_REPO_RELOAD_ATTEMPTS,
+                loaded_cursor = ?loaded.publication_cursor,
+                current_cursor = ?current_cursor,
+                "hosted publication moved during full graph recovery; retrying"
+            );
+        }
+
+        Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+            format!(
+                "hosted repo {repo_id} publication moved during all {HOSTED_REPO_RELOAD_ATTEMPTS} recovery attempts"
+            ),
+        )))
+    }
+
+    /// Return the graph and authority envelope from one generation-bound
+    /// cache entry. Every hosted request probes the backend publication first;
+    /// unchanged generations avoid body downloads, while changed generations
+    /// reload once per repository.
+    pub async fn get_repo_graph(&self, repo_id: &str) -> Result<Arc<kin_db::InMemoryGraph>> {
+        let entry = self.get_repo_cache_entry(repo_id).await?;
+        Ok(Arc::clone(&entry.graph))
+    }
+
+    /// Return repository metadata from the same recovered generation as the
+    /// cached hosted graph.
+    ///
+    /// get_repo_graph performs addressability, absence and backend-fault
+    /// classification before this read. An envelope-free generation remains
+    /// represented as None and fails loud at the route rather than causing a
+    /// second storage open that might observe a different generation.
+    pub async fn get_repo_authority_metadata(
+        &self,
+        repo_id: &str,
+    ) -> Result<Option<Arc<kin_db::PersistedRepositoryAuthority>>> {
+        let entry = self.get_repo_cache_entry(repo_id).await?;
+        Ok(entry.repository_authority.as_ref().map(Arc::clone))
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn evict_repo_cache_for_test(&self, repo_id: &str) {
+        self.repo_graphs.write().await.remove(repo_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repo_graph_load_gate_count_for_test(&self) -> usize {
+        self.repo_graph_load_gates.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repo_graph_load_waiters_for_test(&self) -> usize {
+        self.repo_graph_load_waiters.load(Ordering::SeqCst)
     }
 
     /// List repo IDs that are currently loaded in the multi-repo cache.
@@ -7180,25 +7538,15 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_repo_graph_load_returns_the_cached_winner() {
-        let winner = Arc::new(kin_db::InMemoryGraph::new());
-        let winner_entity = test_entity("winner", "src/winner.rs");
-        winner.upsert_entity(&winner_entity).unwrap();
+    fn hosted_repo_cache_identity_is_the_backend_cursor_not_graph_contents() {
+        let graph = Arc::new(kin_db::InMemoryGraph::new());
+        let first = kin_db::SnapshotCursor::from_backend_generation(41);
+        let second = kin_db::SnapshotCursor::from_backend_generation(42);
+        let entry = HostedRepoCacheEntry::new(graph, None, Some(first));
 
-        let losing_load = Arc::new(kin_db::InMemoryGraph::new());
-        let losing_entity = test_entity("loser", "src/loser.rs");
-        losing_load.upsert_entity(&losing_entity).unwrap();
-
-        // Deterministically model two slow-path loads that both missed the
-        // read cache: the first task has acquired the write lock and installed
-        // its generation before the second task reaches the entry operation.
-        let mut graphs = HashMap::new();
-        graphs.insert("shared".to_string(), Arc::clone(&winner));
-        let returned = DaemonState::cache_loaded_repo_graph(&mut graphs, "shared", losing_load);
-
-        assert!(Arc::ptr_eq(&returned, &winner));
-        assert!(returned.get_entity(&winner_entity.id).unwrap().is_some());
-        assert!(returned.get_entity(&losing_entity.id).unwrap().is_none());
+        assert!(entry.is_current_at(Some(first)));
+        assert!(!entry.is_current_at(Some(second)));
+        assert!(!entry.is_current_at(None));
     }
 
     struct CleanupFailOnceBackend {
@@ -9155,6 +9503,7 @@ mod tests {
             Some(allowed),
         )
         .unwrap();
+        state.allow_hosted_in_memory_spine_for_test();
 
         // Build the primary repo's served graph: a caller plus an unresolved
         // cross-repo `Calls` to `kin_db::InMemoryGraph`, carrying the
@@ -9294,6 +9643,165 @@ mod tests {
         assert!(
             spine.cross_repo_edges_snapshot().complete,
             "a stable two-phase pass over both repos should certify completeness"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hosted_spine_refresh_refuses_a_cross_pod_publication_race() {
+        use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let repo_id = format!("hosted-spine-race-{}", uuid::Uuid::new_v4());
+        let storage = tempfile::tempdir().unwrap();
+        let v2_root = storage.path().join("v2");
+        std::fs::create_dir(&v2_root).unwrap();
+        let first = InMemoryGraph::new();
+        let first_entity = test_entity("first_publication", "src/first.rs");
+        first.upsert_entity(&first_entity).unwrap();
+        let first_generation = LocalFileBackend::new(&v2_root)
+            .save_snapshot(
+                &repo_id,
+                &first.to_snapshot().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let allowed = Some([repo_id.clone()].into_iter().collect());
+        let state = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(&v2_root)),
+            &repo_id,
+            allowed,
+        )
+        .unwrap();
+        state.allow_hosted_in_memory_spine_for_test();
+        state
+            .ingest_repo_into_spine(&repo_id, false)
+            .await
+            .expect("the first publication must register before the race");
+
+        let second = InMemoryGraph::new();
+        let second_entity = test_entity("second_publication", "src/second.rs");
+        second.upsert_entity(&second_entity).unwrap();
+        let second_root = hex::encode(second.compute_root_hash());
+        let second_bytes = second.to_snapshot().to_bytes().unwrap();
+        let writer_root = v2_root.clone();
+        let raced = state
+            .refresh_all_cross_repo_edges_with_before_commit_hook(|| {
+                LocalFileBackend::new(&writer_root)
+                    .save_snapshot(&repo_id, &second_bytes, first_generation)
+                    .expect("the cross-pod fixture must publish its successor");
+            })
+            .await
+            .expect("a publication race is an incomplete pass, not a daemon crash");
+        assert_eq!(
+            raced.repos_refreshed, 0,
+            "a pass captured from the old cursor must not certify success"
+        );
+        let spine = state.spine().unwrap();
+        assert!(
+            !spine.cross_repo_edges_snapshot().complete,
+            "a stale hosted capture must leave derived topology explicitly incomplete"
+        );
+
+        let retried = state
+            .refresh_all_cross_repo_edges()
+            .await
+            .expect("the next pass must reload and bind the successor cursor");
+        assert_eq!(retried.repos_refreshed, 1);
+        assert_eq!(
+            spine.root_hash(&repo_id).as_deref(),
+            Some(second_root.as_str())
+        );
+        assert!(
+            spine.lookup_by_id(&repo_id, &second_entity.id).is_some(),
+            "the successful retry must publish rows from the successor generation"
+        );
+        assert!(spine.cross_repo_edges_snapshot().complete);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hosted_spine_refuses_persistence_without_cursor_cas() {
+        use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
+
+        let _spine_env = kin_core::test_env::EnvVarGuard::unset("KIN_DISABLE_SPINE");
+        let repo_id = format!("hosted-spine-hold-{}", uuid::Uuid::new_v4());
+        let storage = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("held_publication", "src/held.rs"))
+            .unwrap();
+        LocalFileBackend::new(storage.path())
+            .save_snapshot(
+                &repo_id,
+                &graph.to_snapshot().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let state = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(storage.path())),
+            &repo_id,
+            None,
+        )
+        .unwrap();
+        let constructions_before = state.spine_backend_constructions.load(Ordering::SeqCst);
+        let hydrations_before = state.spine_backend_hydrations.load(Ordering::SeqCst);
+
+        assert!(
+            state.ensure_spine().is_none(),
+            "hosted mode must not hydrate or write cursorless persistent spine rows"
+        );
+        assert!(state.spine().is_none());
+        assert_eq!(
+            state.spine_backend_constructions.load(Ordering::SeqCst),
+            constructions_before,
+            "the hold must fire before backend construction or hydration can begin"
+        );
+        assert_eq!(
+            state.spine_backend_hydrations.load(Ordering::SeqCst),
+            hydrations_before,
+            "the hold must fire before durable hydration can begin"
+        );
+        assert_eq!(
+            state.spine_unavailable_reason(),
+            HOSTED_SPINE_CURSOR_CAS_REQUIRED
+        );
+        let error = state
+            .ingest_repo_into_spine(&repo_id, false)
+            .await
+            .expect_err("cursorless durable persistence must fail closed");
+        assert!(
+            error.to_string().contains("compare-and-swap a head"),
+            "the hold must name the missing durable invariant: {error}"
+        );
+        assert!(
+            state.spine().is_none(),
+            "a refused ingest must not initialize a fallback backend"
+        );
+        assert_eq!(
+            state.spine_backend_constructions.load(Ordering::SeqCst),
+            constructions_before,
+            "the ingest refusal must also happen before backend construction"
+        );
+        assert_eq!(
+            state.spine_backend_hydrations.load(Ordering::SeqCst),
+            hydrations_before,
+            "the ingest refusal must also happen before durable hydration"
         );
     }
 

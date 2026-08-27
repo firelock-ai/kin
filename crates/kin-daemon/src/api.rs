@@ -10024,6 +10024,36 @@ fn repository_metadata(
     })
 }
 
+/// Resolve the ref metadata for the exact hosted graph generation already in
+/// the daemon cache.
+///
+/// A hosted daemon loads and validates the complete repository authority when
+/// it opens a graph. Reopening the manager here downloaded that same full
+/// authority for every tiny refs response. The state cache binds metadata and
+/// graph in one entry, probes its publication cursor, and replaces both as one
+/// unit when authority moves, so this is both cheaper and stricter about
+/// generation consistency.
+async fn repository_ref_metadata(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<Arc<kin_db::PersistedRepositoryAuthority>, (StatusCode, String)> {
+    if state.storage_backend.is_some() {
+        return state
+            .get_repo_authority_metadata(repo_id)
+            .await
+            .map_err(|error| repo_addressed_error(state, error))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    "snapshot has no repository-v6 authority envelope".to_string(),
+                )
+            });
+    }
+
+    let snapshot = repository_authority_snapshot(state, repo_id).await?;
+    Ok(Arc::new(repository_metadata(&snapshot)?.clone()))
+}
+
 fn resolve_repository_ref_target(
     snapshot: &kin_db::GraphSnapshot,
     target: &kin_model::RefTarget,
@@ -10322,7 +10352,12 @@ async fn repo_transfer_receive(
     // the committed transfer, and must not be answered to the sending peer as
     // a failed publication.
     let refresh = if state.storage_backend.is_some() {
-        state.repo_graphs.write().await.remove(&repo_id);
+        // Hosted cache entries carry their exact backend publication cursor.
+        // The committed writer must return its durable receipt immediately;
+        // the next reader probes that cursor and single-flights any successor
+        // reload. An explicit post-commit eviction could wait behind an
+        // unrelated full reload and could delete a successor installed before
+        // the eviction finally acquired its gate.
         DerivedViewRefresh::Current
     } else {
         match refresh_local_derived_views(
@@ -10341,7 +10376,6 @@ async fn repo_transfer_receive(
 
 /// Everything a negotiation needs, resolved from one authority lease.
 struct TransferCommandContext {
-    repo_id: String,
     repository_id: RepositoryId,
     authority: RepositoryAuthorityManager<dyn StorageBackend>,
     /// Absent when neither the caller nor this replica names a ref, which is
@@ -10426,7 +10460,6 @@ fn transfer_command_context(
     }
 
     Ok(TransferCommandContext {
-        repo_id,
         repository_id,
         authority,
         source_ref,
@@ -10497,7 +10530,6 @@ pub(crate) async fn pull_into_replica(
 ) -> Result<kin_cli::commands::transfer::CommandTransferResponse, (StatusCode, String)> {
     let state = Arc::clone(state);
     let context = transfer_command_context(&state, request)?;
-    let repo_id = context.repo_id.clone();
     let repository_id = context.repository_id.clone();
     let requested_source_ref = context.source_ref.clone();
     let requested_destination_ref = context.destination_ref.clone();
@@ -10582,9 +10614,9 @@ pub(crate) async fn pull_into_replica(
         }
     })?;
 
-    if !local_derived_views && outcome.moved_history() {
-        state.repo_graphs.write().await.remove(&repo_id);
-    }
+    // Hosted cache freshness is cursor-driven. Do not put a durable pull
+    // receipt behind an in-flight full reload, and do not evict a successor a
+    // concurrent reader may already have installed.
     if !outcome.moved_history() {
         derived_views = DerivedViewRefresh::Current;
     }
@@ -10894,8 +10926,7 @@ async fn repo_refs(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
-    let metadata = repository_metadata(&snapshot)?;
+    let metadata = repository_ref_metadata(&state, &repo_id).await?;
     let default_name = metadata.ref_state.default_ref.clone();
     let workspace_head = metadata.workspaces.iter().find_map(|workspace| {
         if let kin_model::WorkspaceHead::Symbolic { target } = &workspace.head {
@@ -10904,7 +10935,7 @@ async fn repo_refs(
             None
         }
     });
-    let selected = default_repository_ref(metadata)?;
+    let selected = default_repository_ref(&metadata)?;
     let selected_head = selected.map(|repository_ref| match &repository_ref.target {
         kin_model::RefTarget::Change { change_id } => change_id.to_string(),
         kin_model::RefTarget::ExternalObject { object } => object.oid.to_string(),
@@ -11803,7 +11834,7 @@ async fn spine_health(
     let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
 
@@ -11850,7 +11881,7 @@ async fn spine_repos(
     let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
 
@@ -11866,7 +11897,7 @@ async fn spine_resolve(
     let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
 
@@ -11889,7 +11920,7 @@ async fn spine_impact(
     let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
 
@@ -11914,7 +11945,7 @@ async fn spine_xref(
     let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
 
@@ -11936,7 +11967,7 @@ async fn spine_edges(
     let spine = state.ensure_spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
     let snapshot = spine.cross_repo_edges_snapshot();
@@ -17083,12 +17114,12 @@ mod tests {
             String::from_utf8_lossy(&receive_body)
         );
         assert!(
-            !destination_state
+            destination_state
                 .list_loaded_repos()
                 .await
                 .iter()
                 .any(|loaded| loaded == &repo_id),
-            "receive must evict the old graph so the next route is a lazy reload"
+            "a durable receive receipt must not wait on or evict the cache; the next read proves freshness from its publication cursor"
         );
 
         // This is the negative control for the incident. Repository-v6 stores
@@ -22861,28 +22892,302 @@ mod tests {
 
     /// Handle the test keeps after the backend is moved into the daemon, so a
     /// fault can be armed once the daemon has already opened healthy.
+    #[derive(Default)]
+    struct BackendBlockState {
+        remaining_arrivals: usize,
+        arrivals: usize,
+        released: bool,
+    }
+
+    struct BackendBlock {
+        state: std::sync::Mutex<BackendBlockState>,
+        changed: std::sync::Condvar,
+    }
+
+    impl BackendBlock {
+        fn new(arrivals: usize) -> Self {
+            Self {
+                state: std::sync::Mutex::new(BackendBlockState {
+                    remaining_arrivals: arrivals,
+                    ..BackendBlockState::default()
+                }),
+                changed: std::sync::Condvar::new(),
+            }
+        }
+
+        fn arrive_and_wait(&self) {
+            let mut state = self.state.lock().unwrap();
+            if state.released || state.remaining_arrivals == 0 {
+                return;
+            }
+            state.remaining_arrivals -= 1;
+            state.arrivals += 1;
+            self.changed.notify_all();
+            while !state.released {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn arrivals(&self) -> usize {
+            self.state.lock().unwrap().arrivals
+        }
+
+        fn released(&self) -> bool {
+            self.state.lock().unwrap().released
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.released = true;
+            self.changed.notify_all();
+        }
+    }
+
     #[derive(Clone)]
-    struct FaultSwitch(Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+    struct BackendBlockHandle(Arc<BackendBlock>);
+
+    impl BackendBlockHandle {
+        fn arrivals(&self) -> usize {
+            self.0.arrivals()
+        }
+
+        fn released(&self) -> bool {
+            self.0.released()
+        }
+
+        fn release(&self) {
+            self.0.release();
+        }
+
+        /// Fail-safe for tests that deliberately park synchronous backend I/O.
+        ///
+        /// Assertions happen only after the test releases and drains the
+        /// parked operation, but a mutant can prevent the expected rendezvous
+        /// entirely. This watchdog keeps that failure diagnostic instead of
+        /// leaving the test process hung forever.
+        fn release_on_deadline(&self, deadline: Duration) -> std::thread::JoinHandle<()> {
+            let block = self.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + deadline;
+                while !block.released() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if !block.released() {
+                    block.release();
+                }
+            })
+        }
+    }
+
+    async fn join_task_or_abort<T: Send + 'static>(
+        task: &mut tokio::task::JoinHandle<T>,
+        bound: Duration,
+    ) -> std::result::Result<T, String> {
+        match tokio::time::timeout(bound, &mut *task).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(format!("task failed while draining: {error}")),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(format!("task did not drain within {bound:?}; aborted"))
+            }
+        }
+    }
+
+    async fn drain_join_set_or_abort<T: Send + 'static>(
+        tasks: &mut tokio::task::JoinSet<T>,
+        bound: Duration,
+    ) -> std::result::Result<Vec<T>, String> {
+        let drained = tokio::time::timeout(bound, async {
+            let mut values = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(value) => values.push(value),
+                    Err(error) => return Err(format!("task failed while draining: {error}")),
+                }
+            }
+            Ok(values)
+        })
+        .await;
+
+        match drained {
+            Ok(Ok(values)) => Ok(values),
+            Ok(Err(error)) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                Err(error)
+            }
+            Err(_) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                Err(format!("task set did not drain within {bound:?}; aborted"))
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct FaultState {
+        authority_reads: std::collections::HashSet<String>,
+        cursor_reads: std::collections::HashSet<String>,
+        recovery_loads: std::collections::HashMap<String, usize>,
+        cursor_probe_blocks: std::collections::HashMap<String, Arc<BackendBlock>>,
+        recovery_load_blocks: std::collections::HashMap<String, Arc<BackendBlock>>,
+        recovery_return_blocks: std::collections::HashMap<String, Arc<BackendBlock>>,
+        publication_save_blocks: std::collections::HashMap<String, Arc<BackendBlock>>,
+    }
+
+    #[derive(Clone)]
+    struct FaultSwitch(Arc<std::sync::Mutex<FaultState>>);
 
     impl FaultSwitch {
         fn start_faulting(&self, repo_id: &str) {
-            self.0.lock().unwrap().insert(repo_id.to_string());
+            let mut state = self.0.lock().unwrap();
+            state.authority_reads.insert(repo_id.to_string());
+            state.cursor_reads.insert(repo_id.to_string());
         }
 
-        fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
-            self.0.lock().unwrap().contains(repo_id).then(|| {
-                kin_db::KinDbError::StorageError(format!(
-                    "{BACKEND_FAULT_TEXT} while reading {repo_id}"
-                ))
-            })
+        fn start_authority_faulting(&self, repo_id: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .authority_reads
+                .insert(repo_id.to_string());
+        }
+
+        fn start_cursor_faulting(&self, repo_id: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_reads
+                .insert(repo_id.to_string());
+        }
+
+        fn block_cursor_probes(&self, repo_id: &str, arrivals: usize) -> BackendBlockHandle {
+            let block = Arc::new(BackendBlock::new(arrivals));
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_probe_blocks
+                .insert(repo_id.to_string(), Arc::clone(&block));
+            BackendBlockHandle(block)
+        }
+
+        fn block_recovery_loads(&self, repo_id: &str, arrivals: usize) -> BackendBlockHandle {
+            let block = Arc::new(BackendBlock::new(arrivals));
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_load_blocks
+                .insert(repo_id.to_string(), Arc::clone(&block));
+            BackendBlockHandle(block)
+        }
+
+        fn block_recovery_returns(&self, repo_id: &str, arrivals: usize) -> BackendBlockHandle {
+            let block = Arc::new(BackendBlock::new(arrivals));
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_return_blocks
+                .insert(repo_id.to_string(), Arc::clone(&block));
+            BackendBlockHandle(block)
+        }
+
+        fn block_publication_saves(&self, repo_id: &str, arrivals: usize) -> BackendBlockHandle {
+            let block = Arc::new(BackendBlock::new(arrivals));
+            self.0
+                .lock()
+                .unwrap()
+                .publication_save_blocks
+                .insert(repo_id.to_string(), Arc::clone(&block));
+            BackendBlockHandle(block)
+        }
+
+        fn cursor_probe_block_for(&self, repo_id: &str) -> Option<Arc<BackendBlock>> {
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_probe_blocks
+                .get(repo_id)
+                .cloned()
+        }
+
+        fn recovery_load_block_for(&self, repo_id: &str) -> Option<Arc<BackendBlock>> {
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_load_blocks
+                .get(repo_id)
+                .cloned()
+        }
+
+        fn recovery_return_block_for(&self, repo_id: &str) -> Option<Arc<BackendBlock>> {
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_return_blocks
+                .get(repo_id)
+                .cloned()
+        }
+
+        fn publication_save_block_for(&self, repo_id: &str) -> Option<Arc<BackendBlock>> {
+            self.0
+                .lock()
+                .unwrap()
+                .publication_save_blocks
+                .get(repo_id)
+                .cloned()
+        }
+
+        fn authority_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.0
+                .lock()
+                .unwrap()
+                .authority_reads
+                .contains(repo_id)
+                .then(|| {
+                    kin_db::KinDbError::StorageError(format!(
+                        "{BACKEND_FAULT_TEXT} while reading {repo_id}"
+                    ))
+                })
+        }
+
+        fn cursor_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_reads
+                .contains(repo_id)
+                .then(|| {
+                    kin_db::KinDbError::StorageError(format!(
+                        "{CURSOR_FAULT_TEXT} while reading {repo_id}"
+                    ))
+                })
+        }
+
+        fn record_recovery_load(&self, repo_id: &str) {
+            *self
+                .0
+                .lock()
+                .unwrap()
+                .recovery_loads
+                .entry(repo_id.to_string())
+                .or_default() += 1;
+        }
+
+        fn recovery_loads(&self, repo_id: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_loads
+                .get(repo_id)
+                .copied()
+                .unwrap_or_default()
         }
     }
 
     impl RepoFaultBackend {
         fn new(path: &std::path::Path) -> (Self, FaultSwitch) {
-            let faulting = FaultSwitch(Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )));
+            let faulting = FaultSwitch(Arc::new(std::sync::Mutex::new(FaultState::default())));
             (
                 Self {
                     inner: kin_db::LocalFileBackend::new(path),
@@ -22892,12 +23197,13 @@ mod tests {
             )
         }
 
-        fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
-            self.faulting.fault_for(repo_id)
+        fn authority_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.faulting.authority_fault_for(repo_id)
         }
     }
 
     const BACKEND_FAULT_TEXT: &str = "object store unreachable";
+    const CURSOR_FAULT_TEXT: &str = "publication metadata unavailable";
 
     impl kin_db::StorageBackend for RepoFaultBackend {
         fn supports_incremental_deltas(&self) -> bool {
@@ -22908,9 +23214,30 @@ mod tests {
             &self,
             repo_id: &str,
         ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
-            match self.fault_for(repo_id) {
+            self.faulting.record_recovery_load(repo_id);
+            if let Some(block) = self.faulting.recovery_load_block_for(repo_id) {
+                block.arrive_and_wait();
+            }
+            let outcome = match self.authority_fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_recovery_state(repo_id),
+            };
+            if let Some(block) = self.faulting.recovery_return_block_for(repo_id) {
+                block.arrive_and_wait();
+            }
+            outcome
+        }
+
+        fn load_snapshot_cursor(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<kin_db::SnapshotCursor>, kin_db::KinDbError> {
+            if let Some(block) = self.faulting.cursor_probe_block_for(repo_id) {
+                block.arrive_and_wait();
+            }
+            match self.faulting.cursor_fault_for(repo_id) {
+                Some(error) => Err(error),
+                None => self.inner.load_snapshot_cursor(repo_id),
             }
         }
 
@@ -22918,7 +23245,7 @@ mod tests {
             &self,
             repo_id: &str,
         ) -> std::result::Result<Option<kin_db::SnapshotAuthority>, kin_db::KinDbError> {
-            match self.fault_for(repo_id) {
+            match self.authority_fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_snapshot_authority(repo_id),
             }
@@ -22929,7 +23256,7 @@ mod tests {
             repo_id: &str,
         ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
         {
-            match self.fault_for(repo_id) {
+            match self.authority_fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_snapshot(repo_id),
             }
@@ -22987,7 +23314,13 @@ mod tests {
             data: &[u8],
             expected_gen: kin_db::Generation,
         ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
-            self.inner.save_snapshot(repo_id, data, expected_gen)
+            let outcome = self.inner.save_snapshot(repo_id, data, expected_gen);
+            if outcome.is_ok() {
+                if let Some(block) = self.faulting.publication_save_block_for(repo_id) {
+                    block.arrive_and_wait();
+                }
+            }
+            outcome
         }
 
         fn save_snapshot_classified(
@@ -22996,8 +23329,15 @@ mod tests {
             data: &[u8],
             expected_cursor: kin_db::SnapshotCursor,
         ) -> kin_db::SnapshotSaveOutcome {
-            self.inner
-                .save_snapshot_classified(repo_id, data, expected_cursor)
+            let outcome = self
+                .inner
+                .save_snapshot_classified(repo_id, data, expected_cursor);
+            if matches!(&outcome, kin_db::SnapshotSaveOutcome::Committed { .. }) {
+                if let Some(block) = self.faulting.publication_save_block_for(repo_id) {
+                    block.arrive_and_wait();
+                }
+            }
+            outcome
         }
 
         fn save_snapshot_validated(
@@ -23007,8 +23347,18 @@ mod tests {
             expected: kin_db::SnapshotCursor,
             history_validator_version: Option<u32>,
         ) -> kin_db::SnapshotSaveOutcome {
-            self.inner
-                .save_snapshot_validated(repo_id, data, expected, history_validator_version)
+            let outcome = self.inner.save_snapshot_validated(
+                repo_id,
+                data,
+                expected,
+                history_validator_version,
+            );
+            if matches!(&outcome, kin_db::SnapshotSaveOutcome::Committed { .. }) {
+                if let Some(block) = self.faulting.publication_save_block_for(repo_id) {
+                    block.arrive_and_wait();
+                }
+            }
+            outcome
         }
 
         fn record_history_validation(
@@ -23032,7 +23382,13 @@ mod tests {
             delta_data: &[u8],
             base_gen: kin_db::Generation,
         ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
-            self.inner.save_delta(repo_id, delta_data, base_gen)
+            let outcome = self.inner.save_delta(repo_id, delta_data, base_gen);
+            if outcome.is_ok() {
+                if let Some(block) = self.faulting.publication_save_block_for(repo_id) {
+                    block.arrive_and_wait();
+                }
+            }
+            outcome
         }
 
         fn load_deltas_since(
@@ -23105,7 +23461,30 @@ mod tests {
             DaemonState::open_with_backend(layout, Box::new(backend), advertised, Some(allowed))
                 .unwrap(),
         );
+        state.allow_hosted_in_memory_spine_for_test();
         (state, faults)
+    }
+
+    fn hosted_state_without_allowlist(
+        label: &str,
+        advertised: &str,
+    ) -> (Arc<DaemonState>, FaultSwitch, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kin-daemon-{label}-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), advertised, None).unwrap(),
+        );
+        state.allow_hosted_in_memory_spine_for_test();
+        (state, faults, backend_dir)
     }
 
     /// The fault fixture must be indistinguishable from the backend it wraps
@@ -23176,6 +23555,634 @@ mod tests {
             })
             .expect("the fixture must forward verified batch reads");
         assert_eq!(batched.as_deref(), Some(body));
+    }
+
+    /// Ref discovery is a metadata read over authority the daemon already
+    /// validated and loaded. Reopening the whole backend snapshot for every
+    /// request made one 315-byte response download and decode the complete
+    /// hosted repository authority, which took 54 seconds on the production
+    /// Kin graph and multiplied peak memory under concurrent status probes.
+    ///
+    /// Faulting storage after startup makes the boundary deterministic. The
+    /// loaded generation must keep answering from its generation-bound cache;
+    /// a cache invalidation test below proves that a later authority movement
+    /// does not stay hidden behind it.
+    #[tokio::test]
+    async fn hosted_refs_reuse_startup_authority_metadata_instead_of_reopening_storage() {
+        let repo_id = format!("hosted-refs-cache-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-hosted-refs-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let expected_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8053,
+            "serve refs from the loaded authority generation",
+        );
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+
+        let startup_recovery_loads = faults.recovery_loads(&repo_id);
+        faults.start_authority_faulting(&repo_id);
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the loaded authority metadata must not reopen storage: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            refs.head_ref.as_deref(),
+            Some(expected_head.to_string().as_str())
+        );
+        assert_eq!(
+            faults.recovery_loads(&repo_id),
+            startup_recovery_loads,
+            "an unchanged cursor must not reopen the full authority"
+        );
+
+        state.evict_repo_cache_for_test(&repo_id).await;
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an invalidated generation must reopen storage rather than serve stale refs: {message}"
+        );
+        assert!(
+            message.contains(BACKEND_FAULT_TEXT),
+            "the reopen must preserve the backend failure: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_refs_fail_closed_when_publication_freshness_cannot_be_probed() {
+        let repo_id = format!("hosted-refs-probe-fault-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-hosted-probe-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8054,
+            "seed a generation whose freshness probe later fails",
+        );
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+
+        faults.start_cursor_faulting(&repo_id);
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached refs must not be served after a publication probe fails: {message}"
+        );
+        assert!(
+            message.contains(CURSOR_FAULT_TEXT),
+            "the refusal must preserve the metadata probe failure: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hosted_refs_reload_one_successor_for_concurrent_generation_misses() {
+        const REQUESTS: usize = 8;
+        let repo_id = format!("hosted-refs-successor-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("kin-daemon-hosted-successor-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let first_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8055,
+            "seed the generation already cached at startup",
+        );
+        let (backend, loads) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+        let startup_recovery_loads = loads.recovery_loads(&repo_id);
+        let second_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            Some(first_head),
+            0x8056,
+            "publish a successor from another daemon",
+        );
+        let probe_block = loads.block_cursor_probes(&repo_id, REQUESTS);
+        let watchdog = probe_block.release_on_deadline(Duration::from_secs(3));
+        let recovery_block = loads.block_recovery_loads(&repo_id, 1);
+        let recovery_watchdog = recovery_block.release_on_deadline(Duration::from_secs(3));
+
+        let path = Arc::new(format!("/repos/{repo_id}/refs"));
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..REQUESTS {
+            let state = Arc::clone(&state);
+            let path = Arc::clone(&path);
+            requests.spawn(async move { repo_route(state, path.as_str()).await });
+        }
+        let all_arrived = tokio::time::timeout(Duration::from_secs(2), async {
+            while probe_block.arrivals() != REQUESTS {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        probe_block.release();
+        let recovery_arrived = tokio::time::timeout(Duration::from_secs(2), async {
+            while recovery_block.arrivals() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let coordination_observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let parked_waiters = state.repo_graph_load_waiters_for_test();
+                let recovery_loads = loads.recovery_loads(&repo_id);
+                if parked_waiters == REQUESTS - 1 || recovery_loads > startup_recovery_loads + 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let recovery_loads_while_winner_blocked = loads.recovery_loads(&repo_id);
+        recovery_block.release();
+        let responses_result = drain_join_set_or_abort(&mut requests, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+        recovery_watchdog.join().unwrap();
+
+        all_arrived.expect("every request must observe the stale cursor before any reload can win");
+        recovery_arrived.expect("one request must win and enter full authority recovery");
+        coordination_observed.expect(
+            "every losing request must either park at the gate or expose a duplicate recovery",
+        );
+        let responses = responses_result.expect("every concurrent refs request must drain");
+        assert_eq!(responses.len(), REQUESTS);
+        assert_eq!(
+            probe_block.arrivals(),
+            REQUESTS,
+            "the test must create concurrent generation misses"
+        );
+        assert_eq!(
+            recovery_loads_while_winner_blocked,
+            startup_recovery_loads + 1,
+            "no waiter may enter recovery while the winning generation reload is parked"
+        );
+        for (status, body) in responses {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the moved generation must remain answerable: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                refs.head_ref.as_deref(),
+                Some(second_head.to_string().as_str()),
+                "no concurrent waiter may receive the stale startup generation"
+            );
+        }
+        assert_eq!(
+            loads.recovery_loads(&repo_id),
+            startup_recovery_loads + 1,
+            "a generation movement must trigger exactly one full authority reload"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hosted_reload_retries_when_publication_moves_after_recovery_read() {
+        let repo_id = format!("hosted-recovery-move-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "kin-daemon-hosted-recovery-move-{}",
+            Uuid::new_v4()
+        ));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let first_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8058,
+            "seed the generation already cached at startup",
+        );
+        let (backend, loads) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+        let startup_recovery_loads = loads.recovery_loads(&repo_id);
+        let second_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            Some(first_head),
+            0x8059,
+            "publish the generation captured by the first recovery",
+        );
+        let recovery_return = loads.block_recovery_returns(&repo_id, 1);
+        let watchdog = recovery_return.release_on_deadline(Duration::from_secs(4));
+
+        let request_state = Arc::clone(&state);
+        let request_path = format!("/repos/{repo_id}/refs");
+        let mut request =
+            tokio::spawn(async move { repo_route(request_state, &request_path).await });
+        let recovery_captured = tokio::time::timeout(Duration::from_secs(2), async {
+            while recovery_return.arrivals() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let third_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            Some(second_head),
+            0x8060,
+            "move publication after the first recovery already read its bytes",
+        );
+        recovery_return.release();
+        let response = join_task_or_abort(&mut request, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+
+        recovery_captured.expect("the first recovery must capture bytes before publication moves");
+        let (status, body) =
+            response.expect("the bounded retry must complete after the recovery block releases");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the successor generation must remain answerable: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            refs.head_ref.as_deref(),
+            Some(third_head.to_string().as_str()),
+            "the route must not install or answer the generation read before the cursor moved"
+        );
+        assert_eq!(
+            loads.recovery_loads(&repo_id),
+            startup_recovery_loads + 2,
+            "one moved recovery and one stable retry must be observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_repo_ids_do_not_grow_reload_coordination_without_an_allowlist() {
+        let advertised = format!("hosted-gate-bound-{}", Uuid::new_v4());
+        let (state, _faults, _backend_dir) =
+            hosted_state_without_allowlist("gate-bound", &advertised);
+        let fixed_gate_count = state.repo_graph_load_gate_count_for_test();
+        assert_eq!(
+            fixed_gate_count, 64,
+            "reload coordination must remain a fixed-size sharded table"
+        );
+
+        for index in 0..(fixed_gate_count * 4) {
+            let repo_id = format!("absent-{index}-{}", Uuid::new_v4());
+            assert!(
+                matches!(
+                    state.get_repo_graph(&repo_id).await,
+                    Err(crate::error::DaemonError::RepoAbsentFromStorage(absent)) if absent == repo_id
+                ),
+                "each adversarial id must reach a real absent-storage answer"
+            );
+        }
+
+        assert_eq!(
+            state.repo_graph_load_gate_count_for_test(),
+            fixed_gate_count,
+            "absent ids must not allocate permanent reload gates"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_hosted_reload_does_not_starve_liveness() {
+        let repo_id = format!("hosted-liveness-{}", Uuid::new_v4());
+        let (state, faults, _backend_dir) =
+            hosted_state_without_allowlist("reload-liveness", &repo_id);
+        state.evict_repo_cache_for_test(&repo_id).await;
+        let recovery_block = faults.block_recovery_loads(&repo_id, 1);
+        let watchdog = recovery_block.release_on_deadline(Duration::from_secs(3));
+
+        let started = Instant::now();
+        let blocked_state = Arc::clone(&state);
+        let blocked_path = format!("/repos/{repo_id}/refs");
+        let mut blocked =
+            tokio::spawn(async move { repo_route(blocked_state, &blocked_path).await });
+        while recovery_block.arrivals() == 0 && started.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let reached_block = recovery_block.arrivals() == 1;
+
+        let (health_status, _health_body) = repo_route(Arc::clone(&state), "/health").await;
+        let liveness_elapsed = started.elapsed();
+        recovery_block.release();
+        let blocked_result = join_task_or_abort(&mut blocked, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+
+        blocked_result.expect("the released full recovery must drain");
+        assert!(
+            reached_block,
+            "the slow full recovery must actually be blocked"
+        );
+        assert_eq!(health_status, StatusCode::OK);
+        assert!(
+            liveness_elapsed < Duration::from_secs(1),
+            "a synchronous hosted reload starved the sole Tokio worker for {liveness_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_hosted_cursor_probe_does_not_starve_liveness() {
+        let repo_id = format!("hosted-probe-liveness-{}", Uuid::new_v4());
+        let (state, faults, _backend_dir) =
+            hosted_state_without_allowlist("probe-liveness", &repo_id);
+        let cursor_block = faults.block_cursor_probes(&repo_id, 1);
+        let watchdog = cursor_block.release_on_deadline(Duration::from_secs(3));
+
+        let started = Instant::now();
+        let blocked_state = Arc::clone(&state);
+        let blocked_path = format!("/repos/{repo_id}/refs");
+        let mut blocked =
+            tokio::spawn(async move { repo_route(blocked_state, &blocked_path).await });
+        while cursor_block.arrivals() == 0 && started.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let reached_block = cursor_block.arrivals() == 1;
+
+        let (health_status, _health_body) = repo_route(Arc::clone(&state), "/health").await;
+        let liveness_elapsed = started.elapsed();
+        cursor_block.release();
+        let blocked_result = join_task_or_abort(&mut blocked, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+
+        blocked_result.expect("the released cursor probe must drain");
+        assert!(
+            reached_block,
+            "the hosted cursor probe must actually be blocked"
+        );
+        assert_eq!(health_status, StatusCode::OK);
+        assert!(
+            liveness_elapsed < Duration::from_secs(1),
+            "a synchronous hosted cursor probe starved the sole Tokio worker for {liveness_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_transfer_receipt_bypasses_an_unrelated_blocked_reload() {
+        let repo_id = format!("hosted-receipt-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let pack = transfer_pack_for_unborn_destination(&repository_id);
+        let admitted_head = pack.source_head;
+        let transfer_id = pack.transfer_id;
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+        let expected_destination_ref = destination_ref.clone();
+        let (state, faults, _backend_dir) =
+            hosted_state_without_allowlist("receipt-reload", &repo_id);
+        state.evict_repo_cache_for_test(&repo_id).await;
+        let recovery_block = faults.block_recovery_loads(&repo_id, 1);
+        let watchdog = recovery_block.release_on_deadline(Duration::from_secs(3));
+
+        let blocked_state = Arc::clone(&state);
+        let blocked_path = format!("/repos/{repo_id}/refs");
+        let mut blocked =
+            tokio::spawn(async move { repo_route(blocked_state, &blocked_path).await });
+        let reached_block = tokio::time::timeout(Duration::from_secs(2), async {
+            while recovery_block.arrivals() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        let receive = router(Arc::clone(&state)).oneshot(
+            Request::post(format!("/repos/{repo_id}/transfer/receive"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "destination_ref": destination_ref,
+                        "pack": pack,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        );
+        let receive_result = tokio::time::timeout(Duration::from_secs(2), receive).await;
+        recovery_block.release();
+        let blocked_result = join_task_or_abort(&mut blocked, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+        let (blocked_status, blocked_body) =
+            blocked_result.expect("the deliberately blocked reload must unwind after release");
+        let response = receive_result
+            .expect("a durable receipt must not wait behind an unrelated full reload")
+            .unwrap();
+        let response_status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+            serde_json::from_slice(&response_body).unwrap();
+        reached_block.expect("the unrelated full reload must reach its deliberate block");
+        assert_eq!(response_status, StatusCode::OK);
+        assert_eq!(
+            receipt.outcome,
+            kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed,
+            "the response must be the durable committed receipt"
+        );
+        assert_eq!(receipt.transfer_id, transfer_id);
+        assert_eq!(receipt.repository_id, repository_id);
+        assert_eq!(receipt.destination_ref, expected_destination_ref);
+        assert_eq!(receipt.destination_head, admitted_head);
+        assert_eq!(
+            blocked_status,
+            StatusCode::OK,
+            "the unblocked reload must install the committed successor: {}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        let refs: RepoRefsResponse = serde_json::from_slice(&blocked_body).unwrap();
+        assert_eq!(
+            refs.head_ref.as_deref(),
+            Some(admitted_head.to_string().as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_receive_completion_does_not_delete_an_installed_successor() {
+        let repo_id = format!("hosted-late-receive-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let pack = transfer_pack_for_unborn_destination(&repository_id);
+        let admitted_head = pack.source_head;
+        let transfer_id = pack.transfer_id;
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+        let expected_destination_ref = destination_ref.clone();
+        let (state, faults, _backend_dir) =
+            hosted_state_without_allowlist("late-receive", &repo_id);
+        let save_block = faults.block_publication_saves(&repo_id, 1);
+
+        let receive_state = Arc::clone(&state);
+        let receive_repo_id = repo_id.clone();
+        let mut receive = tokio::spawn(async move {
+            router(receive_state)
+                .oneshot(
+                    Request::post(format!("/repos/{receive_repo_id}/transfer/receive"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&serde_json::json!({
+                                "destination_ref": destination_ref,
+                                "pack": pack,
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        });
+        let reached_save = tokio::time::timeout(Duration::from_secs(2), async {
+            while save_block.arrivals() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        if reached_save.is_err() {
+            save_block.release();
+            let _ = join_task_or_abort(&mut receive, Duration::from_secs(3)).await;
+            panic!("the receive must pause after its durable publication");
+        }
+
+        let installed_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")),
+        )
+        .await;
+        let loads_after_install = faults.recovery_loads(&repo_id);
+
+        save_block.release();
+        let receive_result = join_task_or_abort(&mut receive, Duration::from_secs(3)).await;
+        let (installed_status, installed_body) = installed_result.expect(
+            "a reader must install the durable successor while receive completion is paused",
+        );
+        assert_eq!(
+            installed_status,
+            StatusCode::OK,
+            "a reader must install the already durable successor while receive completion is paused: {}",
+            String::from_utf8_lossy(&installed_body)
+        );
+        let installed: RepoRefsResponse = serde_json::from_slice(&installed_body).unwrap();
+        assert_eq!(
+            installed.head_ref.as_deref(),
+            Some(admitted_head.to_string().as_str())
+        );
+        let response = receive_result
+            .expect("receive completion must resume after the save block releases")
+            .unwrap();
+        let response_status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+            serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(response_status, StatusCode::OK);
+        assert_eq!(
+            receipt.outcome,
+            kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed,
+            "the late completion must return its durable committed receipt"
+        );
+        assert_eq!(receipt.transfer_id, transfer_id);
+        assert_eq!(receipt.repository_id, repository_id);
+        assert_eq!(receipt.destination_ref, expected_destination_ref);
+        assert_eq!(receipt.destination_head, admitted_head);
+        tokio::task::yield_now().await;
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            faults.recovery_loads(&repo_id),
+            loads_after_install,
+            "receive completion after successor installation must not evict that generation"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hosted_spine_does_not_roll_current_rows_back_to_the_startup_graph() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let repo_id = format!("hosted-spine-current-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _faults, backend_dir) =
+            hosted_state_without_allowlist("spine-current", &repo_id);
+        seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8057,
+            "publish authority after the daemon startup graph was frozen",
+        );
+
+        let ingested = state
+            .ingest_repo_into_spine(&repo_id, false)
+            .await
+            .expect("cursor-bound hosted authority must ingest");
+        let spine = state.spine().expect("ingest initializes the hosted spine");
+        assert_eq!(
+            spine.root_hash(&repo_id).as_deref(),
+            Some(ingested.root_hash.as_str())
+        );
+
+        let ensured = state
+            .ensure_spine()
+            .expect("the hosted spine remains available");
+        assert_eq!(
+            ensured.root_hash(&repo_id).as_deref(),
+            Some(ingested.root_hash.as_str()),
+            "ensure_spine must not re-register the immutable startup graph over current hosted authority"
+        );
     }
 
     /// A hosted daemon serves every allowlisted repository, not only the one it
