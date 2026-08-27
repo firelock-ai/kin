@@ -593,7 +593,6 @@ pub fn trace_constant_score(entity: &Entity, focal_dir: Option<&str>) -> (bool, 
     )
 }
 
-
 /// Where one fan-out candidate sits relative to the node being expanded.
 ///
 /// Three states, not two. A file-less candidate is neither in the node's file
@@ -647,8 +646,8 @@ pub fn fanout_cap_keeps(locality: &[FanoutLocality], limit: usize) -> Vec<usize>
     {
         return kept;
     }
-    let Some(crossing) = (limit..locality.len())
-        .find(|&index| locality[index] == FanoutLocality::OtherFile)
+    let Some(crossing) =
+        (limit..locality.len()).find(|&index| locality[index] == FanoutLocality::OtherFile)
     else {
         return kept;
     };

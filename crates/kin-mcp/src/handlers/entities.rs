@@ -3651,7 +3651,9 @@ fn record_trace_spine_clipping(result: &mut serde_json::Value) {
     let mut widest: Option<(String, u64, u64)> = None;
     if let Some(clips) = result["clipped_steps"].as_array_mut() {
         for clip in clips.iter_mut() {
-            let on_spine = clip["step"].as_u64().is_some_and(|step| parents.contains(&step));
+            let on_spine = clip["step"]
+                .as_u64()
+                .is_some_and(|step| parents.contains(&step));
             clip["continued_below"] = serde_json::Value::Bool(on_spine);
             if !on_spine {
                 continue;
@@ -4138,9 +4140,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         };
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
-                        let reaches_target = reach_set
-                            .as_ref()
-                            .is_some_and(|set| set.contains(&next_id));
+                        let reaches_target =
+                            reach_set.as_ref().is_some_and(|set| set.contains(&next_id));
                         candidates.push(TraceFanoutCandidate {
                             reaches_target,
                             call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
@@ -8907,7 +8908,6 @@ mod tests {
             .map(|step| step["entity_name"].as_str().unwrap_or_default().to_string())
             .collect()
     }
-
 
     /// The fan-out the stranger measured, on the arm that has its own copy of
     /// the cap.

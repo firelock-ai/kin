@@ -1066,9 +1066,8 @@ pub fn build_trace_data_flow_response_within(
                         };
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
-                        let reaches_target = reach_set
-                            .as_ref()
-                            .is_some_and(|set| set.contains(&next_id));
+                        let reaches_target =
+                            reach_set.as_ref().is_some_and(|set| set.contains(&next_id));
                         candidates.push(FanoutCandidate {
                             reaches_target,
                             call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
@@ -1331,11 +1330,7 @@ pub fn build_trace_data_flow_response_within(
 /// dropped were never followed. Only the second makes "this chain does not
 /// contain X" mean nothing at all.
 fn record_spine_clipping(response: &mut TraceDataFlowResponse) {
-    let parents: HashSet<usize> = response
-        .chain
-        .iter()
-        .map(|step| step.parent_step)
-        .collect();
+    let parents: HashSet<usize> = response.chain.iter().map(|step| step.parent_step).collect();
     let mut spine_steps = 0usize;
     let mut spine_crossing = 0usize;
     for clip in &mut response.clipped_steps {
@@ -1360,9 +1355,7 @@ fn record_spine_clipping(response: &mut TraceDataFlowResponse) {
     };
     let dropped = widest.dropped_callees + widest.dropped_callers;
     let crossing = if spine_crossing > 0 {
-        format!(
-            ", {spine_crossing} of which lived outside the file of the node that offered them"
-        )
+        format!(", {spine_crossing} of which lived outside the file of the node that offered them")
     } else {
         String::new()
     };
@@ -2960,7 +2953,11 @@ mod tests {
         .unwrap();
 
         let kept = step_names(&response);
-        assert_eq!(kept.len(), 4, "the four-wide cap still keeps four: {kept:?}");
+        assert_eq!(
+            kept.len(),
+            4,
+            "the four-wide cap still keeps four: {kept:?}"
+        );
         assert_eq!(
             response.clipped_steps[0].dropped_callees, 11,
             "and still drops eleven, because a floor is not extra breadth"
@@ -3210,8 +3207,7 @@ mod tests {
         for _ in 0..9 {
             let request = trace_request(&focal_id, 5, TraceDirection::Calls, 4);
             let started = std::time::Instant::now();
-            let response =
-                build_trace_data_flow_response(&authority, &graph, &request).unwrap();
+            let response = build_trace_data_flow_response(&authority, &graph, &request).unwrap();
             samples.push(started.elapsed());
             assert!(!response.chain.is_empty());
         }
