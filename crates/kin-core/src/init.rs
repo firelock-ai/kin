@@ -808,6 +808,17 @@ pub fn prepare_repository_layout_with_origin(
         crate::tree::initialize_projection_control_directory(layout.root())?;
         std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
             .map_err(|error| KinError::io(layout.version_path(), error))?;
+        // Which replay semantics authored this store, recorded here because this
+        // is the one staging boundary every store-creation path crosses: `kin
+        // init` on a bare directory, `kin init` over a Git checkout, a replica
+        // staged by `kin clone`, and both of `kin-migrate`'s doors. Writing it
+        // into the stage rather than after publication is what makes an absent
+        // record mean one thing: `.kin` is published by a single no-replace
+        // rename, so a store a reader can see either carries its own provenance
+        // or predates the record entirely.
+        crate::hydration_semantics::stamp_staged(&layout).map_err(|error| {
+            KinError::io(layout.kindb_hydration_semantics_path(), error)
+        })?;
         config.save_initialization_stage(layout.root())?;
         manifest.save(&layout.manifest_path())?;
         let metadata_seal = capture_metadata_seal(&layout)?;
