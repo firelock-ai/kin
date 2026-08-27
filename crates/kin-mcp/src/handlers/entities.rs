@@ -943,6 +943,22 @@ pub fn handle_get_context_pack<G: GraphStore>(
         ),
         None => serde_json::Value::Null,
     };
+    // Whether a caller could have reached this focal through a call the linker
+    // recorded no edge for (FIR-2775), read exactly as `find_references` reads
+    // it and published under the same key.
+    //
+    // A pack's `dependents` group is built by the same collector over the same
+    // edges, so it inherits the same gap and has to report it the same way. The
+    // method gate beside this one is shared for precisely that reason: gating a
+    // shared gap on the tool name alone was how two surfaces over one graph came
+    // to answer opposite things about one entity, the tool that refused to
+    // certify and the tool that published `[]` reading the identical incomplete
+    // call graph. Adding a new gap to one surface and not the other would
+    // rebuild that disagreement from scratch.
+    let caller_arrival = match &focal_entity {
+        Some(entity) => crate::caller_arrival::observe_caller_arrival(store, entity).to_json(),
+        None => serde_json::Value::Null,
+    };
 
     // The dependency section carries both directions, so it is served as two
     // groups named for what they are. Serving it as one list called
@@ -1061,6 +1077,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         // language rather than as a bare fact. Computed by the same observer
         // `find_references` uses, from the same witnesses.
         crate::edge_coverage::EDGE_COVERAGE_KEY: edge_coverage,
+        crate::caller_arrival::CALLER_ARRIVAL_KEY: caller_arrival,
         "token_budget": budget.max_tokens(),
         "tokens_used": pack.actual_tokens,
     });
@@ -2035,6 +2052,21 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "cross_repo": cross_repo,
     });
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    // Whether a caller could have reached this focal through a call site the
+    // linker recorded no edge for (FIR-2775). `edge_coverage` above answers
+    // whether the graph holds the CLASS of edge this query reads; this answers
+    // whether the files that can reach this focal had their own call sites
+    // accounted for. A graph can pass the first and fail the second, and that is
+    // the state in which an empty reference list came back certified for a
+    // function a test calls.
+    //
+    // Published on every answer rather than only on empty ones, for the reason
+    // stated above `edge_coverage`: an answer that returned rows proved nothing
+    // about the caller it missed. The gate in `crate::negative` reads it back
+    // from here so the verdict and the evidence a reader audits it against are
+    // the same object.
+    result[crate::caller_arrival::CALLER_ARRIVAL_KEY] =
+        crate::caller_arrival::observe_caller_arrival(store, &target).to_json();
     disclose_withheld_candidates(&mut result);
 
     // Say that a bare name was resolved, and to how many candidates.
@@ -10187,6 +10219,64 @@ mod tests {
             serde_json::json!(RESPONSE_DEFAULT_MAX_CHARS),
             "trace_data_flow answers under the one shared default, not a budget of its own"
         );
+    }
+
+    /// FIR-2775. Both reference surfaces must actually EMIT the arrival reading,
+    /// not merely be able to read one.
+    ///
+    /// This exists because the falsification of the shared gate stayed green
+    /// under the mutation that deletes the pack's publication. The envelope test
+    /// injects the block into both payloads by hand, so it proves the gate reads
+    /// a block and proves nothing about whether either handler produces one. Two
+    /// tests, each correct, jointly guarding nothing: the property that matters
+    /// lives in the agreement between what one side emits and what the other
+    /// reads, and only this end asserts the emitting half.
+    #[tokio::test]
+    async fn both_reference_surfaces_publish_the_arrival_reading() {
+        let (store, focal_id) = wide_store(3);
+        let sessions = SessionRegistry::empty_for_test();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        )]);
+
+        let pack = parsed_response(&crate::finalize_with_envelope(
+            handle_get_context_pack(&args, &store, &sessions, None).unwrap(),
+            structurally_ready_envelope(),
+            "get_context_pack",
+        ));
+        let references = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        for (label, response) in [
+            ("get_context_pack", &pack),
+            ("find_references", &references),
+        ] {
+            let block = &response[crate::caller_arrival::CALLER_ARRIVAL_KEY];
+            assert!(
+                block.is_object(),
+                "{label} must publish the arrival reading the negative envelope gates on; got \
+                 {block}"
+            );
+            // A state the gate recognizes, so the block cannot be present and
+            // inert. `caller_arrival_state_unknown` is what an unrecognized one
+            // produces, and it would read as a gap for the wrong reason.
+            let state = block["state"].as_str().unwrap_or_default();
+            assert!(
+                matches!(state, "accounted" | "unaccounted" | "unmeasured"),
+                "{label} published an arrival state the gate does not recognize: {state:?}"
+            );
+            // The count the verdict rests on rides beside the rows on every
+            // answer, populated or not, so a reader never has to tell "checked
+            // and fine" from "not reported".
+            assert!(
+                block["unaccounted_file_count"].is_u64(),
+                "{label} must publish the unaccounted count beside the rows; got {block}"
+            );
+        }
     }
 
     #[test]
