@@ -15,6 +15,7 @@ pub mod backend;
 pub mod federation;
 pub mod firestore;
 pub mod index;
+pub mod publication;
 pub mod query;
 pub mod routing;
 pub mod store;
@@ -25,7 +26,10 @@ pub mod xref;
 /// detect payload-shape changes and adapt. Bump on any breaking field change.
 pub const SPINE_PAYLOAD_VERSION: u32 = 1;
 
-pub use backend::{InMemorySpineBackend, SpineBackend, SpineError};
+pub use backend::{
+    InMemorySpineBackend, PreparedRepoSpinePublication, SpineBackend, SpineError,
+    SpinePublicationBackendId,
+};
 pub use federation::{federated_impact, FederatedEdge, FederatedImpact, FederatedNode};
 pub use firestore::FirestoreSpineBackend;
 #[cfg(feature = "firestore")]
@@ -34,9 +38,18 @@ pub use index::{
     AuthorityRootState, CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex,
     SpineXrefAuthorityAnchor, SpineXrefDecodeError, SpineXrefResponse,
 };
+pub use publication::{
+    RepoPublicationCommit, RepoPublicationConflict, RepoPublicationHead, RepoPublicationPhase,
+    RepoSpinePublication, SpineRolloutFence, SpineRolloutFenceCommit,
+    SpineRolloutFenceEvidence, SpineRolloutRepositoryFence, SpineSourceCursor,
+    REPO_PUBLICATION_SCHEMA_VERSION, SPINE_ROLLOUT_FENCE_SCHEMA,
+};
 pub use query::{classify_spine_probe, SpineProbe, SpineQuery};
 pub use routing::{RepoEndpoint, RoutingTable};
-pub use store::{LoadedRepo, SpineStore};
+pub use store::{
+    LoadedRepo, LoadedRepoPublication, LoadedSpineRolloutFence, PreparedStorePublication,
+    RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition,
+};
 pub use xref::{
     collect_unresolved_imports, materialize_edges, resolve_imports, ResolveResult, UnresolvedImport,
 };

@@ -8,14 +8,21 @@
 //! - `FirestoreSpineBackend`: Firestore REST API (cloud, stateless daemon pool)
 //! - `CachedSpineBackend<B>`: LRU cache wrapper for any backend
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use kin_model::{Entity, EntityId, EntityKind, Relation, SemanticFingerprint};
+use parking_lot::Mutex as ParkingMutex;
+use uuid::Uuid;
 
 use crate::federation::{self, FederatedImpact};
 use crate::index::{
     CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex, SpineXrefResponse,
 };
+use crate::publication::{
+    RepoPublicationCommit, RepoPublicationConflict, RepoPublicationHead, RepoSpinePublication,
+    SpineRolloutFence, SpineRolloutFenceCommit, SpineSourceCursor,
+};
+use crate::store::{LoadedSpineRolloutFence, PreparedStorePublication, StoreHeadPrecondition};
 
 /// Error type for spine backend operations.
 #[derive(Debug, thiserror::Error)]
@@ -36,12 +43,134 @@ pub enum SpineError {
     Auth(String),
 }
 
+/// Opaque identity used to bind a prepared publication to one backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SpinePublicationBackendId(Uuid);
+
+impl SpinePublicationBackendId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for SpinePublicationBackendId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Opaque cursor-bound publication staged by one concrete backend instance.
+///
+/// A token cannot be committed through another backend, even when both share
+/// the same durable store. The durable head CAS remains the cross-pod arbiter;
+/// this owner binding prevents accidental local-cache installation elsewhere.
+#[derive(Debug)]
+pub struct PreparedRepoSpinePublication {
+    owner: SpinePublicationBackendId,
+    prepared: PreparedStorePublication,
+}
+
+impl PreparedRepoSpinePublication {
+    /// Bind a store preparation to the backend instance that staged it.
+    pub fn bind(
+        owner: SpinePublicationBackendId,
+        prepared: PreparedStorePublication,
+    ) -> Self {
+        Self { owner, prepared }
+    }
+
+    pub fn candidate_head(&self) -> &RepoPublicationHead {
+        self.prepared.candidate_head()
+    }
+
+    /// Consume the token through its owning backend.
+    pub fn into_store_preparation(
+        self,
+        owner: SpinePublicationBackendId,
+    ) -> Result<PreparedStorePublication, SpineError> {
+        if self.owner != owner {
+            return Err(SpineError::Backend(
+                "prepared spine publication belongs to another backend".to_string(),
+            ));
+        }
+        Ok(self.prepared)
+    }
+}
+
 /// Abstraction over spine metadata storage.
 ///
 /// All methods are synchronous (blocking) for compatibility with the existing
 /// SpineIndex call sites. The FirestoreSpineBackend uses `tokio::runtime::Handle`
 /// internally to bridge async HTTP calls.
 pub trait SpineBackend: Send + Sync {
+    /// Atomically create or advance the shared hosted rollout fence.
+    fn advance_rollout_fence(
+        &self,
+        _fence: SpineRolloutFence,
+    ) -> Result<SpineRolloutFenceCommit, SpineError> {
+        Err(SpineError::Backend(
+            "atomic spine rollout fencing is unsupported".to_string(),
+        ))
+    }
+
+    /// Return the exact active rollout payload and durable revision used to
+    /// validate hosted readiness and bind evidence into the GCS control record.
+    fn active_rollout_fence(&self) -> Result<LoadedSpineRolloutFence, SpineError> {
+        Err(SpineError::Backend(
+            "durable spine rollout fence is unsupported".to_string(),
+        ))
+    }
+
+    /// Persist the explicit one-way boundary that closes legacy cursorless
+    /// collections after every repository has a committed v2 head and older
+    /// writers have been removed from service.
+    fn complete_legacy_migration(&self) -> Result<(), SpineError> {
+        Err(SpineError::Backend(
+            "durable legacy spine migration completion is unsupported".to_string(),
+        ))
+    }
+
+    /// Refresh reader-visible state from committed durable heads.
+    ///
+    /// Hosted request boundaries call this before serving authority so an idle
+    /// pod cannot remain indefinitely behind a head another pod committed. A
+    /// backend without a durable refresh primitive must fail loudly.
+    fn refresh_committed_publications(&self) -> Result<(), SpineError> {
+        Err(SpineError::Backend(
+            "committed-head spine refresh is unsupported".to_string(),
+        ))
+    }
+
+    /// Stage immutable rows for one cursor-bound repository publication.
+    ///
+    /// Backends must opt in explicitly. Hosted callers treat the default error
+    /// as an unavailable correctness primitive, never as permission to fall
+    /// back to delete-and-rewrite persistence.
+    fn prepare_repo_publication(
+        &self,
+        _publication: RepoSpinePublication,
+    ) -> Result<PreparedRepoSpinePublication, SpineError> {
+        Err(SpineError::Backend(
+            "cursor-bound repo publication is unsupported".to_string(),
+        ))
+    }
+
+    /// Atomically move the repository head captured by `prepare`.
+    fn commit_repo_publication(
+        &self,
+        _prepared: PreparedRepoSpinePublication,
+    ) -> Result<RepoPublicationCommit, SpineError> {
+        Err(SpineError::Backend(
+            "atomic repo publication head compare-and-swap is unsupported".to_string(),
+        ))
+    }
+
+    /// Cursor installed with the committed publication currently served by
+    /// this backend. Legacy/local registrations return `None`.
+    fn source_cursor(&self, _repo_id: &str) -> Option<SpineSourceCursor> {
+        None
+    }
+
     /// Register all entities from a repo, replacing any previous entries.
     fn register_repo(&self, repo_id: &str, entries: Vec<EntityEntry>, root_hash: &str);
 
@@ -94,6 +223,24 @@ pub trait SpineBackend: Send + Sync {
 
     /// Set of all registered repo IDs.
     fn registered_repo_ids(&self) -> HashSet<String>;
+
+    /// Derive one repository's complete outgoing edge replacement without
+    /// mutating reader-visible state.
+    ///
+    /// Hosted callers use this to build a cursor-bound edge publication after
+    /// metadata is committed. Backends that cannot provide a detached result
+    /// fail loudly instead of falling back to an in-place refresh.
+    fn derive_cross_repo_edges(
+        &self,
+        _repo_id: &str,
+        _entities: &[Entity],
+        _relations: &[Relation],
+        _registry_repo_ids: &[String],
+    ) -> Result<Vec<CrossRepoEdge>, SpineError> {
+        Err(SpineError::Backend(
+            "detached cross-repo edge derivation is unsupported".to_string(),
+        ))
+    }
 
     /// Refresh cross-repo edges for a repo from its entities and relations.
     fn refresh_cross_repo_edges(
@@ -151,12 +298,16 @@ pub trait SpineBackend: Send + Sync {
 /// All data is held in memory with no external dependencies.
 pub struct InMemorySpineBackend {
     index: SpineIndex,
+    publication_heads: ParkingMutex<HashMap<String, (u64, RepoPublicationHead)>>,
+    publication_backend_id: SpinePublicationBackendId,
 }
 
 impl InMemorySpineBackend {
     pub fn new() -> Self {
         Self {
             index: SpineIndex::new(),
+            publication_heads: ParkingMutex::new(HashMap::new()),
+            publication_backend_id: SpinePublicationBackendId::new(),
         }
     }
 
@@ -174,11 +325,116 @@ impl Default for InMemorySpineBackend {
 }
 
 impl SpineBackend for InMemorySpineBackend {
+    fn refresh_committed_publications(&self) -> Result<(), SpineError> {
+        Ok(())
+    }
+
+    fn prepare_repo_publication(
+        &self,
+        publication: RepoSpinePublication,
+    ) -> Result<PreparedRepoSpinePublication, SpineError> {
+        let mut heads = self.publication_heads.lock();
+        if heads.get(&publication.repo_id).is_some_and(|(_, head)| {
+            self.index.source_cursor(&publication.repo_id) != Some(head.source_cursor)
+        }) {
+            heads.remove(&publication.repo_id);
+        }
+        let observed = heads.get(&publication.repo_id).cloned();
+        let (revision, observed_head) = match observed {
+            Some((revision, head)) => (
+                StoreHeadPrecondition::Revision(revision.to_string()),
+                Some(head),
+            ),
+            None => (StoreHeadPrecondition::Missing, None),
+        };
+        let prepared = PreparedStorePublication::new(publication, observed_head, revision)?;
+        Ok(PreparedRepoSpinePublication::bind(
+            self.publication_backend_id,
+            prepared,
+        ))
+    }
+
+    fn commit_repo_publication(
+        &self,
+        prepared: PreparedRepoSpinePublication,
+    ) -> Result<RepoPublicationCommit, SpineError> {
+        let prepared =
+            prepared.into_store_preparation(self.publication_backend_id)?;
+        let candidate = prepared.candidate_head().clone();
+        let mut heads = self.publication_heads.lock();
+        if heads.get(&candidate.repo_id).is_some_and(|(_, head)| {
+            self.index.source_cursor(&candidate.repo_id) != Some(head.source_cursor)
+        }) {
+            heads.remove(&candidate.repo_id);
+        }
+        let current = heads.get(&candidate.repo_id).cloned();
+        let precondition_matches = match (prepared.head_precondition(), &current) {
+            (StoreHeadPrecondition::Missing, None) => true,
+            (StoreHeadPrecondition::Revision(expected), Some((revision, _))) => {
+                expected == &revision.to_string()
+            }
+            _ => false,
+        };
+        if !precondition_matches {
+            if current
+                .as_ref()
+                .is_some_and(|(_, head)| head.publication_id == candidate.publication_id)
+            {
+                self.install_committed_publication(&prepared);
+                return Ok(RepoPublicationCommit::AlreadyCommitted {
+                    source_cursor: candidate.source_cursor,
+                });
+            }
+            return Ok(RepoPublicationCommit::Conflict(
+                RepoPublicationConflict::against(
+                    candidate.source_cursor,
+                    current.as_ref().map(|(_, head)| head),
+                ),
+            ));
+        }
+
+        if prepared.terminal_result().is_some() {
+            if current
+                .as_ref()
+                .is_some_and(|(_, head)| head.publication_id == candidate.publication_id)
+            {
+                self.install_committed_publication(&prepared);
+                return Ok(RepoPublicationCommit::AlreadyCommitted {
+                    source_cursor: candidate.source_cursor,
+                });
+            }
+            return Ok(RepoPublicationCommit::Conflict(
+                RepoPublicationConflict::against(
+                    candidate.source_cursor,
+                    current.as_ref().map(|(_, head)| head),
+                ),
+            ));
+        }
+
+        let next_revision = match current.as_ref() {
+            Some((revision, _)) => revision.checked_add(1).ok_or_else(|| {
+                SpineError::Backend("in-memory spine head revision exhausted".to_string())
+            })?,
+            None => 1,
+        };
+        heads.insert(candidate.repo_id.clone(), (next_revision, candidate.clone()));
+        self.install_committed_publication(&prepared);
+        Ok(RepoPublicationCommit::Committed {
+            source_cursor: candidate.source_cursor,
+        })
+    }
+
+    fn source_cursor(&self, repo_id: &str) -> Option<SpineSourceCursor> {
+        self.index.source_cursor(repo_id)
+    }
+
     fn authority_complete(&self) -> bool {
         self.index.authority_is_complete()
     }
 
     fn register_repo(&self, repo_id: &str, entries: Vec<EntityEntry>, root_hash: &str) {
+        let mut publication_heads = self.publication_heads.lock();
+        publication_heads.remove(repo_id);
         self.index.register_repo(repo_id, entries, root_hash);
     }
 
@@ -208,6 +464,8 @@ impl SpineBackend for InMemorySpineBackend {
     }
 
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
+        let mut publication_heads = self.publication_heads.lock();
+        publication_heads.remove(&edge.src_repo);
         self.index.add_cross_repo_edge(edge);
     }
 
@@ -231,6 +489,18 @@ impl SpineBackend for InMemorySpineBackend {
         self.index.registered_repo_ids()
     }
 
+    fn derive_cross_repo_edges(
+        &self,
+        repo_id: &str,
+        entities: &[Entity],
+        relations: &[Relation],
+        registry_repo_ids: &[String],
+    ) -> Result<Vec<CrossRepoEdge>, SpineError> {
+        Ok(self
+            .index
+            .derive_cross_repo_edges(repo_id, entities, relations, registry_repo_ids))
+    }
+
     fn refresh_cross_repo_edges(
         &self,
         repo_id: &str,
@@ -238,6 +508,8 @@ impl SpineBackend for InMemorySpineBackend {
         relations: &[Relation],
         registry_repo_ids: &[String],
     ) {
+        let mut publication_heads = self.publication_heads.lock();
+        publication_heads.remove(repo_id);
         self.index
             .refresh_cross_repo_edges(repo_id, entities, relations, registry_repo_ids);
     }
@@ -270,6 +542,20 @@ impl SpineBackend for InMemorySpineBackend {
         max_depth: u32,
     ) -> FederatedImpact {
         federation::federated_impact(&self.index, start_repo, start_entity, max_depth)
+    }
+}
+
+impl InMemorySpineBackend {
+    fn install_committed_publication(&self, prepared: &PreparedStorePublication) {
+        let publication = prepared.publication();
+        self.index.install_repo_publication(
+            &publication.repo_id,
+            publication.entries.clone(),
+            &publication.root_hash,
+            publication.source_cursor,
+            publication.outgoing_edges.clone(),
+            publication.resolution_roots.as_ref(),
+        );
     }
 }
 
@@ -399,6 +685,73 @@ mod tests {
         assert_eq!(results[0].repo_id, "repo-a");
 
         assert_eq!(backend.root_hash("repo-a"), Some("hash-a".to_string()));
+    }
+
+    #[test]
+    fn legacy_in_memory_mutation_invalidates_the_committed_cursor() {
+        let backend = InMemorySpineBackend::new();
+        let prepared = backend
+            .prepare_repo_publication(RepoSpinePublication {
+                repo_id: "repo".to_string(),
+                source_cursor: SpineSourceCursor::from_backend_generation(7),
+                root_hash: "root-7".to_string(),
+                entries: vec![test_entry("repo", "before", EntityKind::Function)],
+                outgoing_edges: None,
+                resolution_roots: None,
+            })
+            .expect("prepare publication");
+        assert!(matches!(
+            backend
+                .commit_repo_publication(prepared)
+                .expect("commit publication"),
+            RepoPublicationCommit::Committed { .. }
+        ));
+        assert_eq!(
+            backend.source_cursor("repo"),
+            Some(SpineSourceCursor::from_backend_generation(7))
+        );
+
+        backend.register_repo("repo", Vec::new(), "legacy-root");
+        assert_eq!(backend.source_cursor("repo"), None);
+
+        let replacement = backend
+            .prepare_repo_publication(RepoSpinePublication {
+                repo_id: "repo".to_string(),
+                source_cursor: SpineSourceCursor::from_backend_generation(8),
+                root_hash: "root-8".to_string(),
+                entries: Vec::new(),
+                outgoing_edges: None,
+                resolution_roots: None,
+            })
+            .expect("legacy mutation cleared the stale head");
+        assert!(matches!(
+            backend
+                .commit_repo_publication(replacement)
+                .expect("commit replacement publication"),
+            RepoPublicationCommit::Committed { source_cursor }
+                if source_cursor == SpineSourceCursor::from_backend_generation(8)
+        ));
+
+        backend
+            .index()
+            .register_repo("repo", Vec::new(), "direct-legacy-root");
+        let direct_replacement = backend
+            .prepare_repo_publication(RepoSpinePublication {
+                repo_id: "repo".to_string(),
+                source_cursor: SpineSourceCursor::from_backend_generation(9),
+                root_hash: "root-9".to_string(),
+                entries: Vec::new(),
+                outgoing_edges: None,
+                resolution_roots: None,
+            })
+            .expect("direct index mutation cleared the stale head");
+        assert!(matches!(
+            backend
+                .commit_repo_publication(direct_replacement)
+                .expect("commit after direct index mutation"),
+            RepoPublicationCommit::Committed { source_cursor }
+                if source_cursor == SpineSourceCursor::from_backend_generation(9)
+        ));
     }
 
     #[test]
