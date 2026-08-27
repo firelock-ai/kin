@@ -441,13 +441,29 @@ fn embed_resource_exhaustion(
             human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
         )
     } else {
+        // The last sentence reads this process's own switch rather than
+        // assuming it is unset. Advice to set a variable the caller has already
+        // set is the shape a stranger hit on the memory-kill warning: they took
+        // it, re-ran, and were told to take it again.
         format!(
             "This machine already clears the {} the {EMBED_MODEL_DOWNLOAD} {EMBED_MODEL_ID} \
              model needs, so more memory is not the first thing to reach for. The other heavy \
              resident in this daemon is the language-server enrichment sweep, measured taking a \
-             daemon from 15 MB to 11.5 GB on a store of about one gigabyte. Set \
-             `KIN_DAEMON_DISABLE_LSP=1` and re-run to take it out of the picture.",
+             daemon from 15 MB to 11.5 GB on a store of about one gigabyte. {}",
             human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
+            if kin_daemon_spawn::enrichment_disabled() {
+                format!(
+                    "This process already carries \
+                     `{}=1`, so stop the daemon (`kin daemon stop`) before re-running: a daemon \
+                     that was already up kept the setting it started with.",
+                    kin_daemon_spawn::DISABLE_ENRICHMENT_ENV
+                )
+            } else {
+                format!(
+                    "Set `{}=1` and re-run to take it out of the picture.",
+                    kin_daemon_spawn::DISABLE_ENRICHMENT_ENV
+                )
+            },
         )
     };
     Some(format!(

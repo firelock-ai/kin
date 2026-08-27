@@ -800,10 +800,9 @@ impl DaemonKillRecord {
             None => "run this repository on a machine with more memory".to_string(),
         };
         format!(
-            "To recover: {more_memory}, or start a daemon yourself with the enrichment sweep off \
-             (`{DISABLE_ENRICHMENT_ENV}=1 kin graph status` in this repository) and retry this \
-             call. `kin doctor` reports this store's memory headroom, and `kin daemon status` \
-             reports what is running now."
+            "To recover: {more_memory}, or {}. `kin doctor` reports this store's memory \
+             headroom, and `kin daemon status` reports what is running now.",
+            enrichment_remedy_clause()
         )
     }
 
@@ -823,6 +822,55 @@ impl DaemonKillRecord {
 /// Named here rather than spelled into each message so the remediation cannot
 /// drift from the switch `kin-daemon` actually reads.
 pub const DISABLE_ENRICHMENT_ENV: &str = "KIN_DAEMON_DISABLE_LSP";
+
+/// Whether a value read from [`DISABLE_ENRICHMENT_ENV`] turns enrichment off.
+///
+/// Pure over the value so a sentence about the switch can be graded without a
+/// process environment, and read once by [`enrichment_disabled`] so the
+/// daemon's own reader and every sentence about the switch answer from one
+/// rule. A second truthiness table beside this one is how advice starts
+/// disagreeing with the switch it advises about.
+pub fn enrichment_disabled_by(value: Option<&str>) -> bool {
+    matches!(value, Some("1" | "true" | "TRUE" | "yes" | "on"))
+}
+
+/// [`enrichment_disabled_by`] against this process's own environment.
+pub fn enrichment_disabled() -> bool {
+    enrichment_disabled_by(std::env::var(DISABLE_ENRICHMENT_ENV).ok().as_deref())
+}
+
+/// The enrichment half of a memory remediation, in the tense this process's own
+/// environment puts it in.
+///
+/// Advice that does not read the environment it advises about is advice a
+/// reader has already taken. A stranger set the switch, ran the command this
+/// sentence names, and got the same sentence back telling them to set it, which
+/// is how the single most useful workaround in their session read as broken.
+///
+/// The already-set wording names the one thing left to do rather than repeating
+/// the switch, because a daemon captures it at ITS process start: one that was
+/// already running kept whatever it started with, and nothing this process
+/// exports reaches it.
+pub fn enrichment_remedy_clause_for(disabled: bool) -> String {
+    if disabled {
+        format!(
+            "stop the daemon this store is using (`kin daemon stop`) so the next one starts \
+             under the `{DISABLE_ENRICHMENT_ENV}=1` this process already carries, since a daemon \
+             that was already running kept the setting it started with"
+        )
+    } else {
+        format!(
+            "start a daemon yourself with the enrichment sweep off \
+             (`{DISABLE_ENRICHMENT_ENV}=1 kin graph status` in this repository) and retry this \
+             call"
+        )
+    }
+}
+
+/// [`enrichment_remedy_clause_for`] against this process's own environment.
+pub fn enrichment_remedy_clause() -> String {
+    enrichment_remedy_clause_for(enrichment_disabled())
+}
 
 /// Signals a deliberate shutdown path sends, which are therefore never recorded
 /// as unexplained.

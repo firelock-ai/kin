@@ -1415,6 +1415,13 @@ fn focal_resolution_gap(payload: &Value, subject: &str) -> Option<String> {
              sibling rather than the entity that was asked about"
         )),
         Some(candidates) if candidates > 1 => {
+            // A focal the caller pinned to one entity was not resolved from
+            // anything, so there is no resolution to qualify. See
+            // [`focal_pinned_to_one_entity`] for why both halves of that are
+            // required and what this deliberately stops claiming.
+            if focal_pinned_to_one_entity(resolution) {
+                return None;
+            }
             // Which rule produced the count decides what the gap is ABOUT: a
             // query that matched several entities is an ambiguous question,
             // while several entities carrying one exact name is an ambiguous
@@ -1436,6 +1443,36 @@ fn focal_resolution_gap(payload: &Value, subject: &str) -> Option<String> {
         }
         Some(_) => None,
     }
+}
+
+/// True when the caller pinned the focal to one entity by id AND the resolution
+/// REPORTED, rather than omitted, that it had no other candidate.
+///
+/// Both halves are load-bearing. `addressed_by: "entity_id"` says the caller
+/// named one UUID and the tool answered for that UUID: nothing was chosen, so
+/// there is no choice to qualify, and "not evidence about the others" describes
+/// a question nobody asked. A stranger addressing eleven exports by id got that
+/// downgrade on seven of them because some other entity in the graph happened
+/// to share the string `request`.
+///
+/// The reported-empty half is what says the producer LOOKED. A payload that
+/// omits `other_candidates` made no claim about them, and reading a missing
+/// field as an empty one is exactly the substitution the `unreported` arm above
+/// exists to refuse. `trace_data_flow` publishes such a block, so the omission
+/// is a live shape rather than a hypothetical, and it keeps the gap.
+///
+/// What this stops claiming, said plainly: a name the graph holds twice can
+/// still cost a pinned focal an edge the extractor could not attribute to
+/// either twin, so a pinned reference list is not thereby proven complete. That
+/// is a bound on completeness, and it stays readable as
+/// `focal_resolution.same_name_candidates` on the response. It is not
+/// ambiguity, and the one verdict must not report it as ambiguity.
+fn focal_pinned_to_one_entity(resolution: &Value) -> bool {
+    resolution.get("addressed_by").and_then(Value::as_str) == Some("entity_id")
+        && resolution
+            .get("other_candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|others| others.is_empty())
 }
 
 /// The limiting-factor id a spine-clipped trace reports under.

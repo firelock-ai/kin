@@ -951,12 +951,19 @@ fn build_graph_status_response_for_store(
     // Work the daemon declined for want of memory is invisible in the same way
     // and for the same reason: the counters above report it as pending, and the
     // process that declined it left nothing behind but this record.
+    //
+    // "The counters above report it as pending" is the condition, not a given,
+    // and the counter is right here. A store at `952/952 indexed (0 pending)`
+    // printed the embed refusal under its own complete line, so the record is
+    // asked whether it still describes work before it is published.
     if let Some(refusal) = kin_root.and_then(kin_core::memory_pressure::PressureRefusal::read) {
-        warnings.push(format!(
-            "{} {}",
-            refusal.cause_sentence(),
-            kin_core::memory_pressure::PRESSURE_REMEDY
-        ));
+        if refusal.describes_outstanding_work(embed_status.pending) {
+            warnings.push(format!(
+                "{} {}",
+                refusal.cause_sentence(),
+                kin_core::memory_pressure::PRESSURE_REMEDY
+            ));
+        }
     }
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());

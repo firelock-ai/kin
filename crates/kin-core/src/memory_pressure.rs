@@ -1178,6 +1178,28 @@ impl PressureRefusal {
         let _ = std::fs::remove_file(pressure_record_path(kin_root));
     }
 
+    /// Whether this record still describes work that has anything to do.
+    ///
+    /// A refusal is a fact about a decision, not about a backlog, and the two
+    /// come apart. An express checkout reporting `Embeddings: 952/952 indexed
+    /// (0 pending)` printed "so background embedding did not start" two rows
+    /// under that line and an all-clear beside it, because the refusal is
+    /// derived from footprint alone and never asks whether there is a batch to
+    /// hold. The reader is told their indexing is stalled on a store that has
+    /// nothing left to index.
+    ///
+    /// Only the embed arm can be emptied this way, and this reports on every
+    /// other. A refused sweep costs cross-file relations whatever the vector
+    /// count says, and a work id this build does not recognise has no known
+    /// backlog to check, so both stay reported: this is a mute for a state that
+    /// was measured, never a default for one that was not.
+    pub fn describes_outstanding_work(&self, pending_embeddings: usize) -> bool {
+        if self.work != HeavyWork::EmbedBatch.id() {
+            return true;
+        }
+        pending_embeddings > 0
+    }
+
     /// The fact alone, for a surface that carries its own remediation field.
     pub fn cause_sentence(&self) -> String {
         self.reason.clone()
