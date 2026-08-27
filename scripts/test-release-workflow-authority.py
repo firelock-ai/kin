@@ -7530,6 +7530,50 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
         )
 
 
+def assert_ruleset_mirror_stays_a_superset(release_tag: str) -> None:
+    """The reviewed mirror must never shrink below what the mint vetoes on.
+
+    `missing_from_ruleset` runs unconditionally in the mint and refuses when the
+    mint requires a context the reviewed mirror does not gate. `REQUIRED_CHECKS`
+    is the veto set and `RULESET_REQUIRED_CHECKS` is the mirror of live ruleset
+    19746451, so the mirror has to stay a superset of the veto set forever, and
+    the day it stops being one EVERY release refuses.
+
+    That is not a theoretical edit. FIR-2815 thins the live ruleset to a short
+    admission list, which makes "sync the mirror to the ruleset" the obvious
+    next tidy-up and makes it fatal. Nothing caught it before this: the mint's
+    own refusal is driven here only against a synthetic environment, so the
+    file's actual mirror content was unread, and a shrunken mirror landed green
+    and failed at the next mint with no pull request to blame.
+
+    The mirror may hold MORE than the veto set. That is its purpose: a context a
+    ruleset gates and the mint does not veto on still has to be published by an
+    admitted build, or the queue waits on a name nobody produces.
+    """
+
+    def block(key: str) -> tuple[str, ...]:
+        found = re.search(
+            rf"\n          {key}: \|\n((?:            \S.*\n)+)", release_tag
+        )
+        if found is None:
+            raise AssertionError(
+                f"release-tag.yml no longer declares {key} as a block scalar"
+            )
+        return tuple(
+            line.strip() for line in found.group(1).splitlines() if line.strip()
+        )
+
+    veto = block("REQUIRED_CHECKS")
+    mirror = block("RULESET_REQUIRED_CHECKS")
+    dropped = sorted(set(veto) - set(mirror))
+    if dropped:
+        raise AssertionError(
+            "the reviewed ruleset mirror must stay a superset of the checks the "
+            f"mint vetoes on; it no longer gates {dropped}, which makes "
+            "missing_from_ruleset non-empty and refuses EVERY release"
+        )
+
+
 def assert_required_check_set_is_single_sourced(release_tag: str) -> None:
     """The env list and the provenance table must name the same contexts.
 
@@ -14994,6 +15038,32 @@ def main() -> None:
     assert_required_context_action_pins(workflow_sources)
     assert_tag_readback_retries(release_tag)
     assert_required_check_set_is_single_sourced(release_tag)
+    assert_ruleset_mirror_stays_a_superset(release_tag)
+    for label, old_name, new_name in (
+        (
+            "the mirror is synced down to a thinned live ruleset",
+            "            Falsify guards\n            Feature permutation tests (ubuntu-latest)\n",
+            "",
+        ),
+        (
+            "one name is dropped from the mirror alone",
+            "            Windows installer + vector release build\n            PR text hygiene\n",
+            "            PR text hygiene\n",
+        ),
+    ):
+        mirror_start = release_tag.index("          RULESET_REQUIRED_CHECKS: |")
+        head, mirror = release_tag[:mirror_start], release_tag[mirror_start:]
+        if mirror.count(old_name) != 1:
+            raise AssertionError(
+                f"ruleset mirror falsification could not identify {label}"
+            )
+        expect_assertion(
+            label,
+            "must stay a superset",
+            lambda mutant=head + mirror.replace(old_name, new_name, 1): (
+                assert_ruleset_mirror_stays_a_superset(mutant)
+            ),
+        )
     assert_soft_decline_is_legible(release_tag)
     assert_recovery_escalation_classifies(
         RELEASE_RECOVERY.read_text(encoding="utf-8")

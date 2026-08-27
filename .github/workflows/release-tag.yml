@@ -922,6 +922,15 @@ jobs:
           # green, which is a silent hang rather than a failure. Reading the
           # mirror against the check-runs the sha carries turns that hang into
           # a named refusal here.
+          #
+          # DO NOT SHRINK THIS LIST TO MATCH A THINNED LIVE RULESET. It is a
+          # superset of REQUIRED_CHECKS by contract, and `missing_from_ruleset`
+          # below refuses when the mint requires a context this list does not
+          # gate, on every sha, unconditionally. FIR-2815 thinned ruleset
+          # 19746451 to a short admission list, which makes syncing this down
+          # the obvious tidy-up and makes it fatal: drop one of the nine and
+          # every release refuses, with no pull request to blame it on.
+          # scripts/test-release-workflow-authority.py enforces the superset.
           RULESET_REQUIRED_CHECKS: |
             Check & Test (ubuntu-latest)
             Check & Test (macos-latest)
