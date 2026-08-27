@@ -795,6 +795,31 @@ pub struct SpineIngestOutcome {
 
 /// Outcome of refreshing cross-repo edges across every registered repo.
 ///
+/// Operator lever for how many siblings the spine loads eagerly. Registered in
+/// `kin-core`'s env registry, which is the surface that decides whether a
+/// `KIN_*` name is a lever or an unrecognized read.
+/// What the spine's sibling capture actually did, kept rather than only logged.
+///
+/// A log line discloses to an operator reading logs. This discloses to the
+/// process: a test can assert it, and a health surface can report it, which is
+/// what makes "bounded" a claim the product carries rather than a sentence it
+/// once printed.
+///
+/// `bounded` and `authority_incomplete` are deliberately separate booleans over
+/// one inequality. A capture the bound stopped is expected and its captures are
+/// sound; a sibling that failed to load is neither. Collapsing them into one
+/// flag is what would let a real failure hide behind a configured cap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SiblingCaptureReport {
+    pub bounded: bool,
+    pub captured: usize,
+    pub registered: usize,
+    pub bound: usize,
+    pub authority_incomplete: bool,
+}
+
+pub(crate) const EAGER_SIBLING_BOUND_ENV: &str = "KIN_SPINE_MAX_EAGER_SIBLINGS";
+
 /// Returned by [`DaemonState::refresh_all_cross_repo_edges`] and surfaced by the
 /// `POST /spine/refresh-cross-repo-edges` route. The hosted import orchestrator
 /// runs this final pass once every repo is registered so cross-repo edges
@@ -1222,6 +1247,16 @@ pub struct DaemonState {
     /// Startup registry/binding gaps prevent a complete local spine claim even
     /// when every retained sibling that remains can be loaded.
     registered_local_repository_authority_incomplete: bool,
+    /// Resolved once, here, rather than read inside the capture loop.
+    ///
+    /// A daemon captures its levers at process start; reading the environment
+    /// per pass would also make this untestable without mutating process-global
+    /// state that every other test in this binary shares, which is a race
+    /// rather than a fixture.
+    eager_sibling_bound: usize,
+    /// Set once, when the spine publishes. Absent until then, which is itself
+    /// the honest answer to "what did the capture do" before it has run.
+    sibling_capture: std::sync::OnceLock<SiblingCaptureReport>,
     /// Frozen startup policy for deployments whose graph backend is the only
     /// write authority. When true, no filesystem/session/VFS compatibility
     /// surface may reconcile bytes back into graph truth.
@@ -1329,6 +1364,22 @@ pub struct DaemonState {
     /// each; it costs no lock the embed path needs and no work proportional to
     /// the graph, which is the constraint FIR-2416 put on this surface.
     pub(crate) graph_status_settled: crate::api::GraphStatusSettledCache,
+    /// Consecutive `kin_graph_status` calls that could not complete a live
+    /// sample of the selected graph, reset by the first one that does.
+    ///
+    /// FIR-2136. A daemon can enter a state where the tool that exists to
+    /// report ill health is the one that stops answering, and before this the
+    /// health surface could not see it: a daemon serving nothing but stale
+    /// replays for hours reported `status: "ok"`.
+    ///
+    /// Consecutive, rather than a lifetime total or the age of the last settled
+    /// reading, because only a consecutive count reset on success separates the
+    /// three states that matter. A daemon nobody has asked reads zero, which is
+    /// the same as a daemon whose samples all succeed, and both are healthy. A
+    /// lifetime total cannot tell a store that recovered from one that never
+    /// did, and an age-of-last-settled cannot tell a wedged daemon from one no
+    /// caller has ever queried, since neither holds a settled reading.
+    pub graph_status_live_sample_failures: AtomicU64,
     /// Serializes derived-index and hosted snapshot persistence so the
     /// persistence loop, idle-shutdown flush, and embedding worker can never
     /// interleave writes. Local repository-v6 authority is committed before
@@ -1795,6 +1846,33 @@ impl DaemonState {
         warn!(reason = %reason, "coordination evidence is incomplete; stream is not claim-eligible");
     }
 
+    /// Record that a status call completed a live sample, clearing any streak.
+    ///
+    /// Called at the one site that records a settled reading, so the reset and
+    /// the success are the same event and cannot drift apart.
+    pub(crate) fn graph_status_live_sample_settled(&self) {
+        self.graph_status_live_sample_failures
+            .store(0, Ordering::Relaxed);
+    }
+
+    /// Record that a status call gave up on a live sample, and return the
+    /// streak length including this one.
+    pub(crate) fn graph_status_live_sample_abandoned(&self) -> u64 {
+        self.graph_status_live_sample_failures
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+    }
+
+    /// Whether this daemon can still answer a live question about itself.
+    ///
+    /// False once the streak crosses the bound, which is what puts the repo
+    /// health surface into `attention` while the condition lasts.
+    pub fn graph_status_is_answerable(&self) -> bool {
+        self.graph_status_live_sample_failures
+            .load(Ordering::Relaxed)
+            < crate::api::GRAPH_STATUS_UNANSWERABLE_STREAK
+    }
+
     /// Load a persisted vector-index sidecar into a graph that was NOT built
     /// through `SnapshotManager` (the storage-backend path uses
     /// `InMemoryGraph::from_snapshot_with_text_index`, which does not load the
@@ -2211,6 +2289,19 @@ impl DaemonState {
         Ok(true)
     }
 
+    /// Whether every registry row naming a live local repository was pinned at
+    /// startup.
+    ///
+    /// A distinct question from the spine's own edge-authority completeness, and
+    /// the two must be reported side by side rather than collapsed. The spine's
+    /// reading goes false for a refresh in flight as readily as for an authority
+    /// that is short; this one is false only when the startup pass could not
+    /// bind a repository the registry named, which is the condition that leaves
+    /// cross-repo answers empty for the rest of the process's life.
+    pub fn startup_authority_complete(&self) -> bool {
+        !self.registered_local_repository_authority_incomplete
+    }
+
     /// Freeze local sibling authority capabilities before the daemon becomes
     /// externally visible.
     ///
@@ -2218,6 +2309,29 @@ impl DaemonState {
     /// spine initialization receives only retained identity/storage bindings,
     /// so a registry edit or storage-root replacement cannot silently change
     /// the daemon's authority set.
+    ///
+    /// **The manifest names the repository; the registry only points at it.**
+    /// This used to refuse a sibling whose registry id differed from its
+    /// manifest's `repo_id`. The two are written by different producers in
+    /// different alphabets: the manifest mints a UUID (`KinManifest::new`) and
+    /// the registry records the directory name (`kin_migrate::update_registry`,
+    /// which is what `kin init` calls). A UUID is never a directory name, so the
+    /// comparison could not pass for any repository on any host, and cross-repo
+    /// spine authority has been empty since it landed. One refused sibling also
+    /// sets `incomplete`, which invalidates the cross-repo edges of every
+    /// registered repo including the primary, so the cost was the whole edge set
+    /// rather than one absent sibling.
+    ///
+    /// Reading the manifest is strictly the safer of the two. The registry is a
+    /// file a user can edit and a stale row can point at a path holding a
+    /// different repository entirely; the manifest is read from the path that is
+    /// actually there, so the identity always describes what was actually
+    /// opened. The registry id is kept only to name the row in a log.
+    ///
+    /// Two rows resolving to one repository identity is the one case this still
+    /// refuses. It means two registry paths hold the same repository, a copied
+    /// checkout being the usual cause, and registering both would silently let
+    /// one overwrite the other's graph authority under the same spine key.
     fn pin_registered_local_repository_authorities(
         layout: &KinLayout,
     ) -> (Vec<RegisteredLocalRepositoryAuthority>, bool) {
@@ -2235,8 +2349,9 @@ impl DaemonState {
             .root()
             .canonicalize()
             .unwrap_or_else(|_| layout.root().to_path_buf());
-        let mut pinned = Vec::new();
+        let mut pinned: Vec<RegisteredLocalRepositoryAuthority> = Vec::new();
         let mut incomplete = false;
+        let mut adopted_identities = 0usize;
 
         for repo in registry.repos {
             let repo_root = repo
@@ -2262,20 +2377,42 @@ impl DaemonState {
                         continue;
                     }
                 };
-            if binding.repository_id().as_str() != repo.id {
+            let manifest_repo_id = binding.repository_id().as_str().to_string();
+            if let Some(existing) = pinned
+                .iter()
+                .find(|pinned| pinned.repo_id == manifest_repo_id)
+            {
                 incomplete = true;
                 warn!(
                     repo_id = %repo.id,
                     path = %repo.path.display(),
-                    manifest_repo_id = %binding.repository_id(),
-                    "registry repository identity does not match startup-pinned manifest authority"
+                    manifest_repo_id = %manifest_repo_id,
+                    already_pinned_as = %existing.repo_id,
+                    "two registry paths hold one repository identity; the later one is not pinned"
                 );
                 continue;
             }
+            if manifest_repo_id != repo.id {
+                adopted_identities += 1;
+                debug!(
+                    registry_id = %repo.id,
+                    path = %repo.path.display(),
+                    manifest_repo_id = %manifest_repo_id,
+                    "registry row names the repository by a label; pinning its manifest identity"
+                );
+            }
             pinned.push(RegisteredLocalRepositoryAuthority {
-                repo_id: repo.id,
+                repo_id: manifest_repo_id,
                 binding,
             });
+        }
+
+        if adopted_identities > 0 {
+            info!(
+                adopted = adopted_identities,
+                pinned = pinned.len(),
+                "pinned sibling authorities under their manifest identities"
+            );
         }
 
         (pinned, incomplete)
@@ -2562,6 +2699,8 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
+            eager_sibling_bound: Self::eager_sibling_load_bound(),
+            sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(false),
             ),
@@ -2595,6 +2734,7 @@ impl DaemonState {
             embedding_work: Mutex::new(()),
             embed_batch_size: AtomicUsize::new(0),
             graph_status_settled: crate::api::GraphStatusSettledCache::default(),
+            graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
@@ -2815,6 +2955,8 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
+            eager_sibling_bound: Self::eager_sibling_load_bound(),
+            sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
                 crate::loop_runner::filesystem_reconcile_disabled_at_startup(true),
             ),
@@ -2848,6 +2990,7 @@ impl DaemonState {
             embedding_work: Mutex::new(()),
             embed_batch_size: AtomicUsize::new(0),
             graph_status_settled: crate::api::GraphStatusSettledCache::default(),
+            graph_status_live_sample_failures: AtomicU64::new(0),
             persist_lock: Mutex::new(()),
             #[cfg(feature = "embeddings")]
             vector_checkpoint_authority_match: VectorCheckpointAuthorityMatch::default(),
@@ -3252,7 +3395,23 @@ impl DaemonState {
         // Capture only sibling capabilities frozen during startup. Lazy
         // initialization may load graph bytes, but cannot rediscover registry
         // paths, manifests, or storage roots from a request.
-        for registered in &self.registered_local_repository_authorities {
+        //
+        // Bounded, because each iteration opens that sibling's whole workspace
+        // graph and joins before the next one starts. This host carries 81
+        // registered siblings over 70.67 GiB, so an unbounded pass is the
+        // startup cost, and the identity fix in this branch is what re-arms it.
+        let eager_bound = self.eager_sibling_bound;
+        let registered_sibling_count = self.registered_local_repository_authorities.len();
+        let mut bounded_out = 0_usize;
+        for (position, registered) in self
+            .registered_local_repository_authorities
+            .iter()
+            .enumerate()
+        {
+            if position >= eager_bound {
+                bounded_out += 1;
+                continue;
+            }
             let sibling_id = registered.repo_id.clone();
             let binding = registered.binding.clone();
             let loaded = std::thread::Builder::new()
@@ -3355,7 +3514,16 @@ impl DaemonState {
             .map(|capture| capture.repo_id.clone())
             .collect::<HashSet<_>>();
         let registered_repo_ids = backend.registered_repo_ids();
-        if registered_repo_ids != captured_repo_ids {
+        // Two different states share one inequality, and conflating them is what
+        // this branch has to avoid. A capture the configured bound stopped is
+        // BOUNDED: deliberate, disclosed, and the captures it did take are
+        // sound. A sibling that failed to load is INCOMPLETE: an answer whose
+        // shape nobody chose. Only the second is a reason to distrust anything.
+        let uncaptured = registered_repo_ids
+            .difference(&captured_repo_ids)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !uncaptured.is_empty() {
             authority_incomplete = true;
             warn!(
                 captured = captured_repo_ids.len(),
@@ -3363,10 +3531,14 @@ impl DaemonState {
                 "spine contains durable advisory repos without a current graph capture"
             );
         }
-        if authority_incomplete {
-            for repo_id in &registered_repo_ids {
-                backend.invalidate_cross_repo_edges(repo_id);
-            }
+        // Scoped, where this used to invalidate every registered repo including
+        // the primary. Edges between captured repos were recomputed from those
+        // captures moments ago and are valid; only edges into a repo this pass
+        // did not capture can be stale. One sibling failing used to mark the
+        // whole cross-repo edge set dirty, which is a far larger blast radius
+        // than the fact that produced it.
+        for repo_id in &uncaptured {
+            backend.invalidate_cross_repo_edges(repo_id);
         }
 
         // A writer announcing itself after the preparation checks but before
@@ -3395,15 +3567,81 @@ impl DaemonState {
             return;
         }
 
+        // `capture_set_complete` keeps meaning what it meant: nothing failed.
+        // The bounded fields are a separate claim, that a deliberate cap left
+        // siblings unconsulted, and they carry the counts so a reader can size
+        // the gap rather than guess at it. A silent cap would be the worse bug:
+        // a complete-looking answer over a subset nobody was told about.
         info!(
             cross_repo_edges = backend.edge_count(),
             capture_set_complete = !authority_incomplete,
+            sibling_capture_bounded = bounded_out > 0,
+            siblings_captured = registered_sibling_count.saturating_sub(bounded_out),
+            siblings_registered = registered_sibling_count,
+            eager_sibling_bound = eager_bound,
             "spine index initialized"
         );
+        if bounded_out > 0 {
+            info!(
+                captured = registered_sibling_count.saturating_sub(bounded_out),
+                registered = registered_sibling_count,
+                bound = eager_bound,
+                var = EAGER_SIBLING_BOUND_ENV,
+                "sibling graph capture stopped at its configured bound; the spine \
+                 answers over a bounded capture set, not an incomplete one"
+            );
+        }
+        let _ = self.sibling_capture.set(SiblingCaptureReport {
+            bounded: bounded_out > 0,
+            captured: registered_sibling_count.saturating_sub(bounded_out),
+            registered: registered_sibling_count,
+            bound: eager_bound,
+            authority_incomplete,
+        });
         let _ = self.spine.get_or_init(move || backend);
     }
 
     /// Create the appropriate spine backend based on environment.
+    /// How many registered siblings the spine loads eagerly at startup.
+    ///
+    /// Each one opens that sibling's whole workspace graph and is joined before
+    /// the next starts, so this number is the startup cost of cross-repo
+    /// authority. It is deliberately conservative: this host carries 81
+    /// registered siblings over 70.67 GiB, and 16 bounds the eager pass to
+    /// roughly a fifth of that while still covering an umbrella of ordinary
+    /// size.
+    ///
+    /// Zero disables eager sibling loading and the spine answers over the
+    /// primary alone, which is a supported operator choice rather than a
+    /// failure. An unparseable value keeps the default and warns, because a
+    /// daemon that will not start is a worse failure than one that starts
+    /// conservatively.
+    fn eager_sibling_load_bound() -> usize {
+        const DEFAULT: usize = 16;
+        let Ok(raw) = std::env::var(EAGER_SIBLING_BOUND_ENV) else {
+            return DEFAULT;
+        };
+        match raw.trim().parse::<usize>() {
+            Ok(bound) => bound,
+            Err(_) => {
+                warn!(
+                    var = EAGER_SIBLING_BOUND_ENV,
+                    value = %raw,
+                    "ignoring an unparseable eager sibling load bound; using the default"
+                );
+                DEFAULT
+            }
+        }
+    }
+
+    /// What the spine's sibling capture did, once it has run.
+    ///
+    /// `None` before the spine publishes, which is not the same claim as a
+    /// complete capture and is deliberately not collapsed into one.
+    pub(crate) fn sibling_capture_report(&self) -> Option<SiblingCaptureReport> {
+        self.sibling_capture.get().copied()
+    }
+
     fn create_spine_backend(&self) -> Arc<dyn kin_spine::SpineBackend> {
         #[cfg(feature = "firestore")]
         {
@@ -7684,6 +7922,551 @@ mod tests {
             sibling_root.as_deref(),
             Some(expected_sibling_root.as_str()),
             "sibling registration must carry its exact nonempty snapshot root"
+        );
+    }
+
+    /// The join between the two producers of repository identity, over the real
+    /// set rather than over two strings a fixture wrote itself.
+    ///
+    /// `spine_init_materializes_cross_repo_edges` above registers its sibling by
+    /// hand, taking the id from `kin_core::init`'s minted manifest identity. That
+    /// makes both sides of the daemon's startup identity comparison agree because
+    /// one fixture wrote both, so the test passes on a tree where the two real
+    /// producers disagree and no sibling can ever be pinned.
+    ///
+    /// This test registers the sibling the way `kin init` registers it, by
+    /// calling the same `kin_migrate::update_registry` that `kin init` calls, and
+    /// then asks for the consequence: cross-repo edges. No repository identity is
+    /// written twice here, so the assertion is about the agreement between the
+    /// registry writer and the daemon's startup check rather than about either
+    /// one alone.
+    /// One registered sibling, registered through the production writer, so both
+    /// checks below start from a state a real install produces.
+    #[cfg(test)]
+    struct SiblingFixture {
+        _sibling_parent: tempfile::TempDir,
+        _registry_dir: tempfile::TempDir,
+        sibling_root: std::path::PathBuf,
+        _spine_env: kin_core::test_env::EnvVarGuard,
+    }
+
+    /// One registered sibling, registered through the production writer, so both
+    /// checks below start from a state a real install produces.
+    ///
+    /// The registry guard is installed BEFORE `update_registry` runs and is
+    /// returned so it outlives the fixture. Setting it afterwards writes the
+    /// entry to this host's real registry and pins nothing, which is how the
+    /// first draft of these checks failed: at their own precondition, which is
+    /// what that precondition is for.
+    #[cfg(test)]
+    fn registered_sibling_fixture() -> SiblingFixture {
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("sibling-checkout");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        kin_core::init(&sibling_root).unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        kin_migrate::update_registry(&sibling_root, 1).unwrap();
+        SiblingFixture {
+            _sibling_parent: sibling_parent,
+            _registry_dir: registry_dir,
+            sibling_root,
+            _spine_env: spine_env,
+        }
+    }
+
+    /// FIR-2763's remaining acceptance: what the eager sibling pass costs on a
+    /// REAL populated registry, measured rather than argued.
+    ///
+    /// `#[ignore]` because it opens this host's own registry and loads whole
+    /// sibling workspace graphs. `KIN_SPINE_MEASURE_BOUNDS` names the bounds to
+    /// sweep, smallest first, so the curve can be stopped before the box is.
+    /// Each arm is a fresh `DaemonState`, because the capture happens once per
+    /// process and a second call would measure a `OnceLock` read.
+    ///
+    /// It reports the bound, the wall clock, and what the capture actually did,
+    /// so a row can be read against the work it describes rather than against
+    /// an assumption about how many siblings that bound reached.
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "measurement against this host's real registry, not a guard"]
+    fn measure_eager_sibling_capture_against_the_real_registry() {
+        let bounds =
+            std::env::var("KIN_SPINE_MEASURE_BOUNDS").unwrap_or_else(|_| "0,1,2,4,8".to_string());
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+
+        eprintln!("FIR2763 MEASURE bound | seconds | captured/registered | bounded | incomplete");
+        for raw in bounds.split(',') {
+            let bound: usize = raw.trim().parse().expect("bounds must be integers");
+            // A fresh state per arm: `ensure_spine` publishes once, so reusing
+            // one would time a OnceLock read rather than a capture.
+            let mut state = test_state(primary_init.layout.clone(), primary_dir.path());
+            let registered = state.registered_local_repository_authorities.len();
+            state.eager_sibling_bound = bound;
+
+            let started = std::time::Instant::now();
+            let _ = state.ensure_spine();
+            let seconds = started.elapsed().as_secs_f64();
+
+            let report = state.sibling_capture_report();
+            eprintln!(
+                "FIR2763 MEASURE {bound:>5} | {seconds:>7.2} | {:>19} | {:>7} | {:>10}",
+                report
+                    .map(|r| format!("{}/{}", r.captured, r.registered))
+                    .unwrap_or_else(|| format!("-/{registered}")),
+                report.map(|r| r.bounded.to_string()).unwrap_or("-".into()),
+                report
+                    .map(|r| r.authority_incomplete.to_string())
+                    .unwrap_or("-".into()),
+            );
+        }
+    }
+
+    /// Which sibling the eager pass actually spends its time on.
+    ///
+    /// The bound sweep showed a large first-sibling cost and a small marginal
+    /// one, which fits two different worlds: a one-time initialization on first
+    /// load, or one pathological sibling that happens to be first. The sweep
+    /// already argues against the first, because a second fresh `DaemonState`
+    /// in the same process paid the cost again. This settles it by timing each
+    /// sibling load separately and naming them.
+    #[test]
+    #[serial_test::serial]
+    #[ignore = "measurement against this host's real registry, not a guard"]
+    fn attribute_the_eager_sibling_cost_per_sibling() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let state = test_state(primary_init.layout, primary_dir.path());
+
+        eprintln!("FIR2763 ATTRIBUTE seconds | repo_id");
+        let mut total = 0.0_f64;
+        // The discriminator. A first sibling is slow under BOTH hypotheses, so
+        // the order is reversed here: if the new first sibling is also slow the
+        // cost is one-time initialization paid by whoever goes first, and if it
+        // is fast the cost belongs to one pathological repository.
+        let reverse = std::env::var("KIN_SPINE_ATTRIBUTE_REVERSE").is_ok();
+        let mut order: Vec<_> = state
+            .registered_local_repository_authorities
+            .iter()
+            .collect();
+        if reverse {
+            order.reverse();
+        }
+        eprintln!("FIR2763 ATTRIBUTE order reversed: {reverse}");
+        for registered in order {
+            let binding = registered.binding.clone();
+            let started = std::time::Instant::now();
+            let loaded = DaemonState::load_registered_workspace_graph(&binding);
+            let seconds = started.elapsed().as_secs_f64();
+            total += seconds;
+            eprintln!(
+                "FIR2763 ATTRIBUTE {seconds:>7.2} | {} {}",
+                registered.repo_id,
+                if loaded.is_ok() { "" } else { "(load failed)" }
+            );
+        }
+        eprintln!(
+            "FIR2763 ATTRIBUTE total {total:.2}s over {} siblings",
+            state.registered_local_repository_authorities.len()
+        );
+    }
+
+    /// FIR-2763's bound, and FIR-2772's scoping, from the BOUNDED side.
+    ///
+    /// A capture the configured bound stopped is not an incomplete authority. It
+    /// is a deliberate partial whose captures are sound, and the two are
+    /// different claims about the same inequality. This pins that a cap
+    /// discloses itself, leaves `authority_incomplete` alone, and does not cost
+    /// the primary its own registration.
+    ///
+    /// Falsified by the other state's mechanism: make the sibling FAIL to load
+    /// instead of capping it, and `bounded` must go false while
+    /// `authority_incomplete` goes true. Two producers of one inequality is the
+    /// trap class this defect came from, so neither arm may assert on the
+    /// inequality itself.
+    #[test]
+    #[serial_test::serial]
+    fn a_capture_stopped_at_its_bound_is_bounded_rather_than_incomplete() {
+        // Held, not dropped: the fixture owns the registry guard, and dropping it
+        // early would unset KIN_REGISTRY_PATH before the daemon reads it.
+        let _fixture = registered_sibling_fixture();
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let mut state = test_state(primary_init.layout, primary_dir.path());
+        assert_eq!(
+            state.registered_local_repository_authorities.len(),
+            1,
+            "the fixture must pin exactly one sibling before the bound can mean anything"
+        );
+
+        // Injected, not set through the environment. The lever is resolved once
+        // at construction precisely so a test can do this without mutating
+        // process-global state every other test in this binary shares.
+        state.eager_sibling_bound = 0;
+
+        let repo_count = {
+            let spine = state.ensure_spine().expect("spine must be enabled");
+            spine.repo_count()
+        };
+        let report = state
+            .sibling_capture_report()
+            .expect("a published spine must report what its sibling capture did");
+
+        assert!(
+            report.bounded,
+            "a capture stopped at its bound must say so: {report:?}"
+        );
+        assert_eq!(
+            report.captured, 0,
+            "bound of zero captures no sibling: {report:?}"
+        );
+        assert_eq!(
+            report.registered, 1,
+            "one sibling was registered: {report:?}"
+        );
+        assert!(
+            !report.authority_incomplete,
+            "a deliberate cap is not an incomplete authority; conflating them is what \
+             lets a real failure hide behind a configured bound: {report:?}"
+        );
+        assert_eq!(
+            repo_count, 1,
+            "the primary must still be captured and registered when siblings are capped: {report:?}"
+        );
+    }
+
+    /// The same inequality from the INCOMPLETE side, which is the falsification
+    /// of the check above and is why both live here rather than one.
+    ///
+    /// A sibling that pinned at startup and then could not be loaded is a shape
+    /// nobody chose. It must report incomplete and must NOT report bounded, or a
+    /// real failure reads as a configured cap.
+    #[test]
+    #[serial_test::serial]
+    fn a_sibling_that_fails_to_load_is_incomplete_and_never_bounded() {
+        let fixture = registered_sibling_fixture();
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let mut state = test_state(primary_init.layout, primary_dir.path());
+        assert_eq!(
+            state.registered_local_repository_authorities.len(),
+            1,
+            "the sibling must pin at startup, so that what fails below is the LOAD \
+             rather than the pin; otherwise this arm tests the wrong layer"
+        );
+
+        // A bound high enough that the sibling is attempted. The failure has to
+        // come from the load, not from the cap, or this arm proves nothing about
+        // the difference between them.
+        state.eager_sibling_bound = 16;
+
+        // Break the sibling AFTER it pinned. Pinning reads the manifest at
+        // startup; loading reads the graph later, and only the second happens
+        // inside the capture loop.
+        std::fs::remove_dir_all(fixture.sibling_root.join(".kin")).unwrap();
+
+        let _ = state.ensure_spine();
+        let report = state
+            .sibling_capture_report()
+            .expect("a published spine must report what its sibling capture did");
+
+        assert!(
+            !report.bounded,
+            "a sibling that failed to load was not capped, and must not claim it was: {report:?}"
+        );
+        assert!(
+            report.authority_incomplete,
+            "a sibling that pinned and then failed to load leaves the authority incomplete: {report:?}"
+        );
+        assert_eq!(
+            report.registered, 1,
+            "the sibling was registered whether or not it loaded: {report:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn spine_pins_the_sibling_that_kin_init_actually_registered() {
+        use kin_db::InMemoryGraph;
+        use kin_model::{
+            GraphNodeId, Relation, RelationEvidence, RelationId, RelationKind, RelationOrigin,
+        };
+
+        let external_id = kin_model::EntityId::new();
+        let imported_symbol = "remote_call";
+
+        // A sibling under a directory whose name is deliberately NOT the shape of
+        // a minted repository identity, so a check that compares the two
+        // identities cannot pass by coincidence of naming.
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("sibling-checkout");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        let sibling_init = kin_core::init(&sibling_root).unwrap();
+        let sibling_graph = InMemoryGraph::new();
+        let sibling_blobs =
+            kin_blobs::BlobStore::new(sibling_init.layout.ingest_cas_dir()).unwrap();
+        let sibling_source = b"pub fn remote_call() {}\n";
+        let sibling_digest = sibling_blobs.write(sibling_source).unwrap();
+        sibling_graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                entity_deltas: Vec::new(),
+                relation_deltas: Vec::new(),
+                tree_deltas: vec![TreeDelta::Added {
+                    artifact_id: ArtifactId::new(),
+                    new: LocatedEntry::new(
+                        RepoPath::from_bytes(b"src/lib.rs".to_vec()).unwrap(),
+                        kin_model::TreeEntry::blob(Hash256::from_bytes(sibling_digest.0), false),
+                    ),
+                }],
+                admission_policy_delta: None,
+                external_reference_deltas: Vec::new(),
+            })
+            .unwrap();
+        sibling_graph
+            .batch_upsert_entities(&[test_entity(imported_symbol, "src/lib.rs")])
+            .unwrap();
+        let plan = crate::repository_commit::plan_native_commit(
+            &sibling_graph,
+            &sibling_blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap(),
+            kin_model::OperationId::new(),
+            kin_model::Timestamp::now(),
+            kin_model::AuthorId::new("spine-fixture"),
+            "publish sibling semantic authority".to_string(),
+        )
+        .unwrap();
+        crate::repository_commit::commit_native_plan(
+            &sibling_blobs,
+            &crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &sibling_init.layout,
+            )
+            .unwrap(),
+            plan,
+        )
+        .unwrap();
+
+        // Register through the production writer. `kin init` calls exactly this
+        // (kin-cli `commands/init.rs`), so whatever identity the registry ends up
+        // carrying is the identity a real install carries.
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+        kin_migrate::update_registry(&sibling_root, 1).unwrap();
+
+        // The sibling id the spine will key on is whatever the production writer
+        // just recorded. Reading it back rather than restating it is what keeps
+        // this test honest about the join: nothing here asserts what that string
+        // should be.
+        let registered = kin_core::registry::KinRegistry::load_from(&registry_path).unwrap();
+        let sibling_entry = registered
+            .repos
+            .iter()
+            .find(|repo| {
+                repo.path
+                    .canonicalize()
+                    .ok()
+                    .zip(sibling_root.canonicalize().ok())
+                    .is_some_and(|(registered, expected)| registered == expected)
+            })
+            .expect("the production registry writer must record the sibling it was given")
+            .clone();
+        let sibling_id = sibling_entry.id.clone();
+
+        // The primary repo: a caller entity plus an unresolved cross-repo call
+        // tagged with the registered sibling as its import source.
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let state = test_state(primary_init.layout, primary_dir.path());
+        let caller = test_entity("caller", "src/main.rs");
+        state
+            .graph
+            .batch_upsert_entities(std::slice::from_ref(&caller))
+            .unwrap();
+        state
+            .graph
+            .upsert_relation(&Relation {
+                id: RelationId::new(),
+                kind: RelationKind::Calls,
+                src: GraphNodeId::Entity(caller.id),
+                dst: GraphNodeId::Entity(external_id),
+                confidence: 1.0,
+                origin: RelationOrigin::Parsed,
+                created_in: None,
+                import_source: Some(sibling_id.clone()),
+                evidence: vec![RelationEvidence {
+                    token: Some(imported_symbol.to_string()),
+                    ..RelationEvidence::default()
+                }],
+            })
+            .unwrap();
+
+        let primary_repo_id = state.cached_repo_id.clone();
+        let (repo_count, edge_count, spine_ids, sibling_roots) = {
+            let spine = state.ensure_spine().expect("spine must be enabled");
+            let ids = spine.registered_repo_ids();
+            let roots = ids
+                .iter()
+                .filter(|id| *id != &primary_repo_id)
+                .filter_map(|id| spine.root_hash(id).map(|root| (id.clone(), root)))
+                .collect::<Vec<_>>();
+            (spine.repo_count(), spine.edge_count(), ids, roots)
+        };
+
+        // Deliberately says nothing about WHICH identity the spine keys on. That
+        // is the open design question this check must outlive: it pins the
+        // consequence, that a sibling `kin init` registered is pinned and its
+        // edges materialize, so an identity change can move the key without
+        // moving this check, and cannot silently zero the spine.
+        assert_eq!(
+            repo_count, 2,
+            "the sibling `kin init` registered must be pinned beside the primary \
+             (registry id {sibling_id:?}, spine ids {spine_ids:?}); a repo_count of 1 \
+             means the daemon refused it at startup"
+        );
+        assert_eq!(
+            sibling_roots.len(),
+            1,
+            "exactly one non-primary repository must carry a registered root \
+             (got {sibling_roots:?})"
+        );
+        assert!(
+            !sibling_roots[0].1.is_empty(),
+            "the pinned sibling's registered root must be its real graph root, not empty \
+             (got {sibling_roots:?})"
+        );
+        assert!(
+            edge_count > 0,
+            "cross-repo edges must materialize for a sibling registered the way `kin init` \
+             registers one (got {edge_count}, spine ids {spine_ids:?})"
+        );
+    }
+
+    /// The one case pinning still refuses: two registry rows resolving to one
+    /// repository identity.
+    ///
+    /// Two paths holding the same repository, a copied checkout being the usual
+    /// cause, would register twice under one spine key and let the second
+    /// overwrite the first's graph authority. Refusing the later row and marking
+    /// the authority set incomplete is the conservative answer, and it is the
+    /// only refusal left in a pass that used to refuse everything.
+    ///
+    /// Exercised against `pin_registered_local_repository_authorities` directly
+    /// rather than through the spine, because both halves of what it decides,
+    /// which rows pinned and whether the set is complete, are its return value
+    /// and nothing downstream reports the second one on its own.
+    #[test]
+    #[serial_test::serial]
+    fn two_registry_rows_for_one_repository_pin_once_and_report_incomplete() {
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("sibling-checkout");
+        std::fs::create_dir_all(&sibling_root).unwrap();
+        kin_core::init(&sibling_root).unwrap();
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        // One repository, two rows. Distinct ids on purpose: `upsert` dedupes on
+        // id, so this is the shape a registry actually reaches when the same
+        // repository is registered from two paths.
+        kin_core::registry::KinRegistry {
+            repos: vec![
+                kin_core::registry::RegisteredRepo {
+                    id: "sibling-checkout".to_string(),
+                    path: sibling_root.clone(),
+                    entities: 1,
+                    last_commit: String::new(),
+                    dependencies: vec![],
+                },
+                kin_core::registry::RegisteredRepo {
+                    id: "sibling-checkout-copy".to_string(),
+                    path: sibling_root.clone(),
+                    entities: 1,
+                    last_commit: String::new(),
+                    dependencies: vec![],
+                },
+            ],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let (pinned, incomplete) =
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout);
+
+        assert_eq!(
+            pinned.len(),
+            1,
+            "one repository must pin once however many registry rows point at it: {:?}",
+            pinned.iter().map(|p| p.repo_id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            incomplete,
+            "a refused duplicate row must leave the authority set reported incomplete"
+        );
+    }
+
+    /// The healthy control for the refusal above: two rows naming two genuinely
+    /// different repositories both pin, and the set reports complete.
+    ///
+    /// Without it the refusal could be tightened into refusing every second
+    /// sibling and nothing would notice, because the test above only ever asserts
+    /// that fewer than two pinned.
+    #[test]
+    #[serial_test::serial]
+    fn two_registry_rows_for_two_repositories_both_pin_and_report_complete() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut roots = Vec::new();
+        for name in ["sibling-one", "sibling-two"] {
+            let root = parent.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            kin_core::init(&root).unwrap();
+            roots.push(root);
+        }
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        kin_core::registry::KinRegistry {
+            repos: roots
+                .iter()
+                .map(|root| kin_core::registry::RegisteredRepo {
+                    id: root.file_name().unwrap().to_string_lossy().to_string(),
+                    path: root.clone(),
+                    entities: 1,
+                    last_commit: String::new(),
+                    dependencies: vec![],
+                })
+                .collect(),
+        }
+        .save_to(&registry_path)
+        .unwrap();
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let (pinned, incomplete) =
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout);
+
+        assert_eq!(
+            pinned.len(),
+            2,
+            "two distinct repositories must both pin: {:?}",
+            pinned.iter().map(|p| p.repo_id.clone()).collect::<Vec<_>>()
+        );
+        assert!(
+            !incomplete,
+            "two distinct repositories pinning cleanly must not report the set incomplete"
         );
     }
 

@@ -2892,36 +2892,43 @@ mod tests {
         );
 
         // Landing this exact pack is a different test, because this fixture's
-        // tree carries a gitlink and that meets a bound of its own, recorded
-        // immediately below. What a bootstrap actually lands is proven by
+        // tree carries a gitlink and what a bootstrap may do with one is a
+        // pair of bounds of its own, recorded immediately below. What a
+        // bootstrap lands when no gitlink is involved at all is proven by
         // `a_bootstrap_pack_establishes_git_authority_on_a_replica_that_had_none`,
         // whose history is Git-origin throughout.
     }
 
-    /// A converted repository holding ANY submodule cannot bootstrap once it
-    /// has native history, and the reason is the exact mirror of the rule that
-    /// forces authority and history into one transaction.
+    /// A converted repository holding a submodule DOES bootstrap, once the
+    /// gitlink its native history inherits is one the same transaction's own
+    /// Git authority projects.
     ///
-    /// `verify_native_change_admission` reads `authenticated_gitlinks` from the
-    /// state BEFORE the transaction (kin-db repository.rs:4228 and :4233), so a
-    /// bootstrap's own authority install cannot authenticate anything: at the
-    /// moment of the check the replica still has no authority at all. One rule
-    /// requires the two halves to arrive together and this one is broken by
-    /// their arriving together.
+    /// This test asserted the opposite refusal until kin-db 0.7.66, and the
+    /// refusal was correct on its own terms and impossible to satisfy.
+    /// `verify_native_change_admission` read `authenticated_gitlinks` from the
+    /// state BEFORE the transaction, so a bootstrap's own authority install
+    /// could authenticate nothing: at the moment of the check the replica still
+    /// held no authority at all. One rule requires the two halves to arrive
+    /// together and this one was broken by their arriving together, so every
+    /// repository carrying a submodule and any native change at all was
+    /// unbootstrappable. From 0.7.66 the check reads the persisted index plus
+    /// the gitlinks carried by the Git-origin changes the SUCCESSOR authority
+    /// projects, and a Git-origin change earns that only by surviving the raw
+    /// tree replay, which requires its semantic tree to equal the raw Git tree
+    /// exactly. The refusal moved to the case below rather than disappearing.
     ///
-    /// It is wider than "a change that touches a submodule". The check walks
-    /// the whole RESOLVED TREE of each native change rather than its deltas, so
-    /// a native change inherits every gitlink in the tree and one submodule
-    /// anywhere catches all of them. Here the gitlink sits at `dependency` and
-    /// the native change only edits `compose.yaml`.
+    /// The width the old test recorded is still real and is what this fixture
+    /// exercises: the check walks the whole RESOLVED TREE of each native change
+    /// rather than its deltas, so a native change inherits every gitlink in the
+    /// tree. Here the gitlink sits at `dependency` and the native change only
+    /// edits `compose.yaml`, so the child is admitted on authority it never
+    /// touched.
     ///
-    /// Recorded rather than worked around, so the class is never rediscovered.
-    /// Tracked as FIR-2751, whose fix has the gitlink check consult the
-    /// successor authority the same transaction installs, the way projection
-    /// membership already validates against the resulting state. This test and
-    /// the bound-4 invariant it mirrors both stay green through that.
+    /// The assertions name the child and the landed gitlink rather than the
+    /// outcome alone, because a transaction that admitted the imported baseline
+    /// and dropped the native change would report Committed too.
     #[test]
-    fn a_bootstrap_carrying_native_history_over_a_gitlink_is_refused_by_name() {
+    fn a_bootstrap_carrying_native_history_over_a_gitlink_its_authority_projects_lands() {
         let fixture = fixture();
         let empty_dir = tempfile::tempdir().unwrap();
         let empty = manager(&empty_dir, &fixture.repository_id);
@@ -2929,8 +2936,127 @@ mod tests {
             repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
         let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
         let pack = build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
-            .expect("the sender builds the bootstrap; the refusal is the receiver's")
+            .expect("a publisher with Git authority may bootstrap an unborn replica")
             .pack;
+        let native_child = pack
+            .changes
+            .iter()
+            .find(|change| matches!(change.origin, ChangeOrigin::Native))
+            .expect("the bootstrap carries the native work on top of the imported baseline")
+            .id;
+
+        let receipt = apply_repository_transfer_pack(
+            &empty,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("bootstrap-sender-test"),
+            &pack,
+            &RepositoryTransferLimits::default(),
+        )
+        .expect("a gitlink this transaction's own Git authority projects authenticates the native child that inherits it");
+        assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+        assert_eq!(receipt.destination_head, pack.source_head);
+
+        let lease = empty.read_authority();
+        assert!(
+            lease.snapshot().changes.contains_key(&native_child),
+            "the native child must be persisted, not merely tolerated by a transaction \
+             that admitted the imported baseline and dropped it"
+        );
+        let store = TransferChangeStore::new(lease.snapshot().changes.values().cloned());
+        let landed = store.resolve_tree_at(&pack.source_head).unwrap();
+        let inherited = landed
+            .artifact_at_path(&RepoPath::from_utf8("dependency").unwrap())
+            .expect("the landed tree must still carry the submodule the baseline imported");
+        assert!(
+            matches!(
+                inherited.entry,
+                TreeEntry::Gitlink { target } if target == fixture.gitlink_target
+            ),
+            "the landed entry must be the exact gitlink the imported authority projects: {:?}",
+            inherited.entry
+        );
+    }
+
+    /// The refusal that did NOT move: a gitlink no authority projects.
+    ///
+    /// The allowance above is bound to the successor authority's own exact
+    /// targets, so it cannot widen into "any gitlink inside a transaction that
+    /// happens to carry Git authority". This drives the same real sender and
+    /// then retargets the inherited submodule to a commit the imported history
+    /// never contained, which is the shape a hostile publisher would send, and
+    /// the receiver must refuse it by the same name it used to refuse
+    /// everything.
+    ///
+    /// The pack is edited rather than published from a second source replica on
+    /// purpose: the source would refuse to commit this change for the same
+    /// reason the destination refuses to admit it, so the only way to put a
+    /// hostile pack on the wire is to build one.
+    #[test]
+    fn a_bootstrap_carrying_a_gitlink_no_authority_projects_is_refused_by_name() {
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+        let status =
+            repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
+        let expectation = RepositoryTransferExpectation::try_from(status).unwrap();
+        let mut pack =
+            build_repository_transfer_segment(&fixture.source, &fixture.main, &expectation)
+                .expect("the sender builds the bootstrap; the refusal is the receiver's")
+                .pack;
+
+        // Read the submodule out of the pack's own head tree rather than
+        // restating the fixture's artifact id here, so this follows the fixture
+        // instead of agreeing with it by coincidence.
+        let sent = TransferChangeStore::new(pack.changes.iter().cloned());
+        let inherited = sent
+            .resolve_tree_at(&pack.source_head)
+            .unwrap()
+            .artifact_at_path(&RepoPath::from_utf8("dependency").unwrap())
+            .expect("the bootstrap's head tree carries the imported submodule")
+            .clone();
+        assert!(
+            matches!(
+                inherited.entry,
+                TreeEntry::Gitlink { target } if target == fixture.gitlink_target
+            ),
+            "this test retargets a gitlink, so what it starts from must be one: {:?}",
+            inherited.entry
+        );
+
+        let unauthenticated = GitObjectId::sha1([0x66; 20]);
+        assert_ne!(
+            unauthenticated, fixture.gitlink_target,
+            "the retargeted commit must be one the imported authority does not project"
+        );
+        let retarget = native_change(
+            vec![pack.source_head],
+            "retarget the imported submodule to a commit no authority projects",
+            vec![TreeDelta::Updated {
+                artifact_id: inherited.artifact_id,
+                old: inherited.located_entry(),
+                new: LocatedEntry::new(inherited.path.clone(), TreeEntry::gitlink(unauthenticated)),
+            }],
+        );
+        pack.changes.push(retarget.clone());
+        pack.source_head = retarget.id;
+        pack.transfer_target_head = retarget.id;
+        let rewritten = TransferChangeStore::new(pack.changes.iter().cloned());
+        pack.trees = pack
+            .changes
+            .iter()
+            .map(|change| RepositoryTransferTreeIdentity {
+                change_id: change.id,
+                tree_hash: compute_resolved_tree_hash(
+                    &rewritten.resolve_tree_at(&change.id).unwrap(),
+                )
+                .unwrap(),
+            })
+            .collect();
+        pack.source_tree_hash =
+            compute_resolved_tree_hash(&rewritten.resolve_tree_at(&pack.source_head).unwrap())
+                .unwrap();
+        pack.transfer_id = compute_transfer_id(&pack).unwrap();
 
         let error = apply_repository_transfer_pack(
             &empty,
@@ -2940,13 +3066,20 @@ mod tests {
             &pack,
             &RepositoryTransferLimits::default(),
         )
-        .expect_err("native history over a gitlink cannot bootstrap");
+        .expect_err("a gitlink this transaction's own authority does not project cannot land");
         assert!(
             error
                 .to_string()
                 .contains("without verified Git external authority"),
-            "the refusal must name the gitlink authentication bound rather than any \
-             of the five this change is about: {error}"
+            "the refusal must name the gitlink authentication bound rather than a tree \
+             identity, a body or a limit the pack edit disturbed: {error}"
+        );
+
+        let after =
+            repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
+        assert!(
+            after.destination_head.is_none() && after.git_authority_hash.is_none(),
+            "a refused bootstrap leaves the replica exactly as unborn as it found it"
         );
     }
 
@@ -3034,10 +3167,9 @@ mod tests {
     /// ref would have hidden. So this drives the real `fetch_pull_pack` and
     /// asserts the pack it comes back with is a bootstrap.
     ///
-    /// It stops at the pack rather than admitting it, because this fixture's
-    /// tree carries a gitlink and admitting would meet FIR-2751 rather than
-    /// anything about pulling. What a bootstrap lands is proven by the
-    /// Git-origin-only test above.
+    /// It stops at the pack rather than admitting it, because what an admitted
+    /// bootstrap lands is a separate question with its own assertions, proven
+    /// immediately below on the pack this negotiation produces.
     #[test]
     fn an_unborn_replica_negotiating_a_pull_is_offered_a_bootstrap() {
         use crate::repository_transfer_negotiation::{fetch_pull_pack, PullNegotiation};
@@ -3066,6 +3198,67 @@ mod tests {
         assert_eq!(
             pack.expected_destination_git_authority_hash, None,
             "the pack must be bound to the unborn lease this replica actually has"
+        );
+    }
+
+    /// The admit step on the pull path, which nothing covered end to end.
+    ///
+    /// The negotiation above proved the offer and stopped, because until
+    /// kin-db 0.7.66 admitting this fixture's pack met the gitlink bound
+    /// instead of anything about pulling. It no longer does, so the sequence a
+    /// native clone would actually run, negotiate then admit, is exercised here
+    /// as one run rather than as two halves that were never joined.
+    ///
+    /// This is the same receive function the push direction proves, reached
+    /// from the other side, and the assertions name what landed rather than the
+    /// outcome alone.
+    #[test]
+    fn an_unborn_replica_admits_the_bootstrap_a_pull_offers_it() {
+        use crate::repository_transfer_negotiation::{fetch_pull_pack, PullNegotiation};
+
+        let fixture = fixture();
+        let empty_dir = tempfile::tempdir().unwrap();
+        let empty = manager(&empty_dir, &fixture.repository_id);
+        let remote = GitAdmittedPeer(&fixture.source);
+
+        let PullNegotiation::Pack(pack) = fetch_pull_pack(
+            &empty,
+            &remote,
+            &fixture.repository_id,
+            &fixture.main,
+            &fixture.main,
+        )
+        .expect("an unborn replica may negotiate a pull from a Git-admitted remote") else {
+            panic!("an unborn replica has everything to admit, so the remote must offer a pack");
+        };
+
+        let receipt = apply_repository_transfer_pack(
+            &empty,
+            &fixture.repository_id,
+            &fixture.main,
+            AuthorId::new("pull-admit-test"),
+            &pack,
+            &RepositoryTransferLimits::default(),
+        )
+        .expect("the replica admits the bootstrap it was offered");
+        assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+
+        let status =
+            repository_transfer_status(&empty, &fixture.repository_id, &fixture.main).unwrap();
+        assert_eq!(
+            status.destination_head,
+            Some(pack.source_head),
+            "the puller must stand on the head it admitted"
+        );
+        assert_eq!(
+            status.destination_tree_hash,
+            Some(pack.source_tree_hash),
+            "and on that head's exact tree"
+        );
+        assert!(
+            status.git_authority_hash.is_some(),
+            "a bootstrap installs the publisher's imported-Git authority, which is what \
+             makes the replica able to pull again"
         );
     }
 

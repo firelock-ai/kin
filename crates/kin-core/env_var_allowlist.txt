@@ -34,6 +34,22 @@ KIN_HEAP_PHASES
 # and no runtime behaviour keys on it. It exists because the synthetic fixtures
 # price a shape rather than a repository.
 KIN_HEAP_REPO
+# Size and target the FIR-2729 increment-2 scale measurement, which is #[ignore]d
+# and reports rather than asserting a ceiling. REPO names a real Git worktree to
+# clone and admit, and COMMITS and STEPS size the synthetic arm it falls back to.
+# Nothing runs without the test being asked for by name, no runtime behaviour
+# keys on any of them, and none is an operator-facing lever. Same shape as
+# KIN_HEAP_REPO and KIN_HEAP_PHASES above.
+KIN_INC2_SCALE_COMMITS
+KIN_INC2_SCALE_REPO
+KIN_INC2_SCALE_STEPS
+# Size and steer the FIR-2763 eager-sibling measurement, which is #[ignore]d and
+# reports rather than asserting a ceiling. BOUNDS names the bounds to sweep;
+# REVERSE flips the iteration order, which is the discriminator that separates a
+# one-time initialization from one expensive repository. Nothing runs without the
+# test being asked for by name and no runtime behaviour keys on either.
+KIN_SPINE_ATTRIBUTE_REVERSE
+KIN_SPINE_MEASURE_BOUNDS
 KIN_INIT_INTERRUPTED_TEST_BARRIER
 KIN_INIT_INTERRUPTED_TEST_SOURCE
 KIN_INIT_STAGING_SIGNAL_TEST_PARENT
@@ -52,3 +68,10 @@ KIN_UPDATE_TEST_WORKER_HOME
 KIN_UPDATE_TEST_WORKER_RECOVER
 KIN_UPDATE_TEST_WORKER_SPEC
 KIN_UPDATE_TEST_WORKER_STAGE
+# Name the repository the receiver-hop corpus arm parses, and the symbol it
+# reports incoming callers for. That arm is #[ignore]d and reports rather than
+# asserting a ceiling, so nothing runs without a path here, and it drives a test
+# harness rather than the product: no runtime behaviour keys on either, and
+# nothing an operator sets.
+KIN_RECEIVER_HOP_CORPUS
+KIN_RECEIVER_HOP_FOCAL

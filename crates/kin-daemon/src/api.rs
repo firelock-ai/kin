@@ -795,6 +795,16 @@ pub struct HealthResponse {
     /// admits nothing. These are the outcomes.
     #[serde(default)]
     pub reconcile: kin_cli::commands::resources::ReconcileHealth,
+    /// Consecutive `kin_graph_status` calls that could not sample this daemon
+    /// live, reset by the first that does. Past
+    /// [`GRAPH_STATUS_UNANSWERABLE_STREAK`] it drives `status: "attention"`.
+    ///
+    /// FIR-2136: a daemon can stop being able to answer a live question about
+    /// itself while every other term here stays healthy, and the surface that
+    /// exists to report ill health was the one that could not see it. Additive
+    /// and defaulted, so a client on either side of this change still parses.
+    #[serde(default)]
+    pub status_live_sample_failures: u64,
     pub build: BuildResponse,
 }
 
@@ -1024,6 +1034,21 @@ pub struct RepoHealthResponse {
     /// refresh then failed; absent means they match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub derived_views_stale: Option<String>,
+    /// Consecutive status calls that could not sample this repo's graph live.
+    /// FIR-2136; the same tally `/health` grades, carried here because this is
+    /// the repo-scoped surface the ticket names.
+    #[serde(default)]
+    pub status_live_sample_failures: u64,
+    /// Whether this daemon can still answer a live question about itself.
+    /// False is the wedged reading, and it is the one a supervisor acts on.
+    #[serde(default = "default_true")]
+    pub status_answerable: bool,
+}
+
+/// Serde default for a boolean whose healthy value is `true`, so a payload from
+/// a daemon that predates the field does not read as the unhealthy case.
+fn default_true() -> bool {
+    true
 }
 
 /// Repo entities search response.
@@ -2049,6 +2074,28 @@ const GRAPH_STATUS_WRITER_SETTLE_FLOOR: Duration = Duration::from_millis(50);
 /// so a backoff there would buy the writer no time and cost the caller 100 ms.
 const GRAPH_STATUS_ATTEMPT_BACKOFF: Duration = Duration::from_millis(25);
 
+/// How many consecutive status calls must fail to sample live before this
+/// daemon reports itself unable to answer a live question about itself.
+///
+/// FIR-2136. A judgement rather than a measurement, so it is written here where
+/// a reader can find and argue with it, the way the derived memory budget's
+/// ceiling is.
+///
+/// One failed CALL already means three revalidations were lost inside it,
+/// across 75 ms of backoff, so five consecutive means fifteen lost across five
+/// separate asks. A store mid-embed can lose a few: the embedding fence is held
+/// for the length of a batch and a caller polling through one legitimately gets
+/// replays. A store that has lost fifteen in a row is not merely busy. The
+/// wedge this exists to catch failed eleven consecutive calls over hours.
+///
+/// Duration was considered as the second axis and deliberately left out. It
+/// would separate a long embed from a wedge more sharply, but the streak is
+/// already driven by how often a caller asks rather than by a poll, since
+/// `kin_graph_status` is a user and agent tool and `/health` is what supervisors
+/// poll. Adding a clock here would buy specificity this signal does not need
+/// and cost every test a time source.
+pub(crate) const GRAPH_STATUS_UNANSWERABLE_STREAK: u64 = 5;
+
 /// The last settled `kin_graph_status` observation of one selected graph.
 ///
 /// The graph is held as a [`std::sync::Weak`] for two reasons: a temporal
@@ -2236,12 +2283,32 @@ async fn mcp_graph_status_with_stable_authority(
         state
             .graph_status_settled
             .record(scope, selected_graph, observation);
+        // Same event as the record above, deliberately at the same site: a
+        // reading that survived revalidation IS this daemon answering a live
+        // question about itself, so the streak clears exactly when that is true
+        // and never on a replay that merely looked like an answer.
+        state.graph_status_live_sample_settled();
         return kin_mcp::handlers::entities::handle_daemon_graph_status_observation(
             scope,
             observation,
         );
     }
 
+    // Reaching here is the failure, whichever of the two answers follows. Both
+    // the no-settled-reading error below and the stale replay after it are a
+    // call that could not sample this daemon live, so the streak advances once
+    // here rather than twice in two arms that could drift apart.
+    let streak = state.graph_status_live_sample_abandoned();
+    if streak == GRAPH_STATUS_UNANSWERABLE_STREAK {
+        // Once, on the crossing, rather than on every call past it. A daemon in
+        // this state is asked repeatedly and a line per call would bury the
+        // transition that matters.
+        tracing::warn!(
+            streak,
+            "this daemon has not completed a live status sample in {streak} consecutive \
+             calls; its repo health surface reports attention until one succeeds"
+        );
+    }
     let attempts = u32::try_from(GRAPH_STATUS_STABLE_READ_ATTEMPTS).unwrap_or(u32::MAX);
     let observed_authority_epoch = state.stable_graph_authority_epoch();
     let Some((observation, age)) = state.graph_status_settled.get(scope, selected_graph) else {
@@ -3098,6 +3165,16 @@ async fn health(
     let background_pass_stopped = state.background_work.any_stopped();
     let reconcile = state.background_work.reconcile_report(sampled_at);
     let reconcile_degraded = reconcile.degraded();
+    // FIR-2136. The term that was missing entirely: whether this daemon can
+    // still answer a live question about itself. Every other term here reports
+    // some subsystem's outcome, and a daemon can be healthy by all of them
+    // while the tool that exists to report ill health has stopped answering.
+    // The wedge that produced this failed eleven consecutive status calls over
+    // hours and reported `ok` throughout.
+    let status_live_sample_failures = state
+        .graph_status_live_sample_failures
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let status_unanswerable = !state.graph_status_is_answerable();
     // Surface graph-safety + derived-index health in the top-level status so an
     // operator or client polling /health sees a non-"ok" signal when the daemon
     // is withholding a suspected mass-deletion wipe OR the embedding worker has
@@ -3128,6 +3205,7 @@ async fn health(
         || coordination_event_persist_failures > 0
         || background_pass_stopped
         || reconcile_degraded
+        || status_unanswerable
     {
         "attention"
     } else {
@@ -3178,6 +3256,7 @@ async fn health(
         daemon_cpu_seconds: state.background_work.daemon_cpu_seconds(),
         background_passes,
         reconcile,
+        status_live_sample_failures,
         build: current_build_response(),
     }))
 }
@@ -9313,6 +9392,11 @@ async fn mcp_tools_call_inner(
             .arguments
             .get("include_type_edges")
             .and_then(serde_json::Value::as_bool);
+        let target = request
+            .arguments
+            .get("target")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.to_string());
         let req = kin_cli::commands::trace_data_flow::TraceDataFlowRequest {
             focal,
             depth,
@@ -9321,6 +9405,7 @@ async fn mcp_tools_call_inner(
             include_body,
             max_response_chars,
             include_type_edges,
+            target,
         };
         let repository_authority = match require_mcp_command_repository_authority(&state) {
             Ok(authority) => authority,
@@ -10815,6 +10900,10 @@ async fn repo_health(
         embed_persistence_unavailable: !state.can_persist_embed_progress_locally(),
         filesystem_reconcile_disabled: state.filesystem_reconcile_disabled(),
         derived_views_stale: state.derived_views_stale.read().await.clone(),
+        status_live_sample_failures: state
+            .graph_status_live_sample_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+        status_answerable: state.graph_status_is_answerable(),
     }))
 }
 
@@ -11789,11 +11878,39 @@ async fn spine_health(
         )
     })?;
 
+    // Two completeness readings, never one. `cross_repo_edges: 0` beside nothing
+    // else is a bare zero: it reads as "this install has no cross-repo edges"
+    // whether the authority was built and found none or was never built at all.
+    //
+    // They answer different questions and both are needed to tell those apart.
+    // `authority_complete` is the spine's own edge authority, which goes false
+    // for a refresh in flight as readily as for an authority that is short.
+    // `startup_authority_complete` is false only when the startup pass could not
+    // bind a repository the registry named, which is the condition that leaves
+    // cross-repo answers empty for the rest of the process's life. Collapsing
+    // them into one boolean would make a transient refresh indistinguishable
+    // from a permanently short authority.
+    // A THIRD reading, for the same reason there are two. A capture stopped at
+    // its configured bound is complete by both fields above: nothing failed, so
+    // the spine's edge authority is sound, and every registered sibling pinned,
+    // so the startup pass is complete. Yet siblings were never consulted. Without
+    // this the route reports a bounded answer as a healthy one, which is the bare
+    // zero this endpoint exists to prevent, arriving from a different direction.
+    //
+    // `bounded` is deliberately not folded into either boolean above. A cap is
+    // expected and its captures are sound; an incomplete authority is neither,
+    // and a reader that cannot tell them apart cannot act on either.
+    let capture = state.sibling_capture_report();
     Ok(Json(json!({
         "status": "ok",
         "repos": spine.repo_count(),
         "entities": spine.entity_count(),
         "cross_repo_edges": spine.edge_count(),
+        "authority_complete": spine.authority_complete(),
+        "startup_authority_complete": state.startup_authority_complete(),
+        "sibling_capture_bounded": capture.map(|report| report.bounded).unwrap_or(false),
+        "siblings_captured": capture.map(|report| report.captured).unwrap_or(0),
+        "siblings_registered": capture.map(|report| report.registered).unwrap_or(0),
     })))
 }
 
@@ -16875,6 +16992,972 @@ mod tests {
                 .is_some_and(|authority| !authority.ref_state.refs.is_empty()),
             "the hosted replica must publish the ref the bootstrap established"
         );
+    }
+
+    // ── FIR-2729 / FIR-2746: the payload-bearing transfer harness ──────────
+    //
+    // Everything above proves the transfer LOOP. `a_hosted_store_admits_a_
+    // native_transfer_and_then_serves_the_head_it_admitted` builds its pack
+    // from `seed_replica_change`, whose changes carry empty `tree_deltas` and
+    // empty `entity_deltas`, so it says nothing about whether a transfer can
+    // carry content. Every hosted repository IS content, so the loop passing
+    // is not evidence the republish can work.
+    //
+    // This harness carries a payload. It exists before the route that would
+    // let one through, so today its job is to pin the refusals precisely
+    // enough that the day a route lands, the right assertion moves and the
+    // wrong one does not.
+
+    /// One megabyte per blob: comfortably under `MAX_TRANSFER_BODY_BYTES`
+    /// (8 MiB, the PER-BODY cap), so a fixture built from these can only ever
+    /// cross the decoded-CLOSURE cap and never the per-body one. Isolating the
+    /// two matters: a fixture that tripped the per-body cap would refuse with a
+    /// different message for a different reason and read exactly like the cap
+    /// this harness is about.
+    #[cfg(unix)]
+    const PAYLOAD_BLOB_BYTES: usize = 1024 * 1024;
+
+    /// How many of those blobs the decoded-closure ceiling holds.
+    ///
+    /// Derived from the product constant rather than written down, and the
+    /// history is the reason. These arms were originally sized to MIRROR real
+    /// repositories against a 16 MiB ceiling: the over arm carried kin's own
+    /// tip tree, which FIR-2746 measured at 27.77 MiB decoded and which did not
+    /// fit, and the under arm carried kin-db at 4.30 MiB, which did. Raising the
+    /// ceiling to 64 MiB made the first of those claims false, because kin's tip
+    /// now fits comfortably, and the straddle self-check below said so by
+    /// failing on every speculative merge. That is the harness working rather
+    /// than breaking: the bound moved and the pin noticed.
+    ///
+    /// The arms cannot mirror a repository any more, because the ceiling now
+    /// sits above every hosted repository's tip closure, which is exactly what
+    /// raising it bought. So they mirror the BOUND instead and follow it, and a
+    /// future change to the ceiling moves them rather than stranding them.
+    #[cfg(unix)]
+    const CAP_BLOBS: usize = (kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES
+        / PAYLOAD_BLOB_BYTES as u64) as usize;
+
+    /// One blob past the ceiling, which is the smallest fixture that can exceed
+    /// it. Exceeding a decoded-byte cap means shipping that many bytes, so the
+    /// cost of this arm is the ceiling itself and no construction avoids it;
+    /// the minimum overshoot is what keeps it off the transport's own limit.
+    #[cfg(unix)]
+    const PAYLOAD_BLOBS_OVER_CAP: usize = CAP_BLOBS + 1;
+
+    /// Comfortably under the ceiling and deliberately cheap, since this arm has
+    /// to publish rather than be refused. Still derived, so a LOWERED ceiling
+    /// cannot leave it stranded above the bound it is supposed to sit under.
+    /// Same generator, same blob size, same commit shape as the arm above; the
+    /// only variable between them is how many blobs there are, which is what
+    /// makes the pair a comparison rather than two separate observations.
+    #[cfg(unix)]
+    const PAYLOAD_BLOBS_UNDER_CAP: usize = if CAP_BLOBS / 2 < 4 { CAP_BLOBS / 2 } else { 4 };
+
+    /// Deterministic, distinct-per-blob, and not compressible into nothing.
+    ///
+    /// All three properties are load-bearing. Deterministic because a
+    /// reassembly assertion compares content hashes against the source tree and
+    /// a fixture that differs run to run cannot be compared to anything.
+    /// Distinct because `validate_pack` deduplicates bodies by hash
+    /// (`repository_transfer.rs:1222`), so a fixture of identical blobs would
+    /// collapse to ONE body and measure deduplication rather than size, while
+    /// still looking like a 24 MiB fixture on disk. Incompressible because the
+    /// cap is on DECODED bytes and a fixture of zeroes would prove nothing
+    /// about what a real tree costs.
+    #[cfg(unix)]
+    fn payload_blob_bytes(seed: u64, len: usize) -> Vec<u8> {
+        // SplitMix64. Chosen because it needs no dependency and is exactly
+        // reproducible from the seed, which is what makes the digests below a
+        // fixture property rather than a run property.
+        let mut out = Vec::with_capacity(len + 8);
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        while out.len() < len {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.extend_from_slice(&z.to_le_bytes());
+        }
+        out.truncate(len);
+        out
+    }
+
+    /// A Git-admitted store carrying real content, adopting a hosted identity,
+    /// built the way the hosted republish runbook stages its five stores:
+    /// `git init`, one commit, `kin init`.
+    #[cfg(unix)]
+    struct PayloadFixture {
+        layout: kin_core::KinLayout,
+        working: PathBuf,
+        /// Repository-relative path to the SHA-256 of the bytes written there.
+        /// This is the source of truth a reassembly assertion compares against,
+        /// and it is a content hash rather than a count on purpose: a count
+        /// survives every corruption that matters.
+        source_digests: std::collections::BTreeMap<String, String>,
+        /// What the fixture's payload actually costs, summed from the bytes
+        /// this function wrote rather than from anything the store reports.
+        payload_bytes: u64,
+    }
+
+    #[cfg(unix)]
+    fn payload_fixture(label: &str, blobs: usize, hosted: &RepositoryId) -> PayloadFixture {
+        payload_fixture_inner(label, blobs, Some(hosted))
+    }
+
+    /// The same fixture with the identity minted rather than adopted, which is
+    /// the one variable the identity control changes.
+    #[cfg(unix)]
+    fn payload_fixture_minting(label: &str, blobs: usize) -> PayloadFixture {
+        payload_fixture_inner(label, blobs, None)
+    }
+
+    #[cfg(unix)]
+    fn payload_fixture_inner(
+        label: &str,
+        blobs: usize,
+        hosted: Option<&RepositoryId>,
+    ) -> PayloadFixture {
+        install_test_registry_override();
+        let working =
+            std::env::temp_dir().join(format!("kin-daemon-payload-{label}-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(working.join("payload")).unwrap();
+        run_test_git(&working, ["init", "--initial-branch=main"]);
+        run_test_git(&working, ["config", "user.email", "kin@example.invalid"]);
+        run_test_git(&working, ["config", "user.name", "Kin Payload Harness"]);
+
+        let mut source_digests = std::collections::BTreeMap::new();
+        let mut payload_bytes = 0_u64;
+        for index in 0..blobs {
+            let path = format!("payload/blob-{index:04}.bin");
+            let bytes = payload_blob_bytes(index as u64 + 1, PAYLOAD_BLOB_BYTES);
+            std::fs::write(working.join(&path), &bytes).unwrap();
+            let digest = hex::encode(Sha256::digest(&bytes));
+            payload_bytes += bytes.len() as u64;
+            source_digests.insert(path, digest);
+        }
+        // The generator is only distinct if it is distinct. Asserting it here
+        // rather than trusting the seed is what stops a later edit to
+        // `payload_blob_bytes` from silently turning this fixture into one
+        // blob deduplicated `blobs` times.
+        assert_eq!(
+            source_digests
+                .values()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            blobs,
+            "every payload blob must be distinct, or the pack deduplicates them \
+             and this fixture measures deduplication rather than size"
+        );
+
+        run_test_git(&working, ["add", "--all"]);
+        run_test_git(
+            &working,
+            ["commit", "-s", "-m", "one commit carrying a real payload"],
+        );
+
+        let init = match hosted {
+            Some(hosted) => {
+                let init = kin_core::init_from_git_adopting(&working, hosted)
+                    .expect("a Git-admitted store may adopt a hosted repository identity");
+                assert_eq!(
+                    kin_core::manifest::KinManifest::load(&init.layout.manifest_path())
+                        .unwrap()
+                        .repo_id,
+                    hosted.as_str(),
+                    "the fixture must carry the hosted identity, or the push it drives \
+                     measures identity rather than payload"
+                );
+                init
+            }
+            None => kin_core::init_from_git(&working)
+                .expect("a Git-admitted store may mint its own identity"),
+        };
+
+        PayloadFixture {
+            layout: init.layout,
+            working,
+            source_digests,
+            payload_bytes,
+        }
+    }
+
+    /// The fixture pair is a comparison, so its two arms have to differ in
+    /// exactly one property and that property has to be the one under test.
+    ///
+    /// This asserts the arithmetic before any push depends on it. Without it
+    /// the pair could drift into measuring something else entirely and both
+    /// arms would still refuse, still for a reason, and still look right.
+    #[cfg(unix)]
+    #[test]
+    fn the_payload_fixtures_straddle_the_transfer_cap_and_nothing_else() {
+        let cap = kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES;
+        let per_body = kin_remote::repository_transfer::MAX_TRANSFER_BODY_BYTES;
+        let max_bodies = kin_remote::repository_transfer::MAX_TRANSFER_BODIES;
+
+        let over = (PAYLOAD_BLOBS_OVER_CAP * PAYLOAD_BLOB_BYTES) as u64;
+        let under = (PAYLOAD_BLOBS_UNDER_CAP * PAYLOAD_BLOB_BYTES) as u64;
+
+        assert!(
+            over > cap,
+            "the over-cap arm must exceed the decoded closure cap: {over} vs {cap}"
+        );
+        assert!(
+            under < cap,
+            "the under-cap arm must fit under the decoded closure cap: {under} vs {cap}"
+        );
+        // The isolation half. An arm that crossed one of the OTHER caps would
+        // be refused for a reason this harness is not about, and its refusal
+        // would read exactly like the one it is about.
+        assert!(
+            (PAYLOAD_BLOB_BYTES as u64) < per_body,
+            "no single blob may cross the per-body cap: {PAYLOAD_BLOB_BYTES} vs {per_body}"
+        );
+        assert!(
+            PAYLOAD_BLOBS_OVER_CAP < max_bodies,
+            "the over-cap arm must stay clear of the body-count cap: \
+             {PAYLOAD_BLOBS_OVER_CAP} vs {max_bodies}"
+        );
+        // The third isolation check, and the one nothing asserted until the
+        // ceiling moved. Bodies travel base64, so an over-cap arm can be large
+        // enough that the TRANSPORT refuses it with a 413 before the decoded
+        // closure check ever runs, and that refusal reads like a refusal this
+        // harness is about. It fits today with room to spare, and it is one
+        // legal edit from not fitting: raising PAYLOAD_BLOB_BYTES to 8 MiB is
+        // allowed by the per-body cap above and would put the over arm's wire
+        // size past this limit while every other assertion here still passed.
+        // Computed the way `http_body_limit_for` computes the limit it is
+        // compared against, so the two cannot drift into disagreeing about what
+        // base64 expansion costs.
+        let wire = over.div_ceil(3) * 4;
+        let http_limit =
+            kin_remote::repository_transfer_http::REPOSITORY_TRANSFER_HTTP_BODY_LIMIT as u64;
+        assert!(
+            wire < http_limit,
+            "the over-cap arm must be refused by the decoded-closure cap, not by the \
+             transport: {wire} base64 bytes on the wire against a {http_limit} byte limit"
+        );
+        // A const block, because both sides are constants and clippy is right
+        // that a runtime assertion over them proves nothing at runtime. Moved
+        // rather than allowed: this way the two arms differing is a compile
+        // error the moment somebody edits them to agree.
+        const {
+            assert!(
+                PAYLOAD_BLOBS_UNDER_CAP < PAYLOAD_BLOBS_OVER_CAP,
+                "the two arms must differ in blob count and nothing else"
+            );
+        }
+    }
+
+    /// The source's own bodies for a fixture, keyed by Kin content address, with
+    /// each one byte-verified against the bytes the fixture wrote.
+    ///
+    /// This is the half that makes the destination check a byte claim rather
+    /// than a name comparison. A Kin body hash IS the content, so a destination
+    /// committing to hash H has committed to those bytes, but only if something
+    /// independent has established what H's bytes are. That is what the SHA-256
+    /// here does, and it deliberately uses a different hash function from the
+    /// one the address is, so the two sides cannot agree by construction.
+    #[cfg(unix)]
+    fn source_payload_bodies(
+        authority: &ActiveApiRepositoryAuthority,
+        expected: &std::collections::BTreeMap<String, String>,
+    ) -> std::collections::BTreeMap<String, (kin_model::Hash256, u64)> {
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .expect("the source replica projects a workspace")
+            .clone();
+
+        let mut bodies = std::collections::BTreeMap::new();
+        for (path, want) in expected {
+            let artifact = workspace
+                .tree
+                .artifacts_by_path()
+                .find(|artifact| artifact.path.as_bytes() == path.as_bytes())
+                .unwrap_or_else(|| panic!("the source projects no artifact at {path}"));
+            let digest = artifact
+                .entry
+                .blob_identity()
+                .unwrap_or_else(|| panic!("the artifact at {path} carries no blob identity"));
+            let bytes = authority
+                .manager
+                .load_source_blob(digest)
+                .unwrap_or_else(|error| panic!("reading {path} failed: {error}"))
+                .unwrap_or_else(|| panic!("the source holds no body for {path}"));
+            assert_eq!(
+                &hex::encode(Sha256::digest(&bytes)),
+                want,
+                "the source's bytes for {path} are not the bytes the fixture wrote, so \
+                 its content address cannot stand in for them"
+            );
+            bodies.insert(path.clone(), (digest, bytes.len() as u64));
+        }
+        assert_eq!(
+            bodies.len(),
+            expected.len(),
+            "every expected path must have produced a body"
+        );
+        bodies
+    }
+
+    /// Assert a hosted replica committed to the payload, read from its OWN
+    /// authority snapshot rather than from the sender's receipt.
+    ///
+    /// It cannot use the workspace-walking comparator: a bootstrapped hosted
+    /// replica commits with `workspace_mutation: null`, so it holds authority
+    /// without projecting a tree, and `ActiveApiRepositoryAuthority::open`
+    /// refuses it by name with "local daemon is missing its startup workspace
+    /// binding". That refusal is the replica behaving correctly, and reading it
+    /// as a failure would have been the easy mistake here.
+    ///
+    /// So the destination is read through `repository_authority_snapshot`, which
+    /// is the reader that answers for a daemon serving a repository through a
+    /// backend rather than a startup binding.
+    ///
+    /// What this proves: the destination's committed authority names every one
+    /// of the source's payload bodies, by content address and with the same
+    /// declared length. Since `source_payload_bodies` has independently verified
+    /// what each of those addresses' bytes are, against a different hash
+    /// function, naming the address is a claim about the bytes.
+    ///
+    /// What it does not prove: that the destination can SERVE those bytes on
+    /// demand. That is a body read against a hosted backend and it is not
+    /// reached here. Said plainly rather than left for a reader to assume.
+    #[cfg(unix)]
+    fn assert_destination_committed_payload(
+        snapshot: &kin_db::GraphSnapshot,
+        source_bodies: &std::collections::BTreeMap<String, (kin_model::Hash256, u64)>,
+    ) -> usize {
+        assert!(
+            !source_bodies.is_empty(),
+            "an empty expectation makes every assertion below vacuously true"
+        );
+        let authority = snapshot
+            .repository_authority
+            .as_ref()
+            .expect("admitting a bootstrap publishes an envelope");
+        let held: std::collections::BTreeMap<kin_model::Hash256, u64> = authority
+            .external_objects
+            .iter()
+            .map(|record| (record.body_hash, record.body_len))
+            .collect();
+        assert!(
+            !held.is_empty(),
+            "the destination's authority names no external object, so this verified \
+             nothing; a bootstrap that admitted no Git objects is what this would hide"
+        );
+
+        for (path, (digest, len)) in source_bodies {
+            let found = held.get(digest).unwrap_or_else(|| {
+                panic!(
+                    "the destination's authority does not name the body for {path}; it \
+                     names {} objects",
+                    held.len()
+                )
+            });
+            assert_eq!(
+                found, len,
+                "the destination declares a different length for {path}'s body"
+            );
+        }
+        source_bodies.len()
+    }
+
+    /// The payload pin, now that the bound in front of it has moved.
+    ///
+    /// This test was written before kin#1156 and asserted the 409 both arms then
+    /// got. It was built to go red the day Git-authority bootstrap landed,
+    /// keyed on the STATUS rather than on a sentence, and that is exactly how it
+    /// failed: `left: 422, right: 409` on the over-cap arm, with the message
+    /// naming the byte budget. The forward-looking half worked, so this is a
+    /// rewrite of what it pins rather than a relaxation of it.
+    ///
+    /// What it pins now is the DIVERGENCE, which is the whole content of the
+    /// change. The two arms differ in one variable, payload size, and now get
+    /// two different answers:
+    ///
+    /// The under-cap arm PUBLISHES. Not "does not fail": the receipt is read,
+    /// and it has to show a bootstrap rather than a fast-forward onto something
+    /// that already existed. `git_authority_delta.old` is null and `.new` is
+    /// present, which is authority being established on a replica that had
+    /// none, and the roots move from generation 0 to 1. Those are the two facts
+    /// that make it the thing kin#1156 built rather than an ordinary push.
+    ///
+    /// The over-cap arm is REFUSED BY NAME, 422, naming the negotiated byte
+    /// limit and the indivisible step. A bootstrap ships every Git object in one
+    /// pack because a pack is self-validating, so it cannot be segmented, and a
+    /// repository past the budget is refused rather than staged.
+    ///
+    /// Both halves are needed. An assertion that the under arm publishes would
+    /// pass on a build that had also stopped refusing the over arm, and an
+    /// assertion that the over arm refuses would pass on a build that refused
+    /// everything, which is what the 409 did yesterday.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_payload_bearing_push_bootstraps_under_the_cap_and_is_refused_over_it() {
+        for (label, blobs, fits) in [
+            ("over", PAYLOAD_BLOBS_OVER_CAP, false),
+            ("under", PAYLOAD_BLOBS_UNDER_CAP, true),
+        ] {
+            let hosted_id = hosted_repository_id();
+            let hosted_repository = RepositoryId::new(hosted_id.clone()).unwrap();
+            let (hosted_state, _hosted_working, _hosted_storage) = hosted_peer_state(&hosted_id);
+            let hosted_url = serve_replica(Arc::clone(&hosted_state)).await;
+
+            let fixture = payload_fixture(label, blobs, &hosted_repository);
+            let cap = kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES;
+            assert_eq!(
+                fixture.payload_bytes > cap,
+                !fits,
+                "the {label} arm must sit on the side of the cap its name claims: \
+                 {} bytes against {cap}",
+                fixture.payload_bytes
+            );
+
+            let source_state =
+                Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
+
+            // The destination's BEFORE, which is the half that makes the after a
+            // statement about the destination. Falsification caught the
+            // after-only version: pointed at the source it still passed, because
+            // a Git-admitted store names its own bodies from the moment it is
+            // created, so only an empty replica can name none and then name all.
+            //
+            // ONE binding for both readings, deliberately, and declared after
+            // the source so that swapping its target is a compiling mutation
+            // rather than an ordering error. Falsification caught that too: with
+            // only the after-reading retargeted, before came from an empty
+            // replica and after from a full one, and neither described a single
+            // replica. Two correct readings that jointly guarantee nothing,
+            // because the property lives in their agreement. The join, not the
+            // endpoints.
+            let observed_replica = Arc::clone(&hosted_state);
+            let before = repository_authority_snapshot(&observed_replica, &hosted_id)
+                .await
+                .expect("an empty hosted replica is readable before anything is pushed");
+            let named_before = before
+                .repository_authority
+                .as_ref()
+                .map(|authority| authority.external_objects.len())
+                .unwrap_or(0);
+            assert_eq!(
+                named_before, 0,
+                "the hosted replica must name no external object before the push, or the \
+                 after-reading proves nothing about what crossed"
+            );
+
+            let request = kin_cli::commands::transfer::CommandTransferRequest {
+                remote_base_url: hosted_url,
+                remote_token: None,
+                repository_id: Some(hosted_id.clone()),
+                source_ref: None,
+                destination_ref: None,
+            };
+            let (status, body) =
+                transfer_command(Arc::clone(&source_state), "push", &request).await;
+            let message = String::from_utf8_lossy(&body).to_string();
+
+            if fits {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "the {label} arm must publish into the empty hosted replica: {message}"
+                );
+                // Read the receipt rather than the status. A 200 says the route
+                // answered; these say it BOOTSTRAPPED, which is the property
+                // kin#1156 added and the only one that distinguishes this from
+                // a push onto a replica that already had authority.
+                let receipt: serde_json::Value = serde_json::from_str(&message)
+                    .expect("a successful push answers with its receipt");
+                let delta = receipt
+                    .pointer("/outcome/receipts/0/authority_receipt/operation/git_authority_delta")
+                    .unwrap_or_else(|| {
+                        panic!("the receipt must carry a git authority delta: {message}")
+                    });
+                assert!(
+                    delta.get("old").is_some_and(|old| old.is_null()),
+                    "the destination must have held NO imported-Git authority before this \
+                     push, which is what makes it a bootstrap: {delta}"
+                );
+                assert!(
+                    delta.get("new").is_some_and(|new| !new.is_null()),
+                    "the push must have established imported-Git authority: {delta}"
+                );
+                let before = receipt
+                    .pointer("/outcome/receipts/0/authority_receipt/roots_before/generation");
+                let after =
+                    receipt.pointer("/outcome/receipts/0/authority_receipt/roots_after/generation");
+                assert_eq!(
+                    (
+                        before.and_then(|v| v.as_u64()),
+                        after.and_then(|v| v.as_u64())
+                    ),
+                    (Some(0), Some(1)),
+                    "an empty replica is generation zero and a bootstrap moves it to one: \
+                     {message}"
+                );
+
+                // The assertion this whole harness was built to be ready for,
+                // and the first day it can run. Until kin#1156 no route put a
+                // payload on a hosted replica, so the comparator ran against the
+                // source and proved only that it could answer. It now runs
+                // against the DESTINATION: every byte sequence the fixture wrote
+                // must be one the hosted replica can serve, by content hash
+                // against the bytes written, never by counting bodies.
+                let source_authority =
+                    ActiveApiRepositoryAuthority::open_layout_for_test(&fixture.layout).unwrap();
+                let source_bodies =
+                    source_payload_bodies(&source_authority, &fixture.source_digests);
+                drop(source_authority);
+                let snapshot = repository_authority_snapshot(&observed_replica, &hosted_id)
+                    .await
+                    .expect("the replica that admitted a bootstrap must be readable after it");
+                let named_after = snapshot
+                    .repository_authority
+                    .as_ref()
+                    .map(|authority| authority.external_objects.len())
+                    .unwrap_or(0);
+                assert!(
+                    named_after > named_before,
+                    "the destination must name MORE external objects after the push than \
+                     before it; naming the same set is what a snapshot of the SOURCE would \
+                     show, and that is the reading this pair exists to exclude"
+                );
+                let verified = assert_destination_committed_payload(&snapshot, &source_bodies);
+                assert_eq!(
+                    verified, blobs,
+                    "every blob the {label} arm wrote must be verified on the destination"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "the {label} arm must be refused on the byte budget, which is Invalid \
+                     rather than Conflict: {message}"
+                );
+                assert!(
+                    message.contains("over negotiated limit"),
+                    "the {label} arm must name the negotiated byte limit: {message}"
+                );
+                assert!(
+                    message.contains("cannot be split across continuation packs"),
+                    "a bootstrap ships every object in one pack, so the refusal must be the \
+                     indivisible-step one rather than a segmentation retry: {message}"
+                );
+                // The bound that MOVED. If this ever comes back, the bootstrap
+                // has regressed and the arm above would still be green, because
+                // both bounds refuse.
+                assert!(
+                    !message.contains("imported-Git authority"),
+                    "the Git-authority bound is closed for the push direction; seeing it \
+                     again is a regression rather than this test being out of date: {message}"
+                );
+            }
+            std::fs::remove_dir_all(&fixture.working).ok();
+        }
+    }
+
+    /// The control that makes the pin above evidence rather than a restatement
+    /// of "pushes fail".
+    ///
+    /// A harness that observes a refusal proves nothing unless it can be shown
+    /// to distinguish refusals. This drives the same payload through the same
+    /// route with ONE property changed, the identity minted rather than
+    /// adopted, and requires a DIFFERENT answer: the identity refusal, named
+    /// with the minted id, and explicitly not the authority bound.
+    ///
+    /// If this and the pin above ever agreed, the pin would be measuring the
+    /// route's willingness to refuse anything, and both would stay green
+    /// through a fix for either bound.
+    ///
+    /// It uses the under-cap arm deliberately. A payload that could not fit
+    /// even if it were admitted would leave the refusal over-determined, and
+    /// the point here is that identity alone decides it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_payload_bearing_push_under_a_minted_identity_is_refused_on_identity_instead() {
+        let hosted_id = hosted_repository_id();
+        let (hosted_state, _hosted_working, _hosted_storage) = hosted_peer_state(&hosted_id);
+        let hosted_url = serve_replica(Arc::clone(&hosted_state)).await;
+
+        // Adopt nothing: mint, the way `kin init` does for an operator who
+        // never names a hosted repository.
+        let fixture = payload_fixture_minting("minted", PAYLOAD_BLOBS_UNDER_CAP);
+        let minted = kin_core::manifest::KinManifest::load(&fixture.layout.manifest_path())
+            .unwrap()
+            .repo_id;
+        assert_ne!(
+            minted, hosted_id,
+            "the control only means something if the two identities differ"
+        );
+
+        let source_state =
+            Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
+        let request = kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: hosted_url,
+            remote_token: None,
+            // Left unset so the push sends what the store actually holds.
+            // Naming the hosted id here is refused locally before a byte
+            // crosses the wire, which measures the local daemon's repository
+            // scope rather than the remote's.
+            repository_id: None,
+            source_ref: None,
+            destination_ref: None,
+        };
+        let (status, body) = transfer_command(Arc::clone(&source_state), "push", &request).await;
+        let message = String::from_utf8_lossy(&body).to_string();
+
+        assert_ne!(
+            status,
+            StatusCode::OK,
+            "a minted identity must never reach a hosted repository that holds another: {message}"
+        );
+        assert!(
+            message.contains(minted.as_str()),
+            "the refusal must name the identity that was asked for: {message}"
+        );
+        assert!(
+            !message.contains("imported-Git authority"),
+            "this arm must be stopped by identity, not by the authority bound; if it \
+             reports the authority bound then the pin beside it is measuring \
+             refusal-in-general rather than that bound: {message}"
+        );
+        std::fs::remove_dir_all(&fixture.working).ok();
+    }
+
+    /// Byte-verify a replica's admitted content against the bytes a fixture
+    /// wrote, by content hash and never by count.
+    ///
+    /// Counts survive every corruption that matters. A replica holding the
+    /// right number of artifacts with the wrong bytes in them, or the right
+    /// bytes under the wrong paths, passes any count and fails this.
+    ///
+    /// The comparison deliberately shares no machinery with the store. The
+    /// expected side is a SHA-256 taken of the bytes at the moment they were
+    /// written to the working tree; the actual side is a SHA-256 taken of what
+    /// `load_source_blob` hands back. Hashing both sides with Kin's own digest
+    /// function would compare the store to itself and hold under any error that
+    /// affected the digest and the content together.
+    ///
+    /// It is route-agnostic on purpose. It takes an authority and a digest map,
+    /// so the day a route lands the payload on a hosted replica this is pointed
+    /// at THAT authority with the same map and asserts the same thing. Until
+    /// then it runs against the source replica, which is what proves the
+    /// comparator can answer at all rather than being written and never run.
+    ///
+    /// Returns how many paths it verified, so a caller can refuse a run that
+    /// verified nothing.
+    #[cfg(unix)]
+    fn assert_payload_reassembles(
+        authority: &ActiveApiRepositoryAuthority,
+        expected: &std::collections::BTreeMap<String, String>,
+    ) -> usize {
+        assert!(
+            !expected.is_empty(),
+            "an empty expectation makes every assertion below vacuously true"
+        );
+        let lease = authority.manager.read_authority();
+        let workspace = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == authority.workspace_id)
+            .expect("the replica projects a workspace")
+            .clone();
+
+        let mut verified = 0_usize;
+        for (path, want) in expected {
+            let artifact = workspace
+                .tree
+                .artifacts_by_path()
+                .find(|artifact| artifact.path.as_bytes() == path.as_bytes())
+                .unwrap_or_else(|| {
+                    panic!("the replica projects no artifact at {path}, so its bytes cannot be compared")
+                });
+            let digest = artifact.entry.blob_identity().unwrap_or_else(|| {
+                panic!("the artifact at {path} carries no blob identity, so it has no bytes")
+            });
+            let bytes = authority
+                .manager
+                .load_source_blob(digest)
+                .unwrap_or_else(|error| panic!("reading {path} failed: {error}"))
+                .unwrap_or_else(|| panic!("the replica holds no body for {path}"));
+            let got = hex::encode(Sha256::digest(&bytes));
+            assert_eq!(
+                &got, want,
+                "the bytes the replica serves for {path} are not the bytes the fixture wrote"
+            );
+            verified += 1;
+        }
+        // The half that stops a silent pass. A loop that found nothing to
+        // compare exits exactly like one that compared everything.
+        assert_eq!(
+            verified,
+            expected.len(),
+            "every expected path must have been verified"
+        );
+        verified
+    }
+
+    /// The reassembly comparator, exercised today against the replica that
+    /// wrote the payload.
+    ///
+    /// The destination half cannot be written yet, because no route puts this
+    /// payload on a hosted replica. What CAN be established now is that the
+    /// comparator answers correctly at all: that the digest map is a true
+    /// record of the bytes, that `load_source_blob` reaches them by path, and
+    /// that a mismatch is detected rather than skipped. A comparator first run
+    /// on the day a route lands is a comparator whose first result nobody can
+    /// distinguish from a bug in the comparator.
+    ///
+    /// The negative half runs here too, in-process: a deliberately wrong
+    /// expectation must panic. Without it this test would pass on a comparator
+    /// that verified nothing.
+    #[cfg(unix)]
+    #[test]
+    fn the_reassembly_comparator_verifies_bytes_and_refuses_a_mismatch() {
+        let hosted_id = hosted_repository_id();
+        let hosted_repository = RepositoryId::new(hosted_id).unwrap();
+        let fixture = payload_fixture("reassembly", PAYLOAD_BLOBS_UNDER_CAP, &hosted_repository);
+        let authority =
+            ActiveApiRepositoryAuthority::open_layout_for_test(&fixture.layout).unwrap();
+
+        let verified = assert_payload_reassembles(&authority, &fixture.source_digests);
+        assert_eq!(
+            verified, PAYLOAD_BLOBS_UNDER_CAP,
+            "the comparator must have verified every blob the fixture wrote"
+        );
+
+        // A comparator that cannot fail is not a comparator. One byte of the
+        // expectation is flipped and the same call must panic, which is the
+        // control that the equality above is load-bearing.
+        let mut corrupted = fixture.source_digests.clone();
+        let (path, digest) = corrupted
+            .iter()
+            .next()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .unwrap();
+        let flipped = format!("{}0{}", &digest[..0], &digest[1..]);
+        assert_ne!(flipped, digest, "the corruption must change the digest");
+        corrupted.insert(path.clone(), flipped);
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_payload_reassembles(&authority, &corrupted)
+        }));
+        assert!(
+            refused.is_err(),
+            "a wrong expected digest for {path} must be refused, or every future \
+             byte-verification is vacuous"
+        );
+
+        // A path the fixture never wrote must be refused too, and this arm is
+        // here because falsification said so: without it, the missing-path
+        // guard was never reached, so a mutation removing it changed nothing
+        // and the guard could not be shown to do anything at all.
+        let mut absent = fixture.source_digests.clone();
+        absent.insert(
+            "payload/never-written.bin".to_string(),
+            hex::encode(Sha256::digest(b"a body no replica holds")),
+        );
+        let refused_absent = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            assert_payload_reassembles(&authority, &absent)
+        }));
+        assert!(
+            refused_absent.is_err(),
+            "an expected path the replica does not project must be refused, or a \
+             reassembly that dropped a file entirely would verify clean"
+        );
+
+        drop(authority);
+        std::fs::remove_dir_all(&fixture.working).ok();
+    }
+
+    /// What the transfer will say about these fixtures once the authority bound
+    /// moves, MEASURED rather than reasoned about.
+    ///
+    /// The push pin beside this cannot reach the size bound: the authority
+    /// comparison runs first and answers 409 for both arms. So the size bound's
+    /// behaviour would be an assertion nobody had ever run, written against a
+    /// route that does not exist, and the first time anyone saw its result
+    /// would be the day it mattered. That is the shape of an assertion that
+    /// turns out to have been wrong all along.
+    ///
+    /// This runs it today by removing the one thing that stops it. The
+    /// expectation is built from the SOURCE store's own transfer status, so its
+    /// `git_authority_hash` is the source's own and `TransferSourceContext::read`
+    /// agrees with itself, and the ref state is set unborn. Everything
+    /// downstream of the authority comparison then runs for real against a real
+    /// payload.
+    ///
+    /// **This is deliberately NOT an empty hosted replica, and the difference is
+    /// worth stating because it would be easy to read it as one.** An empty
+    /// replica's `repository_transfer_status` reports five things together
+    /// (`repository_transfer.rs:387`): `destination_target: None`,
+    /// `destination_head: None`, `default_ref: None`, `git_authority_hash: None`
+    /// and `roots.generation == 0`. This probe sets the first two and keeps the
+    /// last three from the source, because the authority hash agreeing is the
+    /// whole mechanism by which the bound in front of the size bound is removed.
+    /// So what runs here is an authority-agreeing replica with an unborn ref,
+    /// which is the smallest world in which the size bound answers, and not a
+    /// simulation of the hosted destination.
+    ///
+    /// The precondition is asserted rather than described, so the day the
+    /// bootstrap keys its compare-and-swap on all five, this test says which
+    /// ones it was holding fixed instead of quietly drifting.
+    ///
+    /// What it establishes, and none of it was measured before:
+    ///
+    /// The under-cap arm assembles a pack. Its body closure covers every blob
+    /// the fixture wrote, verified by content hash against the source digests
+    /// rather than by counting bodies.
+    ///
+    /// The over-cap arm is refused, and refused by the INDIVISIBLE-STEP path
+    /// rather than by `validate_pack`. A one-commit history is one change, and
+    /// `Assembled::OverNegotiatedBound` is segmentation, so the builder has
+    /// nothing smaller to try. The sentence names `over negotiated limit`, which
+    /// is what the push pin's negative assertions are keyed on, so this is also
+    /// what proves those strings are the right ones to watch for.
+    #[cfg(unix)]
+    #[test]
+    fn the_size_bound_answers_for_real_once_the_authority_bound_is_out_of_the_way() {
+        let main = kin_model::RefName::branch(b"main").unwrap();
+
+        for (label, blobs, fits) in [
+            ("under", PAYLOAD_BLOBS_UNDER_CAP, true),
+            ("over", PAYLOAD_BLOBS_OVER_CAP, false),
+        ] {
+            let hosted_id = hosted_repository_id();
+            let hosted_repository = RepositoryId::new(hosted_id).unwrap();
+            let fixture = payload_fixture(label, blobs, &hosted_repository);
+            let authority =
+                ActiveApiRepositoryAuthority::open_layout_for_test(&fixture.layout).unwrap();
+
+            let status = kin_remote::repository_transfer::repository_transfer_status(
+                &authority.manager,
+                &hosted_repository,
+                &main,
+            )
+            .unwrap();
+            let mut expectation =
+                kin_remote::repository_transfer::RepositoryTransferExpectation::try_from(status)
+                    .unwrap();
+            // Record what this probe holds fixed, against the five fields an
+            // empty replica reports together. Asserted rather than assumed:
+            // these are the source's own values, and the day the bootstrap keys
+            // its compare-and-swap on all five, a reader needs to know which
+            // ones this test was never varying.
+            assert!(
+                expectation.git_authority_hash.is_some(),
+                "the probe keeps the SOURCE's Git authority, which is how the bound \
+                 in front of the size bound is removed; an empty replica reports None"
+            );
+            assert_eq!(
+                expectation.repository_id, hosted_repository,
+                "the probe must be about the hosted identity it adopted"
+            );
+            // The ref state, and only the ref state, is moved to unborn. Both
+            // fields move together because `validate_expectation` requires them
+            // both present or both absent, and a half-set destination would be
+            // refused for a reason that is not the one under test.
+            expectation.destination_target = None;
+            expectation.destination_head = None;
+
+            // The SEGMENT builder, because that is what a push calls
+            // (`push_to_remote` -> `build_repository_transfer_segment`). Its
+            // sibling `build_repository_transfer_pack` refuses the same
+            // condition with a shorter sentence, so probing that one would pin
+            // wording no push can produce. Measured, not read: the first draft
+            // of this test called the sibling and got
+            // `carries a 16777491 byte source body closure, over negotiated
+            // limit 16777216` with no mention of the indivisible step.
+            let built = kin_remote::repository_transfer::build_repository_transfer_segment(
+                &authority.manager,
+                &main,
+                &expectation,
+            );
+
+            if fits {
+                let pack = built
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "the {label} arm must assemble a segment once authority agrees: {error}"
+                        )
+                    })
+                    .pack;
+                let closure: u64 = pack.bodies.iter().map(|body| body.byte_len).sum();
+                assert!(
+                    closure >= fixture.payload_bytes,
+                    "the {label} arm's body closure must cover the payload it wrote: \
+                     {closure} against {}",
+                    fixture.payload_bytes
+                );
+                // By content hash, never by count. A pack carrying the right
+                // number of bodies with the wrong bytes passes any count.
+                let carried: std::collections::BTreeSet<String> = pack
+                    .bodies
+                    .iter()
+                    .map(|body| {
+                        hex::encode(Sha256::digest(
+                            body.decode()
+                                .expect("a pack body decodes to its declared length"),
+                        ))
+                    })
+                    .collect();
+                for (path, want) in &fixture.source_digests {
+                    assert!(
+                        carried.contains(want),
+                        "the {label} arm's pack carries no body whose bytes hash to the \
+                         fixture's {path}"
+                    );
+                }
+            } else {
+                let error = built.err().unwrap_or_else(|| {
+                    panic!(
+                        "the over-cap arm must be refused once authority agrees, or the \
+                         cap FIR-2746 records does not bind"
+                    )
+                });
+                let message = error.to_string();
+                assert!(
+                    message.contains("over negotiated limit"),
+                    "the {label} arm must name the negotiated byte limit: {message}"
+                );
+                assert!(
+                    message.contains("cannot be split across continuation packs"),
+                    "a one-commit history is one change, so the refusal must be the \
+                     indivisible-step one rather than a segmentation retry: {message}"
+                );
+                // The number the refusal reports is a LOWER bound, not the
+                // payload. `assemble_segment_pack` returns the moment the
+                // running total crosses the limit, so it names the total at the
+                // crossing and stops counting. Asserting it equalled the
+                // fixture's 24 MiB would fail against a correct implementation.
+                assert!(
+                    message.contains(
+                        &kin_remote::repository_transfer::MAX_TRANSFER_DECODED_BODY_BYTES
+                            .to_string()
+                    ),
+                    "the refusal must name the limit it enforced, which is what makes \
+                     the number in it readable: {message}"
+                );
+                // The variant decides the HTTP status the push pin watches, so
+                // it is asserted here rather than left to be assumed there.
+                assert!(
+                    matches!(
+                        error,
+                        kin_remote::repository_transfer::RepositoryTransferError::Invalid(_)
+                    ),
+                    "the size bound must be Invalid, which maps to 422 and is what \
+                     separates it from the authority bound's 409: {message}"
+                );
+            }
+
+            drop(authority);
+            std::fs::remove_dir_all(&fixture.working).ok();
+        }
     }
 
     /// Two replicas of ONE repository: a real local one with a graph-owned
@@ -25703,6 +26786,115 @@ mod tests {
         .unwrap()
     }
 
+    /// FIR-2136: a daemon that can no longer answer a live question about
+    /// itself says so on the surface supervisors poll.
+    ///
+    /// The wedge that produced this ticket failed every status call for hours
+    /// while `/health` reported `ok` throughout, because health graded eight
+    /// subsystem outcomes and none of them was "can I still answer". The cure
+    /// was a restart nobody knew to perform.
+    ///
+    /// Three arms, and the first is the one that decides the SHAPE of the
+    /// signal rather than merely testing it. A daemon nobody has queried holds
+    /// no settled reading, exactly like a wedged one, so an age-of-last-settled
+    /// probe cannot tell them apart and would report every idle daemon as sick.
+    /// A lifetime failure total cannot tell a store that recovered from one
+    /// that never did. Only a consecutive count reset on success separates all
+    /// three, which is why the counter has that shape and why arm one is not
+    /// decoration.
+    ///
+    /// Every arm reports independently rather than aborting at the first, so a
+    /// falsification grid cannot read a row as green that was never reached.
+    #[tokio::test]
+    async fn a_daemon_that_cannot_sample_itself_live_reports_attention() {
+        let state = test_state();
+        let graph = Arc::clone(&state.graph);
+        state
+            .graph
+            .upsert_entity(&test_entity("handler", "src/lib.py"))
+            .unwrap();
+
+        let mut failed: Vec<String> = Vec::new();
+        let mut check = |ok: bool, arm: &str, why: String| {
+            if !ok {
+                failed.push(format!("[{arm}] {why}"));
+            }
+        };
+
+        // Arm 1. Nobody has asked. Healthy, and it must stay healthy.
+        let quiet = health_json(Arc::clone(&state)).await;
+        check(
+            quiet.status == "ok",
+            "nobody-asked-is-ok",
+            format!(
+                "a daemon nobody has queried is not wedged: {}",
+                quiet.status
+            ),
+        );
+        check(
+            quiet.status_live_sample_failures == 0,
+            "nobody-asked-counts-zero",
+            format!(
+                "no call, no failures: {}",
+                quiet.status_live_sample_failures
+            ),
+        );
+
+        // Arm 2. Asked, and every call loses its live sample. Holding the
+        // embedding fence is what a real embed pass does to this path.
+        {
+            let _wedge = state
+                .embedding_work
+                .lock()
+                .expect("the fixture takes the embedding fence");
+            for _ in 0..GRAPH_STATUS_UNANSWERABLE_STREAK {
+                let _ = head_graph_status(&state, &graph).await;
+            }
+            let wedged = health_json(Arc::clone(&state)).await;
+            check(
+                wedged.status == "attention",
+                "wedged-is-attention",
+                format!(
+                    "{GRAPH_STATUS_UNANSWERABLE_STREAK} consecutive failed live samples must \
+                     reach the surface: status={} failures={}",
+                    wedged.status, wedged.status_live_sample_failures
+                ),
+            );
+            check(
+                wedged.status_live_sample_failures >= GRAPH_STATUS_UNANSWERABLE_STREAK,
+                "wedged-counts-the-streak",
+                format!(
+                    "the streak is what the verdict rests on: {}",
+                    wedged.status_live_sample_failures
+                ),
+            );
+        }
+
+        // Arm 3. The fence is released and one call samples live again. The
+        // reset lives at the record site, so recovery is the same event as the
+        // reading that proves it.
+        let _ = head_graph_status(&state, &graph).await;
+        let recovered = health_json(Arc::clone(&state)).await;
+        check(
+            recovered.status == "ok",
+            "recovery-clears-attention",
+            format!(
+                "one successful live sample ends the condition: {}",
+                recovered.status
+            ),
+        );
+        check(
+            recovered.status_live_sample_failures == 0,
+            "recovery-clears-the-streak",
+            format!(
+                "a streak that survived its own recovery would wedge forever: {}",
+                recovered.status_live_sample_failures
+            ),
+        );
+
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
     fn parse_graph_status(
         result: &kin_mcp::ToolCallResult,
     ) -> kin_mcp::handlers::entities::GraphStatusReport {
@@ -29816,6 +31008,217 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
+    }
+
+    /// A zero edge count says nothing on its own, so the health route reports
+    /// what produced it.
+    ///
+    /// `cross_repo_edges: 0` beside nothing else is the bare zero this ticket is
+    /// about: an authority that was built and found no edges and an authority
+    /// that was never built read identically. The two completeness fields are
+    /// what separate them, and this asserts both are present and typed, on a
+    /// healthy single-repo daemon where the answer is a real zero.
+    ///
+    /// Serialized because the sibling below sets `KIN_REGISTRY_PATH`, which is
+    /// process-global, and `serial_test::serial` only serializes a test against
+    /// OTHER serial tests. That sibling carries the attribute; without it here
+    /// the two run concurrently, the sibling installs its deliberately
+    /// unbindable registry while this test's daemon is opening, and this test
+    /// reads the other one's world: `startup_authority_complete` comes back
+    /// false and the assertion below fails for a reason unrelated to the code
+    /// under test.
+    ///
+    /// It passes alone and fails in company, so a solo run is not a control for
+    /// it. `cargo test -p kin-daemon --lib -- spine_health` is.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spine_health_reports_both_completeness_readings_beside_the_edge_count() {
+        let state = test_state();
+        let startup_complete = state.startup_authority_complete();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json["cross_repo_edges"].is_u64(),
+            "the count this qualifies must still be reported: {json}"
+        );
+        assert!(
+            json["authority_complete"].is_boolean(),
+            "the spine's own edge-authority reading must be reported: {json}"
+        );
+        assert!(
+            json["startup_authority_complete"].is_boolean(),
+            "the startup pin's reading must be reported beside it: {json}"
+        );
+        // Healthy control: a single-repo daemon that pinned everything the
+        // registry named reports a complete startup authority, so the field
+        // cannot be hardcoded to the alarming value and read as working.
+        assert_eq!(
+            json["startup_authority_complete"],
+            serde_json::json!(startup_complete),
+            "the route must report the state's own reading, not a constant: {json}"
+        );
+        assert_eq!(
+            json["startup_authority_complete"],
+            serde_json::json!(true),
+            "a daemon whose registry named nothing it could not pin is complete: {json}"
+        );
+    }
+
+    /// A bounded capture is a third state, and both of 1171's readings call it
+    /// healthy.
+    ///
+    /// FIR-2763's eager-sibling bound stops the capture deliberately. Nothing
+    /// failed, so `authority_complete` is true; every registered sibling pinned,
+    /// so `startup_authority_complete` is true. A reader with only those two
+    /// fields cannot tell a bounded answer from a complete one, which is the
+    /// bare zero this endpoint exists to prevent arriving from a new direction.
+    /// So the route reports the bound too, with the counts that size it.
+    ///
+    /// The healthy control is the half that makes it able to fail: on a daemon
+    /// that capped nothing, `sibling_capture_bounded` must be FALSE, so the
+    /// field cannot be hardcoded to the alarming value and read as working.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spine_health_reports_a_bounded_sibling_capture_as_its_own_state() {
+        let state = test_state();
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert!(
+            json["sibling_capture_bounded"].is_boolean(),
+            "a bounded capture must be reportable beside the two completeness readings: {json}"
+        );
+        assert!(
+            json["siblings_captured"].is_u64(),
+            "a bound is only actionable with the counts that size it: {json}"
+        );
+        assert!(
+            json["siblings_registered"].is_u64(),
+            "captured means nothing without the registered total beside it: {json}"
+        );
+        assert_eq!(
+            json["sibling_capture_bounded"],
+            serde_json::json!(false),
+            "a daemon that capped nothing must not claim it was bounded: {json}"
+        );
+    }
+
+    /// The two readings are not the same reading, and the route must not
+    /// collapse them.
+    ///
+    /// A refresh in flight turns the spine's own authority incomplete while the
+    /// startup pin stays complete. If one field were derived from the other, or
+    /// both from one source, this case would report the startup pass as short
+    /// and send a reader hunting a registry problem that does not exist.
+    #[tokio::test]
+    async fn a_dirty_edge_authority_does_not_report_the_startup_pin_as_short() {
+        let state = test_state();
+        let spine = state.ensure_spine().expect("spine enabled in test");
+        for repo in spine.registered_repo_ids() {
+            spine.invalidate_cross_repo_edges(&repo);
+        }
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["authority_complete"],
+            serde_json::json!(false),
+            "a dirtied edge authority must read incomplete: {json}"
+        );
+        assert_eq!(
+            json["startup_authority_complete"],
+            serde_json::json!(true),
+            "dirtying edges says nothing about what the startup pass could bind: {json}"
+        );
+    }
+
+    /// The alarming value, actually produced.
+    ///
+    /// The two tests above run on a daemon that pinned everything, so both read
+    /// `startup_authority_complete: true`, and a mutation hardcoding the field to
+    /// `true` left them both green. An assertion comparing the route's answer to
+    /// the state's answer cannot catch that when the two agree on `true` anyway,
+    /// which made it decoration rather than a control.
+    ///
+    /// This builds a daemon whose startup pass cannot bind a repository the
+    /// registry names, which is the condition the field exists to report, and
+    /// requires the route to say so. Hardcoding either value now fails one of
+    /// the two directions.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spine_health_reports_a_startup_authority_it_could_not_bind() {
+        // A registry row pointing at a directory that carries a `.kin` but no
+        // readable manifest. Binding it fails, which is what leaves the startup
+        // authority set short.
+        let sibling_parent = tempfile::tempdir().unwrap();
+        let sibling_root = sibling_parent.path().join("unbindable-sibling");
+        std::fs::create_dir_all(sibling_root.join(".kin")).unwrap();
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: "unbindable-sibling".to_string(),
+                path: sibling_root.clone(),
+                entities: 1,
+                last_commit: String::new(),
+                dependencies: vec![],
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+        let _registry_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+
+        let primary_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(primary_dir.path()).unwrap().layout;
+        let state = Arc::new(DaemonState::open(layout).unwrap());
+        assert!(
+            !state.startup_authority_complete(),
+            "the fixture must actually produce a short startup authority, or this \
+             test proves nothing about reporting one"
+        );
+
+        let app = router(state);
+        let response = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(
+            json["startup_authority_complete"],
+            serde_json::json!(false),
+            "a registry row the daemon could not bind must reach the reader: {json}"
+        );
     }
 
     #[tokio::test]

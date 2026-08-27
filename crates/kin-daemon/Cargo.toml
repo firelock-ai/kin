@@ -96,6 +96,7 @@ kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 base64 = "0.23"
 kin-core = { workspace = true, features = ["test-support"] }
 kin-git = { workspace = true, features = ["test-support"] }
+kin-migrate = { workspace = true }
 http-body = "1"
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }

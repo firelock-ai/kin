@@ -943,6 +943,22 @@ pub fn handle_get_context_pack<G: GraphStore>(
         ),
         None => serde_json::Value::Null,
     };
+    // Whether a caller could have reached this focal through a call the linker
+    // recorded no edge for (FIR-2775), read exactly as `find_references` reads
+    // it and published under the same key.
+    //
+    // A pack's `dependents` group is built by the same collector over the same
+    // edges, so it inherits the same gap and has to report it the same way. The
+    // method gate beside this one is shared for precisely that reason: gating a
+    // shared gap on the tool name alone was how two surfaces over one graph came
+    // to answer opposite things about one entity, the tool that refused to
+    // certify and the tool that published `[]` reading the identical incomplete
+    // call graph. Adding a new gap to one surface and not the other would
+    // rebuild that disagreement from scratch.
+    let caller_arrival = match &focal_entity {
+        Some(entity) => crate::caller_arrival::observe_caller_arrival(store, entity).to_json(),
+        None => serde_json::Value::Null,
+    };
 
     // The dependency section carries both directions, so it is served as two
     // groups named for what they are. Serving it as one list called
@@ -1061,6 +1077,7 @@ pub fn handle_get_context_pack<G: GraphStore>(
         // language rather than as a bare fact. Computed by the same observer
         // `find_references` uses, from the same witnesses.
         crate::edge_coverage::EDGE_COVERAGE_KEY: edge_coverage,
+        crate::caller_arrival::CALLER_ARRIVAL_KEY: caller_arrival,
         "token_budget": budget.max_tokens(),
         "tokens_used": pack.actual_tokens,
     });
@@ -2035,6 +2052,21 @@ async fn handle_find_references_with_authority_source<G: GraphStore>(
         "cross_repo": cross_repo,
     });
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    // Whether a caller could have reached this focal through a call site the
+    // linker recorded no edge for (FIR-2775). `edge_coverage` above answers
+    // whether the graph holds the CLASS of edge this query reads; this answers
+    // whether the files that can reach this focal had their own call sites
+    // accounted for. A graph can pass the first and fail the second, and that is
+    // the state in which an empty reference list came back certified for a
+    // function a test calls.
+    //
+    // Published on every answer rather than only on empty ones, for the reason
+    // stated above `edge_coverage`: an answer that returned rows proved nothing
+    // about the caller it missed. The gate in `crate::negative` reads it back
+    // from here so the verdict and the evidence a reader audits it against are
+    // the same object.
+    result[crate::caller_arrival::CALLER_ARRIVAL_KEY] =
+        crate::caller_arrival::observe_caller_arrival(store, &target).to_json();
     disclose_withheld_candidates(&mut result);
 
     // Say that a bare name was resolved, and to how many candidates.
@@ -3271,7 +3303,12 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
 }
 
 pub const TRACE_DATA_FLOW_DESC: &str = "\
-Walk the actual call/data-flow chain rooted at a focal entity and return it as an \
+A CALL-CHAIN WALKER, despite the name: it walks entity-to-entity edges and returns them \
+as an ordered list of steps in one call. It does NOT follow a value. If your question is \
+\"where does this parameter end up\" or \"what actually reads this field\", start with \
+semantic_locate on the behavior at the far end, because the graph has no node for a value \
+and this walker will trace control flow past the branch the data went down. \
+Walk the call chain rooted at a focal entity and return it as an \
 ordered list of steps in one call. Unlike trace_computation (which returns a flat \
 neighborhood), this follows Calls/Imports/References edges directionally from the \
 focal: direction='calls' walks outward to callees, 'callers' walks inward to callers, \
@@ -3295,7 +3332,14 @@ breadth: the per-step cap keeps the most relevant neighbors (located over file-l
 test, Calls over Imports over References, the expanded node's own file first) rather than \
 whatever order the relation table returned, and any node whose fan-out was cut carries \
 `fanout_truncated` with `fanout_dropped`, listed together under `clipped_steps`, so you can \
-re-query exactly that node with a wider limit_per_step. Every step reports the same keys: a \
+re-query exactly that node with a wider limit_per_step. That cap is where a narrow walk \
+loses answers: on a fifteen-callee function a five-wide cap discards ten neighbors, and it \
+ranks them by proximity, which no question is an input to. Pass `target` with the symbol \
+you are trying to reach and every neighbor from which it is still reachable sorts ahead of \
+every neighbor that is not, BEFORE the cap cuts. Without a target, read \
+`spine_clipped_steps`: when it is above zero the walk continued beneath a node whose \
+fan-out was already cut, so this chain is one route among several and a hop it does not \
+contain was never looked for. Do not read such a chain as evidence that X never reaches Y. Every step reports the same keys: a \
 symbol the graph owns no file for carries explicit nulls plus `external: true` rather than a \
 shorter record, and one symbol never appears both located and file-less in one response. \
 When the chain comes back empty, the additive `negative` object's `safe_to_conclude_absent` \
@@ -3385,6 +3429,10 @@ struct TraceFanoutCandidate {
     /// the same neighbor replaces them, so the step reports what the edge it
     /// names actually proved.
     resolution: RelationResolution,
+    /// Whether a named target is still reachable from this candidate inside the
+    /// requested depth. False for every candidate when no target was named, so
+    /// an untargeted walk orders exactly as it did before this existed.
+    reaches_target: bool,
 }
 
 impl TraceFanoutCandidate {
@@ -3399,10 +3447,119 @@ impl TraceFanoutCandidate {
     }
 }
 
+/// Entities from which `target` is reachable, walking the requested direction
+/// backwards and bounded by the same depth as the chain.
+///
+/// The depth bound is the walk's whole depth rather than the remaining depth at
+/// each candidate, which makes the set a superset in that direction: preferring
+/// a neighbor that might reach the target costs a cap slot, while missing one
+/// costs the answer.
+fn trace_reach_set_toward<G: GraphStore>(
+    store: &G,
+    target: &kin_model::entity::Entity,
+    direction: &str,
+    depth: usize,
+    allowed: &std::collections::HashSet<RelationKind>,
+) -> Result<std::collections::HashSet<kin_model::ids::EntityId>> {
+    let want_callees = direction == "calls" || direction == "both";
+    let want_callers = direction == "callers" || direction == "both";
+    let mut seen: std::collections::HashSet<kin_model::ids::EntityId> =
+        std::collections::HashSet::new();
+    seen.insert(target.id);
+    let mut frontier = vec![target.id];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for node in frontier.drain(..) {
+            let relations = store
+                .get_all_relations_for_entity(&node)
+                .map_err(McpError::graph)?;
+            for rel in &relations {
+                if !allowed.contains(&rel.kind) {
+                    continue;
+                }
+                let src = rel.src.as_entity();
+                let dst = match rel.dst {
+                    kin_model::GraphNodeId::Entity(id) => Some(id),
+                    _ => None,
+                };
+                // One step back along whichever sense the forward walk takes: a
+                // `calls` chain reaches the target through outgoing edges, so
+                // whoever reaches it is on the incoming side.
+                let prior = if want_callees && dst == Some(node) {
+                    src
+                } else if want_callers && src == Some(node) {
+                    dst
+                } else {
+                    None
+                };
+                let Some(prior) = prior else { continue };
+                if prior != node && seen.insert(prior) {
+                    next.push(prior);
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    Ok(seen)
+}
+
+/// Apply the per-step cap to one side of a node's ranked fan-out.
+///
+/// Returns how many candidates were dropped, and how many of those lived
+/// outside the expanding node's own file. The keep rule is
+/// [`kin_ranking::entity_ranking::fanout_cap_keeps`], the same one the CLI
+/// walker calls, because two copies of a cap can only ever disagree in a way
+/// that reads as a passing run on both sides.
+fn apply_trace_fanout_cap(
+    candidates: &mut Vec<TraceFanoutCandidate>,
+    node_file: Option<&str>,
+    limit: usize,
+) -> (usize, usize) {
+    let locality: Vec<kin_ranking::entity_ranking::FanoutLocality> = candidates
+        .iter()
+        .map(|candidate| match candidate.entity.file_origin.as_ref() {
+            None => kin_ranking::entity_ranking::FanoutLocality::Unlocated,
+            Some(file) if node_file == Some(file.0.as_str()) => {
+                kin_ranking::entity_ranking::FanoutLocality::SameFile
+            }
+            Some(_) => kin_ranking::entity_ranking::FanoutLocality::OtherFile,
+        })
+        .collect();
+    let keep = kin_ranking::entity_ranking::fanout_cap_keeps(&locality, limit);
+    if keep.len() == candidates.len() {
+        return (0, 0);
+    }
+    let kept: std::collections::HashSet<usize> = keep.iter().copied().collect();
+    let dropped_crossing = (0..candidates.len())
+        .filter(|index| {
+            !kept.contains(index)
+                && locality[*index] == kin_ranking::entity_ranking::FanoutLocality::OtherFile
+        })
+        .count();
+    let dropped = candidates.len() - keep.len();
+    let mut taken: Vec<TraceFanoutCandidate> = Vec::with_capacity(keep.len());
+    for (index, candidate) in std::mem::take(candidates).into_iter().enumerate() {
+        if kept.contains(&index) {
+            taken.push(candidate);
+        }
+    }
+    *candidates = taken;
+    (dropped, dropped_crossing)
+}
+
 /// Order one side of a node's fan-out by relevance, most relevant first, with
 /// name and id tiebreaks so the same store returns the same chain every run.
 fn sort_trace_candidates(candidates: &mut [TraceFanoutCandidate], node: &TraceFrontierNode) {
     candidates.sort_by(|left, right| {
+        // The question first, when there is one. Every proximity term below is
+        // a guess about what the caller meant; reachability toward a named
+        // target is the one term that knows.
+        if left.reaches_target != right.reaches_target {
+            return right.reaches_target.cmp(&left.reaches_target);
+        }
         let left_score = trace_fanout_score(
             &left.entity,
             left.relation_kind,
@@ -3503,6 +3660,84 @@ fn trace_step_value(
 
 /// Push one degradation onto the response, creating the array if this is the
 /// first.
+/// Mark the clips the chain continued beneath, and count them once at the top.
+///
+/// The distinction is the point of the field. A clip at the end of a branch
+/// costs breadth a reader can see missing; a clip the walk went on beneath
+/// hands back a route that reads like the route, while the neighbors it dropped
+/// were never followed. Only the second makes "this chain does not contain X"
+/// mean nothing at all. Mirrors `record_spine_clipping` on the CLI walker, and
+/// the two are held together by `both_trace_walkers_report_spine_clipping`.
+fn record_trace_spine_clipping(result: &mut serde_json::Value) {
+    let parents: std::collections::HashSet<u64> = result["chain"]
+        .as_array()
+        .map(|chain| {
+            chain
+                .iter()
+                .filter_map(|step| step["parent_step"].as_u64())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut spine_steps = 0usize;
+    let mut spine_crossing = 0usize;
+    let mut widest: Option<(String, u64, u64)> = None;
+    if let Some(clips) = result["clipped_steps"].as_array_mut() {
+        for clip in clips.iter_mut() {
+            let on_spine = clip["step"]
+                .as_u64()
+                .is_some_and(|step| parents.contains(&step));
+            clip["continued_below"] = serde_json::Value::Bool(on_spine);
+            if !on_spine {
+                continue;
+            }
+            spine_steps += 1;
+            spine_crossing += clip["dropped_crossing_file"].as_u64().unwrap_or(0) as usize;
+            let dropped = clip["dropped_callees"].as_u64().unwrap_or(0)
+                + clip["dropped_callers"].as_u64().unwrap_or(0);
+            if widest.as_ref().is_none_or(|(_, most, _)| dropped > *most) {
+                widest = Some((
+                    clip["entity_name"].as_str().unwrap_or_default().to_string(),
+                    dropped,
+                    clip["limit_per_step"].as_u64().unwrap_or(0),
+                ));
+            }
+        }
+    }
+    if spine_steps == 0 {
+        return;
+    }
+    result["spine_clipped_steps"] = serde_json::Value::from(spine_steps);
+    if spine_crossing > 0 {
+        result["spine_dropped_crossing_file"] = serde_json::Value::from(spine_crossing);
+    }
+    let Some((name, dropped, limit)) = widest else {
+        return;
+    };
+    let crossing = if spine_crossing > 0 {
+        format!(", {spine_crossing} of which lived outside the file of the node that offered them")
+    } else {
+        String::new()
+    };
+    append_trace_degradation(
+        result,
+        serde_json::json!({
+            "component": "fanout_cap",
+            "reason": "spine_clipped",
+            "detail": format!(
+                "the walk continued beneath {spine_steps} node(s) whose fan-out limit_per_step \
+                 {limit} had already cut, dropping neighbors that were never followed{crossing}; \
+                 the widest was '{name}', which offered {dropped} more than the cap kept. This \
+                 chain is one route among the ones the cap left, so a hop it does not contain \
+                 was not looked for and its absence proves nothing"
+            ),
+            "remediation": format!(
+                "name the symbol you are looking for as `target` so the cap ranks toward it, or \
+                 re-query '{name}' with limit_per_step above {limit}"
+            ),
+        }),
+    );
+}
+
 fn append_trace_degradation(result: &mut serde_json::Value, disclosure: serde_json::Value) {
     match result
         .get_mut("degradations")
@@ -3813,6 +4048,33 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     let mut step_language: std::collections::HashMap<usize, kin_model::ids::LanguageId> =
         std::collections::HashMap::new();
 
+    // The question, resolved once and consulted per candidate. A target that
+    // resolves to nothing is disclosed rather than fatal: the chain the caller
+    // asked for is still the chain.
+    let mut target_name: Option<String> = None;
+    let mut target_unresolved: Option<String> = None;
+    let mut reach_set: Option<std::collections::HashSet<kin_model::ids::EntityId>> = None;
+    if let Some(target) = get_optional_string_param(args, "target")
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let resolved = match uuid::Uuid::parse_str(&target).ok() {
+            Some(uuid) => store
+                .get_entity(&kin_model::ids::EntityId(uuid))
+                .map_err(McpError::graph)?,
+            None => select_best_reference_target(store, &target).map_err(McpError::graph)?,
+        };
+        match resolved {
+            Some(entity) => {
+                reach_set = Some(trace_reach_set_toward(
+                    store, &entity, direction, depth, &allowed,
+                )?);
+                target_name = Some(entity.name.clone());
+            }
+            None => target_unresolved = Some(target),
+        }
+    }
+
     // Frontier: (step, entity, depth, file, dir) — the expanded node's own
     // location travels with it, because relevance is scored against the node
     // being expanded rather than against the focal.
@@ -3910,7 +4172,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         };
                         candidate_index.insert((next_id, role), candidates.len());
                         let crossing = kin_index::trace_crossing_for(&entity, Some(rel));
+                        let reaches_target =
+                            reach_set.as_ref().is_some_and(|set| set.contains(&next_id));
                         candidates.push(TraceFanoutCandidate {
+                            reaches_target,
                             call_edges: usize::from(kin_index::is_raise_classifiable_call_edge(
                                 rel,
                             )),
@@ -3943,10 +4208,10 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 candidates.into_iter().partition(|c| c.role == "callee");
             sort_trace_candidates(&mut callees, &node);
             sort_trace_candidates(&mut callers, &node);
-            let dropped_callees = callees.len().saturating_sub(limit_per_step);
-            let dropped_callers = callers.len().saturating_sub(limit_per_step);
-            callees.truncate(limit_per_step);
-            callers.truncate(limit_per_step);
+            let (dropped_callees, crossing_callees) =
+                apply_trace_fanout_cap(&mut callees, node.file.as_deref(), limit_per_step);
+            let (dropped_callers, crossing_callers) =
+                apply_trace_fanout_cap(&mut callers, node.file.as_deref(), limit_per_step);
 
             if dropped_callees + dropped_callers > 0 {
                 truncated = true;
@@ -3964,14 +4229,20 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                         step["entity_name"].as_str().unwrap_or_default().to_string(),
                     )
                 };
-                clipped_steps.push(serde_json::json!({
+                let mut clip = serde_json::json!({
                     "step": node.step,
                     "entity_id": entity_id,
                     "entity_name": entity_name,
                     "dropped_callees": dropped_callees,
                     "dropped_callers": dropped_callers,
+                    "continued_below": false,
                     "limit_per_step": limit_per_step,
-                }));
+                });
+                let crossing = crossing_callees + crossing_callers;
+                if crossing > 0 {
+                    clip["dropped_crossing_file"] = serde_json::Value::from(crossing);
+                }
+                clipped_steps.push(clip);
             }
 
             for candidate in callees.into_iter().chain(callers) {
@@ -4204,6 +4475,23 @@ pub fn handle_trace_data_flow<G: GraphStore>(
         },
     });
     result[crate::edge_coverage::EDGE_COVERAGE_KEY] = edge_coverage;
+    if let Some(name) = target_name {
+        result["target_name"] = serde_json::Value::from(name);
+    }
+    if let Some(target) = target_unresolved {
+        append_trace_degradation(
+            &mut result,
+            serde_json::json!({
+                "component": "target_reachability",
+                "reason": "target_not_resolved",
+                "detail": format!(
+                    "no entity matches target '{target}', so this walk ranked its fan-out by \
+                     relevance alone and the question had no vote in what the cap kept"
+                ),
+                "remediation": "check the target's spelling, or find it first with semantic_locate",
+            }),
+        );
+    }
     if !clipped_steps.is_empty() {
         result["clipped_steps"] = serde_json::Value::Array(clipped_steps);
     }
@@ -4221,6 +4509,9 @@ pub fn handle_trace_data_flow<G: GraphStore>(
     // a key that appears only after a cut cannot be read as a zero.
     result["fanout_narrowed"] = serde_json::Value::from(0);
     bound_trace_payload(&mut result, max_response_chars);
+    // After the bound, because a clip is on the spine only if the walk beneath
+    // it is in the response the caller receives.
+    record_trace_spine_clipping(&mut result);
     // Counted from the chain rather than during the walk, so the numbers
     // describe the steps this payload carries after `bound_trace_payload` has
     // dropped whatever it drops. Kept apart rather than summed because only the
@@ -5200,21 +5491,197 @@ mod tests {
     /// cannot keep, and a reader who took it spent a tool call learning that
     /// (FIR-2603). The capability is a separate, much larger piece of work; this
     /// guard is only that the description stops claiming it.
+    ///
+    /// Strengthened for FIR-2781 part three, because what it pinned was a
+    /// PHRASING and not the property. It banned one historical string, so a
+    /// rewrite promising value tracing in any other words passed it; it asserted
+    /// containment anywhere rather than position, so the call-chain-walker claim
+    /// could move to the bottom or vanish while a later line kept the test
+    /// green; and it said nothing about the routing to `semantic_locate`, so the
+    /// stranger's actual recommendation could disappear silently. The text being
+    /// present today is the weakest possible state of done, one rewrite from
+    /// gone.
     #[test]
     fn the_trace_description_promises_entity_edges_and_never_value_tracing() {
         let description = TRACE_DATA_FLOW_DESC;
         assert!(
-            !description.contains("trace this value back to its source"),
-            "the description must not promise value-level tracing: {description}"
-        );
-        assert!(
             description.contains("The unit is the entity, not the value"),
-            "and it must state the unit it does walk: {description}"
+            "it must state the unit it does walk: {description}"
         );
         assert!(
             description.contains("Calls/Imports/References edges"),
             "naming the edge classes it follows: {description}"
         );
+    }
+
+    /// The opening sentence, which is the only part of a long description a
+    /// hurried caller reads, and the reason this tool cost a stranger a wasted
+    /// call: its NAME promises data flow and the substrate walks call chains.
+    ///
+    /// Pinned by POSITION rather than by containment. A rewrite that keeps the
+    /// claim somewhere further down leaves the name unqualified exactly where it
+    /// is read, which is the state FIR-2781 was filed about, so a containment
+    /// check would stay green through the regression it exists to catch.
+    #[test]
+    fn the_trace_descriptions_first_sentence_says_what_it_actually_walks() {
+        let opening = trace_description_opening_sentence();
+        let lowered = opening.to_ascii_lowercase();
+        assert!(
+            lowered.contains("call-chain walker") || lowered.contains("call chain walker"),
+            "the FIRST sentence must say plainly what this walks, because the tool's own name \
+             says otherwise and the first sentence is what a hurried caller reads. Got: {opening}"
+        );
+    }
+
+    /// The stranger's own recommendation, kept as a routable destination rather
+    /// than as prose that happens to be true today.
+    ///
+    /// A description that denies doing value tracing and then leaves the caller
+    /// nowhere to go has answered half the question. `semantic_locate` is the
+    /// surface that did answer it, in one call, in the session that filed this,
+    /// and it is a proper noun, so asserting it by name pins the routing rather
+    /// than a phrasing of the routing.
+    #[test]
+    fn the_trace_description_routes_value_questions_to_semantic_locate() {
+        let description = TRACE_DATA_FLOW_DESC;
+        let opening: String = description.chars().take(600).collect();
+        assert!(
+            opening.contains("semantic_locate"),
+            "a value-flow question must be routed somewhere, by name, in the opening block \
+             rather than left for the caller to guess: {opening}"
+        );
+    }
+
+    /// The negative, made property-shaped instead of banning one historical
+    /// string.
+    ///
+    /// The trap this has to survive, and it caught me on the first attempt: the
+    /// honest text DENIES value tracing in words that contain the promise as a
+    /// substring. "It cannot trace a value back to its source" contains "trace a
+    /// value". A bare substring sweep therefore fires on the correct text, and a
+    /// guard that fails on correct text is a guard whoever meets it deletes.
+    ///
+    /// So the check is negation-aware: a promise pattern is a violation only
+    /// where no negator precedes it. And the denial fixture is taken FROM THE
+    /// REAL DESCRIPTION rather than invented, because that is exactly how the
+    /// first attempt failed. I wrote a denial in my own words, it happened not to
+    /// contain the pattern that fires, and the guard passed its control while
+    /// failing the actual text. A fixture written by the same hand as the check
+    /// cannot tell you what the producer really says.
+    #[test]
+    fn the_trace_description_never_promises_to_follow_a_value() {
+        for promise in TRACE_VALUE_PROMISES {
+            assert!(
+                !promises_without_negation(TRACE_DATA_FLOW_DESC, promise),
+                "the description promises value-level tracing the substrate cannot do \
+                 ({promise:?}); there is no FlowsTo relation kind and no Parameter entity kind \
+                 for it to walk"
+            );
+        }
+
+        // Control one: the denials the real description already makes must pass,
+        // quoted from it rather than paraphrased. Each of these CONTAINS a banned
+        // pattern and is correct text.
+        for denial in [
+            "It does NOT follow a value.",
+            "It cannot trace a value back to its source.",
+            "The unit is the entity, not the value",
+            "the graph has no node for a value",
+        ] {
+            assert!(
+                TRACE_DATA_FLOW_DESC.contains(denial),
+                "this control is quoted from the description and must still be in it, or the \
+                 control has drifted from what it controls for: {denial:?}"
+            );
+            for promise in TRACE_VALUE_PROMISES {
+                assert!(
+                    !promises_without_negation(denial, promise),
+                    "pattern {promise:?} fires on the honest denial {denial:?}, so it bans \
+                     correct text and will be deleted by whoever trips it"
+                );
+            }
+        }
+
+        // Control two: each pattern must catch the promise it names, un-negated,
+        // or the list is decoration that can never fail.
+        for (promise, wording) in TRACE_VALUE_PROMISES
+            .iter()
+            .zip(TRACE_VALUE_PROMISE_EXAMPLES)
+        {
+            assert!(
+                promises_without_negation(wording, promise),
+                "pattern {promise:?} does not catch its own example {wording:?}, so it guards \
+                 nothing"
+            );
+        }
+    }
+
+    /// Whether `text` states `promise` somewhere no negator precedes it.
+    ///
+    /// The window is the sixteen characters before the match, which holds every
+    /// negator this text uses ("cannot ", "does NOT ", "never ", "no node for ",
+    /// "not the value") without reaching back into a previous clause. Widening it
+    /// would start swallowing negations that belong to a different sentence,
+    /// which is the failure mode in the other direction: a guard that never
+    /// fires because some earlier sentence said "not".
+    fn promises_without_negation(text: &str, promise: &str) -> bool {
+        let lowered = text.to_ascii_lowercase();
+        let mut from = 0usize;
+        while let Some(offset) = lowered[from..].find(promise) {
+            let at = from + offset;
+            let window_start = at.saturating_sub(16);
+            let window = &lowered[window_start..at];
+            let negated = ["not", "never", "cannot", "no ", "n't"]
+                .iter()
+                .any(|negator| window.contains(negator));
+            if !negated {
+                return true;
+            }
+            from = at + promise.len();
+        }
+        false
+    }
+
+    /// Shapes that only an actual promise of value-level tracing takes: a verb
+    /// with the value as its OBJECT. Negation is handled by the matcher rather
+    /// than by the patterns, so a denial using any of these words still passes.
+    const TRACE_VALUE_PROMISES: &[&str] = &[
+        "trace this value",
+        "trace a value",
+        "traces values",
+        "trace the value back",
+        "follows a value",
+        "follows the value",
+        "value-level trace",
+        "where a value comes from",
+    ];
+
+    /// One real sentence per pattern, un-negated, so the list is proven able to
+    /// catch what it claims to catch rather than assumed able.
+    const TRACE_VALUE_PROMISE_EXAMPLES: &[&str] = &[
+        "It can trace this value back to its source.",
+        "Use it to trace a value through the program.",
+        "It traces values across assignments.",
+        "It will trace the value back to where it was assigned.",
+        "It follows a value through fields and returns.",
+        "It follows the value into every caller.",
+        "A value-level trace of the parameter.",
+        "It answers where a value comes from.",
+    ];
+
+    /// The first sentence of the trace description, by position.
+    ///
+    /// Split on the first sentence-ending period followed by a space. The
+    /// opening carries a colon and a comma before that point and no
+    /// abbreviation, so this boundary is the real one rather than a guess; the
+    /// test above prints what it got, so a future rewrite that breaks the
+    /// assumption says so rather than failing obscurely.
+    fn trace_description_opening_sentence() -> String {
+        let text = TRACE_DATA_FLOW_DESC.trim_start();
+        match text.find(". ") {
+            Some(end) => text[..=end].to_string(),
+            None => text.to_string(),
+        }
     }
 
     fn make_entity(name: &str, file: &str) -> Entity {
@@ -8650,6 +9117,108 @@ mod tests {
             .collect()
     }
 
+    /// The fan-out the stranger measured, on the arm that has its own copy of
+    /// the cap.
+    ///
+    /// Two walkers apply a per-step cap in this codebase, and a rule fixed in
+    /// one of them is a rule that reads as fixed on both while only one is. So
+    /// this fixture is the CLI walker's `requests_send_graph` again, at the
+    /// same tiers, asserted through the GraphStore handler.
+    fn requests_send_store() -> (InMemoryGraph, EntityId) {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("Session.send", "src/requests/sessions.py");
+        let focal_id = focal.id;
+        store.upsert_entity(&focal).unwrap();
+
+        let mut edges: Vec<(Entity, f32)> = Vec::new();
+        for index in 0..11 {
+            edges.push((
+                make_entity(&format!("Session.own_{index}"), "src/requests/sessions.py"),
+                1.0,
+            ));
+        }
+        edges.push((
+            make_entity("extract_cookies_to_jar", "src/requests/cookies.py"),
+            0.9,
+        ));
+        edges.push((make_entity("dispatch_hook", "src/requests/hooks.py"), 0.9));
+        edges.push((
+            make_entity("HTTPAdapter.send", "src/requests/adapters.py"),
+            0.85,
+        ));
+
+        for (entity, confidence) in &edges {
+            store.upsert_entity(entity).unwrap();
+            let mut relation = make_relation(focal_id, entity.id, RelationKind::Calls);
+            relation.confidence = *confidence;
+            store.upsert_relation(&relation).unwrap();
+        }
+        (store, focal_id)
+    }
+
+    #[test]
+    fn trace_data_flow_offline_cap_leaves_the_module_and_names_the_target() {
+        let (store, focal_id) = requests_send_store();
+        let untargeted = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(4)),
+            ],
+        );
+        let names = traced_step_names(&untargeted);
+        assert_eq!(names.len(), 4);
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| !name.starts_with("Session."))
+                .count(),
+            1,
+            "one slot leaves the file, on this arm too: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name == "HTTPAdapter.send"),
+            "and the hop nobody asked for is still not the one it keeps: {names:?}"
+        );
+        assert_eq!(
+            untargeted["spine_clipped_steps"], 1,
+            "the walk continued beneath the clipped focal: {untargeted}"
+        );
+        assert_eq!(
+            untargeted["clipped_steps"][0]["dropped_crossing_file"], 2,
+            "two module-crossing hops were dropped: {untargeted}"
+        );
+        assert!(
+            untargeted["degradations"]
+                .as_array()
+                .is_some_and(|degradations| degradations
+                    .iter()
+                    .any(|degradation| degradation["reason"] == "spine_clipped")),
+            "and the disclosure fires: {untargeted}"
+        );
+
+        let targeted = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal_id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(4)),
+                ("target", serde_json::json!("HTTPAdapter.send")),
+            ],
+        );
+        assert!(
+            traced_step_names(&targeted)
+                .iter()
+                .any(|name| name == "HTTPAdapter.send"),
+            "naming the hop keeps it here too: {:?}",
+            traced_step_names(&targeted)
+        );
+        assert_eq!(targeted["target_name"], "HTTPAdapter.send");
+    }
+
     /// Both arms of one tool have to answer the same way, so the offline arm
     /// gets the same fixture at the same reported parameters.
     #[test]
@@ -9826,6 +10395,64 @@ mod tests {
             serde_json::json!(RESPONSE_DEFAULT_MAX_CHARS),
             "trace_data_flow answers under the one shared default, not a budget of its own"
         );
+    }
+
+    /// FIR-2775. Both reference surfaces must actually EMIT the arrival reading,
+    /// not merely be able to read one.
+    ///
+    /// This exists because the falsification of the shared gate stayed green
+    /// under the mutation that deletes the pack's publication. The envelope test
+    /// injects the block into both payloads by hand, so it proves the gate reads
+    /// a block and proves nothing about whether either handler produces one. Two
+    /// tests, each correct, jointly guarding nothing: the property that matters
+    /// lives in the agreement between what one side emits and what the other
+    /// reads, and only this end asserts the emitting half.
+    #[tokio::test]
+    async fn both_reference_surfaces_publish_the_arrival_reading() {
+        let (store, focal_id) = wide_store(3);
+        let sessions = SessionRegistry::empty_for_test();
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(focal_id.to_string()),
+        )]);
+
+        let pack = parsed_response(&crate::finalize_with_envelope(
+            handle_get_context_pack(&args, &store, &sessions, None).unwrap(),
+            structurally_ready_envelope(),
+            "get_context_pack",
+        ));
+        let references = parsed_response(&crate::finalize_with_envelope(
+            handle_find_references(&args, &store, None).await.unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ));
+
+        for (label, response) in [
+            ("get_context_pack", &pack),
+            ("find_references", &references),
+        ] {
+            let block = &response[crate::caller_arrival::CALLER_ARRIVAL_KEY];
+            assert!(
+                block.is_object(),
+                "{label} must publish the arrival reading the negative envelope gates on; got \
+                 {block}"
+            );
+            // A state the gate recognizes, so the block cannot be present and
+            // inert. `caller_arrival_state_unknown` is what an unrecognized one
+            // produces, and it would read as a gap for the wrong reason.
+            let state = block["state"].as_str().unwrap_or_default();
+            assert!(
+                matches!(state, "accounted" | "unaccounted" | "unmeasured"),
+                "{label} published an arrival state the gate does not recognize: {state:?}"
+            );
+            // The count the verdict rests on rides beside the rows on every
+            // answer, populated or not, so a reader never has to tell "checked
+            // and fine" from "not reported".
+            assert!(
+                block["unaccounted_file_count"].is_u64(),
+                "{label} must publish the unaccounted count beside the rows; got {block}"
+            );
+        }
     }
 
     #[test]

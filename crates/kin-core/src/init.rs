@@ -775,7 +775,11 @@ pub fn prepare_repository_layout_with_origin(
     let staging_parent = staging_root
         .parent()
         .expect("canonical repository stage always has a parent");
-    recover_orphaned_repository_stages(staging_parent, &final_kin_dir)?;
+    // Reported rather than dropped. This is the native path, where a killed
+    // conversion's stranded stages were reclaimed with nothing said at all,
+    // while the Git path at least named the capture directories beside them.
+    let reclaimed = recover_orphaned_repository_stages(staging_parent, &final_kin_dir)?;
+    crate::init_attempt::report_reclaimed_stages(reclaimed.recovered, reclaimed.retained);
 
     create_private_staging_root(&staging_root)?;
     let layout = KinLayout::new(staging_root);
@@ -2328,14 +2332,30 @@ fn filesystem_entry_exists(path: &Path) -> Result<bool> {
 /// Invalid, ambiguous, replaced, or active candidates are retained. Automatic
 /// orphan recovery is disabled when the platform cannot expose a stable file
 /// identity and current-user ownership.
+/// What one reclaim pass over abandoned repository stages did.
+///
+/// Two numbers rather than one, because an operator's question after a killed
+/// conversion is not only what came back but what is still sitting on their
+/// disk. Both tallies existed already and neither left this function: the
+/// return value was dropped at both call sites and the retained count reached
+/// an `info!` and nothing a person running `kin init` would ever see. FIR-2792.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ReclaimedStages {
+    /// Stages whose owner was proven gone, whose disk this pass took back.
+    pub recovered: usize,
+    /// Stages this pass declined to touch, because it could not prove them
+    /// unused.
+    pub retained: usize,
+}
+
 pub(crate) fn recover_orphaned_repository_stages(
     staging_parent: &Path,
     final_kin_dir: &Path,
-) -> Result<usize> {
+) -> Result<ReclaimedStages> {
     #[cfg(not(unix))]
     {
         let _ = (staging_parent, final_kin_dir);
-        return Ok(0);
+        return Ok(ReclaimedStages::default());
     }
 
     #[cfg(unix)]
@@ -2529,7 +2549,10 @@ pub(crate) fn recover_orphaned_repository_stages(
                 staging_parent.display()
             );
         }
-        Ok(recovered)
+        Ok(ReclaimedStages {
+            recovered,
+            retained,
+        })
     }
 }
 
@@ -2882,7 +2905,9 @@ mod tests {
         drop(prepared);
 
         assert_eq!(
-            recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+            recover_orphaned_repository_stages(&parent, &final_kin)
+                .unwrap()
+                .recovered,
             0,
             "recovery must reap nothing where it cannot prove ownership"
         );
@@ -3256,7 +3281,9 @@ mod tests {
         let staging_parent = staging_root.parent().unwrap();
 
         assert_eq!(
-            recover_orphaned_repository_stages(staging_parent, &final_kin).unwrap(),
+            recover_orphaned_repository_stages(staging_parent, &final_kin)
+                .unwrap()
+                .recovered,
             0
         );
         assert!(staging_root.is_dir());
@@ -3290,7 +3317,9 @@ mod tests {
         assert!(staging_root.is_dir());
         assert!(owner_path.is_file());
         assert_eq!(
-            recover_orphaned_repository_stages(&staging_parent, &final_kin).unwrap(),
+            recover_orphaned_repository_stages(&staging_parent, &final_kin)
+                .unwrap()
+                .recovered,
             1
         );
         assert!(!staging_root.exists());
@@ -3353,7 +3382,9 @@ mod tests {
             assert!(stage_root.is_dir(), "{label} stage must exist to be reaped");
 
             assert_eq!(
-                recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+                recover_orphaned_repository_stages(&parent, &final_kin)
+                    .unwrap()
+                    .recovered,
                 1,
                 "an abandoned {label} stage must be reclaimed, not walked past"
             );
@@ -3368,6 +3399,73 @@ mod tests {
         }
     }
 
+    /// The two tallies, joined to the sentence an operator actually reads.
+    ///
+    /// Both numbers were already computed and neither left this function: the
+    /// return value was dropped at both call sites and the retained count went
+    /// to an `info!`. So a stage came off somebody's disk and appeared in no
+    /// sentence anywhere, which is the silence FIR-2639 removed from the
+    /// capture side and left standing here.
+    ///
+    /// The counts are read out of the pass and handed straight to the renderer
+    /// rather than being written twice. A test that asserted `recovered == 1`
+    /// here and `"reclaimed 1"` in the wording test would leave both green on
+    /// the day the two stopped meaning the same thing.
+    ///
+    /// Unix-only for the reason its neighbours are: off Unix the pass returns
+    /// zero unconditionally, so a nonzero count there would measure the
+    /// platform.
+    #[cfg(unix)]
+    #[test]
+    fn a_reclaimed_stage_reaches_the_operator_and_a_clean_parent_stays_silent() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let final_kin = parent.join(".kin");
+
+        // The control first, and on the same parent, so the silence is a fact
+        // about having nothing to report rather than about a different
+        // directory. A line printed here would print under every conversion.
+        let quiet = recover_orphaned_repository_stages(&parent, &final_kin).unwrap();
+        assert_eq!(quiet, ReclaimedStages::default(), "nothing is stranded yet");
+        assert!(
+            crate::init_attempt::reclaimed_stage_lines(quiet.recovered, quiet.retained).is_empty(),
+            "an ordinary conversion reclaims nothing and must say nothing"
+        );
+
+        // Now strand one the way a kill does: nothing runs on the way out, and
+        // what is on disk is all the next pass has to go on.
+        let mut prepared = prepare_repository_layout_with_origin(
+            &parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4())),
+            &final_kin,
+            KinConfig::default(),
+            KinManifest::new(),
+            RepositoryIdentityOrigin::Minted,
+        )
+        .unwrap();
+        let stage_root = prepared.layout.root().to_path_buf();
+        prepared.cleanup_armed = false;
+        drop(prepared);
+        assert!(stage_root.is_dir(), "the stage must exist to be reclaimed");
+
+        let reclaimed = recover_orphaned_repository_stages(&parent, &final_kin).unwrap();
+        assert!(
+            reclaimed.recovered > 0,
+            "the pass took a stage back: {reclaimed:?}"
+        );
+        assert!(!stage_root.exists(), "and its disk is gone");
+
+        let lines =
+            crate::init_attempt::reclaimed_stage_lines(reclaimed.recovered, reclaimed.retained);
+        assert!(
+            !lines.is_empty(),
+            "a stage that came off this disk has to appear in a sentence: {reclaimed:?}"
+        );
+        assert!(
+            lines[0].contains(&format!("reclaimed {}", reclaimed.recovered)),
+            "the sentence carries the count the pass actually returned, not a literal: {lines:?}"
+        );
+    }
+
     #[test]
     fn orphan_recovery_retains_unprovable_and_replaced_stages() {
         let directory = tempfile::tempdir().unwrap();
@@ -3377,7 +3475,9 @@ mod tests {
         let unproved = parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
         create_private_staging_root(&unproved).unwrap();
         assert_eq!(
-            recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+            recover_orphaned_repository_stages(&parent, &final_kin)
+                .unwrap()
+                .recovered,
             0
         );
         assert!(unproved.is_dir());
@@ -3392,7 +3492,9 @@ mod tests {
         create_private_staging_root(&replaced).unwrap();
 
         assert_eq!(
-            recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+            recover_orphaned_repository_stages(&parent, &final_kin)
+                .unwrap()
+                .recovered,
             0
         );
         assert!(replaced.is_dir());
@@ -3418,7 +3520,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+            recover_orphaned_repository_stages(&parent, &final_kin)
+                .unwrap()
+                .recovered,
             0
         );
         assert!(non_private_stage.is_dir());
@@ -3430,7 +3534,9 @@ mod tests {
         std::fs::hard_link(&non_private_owner, &hard_link).unwrap();
 
         assert_eq!(
-            recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+            recover_orphaned_repository_stages(&parent, &final_kin)
+                .unwrap()
+                .recovered,
             0
         );
         assert!(non_private_stage.is_dir());
@@ -3462,12 +3568,16 @@ mod tests {
         drop(prepared);
 
         assert_eq!(
-            recover_orphaned_repository_stages(&parent, &other_final_kin).unwrap(),
+            recover_orphaned_repository_stages(&parent, &other_final_kin)
+                .unwrap()
+                .recovered,
             0
         );
         assert!(staging_root.is_dir());
         assert_eq!(
-            recover_orphaned_repository_stages(&parent, &final_kin).unwrap(),
+            recover_orphaned_repository_stages(&parent, &final_kin)
+                .unwrap()
+                .recovered,
             1
         );
         assert!(!staging_root.exists());

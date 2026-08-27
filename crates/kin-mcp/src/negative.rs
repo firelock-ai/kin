@@ -1438,6 +1438,12 @@ fn focal_resolution_gap(payload: &Value, subject: &str) -> Option<String> {
     }
 }
 
+/// The limiting-factor id a spine-clipped trace reports under.
+///
+/// Spelled once so the gate, the clause and every test key on one string, the
+/// way `caller_arrival` spells its own.
+pub(crate) const TRACE_SPINE_CLIPPED_LIMITING_FACTOR: &str = "trace_spine_clipped";
+
 fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     let mut gaps = Vec::new();
 
@@ -1459,6 +1465,32 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     // twin a question that was asked of one.
     if let Some(gap) = focal_resolution_gap(payload, "an empty chain") {
         gaps.push(gap);
+    }
+
+    // Spine clipping supersedes the two general cap clauses below, and this is
+    // the whole subject of FIR-2781. A cap at the end of a branch costs breadth
+    // a reader can see missing; a cap the walk went on BENEATH hands back a route
+    // that reads like the route while the neighbours it dropped were never
+    // followed. Only the second makes "this chain does not contain X" mean
+    // nothing at all, and it is the state in which a stranger walked `verify`
+    // from `requests.get`, never reached `HTTPAdapter.send`, and would have
+    // written that `verify` ends at `Session.send` had they trusted the answer.
+    //
+    // The walker already discloses this precisely, as a `fanout_cap` /
+    // `spine_clipped` degradation whose detail says the absence proves nothing.
+    // That sentence never reached the verdict: `trace_data_flow` is excluded by
+    // name from the `retrieval_degraded` gap, on the correct ground that it
+    // states its gaps in walk vocabulary here instead, and this function had no
+    // spine clause. So the right sentence existed in a channel the verdict does
+    // not read for this tool, and what a caller saw in `limiting_factor` was a
+    // cap notice they could reasonably hear as a lower bound.
+    let spine_clipped = payload
+        .get("spine_clipped_steps")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if spine_clipped > 0 {
+        gaps.push(spine_clipping_gap(payload, spine_clipped));
+        return gaps;
     }
 
     // A walk cut short by its own caps or work ceilings stopped before it could
@@ -1483,6 +1515,70 @@ fn trace_flow_gaps(payload: &Value) -> Vec<String> {
     }
 
     gaps
+}
+
+/// The limiting factor for a chain the walk continued beneath a clipped node.
+///
+/// It ABSORBS the two clauses it supersedes rather than replacing them away: the
+/// cap numbers `trace_walk_truncated` would have carried and the fact that the
+/// walk ran degraded are both stated here, so no information dies with them. It
+/// then adds the part neither could say, which is that the dropped set is drawn
+/// from the same neighbourhood the question is about, so this chain not
+/// containing a hop is not evidence that no such hop exists.
+///
+/// One clause, never several. Three sentences about one cap teach a reader to
+/// skim all three, which is the flooring argument moved down to the clause
+/// level: a caller reading one precise sentence acts on it, and a caller reading
+/// two hedges tunes both out.
+///
+/// Every list inside this clause joins on ", " and never on "; ", which is
+/// [`crate::verdict::CLAUSE_SEPARATOR`]. The vec this returns into is joined on
+/// the separator by its caller, and that is correct, because those elements ARE
+/// clauses; a separator INSIDE one clause is what reaches a reader as a labelled
+/// clause plus an unlabelled fragment.
+fn spine_clipping_gap(payload: &Value, spine_clipped: u64) -> String {
+    let nodes = if spine_clipped == 1 { "node" } else { "nodes" };
+    // The two facts the superseded clauses carried, absorbed rather than lost.
+    let mut absorbed: Vec<String> = Vec::new();
+    if let Some(dropped) = payload.get("steps_omitted").and_then(Value::as_u64) {
+        if dropped > 0 {
+            absorbed.push(format!("{dropped} step(s) were omitted from the response"));
+        }
+    }
+    if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
+        absorbed.push("the walk hit a per-step or total cap".to_string());
+    }
+    if payload
+        .get("degradations")
+        .and_then(Value::as_array)
+        .is_some_and(|degradations| !degradations.is_empty())
+    {
+        absorbed.push("the walk ran degraded under its own work bounds".to_string());
+    }
+    let carried = if absorbed.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", absorbed.join(", "))
+    };
+    let crossing = match payload
+        .get("spine_dropped_crossing_file")
+        .and_then(Value::as_u64)
+    {
+        Some(count) if count > 0 => {
+            format!(", {count} of the dropped neighbours lived outside the file that offered them")
+        }
+        _ => String::new(),
+    };
+    format!(
+        "{TRACE_SPINE_CLIPPED_LIMITING_FACTOR}: the walk continued beneath {spine_clipped} \
+         {nodes} whose fan-out the per-step cap had already cut{carried}{crossing}, so the \
+         neighbours it dropped were never followed and this chain is one route among the ones \
+         the cap happened to keep. It is NOT a lower bound on a complete search: a hop missing \
+         from it was not looked for, so its absence is no evidence that the focal cannot reach \
+         it, and no conclusion of the form \"X never reaches Y\" may be drawn from this answer. \
+         Name the symbol you are after as `target` so the cap ranks toward it, or re-query the \
+         clipped node with a larger `limit_per_step`"
+    )
 }
 
 /// The component and reason a retrieval payload files its corpus-scale
@@ -1856,7 +1952,7 @@ fn focal_is_method(payload: &Value) -> bool {
 /// cannot act on, describing a state the response already reports in full under
 /// `cross_repo`, teaches the reader to discount every limit including the real
 /// ones.
-enum CrossRepoQualifier {
+pub(crate) enum CrossRepoQualifier {
     /// The spine answered completely. Nothing to report.
     Complete,
     /// A configured spine failed, went stale, or answered incompletely. The
@@ -1921,6 +2017,28 @@ fn apply_cross_repo_qualifier(
         CrossRepoQualifier::Gap(reason) => push_gap(trustworthy, trust_reason, reason),
         CrossRepoQualifier::Note(note) => notes.push(note),
         CrossRepoQualifier::Complete => {}
+    }
+}
+
+/// The cross-repo qualifier this response earns, for the callers that need it
+/// outside this gate.
+///
+/// Exposed because [`crate::verdict`] must weigh the same fact, and a second
+/// implementation of "is cross-repo authority a gap" would drift from this one.
+/// The rule lives here once; the verdict maps it onto a reading.
+///
+/// `None` means the payload carries no cross-repo accounting at all, which is
+/// not the same as reporting that nothing was missed. This gate treats an absent
+/// block as a gap when an absence is being claimed, because an answer that says
+/// "nothing references this" while silently reporting no cross-repo authority is
+/// the exact shape it exists to refuse. A populated answer claims no absence, so
+/// there the honest reading is that the concept is not carried.
+pub(crate) fn cross_repo_qualifier(tool: &str, payload: &Value) -> Option<CrossRepoQualifier> {
+    payload.get("cross_repo")?;
+    match tool {
+        "find_references" => Some(cross_repo_references_qualifier(payload)),
+        "bulk_check_references" => Some(cross_repo_bulk_qualifier(payload)),
+        _ => None,
     }
 }
 
@@ -2176,6 +2294,33 @@ pub fn negative_for(
     // resolves a name.
     if tool == "find_references" {
         if let Some(gap) = focal_resolution_gap(payload, "this reference list") {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
+    }
+
+    // Whether a caller could have arrived through a call the graph does not hold
+    // (FIR-2775). Scoped to answers that claim an absence, like the cross-repo
+    // gate below and for the same reason: a shortfall in the arrival paths
+    // bounds what "nothing calls this" can mean, and says nothing about whether
+    // the rows a populated answer did return are real.
+    //
+    // This is the gap that had no input at all. `storage.note_body` was called
+    // once, from a test that reached the module through `from notekeeper import
+    // storage`, and the linker declined to bind the call. Every other gate here
+    // read a healthy store and agreed, so the answer certified: state
+    // `certified`, `absence_claim: authoritative`, `safe_to_conclude_absent:
+    // true`, `limiting_factor: null`, about a function one grep proves is used.
+    // The file that called it had produced 15 entities, so the
+    // file-produced-nothing warning did not apply, and no other signal in the
+    // envelope could see a call site that became no edge.
+    // Shared with `get_context_pack` on purpose, exactly like the method gate
+    // below. A pack's `dependents` group is built by the same collector over the
+    // same edges, so it inherits the same gap; gating this on `find_references`
+    // alone would let the tool that refuses to certify and the tool that
+    // publishes `[]` read one incomplete call graph and answer opposite things,
+    // which is the disagreement the method gate was widened to end.
+    if matches!(tool, "find_references" | "get_context_pack") && claims_absence {
+        if let Some(gap) = crate::caller_arrival::arrival_gap(payload) {
             push_gap(&mut trustworthy, &mut trust_reason, gap);
         }
     }
@@ -2821,7 +2966,138 @@ mod tests {
                 "matched": "exact_focal_name",
                 "other_candidates": [],
             },
+            // Every real answer carries this block too (FIR-2775), for the same
+            // reason the resolution block above is here: a fixture without one
+            // is not a smaller response, it is a shape the handler cannot
+            // produce, and leaving it out would exercise the absence gates
+            // against a payload that never says whether a caller could have
+            // arrived through an edge the graph does not hold.
+            //
+            // Healthy by default, which is what makes this fixture a control:
+            // the gate below has to leave an accounted arrival alone, or every
+            // absence in this module goes inconclusive and the envelope stops
+            // meaning anything.
+            crate::caller_arrival::CALLER_ARRIVAL_KEY: {
+                "state": "accounted",
+                "family_files": 2,
+                "family_measured": 2,
+                "unaccounted_files": [],
+                "unmeasured_reason": null,
+            },
         })
+    }
+
+    /// FIR-2775, the reproduction. A Python package under `src/` whose test
+    /// reached a module through `from notekeeper import storage` and called
+    /// `storage.note_body(db, note.id)`. The parser read the call, the linker
+    /// declined to bind it, and nothing recorded the decline, so this answer
+    /// came back `certified` / `safe_to_conclude_absent: true` about a function
+    /// one grep proves is used. Every other gate in this module read a healthy
+    /// store and agreed, which is why the reading had to be added rather than
+    /// tightened.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_a_caller_could_arrive_unaccounted() {
+        let mut payload = authoritative_empty_references("function");
+        payload[crate::caller_arrival::CALLER_ARRIVAL_KEY] = json!({
+            "state": "unaccounted",
+            "family_files": 1,
+            "family_measured": 0,
+            "unaccounted_files": [{
+                "file": "tests/test_storage.py",
+                "parsed_call_sites": null,
+                "resolved_call_edges": 2,
+                "unaccounted_call_sites": null,
+            }],
+            "unmeasured_reason": null,
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(crate::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+            "the limiting factor must lead the reason: {reason}"
+        );
+        assert!(
+            reason.contains("tests/test_storage.py"),
+            "the reason names the file whose calls became no edge: {reason}"
+        );
+    }
+
+    /// The control the ticket demands beside it. Flooring every absence destroys
+    /// the envelope's value in the other direction, so the accounted arrival the
+    /// shared fixture carries must leave an authoritative absence alone.
+    #[test]
+    fn find_references_absence_stays_authoritative_when_every_arrival_is_accounted() {
+        let payload = authoritative_empty_references("function");
+        assert_eq!(
+            payload[crate::caller_arrival::CALLER_ARRIVAL_KEY]["state"],
+            json!("accounted"),
+            "the control is only a control while the fixture is healthy"
+        );
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+    }
+
+    /// An arrival the reading could not take is not an arrival it cleared. The
+    /// two states are one word apart in the payload and opposite in consequence,
+    /// so each gets its own arm.
+    #[test]
+    fn find_references_absence_is_inconclusive_when_arrival_could_not_be_measured() {
+        let mut payload = authoritative_empty_references("function");
+        payload[crate::caller_arrival::CALLER_ARRIVAL_KEY] = json!({
+            "state": "unmeasured",
+            "family_files": 0,
+            "family_measured": 0,
+            "unaccounted_files": [],
+            "unmeasured_reason": "the graph holds no import or include edge into this file",
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("empty references yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.starts_with(crate::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR),
+            "an unmeasured arrival names itself rather than borrowing the unresolved id: {reason}"
+        );
+    }
+
+    /// The gate is scoped to answers that claim an absence, like the cross-repo
+    /// one below it. An answer holding rows asserts nothing about what is not
+    /// there, and putting a floor under it would report every populated answer
+    /// on every repository with one unresolvable call as limited.
+    #[test]
+    fn an_answer_with_rows_is_not_limited_by_an_unaccounted_arrival() {
+        let mut payload = authoritative_empty_references("function");
+        payload["total_upstream"] = json!(1);
+        payload["references"] = json!([{ "name": "caller", "file_path": "app.py" }]);
+        payload[crate::caller_arrival::CALLER_ARRIVAL_KEY] = json!({
+            "state": "unaccounted",
+            "family_files": 1,
+            "family_measured": 1,
+            "unaccounted_files": [{
+                "file": "tests/test_storage.py",
+                "parsed_call_sites": 3,
+                "resolved_call_edges": 2,
+                "unaccounted_call_sites": 1,
+            }],
+            "unmeasured_reason": null,
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("a populated reference answer is still qualified");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "no absence is claimed by an answer with rows"
+        );
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains(crate::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+            "the arrival gate must not fire on an answer that claims no absence: {reason}"
+        );
     }
 
     /// FIR-2475, the verdict half. `find_references` published a
@@ -3950,6 +4226,76 @@ mod tests {
             },
             "edge_coverage": coverage,
         })
+    }
+
+    /// FIR-2775's two-surface arm. The gate that refuses to certify a reference
+    /// absence a dropped call could be hiding in has to reach `get_context_pack`
+    /// too, because a pack's `dependents` group is built by the same collector
+    /// over the same edges. Gating a shared gap on the tool name alone is how
+    /// two surfaces over one graph came to answer opposite things about one
+    /// entity: the tool that refused to certify and the tool that published `[]`
+    /// were reading the identical incomplete call graph.
+    ///
+    /// So this asserts the AGREEMENT rather than each end separately. One block,
+    /// both tools, one verdict, and the healthy control beside it in the same
+    /// test so a fix that floors both surfaces cannot pass either.
+    #[test]
+    fn both_reference_surfaces_reach_one_verdict_on_one_arrival_reading() {
+        let unaccounted = json!({
+            "state": "unaccounted",
+            "family_files": 1,
+            "family_measured": 0,
+            "unaccounted_file_count": 1,
+            "unaccounted_files": [{
+                "file": "tests/test_storage.py",
+                "parsed_call_sites": null,
+                "resolved_call_edges": 2,
+                "unaccounted_call_sites": null,
+            }],
+            "unaccounted_files_truncated": false,
+            "unmeasured_reason": null,
+        });
+        let accounted = json!({
+            "state": "accounted",
+            "family_files": 2,
+            "family_measured": 2,
+            "unaccounted_file_count": 0,
+            "unaccounted_files": [],
+            "unaccounted_files_truncated": false,
+            "unmeasured_reason": null,
+        });
+
+        for (block, expected, label) in [
+            (&unaccounted, false, "an unaccounted arrival"),
+            (&accounted, true, "an accounted arrival"),
+        ] {
+            let mut references = authoritative_empty_references("function");
+            references[crate::caller_arrival::CALLER_ARRIVAL_KEY] = block.clone();
+            let mut pack = empty_pack_dependents("function", cross_file_edges_observed());
+            pack[crate::caller_arrival::CALLER_ARRIVAL_KEY] = block.clone();
+
+            let from_references =
+                negative_for("find_references", &references, &structural_ready_envelope())
+                    .expect("empty references yields a negative");
+            let from_pack = negative_for("get_context_pack", &pack, &structural_ready_envelope())
+                .expect("an empty dependents group yields a negative");
+
+            assert_eq!(
+                from_references["safe_to_conclude_absent"],
+                json!(expected),
+                "{label}: find_references answered the wrong way"
+            );
+            assert_eq!(
+                from_pack["safe_to_conclude_absent"],
+                json!(expected),
+                "{label}: get_context_pack answered the wrong way"
+            );
+            assert_eq!(
+                from_references["safe_to_conclude_absent"], from_pack["safe_to_conclude_absent"],
+                "{label}: the two surfaces disagreed over one reading, which is the exact \
+                 failure this gate is shared to prevent"
+            );
+        }
     }
 
     /// FIR-2474, the half an agent acts on. `get_context_pack` published
@@ -5463,6 +5809,246 @@ mod tests {
             json!(true),
             "an outgoing-only walk never read the under-resolved edges: {negative}"
         );
+    }
+
+    /// The requests-shaped fixture, FIR-2781's own case. A POPULATED chain whose
+    /// spine was clipped: the stranger walked `verify` from `requests.get`,
+    /// `limit_per_step` threw away 11 of `Session.send`'s 15 callees before
+    /// relevance was consulted, `HTTPAdapter.send` never appeared, and the
+    /// answer read as a lower bound. Had they trusted it they would have written
+    /// that `verify` ends at `Session.send`.
+    fn spine_clipped_trace() -> Value {
+        let mut payload = clean_empty_trace("calls");
+        // Populated, which is the point: this defect does not need an empty
+        // answer, and the gate must fire on a chain that returned rows.
+        payload["chain"] = json!([
+            { "entity_name": "get", "parent_step": null, "step": 0 },
+            { "entity_name": "request", "parent_step": 0, "step": 1 },
+            { "entity_name": "Session.request", "parent_step": 1, "step": 2 },
+            { "entity_name": "Session.send", "parent_step": 2, "step": 3 },
+            { "entity_name": "resolve_redirects", "parent_step": 3, "step": 4 },
+        ]);
+        payload["total_steps"] = json!(5);
+        payload["truncated"] = json!(true);
+        payload["steps_omitted"] = json!(126);
+        payload["spine_clipped_steps"] = json!(1);
+        payload["spine_dropped_crossing_file"] = json!(11);
+        payload["degradations"] = json!([
+            { "component": "fanout_cap", "reason": "spine_clipped" }
+        ]);
+        payload
+    }
+
+    /// The refusal itself: a spine-clipped answer may not be read as evidence
+    /// that the focal cannot reach something, and the sentence has to say so in
+    /// words a caller cannot hear as a mere lower bound.
+    #[test]
+    fn a_spine_clipped_chain_refuses_the_never_reaches_conclusion() {
+        let negative = negative_for(
+            "trace_data_flow",
+            &spine_clipped_trace(),
+            &structural_ready_envelope(),
+        )
+        .expect("a qualified trace answer yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains(TRACE_SPINE_CLIPPED_LIMITING_FACTOR),
+            "the spine clause must be in the factor: {reason}"
+        );
+        // The three things the acceptance asks the sentence to say, each checked
+        // rather than assumed from the id being present.
+        assert!(
+            reason.contains("NOT a lower bound"),
+            "the sentence must refuse the lower-bound reading outright: {reason}"
+        );
+        assert!(
+            reason.contains("was not looked for"),
+            "it must say the missing hop was never searched, not merely not found: {reason}"
+        );
+        assert!(
+            reason.contains("X never reaches Y"),
+            "it must name the conclusion it forbids: {reason}"
+        );
+    }
+
+    /// The captain's first condition: the specific clause ABSORBS the two it
+    /// supersedes rather than replacing them away, so no information dies with
+    /// them.
+    #[test]
+    fn the_spine_clause_carries_what_the_clauses_it_supersedes_would_have_said() {
+        let negative = negative_for(
+            "trace_data_flow",
+            &spine_clipped_trace(),
+            &structural_ready_envelope(),
+        )
+        .unwrap();
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("126 step(s) were omitted"),
+            "the omitted count trace_walk_truncated would have implied must survive: {reason}"
+        );
+        assert!(
+            reason.contains("hit a per-step or total cap"),
+            "the cap fact must survive: {reason}"
+        );
+        assert!(
+            reason.contains("ran degraded"),
+            "the degraded fact trace_walk_degraded carried must survive: {reason}"
+        );
+        assert!(
+            reason.contains("11 of the dropped neighbours lived outside the file"),
+            "the cross-file count must survive: {reason}"
+        );
+    }
+
+    /// The captain's second condition, pinned as a property rather than left an
+    /// implementation detail: a spine-clipped answer carries EXACTLY ONE cap
+    /// clause. Goes red if anyone re-adds a general clause beside the specific
+    /// one, or breaks the supersession so both fire.
+    ///
+    /// Its controls sit in the same test, because a supersession assertion with
+    /// no control is satisfied by a gate that emits nothing at all: a non-spine
+    /// truncation must still get `trace_walk_truncated`, and a non-spine
+    /// degradation must still get `trace_walk_degraded`, each untouched.
+    #[test]
+    fn a_spine_clipped_answer_carries_exactly_one_cap_clause() {
+        let negative = negative_for(
+            "trace_data_flow",
+            &spine_clipped_trace(),
+            &structural_ready_envelope(),
+        )
+        .unwrap();
+        let reason = negative["trust_reason"].as_str().unwrap();
+        let cap_clauses = [
+            TRACE_SPINE_CLIPPED_LIMITING_FACTOR,
+            "trace_walk_truncated",
+            "trace_walk_degraded",
+        ]
+        .iter()
+        .filter(|id| reason.contains(**id))
+        .count();
+        assert_eq!(
+            cap_clauses, 1,
+            "one cap, one sentence: three sentences about one cap teach a reader to skim all \
+             three. Got {cap_clauses} in: {reason}"
+        );
+        assert!(reason.contains(TRACE_SPINE_CLIPPED_LIMITING_FACTOR));
+
+        // Control one: truncation that did NOT clip the spine keeps the general
+        // clause, untouched.
+        let mut truncated = clean_empty_trace("both");
+        truncated["truncated"] = json!(true);
+        let general =
+            negative_for("trace_data_flow", &truncated, &structural_ready_envelope()).unwrap();
+        let general_reason = general["trust_reason"].as_str().unwrap();
+        assert!(
+            general_reason.contains("trace_walk_truncated"),
+            "a non-spine truncation must still get the general clause: {general_reason}"
+        );
+        assert!(
+            !general_reason.contains(TRACE_SPINE_CLIPPED_LIMITING_FACTOR),
+            "and must not get the spine clause: {general_reason}"
+        );
+
+        // Control two: a degradation that did NOT clip the spine likewise.
+        let mut degraded = clean_empty_trace("both");
+        degraded["degradations"] = json!([{ "component": "entity_bodies", "reason": "budget" }]);
+        let general =
+            negative_for("trace_data_flow", &degraded, &structural_ready_envelope()).unwrap();
+        let general_reason = general["trust_reason"].as_str().unwrap();
+        assert!(
+            general_reason.contains("trace_walk_degraded"),
+            "a non-spine degradation must still get the general clause: {general_reason}"
+        );
+        assert!(
+            !general_reason.contains(TRACE_SPINE_CLIPPED_LIMITING_FACTOR),
+            "and must not get the spine clause: {general_reason}"
+        );
+    }
+
+    /// The other half of the control the ticket demands: an unclipped trace
+    /// still certifies. A gate that refused every trace would pass every
+    /// assertion above and be worthless.
+    #[test]
+    fn an_unclipped_trace_still_certifies() {
+        let negative = negative_for(
+            "trace_data_flow",
+            &clean_empty_trace("both"),
+            &structural_ready_envelope(),
+        )
+        .unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains(TRACE_SPINE_CLIPPED_LIMITING_FACTOR),
+            "{reason}"
+        );
+
+        // And clipping that is NOT on the spine is not spine clipping. A clip at
+        // the end of a branch costs breadth a reader can see missing; only a clip
+        // the walk continued BENEATH makes the chain read like the route while
+        // hiding the hop. This is the sharper control, because a gate keyed on
+        // `clipped_steps` rather than on `spine_clipped_steps` passes every other
+        // arm here and fails this one.
+        let mut off_spine = clean_empty_trace("both");
+        off_spine["clipped_steps"] = json!([
+            { "entity_name": "leaf", "step": 9, "continued_below": false, "dropped_callees": 4 }
+        ]);
+        let negative =
+            negative_for("trace_data_flow", &off_spine, &structural_ready_envelope()).unwrap();
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains(TRACE_SPINE_CLIPPED_LIMITING_FACTOR),
+            "a clip the walk did not continue beneath is not spine clipping: {reason}"
+        );
+    }
+
+    /// The join rule, asserted on this producer rather than trusted to the guard
+    /// that drives a different one by name.
+    ///
+    /// The clause names a list of absorbed facts, and the vec it returns into is
+    /// joined on `CLAUSE_SEPARATOR` by its caller. Joining CLAUSES on the
+    /// separator is correct; a separator INSIDE one clause reaches a reader as a
+    /// labelled clause plus an unlabelled fragment.
+    #[test]
+    fn the_spine_clause_never_carries_the_clause_separator() {
+        let mut seen = 0;
+        for (label, payload) in [
+            ("all facts absorbed", spine_clipped_trace()),
+            ("no cross-file drops", {
+                let mut p = spine_clipped_trace();
+                p.as_object_mut()
+                    .unwrap()
+                    .remove("spine_dropped_crossing_file");
+                p
+            }),
+            ("clipped but neither truncated nor degraded", {
+                let mut p = spine_clipped_trace();
+                p["truncated"] = json!(false);
+                p.as_object_mut().unwrap().remove("steps_omitted");
+                p["degradations"] = json!([]);
+                p
+            }),
+            ("several spine nodes", {
+                let mut p = spine_clipped_trace();
+                p["spine_clipped_steps"] = json!(4);
+                p
+            }),
+        ] {
+            let clause = spine_clipping_gap(
+                &payload,
+                payload["spine_clipped_steps"].as_u64().unwrap_or(1),
+            );
+            seen += 1;
+            assert!(
+                !clause.contains(crate::verdict::CLAUSE_SEPARATOR),
+                "{label}: the clause carries the separator, so any reader that splits the \
+                 rendered factor cuts it into a labelled clause and an unlabelled fragment: \
+                 {clause}"
+            );
+        }
+        assert!(seen > 0, "no clause was produced, so this asserted nothing");
     }
 
     /// A walk stopped by its own caps or work bounds did not examine what an

@@ -1836,11 +1836,22 @@ fn embed_batch_under_pressure(
     }
 }
 
-/// One row of the host's process table, in the three fields a footprint needs.
+/// One row of the host's process table, in the four fields a footprint needs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ProcessRow {
     pub(crate) pid: u32,
     pub(crate) parent: Option<u32>,
+    /// Whether the host reported this row as a THREAD of `parent` rather than
+    /// as a process of its own.
+    ///
+    /// Linux lists a process's threads under `/proc/<pid>/task` and `sysinfo`
+    /// returns them from `processes()` beside real processes, each with its own
+    /// tid as a pid and its owning process as its parent. Nothing in the shape
+    /// of such a row says it is not a process, which is the whole of FIR-2823:
+    /// a thread shares its process's address space, so `/proc/<tid>/smaps_rollup`
+    /// answers with the WHOLE process's proportional set, and charging one row
+    /// per thread multiplies a daemon's footprint by its thread count.
+    pub(crate) is_thread: bool,
     /// What this process contributes to what the container is charged: a
     /// proportional or private figure, never a resident set. See
     /// [`kin_daemon_spawn::process_footprint_bytes`] for what each platform
@@ -1872,6 +1883,17 @@ pub(crate) struct ProcessRow {
 /// refusing to answer, because the descendants are still real and a caller that
 /// got nothing would fall back to the pre-budget behaviour on a reading that
 /// mostly succeeded.
+///
+/// A row the host reported as a THREAD is not a descendant and is never
+/// charged, which is FIR-2823. Threads share one address space, so every one of
+/// them reads back the whole process's proportional set, and counting them as
+/// children multiplies the process by its thread count rather than measuring
+/// anything: the v0.6.1 stranger measured a 1.41 GiB daemon reporting 10.35
+/// GiB, its own figure repeated once per thread, which refused background
+/// embedding on a repository that had room and left it at 0 of 2116 vectors for
+/// the life of the container. Skipping the row outright loses nothing a real
+/// child would have contributed, because Linux parents a process forked from a
+/// thread to the thread's PROCESS, so no real descendant ever hangs off a tid.
 pub(crate) fn tree_footprint_from(
     root: u32,
     rows: &[ProcessRow],
@@ -1890,6 +1912,9 @@ pub(crate) fn tree_footprint_from(
         }
         for row in rows.iter().filter(|row| row.parent == Some(pid)) {
             if !visited.insert(row.pid) {
+                continue;
+            }
+            if row.is_thread {
                 continue;
             }
             children_bytes = children_bytes.saturating_add(row.footprint_bytes);
@@ -1946,22 +1971,7 @@ fn sample_tree_footprint() -> Option<kin_core::memory_pressure::TreeFootprint> {
 /// accessor states the intent without arguing with a guard that is right to be
 /// blunt.
 fn walk_process_table() -> Option<kin_core::memory_pressure::TreeFootprint> {
-    let me = sysinfo::get_current_pid().ok()?;
-    let mut system = sysinfo::System::new();
-    system.refresh_processes_specifics(
-        sysinfo::ProcessesToUpdate::All,
-        true,
-        sysinfo::ProcessRefreshKind::nothing().with_memory(),
-    );
-    let rows = system
-        .processes()
-        .iter()
-        .map(|(pid, process)| ProcessRow {
-            pid: pid.as_u32(),
-            parent: process.parent().map(|parent| parent.as_u32()),
-            footprint_bytes: row_footprint_bytes(pid.as_u32(), process),
-        })
-        .collect::<Vec<_>>();
+    let (me, rows) = current_process_rows()?;
     if rows.is_empty() {
         return None;
     }
@@ -1972,15 +1982,61 @@ fn walk_process_table() -> Option<kin_core::memory_pressure::TreeFootprint> {
     // a figure nobody could take.
     if !rows
         .iter()
-        .any(|row| row.pid == me.as_u32() && row.footprint_bytes > 0)
+        .any(|row| row.pid == me && row.footprint_bytes > 0)
     {
         return None;
     }
-    let folded = tree_footprint_from(me.as_u32(), &rows);
+    let folded = tree_footprint_from(me, &rows);
     // Held to what the kernel says this container is charged, so the figure a
     // reader sees beside a cap can never exceed it. Off a cgroup there is no
     // such ceiling and the reading stands as measured.
     Some(folded.clamped_to(kin_daemon_spawn::cgroup_memory().current_bytes))
+}
+
+/// This process's pid and the host's process table as rows the fold can take.
+///
+/// Split from the fold above it so the marking can be checked against a real
+/// host. The fold's refusal to charge a thread is only worth anything if
+/// something actually marks one, and that join cannot be seen from either side
+/// alone: a `thread_kind()` that never answered `Some` would leave the fold's
+/// rule dead and every synthetic test still green, which is exactly how
+/// FIR-2823 would come back.
+fn current_process_rows() -> Option<(u32, Vec<ProcessRow>)> {
+    let me = sysinfo::get_current_pid().ok()?.as_u32();
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing().with_memory(),
+    );
+    let rows = system
+        .processes()
+        .iter()
+        .map(|(pid, process)| {
+            // `thread_kind()` is `Some` exactly for the `/proc/<pid>/task`
+            // entries Linux publishes beside real processes, and `None` for a
+            // process on every platform. A thread is marked rather than dropped
+            // here so the rule that refuses to charge it lives in the fold,
+            // where the budget rests on it and a synthetic table can exercise
+            // it.
+            let is_thread = process.thread_kind().is_some();
+            ProcessRow {
+                pid: pid.as_u32(),
+                parent: process.parent().map(|parent| parent.as_u32()),
+                is_thread,
+                // Not read for a thread: `/proc/<tid>/smaps_rollup` answers
+                // with the whole owning process's proportional set, so the
+                // figure would be both wrong and, on a large address space,
+                // expensive to be wrong with.
+                footprint_bytes: if is_thread {
+                    0
+                } else {
+                    row_footprint_bytes(pid.as_u32(), process)
+                },
+            }
+        })
+        .collect::<Vec<_>>();
+    Some((me, rows))
 }
 
 /// What one row of the process table contributes, in bytes.
@@ -7593,6 +7649,20 @@ mod memory_pressure_tests {
         ProcessRow {
             pid,
             parent,
+            is_thread: false,
+            footprint_bytes,
+        }
+    }
+
+    /// One `/proc/<pid>/task` row as Linux publishes it: its own tid, its
+    /// owning process as its parent, and, because a thread shares that
+    /// process's address space, that process's whole proportional set as its
+    /// reading. FIR-2823.
+    fn thread_of(tid: u32, owner: u32, footprint_bytes: u64) -> ProcessRow {
+        ProcessRow {
+            pid: tid,
+            parent: Some(owner),
+            is_thread: true,
             footprint_bytes,
         }
     }
@@ -7641,6 +7711,7 @@ mod memory_pressure_tests {
             .map(|(pid, parent, body)| ProcessRow {
                 pid: *pid,
                 parent: *parent,
+                is_thread: false,
                 footprint_bytes: kin_daemon_spawn::resolve_process_footprint(
                     Some(body),
                     None,
@@ -7745,6 +7816,193 @@ mod memory_pressure_tests {
         );
     }
 
+    /// FIR-2823, over the process table Linux publishes for a threaded daemon.
+    ///
+    /// The shape is the v0.6.1 stranger's express reading: one daemon whose
+    /// eleven threads `sysinfo` returns from `processes()` beside real
+    /// processes, each with its own tid and the daemon as its parent. Every
+    /// thread row carries the daemon's rollup VERBATIM, because that is what
+    /// `/proc/<tid>/smaps_rollup` answers with: threads share one address
+    /// space, so each reads back the whole process's proportional set.
+    ///
+    /// Two real descendants sit beside the threads, a language server and its
+    /// worker, so the test separates the fix from an over-deletion. A fold that
+    /// stopped counting children at all would satisfy "the number got smaller"
+    /// and fails here on `child_count` and on the children's own bytes.
+    ///
+    /// The pre-fix figure is computed from the same fixture rather than written
+    /// down, so the control and the experiment cannot drift apart.
+    #[test]
+    fn a_daemons_threads_are_not_children_and_are_counted_once() {
+        const KB: u64 = 1024;
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // The measured express daemon: 1.41 GiB resident, 0.863 GiB
+        // proportional, eleven threads, and Kin reporting 10.35 GiB.
+        const DAEMON_RSS_KB: u64 = 1_478_656;
+        const DAEMON_PSS_KB: u64 = 905_216;
+        const THREADS: u64 = 11;
+        const SERVER_PSS_KB: u64 = 512 * KB;
+        const WORKER_PSS_KB: u64 = 128 * KB;
+
+        fn rollup(rss_kb: u64, pss_kb: u64) -> String {
+            format!(
+                "Rss:            {rss_kb} kB\nPss:            {pss_kb} kB\n\
+                 Shared_Clean:   {} kB\nPrivate_Clean:  {pss_kb} kB\n",
+                rss_kb.saturating_sub(pss_kb),
+            )
+        }
+        let read = |body: &str| {
+            kin_daemon_spawn::resolve_process_footprint(Some(body), None, None, 4096)
+                .expect("a rollup carrying a Pss line is readable")
+        };
+
+        let daemon_body = rollup(DAEMON_RSS_KB, DAEMON_PSS_KB);
+        let daemon_bytes = read(&daemon_body);
+        let server_bytes = read(&rollup(SERVER_PSS_KB * 2, SERVER_PSS_KB));
+        let worker_bytes = read(&rollup(WORKER_PSS_KB * 2, WORKER_PSS_KB));
+
+        // The fixture's central claim, asserted rather than assumed: a thread's
+        // rollup IS its process's, so a thread row's reading is the daemon's
+        // own figure over again.
+        let thread_bytes = read(&daemon_body);
+        assert_eq!(
+            thread_bytes, daemon_bytes,
+            "a thread reads back the whole address space it shares, which is why summing \
+             threads multiplies rather than measures"
+        );
+
+        let table = |threads: u64| {
+            let mut rows = vec![
+                row(100, Some(1), daemon_bytes),
+                row(200, Some(100), server_bytes),
+                row(201, Some(200), worker_bytes),
+            ];
+            rows.extend((0..threads).map(|n| {
+                thread_of(
+                    u32::try_from(300 + n).expect("fixture tids fit in a u32"),
+                    100,
+                    thread_bytes,
+                )
+            }));
+            rows
+        };
+
+        let tree = tree_footprint_from(100, &table(THREADS));
+
+        assert_eq!(
+            tree.child_count, 2,
+            "the language server and its worker are the daemon's only children; the eleven \
+             threads are the daemon itself"
+        );
+        assert_eq!(
+            tree.own_bytes, daemon_bytes,
+            "the daemon's own proportional set, counted once"
+        );
+        assert_eq!(
+            tree.children_bytes,
+            server_bytes + worker_bytes,
+            "every real descendant still charged, so this cannot be satisfied by counting none"
+        );
+        assert_eq!(
+            tree.total_bytes(),
+            daemon_bytes + server_bytes + worker_bytes,
+            "one reading per process, threads folded into the process that owns them"
+        );
+
+        // The acceptance criterion, stated the way it was written: thread count
+        // must not move the answer.
+        assert_eq!(
+            tree_footprint_from(100, &table(1)),
+            tree_footprint_from(100, &table(64)),
+            "a daemon with 64 threads reports what the same daemon with one thread reports"
+        );
+
+        // The pre-fix arithmetic, from the same fixture: the daemon's own
+        // figure once per thread plus itself.
+        let pre_fix_bytes = daemon_bytes * (THREADS + 1) + server_bytes + worker_bytes;
+        assert!(
+            pre_fix_bytes > 10 * GIB,
+            "the pre-fix reading of this fixture is {pre_fix_bytes} bytes, the 10.35 GiB the \
+             stranger was shown, and this test exists to be able to see it"
+        );
+        assert!(
+            tree.total_bytes() < 2 * GIB,
+            "roughly 1.5 GiB, against the 10.35 GiB reported"
+        );
+
+        // What that costs is not a label on a dial. Under the stranger's 12 GiB
+        // container the derived budget is 6 GiB, and the two readings give
+        // opposite answers to "may background embedding start", which is why
+        // one repository sat at 0 of 2116 vectors.
+        let bars = kin_core::memory_pressure::Thresholds::default();
+        let host = kin_core::memory_pressure::MemoryPressure::Known(
+            kin_core::memory_pressure::MemoryReading {
+                source: kin_core::memory_pressure::PressureSource::Cgroup,
+                limit_bytes: 12 * GIB,
+                used_bytes: 3 * GIB,
+                swap_used_bytes: None,
+                swap_total_bytes: None,
+                oom_kills: Some(0),
+                peak_bytes: None,
+            },
+        );
+        // Derived by hand rather than through `resolve`, for the reason the
+        // FIR-2653 test above gives: a sibling test pins an operator budget,
+        // and a check another test can switch off is a check that cannot fail.
+        let budget = kin_core::memory_pressure::FootprintBudget {
+            bytes: kin_core::memory_pressure::FootprintBudget::derived_from(12 * GIB),
+            source: kin_core::memory_pressure::BudgetSource::Derived,
+        };
+        assert_eq!(budget.bytes, 6 * GIB, "half of a 12 GiB container");
+        let stand = |footprint| kin_core::memory_pressure::BudgetStanding { footprint, budget };
+        assert_eq!(
+            kin_core::memory_pressure::Verdict::decide(
+                kin_core::memory_pressure::HeavyWork::EmbedBatch,
+                &host,
+                Some(&stand(tree)),
+                &bars,
+            ),
+            kin_core::memory_pressure::Verdict::Proceed,
+            "counted once, the daemon has room and embedding starts"
+        );
+        let pre_fix = kin_core::memory_pressure::TreeFootprint {
+            own_bytes: daemon_bytes,
+            children_bytes: pre_fix_bytes - daemon_bytes,
+            child_count: usize::try_from(THREADS).expect("fixture thread count fits") + 2,
+            kernel_capped: false,
+        };
+        assert!(
+            kin_core::memory_pressure::Verdict::decide(
+                kin_core::memory_pressure::HeavyWork::EmbedBatch,
+                &host,
+                Some(&stand(pre_fix)),
+                &bars,
+            )
+            .refused(),
+            "and the pre-fix reading refuses it, which is the defect this fixes"
+        );
+    }
+
+    /// A thread that is somehow reported as owning a process must not smuggle
+    /// that process back into the count through the walk, and a thread of a
+    /// CHILD is the daemon's memory exactly once, through the child.
+    #[test]
+    fn threads_are_skipped_at_every_depth() {
+        let table = [
+            row(100, Some(1), 1024),
+            row(200, Some(100), 2048),
+            thread_of(300, 100, 1024),
+            thread_of(301, 200, 2048),
+        ];
+        let tree = tree_footprint_from(100, &table);
+        assert_eq!(
+            tree.child_count, 1,
+            "one real child, whose own threads are itself"
+        );
+        assert_eq!(tree.children_bytes, 2048, "the child charged once");
+        assert_eq!(tree.total_bytes(), 1024 + 2048);
+    }
+
     /// The shape the measured failure had: a daemon, a language server it
     /// started, and an unrelated process that must not be counted.
     #[test]
@@ -7829,6 +8087,96 @@ mod memory_pressure_tests {
             "a running process holds more than nothing"
         );
         assert!(sampled.total_bytes() >= sampled.own_bytes);
+    }
+
+    /// FIR-2823 on the LIVE path: the seam between marking a thread and
+    /// refusing to charge it.
+    ///
+    /// The fold test proves the fold skips a row marked as a thread. It cannot
+    /// prove anything marks one, and a `thread_kind()` that never answered
+    /// `Some` would leave that rule dead with every synthetic test still green.
+    /// That is the join, so it is asserted over the real process table rather
+    /// than at either end of it: threads this test starts itself must appear as
+    /// thread rows, and the fold over the same reading must not have grown
+    /// children by them.
+    ///
+    /// Linux only, because Linux is the platform that publishes
+    /// `/proc/<pid>/task` and the only one where `sysinfo` returns threads from
+    /// `processes()` at all. On macOS and Windows the reading contains no
+    /// thread rows to find, so this would pass without exercising anything, and
+    /// a check that cannot fail is worse than an absent one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn threads_this_process_starts_are_marked_and_never_become_children() {
+        use super::current_process_rows;
+
+        const SPAWNED: usize = 64;
+
+        let own_threads = |rows: &[ProcessRow], me: u32| {
+            rows.iter()
+                .filter(|row| row.parent == Some(me) && row.is_thread)
+                .count()
+        };
+
+        let (me, before) = current_process_rows().expect("Linux publishes a process table");
+        let threads_before = own_threads(&before, me);
+
+        // Parked rather than spinning, so the threads are alive for the second
+        // reading and cost the box nothing while they wait.
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Arc::new(std::sync::Mutex::new(wait));
+        let started = std::sync::Arc::new(std::sync::Barrier::new(SPAWNED + 1));
+        let handles = (0..SPAWNED)
+            .map(|_| {
+                let wait = std::sync::Arc::clone(&wait);
+                let started = std::sync::Arc::clone(&started);
+                std::thread::spawn(move || {
+                    started.wait();
+                    let _ = wait
+                        .lock()
+                        .expect("the park channel is not poisoned")
+                        .recv();
+                })
+            })
+            .collect::<Vec<_>>();
+        started.wait();
+
+        let (me_again, after) = current_process_rows().expect("Linux publishes a process table");
+        assert_eq!(me_again, me, "the same process across both readings");
+        let threads_after = own_threads(&after, me);
+
+        // Half the join: the marking is live. Without this, the fold's rule
+        // could be unreachable and nothing here would say so.
+        //
+        // An absolute floor rather than a delta, because a delta is only sound
+        // when this test owns the process. `cargo nextest` gives it one, plain
+        // `cargo test --workspace` does not, and there a sibling test's threads
+        // exiting between the two readings subtracts from the delta and fails a
+        // correct build. The floor cannot be gamed the same way: the SPAWNED
+        // threads are alive at the second reading by construction, so anything
+        // that marks threads at all must report at least that many.
+        assert!(
+            threads_after >= SPAWNED,
+            "starting {SPAWNED} threads must show up as thread rows parented to this process: \
+             {threads_before} before, {threads_after} after"
+        );
+
+        // The other half, over that same reading. Bounded by the number of
+        // threads started rather than by an exact count, because other tests in
+        // this binary run concurrently and may hold real child processes; the
+        // pre-fix reading would be at least SPAWNED and this is well under it.
+        let tree = tree_footprint_from(me, &after);
+        assert!(
+            tree.child_count < SPAWNED,
+            "the {SPAWNED} threads this test started are not children of it, yet the fold \
+             counted {} of them",
+            tree.child_count
+        );
+
+        drop(release);
+        for handle in handles {
+            handle.join().expect("a parked thread exits when released");
+        }
     }
 
     /// FIR-2653, on the LIVE path rather than over a fixture.

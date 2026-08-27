@@ -240,6 +240,7 @@ fn trace_callees(
             include_body: Some(false),
             max_response_chars: None,
             include_type_edges: None,
+            target: None,
         },
     )
     .expect("trace fixture")

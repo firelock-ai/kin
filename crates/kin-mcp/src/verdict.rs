@@ -252,6 +252,7 @@ impl Verdict {
             ("edge_coverage", edge_coverage_reading(tool, payload)),
             ("withheld_candidates", withheld_candidates_reading(payload)),
             ("degradations", degradations_reading(payload)),
+            ("cross_repo", cross_repo_reading(tool, payload)),
             ("completeness", completeness_reading(envelope)),
             ("graph_freshness", graph_freshness_reading(envelope)),
         ];
@@ -685,6 +686,63 @@ fn withheld_candidates_reading(payload: &Value) -> Reading {
              and are not in the counts here, so the headline is a floor and each withheld row \
              may belong in it"
         )]),
+    }
+}
+
+/// Whether the configured cross-repo authority could answer for this response.
+///
+/// The absence gate already weighs this, and weighs it well, but only on an
+/// answer that CLAIMS an absence. That scoping is deliberate and it is right for
+/// what it was written for: a populated answer claims nothing is missing, so
+/// refusing there on a store with no spine would put a floor under every answer
+/// forever.
+///
+/// What it leaves uncovered is the case this input exists for. A populated
+/// answer is presented as the reference set, and when a configured spine went
+/// stale or answered incompletely, every cross-repo row is missing from a set
+/// nothing marks as partial. That is `find_references` certifying an answer as
+/// the whole set while recording that a class is absent, one level up: the class
+/// here is every other repository. The gap belongs in the verdict on both
+/// shapes of answer, and only the absence claim differs.
+///
+/// The rule itself is not restated here. [`crate::negative::cross_repo_qualifier`]
+/// owns it, so this reading and the absence gate can never disagree about what
+/// counts as a gap, and the clause text is identical, which is what makes the
+/// composer's label dedupe collapse them to one on an answer where both speak.
+///
+/// Silent, never refusing, in the states that are facts about an install rather
+/// than limits on an answer: no spine configured, and a repository the spine has
+/// not registered. Both already travel as notes on the absence path, and both
+/// are the ordinary state of a healthy single-repo store, so refusing on either
+/// is the "mark everything uncertain" regression arriving by a side door.
+///
+/// Silent on a third, which the absence path does treat as a gap and this one
+/// deliberately does not. An `unavailable` carrying no `code` is a caller that
+/// never bound to a repository at all, not a spine that failed:
+/// the absence gate's own unavailable-qualifier states the principle
+/// itself, that every code "describes a spine that IS configured and did not
+/// answer", and an uncoded reason reaches the gap branch only through the
+/// catch-all label. `kin refs` is such a caller on every invocation, since it
+/// resolves its binding from `KIN_REPO_ID` and that is an override rather than
+/// something an install sets, so weighing it here would mark every CLI reference
+/// answer on every machine a lower bound. The absence path keeps its stricter
+/// reading, because an answer asserting that nothing references a symbol while
+/// reporting no cross-repo authority is exactly what that gate exists to refuse,
+/// and a populated answer asserts no such thing.
+fn cross_repo_reading(tool: &str, payload: &Value) -> Reading {
+    use crate::negative::CrossRepoQualifier;
+    let unbound_caller = payload.get("cross_repo").is_some_and(|cross_repo| {
+        cross_repo.get("status").and_then(Value::as_str) == Some("unavailable")
+            && cross_repo.get("code").and_then(Value::as_str).is_none()
+    });
+    if unbound_caller {
+        return Reading::Silent;
+    }
+    match crate::negative::cross_repo_qualifier(tool, payload) {
+        None => Reading::Silent,
+        Some(CrossRepoQualifier::Complete) => Reading::Certified,
+        Some(CrossRepoQualifier::Note(_)) => Reading::Silent,
+        Some(CrossRepoQualifier::Gap(reason)) => Reading::Inconclusive(vec![reason]),
     }
 }
 
@@ -1784,6 +1842,11 @@ mod tests {
 
     /// A populated reference answer whose every other input is clean, with one
     /// requested class in the state given.
+    /// One focal id for the fixture, named once so the payload's `focal_entity`
+    /// and the cross-repo anchor cannot drift apart into a response that would
+    /// never be produced.
+    const FIXTURE_FOCAL_ID: &str = "0195f2a1-0000-7000-8000-00000000f0ca";
+
     fn populated_reference_payload(imports: &str) -> Value {
         json!({
             "references": [{"name": "index_note"}, {"name": "test_blank_code_masks_fences"}],
@@ -1791,11 +1854,18 @@ mod tests {
             "relation_kinds": ["calls", "imports", "references"],
             "counts": {"receiver_name_candidates": 0},
             "degradations": [],
+            // Complete the way a real answer is complete. The producer always
+            // writes an anchor beside the roots and always writes `focal_entity`,
+            // and the absence gate has always required the anchor to name the
+            // focal this query asked about. A fixture carrying roots and no
+            // anchor describes a response the handler cannot emit.
+            "focal_entity": {"id": FIXTURE_FOCAL_ID},
             "cross_repo": {
                 "status": "available",
                 "authority_complete": true,
                 "authority_revision": "sha256:complete",
                 "authority_roots": {"local": "local-root"},
+                "authority_anchor": {"repo_id": "local", "entity_id": FIXTURE_FOCAL_ID},
             },
             "focal_resolution": {
                 "addressed_by": "entity_id",
@@ -1812,6 +1882,260 @@ mod tests {
                 "budget_exhausted": false,
             },
         })
+    }
+
+    /// FIR-2764. A populated answer whose configured spine answered incompletely
+    /// is a lower bound, and the verdict has to say so.
+    ///
+    /// The absence gate already weighs cross-repo authority, and weighs it well,
+    /// but only on an answer that claims an absence. A populated answer is
+    /// presented as the reference set, so a spine that could not answer means
+    /// every cross-repo row is missing from a set nothing marks as partial.
+    /// Before this input the verdict read six other blocks, none of which can
+    /// see the spine, and certified.
+    #[test]
+    fn a_populated_answer_over_an_incomplete_spine_is_a_lower_bound() {
+        let mut payload = populated_reference_payload("present");
+        payload["cross_repo"]["authority_complete"] = json!(false);
+        let negative = json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+
+        assert_eq!(
+            verdict["state"],
+            json!(INCONCLUSIVE),
+            "a set presented as whole while the spine could not answer: {verdict}"
+        );
+        assert_eq!(
+            verdict["inputs"]["cross_repo"],
+            json!(INCONCLUSIVE),
+            "{verdict}"
+        );
+        let factor = verdict["limiting_factor"].as_str().expect("a factor");
+        assert!(
+            factor.contains("cross_repo_authority_incomplete"),
+            "the factor must name the spine rather than something else: {factor}"
+        );
+    }
+
+    /// The same shape with an `unavailable` spine that named its condition.
+    #[test]
+    fn a_populated_answer_over_a_stale_spine_is_a_lower_bound() {
+        let mut payload = populated_reference_payload("present");
+        payload["cross_repo"] = json!({
+            "status": "unavailable",
+            "code": "spine_root_stale",
+            "reason": "spine root mismatch for repository local",
+        });
+        let negative = json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+
+        assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{verdict}");
+        let factor = verdict["limiting_factor"].as_str().expect("a factor");
+        assert!(
+            factor.contains("spine_root_stale"),
+            "the producer's own code names the condition: {factor}"
+        );
+    }
+
+    /// The controls that keep this input from becoming a floor under every
+    /// answer, which is the regression the absence gate's own scoping comment
+    /// warns about. Each of these is an ordinary state of a healthy install, and
+    /// each must leave the verdict certified with no factor at all.
+    ///
+    /// `unavailable` with no code is `kin refs` on every invocation: it resolves
+    /// its binding from `KIN_REPO_ID`, which is an override rather than
+    /// something an install sets. Weighing it would mark every CLI reference
+    /// answer on every machine a lower bound.
+    #[test]
+    fn the_ordinary_states_of_a_healthy_install_limit_nothing() {
+        let mut broken: Vec<String> = Vec::new();
+        for (case, cross_repo) in [
+            ("no spine configured", json!({ "status": "not_configured" })),
+            (
+                "a repository the spine has not registered",
+                json!({
+                    "status": "unavailable",
+                    "code": "spine_repo_unregistered",
+                    "reason": "repository local has no registered spine authority",
+                }),
+            ),
+            (
+                "a caller that never bound to a repository",
+                json!({
+                    "status": "unavailable",
+                    "reason": "KIN_REPO_ID is missing or blank; cross-repo authority cannot \
+                               bind this graph to a repository",
+                }),
+            ),
+        ] {
+            let mut payload = populated_reference_payload("present");
+            payload["cross_repo"] = cross_repo;
+            let negative =
+                json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
+            let verdict = Verdict::compute(
+                "find_references",
+                &payload,
+                &Envelope::daemon(),
+                Some(&negative),
+            )
+            .expect("a retrieval payload carries a verdict")
+            .to_value();
+
+            // Collected rather than asserted in place. A bare assert aborts the
+            // loop on the first case, so a break confined to a later one is
+            // invisible behind an earlier one failing first, and the mutation
+            // written for it reads as covered while proving nothing.
+            if verdict["state"] != json!(CERTIFIED) {
+                broken.push(format!(
+                    "{case} is a fact about the install, not a limit on the answer: {verdict}"
+                ));
+            }
+            if verdict["limiting_factor"] != Value::Null {
+                broken.push(format!("{case} must contribute no clause: {verdict}"));
+            }
+            if verdict["inputs"]["cross_repo"] != json!(NOT_APPLICABLE) {
+                broken.push(format!(
+                    "{case} must read silent rather than certifying: {verdict}"
+                ));
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "{} of the ordinary install states limited an answer:\n{}",
+            broken.len(),
+            broken.join("\n")
+        );
+    }
+
+    /// A complete spine certifies rather than staying silent, so the input
+    /// contributes agreement on the healthy path instead of merely not refusing.
+    #[test]
+    fn a_complete_spine_certifies_as_its_own_named_input() {
+        let payload = populated_reference_payload("present");
+        let negative = json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+
+        assert_eq!(verdict["state"], json!(CERTIFIED), "{verdict}");
+        assert_eq!(
+            verdict["inputs"]["cross_repo"],
+            json!(CERTIFIED),
+            "{verdict}"
+        );
+        assert_eq!(verdict["limiting_factor"], Value::Null, "{verdict}");
+    }
+
+    /// The same gap seen by two readings is named once.
+    ///
+    /// On an answer that claims an absence, the gate puts the cross-repo clause
+    /// in `trust_reason` and the absence-gate reading splits it back out, while
+    /// this input builds the same clause directly. Both speak, and the composer
+    /// dedupes by label, so the reader gets one clause rather than the same
+    /// sentence twice. That is the FIR-2672 rule this input has to obey rather
+    /// than re-break.
+    #[test]
+    fn one_gap_seen_by_two_readings_is_named_once() {
+        let mut payload = populated_reference_payload("present");
+        payload["cross_repo"]["authority_complete"] = json!(false);
+        let negative = json!({
+            "interpretation": "absence_claim",
+            "trust": "inconclusive",
+            "trust_reason": "cross_repo_authority_incomplete: spine topology or requested \
+                             relation subtype is incomplete at revision sha256:complete",
+        });
+        let verdict = Verdict::compute(
+            "find_references",
+            &payload,
+            &Envelope::daemon(),
+            Some(&negative),
+        )
+        .expect("a retrieval payload carries a verdict")
+        .to_value();
+
+        let factor = verdict["limiting_factor"].as_str().expect("a factor");
+        assert_eq!(
+            factor.matches("cross_repo_authority_incomplete").count(),
+            1,
+            "the gap is one gap however many readings noticed it: {factor}"
+        );
+    }
+
+    /// The other tool that carries a cross-repo block reaches the same input.
+    ///
+    /// The dispatch names two tools, and the absence gate names the same two, so
+    /// the strings are written twice in one file. A rename that moved one and not
+    /// the other would leave this arm matching nothing, and nothing about a
+    /// find_references test can see that: the verdict would simply stop weighing
+    /// cross-repo authority on bulk answers and no assertion anywhere would go
+    /// red.
+    ///
+    /// So the arm gets its own case, with the healthy direction beside the
+    /// refusing one. A dispatch that stopped matching would certify both.
+    #[test]
+    fn the_bulk_tool_reaches_the_same_cross_repo_input() {
+        let complete = json!({
+            "status": "available",
+            "authority_complete": true,
+            "authority_revision": "sha256:complete",
+            "authority_roots": {"local": "local-root"},
+            "relation_subtype_complete": true,
+            "verdicts_complete": true,
+        });
+        let mut incomplete = complete.clone();
+        incomplete["authority_complete"] = json!(false);
+
+        for (case, cross_repo, expected_state, expected_input) in [
+            ("a complete bulk authority", complete, CERTIFIED, CERTIFIED),
+            (
+                "a bulk authority that answered incompletely",
+                incomplete,
+                INCONCLUSIVE,
+                INCONCLUSIVE,
+            ),
+        ] {
+            let payload = json!({
+                "results": [{"name": "index_note", "has_references": true}],
+                "degradations": [],
+                "cross_repo": cross_repo,
+            });
+            let negative =
+                json!({ "interpretation": "qualified_answer", "trust": "authoritative" });
+            let verdict = Verdict::compute(
+                "bulk_check_references",
+                &payload,
+                &Envelope::daemon(),
+                Some(&negative),
+            )
+            .expect("a retrieval payload carries a verdict")
+            .to_value();
+
+            assert_eq!(
+                verdict["inputs"]["cross_repo"],
+                json!(expected_input),
+                "{case}: the bulk dispatch arm must be reached: {verdict}"
+            );
+            assert_eq!(verdict["state"], json!(expected_state), "{case}: {verdict}");
+        }
     }
 
     /// FIR-2672, the sole-cause case. Every input is clean except one requested

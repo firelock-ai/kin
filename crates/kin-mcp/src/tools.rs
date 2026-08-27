@@ -555,6 +555,7 @@ fn registered_tools() -> ToolsListResult {
                             "default": "both"
                         },
                         "limit_per_step": { "type": "integer", "description": "Max relations expanded per step (default 5, capped at 25). Kept by relevance, not by relation order; a step whose fan-out was cut says so with the count it dropped.", "default": 5, "minimum": 1, "maximum": 25 },
+                        "target": { "type": "string", "description": "A symbol you are trying to reach, by exact name or UUID. Neighbors from which it is still reachable inside the requested depth survive the per-step cap ahead of neighbors that are not, so the question decides what a narrow walk keeps instead of proximity deciding it. Optional; a target that resolves to nothing is reported in degradations and the chain is still returned." },
                         "include_body": {
                             "type": "boolean",
                             "description": "Inline each step's source body (default true). Pass false to ask for the SHAPE of the chain (names, kinds, roles, spans, edges), which is a fraction of the size and is what you want unless you intend to read the code.",

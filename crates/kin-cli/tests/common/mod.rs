@@ -1842,6 +1842,10 @@ fn owned_process_ids(owner_env: &'static str, owner_token: &str) -> Vec<u32> {
     let mut pids = system
         .processes()
         .values()
+        // A thread inherits its owning process's environment, so an unfiltered
+        // scan reports one owned process once per thread and every failure
+        // message counts tids as strays (FIR-2823).
+        .filter(|process| process.thread_kind().is_none())
         .filter(|process| process_has_owner_token(process, owner_env, owner_token))
         .map(|process| process.pid().as_u32())
         .collect::<Vec<_>>();

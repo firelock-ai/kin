@@ -196,6 +196,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_parse_coverage(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
+    checks.push(check_memory_floor());
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
     checks.push(check_interrupted_init());
@@ -3993,6 +3994,274 @@ fn check_commit_memory_headroom() -> HealthCheck {
     commit_memory_headroom_check_for(&footprint, &crate::capability::memory_evidence())
 }
 
+/// What this machine affords Kin, stated before a conversion starts rather than
+/// after one has already cost something.
+///
+/// Every other memory row on this page needs a store to talk about, so on a
+/// fresh box, before `kin init`, all of them read n/a and the page says nothing
+/// at all about whether Kin fits here. FIR-2787 is what that costs: four
+/// separate disclosures reached one reader, each of them true, each on a
+/// different surface, and each after the work it described had been paid for.
+/// This row needs no repository, so it is the one that arrives first.
+///
+/// It states three things a reader can act on before an import runs for eleven
+/// minutes: the ceiling this process actually runs under, what one repository
+/// daemon will be allowed to hold inside it, and whether this machine is over
+/// the line where locate runs its full multihop budget. It forecasts nothing
+/// about a particular store, which is the neighbouring row's job and needs one
+/// to exist.
+///
+/// Advisory by construction, like every memory row here. `Degraded` never
+/// blocks readiness, because a machine smaller than Kin wants is a fact about
+/// the machine, and a check that failed on it would fail every correct install
+/// on a small host.
+fn check_memory_floor() -> HealthCheck {
+    memory_floor_check_for(
+        &crate::capability::memory_evidence(),
+        &crate::capability::CapabilityDetection::detect(),
+    )
+}
+
+/// Core of [`check_memory_floor`] with both readings as inputs, so every branch
+/// is testable on any host, including the small container no developer here
+/// runs on.
+fn memory_floor_check_for(
+    evidence: &crate::capability::MemoryEvidence,
+    detection: &crate::capability::CapabilityDetection,
+) -> HealthCheck {
+    const ID: &str = "memory_floor";
+    const LABEL: &str = "Memory floor";
+
+    let available = format_health_bytes(evidence.limit_bytes);
+    let ceiling_source = evidence.limit_source.describe();
+    // Resolved rather than derived, so an operator who named a budget is told
+    // their own number. `kin doctor` runs before the conversion, so the daemon
+    // this row is describing is one this shell has not started yet and will
+    // start with this environment.
+    let budget = kin_core::memory_pressure::FootprintBudget::resolve(Some(evidence.limit_bytes))
+        .unwrap_or(kin_core::memory_pressure::FootprintBudget {
+            bytes: kin_core::memory_pressure::FootprintBudget::derived_from(evidence.limit_bytes),
+            source: kin_core::memory_pressure::BudgetSource::Derived,
+        });
+    let daemon_clause = format!(
+        "one repository daemon is allowed {} of that, {}, and its background embedding is the \
+         first work held back once that is spent; a second repository gets its own daemon and \
+         its own {}, so two of them are allowed {} here",
+        format_health_bytes(budget.bytes),
+        describe_daemon_budget(&budget, evidence.limit_bytes),
+        format_health_bytes(budget.bytes),
+        format_health_bytes(budget.bytes.saturating_mul(2)),
+    );
+
+    let (tier_clause, tier_is_full) = memory_floor_tier_clause(detection);
+
+    // The cheapest commit anybody has measured, so a ceiling under it is under
+    // every row in the table. A reader with no store cannot pick a row by store
+    // size the way `Commit memory headroom` does, so this quotes the floor of
+    // the table and names the repository it came from.
+    let cheapest = MEASURED_COMMIT_PEAKS
+        .iter()
+        .min_by_key(|point| point.peak_bytes);
+    let (commit_clause, ceiling_clears) = match cheapest {
+        None => (None, true),
+        Some(point) => {
+            let comfortable = point.peak_bytes.saturating_add(
+                point
+                    .peak_bytes
+                    .saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT)
+                    / 100,
+            );
+            let clears = evidence.limit_bytes >= comfortable;
+            let clause = if clears {
+                format!(
+                    "The cheapest commit Kin has measured drove a {} machine to {} in total on \
+                     {} ({} store), and this ceiling clears that by at least {}%",
+                    format_health_bytes(point.observed_ceiling_bytes),
+                    format_health_bytes(point.peak_bytes),
+                    point.repository,
+                    format_health_bytes(point.store_bytes),
+                    COMMIT_PEAK_COMFORT_MARGIN_PERCENT,
+                )
+            } else {
+                format!(
+                    "The cheapest commit Kin has measured drove a {} machine to {} in total on \
+                     {} ({} store), and {available} is not {}% clear of that, so a commit here \
+                     has no measured room. That total is a whole-machine reading with everything \
+                     else resident inside it rather than a commit's own demand, so this compares \
+                     a ceiling against an observation and forecasts nothing about a write here",
+                    format_health_bytes(point.observed_ceiling_bytes),
+                    format_health_bytes(point.peak_bytes),
+                    point.repository,
+                    format_health_bytes(point.store_bytes),
+                    COMMIT_PEAK_COMFORT_MARGIN_PERCENT,
+                )
+            };
+            (Some(clause), clears)
+        }
+    };
+
+    let mut detail =
+        format!("{available} of memory here ({ceiling_source}); {daemon_clause}. {tier_clause}");
+    if let Some(commit_clause) = commit_clause {
+        detail.push_str(". ");
+        detail.push_str(&commit_clause);
+    }
+    detail.push('.');
+
+    if ceiling_clears && tier_is_full {
+        return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, detail);
+    }
+
+    // One fix line, carrying only the moves that apply. A fix that listed a
+    // larger machine under a shortfall the machine does not have is the kind of
+    // advice that sends a reader to buy hardware they already own, which is the
+    // defect `disabled_signals` was corrected for.
+    let mut moves: Vec<String> = Vec::new();
+    if !ceiling_clears {
+        moves.push(
+            "convert one repository at a time here, and run `kin daemon stop` in a repository you \
+             are not working in"
+                .to_string(),
+        );
+        moves.push(format!(
+            "raise this ceiling above {}",
+            format_health_bytes(
+                cheapest
+                    .map(|point| point.peak_bytes.saturating_add(
+                        point
+                            .peak_bytes
+                            .saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT)
+                            / 100,
+                    ))
+                    .unwrap_or(evidence.limit_bytes)
+            )
+        ));
+    }
+    if !tier_is_full {
+        moves.push(format!(
+            "run locate work on a machine with {} cores and {:.0} GB to get the full multihop \
+             budget",
+            crate::capability::PERFORMANCE_TIER_MIN_CORES,
+            crate::capability::PERFORMANCE_TIER_MIN_RAM_GB,
+        ));
+    }
+    HealthCheck::new(ID, LABEL, HealthStatus::Degraded, detail).with_manual_fix(format!(
+        "Before converting a repository here: {}.",
+        moves.join(", or ")
+    ))
+}
+
+/// Where a daemon's budget came from, in the four shapes it can take.
+///
+/// "Half the ceiling" is true of a 12 GiB container and false of a 128 GiB
+/// workstation, where half is 64 and the derived budget is capped at 8. The row
+/// printed the half sentence over both, which is a claim eight times the size of
+/// the fact on the second machine, and a reader who trusted it would size their
+/// host for a daemon Kin will never let grow that large.
+fn describe_daemon_budget(
+    budget: &kin_core::memory_pressure::FootprintBudget,
+    ceiling_bytes: u64,
+) -> String {
+    if budget.source == kin_core::memory_pressure::BudgetSource::Operator {
+        return format!(
+            "the figure {} names rather than anything derived from this ceiling",
+            kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV
+        );
+    }
+    let half = ceiling_bytes / 2;
+    if budget.bytes >= kin_core::memory_pressure::DERIVED_BUDGET_CEILING_BYTES
+        && half > budget.bytes
+    {
+        return format!(
+            "the most a derived budget ever allows one daemon rather than half of {}, because a \
+             repository daemon holding more than that is pathological whatever the host has spare",
+            format_health_bytes(ceiling_bytes)
+        );
+    }
+    if budget.bytes <= kin_core::memory_pressure::DERIVED_BUDGET_FLOOR_BYTES && half < budget.bytes
+    {
+        return "the least a derived budget ever allows, because a smaller one would back off \
+                before it could do anything useful"
+            .to_string();
+    }
+    "half the ceiling".to_string()
+}
+
+/// The tier half of the row, and whether this machine is over the line.
+///
+/// Split out because it has four shapes and the row has two, and because the
+/// case that matters most is the one nobody can reach on a developer host: a
+/// tier scored against a stand-in after the memory probe failed. That tier must
+/// never be reported as a reading, since "run on a bigger host" is actively
+/// wrong advice for a host that was never read.
+fn memory_floor_tier_clause(detection: &crate::capability::CapabilityDetection) -> (String, bool) {
+    let full = detection.profile == crate::capability::LocateProfile::Performance;
+    let line = format!(
+        "the {} core / {:.0} GB line",
+        crate::capability::PERFORMANCE_TIER_MIN_CORES,
+        crate::capability::PERFORMANCE_TIER_MIN_RAM_GB,
+    );
+    let narrowing = format!(
+        "multihop depth {} of {}, frontier {} of {}, timeout {}ms of {}ms",
+        detection.profile.multihop_max_depth(),
+        crate::capability::LocateProfile::Performance.multihop_max_depth(),
+        detection.profile.multihop_frontier_limit(),
+        crate::capability::LocateProfile::Performance.multihop_frontier_limit(),
+        detection.profile.multihop_timeout_ms(),
+        crate::capability::LocateProfile::Performance.multihop_timeout_ms(),
+    );
+
+    if detection.forced_by_env {
+        let clause = if full {
+            format!(
+                "KIN_LOCATE_PROFILE pins locate to the {} tier, so no reading of this host decided \
+                 it and it runs the full multihop budget",
+                detection.profile.name()
+            )
+        } else {
+            format!(
+                "KIN_LOCATE_PROFILE pins locate to the {} tier, so no reading of this host decided \
+                 it: {narrowing}",
+                detection.profile.name()
+            )
+        };
+        return (clause, full);
+    }
+
+    // A probe that could not answer is scored against a stand-in, and the
+    // stand-in is 4 GB, so this arm is always below the line. Saying which
+    // numbers were read is the whole point: the remediation differs.
+    if let Some(reason) = detection.misread_host() {
+        return (
+            format!(
+                "this host's memory could not be read ({reason}), so locate was scored against a \
+                 stand-in rather than a measurement and sits on the {} tier: {narrowing}",
+                detection.profile.name()
+            ),
+            false,
+        );
+    }
+
+    let cores = detection.cores.unwrap_or(0);
+    let ram = detection
+        .memory
+        .as_ref()
+        .map(|memory| memory.gb_or_stand_in())
+        .unwrap_or(0.0);
+    let clause = if full {
+        format!(
+            "{cores} cores and {ram:.1} GB put this machine at or over {line}, so locate runs its \
+             full multihop budget"
+        )
+    } else {
+        format!(
+            "{cores} cores and {ram:.1} GB put locate on the {} tier, under {line}: {narrowing}",
+            detection.profile.name()
+        )
+    };
+    (clause, full)
+}
+
 /// Whether a daemon serving this store was killed, and what killed it.
 ///
 /// Every other row on this page describes a daemon that is running or one that
@@ -4573,6 +4842,320 @@ mod tests {
             cgroup_oom_kills: None,
             cgroup_ceiling_hits: None,
         }
+    }
+
+    /// Build a detection the way the host probe would have, so a row's numbers
+    /// come from a shape the real reader produces rather than from a literal.
+    fn detected(
+        profile: crate::capability::LocateProfile,
+        cores: usize,
+        ram_gb: f64,
+    ) -> crate::capability::CapabilityDetection {
+        crate::capability::CapabilityDetection {
+            profile,
+            forced_by_env: false,
+            cores: Some(cores),
+            memory: Some(crate::capability::HostMemory::Detected(ram_gb)),
+        }
+    }
+
+    /// "Half the ceiling" is true of a small container and false of a big host.
+    ///
+    /// The first draft of this row said it over both. On the 128 GiB machine it
+    /// was written on, half is 64 GiB and the budget a daemon actually gets is
+    /// 8, so the sentence was eight times the size of the fact and pointed a
+    /// reader at a host they would never need. Caught by printing the row rather
+    /// than by reading it, which is why this arm exists.
+    ///
+    /// Falsify by restoring the unconditional "half the ceiling": the clamped
+    /// arm goes red and the container arm stays green, which is exactly how the
+    /// defect read.
+    #[test]
+    #[serial]
+    fn the_budget_clause_says_half_only_where_the_budget_really_is_half() {
+        let container = memory_floor_check_for(
+            &capped_memory(12288 * MIB),
+            &detected(crate::capability::LocateProfile::Standard, 5, 12.0),
+        );
+        assert!(
+            container
+                .detail
+                .contains("6.0 GiB of that, half the ceiling"),
+            "on a 12 GiB box the derived budget really is half of it: {}",
+            container.detail
+        );
+
+        let workstation = memory_floor_check_for(
+            &memory(128 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Performance, 18, 128.0),
+        );
+        assert!(
+            !workstation.detail.contains("half the ceiling"),
+            "half of 128 GiB is 64 and the cap holds a daemon to 8, so this machine is not \
+             getting half of anything: {}",
+            workstation.detail
+        );
+        assert!(
+            workstation.detail.contains("8.0 GiB of that")
+                && workstation
+                    .detail
+                    .contains("the most a derived budget ever allows"),
+            "and the row names the cap that decided it: {}",
+            workstation.detail
+        );
+    }
+
+    /// A budget an operator named is theirs, not a number this row derived.
+    ///
+    /// Doctor runs before the conversion, so the daemon being described is one
+    /// this shell has not started and will start with this environment. Quoting
+    /// a derived figure over an operator's own would misreport the machine they
+    /// configured.
+    #[test]
+    #[serial]
+    fn a_budget_an_operator_named_is_reported_as_theirs() {
+        let _guard = EnvVarGuard::set(
+            kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV,
+            (3 * 1024 * MIB).to_string(),
+        );
+        let check = memory_floor_check_for(
+            &memory(128 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Performance, 18, 128.0),
+        );
+        assert!(
+            check.detail.contains("3.0 GiB of that")
+                && check
+                    .detail
+                    .contains(kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV),
+            "the row quotes the operator's number and names where it came from: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("half the ceiling"),
+            "and never calls it a fraction of anything: {}",
+            check.detail
+        );
+    }
+
+    /// The stranger's own box, and the reading nobody was given until after an
+    /// eleven-minute conversion had spent itself.
+    ///
+    /// Five schedulable CPUs and a 12 GiB container cap. Every memory row on
+    /// this page reads n/a there before `kin init`, because every one of them
+    /// needs a store, so the page said nothing at all about a machine two
+    /// converted repositories would not fit on.
+    ///
+    /// Falsify by returning `Healthy` unconditionally, or by deleting the
+    /// registration: the constrained arm goes quiet, which is the state this
+    /// row exists to end.
+    #[test]
+    #[serial]
+    fn the_memory_floor_row_reads_a_constrained_container_before_any_repository_exists() {
+        let check = memory_floor_check_for(
+            &capped_memory(12288 * MIB),
+            &detected(crate::capability::LocateProfile::Standard, 5, 12.0),
+        );
+
+        assert!(
+            matches!(check.status, HealthStatus::Degraded),
+            "a container two daemons do not fit in is not a quiet row: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("12.0 GiB") && check.detail.contains("container"),
+            "the ceiling and which reading it came from are the whole point: {}",
+            check.detail
+        );
+        assert!(
+            check.detail.contains("6.0 GiB"),
+            "the per-daemon budget is what the reader is about to spend: {}",
+            check.detail
+        );
+        assert!(
+            check.manual_fix.is_some(),
+            "every non-green row on this page carries the fix it needs: {check:?}"
+        );
+    }
+
+    /// The arithmetic that makes a 12 GiB box a bad place for two repositories,
+    /// stated before the second conversion rather than after it.
+    ///
+    /// One daemon per repository, each deriving half the ceiling. Two of them
+    /// are allowed the whole machine, which is the sentence the stranger
+    /// assembled for themselves out of four surfaces over several hours.
+    #[test]
+    #[serial]
+    fn the_row_states_what_two_repository_daemons_come_to_against_this_ceiling() {
+        let check = memory_floor_check_for(
+            &capped_memory(12288 * MIB),
+            &detected(crate::capability::LocateProfile::Standard, 5, 12.0),
+        );
+        assert!(
+            check.detail.contains("two of them are allowed 12.0 GiB"),
+            "one daemon at 6.0 GiB is unremarkable and two are the whole box; the row has to do \
+             that multiplication for the reader: {}",
+            check.detail
+        );
+    }
+
+    /// The control, and the reason the row is worth having at all.
+    ///
+    /// A warning that fires on every machine is wallpaper by the second run.
+    /// This is a developer host clear of both lines, and it has to be silent.
+    #[test]
+    #[serial]
+    fn a_machine_over_both_lines_keeps_a_quiet_row_and_offers_no_repair() {
+        let check = memory_floor_check_for(
+            &memory(64 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Performance, 10, 64.0),
+        );
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "{}",
+            check.detail
+        );
+        assert!(
+            check.manual_fix.is_none(),
+            "there is nothing to repair on a machine that clears both lines: {check:?}"
+        );
+        assert!(
+            check.detail.contains("full multihop budget"),
+            "and it says so, because a reader deciding where to convert wants the positive \
+             answer too: {}",
+            check.detail
+        );
+    }
+
+    /// A fix line names only the moves this machine needs.
+    ///
+    /// A 32 GiB box with four cores clears every measured commit and is still
+    /// under the tier line. Telling that reader to raise a memory limit is the
+    /// shape of advice that sent an earlier operator off to buy hardware they
+    /// were already running, which is what `disabled_signals` was corrected
+    /// for. The two arms are asserted against each other so neither can quietly
+    /// become the other's text.
+    #[test]
+    #[serial]
+    fn the_fix_line_names_the_shortfall_this_machine_has_and_not_the_other_one() {
+        let tier_only = memory_floor_check_for(
+            &memory(32 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Standard, 4, 32.0),
+        );
+        assert!(
+            matches!(tier_only.status, HealthStatus::Degraded),
+            "{}",
+            tier_only.detail
+        );
+        let fix = tier_only
+            .manual_fix
+            .clone()
+            .expect("a row needing attention carries its fix");
+        assert!(
+            fix.contains("multihop"),
+            "the shortfall this machine has is the tier: {fix}"
+        );
+        assert!(
+            !fix.contains("raise this ceiling"),
+            "and a machine with memory to spare must not be told to buy more: {fix}"
+        );
+
+        let ceiling_only = memory_floor_check_for(
+            &capped_memory(8 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Performance, 16, 8.0),
+        );
+        let fix = ceiling_only
+            .manual_fix
+            .clone()
+            .expect("a ceiling under every measured commit carries its fix");
+        assert!(
+            fix.contains("raise this ceiling"),
+            "the shortfall here is the ceiling: {fix}"
+        );
+        assert!(
+            !fix.contains("multihop"),
+            "and locate is already running at full budget on it: {fix}"
+        );
+    }
+
+    /// The line a reader is told is the line that is scored.
+    ///
+    /// Two constants, read by the tier scorer and by this row, so the sentence
+    /// cannot drift from the threshold. Asserting a literal "8 core / 16 GB"
+    /// here would write the number twice and let the row keep quoting a line
+    /// the scorer had moved off.
+    ///
+    /// Falsify by hardcoding the pair in `memory_floor_tier_clause` and then
+    /// changing either constant: this goes red and nothing else does.
+    #[test]
+    #[serial]
+    fn the_tier_line_the_row_quotes_is_the_one_the_scorer_uses() {
+        let check = memory_floor_check_for(
+            &memory(64 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Performance, 10, 64.0),
+        );
+        let line = format!(
+            "{} core / {:.0} GB",
+            crate::capability::PERFORMANCE_TIER_MIN_CORES,
+            crate::capability::PERFORMANCE_TIER_MIN_RAM_GB,
+        );
+        assert!(
+            check.detail.contains(&line),
+            "the row has to quote the scorer's own threshold: wanted {line} in {}",
+            check.detail
+        );
+    }
+
+    /// A tier scored from a probe that failed is never reported as a reading.
+    ///
+    /// The stand-in is 4 GB, so this arm always lands below the line, and "run
+    /// on a bigger host" is actively wrong advice for a host nothing read. The
+    /// forced arm is the same rule from the other side: an operator who named
+    /// the tier was not measured either.
+    #[test]
+    #[serial]
+    fn a_tier_from_an_unread_host_or_an_operator_says_so_instead_of_quoting_numbers() {
+        let misread = memory_floor_check_for(
+            &memory(64 * 1024 * MIB),
+            &crate::capability::CapabilityDetection {
+                profile: crate::capability::LocateProfile::Minimal,
+                forced_by_env: false,
+                cores: Some(10),
+                memory: Some(crate::capability::HostMemory::Undetected(
+                    "sysctl hw.memsize refused".to_string(),
+                )),
+            },
+        );
+        assert!(
+            misread.detail.contains("could not be read")
+                && misread.detail.contains("sysctl hw.memsize refused"),
+            "the row says the host was not read, and quotes the probe's own reason: {}",
+            misread.detail
+        );
+        assert!(
+            matches!(misread.status, HealthStatus::Degraded),
+            "an unmeasured host is not a machine this row has cleared: {}",
+            misread.detail
+        );
+
+        let forced = memory_floor_check_for(
+            &memory(64 * 1024 * MIB),
+            &crate::capability::CapabilityDetection {
+                profile: crate::capability::LocateProfile::Performance,
+                forced_by_env: true,
+                cores: None,
+                memory: None,
+            },
+        );
+        assert!(
+            forced.detail.contains("KIN_LOCATE_PROFILE"),
+            "a tier an operator named says who named it: {}",
+            forced.detail
+        );
+        assert!(
+            matches!(forced.status, HealthStatus::Healthy),
+            "a forced performance tier runs the full budget, whoever chose it: {}",
+            forced.detail
+        );
     }
 
     /// The reading a user needed BEFORE the commit that killed their daemon.
@@ -7862,6 +8445,11 @@ mod tests {
         assert!(json.contains("\"platform\""));
         assert!(json.contains("\"healthy\""));
         assert!(json.contains("\"retrieval_profile\""));
+        // The row FIR-2787 is about answers with no repository in sight, so a
+        // run outside one is exactly where it has to appear. Every unit test
+        // above calls its core directly and would stay green if nobody ever
+        // registered it, which is the shape of a check that cannot fail.
+        assert!(json.contains("\"memory_floor\""));
     }
 
     #[cfg(unix)]

@@ -21,9 +21,90 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     let result = run_daemon_commit(&layout, &message, quiet).await?;
     if !quiet {
-        println!("{}", render_commit_summary(&result));
+        println!(
+            "{}",
+            render_commit_summary(&result, pending_enrichment(&layout).await.as_deref())
+        );
     }
     Ok(())
+}
+
+/// What this store's cross-file sweep still owes, when it owes anything.
+///
+/// `kin commit` printed `(0 entities, 0 relations, 2 artifacts)` for a fully
+/// parseable new module, because the counts are the change's own deltas and the
+/// sweep that derives cross-file edges had not reached the file yet. The next
+/// `kin diff` then showed `Relations: +123` on a tree with no file change. Both
+/// readings are correct and neither one says the word "yet", so the surface
+/// that reports success is the surface that leaves out the part that is still
+/// moving. FIR-2776.
+///
+/// Read after the commit and not before it, because the question is what is
+/// outstanding for the store the reader now has. Every failure answers `None`:
+/// an enrichment probe must never be able to turn a landed commit into an
+/// error, and a commit that already succeeded is not made wrong by a daemon
+/// that would not say how its sweep is going.
+async fn pending_enrichment(layout: &kin_core::KinLayout) -> Option<String> {
+    let url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
+    let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout).ok()?;
+    let status = probe_sweep_status(&client).await?;
+    let field = |name: &str| status.get(name).and_then(|value| value.as_u64());
+    let done = field("files_done")?;
+    let total = field("files_total")?;
+    let running = status
+        .get("running")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    pending_enrichment_line(running, done, total)
+}
+
+/// Ask the daemon how its sweep is going, under a bound of this command's own.
+///
+/// A function rather than an inline `timeout`, so a test can drive the real
+/// call against a real socket that never answers. Asserting the bound by
+/// wrapping the client in the test would pin the constant and nothing else, and
+/// would keep passing on the day this call site stopped using it.
+///
+/// The client's own ceiling is 300 s. The endpoint is an atomics read and
+/// answers instantly on a daemon that is well, but the daemon this line is
+/// ABOUT is a busy one, and five minutes of silence after a commit that already
+/// landed is a worse surface than no line at all. An answer that does not
+/// arrive in the window is treated exactly like one that could not be read.
+async fn probe_sweep_status(
+    client: &crate::daemon_client::DaemonClient,
+) -> Option<serde_json::Value> {
+    tokio::time::timeout(PENDING_ENRICHMENT_PROBE, client.lsp_sweep_status())
+        .await
+        .ok()?
+        .ok()
+}
+
+/// The sentence, split from the probe so both branches are testable without a
+/// daemon.
+///
+/// Two conditions, not one. `running` alone goes quiet on a sweep that was cut
+/// short and never resumed, which is a store with work outstanding and nothing
+/// in flight to finish it. An unwalked file count alone goes quiet in the
+/// window between a sweep being queued and its first file landing.
+///
+/// A store whose sweep has walked everything it has prints nothing, and a store
+/// that has never had a file to walk prints nothing either, because both
+/// counters are zero and zero is not behind zero. That silence is the point: a
+/// line under every commit is a line nobody reads by the third one.
+fn pending_enrichment_line(running: bool, done: u64, total: u64) -> Option<String> {
+    if !running && done >= total {
+        return None;
+    }
+    if total == 0 {
+        return None;
+    }
+    Some(format!(
+        "Cross-file enrichment is still catching up ({done} of {total} files). The counts above \
+         are this change's own deltas, so edges the sweep has not reached are not in it; they \
+         reach durable authority at your next commit. Until then they live only in this daemon, \
+         and a daemon that exits loses them from its live graph; its next start resumes the sweep \
+         from where it stopped."
+    ))
 }
 
 /// The announcement this command publishes for as long as it runs.
@@ -63,8 +144,8 @@ impl Drop for CommitAnnouncement {
 /// working tree this change came from stays dirty and `git log` never moves.
 /// Without it a brownfield user commits all day and reads `git status` as proof
 /// that nothing happened.
-fn render_commit_summary(result: &DaemonCommitResult) -> String {
-    format!(
+fn render_commit_summary(result: &DaemonCommitResult, pending: Option<&str>) -> String {
+    let summary = format!(
         "Created semantic change {} on branch '{}' ({} entities, {} relations, {} artifacts)\n{}",
         result.change_id,
         result.branch,
@@ -72,7 +153,11 @@ fn render_commit_summary(result: &DaemonCommitResult) -> String {
         result.relation_count,
         result.file_count,
         AUTHORITY_NOT_GIT_NOTE,
-    )
+    );
+    match pending {
+        Some(pending) => format!("{summary}\n{pending}"),
+        None => summary,
+    }
 }
 
 /// Result from the daemon-owned native commit transaction.
@@ -89,6 +174,13 @@ struct DaemonCommitResult {
     relation_count: usize,
     file_count: usize,
 }
+
+/// How long the post-commit enrichment probe is allowed to take.
+///
+/// Short on purpose. The commit has landed by the time this runs, so every
+/// second here is a second a user waits to be told their write succeeded, and
+/// the sentence it buys is an advisory one.
+const PENDING_ENRICHMENT_PROBE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How often the phase tail is read while the commit request is outstanding.
 const PHASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -348,6 +440,14 @@ fn resolve_commit_after_lost_reply(
                     daemon_alive,
                     unix_now(),
                     &crate::capability::memory_evidence_since(memory_baseline),
+                    // Sampled here rather than inside the explanation so the
+                    // sentence stays a pure rendering of what was observed.
+                    // The dead daemon is excluded by its own marker pid: it is
+                    // already gone, and a pid the OS has reused would otherwise
+                    // be reported as memory a reader could reclaim.
+                    &super::commit_progress::other_resident_daemons(
+                        abandoned.as_ref().map_or(0, |open| open.pid),
+                    ),
                 )
             });
             let error = match cause {
@@ -693,7 +793,7 @@ mod tests {
             .expect("a commit with no reply deadline waits for the daemon");
         let result: DaemonCommitResult = response.json().await.unwrap();
         assert_eq!(result.change_id, "5b8ca7b7");
-        assert_eq!(render_commit_summary(&result).lines().count(), 2);
+        assert_eq!(render_commit_summary(&result, None).lines().count(), 2);
 
         serving.abort();
     }
@@ -800,13 +900,16 @@ mod tests {
     /// stayed dirty forever afterward.
     #[test]
     fn a_successful_commit_says_the_change_is_in_kin_authority_and_not_in_git() {
-        let summary = render_commit_summary(&DaemonCommitResult {
-            change_id: "9ade4452cd80".to_string(),
-            branch: "refs/heads/main".to_string(),
-            entity_count: 0,
-            relation_count: 0,
-            file_count: 1,
-        });
+        let summary = render_commit_summary(
+            &DaemonCommitResult {
+                change_id: "9ade4452cd80".to_string(),
+                branch: "refs/heads/main".to_string(),
+                entity_count: 0,
+                relation_count: 0,
+                file_count: 1,
+            },
+            None,
+        );
         assert!(
             summary.contains("Created semantic change 9ade4452cd80"),
             "{summary}"
@@ -817,6 +920,138 @@ mod tests {
             "the note must name the surface that keeps disagreeing: {summary}"
         );
         assert!(summary.contains("kin eject"), "{summary}");
+    }
+
+    /// The measured FIR-2776 commit, and the store that must stay quiet.
+    ///
+    /// A fully parseable new module landed as `(0 entities, 0 relations, 2
+    /// artifacts)` because the counts are the change's own deltas and the sweep
+    /// deriving its cross-file edges had not reached the file. The next `kin
+    /// diff` then reported `Relations: +123` on a tree nobody had touched. Both
+    /// numbers were right; neither surface said the word "yet".
+    ///
+    /// The caught-up arm is the load-bearing half. A line printed under every
+    /// commit is a line a user stops reading by the third one, and then it is
+    /// worth nothing on the commit that needed it.
+    #[test]
+    fn a_commit_taken_while_the_sweep_is_behind_says_so_and_a_caught_up_one_says_nothing() {
+        let behind = pending_enrichment_line(true, 312, 480)
+            .expect("a sweep with files left to walk is work this commit did not record");
+        assert!(
+            behind.contains("312 of 480 files"),
+            "the reader needs the distance, not the fact: {behind}"
+        );
+        assert!(
+            behind.contains("deltas"),
+            "the sentence has to say why the counts above look empty: {behind}"
+        );
+        assert!(
+            behind.contains("next commit"),
+            "and when the missing edges arrive: {behind}"
+        );
+        assert!(
+            behind.contains("exits"),
+            "and what happens if the daemon goes first: {behind}"
+        );
+
+        assert!(
+            pending_enrichment_line(false, 480, 480).is_none(),
+            "a store whose sweep has walked everything it has is not behind, and a warning it \
+             always prints is a warning nobody reads"
+        );
+    }
+
+    /// The two shapes a single condition would have missed.
+    ///
+    /// Keying on `running` alone goes quiet over a sweep that was cut short and
+    /// is not coming back, which is precisely a store with outstanding work and
+    /// nothing in flight to finish it. Keying on the file counts alone goes
+    /// quiet in the window between a sweep being queued and its first file
+    /// landing, and a commit taken in that window is the one this exists for.
+    #[test]
+    fn a_sweep_that_stopped_early_is_still_behind_and_an_empty_walk_is_not() {
+        assert!(
+            pending_enrichment_line(false, 12, 480).is_some(),
+            "nothing is running and 468 files are unwalked; that is outstanding work"
+        );
+        assert!(
+            pending_enrichment_line(true, 0, 0).is_none(),
+            "a queued sweep with nothing to walk owes nothing"
+        );
+        assert!(
+            pending_enrichment_line(false, 0, 0).is_none(),
+            "and neither does a store that has never had a file to walk"
+        );
+    }
+
+    /// The line is appended, and nothing else about the summary moves.
+    ///
+    /// Two lines when the sweep has caught up, three when it has not, and the
+    /// first two byte-identical either way. The note about `git status` is the
+    /// one sentence this command exists to keep saying, and an enrichment line
+    /// that displaced it would trade one confusion for another.
+    #[test]
+    fn the_pending_line_is_added_beneath_the_summary_and_replaces_none_of_it() {
+        let result = DaemonCommitResult {
+            change_id: "9ade4452cd80".to_string(),
+            branch: "refs/heads/main".to_string(),
+            entity_count: 0,
+            relation_count: 0,
+            file_count: 2,
+        };
+        let quiet = render_commit_summary(&result, None);
+        let noisy = render_commit_summary(&result, Some("Cross-file enrichment is behind."));
+
+        assert_eq!(quiet.lines().count(), 2, "{quiet}");
+        assert_eq!(noisy.lines().count(), 3, "{noisy}");
+        assert_eq!(
+            quiet.lines().take(2).collect::<Vec<_>>(),
+            noisy.lines().take(2).collect::<Vec<_>>(),
+            "the summary and the git-status note are unchanged by the third line"
+        );
+        assert!(
+            noisy.ends_with("Cross-file enrichment is behind."),
+            "{noisy}"
+        );
+    }
+
+    /// A landed commit is never held hostage by the probe that annotates it.
+    ///
+    /// The daemon client's own ceiling is 300 s, and `/lsp/sweep/status` is an
+    /// atomics read that answers instantly on a daemon that is well. The daemon
+    /// this line is about is a busy one, so the well case is not the one to
+    /// size for: five minutes of silence after a write that already succeeded
+    /// is worse than no line at all.
+    ///
+    /// Driven against a socket that accepts and then says nothing, which is the
+    /// shape a wedged daemon presents, so the bound is proved by a hang rather
+    /// than asserted about a constant.
+    #[tokio::test]
+    async fn a_probe_that_never_answers_gives_up_long_before_the_client_would() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let silent = tokio::spawn(async move {
+            // Accept and hold. Never reply.
+            let _held = listener.accept().await;
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        });
+
+        let client =
+            crate::daemon_client::DaemonClient::from_base_url(format!("http://{addr}")).unwrap();
+        let started = std::time::Instant::now();
+        let answered = probe_sweep_status(&client).await;
+        let waited = started.elapsed();
+
+        assert!(
+            answered.is_none(),
+            "a socket that never replies must trip the bound, not return a reading"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(30),
+            "the probe waited {waited:?}; the client's own ceiling is 300s and this line is not \
+             worth any of it"
+        );
+        silent.abort();
     }
 
     /// The announcement this command publishes before it does anything else,

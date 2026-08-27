@@ -49,12 +49,26 @@ pub fn build_and_save_kidx(snapshot_path: &Path, graph: &kin_db::InMemoryGraph) 
 }
 
 /// Register the repo in this home's resolved registry with its entity count.
+///
+/// The id recorded is the identity the repository publishes in its own manifest,
+/// so the registry and the daemon's startup authority pin speak one alphabet.
+/// This used to record `repo_root.file_name()`, the directory name, while the
+/// manifest minted a UUID, and the daemon refused every sibling whose two
+/// identities disagreed, which was all of them.
+///
+/// The directory name remains the fallback for a repository with no readable
+/// manifest. A row that names the path badly is still a row; refusing to
+/// register would lose the repository entirely over a file this function is not
+/// the right place to repair.
 pub fn update_registry(repo_root: &Path, entity_count: usize) -> Result<()> {
-    let repo_id = repo_root
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let repo_id =
+        kin_core::registry::published_repository_identity(repo_root).unwrap_or_else(|| {
+            repo_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("unknown")
+                .to_string()
+        });
     let canonical = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
@@ -93,6 +107,73 @@ pub async fn trigger_lsp_sweep() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The registry records the identity the repository publishes, not the name
+    /// of the directory it happens to sit in.
+    ///
+    /// Asserted against the manifest itself rather than against a string this
+    /// test writes. The whole defect was two producers writing the same concept
+    /// in two alphabets, so a test that spells the expected id out would be the
+    /// same mistake one layer up: it would pass while the two real producers
+    /// disagreed. The directory is deliberately named so a directory-name id and
+    /// a manifest id cannot be confused.
+    #[test]
+    fn the_registry_records_the_identity_the_repository_publishes() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo_root = parent.path().join("some-checkout-directory");
+        std::fs::create_dir_all(&repo_root).unwrap();
+        kin_core::init(&repo_root).unwrap();
+
+        let registry_path = parent.path().join("registry-home/registry.toml");
+        let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        update_registry(&repo_root, 7).unwrap();
+
+        let published = kin_core::registry::published_repository_identity(&repo_root)
+            .expect("an initialized repository publishes an identity");
+        let registry = kin_core::registry::KinRegistry::load_from(&registry_path).unwrap();
+        let row = registry
+            .repos
+            .iter()
+            .find(|repo| {
+                repo.path
+                    .canonicalize()
+                    .ok()
+                    .zip(repo_root.canonicalize().ok())
+                    .is_some_and(|(recorded, expected)| recorded == expected)
+            })
+            .expect("the repository must be registered");
+
+        assert_eq!(
+            row.id, published,
+            "the registry id must be the manifest's identity, not the directory name"
+        );
+        assert_ne!(
+            row.id, "some-checkout-directory",
+            "recording the directory name is the defect this replaced"
+        );
+    }
+
+    /// The fallback, which must stay. A repository with no readable manifest is
+    /// still registered under its directory name, because losing the row
+    /// entirely over an unreadable file is worse than naming it badly.
+    #[test]
+    fn a_repository_with_no_manifest_is_still_registered_under_its_directory_name() {
+        let parent = tempfile::tempdir().unwrap();
+        let repo_root = parent.path().join("unmanifested-checkout");
+        std::fs::create_dir_all(&repo_root).unwrap();
+
+        let registry_path = parent.path().join("registry-home/registry.toml");
+        let _registry = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path);
+        update_registry(&repo_root, 0).unwrap();
+
+        let registry = kin_core::registry::KinRegistry::load_from(&registry_path).unwrap();
+        assert_eq!(
+            registry.repos.len(),
+            1,
+            "the row must exist even with no manifest to read"
+        );
+        assert_eq!(registry.repos[0].id, "unmanifested-checkout");
+    }
 
     #[test]
     fn update_registry_does_not_panic_on_missing_home() {

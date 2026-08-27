@@ -35,6 +35,10 @@ HOLD_ALARM_POLICY = "scripts/release-hold-alarm.mjs"
 PROOF_GATE = ROOT / "scripts" / "check-release-proof-artifacts.mjs"
 PROOF_GATE_POLICY = "scripts/check-release-proof-artifacts.mjs"
 INSTALL_PROOF_CANARY = WORKFLOWS / "install-proof-canary.yml"
+RUST_TOOLCHAIN_ACTION = ROOT / ".github" / "actions" / "rust-toolchain" / "action.yml"
+TOOLCHAIN_PRUNE = (
+    ROOT / ".github" / "actions" / "rust-toolchain" / "prune-image-toolchains.sh"
+)
 CAPABILITY_CONTRACT = ROOT / "scripts" / "verify-capability-proof.mjs"
 CAPABILITY_CONTRACT_POLICY = "scripts/verify-capability-proof.mjs"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
@@ -478,19 +482,26 @@ DOCS_ONLY_CLASSIFIER_JOB = textwrap.dedent(
             echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
     """
 ).rstrip()
-DOCS_ONLY_CHECK_JOB = textwrap.dedent(
+# The inert pull-request producer of both expanded `Check & Test` names. It
+# covered documentation-only diffs alone until FIR-2815 took the ubuntu and
+# macOS suites off the pull-request path; it now covers every pull request, and
+# it carries no `needs:` so it reports without waiting on the classifier. Its
+# condition and the two aggregates' are mutually exclusive on every event, which
+# is what keeps one required name from having two check runs behind it.
+PULL_REQUEST_CHECK_STUB = textwrap.dedent(
     """\
-    check-docs-only:
+    check-pr-fast-path:
       name: Check & Test
-      needs: changes
-      if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}
+      if: ${{ !cancelled() && github.event_name == 'pull_request' }}
       runs-on: ubuntu-latest
       strategy:
         matrix:
           os: [ubuntu-latest, macos-latest]
       steps:
-        - name: Report the documentation-only fast path
-          run: echo "documentation-only diff; build and test validation not applicable"
+        - name: Report the pull-request fast path
+          run: |
+            echo "Check & Test runs in the merge queue and on every main commit."
+            echo "Admission is the fast gate; see .github/workflows/ci.yml."
     """
 ).rstrip()
 # The ubuntu shards publish `Check & Test ubuntu shard (1)` and `(2)`, which no
@@ -507,7 +518,10 @@ REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
     check:
       name: Check & Test ubuntu shard
       needs: changes
-      if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+      if: >-
+        ${{ !cancelled()
+        && needs.changes.outputs.docs_only != 'true'
+        && github.event_name != 'pull_request' }}
       runs-on: ubuntu-latest
       timeout-minutes: 60
       env:
@@ -531,7 +545,10 @@ UBUNTU_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
     check-aggregate:
       name: Check & Test
       needs: [changes, check]
-      if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+      if: >-
+        ${{ !cancelled()
+        && needs.changes.outputs.docs_only != 'true'
+        && github.event_name != 'pull_request' }}
       runs-on: ubuntu-latest
       timeout-minutes: 5
       strategy:
@@ -603,7 +620,10 @@ MACOS_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
     check-macos-aggregate:
       name: Check & Test
       needs: [changes, check-macos]
-      if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
+      if: >-
+        ${{ !cancelled()
+        && needs.changes.outputs.docs_only != 'true'
+        && github.event_name != 'pull_request' }}
       runs-on: ubuntu-latest
       timeout-minutes: 5
       strategy:
@@ -631,7 +651,18 @@ CI_JOB_DISPLAY_NAMES = {
     "windows-authority-runtime-tests": "Windows authority runtime tests",
     "windows-installer": "Windows installer + vector release build",
     "changes": "Classify diff scope",
-    "check-docs-only": "Check & Test",
+    # The admission core (FIR-2815). Both run on every event and between them
+    # they are the whole of what blocks a pull request. `fast-gate-tests`
+    # publishes a shard name no ruleset requires; `fast-gate-tests-aggregate`
+    # publishes the required name and is green only when every shard succeeded.
+    "fast-gate-lint": "Fast gate lint and policy",
+    "fast-gate-tests": "Fast gate test shard",
+    "fast-gate-tests-aggregate": "Fast gate build and tests",
+    # The inert pull-request producer of the two expanded `Check & Test` names.
+    # It covered documentation-only diffs alone until FIR-2815 moved the ubuntu
+    # and macOS suites off the pull-request path; it now covers every pull
+    # request, which is why the id no longer says docs.
+    "check-pr-fast-path": "Check & Test",
     # The ubuntu half of Check & Test, split so its 14.98-minute test step can
     # run as two nextest partitions. The shard job keeps the id `check`, which
     # bin/kin-precheck and rust-cache both key on, and publishes a name of its
@@ -653,7 +684,7 @@ CI_JOB_DISPLAY_NAMES = {
     # branch ruleset names it, so each is listed here to be reviewed as a
     # producer, and the ruleset is what makes it block.
     "falsify-guards": "Falsify guards",
-    "feature-tests-docs-only": "Feature permutation tests",
+    "feature-tests-pr-fast-path": "Feature permutation tests",
     "feature-tests": "Feature permutation tests",
     "coverage": "Code Coverage",
     "install-proof-pr-build": "Install Proof (PR) Build",
@@ -842,15 +873,30 @@ REQUIRED_CHECK_JOB_PRODUCERS = {
     # mutually exclusive by condition, so no two of them ever publish the same
     # expanded name on one event.
     "Check & Test": {
-        (".github/workflows/ci.yml", "check-docs-only"),
+        (".github/workflows/ci.yml", "check-pr-fast-path"),
         (".github/workflows/ci.yml", "check-aggregate"),
         (".github/workflows/ci.yml", "check-macos-aggregate"),
     },
     "Falsify guards": {
         (".github/workflows/ci.yml", "falsify-guards"),
     },
+    # The admission core (FIR-2815). Neither is required by a ruleset at the
+    # moment this lands; the captain adds them, and the shape of that change is
+    # in the report. They are registered here for the reason `Install Proof (PR)
+    # Gate` is: this map is what stops a second job appearing under a name a
+    # ruleset is about to block on, and a name is easiest to steal in the window
+    # before anything requires it.
+    "Fast gate lint and policy": {
+        (".github/workflows/ci.yml", "fast-gate-lint"),
+    },
+    "Fast gate build and tests": {
+        (".github/workflows/ci.yml", "fast-gate-tests-aggregate"),
+    },
+    "Fast gate test shard": {
+        (".github/workflows/ci.yml", "fast-gate-tests"),
+    },
     "Feature permutation tests": {
-        (".github/workflows/ci.yml", "feature-tests-docs-only"),
+        (".github/workflows/ci.yml", "feature-tests-pr-fast-path"),
         (".github/workflows/ci.yml", "feature-tests"),
     },
     "DCO Sign-off": {
@@ -3046,6 +3092,21 @@ INSTALL_PROOF_PULL_REQUEST_JOBS = (
 )
 
 
+# The only event filters the pull-request install proof jobs may carry, matched
+# on the whole stripped line. A set rather than a substring test, because
+# `event_name != 'pull_request'` is a substring of every filter that also
+# excludes something else, and the thing this assertion exists to catch is a
+# heavy leg quietly leaving the merge queue. `install-proof-pr-gate` carries no
+# job-level filter at all: it always reports, and decides inside its own step.
+INSTALL_PROOF_ADMITTED_EVENT_FILTERS = frozenset(
+    {"&& github.event_name != 'pull_request'"}
+)
+# The gate is exempt from even that. It always reports, under one stable name,
+# and decides inside its own step, so any job-level event filter here publishes
+# no check rather than a skipped one.
+INSTALL_PROOF_PULL_REQUEST_GATE = "install-proof-pr-gate"
+
+
 def assert_install_proof_runs_on_pull_requests(ci: str, install_proof: str) -> None:
     """Require the release install proof to run before a tag exists.
 
@@ -3061,11 +3122,23 @@ def assert_install_proof_runs_on_pull_requests(ci: str, install_proof: str) -> N
     falsifiable. The proof must reach the reviewed reusable workflow rather
     than a lookalike; the binaries it installs must be the ones the pull
     request compiled and packaged in the release archive layout; and none of
-    the three jobs may exclude the pull request or the merge queue, which is
-    exactly how a heavy leg gets quietly moved back to main and how this class
-    of break returns. The semantic-coverage assertion itself is pinned last:
-    the step producing its capture stays on the ordinary Unix path, so a
-    pull-request run reaches it rather than skipping it as an optional extra.
+    the three jobs may exclude the MERGE QUEUE, which is what the release mint
+    reads. The semantic-coverage assertion itself is pinned last: the step
+    producing its capture stays on the ordinary Unix path, so a run reaches it
+    rather than skipping it as an optional extra.
+
+    The pull-request exclusion used to be barred too, and FIR-2815 admits
+    exactly one form of it and no other. The reason it was barred has not
+    changed and is not weakened: a heavy leg quietly moved back to main is how
+    this class of break returns. What changed is where "before a tag" is paid.
+    The proof measured 9.4 minutes on a pull request against a ten-minute
+    open-to-merge bar, and it now runs in the merge queue and on every commit
+    that reaches main, both of which are before any tag. `release-tag.yml`
+    still refuses to mint a sha whose required checks are not green.
+
+    The admitted form is the exact expression below and nothing else, so an
+    event filter that excluded the merge queue, or excluded a push, or was
+    written differently enough to mean something else, still fails here.
     """
 
     jobs = workflow_job_blocks(ci)
@@ -3103,11 +3176,33 @@ def assert_install_proof_runs_on_pull_requests(ci: str, install_proof: str) -> N
 
     for job_id, job in zip(INSTALL_PROOF_PULL_REQUEST_JOBS, (build, call, gate)):
         for line in active_lines(job):
-            if "event_name" in line:
+            clause = line.strip()
+            is_condition = clause.startswith(("&&", "||", "if:"))
+            if not is_condition or "event_name" not in clause:
+                continue
+            # A folded `if:` puts the closing `}}` on whichever clause happens
+            # to be last, so one reviewed filter reads two ways depending on
+            # clause order. Normalise that and nothing else.
+            clause = clause.removesuffix("}}").strip()
+            if job_id == INSTALL_PROOF_PULL_REQUEST_GATE:
                 raise AssertionError(
-                    f"{job_id} must not exclude an event: the install proof "
-                    "exists to run on pull requests and merge groups, and a "
-                    f"job-level event filter silently returns it to the tag: {line}"
+                    f"{job_id} must not exclude an event. It is the job that "
+                    "always reports, under one stable name, and is the context "
+                    "to require; a filter here publishes no check at all rather "
+                    f"than a skipped one: {line}"
+                )
+            if clause not in INSTALL_PROOF_ADMITTED_EVENT_FILTERS:
+                raise AssertionError(
+                    f"{job_id} carries an event filter that is not the one "
+                    "reviewed under FIR-2815. The install proof runs in the "
+                    "merge queue and on every main commit, and a filter written "
+                    f"any other way silently returns it to the tag: {line}"
+                )
+            if "merge_group" in line or "push" in line:
+                raise AssertionError(
+                    f"{job_id} must run inside the merge queue and on main: "
+                    "the release mint keys off the queue-proven sha and "
+                    f"refuses a build that skipped this proof: {line}"
                 )
 
     gate_lines = active_lines(gate)
@@ -3549,6 +3644,251 @@ def assert_install_proof_status_contract(
     )
 
 
+def assert_toolchain_prune_is_wired(action: str) -> None:
+    """Keep the cache key a function of this repository, not of the runner image.
+
+    `Swatinem/rust-cache` hashes every entry of `rustup toolchain list` into half its key.
+    Two ubuntu-latest jobs sixty-five seconds apart drew images carrying 1.97.1 and 1.98.0,
+    hashed to 8374e8ea and 6ea01539 against one `Cargo.lock`, and could not restore each
+    other's cache. Nothing in this repository chose either version.
+
+    The obvious fix is the wrong one and has its own arm below: turning off
+    `add-rust-environment-hash-key` gates BOTH halves of the key in that action's source,
+    so the key freezes at its bare prefix and stops varying on `Cargo.lock` at all.
+
+    Order is the load-bearing part here. The image's set has to be recorded BEFORE the
+    install, because afterwards nothing can tell an image toolchain from the one this action
+    added, and a prune that reads the list after the install would remove the toolchain it
+    just installed or nothing at all.
+    """
+
+    for step in (
+        "Record the toolchains the runner image shipped",
+        "Prune toolchains this repository never named",
+    ):
+        if action.count(f"- name: {step}\n") != 1:
+            raise AssertionError(
+                f"the rust-toolchain action must declare exactly one step named {step!r}; "
+                "without it the cargo cache key carries whatever toolchain the runner "
+                "image happened to ship"
+            )
+    record = action.index("- name: Record the toolchains the runner image shipped")
+    install = action.index("- name: Install the toolchain")
+    prune = action.index("- name: Prune toolchains this repository never named")
+    if not record < install < prune:
+        raise AssertionError(
+            "the image toolchain set must be recorded before the install and pruned after "
+            "it; recorded after the install it cannot tell the image's toolchains from ours"
+        )
+    # The needle is the INVOCATION, never the name. The step's own comment names the
+    # script, so a needle of `prune-image-toolchains.sh` matches a step that calls nothing
+    # and this assertion could not fail. That is how it read on the first run of the
+    # mutation below, which is the only reason it is written this way.
+    if 'bash "$GITHUB_ACTION_PATH/prune-image-toolchains.sh"' not in action:
+        raise AssertionError(
+            "the prune step must call prune-image-toolchains.sh, which is the copy the "
+            "behavioral cases below drive"
+        )
+    if "repo_pin=$repo_pin" not in action and 'repo_pin=$repo_pin' not in action:
+        raise AssertionError(
+            "the resolve step must publish repo_pin, because the prune keeps the channel "
+            "rust-toolchain.toml names as well as the toolchain the caller asked for"
+        )
+
+
+def run_prune(
+    tmp: Path,
+    resolved: str,
+    preinstalled: list[str],
+    repo_pin: str = "",
+    uninstall_fails: str = "",
+    uninstall_fails_after: str = "",
+    after: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Drive the prune script against a stub rustup, so its logic is testable off CI.
+
+    The stub is the whole point. Asserting the script's TEXT would pass on a script that
+    removes the wrong toolchain, and a check that cannot fail is not evidence. `after` lets
+    a case model a rustup that reports something the prune did not achieve, which is the
+    straggler the assertion exists to catch.
+    """
+
+    bindir = tmp / "bin"
+    bindir.mkdir(parents=True, exist_ok=True)
+    state = tmp / "installed.txt"
+    state.write_text("\n".join(preinstalled) + "\n", encoding="utf-8")
+    forced = tmp / "forced-after.txt"
+    if after is not None:
+        forced.write_text("\n".join(after) + "\n", encoding="utf-8")
+    stub = bindir / "rustup"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f'STATE="{state}"\n'
+        f'FORCED="{forced}"\n'
+        f'FAILS="{uninstall_fails}"\n'
+        f'FAILS_AFTER="{uninstall_fails_after}"\n'
+        'if [ "$1" = "toolchain" ] && [ "$2" = "list" ]; then\n'
+        '  if [ -f "$FORCED" ]; then cat "$FORCED"; else cat "$STATE"; fi\n'
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1" = "toolchain" ] && [ "$2" = "uninstall" ]; then\n'
+        '  if [ -n "$FAILS" ] && [ "$3" = "$FAILS" ]; then echo "stub refuses $3" >&2; exit 1; fi\n'
+        '  grep -v "^$3\\( \\|$\\)" "$STATE" > "$STATE.new" || true\n'
+        '  mv "$STATE.new" "$STATE"\n'
+        '  if [ -n "$FAILS_AFTER" ] && [ "$3" = "$FAILS_AFTER" ]; then echo "stub errored after removing $3" >&2; exit 1; fi\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    before = tmp / "before.txt"
+    before.write_text("\n".join(preinstalled) + "\n", encoding="utf-8")
+    env = dict(os.environ)
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    return subprocess.run(
+        ["bash", str(TOOLCHAIN_PRUNE), resolved, str(before), repo_pin],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=False,
+    )
+
+
+def assert_toolchain_prune_behavior() -> None:
+    """The prune keeps what this repository names and removes what the image shipped."""
+
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+
+        # The measured case: the image shipped a second stable nobody here chose.
+        run = run_prune(
+            tmp / "image-extra",
+            "1.96.0",
+            [
+                "1.96.0-x86_64-unknown-linux-gnu (default)",
+                "1.98.0-x86_64-unknown-linux-gnu",
+            ],
+            repo_pin="1.96.0",
+        )
+        if run.returncode != 0:
+            raise AssertionError(f"the prune refused an ordinary image: {run.stderr}")
+        if "removing 1.98.0-x86_64-unknown-linux-gnu" not in run.stdout:
+            raise AssertionError(
+                f"the prune left the image's own toolchain installed: {run.stdout}"
+            )
+        if "keeping 1.96.0-x86_64-unknown-linux-gnu" not in run.stdout:
+            raise AssertionError(
+                f"the prune removed the toolchain this repository pins: {run.stdout}"
+            )
+
+        # fuzz.yml's shape: a caller-supplied nightly, and a bare `cargo` that
+        # rust-toolchain.toml resolves to the stable pin. Both survive.
+        run = run_prune(
+            tmp / "two-named",
+            "nightly-2026-06-17",
+            [
+                "1.96.0-x86_64-unknown-linux-gnu",
+                "1.98.0-x86_64-unknown-linux-gnu",
+                "nightly-2026-06-17-x86_64-unknown-linux-gnu",
+            ],
+            repo_pin="1.96.0",
+        )
+        if run.returncode != 0:
+            raise AssertionError(f"the prune refused the fuzz shape: {run.stderr}")
+        for kept in ("1.96.0-x86_64", "nightly-2026-06-17-x86_64"):
+            if f"keeping {kept}" not in run.stdout:
+                raise AssertionError(
+                    f"the prune removed {kept}, which this repository names: {run.stdout}"
+                )
+        if "removing 1.98.0-x86_64-unknown-linux-gnu" not in run.stdout:
+            raise AssertionError(
+                f"the prune kept a toolchain nobody named: {run.stdout}"
+            )
+
+        # A prefix must not be read as a match in either direction.
+        run = run_prune(
+            tmp / "prefix",
+            "1.9",
+            ["1.96.0-x86_64-unknown-linux-gnu"],
+        )
+        if run.returncode == 0:
+            raise AssertionError(
+                "channel 1.9 matched toolchain 1.96.0, so a prefix is being read as a "
+                "match and the wrong toolchain can be kept"
+            )
+
+        # A refused uninstall must stop the job. Swallowed, it leaves a third toolchain in
+        # the list under a green run, which is exactly the defect being fixed.
+        run = run_prune(
+            tmp / "refused",
+            "1.96.0",
+            [
+                "1.96.0-x86_64-unknown-linux-gnu",
+                "1.98.0-x86_64-unknown-linux-gnu",
+            ],
+            repo_pin="1.96.0",
+            uninstall_fails="1.98.0-x86_64-unknown-linux-gnu",
+        )
+        if run.returncode == 0:
+            raise AssertionError(
+                "a refused uninstall exited zero, so a toolchain this repository never "
+                "chose survives into the cache key under a green run"
+            )
+        if "could not uninstall" not in run.stderr:
+            raise AssertionError(
+                f"a refused uninstall did not name itself: {run.stderr}"
+            )
+
+        # The same refusal from a rustup that removed the toolchain and THEN errored. It
+        # leaves no straggler, so the assertion below cannot shield it, and the loud
+        # failure is the only thing that can stop the job. Without this case the
+        # "could not uninstall" assertion is unreachable: every refusal the other stub mode
+        # produces is caught by the straggler check first, and an assertion nothing can
+        # reach is not evidence.
+        run = run_prune(
+            tmp / "refused-after",
+            "1.96.0",
+            [
+                "1.96.0-x86_64-unknown-linux-gnu",
+                "1.98.0-x86_64-unknown-linux-gnu",
+            ],
+            repo_pin="1.96.0",
+            uninstall_fails_after="1.98.0-x86_64-unknown-linux-gnu",
+        )
+        if run.returncode == 0:
+            raise AssertionError(
+                "an uninstall that errored after doing the work exited zero, so nothing "
+                "stops a job whose toolchain removal is only half trustworthy"
+            )
+        if "could not uninstall" not in run.stderr:
+            raise AssertionError(
+                f"a refusal that left no straggler was not named: {run.stderr}"
+            )
+
+        # And the straggler assertion, which is what turns this from a hope into a check:
+        # a rustup that reports an unnamed toolchain still installed must fail the step,
+        # however it got there.
+        run = run_prune(
+            tmp / "straggler",
+            "1.96.0",
+            ["1.96.0-x86_64-unknown-linux-gnu"],
+            repo_pin="1.96.0",
+            after=[
+                "1.96.0-x86_64-unknown-linux-gnu",
+                "1.99.0-x86_64-unknown-linux-gnu",
+            ],
+        )
+        if run.returncode == 0:
+            raise AssertionError(
+                "a toolchain this repository never named survived the prune and the step "
+                "still passed, so the invariant is asserted nowhere"
+            )
+        if "survived the prune" not in run.stderr:
+            raise AssertionError(f"the straggler was not named: {run.stderr}")
+
+
 def assert_docs_only_classifier_guard(workflow: str) -> None:
     """Require the exact workflow header, classifier job, and classifier shell."""
 
@@ -3827,6 +4167,11 @@ WINDOWS_AUTHORITY_JOBS = (
     "windows-authority-runtime-tests",
 )
 WINDOWS_AUTHORITY_LEG_HELPERS = "source ./scripts/windows-authority-legs.sh"
+# The one job-level condition these three may carry, matched whole. Whole rather
+# than by substring, because `github.event_name != 'pull_request'` is a
+# substring of every condition that also excludes the merge queue or the push,
+# and that is the thing this rule exists to catch.
+WINDOWS_AUTHORITY_ADMITTED_IF = "${{ github.event_name != 'pull_request' }}"
 # Every native Windows leg, wherever it runs. The set is what the three jobs
 # owe between them, so splitting or rebalancing them stays a free choice while
 # dropping one does not: a leg that leaves this file has to leave it visibly.
@@ -3858,6 +4203,116 @@ WINDOWS_AUTHORITY_LEGS = (
 )
 
 
+# The admission core, FIR-2815. Two jobs decide whether a pull request may land
+# and a third publishes the required name for the sharded one. Everything about
+# that arrangement is invisible from the context name, which is why it is pinned
+# here the way the Check & Test aggregates are: a required context that goes
+# green on a shard that never ran is worse than no context at all, and an
+# admission gate is the one place where that is cheapest to introduce and
+# hardest to notice.
+FAST_GATE_LINT_STEPS = (
+    "run: cargo fmt -- --check",
+    "run: python3 scripts/check-quarantine.py",
+    "cargo clippy --all-targets --all-features -- $allows",
+    "bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'",
+)
+# What the sharded half owes. The listing assertion is the load-bearing one: the
+# scope selector narrows the run to the packages a diff can have broken, and a
+# nextest filter matching nothing grades nothing and exits 0, printing the same
+# summary a clean pass prints. Without a listing count the whole job is a check
+# that cannot fail.
+FAST_GATE_SHARD_STEPS = (
+    "python3 scripts/changed-crate-scope.py",
+    "cargo nextest list --locked",
+    'print("::error title=Empty test selection::the scope lists zero tests")',
+    "cargo nextest run --locked",
+    "run: python3 scripts/check-quarantine.py --report-junit",
+)
+FAST_GATE_SHARD_MATRIX = "shard: [1, 2, 3]"
+FAST_GATE_SHARD_INDEPENDENT_LEGS = "fail-fast: false"
+FAST_GATE_AGGREGATE_ALWAYS_RUNS = "if: ${{ !cancelled() }}"
+FAST_GATE_AGGREGATE_NEEDS = "needs: [changes, fast-gate-tests]"
+FAST_GATE_AGGREGATE_SUCCESS_GATE = 'if [ "$SHARDS" != "success" ]; then'
+
+
+def assert_fast_gate_authority(workflow: str) -> None:
+    """Pin the admission core so it cannot go green having graded nothing.
+
+    Three properties, none of them observable from the required context's name.
+
+    The aggregate ALWAYS runs. It is the only producer of the required name, and
+    a required context nobody reports blocks a merge forever with every visible
+    check green, which is a silent hang rather than a failure. So its condition
+    is `!cancelled()` and nothing narrower, and it decides inside its own step.
+
+    The aggregate admits `success` from the shards and nothing else. `skipped`
+    and `cancelled` mean part of the selection never ran, and a required context
+    green on that is worse than no context at all. The documentation-only case
+    is the one exemption and it is spelled out in the step rather than inferred
+    from a job condition, so a reader can see which case is being passed.
+
+    The shards assert their LISTING before they run. The scope selector narrows
+    to the packages a diff can have broken, and a nextest filter matching
+    nothing grades nothing and exits 0 with the same summary a clean pass
+    prints. The count is what separates the two, and it is the only thing that
+    can, so it is required here rather than left to a reviewer to notice.
+    """
+
+    jobs = workflow_job_blocks(workflow)
+    for job_id in ("fast-gate-lint", "fast-gate-tests", "fast-gate-tests-aggregate"):
+        if job_id not in jobs:
+            raise AssertionError(
+                f"the admission core lost {job_id}; what blocks a pull request "
+                "from landing is not something to remove quietly"
+            )
+
+    lint = active_lines(jobs["fast-gate-lint"])
+    for policy in FAST_GATE_LINT_STEPS:
+        if not any(policy in line for line in lint):
+            raise AssertionError(
+                "the admission core's lint and policy half must keep running "
+                f"`{policy}`: 31 of 64 measured pull-request failures were "
+                "formatting, clippy or a policy script"
+            )
+
+    shard = jobs["fast-gate-tests"]
+    shard_lines = active_lines(shard)
+    for policy in FAST_GATE_SHARD_STEPS:
+        if not any(policy in line for line in shard_lines):
+            raise AssertionError(
+                f"the admission core's sharded half must keep running `{policy}`"
+            )
+    for policy in (FAST_GATE_SHARD_MATRIX, FAST_GATE_SHARD_INDEPENDENT_LEGS):
+        if policy not in shard_lines:
+            raise AssertionError(
+                f"the admission core's shards must keep `{policy}`: one red "
+                "shard cancelling its siblings makes the aggregate report one "
+                "cause where there may be three"
+            )
+
+    aggregate = jobs["fast-gate-tests-aggregate"]
+    aggregate_lines = active_lines(aggregate)
+    conditions = [line for line in aggregate_lines if line.startswith("if:")]
+    if conditions != [FAST_GATE_AGGREGATE_ALWAYS_RUNS]:
+        raise AssertionError(
+            "the admission core's aggregate publishes the required name and "
+            f"must run on every event, with `{FAST_GATE_AGGREGATE_ALWAYS_RUNS}` "
+            f"and nothing narrower; it carries {conditions}. A required context "
+            "nobody reports is a silent hang, not a failure"
+        )
+    if FAST_GATE_AGGREGATE_NEEDS not in aggregate_lines:
+        raise AssertionError(
+            "the admission core's aggregate must wait on the shards it grades; "
+            f"missing `{FAST_GATE_AGGREGATE_NEEDS}`"
+        )
+    if FAST_GATE_AGGREGATE_SUCCESS_GATE not in aggregate_lines:
+        raise AssertionError(
+            "the admission core's aggregate must admit only `success` from the "
+            "shards: `skipped` and `cancelled` mean part of the selection never "
+            "ran, and a required context green on that is worse than none"
+        )
+
+
 def assert_windows_authority_split(ci_jobs: dict[str, str]) -> None:
     """Hold the three native Windows jobs to what one job used to owe.
 
@@ -3871,9 +4326,17 @@ def assert_windows_authority_split(ci_jobs: dict[str, str]) -> None:
     drop a test, because the leg simply is not in the job you are reading and
     the other job looks complete on its own.
 
-    No job takes a job-level `if:`. These jobs are the merge group's only proof
+    No job takes a job-level `if:` other than the one reviewed under FIR-2815,
+    which takes them off pull requests and leaves them on the merge queue and on
+    every commit that reaches main. These jobs are the merge group's only proof
     of the native Windows admission contract, and that reasoning did not change
-    when one job became three.
+    when one job became three, nor when the pull-request half of CI was thinned:
+    a filter excluding the queue or the push is still what would quietly move
+    this proof to the tag, and is still refused. The longest of the three
+    measured 11.7 minutes, which no admission gate carries against a ten-minute
+    open-to-merge bar, and `merge_pr_ready` refuses while any check is pending,
+    so leaving them on pull requests set the lane's clock whether or not any
+    ruleset named them.
 
     The step budgets sum to less than the job cap. GitHub CANCELS a job that
     hits its own timeout, and a cancelled job is silent on a check no ruleset
@@ -3897,11 +4360,14 @@ def assert_windows_authority_split(ci_jobs: dict[str, str]) -> None:
 
     for job_id in WINDOWS_AUTHORITY_JOBS:
         block = ci_jobs[job_id]
-        if re.search(r"(?m)^    if:", block) is not None:
+        conditions = re.findall(r"(?m)^    if: (.*)$", block)
+        if conditions != [] and conditions != [WINDOWS_AUTHORITY_ADMITTED_IF]:
             raise AssertionError(
-                "the Windows authority jobs must stay on every event, so "
-                "admission behavior is asserted before a release commit can "
-                f"carry it: {job_id}"
+                "the Windows authority jobs must stay on the merge queue and "
+                "on every main commit, so admission behavior is asserted "
+                "before a release commit can carry it. The only reviewed "
+                f"condition is `{WINDOWS_AUTHORITY_ADMITTED_IF}`, and "
+                f"{job_id} carries {conditions}"
             )
         require(block, WINDOWS_AUTHORITY_LEG_HELPERS, f"shared leg helpers in {job_id}")
         job_cap = re.search(r"(?m)^    timeout-minutes: (?P<cap>\d+)$", block)
@@ -4703,14 +5169,12 @@ def assert_check_consumer_authority(workflow: str) -> None:
             "identity and display-name map"
         )
 
-    docs_only = blocks.get("check-docs-only")
+    stub = blocks.get("check-pr-fast-path")
     real = blocks.get("check")
-    if (
-        docs_only is None
-        or classifier_active_job_source(docs_only) != DOCS_ONLY_CHECK_JOB
-    ):
+    if stub is None or classifier_active_job_source(stub) != PULL_REQUEST_CHECK_STUB:
         raise AssertionError(
-            "Check & Test consumer authority requires the exact inert docs-only job"
+            "Check & Test consumer authority requires the exact inert "
+            "pull-request job"
         )
     if (
         real is None
@@ -7063,6 +7527,50 @@ def assert_recovery_escalation_classifies(release_recovery: str) -> None:
         raise AssertionError(
             "recovery claimed Release absence after a non-404 API failure: "
             f"{unreadable_release_body}"
+        )
+
+
+def assert_ruleset_mirror_stays_a_superset(release_tag: str) -> None:
+    """The reviewed mirror must never shrink below what the mint vetoes on.
+
+    `missing_from_ruleset` runs unconditionally in the mint and refuses when the
+    mint requires a context the reviewed mirror does not gate. `REQUIRED_CHECKS`
+    is the veto set and `RULESET_REQUIRED_CHECKS` is the mirror of live ruleset
+    19746451, so the mirror has to stay a superset of the veto set forever, and
+    the day it stops being one EVERY release refuses.
+
+    That is not a theoretical edit. FIR-2815 thins the live ruleset to a short
+    admission list, which makes "sync the mirror to the ruleset" the obvious
+    next tidy-up and makes it fatal. Nothing caught it before this: the mint's
+    own refusal is driven here only against a synthetic environment, so the
+    file's actual mirror content was unread, and a shrunken mirror landed green
+    and failed at the next mint with no pull request to blame.
+
+    The mirror may hold MORE than the veto set. That is its purpose: a context a
+    ruleset gates and the mint does not veto on still has to be published by an
+    admitted build, or the queue waits on a name nobody produces.
+    """
+
+    def block(key: str) -> tuple[str, ...]:
+        found = re.search(
+            rf"\n          {key}: \|\n((?:            \S.*\n)+)", release_tag
+        )
+        if found is None:
+            raise AssertionError(
+                f"release-tag.yml no longer declares {key} as a block scalar"
+            )
+        return tuple(
+            line.strip() for line in found.group(1).splitlines() if line.strip()
+        )
+
+    veto = block("REQUIRED_CHECKS")
+    mirror = block("RULESET_REQUIRED_CHECKS")
+    dropped = sorted(set(veto) - set(mirror))
+    if dropped:
+        raise AssertionError(
+            "the reviewed ruleset mirror must stay a superset of the checks the "
+            f"mint vetoes on; it no longer gates {dropped}, which makes "
+            "missing_from_ruleset non-empty and refuses EVERY release"
         )
 
 
@@ -11476,14 +11984,33 @@ def main() -> None:
             "exactly once",
         ),
         (
-            "a Windows authority job takes a job-level condition",
+            "a Windows authority job is taken off the merge queue",
             "windows-authority-runtime-tests",
             ci_jobs["windows-authority-runtime-tests"].replace(
                 "    runs-on: windows-latest",
                 "    if: github.event_name != 'merge_group'\n    runs-on: windows-latest",
                 1,
             ),
-            "must stay on every event",
+            "must stay on the merge queue",
+        ),
+        (
+            "a Windows authority job takes an unreviewed job-level condition",
+            "windows-authority-runtime-tests",
+            ci_jobs["windows-authority-runtime-tests"].replace(
+                f"    if: {WINDOWS_AUTHORITY_ADMITTED_IF}\n", "    if: ${{ false }}\n", 1
+            ),
+            "The only reviewed condition is",
+        ),
+        (
+            "the reviewed condition is widened to exclude the push as well",
+            "windows-authority-runtime-tests",
+            ci_jobs["windows-authority-runtime-tests"].replace(
+                f"    if: {WINDOWS_AUTHORITY_ADMITTED_IF}\n",
+                "    if: ${{ github.event_name != 'pull_request'"
+                " && github.event_name != 'push' }}\n",
+                1,
+            ),
+            "The only reviewed condition is",
         ),
         (
             "a Windows authority job stops sourcing the shared leg helpers",
@@ -12356,11 +12883,49 @@ def main() -> None:
     # reviewed shell is meaningless without its checkout, output, id, event,
     # SHA, shell, and startup-environment bindings, so those are one authority
     # contract rather than independently mutable text.
+    # The span ends at the next job header rather than at a named sibling. It
+    # used to name `check-docs-only`, which put this reader one job rename or
+    # one inserted job away from a ValueError that reads like a missing
+    # classifier rather than like a moved neighbour.
     classifier_start = ci_workflow.index("  changes:")
-    classifier_end = ci_workflow.index("\n  check-docs-only:", classifier_start)
-    classifier = ci_workflow[classifier_start:classifier_end]
+    next_job = re.search(
+        r"(?m)^  [A-Za-z0-9_.-]+:$", ci_workflow[classifier_start + len("  changes:") :]
+    )
+    if next_job is None:
+        raise AssertionError("the classifier job must be followed by another job")
+    classifier_end = classifier_start + len("  changes:") + next_job.start()
+    classifier = ci_workflow[classifier_start:classifier_end].rstrip("\n")
     assert_docs_only_classifier_guard(ci_workflow)
     assert_assertion_reachability_gate_wired(ci_workflow)
+    toolchain_action = RUST_TOOLCHAIN_ACTION.read_text(encoding="utf-8")
+    assert_toolchain_prune_is_wired(toolchain_action)
+    assert_toolchain_prune_behavior()
+    for label, original, replacement, expected in (
+        (
+            "the prune step is dropped, so the image decides the cache key",
+            "    - name: Prune toolchains this repository never named",
+            "    - name: Prune nothing at all",
+            "must declare exactly one step named",
+        ),
+        (
+            "the image set is recorded after the install, where it cannot tell them apart",
+            "    - name: Record the toolchains the runner image shipped",
+            "    - name: Recorded too late",
+            "must declare exactly one step named",
+        ),
+        (
+            "the prune stops calling the script the behavioral cases drive",
+            'bash "$GITHUB_ACTION_PATH/prune-image-toolchains.sh" \\',
+            "true \\",
+            "must call prune-image-toolchains.sh",
+        ),
+    ):
+        mutant = replace_exactly_once(toolchain_action, original, replacement, label)
+        expect_assertion(
+            label,
+            expected,
+            lambda mutant=mutant: assert_toolchain_prune_is_wired(mutant),
+        )
     assert_cargo_deny_reads_every_advisory(sast)
     assert_advisory_sweep_authority(advisory_sweep, release_train)
     for label, source, original, replacement, expected, check in (
@@ -12714,8 +13279,77 @@ def main() -> None:
     assert_check_consumer_authority(ci_workflow)
     assert_macos_shard_authority(ci_workflow)
     assert_ubuntu_shard_authority(ci_workflow)
+    assert_fast_gate_authority(ci_workflow)
+    fast_gate_blocks = workflow_job_blocks(ci_workflow)
+    for label, owner, old, new, expected in (
+        (
+            "the aggregate stops always running, so a pull request waits on a "
+            "context nothing will report",
+            "fast-gate-tests-aggregate",
+            f"    {FAST_GATE_AGGREGATE_ALWAYS_RUNS}",
+            "    if: ${{ !cancelled() && github.event_name != 'pull_request' }}",
+            "must run on every event",
+        ),
+        (
+            "the aggregate accepts a shard result that is not success",
+            "fast-gate-tests-aggregate",
+            FAST_GATE_AGGREGATE_SUCCESS_GATE,
+            'if [ "$SHARDS" = "failure" ]; then',
+            "admit only `success`",
+        ),
+        (
+            "the aggregate stops waiting on the shards it grades",
+            "fast-gate-tests-aggregate",
+            f"    {FAST_GATE_AGGREGATE_NEEDS}",
+            "    needs: changes",
+            "must wait on the shards",
+        ),
+        (
+            "the shards stop asserting the selection lists any test",
+            "fast-gate-tests",
+            'print("::error title=Empty test selection::the scope lists zero tests")',
+            "pass",
+            "sharded half must keep running",
+        ),
+        (
+            "the scope selector is dropped and the shards test whatever is left",
+            "fast-gate-tests",
+            "python3 scripts/changed-crate-scope.py",
+            "true scripts/changed-crate-scope-disabled.py",
+            "sharded half must keep running",
+        ),
+        (
+            "one red shard is allowed to cancel its passing siblings",
+            "fast-gate-tests",
+            f"      {FAST_GATE_SHARD_INDEPENDENT_LEGS}",
+            "      fail-fast: true",
+            "shards must keep",
+        ),
+        (
+            "the quarantine clock stops running in the admission core",
+            "fast-gate-lint",
+            "        run: python3 scripts/check-quarantine.py\n",
+            "        run: true\n",
+            "lint and policy half must keep running",
+        ),
+    ):
+        # Scoped to the owning job block rather than the whole file: two jobs
+        # carry `if: ${{ !cancelled() }}`, and a whole-file replace would mutate
+        # whichever came first and grade a job this assertion is not about.
+        block = fast_gate_blocks[owner]
+        if block.count(old) != 1:
+            raise AssertionError(
+                f"admission core falsification could not identify {label}"
+            )
+        mutant_workflow = ci_workflow.replace(block, block.replace(old, new, 1), 1)
+        expect_assertion(
+            label,
+            expected,
+            lambda mutant=mutant_workflow: assert_fast_gate_authority(mutant),
+        )
+
     consumer_blocks = workflow_job_blocks(ci_workflow)
-    docs_only_check = consumer_blocks["check-docs-only"]
+    stub_check = consumer_blocks["check-pr-fast-path"]
     real_check = consumer_blocks["check"]
     macos_shards = consumer_blocks["check-macos"]
     macos_aggregate = consumer_blocks["check-macos-aggregate"]
@@ -12910,25 +13544,28 @@ def main() -> None:
             ),
         )
 
-    docs_only_condition = (
-        "    if: ${{ !cancelled() && needs.changes.outputs.docs_only == 'true' }}"
+    stub_condition = (
+        "    if: ${{ !cancelled() && github.event_name == 'pull_request' }}"
     )
     real_check_condition = (
-        "    if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}"
+        "    if: >-\n"
+        "      ${{ !cancelled()\n"
+        "      && needs.changes.outputs.docs_only != 'true'\n"
+        "      && github.event_name != 'pull_request' }}"
     )
-    swapped_docs_only_check = docs_only_check.replace(
-        docs_only_condition,
+    swapped_stub_check = stub_check.replace(
+        stub_condition,
         real_check_condition,
         1,
     )
     swapped_real_check = real_check.replace(
         real_check_condition,
-        docs_only_condition,
+        stub_condition,
         1,
     )
     swapped_consumers = ci_workflow.replace(
-        docs_only_check,
-        swapped_docs_only_check,
+        stub_check,
+        swapped_stub_check,
         1,
     ).replace(
         real_check,
@@ -12943,43 +13580,53 @@ def main() -> None:
 
     for label, old, new in (
         (
-            "docs-only Check & Test job identity changed",
-            "  check-docs-only:",
+            "pull-request Check & Test job identity changed",
+            "  check-pr-fast-path:",
             "  check-context-spoof:",
         ),
         (
-            "docs-only Check & Test display name changed",
+            "pull-request Check & Test display name changed",
             "    name: Check & Test",
             "    name: Documentation shortcut",
         ),
         (
-            "docs-only Check & Test dependency changed",
-            "    needs: changes",
-            "    needs: dco",
+            "pull-request Check & Test gained a dependency it must not wait on",
+            "    runs-on: ubuntu-latest",
+            "    needs: changes\n    runs-on: ubuntu-latest",
         ),
         (
-            "docs-only Check & Test runner changed",
+            "pull-request Check & Test runner changed",
             "    runs-on: ubuntu-latest",
             "    runs-on: ${{ matrix.os }}",
         ),
         (
-            "docs-only Check & Test matrix changed",
+            "pull-request Check & Test matrix changed",
             "        os: [ubuntu-latest, macos-latest]",
             "        os: [ubuntu-latest]",
         ),
         (
-            "docs-only Check & Test inert step changed",
-            '      run: echo "documentation-only diff; '
-            'build and test validation not applicable"',
-            '      run: echo "unreviewed shortcut"',
+            "pull-request Check & Test inert step changed",
+            '          echo "Admission is the fast gate; '
+            'see .github/workflows/ci.yml."',
+            '          echo "unreviewed shortcut"',
+        ),
+        (
+            # The one that matters most after FIR-2815: narrowing this back to
+            # documentation-only diffs leaves every ordinary pull request with
+            # no producer of either expanded `Check & Test` name at all, which
+            # is a silent hang rather than a failure.
+            "pull-request Check & Test narrowed back to documentation diffs",
+            "    if: ${{ !cancelled() && github.event_name == 'pull_request' }}",
+            "    if: ${{ !cancelled() && "
+            "needs.changes.outputs.docs_only == 'true' }}",
         ),
     ):
-        if docs_only_check.count(old) != 1:
+        if stub_check.count(old) != 1:
             raise AssertionError(
                 f"Check & Test consumer falsification could not identify {label}"
             )
-        mutant_job = docs_only_check.replace(old, new, 1)
-        mutant_workflow = ci_workflow.replace(docs_only_check, mutant_job, 1)
+        mutant_job = stub_check.replace(old, new, 1)
+        mutant_workflow = ci_workflow.replace(stub_check, mutant_job, 1)
         expect_assertion(
             label,
             "Check & Test consumer authority",
@@ -14391,6 +15038,32 @@ def main() -> None:
     assert_required_context_action_pins(workflow_sources)
     assert_tag_readback_retries(release_tag)
     assert_required_check_set_is_single_sourced(release_tag)
+    assert_ruleset_mirror_stays_a_superset(release_tag)
+    for label, old_name, new_name in (
+        (
+            "the mirror is synced down to a thinned live ruleset",
+            "            Falsify guards\n            Feature permutation tests (ubuntu-latest)\n",
+            "",
+        ),
+        (
+            "one name is dropped from the mirror alone",
+            "            Windows installer + vector release build\n            PR text hygiene\n",
+            "            PR text hygiene\n",
+        ),
+    ):
+        mirror_start = release_tag.index("          RULESET_REQUIRED_CHECKS: |")
+        head, mirror = release_tag[:mirror_start], release_tag[mirror_start:]
+        if mirror.count(old_name) != 1:
+            raise AssertionError(
+                f"ruleset mirror falsification could not identify {label}"
+            )
+        expect_assertion(
+            label,
+            "must stay a superset",
+            lambda mutant=head + mirror.replace(old_name, new_name, 1): (
+                assert_ruleset_mirror_stays_a_superset(mutant)
+            ),
+        )
     assert_soft_decline_is_legible(release_tag)
     assert_recovery_escalation_classifies(
         RELEASE_RECOVERY.read_text(encoding="utf-8")
