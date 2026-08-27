@@ -38,7 +38,9 @@ exercises every rule above against its inverse and needs no reports.
 from __future__ import print_function
 
 import argparse
+import contextlib
 import functools
+import io
 import json
 import os
 import sys
@@ -244,6 +246,27 @@ def self_test():
         problems.append("a missing report was accepted")
     except GateError:
         pass
+
+    # Exercise the actual run boundary, not only decide(). A missing report must
+    # return a process-failing status and emit a GitHub error annotation. This is
+    # what makes an unneutralized workflow invocation authoritative.
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        missing_run_rc = run(
+            ["missing=/nonexistent/acceptance-gate-self-test-run.json"], []
+        )
+    missing_run_output = output.getvalue()
+    expect("a failing run returns 1", missing_run_rc, 1)
+    expect(
+        "a failing run emits a GitHub error annotation",
+        "::error::missing: no report at " in missing_run_output,
+        True,
+    )
+    expect(
+        "a failing run names the failed verdict",
+        "acceptance gate FAILED on 1 finding(s)" in missing_run_output,
+        True,
+    )
 
     for line in problems:
         print("SELF-TEST FAIL %s" % line)
