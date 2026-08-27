@@ -11,6 +11,8 @@
 //! Object layout in the bucket:
 //! ```text
 //! {prefix}/{repo_id}/graph.kndb              — checksummed full-authority snapshot envelope
+//! {prefix}/{repo_id}/vector-artifacts/v{hash_version}/{snapshot_cursor}/{retrieval_hash}.kvec
+//!                                              — checksummed, graph-bound derived vector artifact
 //! {prefix}/{repo_id}/source-blobs/sha256/HH/HASH — immutable exact source bytes
 //! {prefix}/{repo_id}/overlays/{session_id}.bin — overlay state
 //! ```
@@ -28,13 +30,34 @@ use sha2::{Digest, Sha256};
 use crate::error::KinDbError;
 use crate::storage::backend::{
     validate_source_blob_read_size, validate_source_blob_repo_id, validate_source_blob_size,
-    verify_source_blob_digest, Generation, SnapshotAuthority, SnapshotCursor,
-    SnapshotRecoveryState, SnapshotSaveOutcome, StorageBackend, GENERATION_INIT,
-    MAX_SOURCE_BLOB_BYTES,
+    verify_source_blob_digest, Generation, PersistedVectorArtifact, SnapshotAuthority,
+    SnapshotCursor, SnapshotRecoveryState, SnapshotSaveOutcome, StorageBackend, VectorArtifact,
+    VectorArtifactBinding, VectorArtifactCursor, VectorArtifactLoadOutcome,
+    VectorArtifactSaveOutcome, VectorRepositoryIdentity, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
+    MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
 
 const GCS_FULL_AUTHORITY_MAGIC: [u8; 8] = *b"KNGCSF02";
 const GCS_FULL_AUTHORITY_HEADER_LEN: usize = 8 + 8 + 32;
+const GCS_VECTOR_ARTIFACT_MAGIC: [u8; 8] = *b"KNGCSV02";
+const GCS_VECTOR_ARTIFACT_HEADER_LEN: usize = 8 + 32 + 8 + 4 + 32 + 8 + 8 + 32;
+const MAX_GCS_VECTOR_ARTIFACT_ENVELOPE_BYTES: u64 = GCS_VECTOR_ARTIFACT_HEADER_LEN as u64
+    + MAX_VECTOR_ARTIFACT_METADATA_BYTES
+    + MAX_VECTOR_ARTIFACT_BYTES;
+
+#[derive(Debug)]
+enum ExactVectorArtifactRetry {
+    Missing,
+    Exact {
+        cursor: VectorArtifactCursor,
+        artifact_sha256: [u8; 32],
+    },
+    Different(VectorArtifactCursor),
+    Corrupt {
+        cursor: VectorArtifactCursor,
+        error: KinDbError,
+    },
+}
 
 /// GCS-backed storage for graph snapshots and overlays.
 ///
@@ -103,6 +126,25 @@ impl GcsBackend {
         validate_source_blob_repo_id(repo_id)?;
         let digest = hex::encode(digest);
         let suffix = format!("{repo_id}/source-blobs/sha256/{}/{}", &digest[..2], digest);
+        Ok(if self.prefix.is_empty() {
+            ObjectPath::from(suffix)
+        } else {
+            ObjectPath::from(format!("{}/{suffix}", self.prefix))
+        })
+    }
+
+    fn vector_artifact_path(
+        &self,
+        repo_id: &str,
+        binding: VectorArtifactBinding,
+    ) -> Result<ObjectPath, KinDbError> {
+        binding.validate_for_repository(repo_id)?;
+        let suffix = format!(
+            "{repo_id}/vector-artifacts/v{}/{:020}/{}.kvec",
+            binding.retrieval_hash_version,
+            binding.snapshot_cursor.backend_generation(),
+            hex::encode(binding.retrieval_authority_hash)
+        );
         Ok(if self.prefix.is_empty() {
             ObjectPath::from(suffix)
         } else {
@@ -182,6 +224,271 @@ impl GcsBackend {
             ));
         }
         Ok(payload.to_vec())
+    }
+
+    fn validate_vector_artifact(artifact: &VectorArtifact) -> Result<(), KinDbError> {
+        if artifact.binding.snapshot_cursor == SnapshotCursor::INITIAL {
+            return Err(KinDbError::StorageError(
+                "vector artifact cannot bind the initial snapshot cursor".to_string(),
+            ));
+        }
+        if artifact.binding.retrieval_hash_version
+            != crate::storage::merkle::RETRIEVAL_AUTHORITY_HASH_VERSION
+        {
+            return Err(KinDbError::StorageError(format!(
+                "vector artifact retrieval hash version {} does not match current {}",
+                artifact.binding.retrieval_hash_version,
+                crate::storage::merkle::RETRIEVAL_AUTHORITY_HASH_VERSION
+            )));
+        }
+        let metadata_len = u64::try_from(artifact.metadata.len()).map_err(|_| {
+            KinDbError::StorageError("vector artifact metadata length exceeds u64".to_string())
+        })?;
+        if metadata_len > MAX_VECTOR_ARTIFACT_METADATA_BYTES {
+            return Err(KinDbError::StorageError(format!(
+                "vector artifact metadata is {metadata_len} bytes, above the {MAX_VECTOR_ARTIFACT_METADATA_BYTES}-byte safety limit"
+            )));
+        }
+        let index_len = u64::try_from(artifact.index.len()).map_err(|_| {
+            KinDbError::StorageError("vector artifact index length exceeds u64".to_string())
+        })?;
+        if index_len > MAX_VECTOR_ARTIFACT_BYTES {
+            return Err(KinDbError::StorageError(format!(
+                "vector artifact index is {index_len} bytes, above the {MAX_VECTOR_ARTIFACT_BYTES}-byte safety limit"
+            )));
+        }
+        Ok(())
+    }
+
+    fn encode_vector_artifact(artifact: &VectorArtifact) -> Result<Vec<u8>, KinDbError> {
+        Self::validate_vector_artifact(artifact)?;
+        let artifact_sha256 = artifact.artifact_sha256()?;
+        let expected_len = GCS_VECTOR_ARTIFACT_HEADER_LEN
+            .checked_add(artifact.metadata.len())
+            .and_then(|len| len.checked_add(artifact.index.len()))
+            .ok_or_else(|| {
+                KinDbError::StorageError("vector artifact envelope length overflows".to_string())
+            })?;
+        let mut encoded = Vec::with_capacity(expected_len);
+        encoded.extend_from_slice(&GCS_VECTOR_ARTIFACT_MAGIC);
+        encoded.extend_from_slice(&artifact.binding.repository_identity.digest());
+        encoded.extend_from_slice(
+            &artifact
+                .binding
+                .snapshot_cursor
+                .backend_generation()
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&artifact.binding.retrieval_hash_version.to_le_bytes());
+        encoded.extend_from_slice(&artifact.binding.retrieval_authority_hash);
+        encoded.extend_from_slice(&(artifact.metadata.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(&(artifact.index.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(&artifact_sha256);
+        encoded.extend_from_slice(&artifact.metadata);
+        encoded.extend_from_slice(&artifact.index);
+        Ok(encoded)
+    }
+
+    fn decode_vector_artifact(
+        bytes: &[u8],
+        expected_binding: VectorArtifactBinding,
+    ) -> Result<(VectorArtifact, [u8; 32]), KinDbError> {
+        if bytes.len() < GCS_VECTOR_ARTIFACT_HEADER_LEN {
+            return Err(KinDbError::StorageError(
+                "GCS vector artifact envelope is truncated".to_string(),
+            ));
+        }
+        if !bytes.starts_with(&GCS_VECTOR_ARTIFACT_MAGIC) {
+            return Err(KinDbError::StorageError(
+                "GCS vector artifact is not a current integrity envelope".to_string(),
+            ));
+        }
+        let repository_identity =
+            VectorRepositoryIdentity::from_digest(bytes[8..40].try_into().expect("fixed range"));
+        let snapshot_generation =
+            Generation::from_le_bytes(bytes[40..48].try_into().expect("fixed range"));
+        let retrieval_hash_version =
+            u32::from_le_bytes(bytes[48..52].try_into().expect("fixed range"));
+        let retrieval_authority_hash = bytes[52..84].try_into().expect("fixed range");
+        let binding = VectorArtifactBinding {
+            repository_identity,
+            snapshot_cursor: SnapshotCursor::from_backend_generation(snapshot_generation),
+            retrieval_hash_version,
+            retrieval_authority_hash,
+        };
+        if binding != expected_binding {
+            return Err(KinDbError::StorageError(format!(
+                "GCS vector artifact binding mismatch: expected repository {}, snapshot cursor {}, retrieval hash version {}, and retrieval hash {}; found repository {}, snapshot cursor {}, retrieval hash version {}, and retrieval hash {}",
+                hex::encode(expected_binding.repository_identity.digest()),
+                expected_binding.snapshot_cursor.backend_generation(),
+                expected_binding.retrieval_hash_version,
+                hex::encode(expected_binding.retrieval_authority_hash),
+                hex::encode(binding.repository_identity.digest()),
+                binding.snapshot_cursor.backend_generation(),
+                binding.retrieval_hash_version,
+                hex::encode(binding.retrieval_authority_hash)
+            )));
+        }
+        let metadata_len = u64::from_le_bytes(bytes[84..92].try_into().expect("fixed range"));
+        let index_len = u64::from_le_bytes(bytes[92..100].try_into().expect("fixed range"));
+        if metadata_len > MAX_VECTOR_ARTIFACT_METADATA_BYTES {
+            return Err(KinDbError::StorageError(format!(
+                "GCS vector artifact metadata is {metadata_len} bytes, above the {MAX_VECTOR_ARTIFACT_METADATA_BYTES}-byte safety limit"
+            )));
+        }
+        if index_len > MAX_VECTOR_ARTIFACT_BYTES {
+            return Err(KinDbError::StorageError(format!(
+                "GCS vector artifact index is {index_len} bytes, above the {MAX_VECTOR_ARTIFACT_BYTES}-byte safety limit"
+            )));
+        }
+        let metadata_len = usize::try_from(metadata_len).map_err(|_| {
+            KinDbError::StorageError("GCS vector artifact metadata exceeds usize".to_string())
+        })?;
+        let index_len = usize::try_from(index_len).map_err(|_| {
+            KinDbError::StorageError("GCS vector artifact index exceeds usize".to_string())
+        })?;
+        let expected_len = GCS_VECTOR_ARTIFACT_HEADER_LEN
+            .checked_add(metadata_len)
+            .and_then(|len| len.checked_add(index_len))
+            .ok_or_else(|| {
+                KinDbError::StorageError(
+                    "GCS vector artifact envelope length overflows".to_string(),
+                )
+            })?;
+        if bytes.len() != expected_len {
+            return Err(KinDbError::StorageError(format!(
+                "GCS vector artifact length mismatch: expected {expected_len}, found {}",
+                bytes.len()
+            )));
+        }
+        let metadata_end = GCS_VECTOR_ARTIFACT_HEADER_LEN + metadata_len;
+        let artifact = VectorArtifact {
+            binding,
+            metadata: bytes[GCS_VECTOR_ARTIFACT_HEADER_LEN..metadata_end].to_vec(),
+            index: bytes[metadata_end..].to_vec(),
+        };
+        let expected_digest: [u8; 32] = bytes[100..132].try_into().expect("fixed range");
+        let actual_digest = artifact.artifact_sha256()?;
+        if actual_digest != expected_digest {
+            return Err(KinDbError::StorageError(
+                "GCS vector artifact digest mismatch".to_string(),
+            ));
+        }
+        Ok((artifact, actual_digest))
+    }
+
+    fn verify_current_vector_binding(
+        &self,
+        repo_id: &str,
+        binding: VectorArtifactBinding,
+    ) -> Result<(), KinDbError> {
+        binding.validate_for_repository(repo_id)?;
+        let current = self.load_snapshot_cursor(repo_id)?.ok_or_else(|| {
+            KinDbError::StorageError(format!(
+                "repo {repo_id}: vector artifact binding names missing graph authority"
+            ))
+        })?;
+        if current != binding.snapshot_cursor {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id}: vector artifact snapshot cursor mismatch: expected current {}, found binding {}",
+                current.backend_generation(),
+                binding.snapshot_cursor.backend_generation()
+            )));
+        }
+        Ok(())
+    }
+
+    fn load_vector_artifact_object(
+        &self,
+        repo_id: &str,
+        binding: VectorArtifactBinding,
+    ) -> Result<VectorArtifactLoadOutcome, KinDbError> {
+        let path = self.vector_artifact_path(repo_id, binding)?;
+        let get_result = match self.block_on(self.store.get(&path)) {
+            Ok(result) => result,
+            Err(object_store::Error::NotFound { .. }) => {
+                return Ok(VectorArtifactLoadOutcome::Missing)
+            }
+            Err(error) => {
+                return Err(KinDbError::StorageError(format!(
+                    "GCS vector artifact load failed for {path}: {error}"
+                )))
+            }
+        };
+        let cursor = VectorArtifactCursor::from_backend_generation(Self::numeric_version(
+            get_result.meta.version.as_deref(),
+            &format!("vector artifact {path}"),
+        )?);
+        let meta_size = get_result.meta.size;
+        if meta_size > MAX_GCS_VECTOR_ARTIFACT_ENVELOPE_BYTES {
+            return Ok(VectorArtifactLoadOutcome::Corrupt {
+                cursor,
+                error: KinDbError::StorageError(format!(
+                    "GCS vector artifact {} is {} bytes, above the {}-byte safety limit",
+                    path, meta_size, MAX_GCS_VECTOR_ARTIFACT_ENVELOPE_BYTES
+                )),
+            });
+        }
+        let bytes = self.block_on(get_result.bytes()).map_err(|error| {
+            KinDbError::StorageError(format!(
+                "GCS vector artifact read bytes failed for {path}: {error}"
+            ))
+        })?;
+        let actual_len = match u64::try_from(bytes.len()) {
+            Ok(actual_len) => actual_len,
+            Err(_) => {
+                return Ok(VectorArtifactLoadOutcome::Corrupt {
+                    cursor,
+                    error: KinDbError::StorageError(format!(
+                        "GCS vector artifact byte length does not fit u64 for {path}"
+                    )),
+                })
+            }
+        };
+        if actual_len != meta_size {
+            return Ok(VectorArtifactLoadOutcome::Corrupt {
+                cursor,
+                error: KinDbError::StorageError(format!(
+                    "GCS vector artifact changed size while reading {path}: metadata reported {}, body returned {actual_len}",
+                    meta_size
+                )),
+            });
+        }
+        let (artifact, artifact_sha256) = match Self::decode_vector_artifact(&bytes, binding) {
+            Ok(decoded) => decoded,
+            Err(error) => return Ok(VectorArtifactLoadOutcome::Corrupt { cursor, error }),
+        };
+        Ok(VectorArtifactLoadOutcome::Loaded(PersistedVectorArtifact {
+            artifact,
+            cursor,
+            artifact_sha256,
+        }))
+    }
+
+    fn confirm_exact_vector_artifact_retry(
+        &self,
+        repo_id: &str,
+        artifact: &VectorArtifact,
+        expected: VectorArtifactCursor,
+    ) -> Result<ExactVectorArtifactRetry, KinDbError> {
+        match self.load_vector_artifact_object(repo_id, artifact.binding)? {
+            VectorArtifactLoadOutcome::Missing => Ok(ExactVectorArtifactRetry::Missing),
+            VectorArtifactLoadOutcome::Loaded(installed) if installed.cursor == expected => {
+                Ok(ExactVectorArtifactRetry::Missing)
+            }
+            VectorArtifactLoadOutcome::Loaded(installed) if installed.artifact == *artifact => {
+                Ok(ExactVectorArtifactRetry::Exact {
+                    cursor: installed.cursor,
+                    artifact_sha256: installed.artifact_sha256,
+                })
+            }
+            VectorArtifactLoadOutcome::Loaded(installed) => {
+                Ok(ExactVectorArtifactRetry::Different(installed.cursor))
+            }
+            VectorArtifactLoadOutcome::Corrupt { cursor, error } => {
+                Ok(ExactVectorArtifactRetry::Corrupt { cursor, error })
+            }
+        }
     }
 
     fn load_snapshot_object(&self, repo_id: &str) -> Result<Option<SnapshotAuthority>, KinDbError> {
@@ -422,6 +729,384 @@ impl StorageBackend for GcsBackend {
         Ok(self
             .load_snapshot_authority(repo_id)?
             .map(|authority| (authority.snapshot_bytes, authority.snapshot_generation)))
+    }
+
+    fn supports_vector_artifacts(&self) -> bool {
+        true
+    }
+
+    fn load_vector_artifact(
+        &self,
+        repo_id: &str,
+        binding: VectorArtifactBinding,
+    ) -> Result<VectorArtifactLoadOutcome, KinDbError> {
+        self.verify_current_vector_binding(repo_id, binding)?;
+        let outcome = self.load_vector_artifact_object(repo_id, binding)?;
+        // Re-read graph authority after probing the object. Missing and corrupt
+        // outcomes can both trigger a replacement write, so they require the
+        // same exact-authority fence as a successfully decoded artifact.
+        self.verify_current_vector_binding(repo_id, binding)?;
+        Ok(outcome)
+    }
+
+    fn save_vector_artifact(
+        &self,
+        repo_id: &str,
+        artifact: &VectorArtifact,
+        expected: VectorArtifactCursor,
+    ) -> VectorArtifactSaveOutcome {
+        if let Err(error) = Self::validate_vector_artifact(artifact) {
+            return VectorArtifactSaveOutcome::NotCommitted {
+                error,
+                observed_cursor: None,
+            };
+        }
+        if let Err(error) = artifact.binding.validate_for_repository(repo_id) {
+            return VectorArtifactSaveOutcome::NotCommitted {
+                error,
+                observed_cursor: None,
+            };
+        }
+        let current_snapshot_cursor = match self.load_snapshot_cursor(repo_id) {
+            Ok(Some(cursor)) => cursor,
+            Ok(None) => {
+                return VectorArtifactSaveOutcome::NotCommitted {
+                    error: KinDbError::StorageError(format!(
+                        "repo {repo_id}: vector artifact binding names missing graph authority"
+                    )),
+                    observed_cursor: None,
+                }
+            }
+            Err(error) => {
+                return VectorArtifactSaveOutcome::Indeterminate {
+                    error: KinDbError::StorageError(format!(
+                        "repo {repo_id}: graph authority could not be verified before vector artifact save: {error}"
+                    )),
+                    observed_cursor: None,
+                }
+            }
+        };
+        if current_snapshot_cursor != artifact.binding.snapshot_cursor {
+            return VectorArtifactSaveOutcome::NotCommitted {
+                error: KinDbError::StorageError(format!(
+                    "repo {repo_id}: vector artifact snapshot cursor mismatch: expected current {}, found binding {}",
+                    current_snapshot_cursor.backend_generation(),
+                    artifact.binding.snapshot_cursor.backend_generation()
+                )),
+                observed_cursor: None,
+            };
+        }
+        let path = match self.vector_artifact_path(repo_id, artifact.binding) {
+            Ok(path) => path,
+            Err(error) => {
+                return VectorArtifactSaveOutcome::NotCommitted {
+                    error,
+                    observed_cursor: None,
+                }
+            }
+        };
+        let encoded = match Self::encode_vector_artifact(artifact) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                return VectorArtifactSaveOutcome::NotCommitted {
+                    error,
+                    observed_cursor: None,
+                }
+            }
+        };
+        let artifact_sha256: [u8; 32] = encoded[100..132]
+            .try_into()
+            .expect("validated vector envelope has a fixed digest range");
+        let current_meta = match self.block_on(self.store.head(&path)) {
+            Ok(meta) => Some(meta),
+            Err(object_store::Error::NotFound { .. }) => None,
+            Err(error) => {
+                return VectorArtifactSaveOutcome::Indeterminate {
+                    error: KinDbError::StorageError(format!(
+                        "GCS head failed for vector artifact {path} before save: {error}"
+                    )),
+                    observed_cursor: None,
+                }
+            }
+        };
+        let options = match current_meta {
+            None if expected == VectorArtifactCursor::INITIAL => PutOptions {
+                mode: PutMode::Create,
+                ..PutOptions::default()
+            },
+            None => {
+                return VectorArtifactSaveOutcome::NotCommitted {
+                    error: KinDbError::StorageError(format!(
+                        "GCS vector artifact {path} is missing at expected cursor {}",
+                        expected.backend_generation()
+                    )),
+                    observed_cursor: None,
+                }
+            }
+            Some(meta) => {
+                let current = match Self::numeric_version(
+                    meta.version.as_deref(),
+                    &format!("vector artifact {path}"),
+                ) {
+                    Ok(generation) => VectorArtifactCursor::from_backend_generation(generation),
+                    Err(error) => {
+                        return VectorArtifactSaveOutcome::Indeterminate {
+                            error,
+                            observed_cursor: None,
+                        }
+                    }
+                };
+                if current != expected {
+                    return match self.confirm_exact_vector_artifact_retry(
+                        repo_id, artifact, expected,
+                    ) {
+                        Ok(ExactVectorArtifactRetry::Exact {
+                            cursor,
+                            artifact_sha256,
+                        }) => match self.verify_current_vector_binding(repo_id, artifact.binding) {
+                            Ok(()) => VectorArtifactSaveOutcome::Committed {
+                                cursor,
+                                artifact_sha256,
+                            },
+                            Err(error) => VectorArtifactSaveOutcome::Indeterminate {
+                                error: KinDbError::StorageError(format!(
+                                    "GCS vector artifact {path} was already installed at cursor {}, but graph authority moved before retry acknowledgement: {error}",
+                                    cursor.backend_generation()
+                                )),
+                                observed_cursor: Some(cursor),
+                            },
+                        },
+                        Ok(ExactVectorArtifactRetry::Different(observed_cursor)) => {
+                            VectorArtifactSaveOutcome::NotCommitted {
+                                error: KinDbError::StorageError(format!(
+                                    "GCS vector artifact cursor mismatch for {path}: expected {}, found {}",
+                                    expected.backend_generation(),
+                                    observed_cursor.backend_generation()
+                                )),
+                                observed_cursor: Some(observed_cursor),
+                            }
+                        }
+                        Ok(ExactVectorArtifactRetry::Corrupt {
+                            cursor: observed_cursor,
+                            error,
+                        }) => VectorArtifactSaveOutcome::NotCommitted {
+                            error: KinDbError::StorageError(format!(
+                                "GCS vector artifact cursor mismatch for {path}: expected {}, found corrupt object at {}: {error}",
+                                expected.backend_generation(),
+                                observed_cursor.backend_generation()
+                            )),
+                            observed_cursor: Some(observed_cursor),
+                        },
+                        Ok(ExactVectorArtifactRetry::Missing) => {
+                            VectorArtifactSaveOutcome::NotCommitted {
+                                error: KinDbError::StorageError(format!(
+                                    "GCS vector artifact cursor mismatch for {path}: expected {}, found {}",
+                                    expected.backend_generation(),
+                                    current.backend_generation()
+                                )),
+                                observed_cursor: Some(current),
+                            }
+                        }
+                        Err(error) => VectorArtifactSaveOutcome::Indeterminate {
+                            error: KinDbError::StorageError(format!(
+                                "GCS vector artifact cursor mismatch for {path}: expected {}, found {}; confirmation failed: {error}",
+                                expected.backend_generation(),
+                                current.backend_generation()
+                            )),
+                            observed_cursor: Some(current),
+                        },
+                    };
+                }
+                PutOptions {
+                    mode: PutMode::Update(UpdateVersion {
+                        e_tag: meta.e_tag,
+                        version: meta.version,
+                    }),
+                    ..PutOptions::default()
+                }
+            }
+        };
+
+        let put_result = self.block_on(self.store.put_opts(
+            &path,
+            PutPayload::from(encoded),
+            options,
+        ));
+        let result = match put_result {
+            Ok(result) => result,
+            Err(error) => {
+                let confirmation =
+                    self.confirm_exact_vector_artifact_retry(repo_id, artifact, expected);
+                let confirmation_detail = match confirmation {
+                    Ok(ExactVectorArtifactRetry::Exact {
+                        cursor,
+                        artifact_sha256,
+                    }) => {
+                        return match self
+                            .verify_current_vector_binding(repo_id, artifact.binding)
+                        {
+                            Ok(()) => VectorArtifactSaveOutcome::Committed {
+                                cursor,
+                                artifact_sha256,
+                            },
+                            Err(binding_error) => VectorArtifactSaveOutcome::Indeterminate {
+                                error: KinDbError::StorageError(format!(
+                                    "GCS vector artifact {path} was installed at cursor {}, but graph authority moved before acknowledgement: {binding_error}",
+                                    cursor.backend_generation()
+                                )),
+                                observed_cursor: Some(cursor),
+                            },
+                        };
+                    }
+                    Ok(ExactVectorArtifactRetry::Different(observed_cursor)) => {
+                        return VectorArtifactSaveOutcome::NotCommitted {
+                            error: KinDbError::StorageError(format!(
+                                "GCS vector artifact save failed for {path}: {error}; readback found a different installed object at cursor {}",
+                                observed_cursor.backend_generation()
+                            )),
+                            observed_cursor: Some(observed_cursor),
+                        };
+                    }
+                    Ok(ExactVectorArtifactRetry::Corrupt {
+                        cursor: observed_cursor,
+                        error: read_error,
+                    }) => {
+                        return VectorArtifactSaveOutcome::NotCommitted {
+                            error: KinDbError::StorageError(format!(
+                                "GCS vector artifact save failed for {path}: {error}; readback found a corrupt installed object at cursor {}: {read_error}",
+                                observed_cursor.backend_generation()
+                            )),
+                            observed_cursor: Some(observed_cursor),
+                        };
+                    }
+                    Ok(ExactVectorArtifactRetry::Missing) => {
+                        "no exact installed candidate was found".to_string()
+                    }
+                    Err(read_error) => {
+                        return VectorArtifactSaveOutcome::Indeterminate {
+                            error: KinDbError::StorageError(format!(
+                                "GCS vector artifact save failed for {path}: {error}; installed candidate verification failed: {read_error}"
+                            )),
+                            observed_cursor: None,
+                        };
+                    }
+                };
+
+                let rejected_before_install = matches!(
+                    &error,
+                    object_store::Error::AlreadyExists { .. }
+                        | object_store::Error::Precondition { .. }
+                        | object_store::Error::NotModified { .. }
+                        | object_store::Error::NotFound { .. }
+                        | object_store::Error::InvalidPath { .. }
+                        | object_store::Error::NotSupported { .. }
+                        | object_store::Error::NotImplemented { .. }
+                        | object_store::Error::PermissionDenied { .. }
+                        | object_store::Error::Unauthenticated { .. }
+                        | object_store::Error::UnknownConfigurationKey { .. }
+                );
+                let classified = KinDbError::StorageError(format!(
+                    "GCS vector artifact save failed for {path}: {error}; {confirmation_detail}"
+                ));
+                return if rejected_before_install {
+                    VectorArtifactSaveOutcome::NotCommitted {
+                        error: classified,
+                        observed_cursor: None,
+                    }
+                } else {
+                    VectorArtifactSaveOutcome::Indeterminate {
+                        error: classified,
+                        observed_cursor: None,
+                    }
+                };
+            }
+        };
+
+        let cursor = match Self::numeric_version(
+            result.version.as_deref(),
+            &format!("vector artifact save result for {path}"),
+        ) {
+            Ok(generation) => VectorArtifactCursor::from_backend_generation(generation),
+            Err(error) => {
+                return VectorArtifactSaveOutcome::Indeterminate {
+                    error: KinDbError::StorageError(format!(
+                        "GCS acknowledged vector artifact save for {path}, but its installed cursor is unknown: {error}"
+                    )),
+                    observed_cursor: None,
+                }
+            }
+        };
+        if cursor.backend_generation() <= expected.backend_generation() {
+            return VectorArtifactSaveOutcome::Indeterminate {
+                error: KinDbError::StorageError(format!(
+                    "GCS vector artifact save for {path} did not advance its cursor: expected above {}, found {}",
+                    expected.backend_generation(),
+                    cursor.backend_generation()
+                )),
+                observed_cursor: Some(cursor),
+            };
+        }
+
+        match self.load_vector_artifact_object(repo_id, artifact.binding) {
+            Ok(VectorArtifactLoadOutcome::Loaded(installed))
+                if installed.cursor == cursor
+                    && installed.artifact_sha256 == artifact_sha256
+                    && installed.artifact == *artifact => {}
+            Ok(VectorArtifactLoadOutcome::Loaded(installed)) => {
+                return VectorArtifactSaveOutcome::Indeterminate {
+                    error: KinDbError::StorageError(format!(
+                        "GCS acknowledged vector artifact save for {path} at cursor {}, but readback found cursor {} or different bytes",
+                        cursor.backend_generation(),
+                        installed.cursor.backend_generation()
+                    )),
+                    observed_cursor: Some(installed.cursor),
+                }
+            }
+            Ok(VectorArtifactLoadOutcome::Missing) => {
+                return VectorArtifactSaveOutcome::Indeterminate {
+                    error: KinDbError::StorageError(format!(
+                        "GCS acknowledged vector artifact save for {path} at cursor {}, but readback found no object",
+                        cursor.backend_generation()
+                    )),
+                    observed_cursor: None,
+                }
+            }
+            Ok(VectorArtifactLoadOutcome::Corrupt {
+                cursor: observed_cursor,
+                error,
+            }) => {
+                return VectorArtifactSaveOutcome::Indeterminate {
+                    error: KinDbError::StorageError(format!(
+                        "GCS acknowledged vector artifact save for {path} at cursor {}, but readback found a corrupt object at cursor {}: {error}",
+                        cursor.backend_generation(),
+                        observed_cursor.backend_generation()
+                    )),
+                    observed_cursor: Some(observed_cursor),
+                }
+            }
+            Err(error) => {
+                return VectorArtifactSaveOutcome::Indeterminate {
+                    error: KinDbError::StorageError(format!(
+                        "GCS acknowledged vector artifact save for {path} at cursor {}, but readback failed: {error}",
+                        cursor.backend_generation()
+                    )),
+                    observed_cursor: None,
+                }
+            }
+        }
+        if let Err(error) = self.verify_current_vector_binding(repo_id, artifact.binding) {
+            return VectorArtifactSaveOutcome::Indeterminate {
+                error: KinDbError::StorageError(format!(
+                    "GCS vector artifact {path} committed at cursor {}, but graph authority moved before acknowledgement: {error}",
+                    cursor.backend_generation()
+                )),
+                observed_cursor: Some(cursor),
+            };
+        }
+        VectorArtifactSaveOutcome::Committed {
+            cursor,
+            artifact_sha256,
+        }
     }
 
     fn save_source_blob(
@@ -789,7 +1474,14 @@ pub(crate) mod tests {
         state: Arc<tokio::sync::Mutex<VersionState>>,
         report_next_get_as_oversized: Arc<AtomicBool>,
         body_get_count: Arc<AtomicUsize>,
+        snapshot_body_get_count: Arc<AtomicUsize>,
         fail_next_put_after_commit: Arc<AtomicBool>,
+        fail_next_put_before_commit: Arc<AtomicBool>,
+        fail_next_snapshot_head: Arc<AtomicBool>,
+        fail_next_vector_head: Arc<AtomicBool>,
+        fail_next_vector_body_get: Arc<AtomicBool>,
+        omit_next_vector_head_version: Arc<AtomicBool>,
+        advance_snapshot_cursor_on_next_vector_get: Arc<AtomicBool>,
     }
 
     impl VersionedMemoryStore {
@@ -802,7 +1494,14 @@ pub(crate) mod tests {
                 })),
                 report_next_get_as_oversized: Arc::new(AtomicBool::new(false)),
                 body_get_count: Arc::new(AtomicUsize::new(0)),
+                snapshot_body_get_count: Arc::new(AtomicUsize::new(0)),
                 fail_next_put_after_commit: Arc::new(AtomicBool::new(false)),
+                fail_next_put_before_commit: Arc::new(AtomicBool::new(false)),
+                fail_next_snapshot_head: Arc::new(AtomicBool::new(false)),
+                fail_next_vector_head: Arc::new(AtomicBool::new(false)),
+                fail_next_vector_body_get: Arc::new(AtomicBool::new(false)),
+                omit_next_vector_head_version: Arc::new(AtomicBool::new(false)),
+                advance_snapshot_cursor_on_next_vector_get: Arc::new(AtomicBool::new(false)),
             }
         }
 
@@ -815,8 +1514,39 @@ pub(crate) mod tests {
             self.body_get_count.load(Ordering::SeqCst)
         }
 
+        fn snapshot_body_get_count(&self) -> usize {
+            self.snapshot_body_get_count.load(Ordering::SeqCst)
+        }
+
         fn fail_next_put_after_commit(&self) {
             self.fail_next_put_after_commit
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_put_before_commit(&self) {
+            self.fail_next_put_before_commit
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_snapshot_head(&self) {
+            self.fail_next_snapshot_head.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_vector_head(&self) {
+            self.fail_next_vector_head.store(true, Ordering::SeqCst);
+        }
+
+        fn fail_next_vector_body_get(&self) {
+            self.fail_next_vector_body_get.store(true, Ordering::SeqCst);
+        }
+
+        fn omit_next_vector_head_version(&self) {
+            self.omit_next_vector_head_version
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn advance_snapshot_cursor_on_next_vector_get(&self) {
+            self.advance_snapshot_cursor_on_next_vector_get
                 .store(true, Ordering::SeqCst);
         }
 
@@ -855,6 +1585,17 @@ pub(crate) mod tests {
             payload: PutPayload,
             opts: PutOptions,
         ) -> ObjectStoreResult<PutResult> {
+            if self
+                .fail_next_put_before_commit
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "VersionedMemoryStore",
+                    source: Box::new(std::io::Error::other(
+                        "injected ambiguous failure before object install",
+                    )),
+                });
+            }
             let mut state = self.state.lock().await;
             if let PutMode::Update(update) = &opts.mode {
                 let expected = update.version.as_deref().ok_or_else(|| {
@@ -903,13 +1644,69 @@ pub(crate) mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> ObjectStoreResult<GetResult> {
-            let reads_body = !options.head;
+            let is_head = options.head;
+            let reads_body = !is_head;
+            let is_vector = location.as_ref().contains("/vector-artifacts/");
+            if is_head
+                && location.as_ref().ends_with("graph.kndb")
+                && self.fail_next_snapshot_head.swap(false, Ordering::SeqCst)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "VersionedMemoryStore",
+                    source: Box::new(std::io::Error::other("injected snapshot HEAD uncertainty")),
+                });
+            }
+            if is_head && is_vector && self.fail_next_vector_head.swap(false, Ordering::SeqCst) {
+                return Err(object_store::Error::Generic {
+                    store: "VersionedMemoryStore",
+                    source: Box::new(std::io::Error::other("injected vector HEAD uncertainty")),
+                });
+            }
+            if reads_body
+                && is_vector
+                && self.fail_next_vector_body_get.swap(false, Ordering::SeqCst)
+            {
+                return Err(object_store::Error::Generic {
+                    store: "VersionedMemoryStore",
+                    source: Box::new(std::io::Error::other(
+                        "injected vector body read uncertainty",
+                    )),
+                });
+            }
+            if reads_body
+                && is_vector
+                && self
+                    .advance_snapshot_cursor_on_next_vector_get
+                    .swap(false, Ordering::SeqCst)
+            {
+                let mut state = self.state.lock().await;
+                let snapshot_path = state
+                    .versions
+                    .keys()
+                    .find(|path| path.ends_with("graph.kndb"))
+                    .cloned()
+                    .expect("fixture must have a graph snapshot before a vector probe");
+                let generation = state.next_generation;
+                state.next_generation += 1;
+                state.versions.insert(snapshot_path, generation);
+            }
             let mut result = self.inner.get_opts(location, options).await?;
             if reads_body {
                 self.body_get_count.fetch_add(1, Ordering::SeqCst);
+                if location.as_ref().ends_with("graph.kndb") {
+                    self.snapshot_body_get_count.fetch_add(1, Ordering::SeqCst);
+                }
             }
             let state = self.state.lock().await;
             Self::apply_version(&mut result.meta, &state);
+            if is_head
+                && is_vector
+                && self
+                    .omit_next_vector_head_version
+                    .swap(false, Ordering::SeqCst)
+            {
+                result.meta.version = None;
+            }
             if self
                 .report_next_get_as_oversized
                 .swap(false, Ordering::SeqCst)
@@ -990,6 +1787,738 @@ pub(crate) mod tests {
 
     fn source_digest(data: &[u8]) -> [u8; 32] {
         Sha256::digest(data).into()
+    }
+
+    fn vector_binding(
+        backend: &GcsBackend,
+        repo_id: &str,
+        snapshot: &GraphSnapshot,
+    ) -> VectorArtifactBinding {
+        let cursor = backend
+            .load_snapshot_cursor(repo_id)
+            .unwrap()
+            .expect("saved snapshot must have a cursor");
+        VectorArtifactBinding::for_repository(
+            repo_id,
+            cursor,
+            crate::storage::merkle::compute_retrieval_authority_hash(snapshot),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn gcs_vector_artifact_roundtrips_across_reopen_with_its_own_cas_cursor() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-repo";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: br#"{"indexed":2,"total":2}"#.to_vec(),
+            index: b"opaque vector index bytes".to_vec(),
+        };
+        let body_reads_before_vectors = store.body_get_count();
+        let snapshot_body_reads_before_vectors = store.snapshot_body_get_count();
+
+        assert!(
+            backend.supports_vector_artifacts(),
+            "GCS must advertise durable vector-artifact persistence"
+        );
+        assert!(matches!(
+            backend
+                .load_vector_artifact(repo_id, artifact.binding)
+                .unwrap(),
+            VectorArtifactLoadOutcome::Missing
+        ));
+        let (cursor, artifact_sha256) =
+            match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+                VectorArtifactSaveOutcome::Committed {
+                    cursor,
+                    artifact_sha256,
+                } => (cursor, artifact_sha256),
+                other => panic!("initial vector artifact save did not commit: {other:?}"),
+            };
+        assert_ne!(cursor, VectorArtifactCursor::INITIAL);
+        assert_eq!(artifact_sha256, artifact.artifact_sha256().unwrap());
+
+        drop(backend);
+        let reopened = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        match reopened
+            .load_vector_artifact(repo_id, artifact.binding)
+            .unwrap()
+        {
+            VectorArtifactLoadOutcome::Loaded(installed) => assert_eq!(
+                installed,
+                PersistedVectorArtifact {
+                    artifact: artifact.clone(),
+                    cursor,
+                    artifact_sha256,
+                }
+            ),
+            other => panic!("reopened vector artifact did not load: {other:?}"),
+        }
+
+        let (retry_cursor, retry_sha256) = match reopened.save_vector_artifact(
+            repo_id,
+            &artifact,
+            VectorArtifactCursor::INITIAL,
+        ) {
+            VectorArtifactSaveOutcome::Committed {
+                cursor,
+                artifact_sha256,
+            } => (cursor, artifact_sha256),
+            other => panic!("exact vector artifact retry did not reconcile: {other:?}"),
+        };
+        assert_eq!(retry_cursor, cursor, "an exact retry must not rewrite");
+        assert_eq!(retry_sha256, artifact_sha256);
+
+        let updated = VectorArtifact {
+            binding: artifact.binding,
+            metadata: br#"{"indexed":3,"total":3}"#.to_vec(),
+            index: b"updated opaque vector index bytes".to_vec(),
+        };
+        let (updated_cursor, updated_sha256) =
+            match reopened.save_vector_artifact(repo_id, &updated, cursor) {
+                VectorArtifactSaveOutcome::Committed {
+                    cursor,
+                    artifact_sha256,
+                } => (cursor, artifact_sha256),
+                other => panic!("vector artifact CAS update did not commit: {other:?}"),
+            };
+        assert_ne!(updated_cursor, cursor);
+        assert_ne!(updated_sha256, artifact_sha256);
+        match reopened.save_vector_artifact(repo_id, &artifact, cursor) {
+            VectorArtifactSaveOutcome::NotCommitted {
+                observed_cursor: Some(observed),
+                ..
+            } => assert_eq!(observed, updated_cursor),
+            other => panic!("stale vector CAS did not report the observed cursor: {other:?}"),
+        }
+        match reopened
+            .load_vector_artifact(repo_id, updated.binding)
+            .unwrap()
+        {
+            VectorArtifactLoadOutcome::Loaded(installed) => assert_eq!(
+                installed,
+                PersistedVectorArtifact {
+                    artifact: updated,
+                    cursor: updated_cursor,
+                    artifact_sha256: updated_sha256,
+                }
+            ),
+            other => panic!("updated vector artifact did not load: {other:?}"),
+        }
+        assert_eq!(
+            store.snapshot_body_get_count(),
+            snapshot_body_reads_before_vectors,
+            "vector load/save/reopen must verify graph authority from object metadata only"
+        );
+        assert!(
+            store.body_get_count() > body_reads_before_vectors,
+            "the fixture must observe vector body reads while snapshot body reads stay flat"
+        );
+    }
+
+    #[test]
+    fn gcs_vector_artifact_fails_closed_on_stale_or_cross_repository_binding() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "bound-vector-repo";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let binding = vector_binding(&backend, repo_id, &snapshot);
+
+        let stale = VectorArtifactBinding {
+            snapshot_cursor: SnapshotCursor::from_backend_generation(
+                binding.snapshot_cursor.backend_generation() + 1,
+            ),
+            ..binding
+        };
+        let stale_error = backend
+            .load_vector_artifact(repo_id, stale)
+            .expect_err("a stale graph cursor must not load vectors");
+        assert!(stale_error.to_string().contains("snapshot cursor mismatch"));
+
+        let unsupported_version = VectorArtifactBinding {
+            retrieval_hash_version: binding.retrieval_hash_version + 1,
+            ..binding
+        };
+        let version_error = backend
+            .load_vector_artifact(repo_id, unsupported_version)
+            .expect_err("an unknown retrieval hash version must fail closed");
+        assert!(version_error.to_string().contains("retrieval hash version"));
+
+        let cross_repository = VectorArtifact {
+            binding: VectorArtifactBinding::for_repository(
+                "different-repo",
+                binding.snapshot_cursor,
+                binding.retrieval_authority_hash,
+            )
+            .unwrap(),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+        let cross_repository_error = match backend.save_vector_artifact(
+            repo_id,
+            &cross_repository,
+            VectorArtifactCursor::INITIAL,
+        ) {
+            VectorArtifactSaveOutcome::NotCommitted { error, .. } => error,
+            other => panic!("cross-repository binding was not refused: {other:?}"),
+        };
+        assert!(cross_repository_error
+            .to_string()
+            .contains("repository identity mismatch"));
+    }
+
+    #[test]
+    fn gcs_vector_artifact_envelope_detects_corruption_and_relabeling() {
+        let binding = VectorArtifactBinding::for_repository(
+            "envelope-repo",
+            SnapshotCursor::from_backend_generation(42),
+            [0x42; 32],
+        )
+        .unwrap();
+        let artifact = VectorArtifact {
+            binding,
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+        let encoded = GcsBackend::encode_vector_artifact(&artifact).unwrap();
+        let (decoded, decoded_sha256) =
+            GcsBackend::decode_vector_artifact(&encoded, binding).unwrap();
+        assert_eq!(decoded, artifact);
+        assert_eq!(decoded_sha256, artifact.artifact_sha256().unwrap());
+
+        let mut corrupt = encoded.clone();
+        *corrupt.last_mut().unwrap() ^= 0xff;
+        let corrupt_error = GcsBackend::decode_vector_artifact(&corrupt, binding)
+            .expect_err("corrupt vector bytes must fail their envelope digest");
+        assert!(corrupt_error.to_string().contains("digest mismatch"));
+
+        let truncated_error = GcsBackend::decode_vector_artifact(
+            &encoded[..GCS_VECTOR_ARTIFACT_HEADER_LEN - 1],
+            binding,
+        )
+        .expect_err("a truncated envelope must fail before allocation");
+        assert!(truncated_error.to_string().contains("truncated"));
+
+        let mut oversized = encoded.clone();
+        oversized[92..100].copy_from_slice(&(MAX_VECTOR_ARTIFACT_BYTES + 1).to_le_bytes());
+        let oversized_error = GcsBackend::decode_vector_artifact(&oversized, binding)
+            .expect_err("an oversized declared index must fail before allocation");
+        assert!(oversized_error.to_string().contains("above the"));
+
+        for offset in [8usize, 40, 48, 52] {
+            let mut rebound = encoded.clone();
+            rebound[offset] ^= 0x01;
+            let error = GcsBackend::decode_vector_artifact(&rebound, binding)
+                .expect_err("every outer binding field must be checked independently");
+            assert!(error.to_string().contains("binding mismatch"));
+        }
+
+        let relabeled = VectorArtifactBinding::for_repository(
+            "other-envelope-repo",
+            binding.snapshot_cursor,
+            binding.retrieval_authority_hash,
+        )
+        .unwrap();
+        let relabel_error = GcsBackend::decode_vector_artifact(&encoded, relabeled)
+            .expect_err("artifact bytes must not be copied into another repository namespace");
+        assert!(relabel_error.to_string().contains("binding mismatch"));
+    }
+
+    #[test]
+    fn gcs_vector_artifact_cross_repository_copy_is_repairable_corruption() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let source_repo = "vector-copy-source";
+        let destination_repo = "vector-copy-destination";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(source_repo, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        backend
+            .save_snapshot(
+                destination_repo,
+                &snapshot.to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let destination_binding = vector_binding(&backend, destination_repo, &snapshot);
+        let copied_artifact = VectorArtifact {
+            binding: VectorArtifactBinding::for_repository(
+                source_repo,
+                destination_binding.snapshot_cursor,
+                destination_binding.retrieval_authority_hash,
+            )
+            .unwrap(),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+        let destination_path = backend
+            .vector_artifact_path(destination_repo, destination_binding)
+            .unwrap();
+        let copied_put = backend
+            .block_on(store.put_opts(
+                &destination_path,
+                PutPayload::from(GcsBackend::encode_vector_artifact(&copied_artifact).unwrap()),
+                PutOptions::default(),
+            ))
+            .unwrap();
+        let copied_cursor = VectorArtifactCursor::from_backend_generation(
+            copied_put.version.unwrap().parse().unwrap(),
+        );
+
+        match backend
+            .load_vector_artifact(destination_repo, destination_binding)
+            .unwrap()
+        {
+            VectorArtifactLoadOutcome::Corrupt { cursor, error } => {
+                assert_eq!(cursor, copied_cursor);
+                assert!(error.to_string().contains("binding mismatch"));
+            }
+            other => panic!("cross-repository copy was not refused as corruption: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_recovers_an_exact_post_install_acknowledgement_loss() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-ack-loss";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+
+        store.fail_next_put_after_commit();
+        let (cursor, artifact_sha256) =
+            match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+                VectorArtifactSaveOutcome::Committed {
+                    cursor,
+                    artifact_sha256,
+                } => (cursor, artifact_sha256),
+                other => panic!("exact installed artifact was not reconciled: {other:?}"),
+            };
+        match backend
+            .load_vector_artifact(repo_id, artifact.binding)
+            .unwrap()
+        {
+            VectorArtifactLoadOutcome::Loaded(installed) => assert_eq!(
+                installed,
+                PersistedVectorArtifact {
+                    artifact,
+                    cursor,
+                    artifact_sha256,
+                }
+            ),
+            other => panic!("acknowledged artifact did not load: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_ambiguous_preinstall_failure_is_indeterminate() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-ambiguous-preinstall";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+
+        store.fail_next_put_before_commit();
+        match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+            VectorArtifactSaveOutcome::Indeterminate {
+                error,
+                observed_cursor: None,
+            } => assert!(error.to_string().contains("ambiguous failure")),
+            other => panic!("ambiguous write failure was misclassified: {other:?}"),
+        }
+        assert!(matches!(
+            backend
+                .load_vector_artifact(repo_id, artifact.binding)
+                .unwrap(),
+            VectorArtifactLoadOutcome::Missing
+        ));
+    }
+
+    #[test]
+    fn gcs_vector_artifact_write_failure_with_unreadable_confirmation_is_indeterminate() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-unreadable-write-confirmation";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+
+        store.fail_next_put_before_commit();
+        store.fail_next_vector_body_get();
+        match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+            VectorArtifactSaveOutcome::Indeterminate {
+                error,
+                observed_cursor: None,
+            } => {
+                let message = error.to_string();
+                assert!(message.contains("installed candidate verification failed"));
+                assert!(message.contains("vector body read uncertainty"));
+            }
+            other => panic!("unreadable write confirmation was misclassified: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_snapshot_head_uncertainty_is_indeterminate() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-snapshot-head-uncertainty";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+
+        store.fail_next_snapshot_head();
+        match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+            VectorArtifactSaveOutcome::Indeterminate {
+                error,
+                observed_cursor: None,
+            } => assert!(error.to_string().contains("snapshot HEAD uncertainty")),
+            other => panic!("snapshot HEAD uncertainty was misclassified: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_vector_head_uncertainty_is_indeterminate() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-object-head-uncertainty";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+
+        store.fail_next_vector_head();
+        match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+            VectorArtifactSaveOutcome::Indeterminate {
+                error,
+                observed_cursor: None,
+            } => assert!(error.to_string().contains("vector HEAD uncertainty")),
+            other => panic!("vector HEAD uncertainty was misclassified: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_unknown_prewrite_cursor_is_indeterminate() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-unknown-prewrite-cursor";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+        let cursor =
+            match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+                VectorArtifactSaveOutcome::Committed { cursor, .. } => cursor,
+                other => panic!("initial vector artifact save did not commit: {other:?}"),
+            };
+
+        store.omit_next_vector_head_version();
+        match backend.save_vector_artifact(repo_id, &artifact, cursor) {
+            VectorArtifactSaveOutcome::Indeterminate {
+                error,
+                observed_cursor: None,
+            } => assert!(error.to_string().contains("missing object meta.version")),
+            other => panic!("unknown object cursor was misclassified: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_stale_confirmation_uncertainty_carries_observed_cursor() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-stale-confirmation-uncertainty";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let first = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"first".to_vec(),
+        };
+        let first_cursor =
+            match backend.save_vector_artifact(repo_id, &first, VectorArtifactCursor::INITIAL) {
+                VectorArtifactSaveOutcome::Committed { cursor, .. } => cursor,
+                other => panic!("initial vector artifact save did not commit: {other:?}"),
+            };
+        let second = VectorArtifact {
+            binding: first.binding,
+            metadata: first.metadata.clone(),
+            index: b"second".to_vec(),
+        };
+        let second_cursor = match backend.save_vector_artifact(repo_id, &second, first_cursor) {
+            VectorArtifactSaveOutcome::Committed { cursor, .. } => cursor,
+            other => panic!("replacement vector artifact save did not commit: {other:?}"),
+        };
+
+        store.fail_next_vector_body_get();
+        match backend.save_vector_artifact(repo_id, &first, first_cursor) {
+            VectorArtifactSaveOutcome::Indeterminate {
+                error,
+                observed_cursor: Some(observed_cursor),
+            } => {
+                assert_eq!(observed_cursor, second_cursor);
+                assert!(error.to_string().contains("vector body read uncertainty"));
+            }
+            other => panic!("stale confirmation uncertainty was misclassified: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_valid_load_does_not_attach_after_graph_moves() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-valid-load-race";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+        match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+            VectorArtifactSaveOutcome::Committed { .. } => {}
+            other => panic!("initial vector artifact save did not commit: {other:?}"),
+        }
+
+        store.advance_snapshot_cursor_on_next_vector_get();
+        let error = backend
+            .load_vector_artifact(repo_id, artifact.binding)
+            .expect_err("graph cursor movement after a valid body read must fail the load");
+        assert!(error.to_string().contains("snapshot cursor mismatch"));
+    }
+
+    #[test]
+    fn gcs_vector_artifact_successful_put_is_indeterminate_if_graph_moves_on_readback() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-successful-put-race";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+
+        store.advance_snapshot_cursor_on_next_vector_get();
+        match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+            VectorArtifactSaveOutcome::Indeterminate {
+                error,
+                observed_cursor: Some(cursor),
+            } => {
+                assert_ne!(cursor, VectorArtifactCursor::INITIAL);
+                assert!(error.to_string().contains("graph authority moved"));
+            }
+            other => panic!("successful old-graph put was incorrectly acknowledged: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_exact_retry_does_not_ack_after_graph_moves() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-exact-retry-race";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+        let cursor =
+            match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+                VectorArtifactSaveOutcome::Committed { cursor, .. } => cursor,
+                other => panic!("initial vector artifact save did not commit: {other:?}"),
+            };
+
+        store.advance_snapshot_cursor_on_next_vector_get();
+        match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+            VectorArtifactSaveOutcome::Indeterminate {
+                error,
+                observed_cursor: Some(observed),
+            } => {
+                assert_eq!(observed, cursor);
+                assert!(error.to_string().contains("graph authority moved"));
+            }
+            other => panic!("exact retry acknowledged stale graph authority: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_corruption_returns_a_trusted_repair_cursor() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-corrupt-repair";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+        let original_cursor =
+            match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+                VectorArtifactSaveOutcome::Committed { cursor, .. } => cursor,
+                other => panic!("initial vector artifact save did not commit: {other:?}"),
+            };
+
+        let path = backend
+            .vector_artifact_path(repo_id, artifact.binding)
+            .unwrap();
+        let mut corrupted = GcsBackend::encode_vector_artifact(&artifact).unwrap();
+        *corrupted.last_mut().unwrap() ^= 0xff;
+        let corrupt_put = backend
+            .block_on(store.put_opts(&path, PutPayload::from(corrupted), PutOptions::default()))
+            .unwrap();
+        let corrupt_cursor = VectorArtifactCursor::from_backend_generation(
+            corrupt_put.version.unwrap().parse().unwrap(),
+        );
+        assert_ne!(corrupt_cursor, original_cursor);
+
+        match backend
+            .load_vector_artifact(repo_id, artifact.binding)
+            .unwrap()
+        {
+            VectorArtifactLoadOutcome::Corrupt { cursor, error } => {
+                assert_eq!(cursor, corrupt_cursor);
+                assert!(error.to_string().contains("digest mismatch"));
+            }
+            other => panic!("corrupt vector artifact was not classified: {other:?}"),
+        }
+
+        match backend.save_vector_artifact(repo_id, &artifact, VectorArtifactCursor::INITIAL) {
+            VectorArtifactSaveOutcome::NotCommitted {
+                observed_cursor: Some(observed),
+                ..
+            } => assert_eq!(observed, corrupt_cursor),
+            other => panic!(
+                "an initial cursor overwrote corruption or discarded its repair cursor: {other:?}"
+            ),
+        }
+
+        let (repaired_cursor, repaired_sha256) =
+            match backend.save_vector_artifact(repo_id, &artifact, corrupt_cursor) {
+                VectorArtifactSaveOutcome::Committed {
+                    cursor,
+                    artifact_sha256,
+                } => (cursor, artifact_sha256),
+                other => panic!("corrupt vector artifact was not repairable: {other:?}"),
+            };
+        assert_ne!(repaired_cursor, corrupt_cursor);
+        match backend
+            .load_vector_artifact(repo_id, artifact.binding)
+            .unwrap()
+        {
+            VectorArtifactLoadOutcome::Loaded(installed) => {
+                assert_eq!(installed.artifact, artifact);
+                assert_eq!(installed.cursor, repaired_cursor);
+                assert_eq!(installed.artifact_sha256, repaired_sha256);
+            }
+            other => panic!("repaired vector artifact did not load: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gcs_vector_artifact_rechecks_graph_cursor_after_a_missing_probe() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-missing-race";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let binding = vector_binding(&backend, repo_id, &snapshot);
+
+        store.advance_snapshot_cursor_on_next_vector_get();
+        let error = backend
+            .load_vector_artifact(repo_id, binding)
+            .expect_err("graph cursor movement after a missing probe must fail the load");
+        assert!(error.to_string().contains("snapshot cursor mismatch"));
+    }
+
+    #[test]
+    fn gcs_vector_artifact_rechecks_graph_cursor_after_a_corrupt_probe() {
+        let store = Arc::new(VersionedMemoryStore::new());
+        let backend = GcsBackend::from_store(Box::new(Arc::clone(&store)), "test");
+        let repo_id = "vector-corrupt-race";
+        let snapshot = GraphSnapshot::empty();
+        backend
+            .save_snapshot(repo_id, &snapshot.to_bytes().unwrap(), GENERATION_INIT)
+            .unwrap();
+        let artifact = VectorArtifact {
+            binding: vector_binding(&backend, repo_id, &snapshot),
+            metadata: b"metadata".to_vec(),
+            index: b"index".to_vec(),
+        };
+        let path = backend
+            .vector_artifact_path(repo_id, artifact.binding)
+            .unwrap();
+        let mut corrupted = GcsBackend::encode_vector_artifact(&artifact).unwrap();
+        *corrupted.last_mut().unwrap() ^= 0xff;
+        backend
+            .block_on(store.put_opts(&path, PutPayload::from(corrupted), PutOptions::default()))
+            .unwrap();
+
+        store.advance_snapshot_cursor_on_next_vector_get();
+        let error = backend
+            .load_vector_artifact(repo_id, artifact.binding)
+            .expect_err("graph cursor movement after a corrupt probe must fail the load");
+        assert!(error.to_string().contains("snapshot cursor mismatch"));
     }
 
     fn unborn_authority_transaction(

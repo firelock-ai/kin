@@ -71,6 +71,220 @@ pub enum SnapshotSaveOutcome {
     Indeterminate(KinDbError),
 }
 
+/// Maximum serialized vector-index payload accepted by a storage backend.
+///
+/// The vector index is a derived accelerator, so a hostile or corrupt object
+/// must never force an unbounded allocation while graph authority is opened.
+pub const MAX_VECTOR_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
+
+/// Maximum metadata envelope accepted beside one vector-index payload.
+pub const MAX_VECTOR_ARTIFACT_METADATA_BYTES: u64 = 1024 * 1024;
+
+const VECTOR_REPOSITORY_IDENTITY_DOMAIN: &[u8] = b"kin-vector-repository-v1:";
+const VECTOR_ARTIFACT_DIGEST_DOMAIN: &[u8] = b"kin-vector-artifact-v2:";
+
+/// Stable repository identity bound into every hosted vector artifact.
+///
+/// Object paths provide namespace isolation, but they are not part of an
+/// artifact's bytes. This digest makes a copied object prove which canonical
+/// repository id produced it instead of trusting the path it was copied to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorRepositoryIdentity([u8; 32]);
+
+impl VectorRepositoryIdentity {
+    /// Derive the stable identity for one validated storage repository id.
+    pub fn from_repo_id(repo_id: &str) -> Result<Self, KinDbError> {
+        validate_source_blob_repo_id(repo_id)?;
+        let mut hasher = Sha256::new();
+        hasher.update(VECTOR_REPOSITORY_IDENTITY_DOMAIN);
+        hasher.update(
+            u64::try_from(repo_id.len())
+                .expect("validated repository id length fits u64")
+                .to_le_bytes(),
+        );
+        hasher.update(repo_id.as_bytes());
+        Ok(Self(hasher.finalize().into()))
+    }
+
+    /// The digest recorded in a hosted vector envelope.
+    pub const fn digest(self) -> [u8; 32] {
+        self.0
+    }
+
+    #[cfg(feature = "gcs")]
+    pub(crate) const fn from_digest(digest: [u8; 32]) -> Self {
+        Self(digest)
+    }
+}
+
+/// Exact graph authority one derived vector artifact belongs to.
+///
+/// The snapshot cursor is the backend's acknowledged publication identity, not
+/// Kin's logical repository generation. The retrieval hash is supplied by the
+/// query-graph owner after repository authority has been materialized; storage
+/// verifies cursor currency and never reconstructs higher-level query semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorArtifactBinding {
+    pub repository_identity: VectorRepositoryIdentity,
+    pub snapshot_cursor: SnapshotCursor,
+    pub retrieval_hash_version: u32,
+    pub retrieval_authority_hash: [u8; 32],
+}
+
+impl VectorArtifactBinding {
+    /// Bind a derived artifact to one exact repository snapshot publication.
+    pub fn for_repository(
+        repo_id: &str,
+        snapshot_cursor: SnapshotCursor,
+        retrieval_authority_hash: [u8; 32],
+    ) -> Result<Self, KinDbError> {
+        Ok(Self {
+            repository_identity: VectorRepositoryIdentity::from_repo_id(repo_id)?,
+            snapshot_cursor,
+            retrieval_hash_version: crate::storage::merkle::RETRIEVAL_AUTHORITY_HASH_VERSION,
+            retrieval_authority_hash,
+        })
+    }
+
+    /// Prove this binding belongs to `repo_id` and uses current typed identities.
+    pub fn validate_for_repository(self, repo_id: &str) -> Result<(), KinDbError> {
+        if self.repository_identity != VectorRepositoryIdentity::from_repo_id(repo_id)? {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id}: vector artifact repository identity mismatch"
+            )));
+        }
+        if self.snapshot_cursor == SnapshotCursor::INITIAL {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id}: vector artifact cannot bind the initial snapshot cursor"
+            )));
+        }
+        if self.retrieval_hash_version != crate::storage::merkle::RETRIEVAL_AUTHORITY_HASH_VERSION {
+            return Err(KinDbError::StorageError(format!(
+                "repo {repo_id}: vector artifact retrieval hash version {} does not match current {}",
+                self.retrieval_hash_version,
+                crate::storage::merkle::RETRIEVAL_AUTHORITY_HASH_VERSION
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// One complete derived vector artifact.
+///
+/// Storage keeps the opaque vector bytes and their validator-owned metadata in
+/// one integrity envelope. It does not interpret either payload. The caller
+/// remains responsible for validating model, dimensions, pipeline epoch, and
+/// indexed coverage recorded in `metadata`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorArtifact {
+    pub binding: VectorArtifactBinding,
+    pub metadata: Vec<u8>,
+    pub index: Vec<u8>,
+}
+
+impl VectorArtifact {
+    /// Portable SHA-256 identity of the complete versioned artifact contract.
+    ///
+    /// The digest covers every binding field, both payload lengths, and both
+    /// payloads under a versioned domain separator. Backends may wrap the
+    /// artifact in their own envelope, but a successful read or write exposes
+    /// this same identity to callers and health/proof surfaces.
+    pub fn artifact_sha256(&self) -> Result<[u8; 32], KinDbError> {
+        let metadata_len = u64::try_from(self.metadata.len()).map_err(|_| {
+            KinDbError::StorageError("vector artifact metadata length exceeds u64".to_string())
+        })?;
+        let index_len = u64::try_from(self.index.len()).map_err(|_| {
+            KinDbError::StorageError("vector artifact index length exceeds u64".to_string())
+        })?;
+        let mut hasher = Sha256::new();
+        hasher.update(VECTOR_ARTIFACT_DIGEST_DOMAIN);
+        hasher.update(self.binding.repository_identity.digest());
+        hasher.update(
+            self.binding
+                .snapshot_cursor
+                .backend_generation()
+                .to_le_bytes(),
+        );
+        hasher.update(self.binding.retrieval_hash_version.to_le_bytes());
+        hasher.update(self.binding.retrieval_authority_hash);
+        hasher.update(metadata_len.to_le_bytes());
+        hasher.update(index_len.to_le_bytes());
+        hasher.update(&self.metadata);
+        hasher.update(&self.index);
+        Ok(hasher.finalize().into())
+    }
+}
+
+/// Backend compare-and-swap cursor for repeated vector checkpoints.
+///
+/// This is intentionally distinct from the graph snapshot cursor. Embedding
+/// can checkpoint several times without changing graph authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorArtifactCursor(Generation);
+
+impl VectorArtifactCursor {
+    pub const INITIAL: Self = Self(GENERATION_INIT);
+
+    pub const fn from_backend_generation(generation: Generation) -> Self {
+        Self(generation)
+    }
+
+    pub const fn backend_generation(self) -> Generation {
+        self.0
+    }
+}
+
+/// A vector artifact together with the cursor required to replace it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedVectorArtifact {
+    pub artifact: VectorArtifact,
+    pub cursor: VectorArtifactCursor,
+    pub artifact_sha256: [u8; 32],
+}
+
+/// Classified result of loading one exact vector artifact binding.
+#[must_use = "a vector artifact load outcome must be classified before vectors are attached"]
+#[derive(Debug)]
+pub enum VectorArtifactLoadOutcome {
+    /// No artifact exists for this exact graph binding.
+    Missing,
+    /// The complete envelope decoded and carries its replacement cursor.
+    Loaded(PersistedVectorArtifact),
+    /// Object metadata yielded a trusted replacement cursor, but the body is
+    /// corrupt or violates the bounded envelope contract.
+    Corrupt {
+        cursor: VectorArtifactCursor,
+        error: KinDbError,
+    },
+}
+
+/// Classified outcome of one vector-artifact compare-and-swap attempt.
+#[must_use = "a vector artifact save outcome must be classified before progress is acknowledged"]
+#[derive(Debug)]
+pub enum VectorArtifactSaveOutcome {
+    /// The exact candidate is installed at `cursor` and graph authority stayed
+    /// current through acknowledgement.
+    Committed {
+        cursor: VectorArtifactCursor,
+        artifact_sha256: [u8; 32],
+    },
+    /// The backend proved the exact candidate is not the installed winner and
+    /// this attempt must not be acknowledged as committed.
+    /// `observed_cursor` names the installed winner when object metadata
+    /// established a trustworthy replacement cursor.
+    NotCommitted {
+        error: KinDbError,
+        observed_cursor: Option<VectorArtifactCursor>,
+    },
+    /// The backend cannot prove the exact candidate's durable live status.
+    /// A known cursor is evidence for reopen, never permission to acknowledge
+    /// the candidate as committed.
+    Indeterminate {
+        error: KinDbError,
+        observed_cursor: Option<VectorArtifactCursor>,
+    },
+}
+
 /// Maximum exact-source object size accepted by any storage backend.
 /// Archive consumers may apply a lower aggregate limit, but no individual
 /// object is allowed to force an allocation larger than this boundary.
@@ -2454,6 +2668,46 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<bool, KinDbError> {
         let _ = (repo_id, workspace_id, artifact);
         Ok(false)
+    }
+
+    /// Whether this backend durably persists generation-bound vector artifacts.
+    fn supports_vector_artifacts(&self) -> bool {
+        false
+    }
+
+    /// Load the vector artifact for one exact graph authority binding.
+    ///
+    /// [`VectorArtifactLoadOutcome::Missing`] means no artifact exists for that
+    /// binding. Backends that do not implement the capability return the same
+    /// outcome and advertise that fact through
+    /// [`supports_vector_artifacts`](Self::supports_vector_artifacts).
+    fn load_vector_artifact(
+        &self,
+        repo_id: &str,
+        binding: VectorArtifactBinding,
+    ) -> Result<VectorArtifactLoadOutcome, KinDbError> {
+        let _ = (repo_id, binding);
+        Ok(VectorArtifactLoadOutcome::Missing)
+    }
+
+    /// Persist one complete vector artifact with compare-and-swap semantics.
+    ///
+    /// `expected` is the cursor returned by the previous load or save. The
+    /// graph binding never changes at this path; a caller embedding a new graph
+    /// authority starts again at [`VectorArtifactCursor::INITIAL`].
+    fn save_vector_artifact(
+        &self,
+        repo_id: &str,
+        artifact: &VectorArtifact,
+        expected: VectorArtifactCursor,
+    ) -> VectorArtifactSaveOutcome {
+        let _ = (artifact, expected);
+        VectorArtifactSaveOutcome::NotCommitted {
+            error: KinDbError::StorageError(format!(
+                "repo {repo_id}: vector artifact persistence is not supported by this backend"
+            )),
+            observed_cursor: None,
+        }
     }
 
     /// Read snapshot authority and its journal from one coherent backend view.

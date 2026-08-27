@@ -13,6 +13,8 @@ use std::sync::Arc;
 
 use crate::engine::{InMemoryGraph, PersistenceEpoch};
 use crate::error::KinDbError;
+#[cfg(feature = "vector")]
+use crate::storage::backend::VectorArtifact;
 use crate::storage::backend::{Generation, GENERATION_INIT};
 use crate::storage::delta::{apply_graph_delta, GraphSnapshotDelta};
 use crate::storage::format::CompactionStats;
@@ -1280,28 +1282,19 @@ fn locate_cache_write_enabled() -> bool {
 }
 
 #[cfg(feature = "vector")]
-fn read_vector_index_metadata(path: &Path) -> Result<Option<VectorIndexMetadata>, KinDbError> {
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let bytes = std::fs::read(path).map_err(|err| {
+fn decode_vector_index_metadata(
+    bytes: &[u8],
+    label: &str,
+) -> Result<VectorIndexMetadata, KinDbError> {
+    let metadata: VectorIndexMetadata = serde_json::from_slice(bytes).map_err(|err| {
         KinDbError::StorageError(format!(
-            "failed to read vector index metadata {}: {err}",
-            path.display()
-        ))
-    })?;
-    let metadata: VectorIndexMetadata = serde_json::from_slice(&bytes).map_err(|err| {
-        KinDbError::StorageError(format!(
-            "failed to decode vector index metadata {}: {err}",
-            path.display()
+            "failed to decode vector index metadata {label}: {err}"
         ))
     })?;
     if metadata.version != VectorIndexMetadata::VERSION {
         return Err(KinDbError::StorageError(format!(
-            "unsupported vector index metadata version {} in {}",
-            metadata.version,
-            path.display()
+            "unsupported vector index metadata version {} in {label}",
+            metadata.version
         )));
     }
     if metadata.graph_root_hash.len() != 64
@@ -1314,11 +1307,78 @@ fn read_vector_index_metadata(path: &Path) -> Result<Option<VectorIndexMetadata>
         || metadata.embedder_identity.is_empty()
     {
         return Err(KinDbError::StorageError(format!(
-            "vector index metadata {} is missing required current identity fields",
-            path.display()
+            "vector index metadata {label} is missing required current identity fields"
         )));
     }
-    Ok(Some(metadata))
+    Ok(metadata)
+}
+
+#[cfg(feature = "vector")]
+fn validate_vector_index_metadata_shape(
+    metadata: &VectorIndexMetadata,
+    decoded_dimensions: usize,
+    decoded_indexed_count: usize,
+    label: &str,
+) -> Result<(), KinDbError> {
+    if metadata.dimensions != decoded_dimensions {
+        return Err(KinDbError::StorageError(format!(
+            "vector index metadata {label} declares {} dimensions, but the decoded index contains {decoded_dimensions}",
+            metadata.dimensions
+        )));
+    }
+    if metadata.indexed != decoded_indexed_count {
+        return Err(KinDbError::StorageError(format!(
+            "vector index metadata {label} declares {} indexed vectors, but the decoded index contains {decoded_indexed_count}",
+            metadata.indexed
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vector")]
+fn read_vector_index_metadata(path: &Path) -> Result<Option<VectorIndexMetadata>, KinDbError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let bytes = std::fs::read(path).map_err(|err| {
+        KinDbError::StorageError(format!(
+            "failed to read vector index metadata {}: {err}",
+            path.display()
+        ))
+    })?;
+    let label = path.display().to_string();
+    Ok(Some(decode_vector_index_metadata(&bytes, &label)?))
+}
+
+/// Validate validator-owned metadata inside one hosted vector artifact.
+///
+/// The outer storage envelope must already have been decoded against the exact
+/// [`crate::storage::backend::VectorArtifactBinding`], and the opaque index
+/// bytes must already have passed their format and self-description loader.
+/// This final hook proves that the inner metadata names the same retrieval
+/// authority as the outer binding, and that its declared dimensions and
+/// coverage equal the shape actually decoded from the index.
+#[cfg(feature = "vector")]
+pub fn validate_hosted_vector_artifact_inner(
+    artifact: &VectorArtifact,
+    decoded_dimensions: usize,
+    decoded_indexed_count: usize,
+) -> Result<(), KinDbError> {
+    let metadata = decode_vector_index_metadata(&artifact.metadata, "hosted vector artifact")?;
+    let expected_authority = hex::encode(artifact.binding.retrieval_authority_hash);
+    if metadata.graph_root_hash != expected_authority {
+        return Err(KinDbError::StorageError(format!(
+            "hosted vector artifact inner retrieval authority {} does not match outer binding {}",
+            metadata.graph_root_hash, expected_authority
+        )));
+    }
+    validate_vector_index_metadata_shape(
+        &metadata,
+        decoded_dimensions,
+        decoded_indexed_count,
+        "inside hosted vector artifact",
+    )
 }
 
 #[cfg(feature = "vector")]
@@ -2192,6 +2252,42 @@ impl SnapshotManager {
                 });
             }
         };
+        let shape_validation = match graph.vector_index_stats() {
+            Some((decoded_dimensions, decoded_count)) if decoded_count == count => {
+                validate_vector_index_metadata_shape(
+                    &metadata,
+                    decoded_dimensions,
+                    decoded_count,
+                    "beside persisted sidecar",
+                )
+            }
+            Some((_, decoded_count)) => Err(KinDbError::StorageError(format!(
+                "vector index loader reported {count} vectors, but the installed index reports {decoded_count}"
+            ))),
+            None => Err(KinDbError::StorageError(
+                "vector index loader reported success without installing an index".to_string(),
+            )),
+        };
+        if let Err(error) = shape_validation {
+            let reason = error.to_string();
+            tracing::warn!(
+                path = %vector_path.display(),
+                check = "decoded_shape",
+                reason = %reason,
+                "LOUD WARNING: archiving incompatible vector index because its declared shape does not match its decoded contents"
+            );
+            graph.reset_vector_index();
+            archive_incompatible_index(&vector_path, &metadata_path);
+            if write_missing_metadata {
+                graph.queue_missing_for_embedding();
+                graph.queue_missing_artifacts_for_embedding();
+            }
+            return Ok(VectorSidecarLoadOutcome {
+                disposition: VectorSidecarDisposition::ArchivedIncompatibleIndex { reason },
+                durable_coverage_before_load,
+                ..Default::default()
+            });
+        }
 
         let (disposition, vectors_dropped) = match verdict {
             SidecarVerdict::StampDrift => {
@@ -6547,6 +6643,91 @@ mod tests {
         assert!(archived_sidecar_path(&vector_path).exists());
     }
 
+    #[test]
+    #[cfg(feature = "vector")]
+    fn hosted_vector_shape_mismatched_indexed_count_refuses_loudly_and_archives() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("count_mismatch_owner");
+        graph.upsert_entity(&entity).unwrap();
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+        drop(graph);
+        drop(mgr);
+
+        let mut metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+        assert_eq!(metadata.indexed, 1);
+        metadata.indexed = 2;
+        write_vector_index_metadata(&metadata_path, &metadata).unwrap();
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(
+            reopened.graph().embedding_status().indexed,
+            0,
+            "a sidecar whose declared coverage exceeds decoded contents must not stay attached"
+        );
+        assert_eq!(
+            reopened.graph().pending_embeddings(),
+            1,
+            "an indexed-count mismatch must queue a clean rebuild"
+        );
+        assert!(!vector_path.exists());
+        assert!(!metadata_path.exists());
+        assert!(archived_sidecar_path(&vector_path).exists());
+        assert!(archived_sidecar_path(&metadata_path).exists());
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn hosted_vector_shape_mismatched_dimensions_refuses_loudly_and_archives() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("dimension_mismatch_owner");
+        graph.upsert_entity(&entity).unwrap();
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+
+        let metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+        let swapped_dimensions = metadata.dimensions + 1;
+        let swapped = VectorIndex::new(swapped_dimensions).unwrap();
+        swapped
+            .upsert(entity.id, &vec![1.0; swapped_dimensions])
+            .unwrap();
+        swapped.set_descriptor(crate::vector::IndexDescriptor {
+            model_id: Some(metadata.embedding_model_id.clone()),
+            graph_root: Some(metadata.graph_root_hash.clone()),
+        });
+        swapped.save(&vector_path).unwrap();
+        drop(graph);
+        drop(mgr);
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(
+            reopened.graph().embedding_status().indexed,
+            0,
+            "a sidecar whose metadata dimension differs from decoded vectors must not stay attached"
+        );
+        assert_eq!(reopened.graph().pending_embeddings(), 1);
+        assert!(!vector_path.exists());
+        assert!(!metadata_path.exists());
+        assert!(archived_sidecar_path(&vector_path).exists());
+        assert!(archived_sidecar_path(&metadata_path).exists());
+    }
+
     /// The deliberate-invalidation fence survives the salvage change: a stamp
     /// zeroed by `invalidate_derived_sidecars` before an inexact delta commit
     /// still refuses (with its named check), is preserved on disk, and queues a
@@ -7488,6 +7669,41 @@ mod tests {
             ),
             "a bound sidecar remains valid when the caller adds no stricter producer pin"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn hosted_vector_shape_metadata_authority_dimensions_and_count_must_match() {
+        let root = [1u8; 32];
+        let metadata = current_vector_metadata(root, 4, 2, "sha256-aabbcc");
+        let artifact = VectorArtifact {
+            binding: crate::storage::VectorArtifactBinding::for_repository(
+                "hosted-inner-contract",
+                crate::storage::SnapshotCursor::from_backend_generation(42),
+                root,
+            )
+            .unwrap(),
+            metadata: serde_json::to_vec(&metadata).unwrap(),
+            index: b"opaque validated index bytes".to_vec(),
+        };
+
+        validate_hosted_vector_artifact_inner(&artifact, 4, 2).unwrap();
+
+        let count_error = validate_hosted_vector_artifact_inner(&artifact, 4, 1)
+            .expect_err("declared and decoded indexed counts must match exactly");
+        assert!(count_error.to_string().contains("2 indexed vectors"));
+
+        let dimension_error = validate_hosted_vector_artifact_inner(&artifact, 8, 2)
+            .expect_err("declared and decoded dimensions must match exactly");
+        assert!(dimension_error.to_string().contains("4 dimensions"));
+
+        let mut wrong_outer = artifact;
+        wrong_outer.binding.retrieval_authority_hash = [2u8; 32];
+        let authority_error = validate_hosted_vector_artifact_inner(&wrong_outer, 4, 2)
+            .expect_err("inner metadata must not be attached to a different outer authority");
+        assert!(authority_error
+            .to_string()
+            .contains("does not match outer binding"));
     }
 
     /// `classify_vector_sidecar`: matching identities on both sides loads.
