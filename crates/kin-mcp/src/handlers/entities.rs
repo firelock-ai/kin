@@ -5491,21 +5491,197 @@ mod tests {
     /// cannot keep, and a reader who took it spent a tool call learning that
     /// (FIR-2603). The capability is a separate, much larger piece of work; this
     /// guard is only that the description stops claiming it.
+    ///
+    /// Strengthened for FIR-2781 part three, because what it pinned was a
+    /// PHRASING and not the property. It banned one historical string, so a
+    /// rewrite promising value tracing in any other words passed it; it asserted
+    /// containment anywhere rather than position, so the call-chain-walker claim
+    /// could move to the bottom or vanish while a later line kept the test
+    /// green; and it said nothing about the routing to `semantic_locate`, so the
+    /// stranger's actual recommendation could disappear silently. The text being
+    /// present today is the weakest possible state of done, one rewrite from
+    /// gone.
     #[test]
     fn the_trace_description_promises_entity_edges_and_never_value_tracing() {
         let description = TRACE_DATA_FLOW_DESC;
         assert!(
-            !description.contains("trace this value back to its source"),
-            "the description must not promise value-level tracing: {description}"
-        );
-        assert!(
             description.contains("The unit is the entity, not the value"),
-            "and it must state the unit it does walk: {description}"
+            "it must state the unit it does walk: {description}"
         );
         assert!(
             description.contains("Calls/Imports/References edges"),
             "naming the edge classes it follows: {description}"
         );
+    }
+
+    /// The opening sentence, which is the only part of a long description a
+    /// hurried caller reads, and the reason this tool cost a stranger a wasted
+    /// call: its NAME promises data flow and the substrate walks call chains.
+    ///
+    /// Pinned by POSITION rather than by containment. A rewrite that keeps the
+    /// claim somewhere further down leaves the name unqualified exactly where it
+    /// is read, which is the state FIR-2781 was filed about, so a containment
+    /// check would stay green through the regression it exists to catch.
+    #[test]
+    fn the_trace_descriptions_first_sentence_says_what_it_actually_walks() {
+        let opening = trace_description_opening_sentence();
+        let lowered = opening.to_ascii_lowercase();
+        assert!(
+            lowered.contains("call-chain walker") || lowered.contains("call chain walker"),
+            "the FIRST sentence must say plainly what this walks, because the tool's own name \
+             says otherwise and the first sentence is what a hurried caller reads. Got: {opening}"
+        );
+    }
+
+    /// The stranger's own recommendation, kept as a routable destination rather
+    /// than as prose that happens to be true today.
+    ///
+    /// A description that denies doing value tracing and then leaves the caller
+    /// nowhere to go has answered half the question. `semantic_locate` is the
+    /// surface that did answer it, in one call, in the session that filed this,
+    /// and it is a proper noun, so asserting it by name pins the routing rather
+    /// than a phrasing of the routing.
+    #[test]
+    fn the_trace_description_routes_value_questions_to_semantic_locate() {
+        let description = TRACE_DATA_FLOW_DESC;
+        let opening: String = description.chars().take(600).collect();
+        assert!(
+            opening.contains("semantic_locate"),
+            "a value-flow question must be routed somewhere, by name, in the opening block \
+             rather than left for the caller to guess: {opening}"
+        );
+    }
+
+    /// The negative, made property-shaped instead of banning one historical
+    /// string.
+    ///
+    /// The trap this has to survive, and it caught me on the first attempt: the
+    /// honest text DENIES value tracing in words that contain the promise as a
+    /// substring. "It cannot trace a value back to its source" contains "trace a
+    /// value". A bare substring sweep therefore fires on the correct text, and a
+    /// guard that fails on correct text is a guard whoever meets it deletes.
+    ///
+    /// So the check is negation-aware: a promise pattern is a violation only
+    /// where no negator precedes it. And the denial fixture is taken FROM THE
+    /// REAL DESCRIPTION rather than invented, because that is exactly how the
+    /// first attempt failed. I wrote a denial in my own words, it happened not to
+    /// contain the pattern that fires, and the guard passed its control while
+    /// failing the actual text. A fixture written by the same hand as the check
+    /// cannot tell you what the producer really says.
+    #[test]
+    fn the_trace_description_never_promises_to_follow_a_value() {
+        for promise in TRACE_VALUE_PROMISES {
+            assert!(
+                !promises_without_negation(TRACE_DATA_FLOW_DESC, promise),
+                "the description promises value-level tracing the substrate cannot do \
+                 ({promise:?}); there is no FlowsTo relation kind and no Parameter entity kind \
+                 for it to walk"
+            );
+        }
+
+        // Control one: the denials the real description already makes must pass,
+        // quoted from it rather than paraphrased. Each of these CONTAINS a banned
+        // pattern and is correct text.
+        for denial in [
+            "It does NOT follow a value.",
+            "It cannot trace a value back to its source.",
+            "The unit is the entity, not the value",
+            "the graph has no node for a value",
+        ] {
+            assert!(
+                TRACE_DATA_FLOW_DESC.contains(denial),
+                "this control is quoted from the description and must still be in it, or the \
+                 control has drifted from what it controls for: {denial:?}"
+            );
+            for promise in TRACE_VALUE_PROMISES {
+                assert!(
+                    !promises_without_negation(denial, promise),
+                    "pattern {promise:?} fires on the honest denial {denial:?}, so it bans \
+                     correct text and will be deleted by whoever trips it"
+                );
+            }
+        }
+
+        // Control two: each pattern must catch the promise it names, un-negated,
+        // or the list is decoration that can never fail.
+        for (promise, wording) in TRACE_VALUE_PROMISES
+            .iter()
+            .zip(TRACE_VALUE_PROMISE_EXAMPLES)
+        {
+            assert!(
+                promises_without_negation(wording, promise),
+                "pattern {promise:?} does not catch its own example {wording:?}, so it guards \
+                 nothing"
+            );
+        }
+    }
+
+    /// Whether `text` states `promise` somewhere no negator precedes it.
+    ///
+    /// The window is the sixteen characters before the match, which holds every
+    /// negator this text uses ("cannot ", "does NOT ", "never ", "no node for ",
+    /// "not the value") without reaching back into a previous clause. Widening it
+    /// would start swallowing negations that belong to a different sentence,
+    /// which is the failure mode in the other direction: a guard that never
+    /// fires because some earlier sentence said "not".
+    fn promises_without_negation(text: &str, promise: &str) -> bool {
+        let lowered = text.to_ascii_lowercase();
+        let mut from = 0usize;
+        while let Some(offset) = lowered[from..].find(promise) {
+            let at = from + offset;
+            let window_start = at.saturating_sub(16);
+            let window = &lowered[window_start..at];
+            let negated = ["not", "never", "cannot", "no ", "n't"]
+                .iter()
+                .any(|negator| window.contains(negator));
+            if !negated {
+                return true;
+            }
+            from = at + promise.len();
+        }
+        false
+    }
+
+    /// Shapes that only an actual promise of value-level tracing takes: a verb
+    /// with the value as its OBJECT. Negation is handled by the matcher rather
+    /// than by the patterns, so a denial using any of these words still passes.
+    const TRACE_VALUE_PROMISES: &[&str] = &[
+        "trace this value",
+        "trace a value",
+        "traces values",
+        "trace the value back",
+        "follows a value",
+        "follows the value",
+        "value-level trace",
+        "where a value comes from",
+    ];
+
+    /// One real sentence per pattern, un-negated, so the list is proven able to
+    /// catch what it claims to catch rather than assumed able.
+    const TRACE_VALUE_PROMISE_EXAMPLES: &[&str] = &[
+        "It can trace this value back to its source.",
+        "Use it to trace a value through the program.",
+        "It traces values across assignments.",
+        "It will trace the value back to where it was assigned.",
+        "It follows a value through fields and returns.",
+        "It follows the value into every caller.",
+        "A value-level trace of the parameter.",
+        "It answers where a value comes from.",
+    ];
+
+    /// The first sentence of the trace description, by position.
+    ///
+    /// Split on the first sentence-ending period followed by a space. The
+    /// opening carries a colon and a comma before that point and no
+    /// abbreviation, so this boundary is the real one rather than a guess; the
+    /// test above prints what it got, so a future rewrite that breaks the
+    /// assumption says so rather than failing obscurely.
+    fn trace_description_opening_sentence() -> String {
+        let text = TRACE_DATA_FLOW_DESC.trim_start();
+        match text.find(". ") {
+            Some(end) => text[..=end].to_string(),
+            None => text.to_string(),
+        }
     }
 
     fn make_entity(name: &str, file: &str) -> Entity {
