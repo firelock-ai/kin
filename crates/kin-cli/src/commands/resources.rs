@@ -371,6 +371,19 @@ pub struct ReconcileHealth {
     /// reader can act on without a large working copy flooding the surface.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub untracked_paths_sample: Vec<String>,
+    /// Seconds since the count above was measured.
+    ///
+    /// The count cannot be read without it. Zero is written by a pass that
+    /// found nothing untracked and by an explicit seam that admitted
+    /// everything, neither record expires, and a reader given the bare number
+    /// takes it for a statement about now. Absent means no measurement has ever
+    /// been taken, which is the weakest possible basis for a zero and has to be
+    /// reported as such rather than as an all-clear (FIR-2820).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untracked_observed_age_seconds: Option<u64>,
+    /// Wall-clock time of the measurement above, RFC 3339.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub untracked_observed_at: Option<String>,
     /// Untracked host entries the effective ignore rules excluded from the most
     /// recent walk.
     ///

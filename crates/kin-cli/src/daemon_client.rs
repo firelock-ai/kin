@@ -107,6 +107,14 @@ pub struct HealthResponse {
     pub behavior_env: kin_core::behavior_env::BehaviorEnv,
     #[serde(default)]
     pub build: Option<BuildResponse>,
+    /// What the reconciliation loop is managing to admit, and what the working
+    /// copy holds that it has not.
+    ///
+    /// Read by `kin status`, which otherwise reports durable authority truth
+    /// alone and so could describe a repository as matching its base change
+    /// while a module the graph has never met sat beside it (FIR-2820).
+    #[serde(default)]
+    pub reconcile: crate::commands::resources::ReconcileHealth,
 }
 
 #[derive(Debug, Deserialize, Clone)]

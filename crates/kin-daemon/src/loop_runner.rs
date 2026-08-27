@@ -530,6 +530,59 @@ pub(crate) fn current_authority_admission(
     Ok((roots, policy))
 }
 
+/// Measure host content graph truth does not carry, right now.
+///
+/// The reconcile loop records this set as a side effect of a pass, and an
+/// explicit seam records it empty because the seam admitted everything. Both
+/// are true when written and neither expires, so between a host write and the
+/// pass that observes it every surface reading the record is told zero over a
+/// working copy holding a module the graph has never met. Three of them then
+/// agree on an absence a one-line grep refutes: the durability block reports
+/// "0 uncommitted", `kin status` reports a tree matching its base, and
+/// `find_references` certifies the name authoritatively absent (FIR-2820).
+///
+/// So the reading is taken when a surface is about to state it, not inherited
+/// from whatever ran last. The walk opens nothing and hashes nothing, which is
+/// what makes that affordable: it is strictly cheaper than the complete content
+/// scan this loop already runs on every batch of watcher events.
+///
+/// Returns whether a measurement was taken. `false` is not a failure; it is the
+/// reading still being current enough, or a daemon whose graph is its own write
+/// authority and whose checkout is therefore not evidence about anything.
+pub(crate) fn refresh_untracked_reading(state: &DaemonState) -> Result<bool> {
+    // A graph-authority daemon does not scan a projected checkout in the first
+    // place, so host paths there are not content anything failed to admit and
+    // counting them would manufacture a disclosure out of the projection.
+    if state.filesystem_reconcile_disabled() {
+        return Ok(false);
+    }
+    let probes = state.background_work.reconcile();
+    if !probes.untracked_refresh_due(Instant::now()) {
+        return Ok(false);
+    }
+    let working_dir = state.layout.working_dir();
+    let (_roots, policy) = current_authority_admission(state)?;
+    let previous = state.graph.resolved_tree();
+    let tracked_paths = previous
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
+    let ignore =
+        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let started = Instant::now();
+    let untracked = kin_index::scan_repository_untracked_paths(
+        working_dir,
+        &ignore,
+        policy.as_ref(),
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+    )
+    .map_err(kin_index::IndexError::from)?;
+    probes.record_untracked_measurement(untracked.iter(), started.elapsed());
+    Ok(true)
+}
+
 /// What one complete walk declined to observe, taken from its own diagnostics.
 ///
 /// Read off the scan rather than recomputed, so the counts a surface prints and
