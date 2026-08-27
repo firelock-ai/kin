@@ -90,33 +90,42 @@ fn planning_a_one_file_commit_reports_where_the_peak_is() {
     );
 
     let workspace = tempfile::tempdir().expect("scratch workspace");
-    let repo = stage_copy(&source, workspace.path());
 
-    // Phase one: convert. Its own peak is the conversion's, not the commit's,
-    // and charging one to the other is the single-process mistake the FIR-2615
-    // lane documented. The counters are re-based afterwards.
-    kin_core::init_from_git(&repo).expect("convert the repository");
+    // Converting takes about eleven minutes on this corpus, so a second arm can
+    // point at a store the first one already built. The default is still a
+    // fresh conversion, because a reused store is only as trustworthy as
+    // whoever last wrote to it.
+    let repo = match std::env::var_os("KIN_HEAP_CONVERTED") {
+        Some(existing) => PathBuf::from(existing),
+        None => {
+            let repo = stage_copy(&source, workspace.path());
+            // Its own peak is the conversion's, not the plan's, and charging
+            // one to the other is the single-process mistake the FIR-2615 lane
+            // documented. The counters are re-based afterwards.
+            kin_core::init_from_git(&repo).expect("convert the repository");
+            repo
+        }
+    };
 
     let layout = kin_core::KinLayout::discover(&repo).expect("layout for the converted repo");
     let binding =
         kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout).expect("authority binding");
     let workspace_id = binding.workspace_id();
 
-    // Phase two: what a daemon holds once the store is merely OPEN. Every term
-    // below is reported against this, because FIR-2615 found most of a
-    // commit's peak is residency rather than the commit.
+    // What a daemon holds once the store is merely OPEN. Every term below is
+    // reported against this, because FIR-2615 found most of a commit's peak is
+    // residency rather than the commit.
     let resident_before_open = support::live();
     let (open_term, manager) = measure("open the authority", || {
         binding.open_manager().expect("open authority manager")
     });
     let lease = manager.read_authority();
     let resident = support::live();
-
     let mut terms = vec![open_term];
 
     // Candidate 1: the authority's own workspace graph, one side of the
     // semantic diff. FIR-2651 stopped the workspace COMPARISON bases carrying
-    // the change map, but this caller is a different one and still asks for a
+    // the change map, but this is a different caller and still asks for a
     // carried base, so it is measured rather than assumed.
     let (term, authority_workspace_graph) = measure("lease.workspace_graph_snapshot", || {
         lease
@@ -126,11 +135,18 @@ fn planning_a_one_file_commit_reports_where_the_peak_is() {
     });
     terms.push(term);
 
-    // Candidate 2: the desired side. `plan_native_commit_inner` builds this
-    // with `InMemoryGraph::to_snapshot`, which deep-clones all seven sub-stores
-    // although the diff beside it reads two.
-    let (term, graph) = measure("InMemoryGraph::from_snapshot", || {
-        kin_db::InMemoryGraph::from_snapshot_without_text_index(lease.snapshot().clone())
+    // Candidate 2: the desired side. The daemon holds a live workspace graph
+    // and exports it with `to_snapshot`. The graph is built HERE from the
+    // workspace snapshot rather than from `lease.snapshot()`, because those are
+    // different surfaces: the authority snapshot carries the change DAG and no
+    // entities at all, so an export measured off it prices a graph the planner
+    // never diffs and would report the two compared domains as free.
+    let (term, graph) = measure("build the workspace graph (probe scaffolding)", || {
+        let base = lease
+            .workspace_graph_snapshot(&workspace_id)
+            .expect("workspace graph snapshot readable")
+            .expect("authority has a graph snapshot for this workspace");
+        kin_db::InMemoryGraph::from_snapshot_without_text_index(base)
             .expect("build the prospective graph")
     });
     terms.push(term);
@@ -140,27 +156,37 @@ fn planning_a_one_file_commit_reports_where_the_peak_is() {
     });
     terms.push(term);
 
-    // The split that decides the fix: what the two domains the diff actually
-    // reads cost, against what the whole export cost.
+    // The split that decides the fix: what the two domains the diff reads cost,
+    // against what the whole export cost.
     let (term, needed) = measure("only the two domains the diff reads", || {
         (desired.entities.clone(), desired.relations.clone())
     });
     terms.push(term);
     drop(needed);
 
-    let (term, change_map) = measure("only the change map", || desired.changes.clone());
+    let (term, change_map) = measure("only the change map", || {
+        (desired.changes.clone(), desired.change_children.clone())
+    });
     terms.push(term);
     drop(change_map);
 
     println!("\nrepository {source:?}");
     println!(
-        "entities {}  relations {}  changes {}",
-        desired.entities.len(),
-        desired.relations.len(),
-        desired.changes.len()
+        "authority workspace graph: entities {}  relations {}  changes {}  tree {}",
+        authority_workspace_graph.entities.len(),
+        authority_workspace_graph.relations.len(),
+        authority_workspace_graph.changes.len(),
+        authority_workspace_graph.resolved_tree.len(),
     );
     println!(
-        "live heap once the store is merely open: {:.1} MiB",
+        "exported desired graph:    entities {}  relations {}  changes {}  tree {}",
+        desired.entities.len(),
+        desired.relations.len(),
+        desired.changes.len(),
+        desired.resolved_tree.len(),
+    );
+    println!(
+        "\nlive heap once the store is merely open: {:.1} MiB",
         mib(resident.saturating_sub(resident_before_open))
     );
     println!("\n{:<48} {:>12} {:>12}", "term", "grew MiB", "retained MiB");
