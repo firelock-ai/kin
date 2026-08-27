@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Flake quarantine, and the two verdicts one execution produces.
+#
+# A job-level retry restarts the check clock, which is what a merge-queue
+# ejection costs: four ejections in the 2026-08-26 window, roughly thirty
+# minutes each, none of them a code change. A test-level retry costs seconds
+# and restarts nothing. This file is where that difference is declared.
+#
+# Every value below was verified against cargo-nextest 0.9.140 by running it,
+# not by reading its help text. The controls are in the report for FIR-2815 and
+# in scripts/check-quarantine.py, and the four that matter are:
+#
+#   retries = 2 + flaky-result = "pass"  -> exit 0, "2 passed (1 flaky)"
+#   flaky-result = "fail", same test     -> exit 100, "FLKY-FL"
+#   no override at all, same test        -> exit 100, plain FAIL
+#   an unknown key anywhere in this file -> a WARNING and exit 0
+#
+# The last one decides the shape of this file. nextest IGNORES keys it does not
+# know, so quarantine bookkeeping cannot live in this table as extra fields: a
+# typo would be silently dropped and the row would still read complete. The
+# bookkeeping is therefore a comment line in a fixed format above each override,
+# and scripts/check-quarantine.py refuses the file unless every override carries
+# one and the comment and the filter name the same test.
+#
+# The blocking verdict is this profile: a quarantined test that passes on retry
+# does not fail the run, so it stops ejecting queue entries and stops reddening
+# main tips. The reporting verdict is the same execution read the other way,
+# out of the JUnit file below, which records every retry as a `flakyFailure`
+# element whatever `flaky-result` says. `check-quarantine.py --report-junit`
+# is that read. Without it quarantine is a place where flakes go quiet, which is
+# the one outcome that would make this file worse than no file.
+#
+# Entering quarantine takes evidence and nothing else does: the test failed at a
+# sha, a SAME-CODE re-run of that job at that exact sha passed, and both run ids
+# are on the ticket. A test that fails deterministically cannot enter, because
+# its re-run is red too.
+
+[profile.default]
+# The blocking verdict. Explicit rather than inherited, because the whole point
+# of this file is that a reader can see which way a flake is being graded.
+flaky-result = "pass"
+
+# The record. Written on every nextest run, including a lane's local one, so the
+# reporting verdict never depends on having remembered a flag. Lands at
+# target/nextest/default/junit.xml.
+[profile.default.junit]
+path = "junit.xml"
+
+# ─── Quarantine rows ────────────────────────────────────────────────────────
+#
+# Format, enforced by scripts/check-quarantine.py:
+#
+#   # quarantine: ticket=FIR-NNNN since=YYYY-MM-DD last-flake=YYYY-MM-DD source=<path>
+#   [[profile.default.overrides]]
+#   filter = 'binary_id(=<pkg>::<target>) & test(=<test path>)'
+#   retries = 2
+#
+# `since` starts the fourteen-day clock. `last-flake` is the most recent run in
+# which this test actually needed a retry, read off nextest's own `(N flaky)`
+# summary; a row whose last flake is seven days old is a promotion candidate and
+# the guard says so. `source` is the file the test lives in, and the guard joins
+# it against the filter so a renamed or deleted test cannot leave a row behind
+# that applies to nothing.
+
+# quarantine: ticket=FIR-2809 since=2026-08-27 last-flake=2026-08-27 source=crates/kin-core/tests/init_phase_ladder_contiguous.rs
+#
+# Day-one intake, and the only row. It ejected pull request 1141 for a measured
+# 34 minutes on 2026-08-26. It has the evidence quarantine demands: the guard was
+# confirmed LOAD-SENSITIVE by the control that counts, same bytes, round one red
+# at 2.6% against a 2.0% bar and round two green. Note what that entry did and
+# copy it: the bar was NOT loosened, and the breached-ladder control that must
+# stay red was re-run to prove the guard still catches a real breach. Parking a
+# test here is never a licence to weaken the assertion it makes.
+[[profile.default.overrides]]
+filter = 'binary_id(=kin-core::init_phase_ladder_contiguous) & test(=the_admission_ladder_accounts_for_the_whole_of_init)'
+retries = 2
