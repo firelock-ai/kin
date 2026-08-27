@@ -58,6 +58,15 @@ separates those from a file an adapter could not read. The doctor row must stay
 `healthy`, and this suite fails if it does not, because a row that went red on
 the count would go red on most JavaScript repositories.
 
+`hydration_semantics_repro.py` covers the durable replay-semantics version
+recorded when a store is created. It builds one fresh repository and requires
+the control to stay silent on `kin graph status`, report a healthy
+`hydration_semantics` doctor row, and omit `hydration_semantics_stale` from the
+stdio MCP envelope. It then plants a stamp one version behind and removes the
+stamp entirely. Both gap arms must disclose on all three surfaces. The
+current-store control is what prevents an always-warning comparator or a
+missing writer from satisfying the suite.
+
 `brownfield_repro.py` covers reference enrichment on two pinned upstream trees,
 `psf/requests` and `expressjs/express`, replayed as single-commit repositories
 holding the exact pinned tree object. Check 0 asserts the run stayed off the GPU

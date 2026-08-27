@@ -808,14 +808,14 @@ pub fn prepare_repository_layout_with_origin(
         crate::tree::initialize_projection_control_directory(layout.root())?;
         std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
             .map_err(|error| KinError::io(layout.version_path(), error))?;
-        // Which replay semantics authored this store, recorded here because this
-        // is the one staging boundary every store-creation path crosses: `kin
-        // init` on a bare directory, `kin init` over a Git checkout, a replica
-        // staged by `kin clone`, and both of `kin-migrate`'s doors. Writing it
-        // into the stage rather than after publication is what makes an absent
-        // record mean one thing: `.kin` is published by a single no-replace
-        // rename, so a store a reader can see either carries its own provenance
-        // or predates the record entirely.
+        // Which replay-semantics version was in force when this store was
+        // created, recorded here because this is the one staging boundary every
+        // store-creation path crosses: `kin init` on a bare directory, `kin
+        // init` over a Git checkout, a replica staged by `kin clone`, and
+        // `kin-migrate`'s Git-admission path. Writing it into the stage rather
+        // than after publication makes a visible unstamped store distinguishable
+        // from an in-flight creation. Absence stays unverified because the store
+        // may predate the record or the file may have been removed.
         crate::hydration_semantics::stamp_staged(&layout)
             .map_err(|error| KinError::io(layout.kindb_hydration_semantics_path(), error))?;
         config.save_initialization_stage(layout.root())?;

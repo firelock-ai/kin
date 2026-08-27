@@ -602,6 +602,20 @@ pub(crate) fn relation_census_hold() -> Option<kin_core::relation_census::Census
     kin_core::relation_census::CensusHold::read(&discover_kin_dir()?)
 }
 
+/// How this store's recorded creation-time replay version stands against this
+/// binary.
+///
+/// Read on every call because the record belongs to the store, not to this MCP
+/// process. A repository can be re-created while an agent session stays open,
+/// and caching the first reading would keep reporting the replaced graph's
+/// provenance.
+pub(crate) fn hydration_semantics_standing(
+) -> Option<kin_core::hydration_semantics::HydrationStanding> {
+    Some(kin_core::hydration_semantics::standing_at(
+        &discover_kin_dir()?,
+    ))
+}
+
 /// What this store's last enrichment sweep could not publish.
 ///
 /// Read fresh on every call for the reason the others are: the record is

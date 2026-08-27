@@ -106,6 +106,10 @@ pub async fn status() -> Result<()> {
         &kin_core::last_admission::read(&layout),
         chrono::Utc::now(),
     );
+    append_hydration_semantics_line(
+        &mut response.lines,
+        &kin_core::hydration_semantics::standing(&layout),
+    );
     // And which projection is showing that truth as files. Read here rather
     // than asked of the daemon for the same reason freshness is: the daemon
     // reports the graph it holds, and whether this host has a mount or an
@@ -137,6 +141,30 @@ fn append_freshness_line(
 ) {
     lines.push(String::new());
     lines.push(format!("ℹ graph truth: {}", freshness.describe(now)));
+}
+
+/// Disclose when the store's creation-time replay version differs from this
+/// binary or cannot establish agreement.
+///
+/// Agreement stays silent. A `hydration semantics` line therefore always names
+/// an actionable gap instead of forcing a reader to parse an always-on label
+/// for a hidden `current` value. Unknown is still a gap: an unreadable record
+/// cannot honestly stand in for agreement.
+fn append_hydration_semantics_line(
+    lines: &mut Vec<String>,
+    standing: &kin_core::hydration_semantics::HydrationStanding,
+) {
+    if !standing.is_gap() {
+        return;
+    }
+    let remedy = standing
+        .remedy()
+        .map(|remedy| format!(" Remedy: {remedy}."))
+        .unwrap_or_default();
+    lines.push(format!(
+        "⚠ hydration semantics: {}.{remedy}",
+        standing.sentence()
+    ));
 }
 
 /// `kin graph validate` — structural integrity checks.
@@ -1763,6 +1791,68 @@ mod tests {
                     "unknown freshness must be stated: {out}"
                 );
             }
+        }
+    }
+
+    mod hydration_semantics {
+        use super::super::append_hydration_semantics_line;
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        fn rendered(standing: &HydrationStanding) -> String {
+            let mut lines = Vec::new();
+            append_hydration_semantics_line(&mut lines, standing);
+            lines.join("\n")
+        }
+
+        #[test]
+        fn agreement_stays_silent() {
+            let out = rendered(&HydrationStanding::Current { version: 10 });
+            assert!(
+                out.is_empty(),
+                "a current store must not manufacture a warning: {out}"
+            );
+        }
+
+        #[test]
+        fn every_gap_is_disclosed_with_its_remedy() {
+            for standing in [
+                HydrationStanding::Behind {
+                    created_under: 9,
+                    derives: 10,
+                },
+                HydrationStanding::Ahead {
+                    created_under: 11,
+                    derives: 10,
+                },
+                HydrationStanding::Unstamped { derives: 10 },
+                HydrationStanding::Unreadable {
+                    reason: "truncated".to_string(),
+                    derives: 10,
+                },
+            ] {
+                let out = rendered(&standing);
+                assert!(
+                    out.contains("hydration semantics:"),
+                    "a gap must name the affected semantics: {out}"
+                );
+                assert!(
+                    out.contains("Remedy:"),
+                    "a gap must carry the standing's remedy: {out}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_ahead_store_is_told_to_upgrade_not_reingest() {
+            let out = rendered(&HydrationStanding::Ahead {
+                created_under: 11,
+                derives: 10,
+            });
+            assert!(out.contains("upgrade this Kin build"), "{out}");
+            assert!(
+                !out.contains("re-ingest the repository"),
+                "an older binary must not replace a newer graph: {out}"
+            );
         }
     }
 

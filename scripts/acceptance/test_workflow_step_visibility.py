@@ -63,6 +63,11 @@ EXPECTED_SUITES = (
         "acceptance/parsehole.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/hydration_semantics_repro.py",
+        "hydration_semantics",
+        "acceptance/hydration_semantics.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/same_owner_call_repro.py",
         "sameowner",
         "acceptance/sameowner.json",
@@ -1003,7 +1008,7 @@ def main() -> int:
     if problems:
         return 1
     print(
-        "workflow authority holds: 13 suite reports reach one always-running verdict in order"
+        "workflow authority holds: 14 suite reports reach one always-running verdict in order"
     )
     return 0
 

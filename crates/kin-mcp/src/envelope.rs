@@ -359,6 +359,13 @@ pub struct Degraded {
     /// retires, so it clears itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation_census_loss: Option<bool>,
+    /// The store's recorded creation-time hydration semantics differ from the
+    /// ones this binary derives, or the record is absent or unreadable. The
+    /// payload can still contain true rows, but an absence cannot be certified
+    /// when the store cannot establish that comparison. This record does not
+    /// claim provenance for history a replica later receives over transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_semantics_stale: Option<bool>,
     /// This store's last language-server enrichment sweep offered relations the
     /// graph does not hold, or published some without invalidating their
     /// endpoints' embeddings. Either way a producer that was supposed to fill
@@ -383,6 +390,7 @@ impl Degraded {
             self.sweep_suspended,
             self.memory_pressure,
             self.relation_census_loss,
+            self.hydration_semantics_stale,
             self.enrichment_shortfall,
         ]
         .into_iter()
@@ -420,6 +428,9 @@ impl Degraded {
         }
         if self.relation_census_loss == Some(true) {
             labels.push("relation_census_loss");
+        }
+        if self.hydration_semantics_stale == Some(true) {
+            labels.push("hydration_semantics_stale");
         }
         if self.enrichment_shortfall == Some(true) {
             labels.push("enrichment_shortfall");
@@ -1625,7 +1636,15 @@ impl Envelope {
             entity_count: Some(entity_count),
             ..GraphState::default()
         };
-        self.degraded = Degraded::default();
+        // Selected-graph status must discard HEAD-only daemon health flags, but
+        // the hydration creation-time version belongs to the store and applies
+        // to every graph view it can select. Preserve that one store-wide fact
+        // across the requalification instead of erasing the disclosure after
+        // the stdio server stamped it.
+        self.degraded = Degraded {
+            hydration_semantics_stale: self.degraded.hydration_semantics_stale,
+            ..Degraded::default()
+        };
         self
     }
 
@@ -1713,6 +1732,29 @@ impl Envelope {
     ) -> Self {
         if hold.is_some() {
             self.degraded.relation_census_loss = Some(true);
+        }
+        self
+    }
+
+    /// Stamp that this store's recorded creation-time hydration semantics differ
+    /// from the ones this binary carries or cannot establish agreement.
+    ///
+    /// The successful empty answer is the one this changes. Historical deltas
+    /// are not re-derived when the binary's replay semantics change, so an
+    /// absent row may be a property of replay semantics this store cannot show
+    /// match the current build rather than a fact about the repository. Missing
+    /// and unreadable records count as gaps because neither can honestly stand
+    /// in for agreement.
+    ///
+    /// Absent rather than `false` when no repository is discoverable or the
+    /// store is current. `None` makes no claim; a fabricated `false` would claim
+    /// a comparison a call outside a Kin repository never performed.
+    pub fn with_hydration_semantics_gap(
+        mut self,
+        standing: Option<&kin_core::hydration_semantics::HydrationStanding>,
+    ) -> Self {
+        if standing.is_some_and(|standing| standing.is_gap()) {
+            self.degraded.hydration_semantics_stale = Some(true);
         }
         self
     }
@@ -3739,6 +3781,58 @@ mod tests {
             !json.contains("relation_census_loss"),
             "an unobserved flag is absent from the wire, not false: {json}"
         );
+    }
+
+    /// FIR-2829: replay-version agreement stays silent and every version gap
+    /// becomes a degraded signal that reaches completeness and negative trust.
+    #[test]
+    fn a_hydration_semantics_gap_becomes_a_degraded_signal_and_agreement_does_not() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let current = HydrationStanding::Current { version: 10 };
+        let whole = Envelope::daemon().with_hydration_semantics_gap(Some(&current));
+        assert_eq!(whole.degraded.hydration_semantics_stale, None);
+        assert!(!whole.degraded.any());
+        assert!(!serde_json::to_string(&whole.degraded)
+            .expect("degraded serializes")
+            .contains("hydration_semantics_stale"));
+
+        for standing in [
+            HydrationStanding::Behind {
+                created_under: 9,
+                derives: 10,
+            },
+            HydrationStanding::Ahead {
+                created_under: 11,
+                derives: 10,
+            },
+            HydrationStanding::Unstamped { derives: 10 },
+            HydrationStanding::Unreadable {
+                reason: "truncated".to_string(),
+                derives: 10,
+            },
+        ] {
+            let flagged = Envelope::daemon().with_hydration_semantics_gap(Some(&standing));
+            assert_eq!(flagged.degraded.hydration_semantics_stale, Some(true));
+            assert!(flagged.degraded.any());
+            assert!(flagged
+                .degraded
+                .active_labels()
+                .contains(&"hydration_semantics_stale"));
+            let (trusted, reason) = flagged.negative_trust(NegativeClass::Semantic);
+            assert!(!trusted);
+            assert!(reason.contains("degraded"), "{reason}");
+
+            let selected = flagged.with_selected_graph_observation(4, 4, 0, 4, Some(4));
+            assert_eq!(
+                selected.degraded.hydration_semantics_stale,
+                Some(true),
+                "a store-wide creation-version gap must survive selected-graph qualification"
+            );
+        }
+
+        let outside = Envelope::daemon().with_hydration_semantics_gap(None);
+        assert_eq!(outside.degraded.hydration_semantics_stale, None);
     }
 }
 

@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-//! Durable record of the replay semantics a store was created under.
+//! Durable record of the replay-semantics version in force when a store was
+//! created.
 //!
 //! [`kin_index::history::HYDRATION_SEMANTICS_VERSION`] declares which revision
-//! of the replay algorithm authors a repository's historical entity and relation
-//! deltas. Its own doc comment says the constant is a declaration and not an
-//! enforcement point: nothing persisted it beside a graph and nothing compared it
-//! when one was opened, so bumping it recorded a decision no surface could act
-//! on. This module is the half that makes the decision legible.
+//! of the replay algorithm this build uses when it authors historical entity and
+//! relation deltas. Its own doc comment says the constant is a declaration and
+//! not an enforcement point: nothing persisted it beside a graph and nothing
+//! compared it when one was opened, so bumping it recorded a decision no surface
+//! could act on. This module is the half that makes the decision legible.
 //!
 //! The consequence was measured rather than imagined. kin#1186 raised the dial
 //! from 9 to 10 because about 48% of the graph's entity population across five
@@ -23,18 +24,20 @@
 //! [`crate::init::prepare_repository_layout_with_origin`], which is the single
 //! staging boundary every store-creation path goes through: `kin init` on a bare
 //! directory, `kin init` over a Git checkout, a replica staged by `kin clone`,
-//! and both of `kin-migrate`'s doors. It writes into the STAGED layout, before
-//! the one no-replace rename that publishes `.kin`, so the store and its stamp
-//! become visible in the same instant.
+//! and `kin-migrate`'s Git-admission path. It writes into the STAGED layout,
+//! before the one no-replace rename that publishes `.kin`, so the store and its
+//! stamp become visible in the same instant.
 //!
-//! That placement is what makes an absent stamp unambiguous, and the ambiguity
-//! it removes is the whole hazard. An absence has producers, and keying a
-//! verdict on one without enumerating the rest is how a healthy freshly
-//! initialized store gets called stale. The producers of "no stamp" are:
+//! That placement makes an absent stamp safe to disclose without confusing it
+//! with an in-flight creation. An absence still has multiple producers, and
+//! keying a stronger claim on one without enumerating the rest is how an
+//! unverified store gets described as known-stale. The producers of "no stamp"
+//! are:
 //!
-//! 1. A store created by a build that predates this record. Determinate: its
-//!    graph was authored under replay semantics older than the constant this
-//!    binary carries. That is every store in existence when this landed.
+//! 1. A store created by a build that predates this record. This proves that the
+//!    store carries no creation-time comparison, not that its history was
+//!    authored under a particular older version. Version 10 existed before the
+//!    record did, and replicas can receive history authored elsewhere.
 //! 2. A store whose creation is still in flight, or was killed part way. Not
 //!    observable: the staged layout lives under `.kin.init-<uuid>` and is
 //!    published by rename, so a `.kin` a reader can see is a conversion that
@@ -44,14 +47,14 @@
 //!    write happens before publication and its error aborts the conversion,
 //!    which cleans up the staging root rather than publishing a store missing
 //!    its own record.
-//! 4. A store whose stamp a person removed. Reads as (1), which errs toward
-//!    disclosure and never toward a false all-clear.
+//! 4. A store whose stamp a person removed. Reads as unverified, which errs
+//!    toward disclosure and never toward a false all-clear.
 //!
 //! ## What the stamp claims, and what it does not
 //!
-//! It claims the version in force when this store was created, which for every
-//! locally admitted store is the version its history was authored under. It does
-//! not claim anything about history a replica later admits over the native
+//! It claims only the version in force when this store was created. For a local
+//! conversion, creation and historical replay happen in the same operation. It
+//! does not claim anything about history a replica later admits over the native
 //! transport: those deltas were authored on whichever host converted the
 //! repository, and the transport carries no version beside them. That limit is
 //! recorded rather than papered over, and closing it belongs to the phase that
@@ -124,21 +127,23 @@ pub enum HydrationSemanticsRead {
 pub enum HydrationStanding {
     /// The store was created under the version this binary derives.
     Current { version: u32 },
-    /// The store was created under an older version, so its persisted history
-    /// was authored by replay semantics this binary has since revised.
+    /// The store records an older creation-time version than this binary
+    /// derives. The record alone does not prove which replay authored history
+    /// later admitted over the native transport.
     Behind { created_under: u32, derives: u32 },
     /// The store was created under a newer version than this binary derives, so
     /// this binary is older than the build that made the store.
     Ahead { created_under: u32, derives: u32 },
-    /// The store carries no record, which means it was created before one was
-    /// written. See the producer enumeration in the module doc.
+    /// The store carries no record, so no creation-time comparison can be made.
+    /// See the producer enumeration in the module doc.
     Unstamped { derives: u32 },
     /// A record exists and could not be read. Never treated as agreement.
     Unreadable { reason: String, derives: u32 },
 }
 
 impl HydrationStanding {
-    /// Whether this store's history and this binary's replay semantics disagree.
+    /// Whether the store's creation-time record differs from this binary or
+    /// cannot establish agreement.
     ///
     /// [`HydrationStanding::Unreadable`] counts, because "we could not tell" is
     /// not "they agree", and a surface that silently treated it as agreement
@@ -163,65 +168,67 @@ impl HydrationStanding {
     /// envelope.
     ///
     /// Names both numbers wherever both are known. "The graph is stale" invites
-    /// a shrug; "authored under 9, this build derives 10" tells a reader what
-    /// changed and lets them look up what version 10 fixed.
+    /// a shrug; "the store records 9 at creation, this build derives 10" tells a
+    /// reader what changed without claiming more provenance than the record
+    /// contains.
     pub fn sentence(&self) -> String {
         match self {
             Self::Current { version } => format!(
-                "this graph was authored under hydration semantics version {version}, which is \
-                 what this build derives"
+                "this store records hydration semantics version {version} at creation, matching \
+                 the version this build derives"
             ),
             Self::Behind {
                 created_under,
                 derives,
             } => format!(
-                "this graph was authored under hydration semantics version {created_under} and \
-                 this build derives version {derives}, so its historical entities and relations \
-                 are what the older replay produced and no path re-derives them in place"
+                "this store records hydration semantics version {created_under} at creation and \
+                 this build derives version {derives}, so the store cannot certify that its \
+                 persisted history reflects this build's replay semantics and no path re-derives \
+                 that history in place"
             ),
             Self::Ahead {
                 created_under,
                 derives,
             } => format!(
-                "this graph was authored under hydration semantics version {created_under} and \
-                 this build derives the older version {derives}, so this binary is behind the \
-                 build that created the store"
+                "this store records hydration semantics version {created_under} at creation and \
+                 this build derives the older version {derives}, so this binary predates the \
+                 store's recorded semantics"
             ),
             Self::Unstamped { derives } => format!(
-                "this graph records no hydration semantics version, so it was authored before \
-                 stores recorded one and by replay semantics older than the version {derives} \
-                 this build derives"
+                "this store records no hydration semantics version, so its persisted history \
+                 cannot be shown to match the version {derives} this build derives"
             ),
             Self::Unreadable { reason, derives } => format!(
-                "this graph's hydration semantics record could not be read ({reason}), so which \
-                 replay authored it is unknown rather than equal to the version {derives} this \
-                 build derives"
+                "this store's hydration semantics record could not be read ({reason}), so its \
+                 creation-time version cannot be shown to match the version {derives} this build \
+                 derives"
             ),
         }
     }
 
     /// What the reader can do about it, when there is anything to do.
     ///
-    /// A re-ingest is the only remedy phase one has, and it is honest only where
-    /// this binary's replay is the newer one. Telling somebody running an old
-    /// binary against a newer store to re-ingest would destroy the better graph
-    /// with a worse one, so that case names the real fix instead.
+    /// Re-ingest only when the record proves this binary is newer. An ahead,
+    /// absent or unreadable record can belong to a newer store, so those cases
+    /// name upgrade-first advice and preserve the original store until the
+    /// direction is known.
     pub fn remedy(&self) -> Option<String> {
         match self {
             Self::Current { .. } => None,
-            Self::Behind { .. } | Self::Unstamped { .. } => Some(
-                "re-ingest the repository with `kin init` into a fresh store to author its \
-                 history under this build's replay semantics"
+            Self::Behind { .. } => Some(
+                "re-ingest the repository with `kin init` into a fresh store recorded under this \
+                 build's replay semantics"
                     .to_string(),
             ),
             Self::Ahead { .. } => Some(
                 "upgrade this Kin build to at least the one that created the store, rather than \
-                 re-ingesting, which would author its history under the older replay"
+                 re-ingesting with the older replay version"
                     .to_string(),
             ),
-            Self::Unreadable { .. } => Some(
-                "re-ingest the repository with `kin init` into a fresh store to rewrite the \
-                 record"
+            Self::Unstamped { .. } | Self::Unreadable { .. } => Some(
+                "upgrade Kin before changing this store; if the newest build still cannot read \
+                 the record, re-ingest the repository into a separate fresh store rather than \
+                 replacing this one"
                     .to_string(),
             ),
         }
@@ -512,10 +519,8 @@ mod tests {
         );
     }
 
-    /// A store created by a newer build must not be told to re-ingest. That
-    /// advice would replace a graph authored by the better replay with one
-    /// authored by the worse, so the two gap directions carry different remedies
-    /// and this is what separates them.
+    /// A store created by a newer build must not be told to re-ingest with this
+    /// older binary. The two gap directions therefore carry different remedies.
     #[test]
     fn an_ahead_store_is_not_told_to_re_ingest() {
         let behind = HydrationStanding::Behind {
@@ -532,6 +537,25 @@ mod tests {
             advice.contains("upgrade") && !advice.contains("re-ingest the repository"),
             "an ahead store must not be told to re-ingest: {advice}"
         );
+    }
+
+    /// Unknown provenance can be a deleted record or a schema from a newer
+    /// build. The advice must preserve the store until that distinction is known
+    /// instead of treating every unknown as an older graph.
+    #[test]
+    fn unknown_provenance_is_given_non_destructive_advice() {
+        for standing in [
+            HydrationStanding::Unstamped { derives: 10 },
+            HydrationStanding::Unreadable {
+                reason: "schema kin.hydration-semantics.v2 is not v1".to_string(),
+                derives: 10,
+            },
+        ] {
+            let advice = standing.remedy().unwrap();
+            assert!(advice.starts_with("upgrade Kin before changing this store"));
+            assert!(advice.contains("separate fresh store"));
+            assert!(!advice.contains("rewrite the record"));
+        }
     }
 
     /// Both numbers, in every gap sentence that knows both. "The graph is
@@ -559,5 +583,24 @@ mod tests {
                 "missing the recorded version: {sentence}"
             );
         }
+    }
+
+    /// The record is creation-time provenance. Native replicas can later admit
+    /// history authored elsewhere, and an absent record can also be a deleted
+    /// file, so no sentence may upgrade the record into unproved authoring fact.
+    #[test]
+    fn sentences_claim_only_what_the_creation_record_proves() {
+        let behind = HydrationStanding::Behind {
+            created_under: 9,
+            derives: 10,
+        }
+        .sentence();
+        assert!(behind.contains("records hydration semantics version 9 at creation"));
+        assert!(!behind.contains("was authored under"), "{behind}");
+
+        let unstamped = HydrationStanding::Unstamped { derives: 10 }.sentence();
+        assert!(unstamped.contains("cannot be shown to match"), "{unstamped}");
+        assert!(!unstamped.contains("older than"), "{unstamped}");
+        assert!(!unstamped.contains("was authored"), "{unstamped}");
     }
 }
