@@ -1017,6 +1017,78 @@ struct RegisteredLocalRepositoryAuthority {
     binding: kin_core::LocalRepositoryAuthorityBinding,
 }
 
+/// Maximum number of per-row registry pin failures emitted during one daemon
+/// startup. The aggregate warning below still reports every refusal exactly;
+/// this bound keeps one stale registry from turning a routine start into
+/// thousands of repeated log records.
+const STARTUP_PIN_FAILURE_DETAIL_LIMIT: usize = 8;
+
+#[derive(Debug, Default)]
+struct StartupPinFailures {
+    refused: usize,
+    duplicate_identities: usize,
+    detailed: usize,
+}
+
+impl StartupPinFailures {
+    fn record_binding_failure(
+        &mut self,
+        repo_id: &str,
+        path: &std::path::Path,
+        error: &dyn std::fmt::Display,
+    ) {
+        self.refused += 1;
+        if self.detailed >= STARTUP_PIN_FAILURE_DETAIL_LIMIT {
+            return;
+        }
+        self.detailed += 1;
+        warn!(
+            repo_id = %repo_id,
+            path = %path.display(),
+            error = %error,
+            "sibling repository authority could not be pinned at daemon startup"
+        );
+    }
+
+    fn record_duplicate_identity(
+        &mut self,
+        repo_id: &str,
+        path: &std::path::Path,
+        manifest_repo_id: &str,
+    ) {
+        self.refused += 1;
+        self.duplicate_identities += 1;
+        if self.detailed >= STARTUP_PIN_FAILURE_DETAIL_LIMIT {
+            return;
+        }
+        self.detailed += 1;
+        warn!(
+            repo_id = %repo_id,
+            path = %path.display(),
+            manifest_repo_id = %manifest_repo_id,
+            already_pinned_as = %manifest_repo_id,
+            "two registry paths hold one repository identity; the later one is not pinned"
+        );
+    }
+
+    fn emit_summary(&self, registry_rows: usize, self_rows_skipped: usize, pinned: usize) {
+        if self.refused == 0 {
+            return;
+        }
+        warn!(
+            registry_rows,
+            self_rows_skipped,
+            pinned,
+            refused = self.refused,
+            duplicate_identities = self.duplicate_identities,
+            detailed = self.detailed,
+            suppressed = self.refused.saturating_sub(self.detailed),
+            remediation = "run `kin registry clean` to remove rows whose paths no longer contain .kin; review incompatible stores separately",
+            "sibling repository authority pinning was incomplete"
+        );
+    }
+}
+
 /// Outcome of ingesting one repo's graph into the spine from durable storage.
 ///
 /// Returned by [`DaemonState::ingest_repo_into_spine`] and surfaced by the
@@ -1492,6 +1564,10 @@ pub struct DaemonState {
     /// Startup registry/binding gaps prevent a complete local spine claim even
     /// when every retained sibling that remains can be loaded.
     registered_local_repository_authority_incomplete: bool,
+    /// Whether the federation layer was disabled when this daemon state was
+    /// constructed. Captured once so startup pinning and request-time spine
+    /// access cannot read different process environments.
+    spine_disabled: bool,
     /// Resolved once, here, rather than read inside the capture loop.
     ///
     /// A daemon captures its levers at process start; reading the environment
@@ -2364,7 +2440,7 @@ impl DaemonState {
         sync_directory_metadata(parent)
     }
 
-    fn spine_disabled() -> bool {
+    fn spine_disabled_from_env() -> bool {
         std::env::var("KIN_DISABLE_SPINE")
             .ok()
             .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
@@ -2590,12 +2666,15 @@ impl DaemonState {
                 return (Vec::new(), true);
             }
         };
+        let registry_rows = registry.repos.len();
         let current_kin_root = layout
             .root()
             .canonicalize()
             .unwrap_or_else(|_| layout.root().to_path_buf());
         let mut pinned: Vec<RegisteredLocalRepositoryAuthority> = Vec::new();
-        let mut incomplete = false;
+        let mut pinned_identities = HashSet::new();
+        let mut failures = StartupPinFailures::default();
+        let mut self_rows_skipped = 0usize;
         let mut adopted_identities = 0usize;
 
         for repo in registry.repos {
@@ -2604,6 +2683,7 @@ impl DaemonState {
                 .canonicalize()
                 .unwrap_or_else(|_| repo.path.clone());
             if repo_root == current_kin_root || current_kin_root.starts_with(&repo_root) {
+                self_rows_skipped += 1;
                 continue;
             }
 
@@ -2612,29 +2692,13 @@ impl DaemonState {
                 match kin_core::LocalRepositoryAuthorityBinding::from_layout(&sibling_layout) {
                     Ok(binding) => binding,
                     Err(error) => {
-                        incomplete = true;
-                        warn!(
-                            repo_id = %repo.id,
-                            path = %repo.path.display(),
-                            error = %error,
-                            "sibling repository authority could not be pinned at daemon startup"
-                        );
+                        failures.record_binding_failure(&repo.id, &repo.path, &error);
                         continue;
                     }
                 };
             let manifest_repo_id = binding.repository_id().as_str().to_string();
-            if let Some(existing) = pinned
-                .iter()
-                .find(|pinned| pinned.repo_id == manifest_repo_id)
-            {
-                incomplete = true;
-                warn!(
-                    repo_id = %repo.id,
-                    path = %repo.path.display(),
-                    manifest_repo_id = %manifest_repo_id,
-                    already_pinned_as = %existing.repo_id,
-                    "two registry paths hold one repository identity; the later one is not pinned"
-                );
+            if !pinned_identities.insert(manifest_repo_id.clone()) {
+                failures.record_duplicate_identity(&repo.id, &repo.path, &manifest_repo_id);
                 continue;
             }
             if manifest_repo_id != repo.id {
@@ -2660,7 +2724,9 @@ impl DaemonState {
             );
         }
 
-        (pinned, incomplete)
+        failures.emit_summary(registry_rows, self_rows_skipped, pinned.len());
+
+        (pinned, failures.refused > 0)
     }
 
     /// Open local daemon state with a repository identity already resolved by
@@ -2748,10 +2814,15 @@ impl DaemonState {
             )))
         })?;
         let local_repository_backend = Arc::new(LocalFileBackend::new(layout.kindb_dir()));
+        let spine_disabled = Self::spine_disabled_from_env();
         let (
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
-        ) = Self::pin_registered_local_repository_authorities(&layout);
+        ) = if spine_disabled {
+            (Vec::new(), false)
+        } else {
+            Self::pin_registered_local_repository_authorities(&layout)
+        };
         // Startup is a reopen of an initialized repository, never construction
         // of an unpersisted generation-zero authority. Use the receipt from
         // this same recovery to refuse an intact namespace whose authority
@@ -2944,6 +3015,7 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
+            spine_disabled,
             eager_sibling_bound: Self::eager_sibling_load_bound(),
             sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
@@ -3171,6 +3243,7 @@ impl DaemonState {
         // Baseline for the shutdown anti-wipe guard (entity count loaded from
         // the backend snapshot).
         let loaded_entity_count = graph.entity_count();
+        let spine_disabled = Self::spine_disabled_from_env();
 
         let coordination_events = CoordinationEventLog::open(&layout, repo_id)?;
         let coordination_event_persist_failures = coordination_events.persisted_failure_count();
@@ -3203,6 +3276,7 @@ impl DaemonState {
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,
+            spine_disabled,
             eager_sibling_bound: Self::eager_sibling_load_bound(),
             sibling_capture: std::sync::OnceLock::new(),
             filesystem_reconcile_disabled: AtomicBool::new(
@@ -3334,7 +3408,7 @@ impl DaemonState {
     /// Every caller therefore re-resolves the primary watermark here rather than
     /// reading whatever root the daemon happened to start with.
     pub fn ensure_spine(&self) -> Option<&dyn kin_spine::SpineBackend> {
-        if Self::spine_disabled() {
+        if self.spine_disabled {
             return None;
         }
         if self.spine.get().is_none() {
@@ -3974,7 +4048,7 @@ impl DaemonState {
         F: FnMut(usize),
     {
         let Some(spine) = self.ensure_spine() else {
-            let reason = if Self::spine_disabled() {
+            let reason = if self.spine_disabled {
                 "spine disabled via KIN_DISABLE_SPINE"
             } else {
                 "spine initialization could not capture stable primary graph authority; retry"
@@ -4075,7 +4149,7 @@ impl DaemonState {
     /// existing edges are removed and re-materialized.
     pub async fn refresh_all_cross_repo_edges(&self) -> Result<SpineRefreshOutcome> {
         let Some(spine) = self.ensure_spine() else {
-            let reason = if Self::spine_disabled() {
+            let reason = if self.spine_disabled {
                 "spine disabled via KIN_DISABLE_SPINE"
             } else {
                 "spine initialization could not capture stable primary graph authority; retry"
@@ -8282,6 +8356,52 @@ mod tests {
         _spine_env: kin_core::test_env::EnvVarGuard,
     }
 
+    #[derive(Default)]
+    struct CapturedPinEvents {
+        rendered: Vec<String>,
+    }
+
+    struct PinCaptureLayer(Arc<Mutex<CapturedPinEvents>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for PinCaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            struct Render<'a>(&'a mut String);
+
+            impl tracing::field::Visit for Render<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    use std::fmt::Write;
+                    let _ = write!(self.0, "{}={value:?} ", field.name());
+                }
+            }
+
+            let mut rendered = String::new();
+            event.record(&mut Render(&mut rendered));
+            self.0.lock().unwrap().rendered.push(rendered);
+        }
+    }
+
+    fn capture_pin_events<T>(run: impl FnOnce() -> T) -> (T, Vec<String>) {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let captured = Arc::new(Mutex::new(CapturedPinEvents::default()));
+        let subscriber =
+            tracing_subscriber::registry().with(PinCaptureLayer(Arc::clone(&captured)));
+        let result = {
+            let _capture = crate::capture_events_on_this_thread(subscriber);
+            run()
+        };
+        let events = std::mem::take(&mut captured.lock().unwrap().rendered);
+        (result, events)
+    }
+
     /// One registered sibling, registered through the production writer, so both
     /// checks below start from a state a real install produces.
     ///
@@ -8307,6 +8427,160 @@ mod tests {
             sibling_root,
             _spine_env: spine_env,
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn startup_pin_failures_emit_bounded_detail_and_complete_counts() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let failure_count = STARTUP_PIN_FAILURE_DETAIL_LIMIT + 5;
+        let mut repos = Vec::new();
+        for index in 0..failure_count {
+            let root = registry_dir.path().join(format!("stale-{index:02}"));
+            std::fs::create_dir_all(root.join(".kin")).unwrap();
+            std::fs::write(root.join(".kin/VERSION"), b"1").unwrap();
+            repos.push(kin_core::registry::RegisteredRepo {
+                id: format!("stale-{index:02}"),
+                path: root,
+                entities: 0,
+                last_commit: String::new(),
+                dependencies: vec![],
+            });
+        }
+        kin_core::registry::KinRegistry { repos }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let ((pinned, incomplete), events) = capture_pin_events(|| {
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout)
+        });
+        let detailed = events
+            .iter()
+            .filter(|event| {
+                event.contains("sibling repository authority could not be pinned at daemon startup")
+            })
+            .count();
+        let summaries = events
+            .iter()
+            .filter(|event| event.contains("sibling repository authority pinning was incomplete"))
+            .collect::<Vec<_>>();
+
+        assert!(pinned.is_empty());
+        assert!(
+            incomplete,
+            "suppressed detail must not suppress incompleteness"
+        );
+        assert_eq!(
+            detailed, STARTUP_PIN_FAILURE_DETAIL_LIMIT,
+            "one stale registry must not emit one detailed warning per row: {events:?}"
+        );
+        assert_eq!(
+            summaries.len(),
+            1,
+            "one startup gets one aggregate: {events:?}"
+        );
+        let summary = summaries[0];
+        for field in [
+            format!("registry_rows={failure_count}"),
+            "pinned=0".to_string(),
+            format!("refused={failure_count}"),
+            format!("detailed={STARTUP_PIN_FAILURE_DETAIL_LIMIT}"),
+            format!(
+                "suppressed={}",
+                failure_count - STARTUP_PIN_FAILURE_DETAIL_LIMIT
+            ),
+        ] {
+            assert!(
+                summary.contains(&field),
+                "aggregate warning must carry {field}: {summary}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_clean_sibling_pin_emits_no_failure_diagnostics() {
+        let _fixture = registered_sibling_fixture();
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+
+        let ((pinned, incomplete), events) = capture_pin_events(|| {
+            DaemonState::pin_registered_local_repository_authorities(&primary_init.layout)
+        });
+
+        assert_eq!(pinned.len(), 1);
+        assert!(!incomplete);
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.contains("sibling repository authority")),
+            "a clean registry must not emit failure diagnostics: {events:?}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn disabling_the_spine_skips_the_registry_pin_pass_at_construction() {
+        let primary_dir = tempfile::tempdir().unwrap();
+        let primary_init = kin_core::init(primary_dir.path()).unwrap();
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        let stale_root = registry_dir.path().join("stale-sibling");
+        std::fs::create_dir_all(stale_root.join(".kin")).unwrap();
+        std::fs::write(stale_root.join(".kin/VERSION"), b"1").unwrap();
+        kin_core::registry::KinRegistry {
+            repos: vec![kin_core::registry::RegisteredRepo {
+                id: "stale-sibling".to_string(),
+                path: stale_root,
+                entities: 0,
+                last_commit: String::new(),
+                dependencies: vec![],
+            }],
+        }
+        .save_to(&registry_path)
+        .unwrap();
+        let mut spine_env =
+            kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+                .with("KIN_DISABLE_SPINE", "1");
+
+        let (disabled, disabled_events) =
+            capture_pin_events(|| test_state(primary_init.layout.clone(), primary_dir.path()));
+        assert!(disabled.registered_local_repository_authorities.is_empty());
+        assert!(disabled.startup_authority_complete());
+        assert!(
+            disabled_events
+                .iter()
+                .all(|event| !event.contains("sibling repository authority")),
+            "a disabled subsystem must not inspect or warn about sibling authority: {disabled_events:?}"
+        );
+
+        // The process environment is not request scoped. Changing it after
+        // construction must not re-enable a state whose startup skipped the
+        // authority pass, or that state could publish a spine from a different
+        // scope than the one it captured.
+        spine_env.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+        assert!(
+            disabled.ensure_spine().is_none(),
+            "spine disable must be captured once at daemon-state construction"
+        );
+        drop(disabled);
+
+        // Falsification control: the same registry with federation enabled must
+        // still be inspected and must still report the unbindable row.
+        let (enabled, enabled_events) =
+            capture_pin_events(|| test_state(primary_init.layout.clone(), primary_dir.path()));
+        assert!(!enabled.startup_authority_complete());
+        assert!(enabled_events.iter().any(|event| {
+            event.contains("sibling repository authority could not be pinned at daemon startup")
+        }));
+        assert!(enabled_events.iter().any(|event| {
+            event.contains("sibling repository authority pinning was incomplete")
+        }));
     }
 
     /// FIR-2763's remaining acceptance: what the eager sibling pass costs on a
@@ -8860,6 +9134,20 @@ mod tests {
         let allowed: HashSet<String> = [primary_id.to_string(), sibling_id.to_string()]
             .into_iter()
             .collect();
+
+        // Spine must be enabled for this test regardless of ambient env. The
+        // state captures that choice at construction, so the guard belongs
+        // before the open. Point discovery at an explicitly empty registry:
+        // this hosted path proves storage-only sibling ingestion and must never
+        // scan a user's real global registry.
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
         let state = DaemonState::open_with_backend(
             init.layout,
             Box::new(LocalFileBackend::new(&v2_root)),
@@ -8893,18 +9181,6 @@ mod tests {
                 }],
             })
             .unwrap();
-
-        // Spine must be enabled for this test regardless of ambient env.
-        // Point discovery at an explicitly empty registry: this hosted path is
-        // proving storage-only sibling ingestion and must never scan a user's
-        // real global registry (which can contain multi-gigabyte graphs).
-        let registry_dir = tempfile::tempdir().unwrap();
-        let registry_path = registry_dir.path().join("registry.toml");
-        kin_core::registry::KinRegistry { repos: Vec::new() }
-            .save_to(&registry_path)
-            .unwrap();
-        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
-            .without("KIN_DISABLE_SPINE");
 
         // ── Drive the production ingest route logic ───────────────────────
         // Sibling first (metadata only), then the anchor with edge refresh —
