@@ -864,13 +864,16 @@ mod tests {
     /// stayed dirty forever afterward.
     #[test]
     fn a_successful_commit_says_the_change_is_in_kin_authority_and_not_in_git() {
-        let summary = render_commit_summary(&DaemonCommitResult {
-            change_id: "9ade4452cd80".to_string(),
-            branch: "refs/heads/main".to_string(),
-            entity_count: 0,
-            relation_count: 0,
-            file_count: 1,
-        });
+        let summary = render_commit_summary(
+            &DaemonCommitResult {
+                change_id: "9ade4452cd80".to_string(),
+                branch: "refs/heads/main".to_string(),
+                entity_count: 0,
+                relation_count: 0,
+                file_count: 1,
+            },
+            None,
+        );
         assert!(
             summary.contains("Created semantic change 9ade4452cd80"),
             "{summary}"
@@ -881,6 +884,96 @@ mod tests {
             "the note must name the surface that keeps disagreeing: {summary}"
         );
         assert!(summary.contains("kin eject"), "{summary}");
+    }
+
+    /// The measured FIR-2776 commit, and the store that must stay quiet.
+    ///
+    /// A fully parseable new module landed as `(0 entities, 0 relations, 2
+    /// artifacts)` because the counts are the change's own deltas and the sweep
+    /// deriving its cross-file edges had not reached the file. The next `kin
+    /// diff` then reported `Relations: +123` on a tree nobody had touched. Both
+    /// numbers were right; neither surface said the word "yet".
+    ///
+    /// The caught-up arm is the load-bearing half. A line printed under every
+    /// commit is a line a user stops reading by the third one, and then it is
+    /// worth nothing on the commit that needed it.
+    #[test]
+    fn a_commit_taken_while_the_sweep_is_behind_says_so_and_a_caught_up_one_says_nothing() {
+        let behind = pending_enrichment_line(true, 312, 480)
+            .expect("a sweep with files left to walk is work this commit did not record");
+        assert!(
+            behind.contains("312 of 480 files"),
+            "the reader needs the distance, not the fact: {behind}"
+        );
+        assert!(
+            behind.contains("deltas"),
+            "the sentence has to say why the counts above look empty: {behind}"
+        );
+        assert!(
+            behind.contains("next commit"),
+            "and when the missing edges arrive: {behind}"
+        );
+        assert!(
+            behind.contains("exits"),
+            "and what happens if the daemon goes first: {behind}"
+        );
+
+        assert!(
+            pending_enrichment_line(false, 480, 480).is_none(),
+            "a store whose sweep has walked everything it has is not behind, and a warning it \
+             always prints is a warning nobody reads"
+        );
+    }
+
+    /// The two shapes a single condition would have missed.
+    ///
+    /// Keying on `running` alone goes quiet over a sweep that was cut short and
+    /// is not coming back, which is precisely a store with outstanding work and
+    /// nothing in flight to finish it. Keying on the file counts alone goes
+    /// quiet in the window between a sweep being queued and its first file
+    /// landing, and a commit taken in that window is the one this exists for.
+    #[test]
+    fn a_sweep_that_stopped_early_is_still_behind_and_an_empty_walk_is_not() {
+        assert!(
+            pending_enrichment_line(false, 12, 480).is_some(),
+            "nothing is running and 468 files are unwalked; that is outstanding work"
+        );
+        assert!(
+            pending_enrichment_line(true, 0, 0).is_none(),
+            "a queued sweep with nothing to walk owes nothing"
+        );
+        assert!(
+            pending_enrichment_line(false, 0, 0).is_none(),
+            "and neither does a store that has never had a file to walk"
+        );
+    }
+
+    /// The line is appended, and nothing else about the summary moves.
+    ///
+    /// Two lines when the sweep has caught up, three when it has not, and the
+    /// first two byte-identical either way. The note about `git status` is the
+    /// one sentence this command exists to keep saying, and an enrichment line
+    /// that displaced it would trade one confusion for another.
+    #[test]
+    fn the_pending_line_is_added_beneath_the_summary_and_replaces_none_of_it() {
+        let result = DaemonCommitResult {
+            change_id: "9ade4452cd80".to_string(),
+            branch: "refs/heads/main".to_string(),
+            entity_count: 0,
+            relation_count: 0,
+            file_count: 2,
+        };
+        let quiet = render_commit_summary(&result, None);
+        let noisy = render_commit_summary(&result, Some("Cross-file enrichment is behind."));
+
+        assert_eq!(quiet.lines().count(), 2, "{quiet}");
+        assert_eq!(noisy.lines().count(), 3, "{noisy}");
+        assert_eq!(
+            quiet.lines().take(2).collect::<Vec<_>>(),
+            noisy.lines().take(2).collect::<Vec<_>>(),
+            "the summary and the git-status note are unchanged by the third line"
+        );
+        assert!(noisy.ends_with("Cross-file enrichment is behind."), "{noisy}");
     }
 
     /// The announcement this command publishes before it does anything else,

@@ -1512,6 +1512,103 @@ mod tests {
         }
     }
 
+
+    /// What the word over the counts is allowed to claim.
+    ///
+    /// The measured FIR-2787 run: entities and relations both nonzero, no
+    /// cross-file reference edge anywhere in the graph, and a summary reading
+    /// "present". Every number under that word was correct. The word was the
+    /// claim, and the reader took it, converted a second repository, and found
+    /// out on a different surface hours later.
+    ///
+    /// The produced arm is half of this test and not a formality. A build that
+    /// said "partial" whenever the counts were nonzero would pass the withheld
+    /// arm and downgrade every healthy conversion Kin has ever done.
+    mod cross_file_enrichment_wording {
+        use super::super::{
+            cross_file_pending_notice, render_semantic_enrichment, CrossFileEnrichment,
+        };
+        use super::enrichment;
+        use crate::commands::status::SemanticEnrichmentPresence;
+
+        fn withheld() -> CrossFileEnrichment {
+            CrossFileEnrichment::Withheld {
+                pending: "no language-server sweep ran for this repository".to_string(),
+            }
+        }
+
+        #[test]
+        fn a_run_that_built_no_cross_file_graph_says_partial_and_names_what_is_pending() {
+            let status = enrichment(SemanticEnrichmentPresence::Present, 1058);
+            let line = render_semantic_enrichment(&status, None, &withheld());
+            assert!(
+                line.starts_with("partial"),
+                "a run that produced no cross-file edge has not produced a present graph: {line}"
+            );
+            assert!(
+                !line.contains("present"),
+                "the word this replaced must be gone, not merely joined: {line}"
+            );
+            assert!(
+                line.contains("1058 entities"),
+                "the counts were never wrong and are still printed: {line}"
+            );
+
+            let notice = cross_file_pending_notice(&status, &withheld())
+                .expect("a partial graph names what is pending beneath the counts");
+            assert!(
+                notice.contains("no language-server sweep ran"),
+                "the notice carries the phase's own reason, not a guess: {notice}"
+            );
+        }
+
+        #[test]
+        fn a_run_that_produced_cross_file_edges_keeps_present_and_prints_no_second_line() {
+            let status = enrichment(SemanticEnrichmentPresence::Present, 1058);
+            let line = render_semantic_enrichment(&status, None, &CrossFileEnrichment::Produced);
+            assert!(
+                line.starts_with("present"),
+                "a conversion that swept its files is present, and a build that could not say so \
+                 would downgrade every healthy repository: {line}"
+            );
+            assert!(
+                cross_file_pending_notice(&status, &CrossFileEnrichment::Produced).is_none(),
+                "and it carries no notice at all"
+            );
+        }
+
+        /// A store with no entity and no relation is not partially anything.
+        ///
+        /// It already carries `semantic_absence_notice`, which says more than
+        /// this one would and says it about the right absence. Two notices
+        /// under one line would each be read as qualifying the other.
+        #[test]
+        fn an_absent_store_keeps_its_own_word_and_gets_no_second_notice() {
+            let status = enrichment(SemanticEnrichmentPresence::Absent, 0);
+            let line = render_semantic_enrichment(&status, None, &withheld());
+            assert!(line.starts_with("absent"), "{line}");
+            assert!(cross_file_pending_notice(&status, &withheld()).is_none());
+        }
+
+        /// A sweep nobody could read supports no claim, so it makes none.
+        ///
+        /// The tempting shape is to treat an unreadable probe as success and
+        /// keep the confident word. That is the exact trade this ticket exists
+        /// to undo, one layer down.
+        #[test]
+        fn a_sweep_this_run_could_not_read_is_withheld_rather_than_produced() {
+            let unreadable = CrossFileEnrichment::unreadable();
+            assert_ne!(unreadable, CrossFileEnrichment::Produced);
+            let pending = unreadable
+                .pending()
+                .expect("an unread sweep is not a produced graph");
+            assert!(
+                pending.contains("unknown"),
+                "and it says it does not know, rather than picking a side: {pending}"
+            );
+        }
+    }
+
     /// The measured FIR-2650 summary, and the two stores it could not tell
     /// apart.
     ///
@@ -1528,7 +1625,7 @@ mod tests {
     fn a_killed_daemon_changes_the_enrichment_summary_and_nothing_else_does() {
         let status = enrichment(SemanticEnrichmentPresence::Present, 1058);
 
-        let quiet = render_semantic_enrichment(&status, None);
+        let quiet = render_semantic_enrichment(&status, None, &CrossFileEnrichment::Produced);
         assert!(
             quiet.contains("completion not attested"),
             "the caveat is true of every store and stays: {quiet}"
@@ -1554,7 +1651,8 @@ mod tests {
             limit_bytes: Some(12 * 1024 * 1024 * 1024),
             last_rss_bytes: Some(11 * 1024 * 1024 * 1024),
         };
-        let killed = render_semantic_enrichment(&status, Some(&record));
+        let killed =
+            render_semantic_enrichment(&status, Some(&record), &CrossFileEnrichment::Produced);
         assert!(
             killed.contains("1058 entities"),
             "the counts are still true and still printed: {killed}"
