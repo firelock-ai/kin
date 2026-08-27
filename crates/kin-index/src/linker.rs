@@ -929,7 +929,10 @@ fn resolve_one_file(
                         target_file.as_str(),
                         receiver_root,
                         rel.dst_name.as_str(),
-                        &ctx.entity_by_file_name,
+                        ctx.import_map.get(file.file_path.as_str()),
+                        &ctx.import_map,
+                        &ctx.known_files,
+                        |target, name| ctx.entity_by_file_name.get(&(target, name)).copied(),
                     ) {
                         accumulate_relation(
                             &mut resolved,
@@ -3905,23 +3908,152 @@ fn settle_receiver_method_owner<'a>(
 /// the parser-pinned and namespace-member tiers.
 const RECEIVER_MODULE_CONFIDENCE: f32 = 0.9;
 
+/// The local name a whole-module re-export binds its source module under.
+///
+/// `extract_assignment_lhs_name` keeps the `module.exports` receiver whole
+/// rather than reducing it to the `exports` property, so a file that does
+/// nothing but hand its exports on names the real module under this key in its
+/// own import map.
+const WHOLE_MODULE_REEXPORT_LOCAL_NAME: &str = "module.exports";
+
+/// The sibling module a package-root receiver's own import specifier names.
+///
+/// `from pkg import mod` records `pkg` as the module path and `mod` as a
+/// specifier and never joins the two, so the receiver resolves to
+/// `pkg/__init__.py` while the callee is defined in the sibling `pkg/mod.py`.
+/// The specifier is already in the calling file's import map, one element over
+/// from the module path the receiver was classified through.
+///
+/// Only a receiver that landed on a package index is eligible, and only the one
+/// sibling the import statement actually names is offered. A module file wins
+/// over a subpackage of the same name, matching [`python_module_file`]'s order.
+fn receiver_package_sibling<S>(
+    target_file: &str,
+    receiver_root: &str,
+    caller_imports: Option<&HashMap<&str, (&str, &str)>>,
+    known_files: &HashSet<S>,
+) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let base_name = target_file
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .unwrap_or(target_file);
+    if !PACKAGE_INDEX_FILENAMES.contains(&base_name) {
+        return None;
+    }
+    let specifier = caller_imports?.get(receiver_root)?.1.trim();
+    if specifier.is_empty() || !is_path_identifier(specifier) {
+        return None;
+    }
+    let dir = parent_dir(target_file);
+    let prefix = if dir.is_empty() {
+        specifier.to_string()
+    } else {
+        format!("{dir}/{specifier}")
+    };
+    for ext in MODULE_EXTENSIONS {
+        let candidate = format!("{prefix}.{ext}");
+        if known_files.contains(candidate.as_str()) {
+            return Some(candidate);
+        }
+    }
+    for index in PACKAGE_INDEX_FILENAMES {
+        let candidate = format!("{prefix}/{index}");
+        if known_files.contains(candidate.as_str()) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The module a file re-exports wholesale.
+///
+/// `module.exports = require('./lib/express')` makes the package entry point the
+/// receiver's file while every export lives one hop away, which is why
+/// `express.static(...)` reached nothing even once `lib/express.js` carried the
+/// entity. The re-export is already recorded as an import of this file, so the
+/// destination is read rather than guessed. A re-export that resolves back to
+/// its own file is refused: a self-loop is not a hop.
+fn whole_module_reexport_target<S>(
+    target_file: &str,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    known_files: &HashSet<S>,
+) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let (module_path, _) = import_map
+        .get(target_file)?
+        .get(WHOLE_MODULE_REEXPORT_LOCAL_NAME)?;
+    let resolved = resolve_module_path(target_file, module_path, known_files)?;
+    (resolved != target_file).then_some(resolved)
+}
+
+/// The single file a receiver's module hands its callee off to, when the
+/// receiver's own file does not define it.
+///
+/// Tier (a0) binds a receiver to the file its import names, and that file is
+/// frequently one hop short of where the callee lives. Two shapes produce that
+/// gap and each names its own destination in source, so neither needs a guess:
+/// a Python package index standing in for a submodule, and a JavaScript entry
+/// point that re-exports another module wholesale.
+///
+/// Exactly one candidate is returned, chosen by a statement the source actually
+/// wrote. Handing the call to the name-matching tiers instead would bind the
+/// bare leaf to any same-named symbol in the repository, which is the false
+/// consumer the caller's `continue` exists to prevent.
+fn resolve_receiver_module_hop<S>(
+    target_file: &str,
+    receiver_root: &str,
+    caller_imports: Option<&HashMap<&str, (&str, &str)>>,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    known_files: &HashSet<S>,
+) -> Option<String>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    receiver_package_sibling(target_file, receiver_root, caller_imports, known_files)
+        .or_else(|| whole_module_reexport_target(target_file, import_map, known_files))
+}
+
 /// Resolve an attribute call whose receiver names a repo-local module. The
 /// callee is looked up as a plain member of that module first, then as a member
 /// of a type the receiver's own root names (`Session.get` for `Session.get(...)`
-/// where `Session` was imported).
-fn resolve_receiver_module_target(
+/// where `Session` was imported). When neither name is in that file, one
+/// re-export hop the source itself names is followed and both lookups are tried
+/// again there.
+///
+/// `lookup` is the caller's own entity index, passed as a closure because the
+/// batch and incremental linkers key theirs differently and this tier has to
+/// answer identically in both: a cold, incremental and reopened graph resolving
+/// one call to different destinations is drift, not a difference.
+fn resolve_receiver_module_target<S>(
     target_file: &str,
     receiver_root: &str,
     method: &str,
-    entity_by_file_name: &HashMap<(&str, &str), EntityId>,
-) -> Option<EntityId> {
-    if let Some(&dst_id) = entity_by_file_name.get(&(target_file, method)) {
+    caller_imports: Option<&HashMap<&str, (&str, &str)>>,
+    import_map: &HashMap<&str, HashMap<&str, (&str, &str)>>,
+    known_files: &HashSet<S>,
+    lookup: impl Fn(&str, &str) -> Option<EntityId>,
+) -> Option<EntityId>
+where
+    S: std::borrow::Borrow<str> + std::hash::Hash + Eq,
+{
+    let qualified = format!("{receiver_root}.{method}");
+    let in_file = |file: &str| lookup(file, method).or_else(|| lookup(file, qualified.as_str()));
+    if let Some(dst_id) = in_file(target_file) {
         return Some(dst_id);
     }
-    let qualified = format!("{receiver_root}.{method}");
-    entity_by_file_name
-        .get(&(target_file, qualified.as_str()))
-        .copied()
+    let hop = resolve_receiver_module_hop(
+        target_file,
+        receiver_root,
+        caller_imports,
+        import_map,
+        known_files,
+    )?;
+    in_file(&hop)
 }
 
 /// Outcome of resolving a relation through its parser-recorded import source.
@@ -6364,16 +6496,24 @@ fn resolve_one_file_incremental(
             let receiver_root = receiver.split('.').next().unwrap_or(receiver);
             match scope {
                 ReceiverScope::Module(target_file) => {
-                    let in_module = linker.entity_by_file_name.get(target_file.as_str());
-                    let dst_id = in_module
-                        .and_then(|names| names.get(rel.dst_name.as_str()))
-                        .copied()
-                        .or_else(|| {
-                            let qualified = format!("{receiver_root}.{}", rel.dst_name);
-                            in_module
-                                .and_then(|names| names.get(qualified.as_str()))
+                    // Shares the batch linker's resolver rather than repeating
+                    // its lookup order, so the re-export hop cannot land on one
+                    // path and be missing from the other.
+                    let dst_id = resolve_receiver_module_target(
+                        target_file.as_str(),
+                        receiver_root,
+                        rel.dst_name.as_str(),
+                        import_map.get(file.file_path.as_str()),
+                        import_map,
+                        &linker.known_files,
+                        |target, name| {
+                            linker
+                                .entity_by_file_name
+                                .get(target)
+                                .and_then(|names| names.get(name))
                                 .copied()
-                        });
+                        },
+                    );
                     if let Some(dst_id) = dst_id {
                         accumulate_relation(
                             &mut resolved,
