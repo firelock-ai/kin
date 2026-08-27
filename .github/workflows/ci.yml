@@ -2081,6 +2081,27 @@ jobs:
       - name: Test gcs feature
         run: cargo nextest run -p kin-daemon --features gcs --locked
 
+      # The production Dockerfile builds gcs without firestore. Hosted mode
+      # must still refuse the process-local in-memory fallback, which cannot
+      # publish durable cursor authority. Keep this exact gcs-only behavioral
+      # guard beside the broader feature pass so the deployed feature shape,
+      # not an all-features surrogate, owns the fail-closed contract.
+      - name: Test hosted gcs spine cursor hold
+        if: matrix.os == 'ubuntu-latest'
+        run: >-
+          cargo test -p kin-daemon --features gcs --locked
+          state::tests::hosted_spine_refuses_persistence_without_cursor_cas
+          -- --exact --nocapture --test-threads=1
+
+      # The optional Firestore factory is held at the same pre-construction
+      # boundary until cursor-bound staged rows and a head CAS replace it.
+      - name: Test hosted Firestore spine cursor hold
+        if: matrix.os == 'ubuntu-latest'
+        run: >-
+          cargo test -p kin-daemon --features firestore --locked
+          state::tests::hosted_spine_refuses_persistence_without_cursor_cas
+          -- --exact --nocapture --test-threads=1
+
       # Nothing else on these legs resolves kin-cli without its default
       # features, so a break that appears only with `vector` and `embeddings`
       # off compiles clean here and reaches main behind a green required
