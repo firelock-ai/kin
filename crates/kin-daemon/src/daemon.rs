@@ -8147,10 +8147,18 @@ mod memory_pressure_tests {
 
         // Half the join: the marking is live. Without this, the fold's rule
         // could be unreachable and nothing here would say so.
+        //
+        // An absolute floor rather than a delta, because a delta is only sound
+        // when this test owns the process. `cargo nextest` gives it one, plain
+        // `cargo test --workspace` does not, and there a sibling test's threads
+        // exiting between the two readings subtracts from the delta and fails a
+        // correct build. The floor cannot be gamed the same way: the SPAWNED
+        // threads are alive at the second reading by construction, so anything
+        // that marks threads at all must report at least that many.
         assert!(
-            threads_after >= threads_before + SPAWNED,
-            "starting {SPAWNED} threads must show up as thread rows: {threads_before} before, \
-             {threads_after} after"
+            threads_after >= SPAWNED,
+            "starting {SPAWNED} threads must show up as thread rows parented to this process: \
+             {threads_before} before, {threads_after} after"
         );
 
         // The other half, over that same reading. Bounded by the number of
