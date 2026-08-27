@@ -322,9 +322,9 @@ pub fn write(layout: &KinLayout, stamp: &HydrationSemanticsStamp) -> std::io::Re
     use std::io::Write;
 
     let path = layout.kindb_hydration_semantics_path();
-    let parent = path.parent().ok_or_else(|| {
-        std::io::Error::other("hydration semantics path has no parent directory")
-    })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("hydration semantics path has no parent directory"))?;
     std::fs::create_dir_all(parent)?;
     let staged = path.with_extension(format!("tmp-{}", std::process::id()));
     let body = serde_json::to_vec(stamp).map_err(std::io::Error::other)?;
@@ -403,9 +403,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = layout_in(dir.path());
         stamp_staged(&layout).unwrap();
-        assert_eq!(standing(&layout), HydrationStanding::Current {
-            version: binary_version()
-        });
+        assert_eq!(
+            standing(&layout),
+            HydrationStanding::Current {
+                version: binary_version()
+            }
+        );
     }
 
     /// The dial is read from where it is declared, not mirrored. A second copy
@@ -428,7 +431,9 @@ mod tests {
         assert_eq!(standing, HydrationStanding::Unstamped { derives: 10 });
         assert!(standing.is_gap());
         assert!(
-            standing.sentence().contains("records no hydration semantics"),
+            standing
+                .sentence()
+                .contains("records no hydration semantics"),
             "an unstamped store must say so: {}",
             standing.sentence()
         );
@@ -545,7 +550,10 @@ mod tests {
             },
         ] {
             let sentence = standing.sentence();
-            assert!(sentence.contains("10"), "missing the derived version: {sentence}");
+            assert!(
+                sentence.contains("10"),
+                "missing the derived version: {sentence}"
+            );
             assert!(
                 sentence.contains('9') || sentence.contains("11"),
                 "missing the recorded version: {sentence}"

@@ -816,9 +816,8 @@ pub fn prepare_repository_layout_with_origin(
         // record mean one thing: `.kin` is published by a single no-replace
         // rename, so a store a reader can see either carries its own provenance
         // or predates the record entirely.
-        crate::hydration_semantics::stamp_staged(&layout).map_err(|error| {
-            KinError::io(layout.kindb_hydration_semantics_path(), error)
-        })?;
+        crate::hydration_semantics::stamp_staged(&layout)
+            .map_err(|error| KinError::io(layout.kindb_hydration_semantics_path(), error))?;
         config.save_initialization_stage(layout.root())?;
         manifest.save(&layout.manifest_path())?;
         let metadata_seal = capture_metadata_seal(&layout)?;
