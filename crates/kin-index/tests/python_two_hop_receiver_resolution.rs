@@ -702,13 +702,25 @@ class Session:
 }
 
 #[test]
-fn a_declined_two_hop_call_keeps_the_edge_the_bare_leaf_would_have_had() {
-    // The hand-back invariant, on the shape that exposed it. The parser writes
-    // the owner half from declarations, so a call whose join fails carries a
-    // name the source never spelled. Tier (d) mints its cross-repo placeholder
-    // from `dst_name`, and a dotted name there produced no edge at all: four
-    // real unresolved-receiver edges vanished from the requests measurement
-    // until a declining tier handed the call back unchanged.
+fn a_declined_two_hop_call_hands_back_cleanly_and_names_nothing() {
+    // The hand-back invariant, on the shape that exposed it, restated against
+    // the contract FIR-2819 left behind.
+    //
+    // The parser writes the owner half from declarations, so a call whose join
+    // fails carries a name the source never spelled. Tier (d) mints its
+    // cross-repo placeholder from `dst_name`, and a dotted name there produces
+    // no edge, which is what a declining tier handing the call back unchanged
+    // exists to keep from mattering.
+    //
+    // What that hand-back used to reach was a tier that minted a destination
+    // entity out of the receiver's own spelling: `transport.dispatch`, a
+    // `Module` carrying no file. That tier is gone, because it was half of
+    // every repository's entity count and named expression fragments as
+    // symbols. So a declined two-hop call now names nothing, and the assertion
+    // is that it names nothing rather than something wrong: a future declining
+    // tier that hands back a MANGLED call and resolves it against some
+    // unrelated local `dispatch` turns this red, which is the regression the
+    // original test was written to catch.
     let files = vec![parse_py(
         "client.py",
         r#"
@@ -732,17 +744,10 @@ def run(session: Session, payload):
         .filter(|r| r.kind == RelationKind::Calls && r.src.as_entity() == Some(caller))
         .collect();
 
-    // Tier (e) builds its token as `{receiver}.{symbol}` and refuses a symbol
-    // that carries a dot of its own, so the parser's `Session.transport.dispatch`
-    // reached it as a symbol it could not use and no edge was recorded at all.
     assert!(
-        outgoing.iter().any(|r| r
-            .evidence
-            .iter()
-            .any(|e| e.token.as_deref() == Some("session.transport.dispatch"))),
-        "a two-hop call the repository cannot settle must still record the \
-         call it makes, through the receiver the source wrote and the bare \
-         symbol it read; got {outgoing:?}"
+        outgoing.is_empty(),
+        "a two-hop call through a type this repository does not own has no \
+         destination here, so it must name none: got {outgoing:?}"
     );
 }
 
