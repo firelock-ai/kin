@@ -1452,6 +1452,21 @@ pub fn agent_default_tool_names() -> &'static [&'static str] {
         "get_entity_source",
         "trace_data_flow",
         "find_references",
+        // The batch form of the tool above, and the one this profile named
+        // without carrying (FIR-2825). `FIND_REFERENCES_DESC` ships here and
+        // tells the caller to reach for `bulk_check_references` rather than
+        // call per entity, so every agent read an instruction to use a tool the
+        // same profile refused. The filter applies to `tools/call` as well as
+        // `tools/list`, so the advice named a tool that answered "not enabled in
+        // this MCP profile".
+        //
+        // It is also the reachability half of absence. `list_file_entities`
+        // below enumerates what a file holds and this classifies that set, so
+        // "which of these has callers" becomes two graph-backed calls. Without
+        // it the surface could rank, walk and enumerate but could never say
+        // anything was unused, which is the gap the v0.6.1 stranger spent tasks
+        // 5 and 6 on before answering both with grep.
+        "bulk_check_references",
         "graph_neighborhood",
         // The enumeration half of discovery. Every other retrieval tool in this
         // profile ranks, filters, or walks, and none of them can say what it

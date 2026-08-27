@@ -192,6 +192,25 @@ impl CallerArrival {
         })
     }
 
+    /// The per-row form, for a batch that publishes one of these per entity.
+    ///
+    /// Three fields rather than seven, and no evidence rows at all. A batch may
+    /// carry up to two hundred of these, and [`to_json`](Self::to_json)'s ten
+    /// evidence objects per row would put the qualifier's own prose in front of
+    /// the verdicts it exists to qualify. That is the defect the v0.6.1 stranger
+    /// filed second: an envelope outcompeting the answer for space. The count
+    /// the verdict rests on survives here, so nothing the gate reads is lost.
+    ///
+    /// Whoever needs the audit rows for one entity asks `find_references` about
+    /// that entity, which publishes the full block.
+    pub fn to_row_json(&self) -> serde_json::Value {
+        json!({
+            "state": self.state.wire(),
+            "unaccounted_file_count": self.unaccounted.len(),
+            "unmeasured_reason": self.unmeasured_reason,
+        })
+    }
+
     /// The one sentence the verdict prints when this reading limits the answer,
     /// or `None` when it does not.
     pub fn limiting_factor(&self) -> Option<String> {
@@ -557,6 +576,156 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
              which is not a state that licenses reading an empty reference list as whole"
         )),
     }
+}
+
+/// Distinct files a single batch will take this reading over.
+///
+/// The reading depends on the focal's file and its importers and on nothing
+/// else about the focal, so every entity of one file shares one answer and a
+/// batch pays per FILE rather than per row. That is what makes the gate
+/// affordable on a 200-entity call: a dead-code sweep over one module takes one
+/// reading, not two hundred.
+///
+/// The budget bounds the other shape, where the ids span the repository. A batch
+/// replacing N `find_references` calls would have paid N readings, so the cap is
+/// not stingy relative to what it replaces, and the row that exceeds it reads
+/// `unmeasured` rather than `accounted`. Declining is the whole discipline here:
+/// a reading not taken is never evidence that arrival is clean.
+pub const BULK_ARRIVAL_FILE_BUDGET: usize = 50;
+
+/// Per-file memo for the readings one batch takes.
+///
+/// Exists so the handler cannot accidentally take the reading per row. The cost
+/// argument above is only true if something enforces it, and a loop calling
+/// [`observe_caller_arrival`] directly does not.
+#[derive(Debug, Default)]
+pub struct ArrivalCache {
+    by_file: std::collections::HashMap<FilePathId, CallerArrival>,
+}
+
+impl ArrivalCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// How many distinct files this cache has measured.
+    pub fn measured_files(&self) -> usize {
+        self.by_file.len()
+    }
+
+    /// The arrival reading for `focal`, taken once per file.
+    ///
+    /// A focal with no file of origin is handed to [`observe_caller_arrival`],
+    /// which reports its own `unmeasured` for exactly that case, so this never
+    /// invents a reason of its own for a shape the reading already names.
+    pub fn observe<G: GraphStore>(&mut self, store: &G, focal: &Entity) -> CallerArrival {
+        let Some(file) = focal.file_origin.clone() else {
+            return observe_caller_arrival(store, focal);
+        };
+        if let Some(cached) = self.by_file.get(&file) {
+            return cached.clone();
+        }
+        if self.by_file.len() >= BULK_ARRIVAL_FILE_BUDGET {
+            return CallerArrival::unmeasured(format!(
+                "this batch already measured {BULK_ARRIVAL_FILE_BUDGET} distinct files, which is \
+                 the per-call budget, so the arrival paths for this entity's file were not read"
+            ));
+        }
+        let reading = observe_caller_arrival(store, focal);
+        self.by_file.insert(file, reading.clone());
+        reading
+    }
+}
+
+/// The batch form of [`arrival_gap`], folded over the rows that actually claim
+/// an absence.
+///
+/// Separate from `arrival_gap` rather than reusing it, because that function's
+/// sentence says "the focal" and a batch has up to two hundred of them. Pointing
+/// it at a synthesized single-focal block would produce a grammatical sentence
+/// describing a focal that does not exist, which is the wrong kind of honest.
+///
+/// Only `has_references: false` rows carry a block to read, so a batch where
+/// everything is referenced folds to `None` and is not downgraded for a gap that
+/// bounds nothing it claimed. A row whose verdict is already incomplete
+/// (`has_references: null`) never reaches here either: it made no false verdict
+/// to qualify.
+pub fn bulk_arrival_gap(payload: &serde_json::Value) -> Option<String> {
+    let rows = payload.get("results")?.as_array()?;
+    let mut unaccounted: Vec<String> = Vec::new();
+    let mut unmeasured: Vec<String> = Vec::new();
+    let mut unknown: Vec<String> = Vec::new();
+    let mut claimed = 0usize;
+    for row in rows {
+        let Some(block) = row.get(CALLER_ARRIVAL_KEY) else {
+            continue;
+        };
+        claimed += 1;
+        let label = row
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| row.get("entity_id").and_then(serde_json::Value::as_str))
+            .unwrap_or("an entity")
+            .to_string();
+        match block.get("state").and_then(serde_json::Value::as_str) {
+            Some("accounted") => {}
+            Some("unaccounted") => {
+                let files = block
+                    .get("unaccounted_file_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                unaccounted.push(format!("{label} ({files} file(s) with unaccounted calls)"));
+            }
+            Some("unmeasured") => {
+                let reason = block
+                    .get("unmeasured_reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("no reason recorded");
+                // Commas only. The rendered factor is split back on
+                // `crate::verdict::CLAUSE_SEPARATOR`, so a separator inside a
+                // clause reaches the reader as a labelled clause plus a bare
+                // fragment. The reason is carried text and could contain one, so
+                // it is scrubbed here rather than trusted.
+                unmeasured.push(format!("{label} ({})", reason.replace("; ", ", ")));
+            }
+            other => unknown.push(format!("{label} ({})", other.unwrap_or("no state reported"))),
+        }
+    }
+    if claimed == 0 {
+        return None;
+    }
+    // Named first when present, because it is the state carrying evidence a
+    // reader can audit. Both states refuse certification identically, so this
+    // orders the message rather than the verdict.
+    if !unaccounted.is_empty() {
+        return Some(format!(
+            "{UNRESOLVED_ARRIVAL_LIMITING_FACTOR}: {} of the {claimed} entit(ies) this call \
+             reported as unreferenced sit in files reached through call sites the linker recorded \
+             no edge for, so a caller may be among them and each false verdict here is a floor \
+             rather than proof of disuse: {}",
+            unaccounted.len(),
+            unaccounted.join(", ")
+        ));
+    }
+    if !unmeasured.is_empty() {
+        return Some(format!(
+            "{UNMEASURED_ARRIVAL_LIMITING_FACTOR}: {} of the {claimed} entit(ies) this call \
+             reported as unreferenced could not have their arrival paths established, so those \
+             verdicts are not evidence of disuse: {}",
+            unmeasured.len(),
+            unmeasured.join(", ")
+        ));
+    }
+    if !unknown.is_empty() {
+        return Some(format!(
+            "caller_arrival_state_unknown: {} of the {claimed} entit(ies) this call reported as \
+             unreferenced carry an arrival state that does not license reading the verdict as \
+             whole: {}",
+            unknown.len(),
+            unknown.join(", ")
+        ));
+    }
+    None
 }
 
 #[cfg(test)]

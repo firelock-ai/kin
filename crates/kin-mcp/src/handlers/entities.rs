@@ -2149,7 +2149,11 @@ list of callers, find_references is the right tool; for finding dead code from a
 concept rather than a known ID set, find_dead_code_seeded combines the search and the \
 classification. Each `has_references:false` row is qualified by the response's additive \
 `negative` object — consult `safe_to_conclude_absent` before treating a false verdict as \
-\"safe to delete\". Unknown entities, stale authority, and unclassified federated relation \
+\"safe to delete\". Each such row also carries its own `caller_arrival` block: when its \
+state is not `accounted`, a caller of that entity may have arrived through a call the \
+linker recorded no edge for, so the false verdict is a floor rather than proof of disuse \
+and the entity is not safe to delete on this answer alone. Unknown entities, stale \
+authority, and unclassified federated relation \
 subtypes return `has_references:null` with `verdict_complete:false`, never a false verdict. \
 When total count authority is incomplete, `reference_count` is null and \
 `known_reference_count` is only a lower bound.";
@@ -2216,6 +2220,10 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
     let mut federated_reference_count = 0usize;
     let mut saw_unknown_federated_subtype = false;
     let mut batch_languages: Vec<kin_model::ids::LanguageId> = Vec::new();
+    // Per-file, because the arrival reading depends on the focal's file and its
+    // importers and on nothing else about the focal. A sweep over one module
+    // takes one reading rather than one per entity.
+    let mut arrival_cache = crate::caller_arrival::ArrivalCache::new();
 
     for raw_id in &entity_ids_raw {
         let entity_id = match parse_entity_id(raw_id) {
@@ -2363,6 +2371,20 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             None
         };
         let verdict_complete = has_references.is_some();
+        // A `has_references: false` row claims nothing calls this entity, and it
+        // is read off the same `Calls` edges `find_references` reads, so it is
+        // wrong in the same way for the same reason: a call the linker declined
+        // to bind produced no edge, and the row cannot tell that from disuse
+        // (FIR-2775, and the relative-import shape in FIR-2821). `find_references`
+        // has refused to certify that shape since the arrival reading existed;
+        // the batch form of the same question answered it with a bare false.
+        //
+        // Taken only for the rows that make the claim. A referenced entity
+        // claims no absence, and a row whose verdict is already incomplete has
+        // declined for a reason of its own, so measuring either would spend the
+        // budget on a row nothing reads it for.
+        let arrival = (has_references == Some(false))
+            .then(|| arrival_cache.observe(store, &entity));
         let reported_reference_count = reference_count_complete.then_some(reference_count);
         let verdict_reason = if federated_subtype_unknown {
             Some("federated relation subtype unavailable")
@@ -2385,6 +2407,9 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             if let Some(reason) = verdict_reason {
                 row["verdict_reason"] = serde_json::json!(reason);
             }
+            if let Some(arrival) = &arrival {
+                row[crate::caller_arrival::CALLER_ARRIVAL_KEY] = arrival.to_row_json();
+            }
             results.push(row);
         } else {
             matched_kinds.sort_by_key(|kind| relation_kind_rank(kind));
@@ -2406,6 +2431,9 @@ fn handle_bulk_check_references_with_authority_source<G: GraphStore>(
             });
             if let Some(reason) = verdict_reason {
                 row["verdict_reason"] = serde_json::json!(reason);
+            }
+            if let Some(arrival) = &arrival {
+                row[crate::caller_arrival::CALLER_ARRIVAL_KEY] = arrival.to_row_json();
             }
             results.push(row);
         }

@@ -2382,6 +2382,17 @@ pub fn negative_for(
             &mut trust_reason,
             &mut notes,
         );
+        // The batch form of the arrival gate above (FIR-2825). Its rows are read
+        // off the same `Calls` edges `find_references` reads, so a call the
+        // linker declined to bind makes a `has_references: false` row wrong the
+        // same way, and this tool answered it with a bare false while the
+        // single-entity form refused to certify the identical question. Folded
+        // over the rows that claim an absence rather than read off one
+        // top-level block, because a batch has up to two hundred focals and a
+        // single-focal sentence would describe none of them.
+        if let Some(gap) = crate::caller_arrival::bulk_arrival_gap(payload) {
+            push_gap(&mut trustworthy, &mut trust_reason, gap);
+        }
     }
 
     // An empty edge set has two readings with opposite consequences: a focal
