@@ -3,8 +3,14 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { assertContract, loadAllSchemas, validateContract } from '../src/index.js';
+
+const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const repositoryRoot = path.resolve(packageRoot, '../..');
 
 test('all schemas load', async () => {
   const schemas = await loadAllSchemas();
@@ -14,6 +20,36 @@ test('all schemas load', async () => {
   assert.ok(schemas.scmResourceGroups);
   assert.ok(schemas.mcpArtifactReadInput);
   assert.ok(schemas.shadowGateReport);
+});
+
+test('repository transfer declarations match the Rust schema authority', async () => {
+  const [declarations, transferSource] = await Promise.all([
+    fs.readFile(path.join(packageRoot, 'src/index.d.ts'), 'utf8'),
+    fs.readFile(
+      path.join(repositoryRoot, 'crates/kin-remote/src/repository_transfer.rs'),
+      'utf8'
+    )
+  ]);
+  const versionMatch = transferSource.match(
+    /pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = (\d+);/
+  );
+
+  assert.ok(versionMatch, 'Rust transfer schema authority must remain readable');
+  const schemaVersion = Number(versionMatch[1]);
+  assert.equal(schemaVersion, 4, 'update the shared declarations for each schema revision');
+
+  for (const contract of [
+    'RepositoryTransferStatus',
+    'RepositoryTransferPack',
+    'RepositoryTransferReceipt'
+  ]) {
+    assert.ok(
+      declarations.includes(
+        `export interface ${contract} {\n  schema_version: ${schemaVersion};`
+      ),
+      `${contract} must declare repository transfer schema ${schemaVersion}`
+    );
+  }
 });
 
 test('exact MCP artifact reads accept lossless paths and reject lossy selectors', async () => {
