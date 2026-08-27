@@ -712,9 +712,13 @@ mod tests {
 
     /// A cap that already kept a crossing has nothing to fix, and must not
     /// reshuffle what relevance chose.
+    ///
+    /// The second crossing below the cap is the point of the fixture. Without
+    /// it, a rule that reserved unconditionally would look identical here,
+    /// because there would be nothing left to promote.
     #[test]
     fn a_cap_that_already_crosses_is_left_alone() {
-        let fanout = [SameFile, OtherFile, SameFile, SameFile, SameFile];
+        let fanout = [SameFile, OtherFile, SameFile, SameFile, OtherFile];
         assert_eq!(fanout_cap_keeps(&fanout, 4), vec![0, 1, 2, 3]);
     }
 
