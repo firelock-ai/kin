@@ -736,6 +736,13 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     ".github/workflows/install-proof.yml": {
         "install-proof": "${{ matrix.os }}",
     },
+    # The dispatch-only dependency receiver first validates the exact payload,
+    # then uses protected App credentials and pinned updater bytes to write one
+    # fixed PR branch. It publishes no pull request or merge-group context.
+    ".github/workflows/kin-registry-release.yml": {
+        "validate-dispatch": "Validate Kin registry release",
+        "dependency-wave": "Refresh Kin registry pins",
+    },
     ".github/workflows/link-check.yml": {
         "link-check": "Check public documentation links",
     },

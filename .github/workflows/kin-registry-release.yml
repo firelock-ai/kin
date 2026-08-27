@@ -1,0 +1,261 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Kin Registry Release Receiver
+
+# repository_dispatch resolves this workflow from the default branch. The
+# sender uses one exact event type, and the validation job below refuses any
+# payload that does not bind an allowed crate to its owning source repository.
+on:
+  repository_dispatch:
+    types: [kin-registry-release]
+
+permissions:
+  contents: read
+
+# GitHub keeps at most one pending run per concurrency group. Every surviving
+# run refreshes the complete allowed pin set, so replacing an older pending
+# event cannot strand that event's crate on its old registry version.
+concurrency:
+  group: kin-registry-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  validate-dispatch:
+    name: Validate Kin registry release
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout trusted receiver policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate event and package authority
+        env:
+          EVENT_ACTION: ${{ github.event.action }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          python3 scripts/validate-kin-registry-release.py \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --event-action "$EVENT_ACTION" \
+            --actor "$GITHUB_ACTOR" \
+            --repository "$GITHUB_REPOSITORY" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --ref "$GITHUB_REF" \
+            --workflow-sha "$GITHUB_SHA"
+
+  dependency-wave:
+    name: Refresh Kin registry pins
+    needs: validate-dispatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment: release-tag
+    permissions:
+      contents: read
+    env:
+      KIN_ACTIONS_SHA: 398595fa14ba1eaebca6eb176facd8a57ce9db05 # v0.1.33
+      WAVE_BRANCH: automation/kin-registry-dependency-wave
+    steps:
+      - name: Mint repository-scoped dependency-wave token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Checkout exact trusted Kin main
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout exact Kin dependency updater
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: firelock-ai/kin-actions
+          ref: ${{ env.KIN_ACTIONS_SHA }}
+          path: .kin-actions
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: ./.github/actions/rust-toolchain
+
+      - name: Configure Kin registry
+        run: |
+          set -euo pipefail
+          cargo_home="$RUNNER_TEMP/kin-cargo-home"
+          echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
+          mkdir -p "$cargo_home"
+          cat > "$cargo_home/config.toml" <<'TOML'
+          [registries.kin]
+          index = "sparse+https://kinlab.ai/registry/cargo/"
+          TOML
+
+      - name: Update the allowed root-manifest pins
+        id: update
+        env:
+          EVENT_CRATE: ${{ github.event.client_payload.crate_name }}
+          EVENT_VERSION: ${{ github.event.client_payload.crate_version }}
+        run: |
+          set -uo pipefail
+          set +e
+          output="$(python3 .kin-actions/scripts/update-cargo-registry-deps.py \
+            --manifest Cargo.toml \
+            --crate kin-blobs \
+            --crate kin-model \
+            --crate kin-db \
+            --crate kin-lsp \
+            --crate kin-vfs-core \
+            --crate "$EVENT_CRATE" \
+            --event-crate "$EVENT_CRATE" \
+            --version "$EVENT_VERSION" 2>&1)"
+          code=$?
+          set -e
+          printf '%s\n' "$output"
+          case "$code" in
+            0)
+              echo "changed=true" >> "$GITHUB_OUTPUT"
+              ;;
+            2)
+              echo "changed=false" >> "$GITHUB_OUTPUT"
+              ;;
+            3)
+              reason="$(printf '%s\n' "$output" \
+                | sed -n 's/^dependency wave blocked: //p' | head -1)"
+              if [ -z "$reason" ]; then
+                echo "::error::dependency updater reported a blocked roll without a reason"
+                exit 1
+              fi
+              echo "::error title=Kin dependency wave blocked::$reason"
+              exit 3
+              ;;
+            *)
+              echo "::error::dependency updater failed with exit code $code"
+              exit "$code"
+              ;;
+          esac
+          echo "title=refresh Kin registry pins after ${EVENT_CRATE}@${EVENT_VERSION}" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Snapshot the exact generated dependency delta
+        id: generated
+        if: steps.update.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          validator="$RUNNER_TEMP/validate-dependency-wave-generated.py"
+          git -C .kin-actions show \
+            "${KIN_ACTIONS_SHA}:scripts/validate-dependency-wave.py" \
+            > "$validator"
+          generated="$(python3 "$validator" \
+            --manifest Cargo.toml \
+            --version-mode manual \
+            --bump-own-version false \
+            --ephemeral-path .kin-actions)"
+          echo "expected_tree=$(jq -r .tree <<<"$generated")" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Verify the updated Kin consumers
+        if: steps.update.outputs.changed == 'true'
+        run: cargo check -p kin-core -p kin-cli -p kin-daemon -p kin-mcp
+
+      - name: Admit the exact verified dependency delta
+        id: admission
+        if: steps.update.outputs.changed == 'true'
+        env:
+          EXPECTED_TREE: ${{ steps.generated.outputs.expected_tree }}
+        run: |
+          set -euo pipefail
+          validator="$RUNNER_TEMP/validate-dependency-wave.py"
+          git -C .kin-actions show \
+            "${KIN_ACTIONS_SHA}:scripts/validate-dependency-wave.py" \
+            > "$validator"
+          admission="$(python3 "$validator" \
+            --manifest Cargo.toml \
+            --version-mode manual \
+            --bump-own-version false \
+            --expected-tree "$EXPECTED_TREE" \
+            --ephemeral-path .kin-actions)"
+          {
+            echo "expected_tree=$(jq -r .tree <<<"$admission")"
+            echo "add_paths<<KIN_PATHS"
+            jq -r '.paths[]' <<<"$admission"
+            echo "KIN_PATHS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Clean helper checkout
+        if: always()
+        run: rm -rf .kin-actions
+
+      - name: Ensure dependency-wave labels exist
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          gh label create release:consumer-bump --force \
+            --color ededed --description "Kin release automation"
+          gh label create proof-impacting --force \
+            --color ededed --description "Kin release automation"
+
+      - name: Open or update the dependency bump PR
+        id: open-pr
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6.1.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          branch: ${{ env.WAVE_BRANCH }}
+          base: ${{ github.event.repository.default_branch }}
+          add-paths: ${{ steps.admission.outputs.add_paths }}
+          delete-branch: true
+          signoff: true
+          labels: release:consumer-bump,proof-impacting
+          author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          committer: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
+          commit-message: "chore(deps): ${{ steps.update.outputs.title }}"
+          title: "chore(deps): ${{ steps.update.outputs.title }}"
+          body: |
+            Automated Kin registry dependency wave.
+
+            This PR updates the allowed root-manifest registry pins after a validated Kin registry publish and verifies the affected Kin consumers before opening or updating the fixed automation branch.
+
+      - name: Verify exact first-party generated PR
+        if: steps.update.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.open-pr.outputs.pull-request-number }}
+          ACTION_HEAD: ${{ steps.open-pr.outputs.pull-request-head-sha }}
+          EXPECTED_TREE: ${{ steps.admission.outputs.expected_tree }}
+          EXPECTED_BASE: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$PR" =~ ^[1-9][0-9]*$ ||
+                ! "$ACTION_HEAD" =~ ^[0-9a-f]{40}$ ||
+                ! "$EXPECTED_TREE" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::dependency action returned invalid PR identity"
+            exit 1
+          fi
+          pull="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR}")"
+          api_head="$(jq -r .head.sha <<<"$pull")"
+          if [ "$(jq -r .state <<<"$pull")" != open ] ||
+             [ "$(jq -r .head.repo.full_name <<<"$pull")" != "$GITHUB_REPOSITORY" ] ||
+             [ "$(jq -r .head.ref <<<"$pull")" != "$WAVE_BRANCH" ] ||
+             [ "$(jq -r .base.ref <<<"$pull")" != "$EXPECTED_BASE" ] ||
+             [ "$api_head" != "$ACTION_HEAD" ]; then
+            echo "::error::dependency PR is not the exact first-party automation branch"
+            exit 1
+          fi
+          api_tree="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/commits/${api_head}" --jq .tree.sha)"
+          if [ "$api_tree" != "$EXPECTED_TREE" ]; then
+            echo "::error::dependency PR tree $api_tree differs from admitted $EXPECTED_TREE"
+            exit 1
+          fi
