@@ -739,6 +739,58 @@ pub fn reclaim_lines(before: &[AbandonedInit]) -> Vec<String> {
     lines
 }
 
+/// Say what a reclaim pass over abandoned repository stages did.
+///
+/// The sibling of [`report_reclaimed`], for the half of the reap that list
+/// cannot see. `reclaim_lines` measures the `.kin-git-capture-*` directories
+/// this run scanned, and a killed conversion also strands a repository STAGE,
+/// reclaimed by owner record rather than by capture lease. Those were reaped on
+/// both paths with the count thrown away, so a stage whose capture record was
+/// unreadable came off an operator's disk and appeared in no sentence anywhere.
+pub fn report_reclaimed_stages(recovered: usize, retained: usize) {
+    for line in reclaimed_stage_lines(recovered, retained) {
+        disclose(&line);
+    }
+}
+
+/// What that pass leaves an operator to read, as lines.
+///
+/// Split from the writing so the wording is pinned by a test rather than by
+/// running a conversion and killing it, exactly as [`reclaim_lines`] is.
+///
+/// Silent when the pass touched nothing, which is every ordinary `kin init`.
+/// That silence is load-bearing: a line printed under every conversion is a line
+/// nobody reads by the third one, and this one has to be read on the first
+/// conversion after a kill.
+pub fn reclaimed_stage_lines(recovered: usize, retained: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    if recovered > 0 {
+        lines.push(format!(
+            "  reclaimed {recovered} repository staging {} an earlier `kin init` left behind here",
+            if recovered == 1 {
+                "directory"
+            } else {
+                "directories"
+            }
+        ));
+    }
+    if retained > 0 {
+        // Named rather than folded into the line above, and never counted as
+        // reclaimed. A directory this run declined to touch is still costing
+        // the operator disk, and the reason it was left is the reason they can
+        // act on it safely.
+        let (noun, verb, pronoun) = if retained == 1 {
+            ("directory", "is", "it")
+        } else {
+            ("directories", "are", "them")
+        };
+        lines.push(format!(
+            "  {retained} more repository staging {noun} {verb} still on disk and this run left              {pronoun} alone, because it could not prove {pronoun} unused; delete {pronoun} by              hand once no `kin init` is running here"
+        ));
+    }
+    lines
+}
+
 /// The `kin doctor` row's detail and fix lines for whatever staging is sitting
 /// beside `parent`, or `None` when there is none.
 ///

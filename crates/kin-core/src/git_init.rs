@@ -262,7 +262,13 @@ fn init_from_git_with_hooks(
     // at their own phase eight, so the disk comes back before the minutes are
     // spent instead of after.
     let capture_dir = crate::init_staging::GitCaptureStaging::claim(source_parent)?;
-    let _ = crate::init::recover_orphaned_repository_stages(source_parent, &final_kin_dir);
+    // The count this used to drop. `report_reclaimed` beneath reads the capture
+    // list, which only ever holds `.kin-git-capture-*` directories with an
+    // abandonable lease, so a repository stage with no readable capture record
+    // was reaped here and named nowhere.
+    let reclaimed = crate::init::recover_orphaned_repository_stages(source_parent, &final_kin_dir)
+        .unwrap_or_default();
+    crate::init_attempt::report_reclaimed_stages(reclaimed.recovered, reclaimed.retained);
     crate::init_attempt::report_reclaimed(&leftovers);
 
     // The ladder now stamps every phase it opens into the capture directory, so
