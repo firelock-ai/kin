@@ -58,6 +58,11 @@ EXPECTED_SUITES = (
         "acceptance/response_budget.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/trace_spine_clipping_repro.py",
+        "trace_spine",
+        "acceptance/trace_spine.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/parse_hole_repro.py",
         "parsehole",
         "acceptance/parsehole.json",
@@ -1003,7 +1008,8 @@ def main() -> int:
     if problems:
         return 1
     print(
-        "workflow authority holds: 13 suite reports reach one always-running verdict in order"
+        "workflow authority holds: %d suite reports reach one always-running verdict in order"
+        % len(EXPECTED_SUITES)
     )
     return 0
 

@@ -2,9 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 
-"""Prove a narrow trace says it may be missing the hop you asked about.
+"""Prove trace cuts preserve and explain the branch the caller asked for.
 
-FIR-2781. The v0.6.0 stranger run walked `Session.send` on a converted
+FIR-2781 established checks 0 through 3. The v0.6.0 stranger run walked `Session.send` on a converted
 `psf/requests` with `limit_per_step: 4` and got a chain that stops two hops
 short of where `verify` goes. The per-step cap had discarded eleven of fifteen
 callees, `HTTPAdapter.send` among them, and the response said so only as a count
@@ -22,7 +22,11 @@ something. It is that a chain missing its point reads exactly like a complete
 one, because the honest label the tool already carried ("treat this as a lower
 bound") is the same label a complete walk carries.
 
-Four checks, on one seeded repository:
+FIR-2824 adds checks 4 through 7. A target that steers discovery must also
+survive both response-budget decisions, and each surviving step must carry the
+exact graph-owned call-site lines that make the hop actionable.
+
+Eight checks, on one seeded repository:
 
   0  a walk the cap cut BENEATH a node it then continued through says so in
      words, naming the node, the parameter and the count, and saying that an
@@ -34,6 +38,14 @@ Four checks, on one seeded repository:
      either half alone is satisfiable by a broken tool
   3  a walk no cap cut publishes none of this, and the keys are ABSENT rather
      than zero, so machinery for incomplete answers never qualifies a complete one
+  4  a wide walk proves `cert_verify` was discovered, then a response-budget
+     cut with that target keeps it and proves the budget actually bit
+  5  the same response budget without a target drops `cert_verify`, beside the
+     targeted arm, so the named question rather than the fixture delivers it
+  6  callee steps carry the exact 1-based call sites from their parent files,
+     including the cross-module hop and the next step beyond it
+  7  the cross-file `send_via_adapter` edge walked backwards reports `send` as
+     a caller and carries that caller's exact site from `sessions.py`
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when one could not
 be read, and 3 when the run could not be set up. `--self-test` exercises every
@@ -71,8 +83,16 @@ SESSIONS_SRC = '''"""Session layer."""
 from adapters import send_via_adapter
 
 
-def get_adapter(url):
+def record_adapter(url):
     return url
+
+
+def normalize_adapter(url):
+    return record_adapter(url)
+
+
+def get_adapter(url):
+    return normalize_adapter(url)
 
 
 def prepare_request(request):
@@ -136,6 +156,30 @@ def send_via_adapter(adapter, request, verify):
 '''
 
 CROSSING_HOP = "send_via_adapter"
+ELISION_TARGET = "cert_verify"
+CALLER_ENTITY = "send"
+SESSIONS_FILE = "sessions.py"
+ADAPTERS_FILE = "adapters.py"
+# Small enough to force branch narrowing on this body-free fixture, while still
+# leaving room for the protected two-hop branch plus the bounder's disclosure.
+RESPONSE_BUDGET = 4000
+WIDE_RESPONSE_BUDGET = 60000
+ELISION_DEPTH = 3
+ELISION_LIMIT = 25
+
+
+def fixture_line(source, needle):
+    matches = [
+        number for number, line in enumerate(source.splitlines(), 1)
+        if needle in line
+    ]
+    if len(matches) != 1:
+        raise AssertionError("fixture line %r matched %d times" % (needle, len(matches)))
+    return matches[0]
+
+
+SESSION_ADAPTER_CALL_LINE = fixture_line(SESSIONS_SRC, "response = send_via_adapter(")
+ADAPTER_CERT_CALL_LINE = fixture_line(ADAPTERS_SRC, "return cert_verify(")
 
 
 def run(cmd, cwd=None, env=None, timeout=600):
@@ -282,6 +326,446 @@ def grade_a_complete_walk_is_not_qualified(payload):
     return PASS, "no clip, no spine key, no disclosure on a walk the cap never cut"
 
 
+def response_budget_degradations(payload, reason):
+    return [
+        item for item in payload.get("degradations") or []
+        if isinstance(item, dict)
+        and item.get("component") == "response_budget"
+        and item.get("reason") == reason
+    ]
+
+
+def graph_bounds_problem(payload, budget):
+    expected = {
+        "depth": ELISION_DEPTH,
+        "direction": "calls",
+        "limit_per_step": ELISION_LIMIT,
+        "max_response_chars": budget,
+        "bodies_included": False,
+    }
+    mismatches = [
+        "%s=%r (wanted %r)" % (key, payload.get(key), value)
+        for key, value in expected.items()
+        if payload.get(key) != value
+    ]
+    return ", ".join(mismatches) if mismatches else None
+
+
+def pretty_serialized_bytes(payload):
+    """Match serde_json::to_string_pretty(...).len() for the ASCII fixture."""
+    return len(json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"))
+
+
+def fanout_clip_problem(payload):
+    clips = payload.get("clipped_steps")
+    if clips:
+        return "clipped_steps is nonempty, so per-step fanout loss can masquerade as response elision"
+    if payload.get("spine_clipped_steps"):
+        return "spine_clipped_steps is nonzero, so the walk itself was clipped"
+    chain = payload.get("chain") or []
+    truncated = [
+        step.get("entity_name")
+        for step in chain
+        if isinstance(step, dict) and step.get("fanout_truncated")
+    ]
+    if truncated:
+        return "chain rows report fanout_truncated: %r" % (truncated,)
+    return None
+
+
+def parentage_problem(payload, require_target):
+    chain = payload.get("chain")
+    if not isinstance(chain, list):
+        return "the response carries no chain array"
+    rows = [step for step in chain if isinstance(step, dict)]
+    if len(rows) != len(chain):
+        return "the chain carries a non-object step"
+    by_step = {}
+    for row in rows:
+        step = row.get("step")
+        parent = row.get("parent_step")
+        if not isinstance(step, int) or not isinstance(parent, int):
+            return "a chain row carries a non-integer step or parent_step"
+        if step in by_step:
+            return "step %r appears more than once" % (step,)
+        by_step[step] = row
+    for row in rows:
+        parent = row["parent_step"]
+        if parent != 0 and parent not in by_step:
+            return "%s points at missing parent step %r" % (
+                row.get("entity_name"), parent,
+            )
+    if not require_target:
+        return None
+    hops = [row for row in rows if row.get("entity_name") == CROSSING_HOP]
+    targets = [row for row in rows if row.get("entity_name") == ELISION_TARGET]
+    if len(hops) != 1 or len(targets) != 1:
+        return "the target path needs exactly one %s and one %s, found %d and %d" % (
+            CROSSING_HOP, ELISION_TARGET, len(hops), len(targets),
+        )
+    if targets[0]["parent_step"] != hops[0]["step"]:
+        return "%s parent_step=%r does not name surviving %s step=%r" % (
+            ELISION_TARGET, targets[0]["parent_step"], CROSSING_HOP, hops[0]["step"],
+        )
+    return None
+
+
+def indexed_chain(payload, label):
+    """Index one chain by local step and canonical entity identity."""
+    chain = payload.get("chain")
+    if not isinstance(chain, list):
+        return None, "%s response carries no chain array" % label
+    by_step = {}
+    by_identity = {}
+    for row in chain:
+        if not isinstance(row, dict):
+            return None, "%s chain carries a non-object step" % label
+        step = row.get("step")
+        identity = row.get("entity_id")
+        name = row.get("entity_name")
+        if not isinstance(step, int):
+            return None, "%s row carries non-integer step=%r" % (label, step)
+        if not isinstance(identity, str) or not identity:
+            return None, "%s step %r carries no canonical entity_id" % (label, step)
+        if not isinstance(name, str) or not name:
+            return None, "%s entity %s carries no entity_name" % (label, identity)
+        if step in by_step:
+            return None, "%s step %r appears more than once" % (label, step)
+        if identity in by_identity:
+            return None, "%s entity_id %s appears more than once" % (label, identity)
+        by_step[step] = row
+        by_identity[identity] = row
+    return (by_step, by_identity), None
+
+
+def bounded_subset_problem(payload, wide):
+    """Every bounded row and parent edge must come from the wide discovery."""
+    wide_index, problem = indexed_chain(wide, "wide")
+    if problem:
+        return problem
+    bounded_index, problem = indexed_chain(payload, "bounded")
+    if problem:
+        return problem
+    wide_by_step, wide_by_identity = wide_index
+    bounded_by_step, bounded_by_identity = bounded_index
+
+    def parent_identity(row, by_step, label):
+        parent = row.get("parent_step")
+        if parent == 0:
+            return "<focal>", None
+        parent_row = by_step.get(parent)
+        if parent_row is None:
+            return None, "%s step %r points at missing parent step %r" % (
+                label, row.get("step"), parent,
+            )
+        return parent_row.get("entity_id"), None
+
+    for identity, row in bounded_by_identity.items():
+        source = wide_by_identity.get(identity)
+        if source is None:
+            return "bounded entity_id %s was not discovered by the wide arm" % identity
+        for key in ("entity_name", "role"):
+            if row.get(key) != source.get(key):
+                return "bounded entity %s changed %s from %r to %r" % (
+                    identity, key, source.get(key), row.get(key),
+                )
+        bounded_parent, problem = parent_identity(row, bounded_by_step, "bounded")
+        if problem:
+            return problem
+        wide_parent, problem = parent_identity(source, wide_by_step, "wide")
+        if problem:
+            return problem
+        if bounded_parent != wide_parent:
+            return "bounded edge into %s changed parent identity from %r to %r" % (
+                identity, wide_parent, bounded_parent,
+            )
+    return None
+
+
+def wide_premise_problem(payload):
+    bounds = graph_bounds_problem(payload, WIDE_RESPONSE_BUDGET)
+    if bounds:
+        return "wide bounds drifted: " + bounds
+    rendered_chars = pretty_serialized_bytes(payload)
+    if rendered_chars > WIDE_RESPONSE_BUDGET:
+        return "the wide response serializes to %d bytes, above its %d-byte budget" % (
+            rendered_chars, WIDE_RESPONSE_BUDGET,
+        )
+    clips = fanout_clip_problem(payload)
+    if clips:
+        return clips
+    if payload.get("steps_omitted") or payload.get("fanout_narrowed") \
+            or payload.get("chain_withheld"):
+        return "the wide premise reports response step loss"
+    if (payload.get("elisions") or {}).get("chain"):
+        return "the wide premise carries an elisions.chain cut"
+    if response_budget_degradations(payload, "steps_omitted") \
+            or response_budget_degradations(payload, "response_bounded"):
+        return "the wide premise carries a response-budget step-loss degradation"
+    chain = payload.get("chain")
+    if isinstance(chain, list) and payload.get("total_steps") != len(chain):
+        return "wide total_steps=%r disagrees with chain length %d" % (
+            payload.get("total_steps"), len(chain),
+        )
+    problem = parentage_problem(payload, require_target=True)
+    if problem:
+        return problem
+    _, problem = indexed_chain(payload, "wide")
+    return problem
+
+
+def bounded_elision_problem(payload, wide):
+    bounds = graph_bounds_problem(payload, RESPONSE_BUDGET)
+    if bounds:
+        return "bounded bounds drifted: " + bounds
+    rendered_chars = pretty_serialized_bytes(payload)
+    if rendered_chars > RESPONSE_BUDGET:
+        return "the bounded response serializes to %d bytes, above its %d-byte budget" % (
+            rendered_chars, RESPONSE_BUDGET,
+        )
+    clips = fanout_clip_problem(payload)
+    if clips:
+        return clips
+    chain = payload.get("chain")
+    if not isinstance(chain, list):
+        return "the response carries no chain array"
+    wide_chain = wide.get("chain")
+    if not isinstance(wide_chain, list):
+        return "the wide response carries no chain array"
+    if len(chain) >= len(wide_chain):
+        return "the bounded chain kept %d of %d steps, so the budget cut nothing" % (
+            len(chain), len(wide_chain),
+        )
+    omitted = payload.get("steps_omitted")
+    narrowed = payload.get("fanout_narrowed")
+    if not isinstance(omitted, int) or omitted <= 0:
+        return "steps_omitted=%r does not prove a response cut" % (omitted,)
+    if not isinstance(narrowed, int) or narrowed <= 0 or narrowed > omitted:
+        return "fanout_narrowed=%r is not a positive subset of steps_omitted=%r" % (
+            narrowed, omitted,
+        )
+    if len(chain) + omitted != len(wide_chain):
+        return "bounded kept plus omitted is %d, but the wide premise discovered %d steps" % (
+            len(chain) + omitted, len(wide_chain),
+        )
+    if payload.get("total_steps") != len(chain):
+        return "total_steps=%r disagrees with bounded chain length %d" % (
+            payload.get("total_steps"), len(chain),
+        )
+    elision = (payload.get("elisions") or {}).get("chain")
+    if not isinstance(elision, dict):
+        return "the cut carries no elisions.chain object"
+    expected = {
+        "kept": len(chain),
+        "elided": omitted,
+        "total": len(wide_chain),
+        "reason": "response_budget",
+    }
+    mismatches = [
+        "%s=%r (wanted %r)" % (key, elision.get(key), value)
+        for key, value in expected.items()
+        if elision.get(key) != value
+    ]
+    if mismatches:
+        return "elisions.chain disagrees: " + ", ".join(mismatches)
+    if len(response_budget_degradations(payload, "steps_omitted")) != 1:
+        return "the cut needs exactly one response_budget/steps_omitted degradation"
+    problem = parentage_problem(payload, require_target=False)
+    if problem:
+        return problem
+    return bounded_subset_problem(payload, wide)
+
+
+def grade_named_target_survives_response_budget(wide, bounded):
+    if not isinstance(wide, dict) or not isinstance(bounded, dict):
+        return UNREADABLE, "the wide or bounded response is not an object"
+    if not isinstance(wide.get("chain"), list) or not isinstance(bounded.get("chain"), list):
+        return UNREADABLE, "the wide or bounded response carries no readable chain"
+    problem = wide_premise_problem(wide)
+    if problem:
+        return FAIL, "the wide discovery premise is not sound: " + problem
+    problem = bounded_elision_problem(bounded, wide)
+    if problem:
+        return FAIL, "the targeted bounded arm is not a coherent response cut: " + problem
+    if bounded.get("target_name") != ELISION_TARGET:
+        return FAIL, "the bounded response does not echo target_name=%s" % (ELISION_TARGET,)
+    problem = parentage_problem(bounded, require_target=True)
+    if problem:
+        return FAIL, "the named target path did not survive intact: " + problem
+    return PASS, "%s and its %s parent survived; steps_omitted=%d, fanout_narrowed=%d" % (
+        ELISION_TARGET,
+        CROSSING_HOP,
+        bounded["steps_omitted"],
+        bounded["fanout_narrowed"],
+    )
+
+
+def grade_unnamed_response_budget_drops_the_target(wide, targeted, unnamed):
+    if not all(isinstance(payload, dict) for payload in (wide, targeted, unnamed)):
+        return UNREADABLE, "one of the three response arms is not an object"
+    if not all(isinstance(payload.get("chain"), list) for payload in (wide, targeted, unnamed)):
+        return UNREADABLE, "one of the three response arms carries no readable chain"
+    target_status, target_detail = grade_named_target_survives_response_budget(wide, targeted)
+    if target_status != PASS:
+        return FAIL, "the paired targeted arm is not a valid control: " + target_detail
+    problem = bounded_elision_problem(unnamed, wide)
+    if problem:
+        return FAIL, "the unnamed bounded arm is not a coherent response cut: " + problem
+    names = chain_names(unnamed)
+    if ELISION_TARGET in names:
+        return FAIL, "the unnamed arm still contains %s: %r" % (ELISION_TARGET, names)
+    if unnamed.get("target_name") is not None:
+        return FAIL, "the unnamed arm reports target_name=%r" % (unnamed.get("target_name"),)
+    for entry in unnamed.get("degradations") or []:
+        if isinstance(entry, dict) and "named target" in (entry.get("detail") or ""):
+            return FAIL, "the unnamed arm claims a named target branch was kept"
+    return PASS, "%s survives only in the paired targeted cut; unnamed steps_omitted=%d" % (
+        ELISION_TARGET, unnamed["steps_omitted"],
+    )
+
+
+def reference_line_contract_problem(payload):
+    chain = payload.get("chain")
+    if not isinstance(chain, list):
+        return "the response carries no chain array"
+    for index, step in enumerate(chain):
+        if not isinstance(step, dict):
+            return "chain row %d is not an object" % index
+        for key in ("reference_lines", "reference_lines_absent_reason"):
+            if key not in step:
+                return "%s omits required key %s" % (step.get("entity_name"), key)
+        lines = step["reference_lines"]
+        reason = step["reference_lines_absent_reason"]
+        if not isinstance(lines, list) or any(
+                not isinstance(line, int) or line < 1 for line in lines):
+            return "%s carries invalid 1-based reference_lines=%r" % (
+                step.get("entity_name"), lines,
+            )
+        if lines != sorted(set(lines)):
+            return "%s reference_lines are not sorted and deduplicated: %r" % (
+                step.get("entity_name"), lines,
+            )
+        if lines and reason is not None:
+            return "%s has site lines but also absent reason %r" % (
+                step.get("entity_name"), reason,
+            )
+        if not lines and (not isinstance(reason, str) or not reason):
+            return "%s has no site lines and no explicit absent reason" % (
+                step.get("entity_name"),
+            )
+        allowed_reasons = {
+            "no_evidence_span",
+            "span_outside_caller_file",
+            "federated_xref",
+            "unreported_by_daemon",
+        }
+        if not lines and reason not in allowed_reasons:
+            return "%s has unknown reference_lines_absent_reason=%r" % (
+                step.get("entity_name"), reason,
+            )
+    return None
+
+
+def one_step(payload, name):
+    matches = [
+        step for step in payload.get("chain") or []
+        if isinstance(step, dict) and step.get("entity_name") == name
+    ]
+    if len(matches) != 1:
+        return None, "%s appears %d times" % (name, len(matches))
+    return matches[0], None
+
+
+def grade_callee_call_sites(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("chain"), list):
+        return UNREADABLE, "the callee walk carries no readable chain"
+    problem = wide_premise_problem(payload)
+    if problem:
+        return FAIL, "the callee walk is not a complete wide premise: " + problem
+    problem = reference_line_contract_problem(payload)
+    if problem:
+        return FAIL, problem
+    expected = (
+        (CROSSING_HOP, SESSION_ADAPTER_CALL_LINE),
+        (ELISION_TARGET, ADAPTER_CERT_CALL_LINE),
+    )
+    for name, line in expected:
+        step, problem = one_step(payload, name)
+        if problem:
+            return FAIL, problem
+        if step.get("role") != "callee":
+            return FAIL, "%s role=%r, wanted callee" % (name, step.get("role"))
+        if step["reference_lines"] != [line]:
+            return FAIL, "%s reference_lines=%r, wanted [%d]" % (
+                name, step["reference_lines"], line,
+            )
+        if step["reference_lines_absent_reason"] is not None:
+            return FAIL, "%s carries an absent reason beside a known site" % name
+    return PASS, "%s line %d and %s line %d come from their parent files" % (
+        CROSSING_HOP,
+        SESSION_ADAPTER_CALL_LINE,
+        ELISION_TARGET,
+        ADAPTER_CERT_CALL_LINE,
+    )
+
+
+def grade_caller_call_site(payload):
+    if not isinstance(payload, dict) or not isinstance(payload.get("chain"), list):
+        return UNREADABLE, "the caller walk carries no readable chain"
+    expected_bounds = {
+        "depth": 1,
+        "direction": "callers",
+        "limit_per_step": ELISION_LIMIT,
+        "max_response_chars": WIDE_RESPONSE_BUDGET,
+        "bodies_included": False,
+    }
+    mismatches = [
+        "%s=%r (wanted %r)" % (key, payload.get(key), value)
+        for key, value in expected_bounds.items()
+        if payload.get(key) != value
+    ]
+    if mismatches:
+        return FAIL, "caller bounds drifted: " + ", ".join(mismatches)
+    problem = fanout_clip_problem(payload)
+    if problem:
+        return FAIL, problem
+    if payload.get("steps_omitted") or payload.get("fanout_narrowed") \
+            or payload.get("chain_withheld") or (payload.get("elisions") or {}).get("chain"):
+        return FAIL, "the caller walk was response-bounded, so it is not a complete premise"
+    if payload.get("total_steps") != len(payload["chain"]):
+        return FAIL, "caller total_steps disagrees with its chain length"
+    problem = parentage_problem(payload, require_target=False)
+    if problem:
+        return FAIL, problem
+    problem = reference_line_contract_problem(payload)
+    if problem:
+        return FAIL, problem
+    step, problem = one_step(payload, CALLER_ENTITY)
+    if problem:
+        return FAIL, problem
+    if step.get("role") != "caller":
+        return FAIL, "%s role=%r, wanted caller" % (CALLER_ENTITY, step.get("role"))
+    if payload.get("focal_file") != ADAPTERS_FILE:
+        return FAIL, "caller focal_file=%r, wanted %s" % (
+            payload.get("focal_file"), ADAPTERS_FILE,
+        )
+    if step.get("entity_file") != SESSIONS_FILE:
+        return FAIL, "%s entity_file=%r, wanted %s" % (
+            CALLER_ENTITY, step.get("entity_file"), SESSIONS_FILE,
+        )
+    if step.get("entity_file") == payload.get("focal_file"):
+        return FAIL, "the caller and focal are in one file, so role-based file selection is untested"
+    if step["reference_lines"] != [SESSION_ADAPTER_CALL_LINE]:
+        return FAIL, "%s caller reference_lines=%r, wanted [%d]" % (
+            CALLER_ENTITY, step["reference_lines"], SESSION_ADAPTER_CALL_LINE,
+        )
+    if step["reference_lines_absent_reason"] is not None:
+        return FAIL, "%s carries an absent reason beside a known caller site" % CALLER_ENTITY
+    return PASS, "%s walked as caller reports sessions.py line %d from a different file" % (
+        CALLER_ENTITY, SESSION_ADAPTER_CALL_LINE,
+    )
+
+
 # ── the run ────────────────────────────────────────────────────────────────
 
 
@@ -291,12 +775,17 @@ class Suite(object):
         self.workdir = workdir
         self.verbose = verbose
         self.env = dict(os.environ)
+        self.env["KIN_HOME"] = os.path.join(workdir, "kin-home")
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
+        self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
         self.env.pop("KIN_MCP_REPO", None)
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
+        os.makedirs(self.env["KIN_HOME"])
         self._repo = None
+        self._elision_arms = None
+        self._caller_trace = None
 
     def git(self, args, repo):
         base = ["git", "-c", "core.hooksPath=/dev/null",
@@ -327,13 +816,17 @@ class Suite(object):
     def kin_run(self, args, repo, timeout=600):
         return run([self.kin] + args, cwd=repo, env=self.env, timeout=timeout)
 
-    def trace(self, limit, target=None):
+    def trace(
+            self, limit, target=None, max_response_chars=None, depth=2,
+            focal="send", direction="calls"):
         """One `kin trace-data-flow`, parsed, or None when it could not be read."""
         repo = self.repo()
-        args = ["trace-data-flow", "--focal", "send", "--direction", "calls",
-                "--depth", "2", "--limit-per-step", str(limit), "--no-bodies"]
+        args = ["trace-data-flow", "--focal", focal, "--direction", direction,
+                "--depth", str(depth), "--limit-per-step", str(limit), "--no-bodies"]
         if target:
             args += ["--target", target]
+        if max_response_chars:
+            args += ["--max-response-chars", str(max_response_chars)]
         rc, out, err = self.kin_run(args, repo)
         if self.verbose:
             print("  $ kin %s -> rc=%s" % (" ".join(args[1:]), rc))
@@ -344,12 +837,60 @@ class Suite(object):
         except ValueError:
             return None
 
+    def elision_arms(self):
+        """One wide premise and a paired target/no-target response cut."""
+        if self._elision_arms is None:
+            wide = self.trace(
+                limit=ELISION_LIMIT,
+                max_response_chars=WIDE_RESPONSE_BUDGET,
+                depth=ELISION_DEPTH,
+            )
+            targeted = self.trace(
+                limit=ELISION_LIMIT,
+                target=ELISION_TARGET,
+                max_response_chars=RESPONSE_BUDGET,
+                depth=ELISION_DEPTH,
+            )
+            unnamed = self.trace(
+                limit=ELISION_LIMIT,
+                max_response_chars=RESPONSE_BUDGET,
+                depth=ELISION_DEPTH,
+            )
+            self._elision_arms = (wide, targeted, unnamed)
+        return self._elision_arms
+
+    def caller_trace(self):
+        if self._caller_trace is None:
+            self._caller_trace = self.trace(
+                limit=ELISION_LIMIT,
+                max_response_chars=WIDE_RESPONSE_BUDGET,
+                depth=1,
+                focal=CROSSING_HOP,
+                direction="callers",
+            )
+        return self._caller_trace
+
+    def close(self):
+        if self._repo is None:
+            return
+        rc, out, err = self.kin_run(["daemon", "stop", "--json"], self._repo, timeout=60)
+        if self.verbose and rc != 0:
+            print("  daemon stop returned rc=%s: %s" % (rc, (err or out)[-300:]))
+
 
 class Result(object):
     def __init__(self, ident, status, detail):
         self.ident = ident
         self.status = status
         self.detail = detail
+
+    def row(self):
+        return {
+            "id": self.ident,
+            "ticket": "FIR-2824",
+            "status": self.status,
+            "detail": self.detail,
+        }
 
 
 def check_says_the_absence_proves_nothing(suite):
@@ -385,11 +926,47 @@ def check_a_complete_walk_is_not_qualified(suite):
     return Result("3", status, "A walk no cap cut carries none of this. " + detail)
 
 
+def check_the_named_target_survives_response_elision(suite):
+    wide, targeted, _ = suite.elision_arms()
+    if wide is None or targeted is None:
+        return Result("4", UNREADABLE, "the wide or targeted bounded walk returned nothing readable")
+    status, detail = grade_named_target_survives_response_budget(wide, targeted)
+    return Result("4", status, "The named branch survives response elision. " + detail)
+
+
+def check_the_unnamed_budget_drops_the_same_target(suite):
+    wide, targeted, unnamed = suite.elision_arms()
+    if wide is None or targeted is None or unnamed is None:
+        return Result("5", UNREADABLE, "one of the three response-budget arms returned nothing readable")
+    status, detail = grade_unnamed_response_budget_drops_the_target(wide, targeted, unnamed)
+    return Result("5", status, "The unnamed control loses the same branch. " + detail)
+
+
+def check_callee_steps_carry_their_parent_file_sites(suite):
+    wide, _, _ = suite.elision_arms()
+    if wide is None:
+        return Result("6", UNREADABLE, "the wide callee walk returned nothing readable")
+    status, detail = grade_callee_call_sites(wide)
+    return Result("6", status, "Callee steps carry their parent-file call sites. " + detail)
+
+
+def check_caller_steps_carry_their_own_file_sites(suite):
+    payload = suite.caller_trace()
+    if payload is None:
+        return Result("7", UNREADABLE, "the caller walk returned nothing readable")
+    status, detail = grade_caller_call_site(payload)
+    return Result("7", status, "Caller steps carry their own-file call sites. " + detail)
+
+
 CHECKS = [
     ("0", check_says_the_absence_proves_nothing),
     ("1", check_separates_the_class_of_loss),
     ("2", check_the_target_is_what_delivers_the_hop),
     ("3", check_a_complete_walk_is_not_qualified),
+    ("4", check_the_named_target_survives_response_elision),
+    ("5", check_the_unnamed_budget_drops_the_same_target),
+    ("6", check_callee_steps_carry_their_parent_file_sites),
+    ("7", check_caller_steps_carry_their_own_file_sites),
 ]
 
 
@@ -416,6 +993,101 @@ CLIPPED = {
 }
 
 CLEAN = {"chain": [{"entity_name": "get_adapter", "parent_step": 0}], "degradations": []}
+WIDE_ELISION = {
+    "depth": ELISION_DEPTH,
+    "direction": "calls",
+    "limit_per_step": ELISION_LIMIT,
+    "max_response_chars": WIDE_RESPONSE_BUDGET,
+    "bodies_included": False,
+    "chain": [
+        {"step": 1, "parent_step": 0, "entity_id": "entity-get-adapter",
+         "entity_name": "get_adapter", "role": "callee",
+         "reference_lines": [1], "reference_lines_absent_reason": None},
+        {"step": 2, "parent_step": 0, "entity_id": "entity-send-via-adapter",
+         "entity_name": CROSSING_HOP, "role": "callee",
+         "reference_lines": [SESSION_ADAPTER_CALL_LINE], "reference_lines_absent_reason": None},
+        {"step": 3, "parent_step": 1, "entity_id": "entity-normalize-adapter",
+         "entity_name": "normalize_adapter", "role": "callee",
+         "reference_lines": [2], "reference_lines_absent_reason": None},
+        {"step": 4, "parent_step": 2, "entity_id": "entity-cert-verify",
+         "entity_name": ELISION_TARGET, "role": "callee",
+         "reference_lines": [ADAPTER_CERT_CALL_LINE], "reference_lines_absent_reason": None},
+        {"step": 5, "parent_step": 3, "entity_id": "entity-record-adapter",
+         "entity_name": "record_adapter", "role": "callee",
+         "reference_lines": [3], "reference_lines_absent_reason": None},
+    ],
+    "total_steps": 5,
+    "degradations": [],
+}
+TARGETED_ELISION = {
+    "depth": ELISION_DEPTH,
+    "direction": "calls",
+    "limit_per_step": ELISION_LIMIT,
+    "max_response_chars": RESPONSE_BUDGET,
+    "bodies_included": False,
+    "chain": [
+        {"step": 2, "parent_step": 0, "entity_id": "entity-send-via-adapter",
+         "entity_name": CROSSING_HOP, "role": "callee"},
+        {"step": 4, "parent_step": 2, "entity_id": "entity-cert-verify",
+         "entity_name": ELISION_TARGET, "role": "callee"},
+    ],
+    "total_steps": 2,
+    "target_name": ELISION_TARGET,
+    "steps_omitted": 3,
+    "fanout_narrowed": 3,
+    "elisions": {
+        "chain": {"kept": 2, "elided": 3, "total": 5, "reason": "response_budget"},
+    },
+    "degradations": [
+        {"component": "response_budget", "reason": "steps_omitted", "detail": "cut"},
+    ],
+}
+UNNAMED_ELISION = {
+    "depth": ELISION_DEPTH,
+    "direction": "calls",
+    "limit_per_step": ELISION_LIMIT,
+    "max_response_chars": RESPONSE_BUDGET,
+    "bodies_included": False,
+    "chain": [
+        {"step": 1, "parent_step": 0, "entity_id": "entity-get-adapter",
+         "entity_name": "get_adapter", "role": "callee"},
+        {"step": 3, "parent_step": 1, "entity_id": "entity-normalize-adapter",
+         "entity_name": "normalize_adapter", "role": "callee"},
+        {"step": 5, "parent_step": 3, "entity_id": "entity-record-adapter",
+         "entity_name": "record_adapter", "role": "callee"},
+    ],
+    "total_steps": 3,
+    "steps_omitted": 2,
+    "fanout_narrowed": 2,
+    "elisions": {
+        "chain": {"kept": 3, "elided": 2, "total": 5, "reason": "response_budget"},
+    },
+    "degradations": [
+        {"component": "response_budget", "reason": "steps_omitted", "detail": "cut"},
+    ],
+}
+CALLER_SITE = {
+    "depth": 1,
+    "direction": "callers",
+    "limit_per_step": ELISION_LIMIT,
+    "max_response_chars": WIDE_RESPONSE_BUDGET,
+    "bodies_included": False,
+    "focal_file": ADAPTERS_FILE,
+    "chain": [
+        {
+            "step": 1,
+            "parent_step": 0,
+            "entity_id": "entity-send",
+            "entity_name": CALLER_ENTITY,
+            "entity_file": SESSIONS_FILE,
+            "role": "caller",
+            "reference_lines": [SESSION_ADAPTER_CALL_LINE],
+            "reference_lines_absent_reason": None,
+        },
+    ],
+    "total_steps": 1,
+    "degradations": [],
+}
 
 
 def _without(payload, *path):
@@ -492,6 +1164,191 @@ def self_test():
     expect("3 cannot read a walk with no chain",
            grade_a_complete_walk_is_not_qualified({"degradations": []}), UNREADABLE)
 
+    expect("4 passes a discovered named branch that survives a real cut",
+           grade_named_target_survives_response_budget(WIDE_ELISION, TARGETED_ELISION), PASS)
+    renumbered_targeted = json.loads(json.dumps(TARGETED_ELISION))
+    renumbered_targeted["chain"][0]["step"] = 20
+    renumbered_targeted["chain"][1]["step"] = 40
+    renumbered_targeted["chain"][1]["parent_step"] = 20
+    expect("4 accepts renumbering when canonical entity and parent identities are unchanged",
+           grade_named_target_survives_response_budget(
+               WIDE_ELISION, renumbered_targeted), PASS)
+    no_cut_targeted = json.loads(json.dumps(TARGETED_ELISION))
+    no_cut_targeted["steps_omitted"] = 0
+    expect("4 fails a targeted arm whose response budget never bit",
+           grade_named_target_survives_response_budget(WIDE_ELISION, no_cut_targeted), FAIL)
+    lost_targeted = json.loads(json.dumps(TARGETED_ELISION))
+    lost_targeted["chain"][1]["entity_name"] = "other_target"
+    expect("4 fails when the named branch was still elided",
+           grade_named_target_survives_response_budget(WIDE_ELISION, lost_targeted), FAIL)
+    unechoed_targeted = json.loads(json.dumps(TARGETED_ELISION))
+    unechoed_targeted.pop("target_name")
+    expect("4 fails when the bounded arm does not echo the target",
+           grade_named_target_survives_response_budget(WIDE_ELISION, unechoed_targeted), FAIL)
+    wide_without_target = json.loads(json.dumps(WIDE_ELISION))
+    wide_without_target["chain"] = [
+        row for row in wide_without_target["chain"]
+        if row["entity_name"] not in (CROSSING_HOP, ELISION_TARGET)
+    ]
+    wide_without_target["total_steps"] = len(wide_without_target["chain"])
+    expect("4 fails a readable wide premise that never discovered the target",
+           grade_named_target_survives_response_budget(wide_without_target, TARGETED_ELISION), FAIL)
+    missing_parent = json.loads(json.dumps(TARGETED_ELISION))
+    missing_parent["chain"][1]["parent_step"] = 0
+    expect("4 fails a target row attached to the surviving wrong parent",
+           grade_named_target_survives_response_budget(WIDE_ELISION, missing_parent), FAIL)
+    orphaned_target = json.loads(json.dumps(TARGETED_ELISION))
+    orphaned_target["chain"][1]["parent_step"] = 99
+    expect("4 fails a target row that points at a missing parent step",
+           grade_named_target_survives_response_budget(WIDE_ELISION, orphaned_target), FAIL)
+    evidence_free = _without(TARGETED_ELISION, "elisions")
+    expect("4 fails a cut with no elisions accounting",
+           grade_named_target_survives_response_budget(WIDE_ELISION, evidence_free), FAIL)
+    no_disclosure = _without(TARGETED_ELISION, "degradations")
+    expect("4 fails a cut with no response-budget degradation",
+           grade_named_target_survives_response_budget(WIDE_ELISION, no_disclosure), FAIL)
+    cut_wide = json.loads(json.dumps(WIDE_ELISION))
+    cut_wide["steps_omitted"] = 1
+    expect("4 fails when the wide discovery premise was already cut",
+           grade_named_target_survives_response_budget(cut_wide, TARGETED_ELISION), FAIL)
+    oversized_wide = json.loads(json.dumps(WIDE_ELISION))
+    oversized_wide["untrimmed_payload"] = "x" * WIDE_RESPONSE_BUDGET
+    expect("4 fails a wide premise whose shipped JSON exceeds its budget",
+           grade_named_target_survives_response_budget(
+               oversized_wide, TARGETED_ELISION), FAIL)
+    clipped_targeted = json.loads(json.dumps(TARGETED_ELISION))
+    clipped_targeted["clipped_steps"] = [{"step": 2}]
+    expect("4 fails when fanout clipping can explain the loss",
+           grade_named_target_survives_response_budget(WIDE_ELISION, clipped_targeted), FAIL)
+    wrong_budget = json.loads(json.dumps(TARGETED_ELISION))
+    wrong_budget["max_response_chars"] = RESPONSE_BUDGET + 1
+    expect("4 fails a bounded arm that echoes a different budget",
+           grade_named_target_survives_response_budget(WIDE_ELISION, wrong_budget), FAIL)
+    oversized_targeted = json.loads(json.dumps(TARGETED_ELISION))
+    oversized_targeted["untrimmed_payload"] = "x" * RESPONSE_BUDGET
+    expect("4 fails a response whose shipped JSON exceeds the echoed budget",
+           grade_named_target_survives_response_budget(
+               WIDE_ELISION, oversized_targeted), FAIL)
+    short_targeted_universe = json.loads(json.dumps(TARGETED_ELISION))
+    short_targeted_universe["steps_omitted"] = 2
+    short_targeted_universe["fanout_narrowed"] = 2
+    short_targeted_universe["elisions"]["chain"] = {
+        "kept": 2,
+        "elided": 2,
+        "total": 4,
+        "reason": "response_budget",
+    }
+    expect("4 fails internally coherent accounting for a smaller source universe",
+           grade_named_target_survives_response_budget(
+               WIDE_ELISION, short_targeted_universe), FAIL)
+    invented_target_identity = json.loads(json.dumps(TARGETED_ELISION))
+    invented_target_identity["chain"][1]["entity_id"] = "entity-not-in-wide"
+    expect("4 fails a coherent target row the wide discovery never returned",
+           grade_named_target_survives_response_budget(
+               WIDE_ELISION, invented_target_identity), FAIL)
+
+    expect("5 passes when the unnamed cut loses the widely discovered target",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, UNNAMED_ELISION), PASS)
+    no_cut_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
+    no_cut_unnamed["steps_omitted"] = 0
+    expect("5 fails an unnamed arm whose response budget never bit",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, no_cut_unnamed), FAIL)
+    kept_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
+    kept_unnamed["chain"][-1]["entity_name"] = ELISION_TARGET
+    expect("5 fails when the unnamed arm already keeps the target",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, kept_unnamed), FAIL)
+    lost_target_control = json.loads(json.dumps(TARGETED_ELISION))
+    lost_target_control["chain"][1]["entity_name"] = "other_target"
+    expect("5 fails when both bounded arms lose the target",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, lost_target_control, UNNAMED_ELISION), FAIL)
+    named_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
+    named_unnamed["target_name"] = ELISION_TARGET
+    expect("5 fails when the unnamed arm claims a target",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, named_unnamed), FAIL)
+    claiming_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
+    claiming_unnamed["degradations"][0]["detail"] = (
+        "cut as whole branches, keeping the branch that reaches the named target"
+    )
+    expect("5 fails when the unnamed disclosure claims it kept a named target",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, claiming_unnamed), FAIL)
+    clipped_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
+    clipped_unnamed["chain"][0]["fanout_truncated"] = True
+    expect("5 fails when the unnamed arm has a per-step fanout cut",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, clipped_unnamed), FAIL)
+    short_unnamed_universe = json.loads(json.dumps(UNNAMED_ELISION))
+    short_unnamed_universe["steps_omitted"] = 1
+    short_unnamed_universe["fanout_narrowed"] = 1
+    short_unnamed_universe["elisions"]["chain"] = {
+        "kept": 3,
+        "elided": 1,
+        "total": 4,
+        "reason": "response_budget",
+    }
+    expect("5 fails internally coherent accounting for a smaller source universe",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, short_unnamed_universe), FAIL)
+    invented_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
+    for index, row in enumerate(invented_unnamed["chain"]):
+        row["entity_name"] = "invented_%d" % index
+    expect("5 fails bounded rows whose identities changed from the wide discovery",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, invented_unnamed), FAIL)
+    expect("5 cannot read a non-object response arm",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, None), UNREADABLE)
+
+    expect("6 passes exact callee sites from both parent files",
+           grade_callee_call_sites(WIDE_ELISION), PASS)
+    wrong_callee_line = json.loads(json.dumps(WIDE_ELISION))
+    wrong_callee_line["chain"][1]["reference_lines"] = [SESSION_ADAPTER_CALL_LINE + 1]
+    expect("6 fails a callee line from the wrong source row",
+           grade_callee_call_sites(wrong_callee_line), FAIL)
+    wrong_callee_role = json.loads(json.dumps(WIDE_ELISION))
+    wrong_callee_role["chain"][3]["role"] = "caller"
+    expect("6 fails when the forward step reports the wrong role",
+           grade_callee_call_sites(wrong_callee_role), FAIL)
+    unexplained_step = json.loads(json.dumps(WIDE_ELISION))
+    unexplained_step["chain"][0]["reference_lines"] = []
+    expect("6 fails any step with no lines and no absent reason",
+           grade_callee_call_sites(unexplained_step), FAIL)
+    invented_reason = json.loads(json.dumps(WIDE_ELISION))
+    invented_reason["chain"][0]["reference_lines"] = []
+    invented_reason["chain"][0]["reference_lines_absent_reason"] = "made_up_reason"
+    expect("6 fails an empty-line row with an unknown absent-reason value",
+           grade_callee_call_sites(invented_reason), FAIL)
+    missing_line_key = json.loads(json.dumps(WIDE_ELISION))
+    missing_line_key["chain"][0].pop("reference_lines_absent_reason")
+    expect("6 fails a chain row that omits one uniform site key",
+           grade_callee_call_sites(missing_line_key), FAIL)
+
+    expect("7 passes the exact caller site in the caller's own file",
+           grade_caller_call_site(CALLER_SITE), PASS)
+    wrong_caller_line = json.loads(json.dumps(CALLER_SITE))
+    wrong_caller_line["chain"][0]["reference_lines"] = [ADAPTER_CERT_CALL_LINE]
+    expect("7 fails when the caller receives a line from the focal file",
+           grade_caller_call_site(wrong_caller_line), FAIL)
+    same_file_caller = json.loads(json.dumps(CALLER_SITE))
+    same_file_caller["chain"][0]["entity_file"] = ADAPTERS_FILE
+    expect("7 fails a fixture whose caller does not cross away from the focal file",
+           grade_caller_call_site(same_file_caller), FAIL)
+    wrong_caller_role = json.loads(json.dumps(CALLER_SITE))
+    wrong_caller_role["chain"][0]["role"] = "callee"
+    expect("7 fails when the reverse step reports the wrong role",
+           grade_caller_call_site(wrong_caller_role), FAIL)
+    reason_beside_line = json.loads(json.dumps(CALLER_SITE))
+    reason_beside_line["chain"][0]["reference_lines_absent_reason"] = "no_evidence_span"
+    expect("7 fails an absent reason beside a known caller site",
+           grade_caller_call_site(reason_beside_line), FAIL)
+    expect("7 cannot read a non-object caller response",
+           grade_caller_call_site(None), UNREADABLE)
+
     for line in failures:
         print("SELFTEST FAIL %s" % line)
     # Counted, never written out. A hardcoded total is a number that drifts from
@@ -510,6 +1367,8 @@ def main(argv):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kin", default=os.environ.get("KIN_BIN") or shutil.which("kin"))
     parser.add_argument("--daemon", default=os.environ.get("KIN_DAEMON_BIN"))
+    parser.add_argument("--json", default=None, help="write the machine-readable report here")
+    parser.add_argument("--label", default=os.environ.get("KIN_ACCEPTANCE_LABEL") or "")
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--self-test", action="store_true")
     opts = parser.parse_args(argv)
@@ -520,10 +1379,22 @@ def main(argv):
     if not opts.kin:
         print("SETUP no kin binary: pass --kin or set KIN_BIN")
         return 3
+    kin = os.path.abspath(os.path.expanduser(opts.kin))
+    if not os.path.isfile(kin) or not os.access(kin, os.X_OK):
+        print("SETUP kin binary is missing or not executable: %s" % kin)
+        return 3
+    daemon = opts.daemon and os.path.abspath(os.path.expanduser(opts.daemon))
+    if daemon is None:
+        sibling = os.path.join(os.path.dirname(kin), "kin-daemon")
+        daemon = sibling if os.path.isfile(sibling) else None
+    if daemon is not None and (not os.path.isfile(daemon) or not os.access(daemon, os.X_OK)):
+        print("SETUP kin-daemon binary is missing or not executable: %s" % daemon)
+        return 3
 
     workdir = tempfile.mkdtemp(prefix="trace-spine-clipping-")
+    suite = None
     try:
-        suite = Suite(opts.kin, workdir, daemon=opts.daemon, verbose=opts.verbose)
+        suite = Suite(kin, workdir, daemon=daemon, verbose=opts.verbose)
         results = []
         for ident, check in CHECKS:
             try:
@@ -537,12 +1408,33 @@ def main(argv):
         if answered != asked:
             print("SETUP asked for %r and %r answered" % (asked, answered))
             return 3
+        if opts.json:
+            report_path = os.path.abspath(opts.json)
+            directory = os.path.dirname(report_path)
+            if directory and not os.path.isdir(directory):
+                os.makedirs(directory)
+            with open(report_path, "w") as handle:
+                json.dump(
+                    {
+                        "suite": "trace_spine_clipping_repro",
+                        "ticket": "FIR-2824",
+                        "label": opts.label,
+                        "kin": kin,
+                        "results": [result.row() for result in results],
+                    },
+                    handle,
+                    indent=2,
+                    sort_keys=True,
+                )
+                handle.write("\n")
         if any(result.status == FAIL for result in results):
             return 1
         if any(result.status == UNREADABLE for result in results):
             return 2
         return 0
     finally:
+        if suite is not None:
+            suite.close()
         shutil.rmtree(workdir, ignore_errors=True)
 
 
