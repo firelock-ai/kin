@@ -254,6 +254,42 @@ fn a_submodule_that_does_not_define_the_callee_reaches_nothing() {
 }
 
 #[test]
+fn a_receiver_bound_to_a_plain_module_does_not_reach_a_same_named_sibling() {
+    // THE ARM THAT KILLS THE PACKAGE-ROOT GUARD, which nothing else here can.
+    //
+    // `from pkg.mod import helper` binds the receiver to a name defined INSIDE
+    // `pkg/mod.py`, so the resolved receiver file is a plain module rather than a
+    // package index. A sibling `pkg/helper.py` exists and does define `run`, so
+    // the hop would happily bind there if it fired. It must not: the source said
+    // `helper` comes out of `pkg.mod`, and `pkg/helper.py` is a different thing
+    // that merely shares a name.
+    //
+    // Without the `PACKAGE_INDEX_FILENAMES` guard this test goes red, which is
+    // the mutation the first round of arms could not construct: with those
+    // fixtures the unguarded lookup landed back on the receiver's own file and
+    // changed nothing, so the guard read as covered while being unfalsifiable.
+    let files = vec![
+        py("pkg/__init__.py", "__version__ = \"1\"\n"),
+        py("pkg/mod.py", "helper = object()\n"),
+        py("pkg/helper.py", "def run():\n    return 1\n"),
+        py(
+            "caller.py",
+            "from pkg.mod import helper\n\n\ndef go():\n    return helper.run()\n",
+        ),
+    ];
+    let caller = entity_id(&files, "caller.py", "go");
+    let decoy = entity_id(&files, "pkg/helper.py", "run");
+
+    let relations = link(&files);
+    assert!(
+        !has_call(&relations, caller, decoy),
+        "`helper` is a name inside pkg/mod.py, not the module pkg/helper.py, so \
+         `helper.run()` must not bind to the same-named sibling; the hop is for a \
+         receiver that resolved to a PACKAGE INDEX standing in for a submodule"
+    );
+}
+
+#[test]
 fn a_receiver_naming_a_class_rather_than_a_submodule_is_unchanged() {
     // CONTROL THAT MUST STAY GREEN UNDER EVERY MUTATION OF THE HOP.
     //
@@ -366,7 +402,10 @@ fn a_real_repository_recovers_calls_through_a_package_index_receiver() {
                 {
                     stack.push(path);
                 }
-            } else if path.extension().and_then(|e| e.to_str()) == Some("py") {
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("py" | "js" | "mjs" | "cjs")
+            ) {
                 sources.push(path);
             }
         }
@@ -374,7 +413,7 @@ fn a_real_repository_recovers_calls_through_a_package_index_receiver() {
     sources.sort();
     assert!(
         !sources.is_empty(),
-        "corpus {} holds no .py files, so this arm measured nothing",
+        "corpus {} holds no source files this census can parse, so it measured nothing",
         root.display()
     );
 
@@ -383,7 +422,13 @@ fn a_real_repository_recovers_calls_through_a_package_index_receiver() {
         .filter_map(|path| {
             let rel = path.strip_prefix(&root).ok()?.to_string_lossy().to_string();
             let source = std::fs::read_to_string(path).ok()?;
-            Some(py(&rel, &source))
+            // Pick the adapter by extension so one census covers both hop shapes:
+            // a Python package index standing in for a submodule, and a JavaScript
+            // entry point re-exporting another module wholesale.
+            match path.extension().and_then(|e| e.to_str()) {
+                Some("py") => Some(py(&rel, &source)),
+                _ => Some(js(&rel, &source)),
+            }
         })
         .collect();
 
