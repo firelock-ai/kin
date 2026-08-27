@@ -593,6 +593,49 @@ pub fn trace_constant_score(entity: &Entity, focal_dir: Option<&str>) -> (bool, 
     )
 }
 
+
+/// Which of a node's ranked neighbors a per-step fan-out cap keeps.
+///
+/// `same_file` is one flag per candidate, in relevance order, saying whether
+/// that candidate lives in the expanded node's own file. The return is the
+/// indices to keep, still in relevance order.
+///
+/// The rule is the ordinary top-N, with one floor under it: a cap may not spend
+/// every slot inside the node's own file when the node has a neighbor outside
+/// it. A chain that never leaves the file it started in has not answered a
+/// data-flow question, and the ranking cannot help here, because the term that
+/// crowds the boundary out is a proximity term that no question is an input to.
+/// The measured case is `Session.send` in `psf/requests`: fifteen callees,
+/// eleven of them parser-certain same-file calls at confidence 1.0, and a
+/// four-wide cap that therefore kept four `sessions.py` functions and dropped
+/// every hop that leaves the module.
+///
+/// The reservation takes at most one slot and never takes it before the node's
+/// own file has two, so a two-wide cap still keeps the two best neighbors it
+/// has and nothing about a narrow walk changes. It is a floor, not a fix for
+/// relevance: it guarantees the chain crosses the boundary when it can, and it
+/// does not know which crossing the caller wanted. Naming a target is what
+/// answers that.
+pub fn fanout_cap_keeps(same_file: &[bool], limit: usize) -> Vec<usize> {
+    if same_file.len() <= limit {
+        return (0..same_file.len()).collect();
+    }
+    let mut kept: Vec<usize> = (0..limit).collect();
+    if limit < 3 {
+        return kept;
+    }
+    if kept.iter().any(|&index| !same_file[index]) {
+        return kept;
+    }
+    let Some(crossing) = (limit..same_file.len()).find(|&index| !same_file[index]) else {
+        return kept;
+    };
+    // The lowest-ranked kept slot, so the reservation costs the least relevant
+    // neighbor rather than the best one, and the kept set stays in rank order.
+    kept[limit - 1] = crossing;
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
