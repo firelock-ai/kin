@@ -3763,10 +3763,24 @@ fn narrow_trace_fanout_to_fit(
 ) -> usize {
     let step_of = |value: &serde_json::Value| value["step"].as_u64().unwrap_or(0);
     let parent_of = |value: &serde_json::Value| value["parent_step"].as_u64();
+    // The question this walk was given, so the branch that answers it is not
+    // offered up as "least relevant". Read off the result rather than passed in
+    // because this is the same string the response echoes to the caller, and a
+    // rule keyed on a second copy is a rule that can drift from the answer.
+    let named = result
+        .get("target_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let must_keep = |value: &serde_json::Value| {
+        named.as_deref().is_some_and(|name| {
+            value.get("entity_name").and_then(serde_json::Value::as_str) == Some(name)
+        })
+    };
     let narrowed = crate::budget::narrow_fanout_to_fit(
         discovered,
         &step_of,
         &parent_of,
+        &must_keep,
         &mut |kept: &[serde_json::Value]| {
             result["chain"] = serde_json::Value::Array(kept.to_vec());
             result["total_steps"] = serde_json::Value::from(kept.len());

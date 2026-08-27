@@ -1903,10 +1903,21 @@ fn enforce_response_budget(response: &mut TraceDataFlowResponse) {
         // Narrow first. Every candidate the shared rule offers is measured the
         // way this response will be sent, so the arithmetic is the budget's own
         // rather than an estimate of it.
+        // The question this walk was given. A step standing for the named target
+        // is never offered up as "least relevant", and neither is any step
+        // between it and the focal; a walk that named nothing, or named
+        // something it never reached, protects nothing and narrows as before.
+        let named = response.target_name.clone();
+        let must_keep = |step: &TraceStep| {
+            named
+                .as_deref()
+                .is_some_and(|name| step.entity.entity_name == name)
+        };
         let narrowed = kin_mcp::budget::narrow_fanout_to_fit(
             &full,
             &|step: &TraceStep| step.step as u64,
             &|step: &TraceStep| Some(step.parent_step as u64),
+            &must_keep,
             &mut |kept: &[TraceStep]| {
                 response.chain = kept.to_vec();
                 response.total_steps = kept.len();
