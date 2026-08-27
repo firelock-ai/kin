@@ -879,8 +879,9 @@ mod tests {
     #[test]
     fn an_unreadable_ceiling_still_reports_no_census_when_none_is_resident() {
         let marker = abandoned_marker(Some(GIB), Some(GIB));
-        let explained = daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(0, None), &[])
-            .expect("a near-ceiling grade against a zero ceiling still explains itself");
+        let explained =
+            daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(0, None), &[])
+                .expect("a near-ceiling grade against a zero ceiling still explains itself");
 
         assert!(
             explained.contains("most likely ran out of memory"),
@@ -902,9 +903,14 @@ mod tests {
     #[test]
     fn a_resident_set_at_the_ceiling_without_kernel_accounting_is_only_likely() {
         let marker = abandoned_marker(Some(11 * GIB + GIB / 2), None);
-        let explained =
-            daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(12 * GIB, None), &[])
-                .expect("a dead daemon holding a marker must be explained");
+        let explained = daemon_loss_explanation(
+            marker.as_deref(),
+            false,
+            1_006,
+            &evidence(12 * GIB, None),
+            &[],
+        )
+        .expect("a dead daemon holding a marker must be explained");
         assert!(
             explained.contains("most likely ran out of memory"),
             "an unaccounted death at the ceiling is a prior, not a kernel statement: {explained}"
@@ -1054,9 +1060,14 @@ mod tests {
     #[test]
     fn a_live_daemon_whose_beat_went_quiet_is_reported_as_wedged_rather_than_gone() {
         let marker = abandoned_marker(Some(3 * GIB), Some(3 * GIB));
-        let explained =
-            daemon_loss_explanation(marker.as_deref(), true, 1_400, &evidence(64 * GIB, None), &[])
-                .expect("a marker with a live pid still explains itself");
+        let explained = daemon_loss_explanation(
+            marker.as_deref(),
+            true,
+            1_400,
+            &evidence(64 * GIB, None),
+            &[],
+        )
+        .expect("a marker with a live pid still explains itself");
         assert!(
             explained.contains("still running but stopped beating 400s ago"),
             "a wedged daemon must not be reported as a dead one: {explained}"
@@ -1068,9 +1079,14 @@ mod tests {
     #[test]
     fn an_unsampled_resident_set_reads_as_absent_and_never_as_zero() {
         let marker = abandoned_marker(None, None);
-        let explained =
-            daemon_loss_explanation(marker.as_deref(), false, 1_006, &evidence(12 * GIB, None), &[])
-                .expect("a dead daemon holding a marker must be explained");
+        let explained = daemon_loss_explanation(
+            marker.as_deref(),
+            false,
+            1_006,
+            &evidence(12 * GIB, None),
+            &[],
+        )
+        .expect("a dead daemon holding a marker must be explained");
         assert!(
             explained.contains("published no memory reading"),
             "an unsampled reading must be stated as absent: {explained}"
