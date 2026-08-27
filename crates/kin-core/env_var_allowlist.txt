@@ -68,3 +68,10 @@ KIN_UPDATE_TEST_WORKER_HOME
 KIN_UPDATE_TEST_WORKER_RECOVER
 KIN_UPDATE_TEST_WORKER_SPEC
 KIN_UPDATE_TEST_WORKER_STAGE
+# Name the repository the receiver-hop corpus arm parses, and the symbol it
+# reports incoming callers for. That arm is #[ignore]d and reports rather than
+# asserting a ceiling, so nothing runs without a path here, and it drives a test
+# harness rather than the product: no runtime behaviour keys on either, and
+# nothing an operator sets.
+KIN_RECEIVER_HOP_CORPUS
+KIN_RECEIVER_HOP_FOCAL
