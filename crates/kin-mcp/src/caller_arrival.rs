@@ -86,6 +86,14 @@ pub const UNMEASURED_ARRIVAL_LIMITING_FACTOR: &str = "caller_arrival_unmeasured"
 /// `accounted` is the silent cap this module exists to refuse.
 const FAMILY_FILE_CAP: usize = 200;
 
+/// Evidence rows the published block carries, at most.
+///
+/// The verdict rests on `unaccounted_file_count`, which is never truncated. These
+/// rows are what a reader audits it with, and they are capped because this block
+/// must not become the reason the answer gets evicted from the response budget.
+/// The block says when it truncated, so a short list is never read as a whole one.
+const EVIDENCE_ROW_CAP: usize = 10;
+
 /// How completely this reading could account for the ways a caller reaches the
 /// focal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +171,23 @@ impl CallerArrival {
             "state": self.state.wire(),
             "family_files": self.family_files,
             "family_measured": self.family_measured,
-            "unaccounted_files": self.unaccounted,
+            // How many family files hold unaccounted calls, beside the rows.
+            // The count is the fact the verdict rests on and it is never
+            // truncated; the rows below are evidence a reader can audit it with,
+            // and those are capped.
+            "unaccounted_file_count": self.unaccounted.len(),
+            // Capped, and the cap is named rather than silent. The one response
+            // shape this module adds must not become the reason the answer gets
+            // evicted: a `find_references` returning two rows already carried
+            // close to eight kilobytes of envelope on the run that filed this,
+            // and a hub with two hundred importers would put two hundred more
+            // objects in front of the references a caller asked for.
+            "unaccounted_files": self
+                .unaccounted
+                .iter()
+                .take(EVIDENCE_ROW_CAP)
+                .collect::<Vec<_>>(),
+            "unaccounted_files_truncated": self.unaccounted.len() > EVIDENCE_ROW_CAP,
             "unmeasured_reason": self.unmeasured_reason,
         })
     }
@@ -869,6 +893,70 @@ mod tests {
             observe_caller_arrival(&small, &small_focal).state,
             ArrivalState::Accounted
         );
+    }
+
+    #[test]
+    fn the_published_block_caps_its_evidence_and_says_so() {
+        // The count the verdict rests on is never truncated; the rows a reader
+        // audits it with are. The stranger's second recommendation was that the
+        // envelope is eating the answer, with a two-row `find_references`
+        // carrying close to eight kilobytes of it, so the block this module adds
+        // must not be the reason the references get evicted. A silent cap would
+        // be the same defect wearing this module's name.
+        let store = InMemoryGraph::new();
+        let focal = entity_in("note_body", FOCAL_FILE, Some(2));
+        let focal_module = entity_in("storage", FOCAL_FILE, Some(2));
+        store.upsert_entity(&focal).unwrap();
+        store.upsert_entity(&focal_module).unwrap();
+        let importers = EVIDENCE_ROW_CAP + 5;
+        for index in 0..importers {
+            // No parse-side count, so every one of them is unaccounted.
+            let importer = entity_in(
+                &format!("importer{index}"),
+                &format!("tests/test_{index:03}.py"),
+                None,
+            );
+            store.upsert_entity(&importer).unwrap();
+            store
+                .upsert_relation(&edge(RelationKind::Imports, &importer, &focal_module))
+                .unwrap();
+        }
+
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(arrival.state, ArrivalState::Unaccounted);
+        assert_eq!(arrival.unaccounted.len(), importers);
+
+        let block = arrival.to_json();
+        assert_eq!(
+            block["unaccounted_file_count"],
+            json!(importers),
+            "the count the verdict rests on is never truncated"
+        );
+        assert_eq!(
+            block["unaccounted_files"].as_array().unwrap().len(),
+            EVIDENCE_ROW_CAP,
+            "the evidence rows are capped"
+        );
+        assert_eq!(
+            block["unaccounted_files_truncated"],
+            json!(true),
+            "a capped list must say so, or a short list reads as a whole one"
+        );
+        // And the gate still fires off the capped block, because it keys on the
+        // state and not on the row count.
+        assert!(arrival_gap(&json!({ CALLER_ARRIVAL_KEY: block }))
+            .is_some_and(|gap| gap.starts_with(UNRESOLVED_ARRIVAL_LIMITING_FACTOR)));
+
+        // The control: a family under the cap publishes every row and says it
+        // did not truncate, so the flag cannot become decoration.
+        let (small, small_focal) = store_with(Some(3), 2, true);
+        let small_block = observe_caller_arrival(&small, &small_focal).to_json();
+        assert_eq!(small_block["unaccounted_file_count"], json!(1));
+        assert_eq!(
+            small_block["unaccounted_files"].as_array().unwrap().len(),
+            1
+        );
+        assert_eq!(small_block["unaccounted_files_truncated"], json!(false));
     }
 
     #[test]
