@@ -2,6 +2,8 @@
 // Copyright 2026 Firelock, LLC
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+#[cfg(feature = "vector")]
+use std::io::Read;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,6 +28,258 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{DaemonError, Result};
 use crate::session_registry::SessionCoordinator;
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct DurableVectorTestBackend {
+    inner: Arc<LocalFileBackend>,
+    vectors: Arc<Mutex<DurableVectorTestState>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DurableVectorTestState {
+    artifacts: HashMap<(String, u64, [u8; 32]), kin_db::PersistedVectorArtifact>,
+    corrupt_loads: HashSet<String>,
+    next_cursor: u64,
+    saves: u64,
+}
+
+#[cfg(test)]
+impl DurableVectorTestBackend {
+    pub(crate) fn new(path: &std::path::Path) -> Self {
+        Self {
+            inner: Arc::new(LocalFileBackend::new(path)),
+            vectors: Arc::new(Mutex::new(DurableVectorTestState {
+                next_cursor: 1,
+                ..DurableVectorTestState::default()
+            })),
+        }
+    }
+
+    pub(crate) fn publish_graph(
+        &self,
+        repo_id: &str,
+        graph: &kin_db::InMemoryGraph,
+        expected_generation: u64,
+    ) -> kin_db::Generation {
+        let (bytes, _) = graph
+            .serialize_snapshot_borrowed()
+            .expect("test graph snapshot must serialize");
+        self.inner
+            .save_snapshot(repo_id, &bytes, expected_generation)
+            .expect("test graph snapshot must publish")
+    }
+
+    pub(crate) fn corrupt_vector_loads(&self, repo_id: &str) {
+        self.vectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .corrupt_loads
+            .insert(repo_id.to_string());
+    }
+
+    pub(crate) fn vector_save_count(&self) -> u64 {
+        self.vectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .saves
+    }
+
+    fn current_binding(
+        &self,
+        repo_id: &str,
+    ) -> std::result::Result<kin_db::VectorArtifactBinding, kin_db::KinDbError> {
+        let recovered =
+            kin_db::load_recovered_snapshot(self.inner.as_ref(), repo_id)?.ok_or_else(|| {
+                kin_db::KinDbError::StorageError(format!(
+                    "repo {repo_id}: no graph authority exists for a vector artifact"
+                ))
+            })?;
+        Ok(kin_db::VectorArtifactBinding {
+            graph_generation: recovered.generation,
+            retrieval_authority_hash: kin_db::storage::compute_retrieval_authority_hash(
+                &recovered.snapshot,
+            ),
+        })
+    }
+
+    fn artifact_key(
+        repo_id: &str,
+        binding: kin_db::VectorArtifactBinding,
+    ) -> (String, u64, [u8; 32]) {
+        (
+            repo_id.to_string(),
+            binding.graph_generation,
+            binding.retrieval_authority_hash,
+        )
+    }
+}
+
+#[cfg(test)]
+impl StorageBackend for DurableVectorTestBackend {
+    fn supports_incremental_deltas(&self) -> bool {
+        true
+    }
+
+    fn supports_vector_artifacts(&self) -> bool {
+        true
+    }
+
+    fn load_vector_artifact(
+        &self,
+        repo_id: &str,
+        binding: kin_db::VectorArtifactBinding,
+    ) -> std::result::Result<Option<kin_db::PersistedVectorArtifact>, kin_db::KinDbError> {
+        if self
+            .vectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .corrupt_loads
+            .contains(repo_id)
+        {
+            return Err(kin_db::KinDbError::StorageError(format!(
+                "repo {repo_id}: injected corrupt vector artifact"
+            )));
+        }
+        let current = self.current_binding(repo_id)?;
+        if binding != current {
+            return Err(kin_db::KinDbError::StorageError(format!(
+                "repo {repo_id}: vector artifact binding does not match current graph authority"
+            )));
+        }
+        Ok(self
+            .vectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .artifacts
+            .get(&Self::artifact_key(repo_id, binding))
+            .cloned())
+    }
+
+    fn save_vector_artifact(
+        &self,
+        repo_id: &str,
+        artifact: &kin_db::VectorArtifact,
+        expected: kin_db::VectorArtifactCursor,
+    ) -> kin_db::VectorArtifactSaveOutcome {
+        let current = match self.current_binding(repo_id) {
+            Ok(binding) => binding,
+            Err(error) => return kin_db::VectorArtifactSaveOutcome::NotCommitted(error),
+        };
+        if artifact.binding != current {
+            return kin_db::VectorArtifactSaveOutcome::NotCommitted(
+                kin_db::KinDbError::StorageError(format!(
+                    "repo {repo_id}: vector artifact binding does not match current graph authority"
+                )),
+            );
+        }
+        let mut state = self
+            .vectors
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = Self::artifact_key(repo_id, artifact.binding);
+        let installed = state.artifacts.get(&key).map(|stored| stored.cursor);
+        if installed.unwrap_or(kin_db::VectorArtifactCursor::INITIAL) != expected {
+            return kin_db::VectorArtifactSaveOutcome::NotCommitted(
+                kin_db::KinDbError::StorageError(format!(
+                    "repo {repo_id}: vector artifact cursor changed"
+                )),
+            );
+        }
+        let cursor = kin_db::VectorArtifactCursor::from_backend_generation(state.next_cursor);
+        state.next_cursor += 1;
+        state.saves += 1;
+        state.artifacts.insert(
+            key,
+            kin_db::PersistedVectorArtifact {
+                artifact: artifact.clone(),
+                cursor,
+            },
+        );
+        kin_db::VectorArtifactSaveOutcome::Committed { cursor }
+    }
+
+    fn load_snapshot(
+        &self,
+        repo_id: &str,
+    ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError> {
+        self.inner.load_snapshot(repo_id)
+    }
+
+    fn load_snapshot_authority(
+        &self,
+        repo_id: &str,
+    ) -> std::result::Result<Option<kin_db::SnapshotAuthority>, kin_db::KinDbError> {
+        self.inner.load_snapshot_authority(repo_id)
+    }
+
+    fn load_recovery_state(
+        &self,
+        repo_id: &str,
+    ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
+        self.inner.load_recovery_state(repo_id)
+    }
+
+    fn save_snapshot(
+        &self,
+        repo_id: &str,
+        data: &[u8],
+        expected_gen: kin_db::Generation,
+    ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+        self.inner.save_snapshot(repo_id, data, expected_gen)
+    }
+
+    fn save_delta(
+        &self,
+        repo_id: &str,
+        delta_data: &[u8],
+        base_gen: kin_db::Generation,
+    ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
+        self.inner.save_delta(repo_id, delta_data, base_gen)
+    }
+
+    fn load_deltas_since(
+        &self,
+        repo_id: &str,
+        since_gen: kin_db::Generation,
+    ) -> std::result::Result<Vec<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError> {
+        self.inner.load_deltas_since(repo_id, since_gen)
+    }
+
+    fn clear_deltas(&self, repo_id: &str) -> std::result::Result<(), kin_db::KinDbError> {
+        self.inner.clear_deltas(repo_id)
+    }
+
+    fn save_overlay(
+        &self,
+        repo_id: &str,
+        session_id: &str,
+        data: &[u8],
+    ) -> std::result::Result<(), kin_db::KinDbError> {
+        self.inner.save_overlay(repo_id, session_id, data)
+    }
+
+    fn load_overlay(
+        &self,
+        repo_id: &str,
+        session_id: &str,
+    ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+        self.inner.load_overlay(repo_id, session_id)
+    }
+
+    fn delete_overlay(
+        &self,
+        repo_id: &str,
+        session_id: &str,
+    ) -> std::result::Result<(), kin_db::KinDbError> {
+        self.inner.delete_overlay(repo_id, session_id)
+    }
+
+    fn list_repos(&self) -> std::result::Result<Vec<String>, kin_db::KinDbError> {
+        self.inner.list_repos()
+    }
+}
 
 /// Read-only overlay used to resolve the complete source tree an incoming
 /// change would create without first inserting that change into graph
@@ -1091,15 +1345,22 @@ pub fn resolve_idle_timeout_floor(
 /// What opening a store's vector sidecar did, as the surfaces need to report it.
 ///
 /// Two independent facts rather than one enum, because they answer different
-/// questions and a reader needs both: `discarded` says an index was on disk and
-/// is NOT attached, `salvage` says one IS attached after retiring keys. At most
-/// one is ever set, but folding them into a single field would invite a caller
-/// to treat "no discard" as "nothing was lost", which is precisely the reading
-/// that made a salvaged store render as a first fill (FIR-2562).
+/// questions and a reader needs both: `discarded` says a persisted local or
+/// hosted artifact was not attached, `salvage` says one IS attached after
+/// retiring keys. At most one is ever set, but folding them into a single field
+/// would invite a caller to treat "no discard" as "nothing was lost", which is
+/// precisely the reading that made a salvaged store render as a first fill
+/// (FIR-2562).
 #[derive(Debug, Clone, Default)]
 struct VectorSidecarOpen {
     discarded: Option<String>,
     salvage: Option<crate::VectorSalvage>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct HostedVectorArtifactState {
+    binding: kin_db::VectorArtifactBinding,
+    cursor: kin_db::VectorArtifactCursor,
 }
 
 /// Read kin-db's sidecar load outcome as the salvage fact the surfaces report,
@@ -1167,8 +1428,8 @@ pub struct DaemonState {
     /// error, so an un-hydrated store is reported as the authority gap it is
     /// rather than as a mysteriously absent object.
     ingest_cas_hydration_gap: Option<String>,
-    /// Why the persisted vector index on disk was not installed when this state
-    /// was opened, when one was there and was not.
+    /// Why a persisted local or hosted vector artifact was not installed when
+    /// this state was opened.
     ///
     /// A discarded index is re-derived from scratch, which is minutes to hours
     /// of embedding on a real repository, so it is stated rather than left to
@@ -1212,6 +1473,20 @@ pub struct DaemonState {
     /// `None` = local repository-v6 authority.
     /// `Some` = hosted StorageBackend (GCS or an isolated backend fixture).
     pub storage_backend: Option<Arc<dyn StorageBackend>>,
+    /// Authority binding and compare-and-swap cursor for this hosted
+    /// repository's current durable vector artifact.
+    ///
+    /// A state whose cursor is `INITIAL` means the backend advertised the
+    /// capability and no artifact exists for the loaded graph generation. Any
+    /// other cursor came from a validated load or committed save. The binding
+    /// is recomputed from recovered durable graph authority at open, rather
+    /// than from the reconstructed live graph or from untrusted artifact
+    /// metadata.
+    /// `None` means either local repository-v6 authority, an unsupported
+    /// backend, or a hosted artifact whose state could not be established
+    /// safely. The last case disables embedding writes for this process rather
+    /// than guessing which remote authority or object a save would replace.
+    hosted_vector_artifact: Mutex<Option<HostedVectorArtifactState>>,
     /// Whether the backend this daemon opened against already holds a
     /// repository-authority envelope.
     ///
@@ -1988,6 +2263,197 @@ impl DaemonState {
         }
     }
 
+    fn vector_metadata_path(layout: &KinLayout) -> std::path::PathBuf {
+        layout
+            .kindb_vector_index_path()
+            .with_extension("kvec.meta.json")
+    }
+
+    fn remove_derived_vector_file(path: &std::path::Path) -> std::io::Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Remove the local projection of a hosted vector artifact.
+    ///
+    /// The StorageBackend object is authority. Keeping a sidecar from another
+    /// backend generation on an ephemeral pod disk would let the next open
+    /// accidentally serve an object that was never loaded through the backend
+    /// capability.
+    fn clear_hosted_vector_projection(layout: &KinLayout) -> std::io::Result<()> {
+        Self::remove_derived_vector_file(&layout.kindb_vector_index_path())?;
+        Self::remove_derived_vector_file(&Self::vector_metadata_path(layout))
+    }
+
+    fn replace_derived_vector_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_extension("backend.tmp");
+        let write_result = (|| -> std::io::Result<()> {
+            let mut file = std::fs::File::create(&tmp)?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, path)?;
+            if let Some(parent) = path.parent() {
+                sync_directory_metadata(parent)?;
+            }
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        write_result
+    }
+
+    fn materialize_hosted_vector_artifact(
+        layout: &KinLayout,
+        artifact: &kin_db::VectorArtifact,
+    ) -> std::result::Result<(), String> {
+        if artifact.index.len() as u64 > kin_db::MAX_VECTOR_ARTIFACT_BYTES {
+            return Err(format!(
+                "durable vector artifact is {} bytes, above the {} byte limit",
+                artifact.index.len(),
+                kin_db::MAX_VECTOR_ARTIFACT_BYTES
+            ));
+        }
+        if artifact.metadata.len() as u64 > kin_db::MAX_VECTOR_ARTIFACT_METADATA_BYTES {
+            return Err(format!(
+                "durable vector metadata is {} bytes, above the {} byte limit",
+                artifact.metadata.len(),
+                kin_db::MAX_VECTOR_ARTIFACT_METADATA_BYTES
+            ));
+        }
+
+        let vector_path = layout.kindb_vector_index_path();
+        let metadata_path = Self::vector_metadata_path(layout);
+        Self::clear_hosted_vector_projection(layout).map_err(|error| {
+            format!(
+                "could not clear the prior local vector projection before backend load: {error}"
+            )
+        })?;
+        if let Err(error) = Self::replace_derived_vector_file(&vector_path, &artifact.index)
+            .and_then(|()| Self::replace_derived_vector_file(&metadata_path, &artifact.metadata))
+        {
+            let _ = Self::clear_hosted_vector_projection(layout);
+            return Err(format!(
+                "could not materialize the durable vector artifact locally: {error}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn load_hosted_vector_artifact(
+        layout: &KinLayout,
+        backend: &dyn StorageBackend,
+        repo_id: &str,
+        graph: &kin_db::InMemoryGraph,
+        generation: kin_db::Generation,
+        retrieval_authority_hash: [u8; 32],
+    ) -> (VectorSidecarOpen, Option<HostedVectorArtifactState>) {
+        if !backend.supports_vector_artifacts() || generation == kin_db::GENERATION_INIT {
+            if let Err(error) = Self::clear_hosted_vector_projection(layout) {
+                let reason = format!(
+                    "the stale local vector projection could not be cleared ({error}); hosted embedding persistence is disabled"
+                );
+                warn!(repo_id, reason, "hosted vector projection cleanup failed");
+                return (
+                    VectorSidecarOpen {
+                        discarded: Some(reason),
+                        salvage: None,
+                    },
+                    None,
+                );
+            }
+            return (VectorSidecarOpen::default(), None);
+        }
+
+        let binding = kin_db::VectorArtifactBinding {
+            graph_generation: generation,
+            retrieval_authority_hash,
+        };
+        let persisted = match backend.load_vector_artifact(repo_id, binding) {
+            Ok(persisted) => persisted,
+            Err(error) => {
+                let _ = Self::clear_hosted_vector_projection(layout);
+                let reason = format!(
+                    "the durable vector artifact for graph generation {generation} could not be loaded ({error}); graph serving continues but embedding persistence is disabled"
+                );
+                warn!(repo_id, generation, error = %error, "durable vector artifact load failed");
+                return (
+                    VectorSidecarOpen {
+                        discarded: Some(reason),
+                        salvage: None,
+                    },
+                    None,
+                );
+            }
+        };
+        let Some(persisted) = persisted else {
+            if let Err(error) = Self::clear_hosted_vector_projection(layout) {
+                let reason = format!(
+                    "no durable vector artifact exists for graph generation {generation}, and the stale local projection could not be cleared ({error})"
+                );
+                return (
+                    VectorSidecarOpen {
+                        discarded: Some(reason),
+                        salvage: None,
+                    },
+                    None,
+                );
+            }
+            return (
+                VectorSidecarOpen::default(),
+                Some(HostedVectorArtifactState {
+                    binding,
+                    cursor: kin_db::VectorArtifactCursor::INITIAL,
+                }),
+            );
+        };
+
+        if persisted.artifact.binding != binding {
+            let _ = Self::clear_hosted_vector_projection(layout);
+            let reason = format!(
+                "the durable vector artifact returned for graph generation {generation} carried a different graph-authority binding"
+            );
+            warn!(
+                repo_id,
+                generation, "durable vector artifact binding mismatch"
+            );
+            return (
+                VectorSidecarOpen {
+                    discarded: Some(reason),
+                    salvage: None,
+                },
+                None,
+            );
+        }
+        if let Err(reason) = Self::materialize_hosted_vector_artifact(layout, &persisted.artifact) {
+            warn!(
+                repo_id,
+                generation, reason, "durable vector artifact materialization failed"
+            );
+            return (
+                VectorSidecarOpen {
+                    discarded: Some(reason),
+                    salvage: None,
+                },
+                None,
+            );
+        }
+
+        (
+            Self::load_validated_vector_index(layout, graph),
+            Some(HostedVectorArtifactState {
+                binding,
+                cursor: persisted.cursor,
+            }),
+        )
+    }
+
     /// Why the persisted vector index retired coverage at open, when it did.
     ///
     /// Reported beside `vector_index_discarded` rather than folded into it,
@@ -1998,9 +2464,9 @@ impl DaemonState {
         self.vector_index_salvage
     }
 
-    /// Why the persisted vector index was not installed at open, when it was
-    /// there and was not. Reported by `/health` and by semantic-query readiness
-    /// so a coverage counter that restarted at zero comes with its reason.
+    /// Why the persisted local or hosted vector artifact was not installed at
+    /// open. Reported by `/health` and by semantic-query readiness so a coverage
+    /// counter that restarted at zero comes with its reason.
     pub fn vector_index_discarded(&self) -> Option<&str> {
         self.vector_index_discarded.as_deref()
     }
@@ -2693,6 +3159,7 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: None,
+            hosted_vector_artifact: Mutex::new(None),
             hosted_authority_envelope: false,
             hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: Some(local_repository_backend),
@@ -2829,52 +3296,55 @@ impl DaemonState {
         allowed_repo_ids: Option<HashSet<String>>,
     ) -> Result<Self> {
         let text_index_path = layout.text_index_dir();
-        let (graph, generation, loaded_snapshot, hosted_authority_envelope) =
-            match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
-                .map_err(DaemonError::from)?
-            {
-                Some(recovered) => {
-                    // Read before the move: `from_snapshot_with_text_index`
-                    // discards this field by design, because the envelope is
-                    // owned by the publication manager and never by the
-                    // in-place mutable graph. This is the last point at which
-                    // the daemon can see whether the object it opened is one
-                    // an envelope-free write would erase.
-                    let hosted_authority_envelope =
-                        recovered.snapshot.repository_authority.is_some();
-                    let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                        recovered.snapshot,
-                        text_index_path.clone(),
-                    )
-                    .map_err(DaemonError::from)?;
-                    info!(
-                        repo_id,
-                        generation = recovered.generation,
-                        deltas_replayed = recovered.deltas_applied,
-                        hosted_authority_envelope,
-                        "loaded graph from storage backend"
-                    );
-                    (
-                        Arc::new(g),
-                        recovered.generation,
-                        true,
-                        hosted_authority_envelope,
-                    )
-                }
-                None => {
-                    info!(repo_id, "no snapshot found, starting with empty graph");
-                    // In cloud mode, an empty graph IS the valid initial state.
-                    // Mark as initialized so the readiness probe passes.
-                    (
-                        Arc::new(kin_db::InMemoryGraph::with_text_index(
-                            text_index_path.clone(),
-                        )),
-                        0,
-                        true,
-                        false,
-                    )
-                }
-            };
+        let (
+            graph,
+            generation,
+            loaded_snapshot,
+            hosted_authority_envelope,
+            retrieval_authority_hash,
+        ) = match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
+            .map_err(DaemonError::from)?
+        {
+            Some(recovered) => {
+                // Read before the move: `from_snapshot_with_text_index`
+                // discards this field by design, because the envelope is
+                // owned by the publication manager and never by the
+                // in-place mutable graph. This is the last point at which
+                // the daemon can see whether the object it opened is one
+                // an envelope-free write would erase.
+                let hosted_authority_envelope = recovered.snapshot.repository_authority.is_some();
+                let retrieval_authority_hash =
+                    kin_db::storage::compute_retrieval_authority_hash(&recovered.snapshot);
+                let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                    recovered.snapshot,
+                    text_index_path.clone(),
+                )
+                .map_err(DaemonError::from)?;
+                info!(
+                    repo_id,
+                    generation = recovered.generation,
+                    deltas_replayed = recovered.deltas_applied,
+                    hosted_authority_envelope,
+                    "loaded graph from storage backend"
+                );
+                (
+                    Arc::new(g),
+                    recovered.generation,
+                    true,
+                    hosted_authority_envelope,
+                    retrieval_authority_hash,
+                )
+            }
+            None => {
+                info!(repo_id, "no snapshot found, starting with empty graph");
+                // In cloud mode, an empty graph IS the valid initial state.
+                // Mark as initialized so the readiness probe passes.
+                let graph = kin_db::InMemoryGraph::with_text_index(text_index_path.clone());
+                let retrieval_authority_hash =
+                    kin_db::storage::compute_retrieval_authority_hash(&graph.to_snapshot());
+                (Arc::new(graph), 0, true, false, retrieval_authority_hash)
+            }
+        };
 
         let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
         let backend: Arc<dyn StorageBackend> = Arc::from(backend);
@@ -2904,10 +3374,18 @@ impl DaemonState {
                     Some(reason)
                 }
             };
-        // The backend path builds the graph via `from_snapshot_with_text_index`,
-        // which does NOT load the vector-index sidecar — do the validated load
-        // here (no-ops if no/stale sidecar).
-        let sidecar_open = Self::load_validated_vector_index(&layout, graph.as_ref());
+        // Hosted local disk is only a projection cache. Resolve the vector
+        // artifact through the same backend authority as the graph, bind it to
+        // the recovered generation and retrieval hash, then materialize it for
+        // kin-db's existing model/dimension/coverage validator.
+        let (sidecar_open, hosted_vector_artifact) = Self::load_hosted_vector_artifact(
+            &layout,
+            backend.as_ref(),
+            repo_id,
+            graph.as_ref(),
+            generation,
+            retrieval_authority_hash,
+        );
         let mut reconciler = Reconciler::new(layout.working_dir().to_path_buf());
         reconciler.seed_lkg_entities_from_graph(graph.as_ref());
         reconciler.seed_cross_file_linker_from_graph(graph.as_ref());
@@ -2949,6 +3427,7 @@ impl DaemonState {
             is_initialized: AtomicBool::new(loaded_snapshot),
             reconciliation_status: AtomicU8::new(RECON_IDLE),
             storage_backend: Some(backend),
+            hosted_vector_artifact: Mutex::new(hosted_vector_artifact),
             hosted_authority_envelope,
             hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: None,
@@ -4499,15 +4978,25 @@ impl DaemonState {
         self.save_snapshot_impl(SnapshotSaveMode::Full)
     }
 
-    /// Whether derived embedding progress may be checkpointed in a local
-    /// vector sidecar.
+    /// Whether derived embedding progress has a durable checkpoint path.
     ///
-    /// A configured `StorageBackend` owns a distinct generation cursor (GCS in
-    /// hosted deployments). Until that backend has an explicit vector-sidecar
-    /// persistence contract, writing a local sidecar against its remote graph
-    /// generation is unsafe and must fail loud.
+    /// Local repository-v6 authority owns its local sidecar. Hosted authority
+    /// must advertise vector artifacts, must have a non-initial graph
+    /// generation to bind them to, and must hold a known artifact CAS cursor.
+    /// A corrupt or indeterminate remote object clears that cursor and fails
+    /// closed for the lifetime of this process.
     pub(crate) fn can_persist_embed_progress_locally(&self) -> bool {
-        self.storage_backend.is_none()
+        let Some(backend) = self.storage_backend.as_ref() else {
+            return true;
+        };
+        let generation = self.snapshot_generation.load(Ordering::SeqCst);
+        backend.supports_vector_artifacts()
+            && generation != kin_db::GENERATION_INIT
+            && self.hosted_vector_artifact.lock().is_ok_and(|state| {
+                state
+                    .as_ref()
+                    .is_some_and(|state| state.binding.graph_generation == generation)
+            })
     }
 
     /// Persist every exact-mode source object referenced by `changes` before
@@ -4993,9 +5482,134 @@ impl DaemonState {
         let generation = self.snapshot_generation.load(Ordering::SeqCst);
         Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
             format!(
-                "{operation} skipped: storage-backend graph authority is at generation {generation}, and no backend vector-sidecar persistence contract exists; refusing a local derived checkpoint against remote authority"
+                "{operation} skipped: storage-backend graph authority is at generation {generation}, but durable vector-artifact capability or its compare-and-swap cursor is unavailable; refusing a local derived checkpoint without a backend authority binding"
             ),
         )))
+    }
+
+    #[cfg(feature = "vector")]
+    fn read_bounded_vector_artifact_file(
+        path: &std::path::Path,
+        max_bytes: u64,
+        label: &str,
+    ) -> Result<Vec<u8>> {
+        let file = std::fs::File::open(path).map_err(DaemonError::from)?;
+        let length = file.metadata().map_err(DaemonError::from)?.len();
+        if length > max_bytes {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "{label} at {} is {length} bytes, above the {max_bytes} byte limit",
+                    path.display()
+                ),
+            )));
+        }
+        let capacity = usize::try_from(length).map_err(|_| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "{label} at {} cannot fit in this process address space",
+                path.display()
+            )))
+        })?;
+        let mut bytes = Vec::with_capacity(capacity);
+        file.take(max_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(DaemonError::from)?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "{label} at {} grew above the {max_bytes} byte limit while it was read",
+                    path.display()
+                ),
+            )));
+        }
+        Ok(bytes)
+    }
+
+    #[cfg(feature = "vector")]
+    fn persist_hosted_vector_artifact(&self, generation: kin_db::Generation) -> Result<()> {
+        let Some(backend) = self.storage_backend.as_ref() else {
+            return Ok(());
+        };
+        if self.snapshot_generation.load(Ordering::SeqCst) != generation {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "refusing durable vector artifact save: graph generation moved away from {generation}"
+                ),
+            )));
+        }
+        let hosted = self
+            .hosted_vector_artifact
+            .lock()
+            .ok()
+            .and_then(|state| *state)
+            .ok_or_else(|| {
+                DaemonError::Graph(kin_db::KinDbError::StorageError(
+                    "durable vector artifact save has no trusted graph binding and compare-and-swap cursor"
+                        .to_string(),
+                ))
+            })?;
+        if hosted.binding.graph_generation != generation {
+            return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
+                format!(
+                    "refusing durable vector artifact save: trusted binding names graph generation {}, not {generation}",
+                    hosted.binding.graph_generation
+                ),
+            )));
+        }
+        let vector_path = self.layout.kindb_vector_index_path();
+        let metadata_path = Self::vector_metadata_path(&self.layout);
+        let metadata = Self::read_bounded_vector_artifact_file(
+            &metadata_path,
+            kin_db::MAX_VECTOR_ARTIFACT_METADATA_BYTES,
+            "vector artifact metadata",
+        )?;
+        let artifact = kin_db::VectorArtifact {
+            // This was derived once from the exact recovered backend snapshot.
+            // Do not substitute the reconstructed live graph or the opaque
+            // validator metadata here: either can legitimately carry a
+            // different derived stamp, while the backend contract requires the
+            // hash of the durable graph authority it is comparing against.
+            binding: hosted.binding,
+            metadata,
+            index: Self::read_bounded_vector_artifact_file(
+                &vector_path,
+                kin_db::MAX_VECTOR_ARTIFACT_BYTES,
+                "vector artifact index",
+            )?,
+        };
+
+        match backend.save_vector_artifact(&self.cached_repo_id, &artifact, hosted.cursor) {
+            kin_db::VectorArtifactSaveOutcome::Committed { cursor } => {
+                let mut installed = self.hosted_vector_artifact.lock().map_err(|_| {
+                    DaemonError::Io(std::io::Error::other(
+                        "hosted vector artifact state lock poisoned",
+                    ))
+                })?;
+                *installed = Some(HostedVectorArtifactState {
+                    binding: hosted.binding,
+                    cursor,
+                });
+                Ok(())
+            }
+            kin_db::VectorArtifactSaveOutcome::NotCommitted(error) => {
+                let reason = format!(
+                    "durable vector artifact was not committed for graph generation {generation}: {error}"
+                );
+                #[cfg(feature = "embeddings")]
+                self.record_deferred_vector_checkpoint(reason.clone());
+                Err(DaemonError::Graph(kin_db::KinDbError::StorageError(reason)))
+            }
+            kin_db::VectorArtifactSaveOutcome::Indeterminate(error) => {
+                if let Ok(mut installed) = self.hosted_vector_artifact.lock() {
+                    *installed = None;
+                }
+                let reason = format!(
+                    "durable vector artifact commit is indeterminate for graph generation {generation}: {error}; embedding persistence is disabled until reopen"
+                );
+                #[cfg(feature = "embeddings")]
+                self.record_deferred_vector_checkpoint(reason.clone());
+                Err(DaemonError::Graph(kin_db::KinDbError::StorageError(reason)))
+            }
+        }
     }
 
     fn save_snapshot_impl(&self, mode: SnapshotSaveMode) -> Result<()> {
@@ -5224,6 +5838,15 @@ impl DaemonState {
         // receipt that may arrive while derived-index I/O is finishing.
         if self.storage_backend.is_some() {
             self.snapshot_generation.store(new_gen, Ordering::SeqCst);
+            if committed && new_gen != expected_gen {
+                if let Ok(mut hosted) = self.hosted_vector_artifact.lock() {
+                    // The new generation's durable retrieval hash must come
+                    // from a recovery read, not from the mutable live graph.
+                    // Clear the old binding until reopen establishes that exact
+                    // authority and its independent vector cursor.
+                    *hosted = None;
+                }
+            }
         }
 
         if committed {
@@ -5292,17 +5915,20 @@ impl DaemonState {
         // provider/model/revision/epoch, which is what decides on reload
         // whether these vectors are still usable. Stamping this binary's build
         // SHA instead made the sidecar unloadable by the next release.
-        kin_db::SnapshotManager::checkpoint_vector_index_for_graph(
+        let checkpointed = kin_db::SnapshotManager::checkpoint_vector_index_for_graph(
             self.layout.kindb_snapshot_path(),
             self.graph.as_ref(),
             None,
         )
         .map_err(DaemonError::from)?;
-        // Cleared only after the sidecar write returns. Clearing on entry, or
-        // beside the authority proof above, would retire the record while the
-        // work it describes was still undurable, which is the state the record
-        // exists to keep visible.
-        self.clear_deferred_vector_checkpoint();
+        if checkpointed {
+            self.persist_hosted_vector_artifact(generation)?;
+            // Cleared only after both the local sidecar projection and, for a
+            // hosted daemon, the backend compare-and-swap return committed.
+            // Clearing earlier would retire the record while its vectors were
+            // still process-local.
+            self.clear_deferred_vector_checkpoint();
+        }
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
             self.finalize_committed_generation(generation)?;
         }
@@ -5405,7 +6031,12 @@ impl DaemonState {
             self.graph.as_ref(),
             None,
         )
-        .map_err(DaemonError::from)
+        .map_err(DaemonError::from)?;
+        let generation = self.snapshot_generation.load(Ordering::SeqCst);
+        self.persist_hosted_vector_artifact(generation)?;
+        #[cfg(feature = "embeddings")]
+        self.clear_deferred_vector_checkpoint();
+        Ok(())
     }
 
     #[cfg(not(feature = "vector"))]
@@ -6131,9 +6762,10 @@ impl DaemonState {
 
     /// True when the background embedding worker will still consume whatever is
     /// queued. Mirrors the three conditions under which the worker stands down:
-    /// a storage-backend graph has no durable vector-sidecar contract so the
-    /// worker never starts, a permanently failed worker has already exited, and
-    /// a paused worker leaves the queue alone until an explicit embed resumes it.
+    /// hosted graph authority has no trusted durable vector artifact binding and
+    /// cursor so the worker never starts, a permanently failed worker has
+    /// already exited, and a paused worker leaves the queue alone until an
+    /// explicit embed resumes it.
     ///
     /// Callers that treat a queued backlog as live work must gate on this.
     /// A backlog nobody will drain is not work in progress, and counting it as
@@ -6339,6 +6971,199 @@ mod tests {
     };
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
+
+    #[test]
+    fn durable_hosted_vector_backend_enables_embedding_persistence_and_worker_drain() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-worker";
+        backend.publish_graph(repo_id, &kin_db::InMemoryGraph::new(), 0);
+
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend), repo_id, None).unwrap();
+
+        assert!(
+            state.can_persist_embed_progress_locally(),
+            "a hosted backend with durable vector artifacts must admit embedding progress"
+        );
+        assert!(
+            state.background_embed_worker_can_drain(),
+            "the background worker must not be disabled when progress is durable"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hosted_vector_checkpoint_reopens_from_the_backend_artifact_after_restart() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-restart";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("persisted_vector", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors.save(&layout.kindb_vector_index_path()).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&layout.kindb_vector_index_path(), &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(1)
+        ));
+        std::fs::remove_file(layout.kindb_vector_index_path()).unwrap();
+
+        state.flush_embed_progress().unwrap();
+        state
+            .flush_embed_progress()
+            .expect("a second checkpoint must replace through the loaded CAS cursor");
+        assert_eq!(backend.vector_save_count(), 2);
+        drop(state);
+        let restarted_working = tempfile::tempdir().unwrap();
+        let restarted_layout = kin_core::init(restarted_working.path()).unwrap().layout;
+
+        let reopened = DaemonState::open_with_backend(
+            restarted_layout,
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            reopened.graph.embedding_status().indexed,
+            1,
+            "restart coverage must come from the backend artifact, not prior process memory"
+        );
+        assert!(reopened.can_persist_embed_progress_locally());
+        assert_eq!(
+            backend.vector_save_count(),
+            2,
+            "reopen must not rewrite an already committed artifact"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hosted_vector_checkpoint_refuses_a_graph_generation_that_moved_remotely() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-stale";
+        let graph = kin_db::InMemoryGraph::new();
+        let generation = backend.publish_graph(repo_id, &graph, 0);
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
+                .unwrap();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        vectors
+            .save(&state.layout.kindb_vector_index_path())
+            .unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&state.layout.kindb_vector_index_path(), &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(0)
+        ));
+        std::fs::remove_file(state.layout.kindb_vector_index_path()).unwrap();
+
+        let advanced = kin_db::InMemoryGraph::new();
+        advanced
+            .upsert_entity(&test_entity("remote_successor", "src/remote.rs"))
+            .unwrap();
+        backend.publish_graph(repo_id, &advanced, generation);
+
+        let error = state
+            .flush_embed_progress()
+            .expect_err("a stale daemon must not publish vectors for newer graph authority");
+        assert!(
+            error.to_string().contains("generation"),
+            "the refusal must name the stale generation boundary: {error:#}"
+        );
+        assert_eq!(
+            backend.vector_save_count(),
+            0,
+            "stale graph authority must be refused before the vector backend CAS"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn corrupt_hosted_vector_artifact_keeps_graph_serving_but_disables_persistence() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-corrupt";
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("graph_survives", "src/lib.rs"))
+            .unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        vectors.save(&layout.kindb_vector_index_path()).unwrap();
+        assert!(matches!(
+            state
+                .graph
+                .load_vector_index_compatible(&layout.kindb_vector_index_path(), &descriptor),
+            kin_db::vector::VectorIndexLoad::Loaded(0)
+        ));
+        std::fs::remove_file(layout.kindb_vector_index_path()).unwrap();
+        state.flush_embed_progress().unwrap();
+        drop(state);
+
+        backend.corrupt_vector_loads(repo_id);
+        DaemonState::clear_hosted_vector_projection(&layout).unwrap();
+        let reopened =
+            DaemonState::open_with_backend(layout, Box::new(backend), repo_id, None).unwrap();
+
+        assert_eq!(reopened.graph.entity_count(), 1);
+        assert!(
+            reopened
+                .vector_index_discarded()
+                .is_some_and(|reason| reason.contains("durable vector artifact")),
+            "corruption must be visible rather than rendered as a fresh empty index"
+        );
+        assert!(
+            !reopened.can_persist_embed_progress_locally(),
+            "an unreadable artifact has no trustworthy replacement cursor"
+        );
+    }
 
     #[test]
     fn directory_metadata_sync_is_portable() {

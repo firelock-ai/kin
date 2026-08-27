@@ -705,17 +705,19 @@ pub struct HealthResponse {
     /// until restart. A true value drives `status: "attention"`.
     #[serde(default)]
     pub embed_worker_failed: bool,
-    /// Whether this daemon's storage backend lacks a durable persistence
-    /// contract for embedding/vector sidecars. This is distinct from a worker
-    /// crash: the worker is intentionally disabled and `/embed` fails closed.
-    /// A true value drives `status: "attention"`.
+    /// Whether this daemon lacks a safe durable checkpoint for embedding/vector
+    /// progress. A backend may lack the capability entirely, or a corrupt or
+    /// indeterminate artifact may leave no trustworthy compare-and-swap cursor.
+    /// This is distinct from a worker crash: the worker is intentionally
+    /// disabled and `/embed` fails closed. A true value drives
+    /// `status: "attention"`.
     #[serde(default)]
     pub embed_persistence_unavailable: bool,
-    /// Why the persisted vector index was not installed when this daemon
-    /// opened, when one was on disk and was not. The graph is intact and every
-    /// query is still served; the index is being re-derived from zero, which is
-    /// worth stating because the only other evidence is a coverage counter that
-    /// restarted without explanation. A value drives `status: "attention"`.
+    /// Why a persisted local or hosted vector artifact was not installed when
+    /// this daemon opened. The graph is intact and every query is still served;
+    /// the index is being re-derived from zero, which is worth stating because
+    /// the only other evidence is a coverage counter that restarted without
+    /// explanation. A value drives `status: "attention"`.
     ///
     /// This describes one daemon's open and so holds for that process's life,
     /// the same way `embed_worker_failed` does, rather than clearing when the
@@ -7002,7 +7004,7 @@ async fn embed(
         if !state.can_persist_embed_progress_locally() {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
-                "embedding unavailable: storage-backend graph authority has no durable vector-sidecar persistence contract; refusing a local derived-index checkpoint while graph serving remains available".to_string(),
+                "embedding unavailable: durable vector-artifact capability or its compare-and-swap cursor is unavailable; refusing an unbound checkpoint while graph serving remains available".to_string(),
             ));
         }
 
@@ -23364,6 +23366,114 @@ mod tests {
             !json.embed_worker_failed,
             "unsupported persistence is a capability degradation, not a worker crash"
         );
+    }
+
+    #[tokio::test]
+    async fn hosted_vector_health_accepts_generation_bound_durability() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = crate::state::DurableVectorTestBackend::new(storage.path());
+        let repo_id = "hosted-health-durable-vector";
+        backend.publish_graph(repo_id, &kin_db::InMemoryGraph::new(), 0);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), repo_id, None).unwrap(),
+        );
+
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "ok");
+        assert!(
+            !json.embed_persistence_unavailable,
+            "durable backend vector artifacts must clear the hosted persistence alert"
+        );
+        assert!(json.vector_index_discarded.is_none());
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[tokio::test]
+    async fn explicit_embed_accepts_a_durable_hosted_vector_backend() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = crate::state::DurableVectorTestBackend::new(storage.path());
+        let repo_id = "hosted-explicit-embed-durable-vector";
+        backend.publish_graph(repo_id, &kin_db::InMemoryGraph::new(), 0);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), repo_id, None).unwrap(),
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::post("/embed")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "batch_size": 4,
+                            "json": true,
+                            "max_seconds": 1,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the durable capability must reach the explicit embed route"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::embed::EmbedResponse =
+            serde_json::from_slice(&body).unwrap();
+        assert_eq!(result.result.total_entities, 0);
+    }
+
+    #[tokio::test]
+    async fn corrupt_hosted_vector_artifact_surfaces_health_attention() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = crate::state::DurableVectorTestBackend::new(storage.path());
+        let repo_id = "hosted-health-corrupt-vector";
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("graph_still_serves", "src/lib.rs"))
+            .unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+        backend.corrupt_vector_loads(repo_id);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), repo_id, None).unwrap(),
+        );
+
+        let response = router(state)
+            .oneshot(Request::get("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let json: HealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.status, "attention");
+        assert!(json.embed_persistence_unavailable);
+        assert!(
+            json.vector_index_discarded
+                .is_some_and(|reason| reason.contains("durable vector artifact")),
+            "corruption must be named rather than rendered as missing coverage"
+        );
+        assert_eq!(json.graph_entity_count, Some(1));
     }
 
     /// One commit pays for exactly one repository-authority successor.
