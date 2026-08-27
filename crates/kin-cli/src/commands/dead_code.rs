@@ -282,11 +282,60 @@ fn build_dead_code_report(
     let method_row = |entity: &kin_model::Entity| {
         kin_core::reference_coverage::kind_under_resolves_incoming_calls(entity.kind)
     };
+    //
+    // The fifth trigger, and the one the v0.6.1 stranger run bought (FIR-2821).
+    // The four above ask whether the graph can support an absence claim in
+    // general. None of them asks the question a delete list actually turns on:
+    // could a caller of THIS row have arrived through a call the linker
+    // recorded no edge for? `find_references` has refused to certify an empty
+    // result on that ground since FIR-2775, reading
+    // `kin_mcp::caller_arrival`. This command read the same edges and applied
+    // none of it, so on a package whose CLI reached its modules through
+    // `from . import mod` the scan listed eleven live functions with no caveat
+    // at all while carefully hedging the one row it could resolve. The reading
+    // is the same one the MCP surface publishes, so the two surfaces cannot
+    // disagree about the same graph generation.
+    //
+    // Memoized per FILE rather than per row. `observe_caller_arrival` consults
+    // the focal only through its file of origin and its language, and it walks
+    // up to `FAMILY_FILE_CAP` importing files per reading, so a scan listing
+    // forty rows out of three files takes three readings and not forty.
+    let mut arrival_by_file: std::collections::HashMap<
+        kin_model::FilePathId,
+        Option<(&'static str, String)>,
+    > = std::collections::HashMap::new();
+    let mut arrival_rows: std::collections::HashMap<EntityId, &'static str> =
+        std::collections::HashMap::new();
+    let mut arrival_reasons: std::collections::BTreeMap<&'static str, String> =
+        std::collections::BTreeMap::new();
+    for entity in unreferenced.iter().chain(test_only.iter()) {
+        let Some(file) = entity.file_origin.clone() else {
+            continue;
+        };
+        let gap = arrival_by_file.entry(file).or_insert_with(|| {
+            let arrival = kin_mcp::caller_arrival::observe_caller_arrival(graph, entity);
+            let factor = match arrival.state {
+                kin_mcp::caller_arrival::ArrivalState::Accounted => return None,
+                kin_mcp::caller_arrival::ArrivalState::Unaccounted => {
+                    kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR
+                }
+                kin_mcp::caller_arrival::ArrivalState::Unmeasured => {
+                    kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+                }
+            };
+            arrival.limiting_factor().map(|reason| (factor, reason))
+        });
+        if let Some((factor, reason)) = gap.clone() {
+            arrival_rows.insert(entity.id, factor);
+            arrival_reasons.entry(factor).or_insert(reason);
+        }
+    }
     let row_is_unverified = |entity: &kin_model::Entity| {
         manifest_gap.is_some()
             || name_only_ids.contains(&entity.id)
             || unsupportable.contains_key(&entity.language.to_string())
             || method_row(entity)
+            || arrival_rows.contains_key(&entity.id)
     };
     let unverified_rows = unreferenced.iter().filter(|e| row_is_unverified(e)).count();
     let mut unverified_reasons: Vec<String> = unsupportable.values().cloned().collect();
@@ -313,6 +362,19 @@ fn build_dead_code_report(
         unverified_reasons.push(format!(
             "{method_rows} listed entities are methods, and {}",
             kin_core::reference_coverage::method_absence_limiting_factor("an empty result")
+        ));
+    }
+    // Counted across both lists for the same reason methods are: a test-only row
+    // claims no PRODUCTION caller exists, and an unaccounted arrival is exactly
+    // the shape a production caller goes missing in.
+    for (factor, reason) in &arrival_reasons {
+        let rows = unreferenced
+            .iter()
+            .chain(test_only.iter())
+            .filter(|entity| arrival_rows.get(&entity.id) == Some(factor))
+            .count();
+        unverified_reasons.push(format!(
+            "{rows} listed entities sit in a file where {reason}"
         ));
     }
     unverified_reasons.extend(manifest_gap.clone());
@@ -412,6 +474,8 @@ fn build_dead_code_report(
                 "  [unverified: {}] ",
                 kin_core::reference_coverage::METHOD_ABSENCE_LIMITING_FACTOR
             )
+        } else if let Some(factor) = arrival_rows.get(&entity.id) {
+            format!("  [unverified: {factor}] ")
         } else if row_is_unverified(entity) {
             "  [unverified] ".to_string()
         } else {

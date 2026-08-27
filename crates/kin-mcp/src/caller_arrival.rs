@@ -32,13 +32,22 @@
 //!   entities.
 //!
 //! A file whose parse side exceeds its edge side holds calls that reached no
-//! destination. That is not by itself a defect: a call into a third-party
-//! package cannot resolve to an in-repo entity either. The linker records those
-//! as unresolved-receiver placeholders, which ARE `Calls` edges and so are
-//! counted here, which is what keeps an ordinary dependency call from reading as
-//! a gap. What remains in the shortfall is calls the linker dropped without a
-//! placeholder, and that is exactly the ambiguity class the focal could be
-//! hiding in.
+//! destination. When this was written the linker minted an unresolved-receiver
+//! placeholder for a call it could not settle, which IS a `Calls` edge, so an
+//! ordinary call into a third-party package stayed out of the shortfall. That
+//! tier was removed in kin#1186, so the shortfall now also carries every call
+//! into a package this repository does not hold, and a file that calls its
+//! standard library reads as a gap on that alone. Measured on the v0.6.1
+//! stranger corpus: `notekeeper/cli.py` parses 57 call sites and the graph
+//! holds 12 edges from its entities.
+//!
+//! So the shortfall is a CEILING on the ambiguity rather than a measure of it,
+//! and this reading is deliberately the conservative side of that: it refuses
+//! to certify where it cannot separate the two, and it never certifies on a
+//! count it did not take. Narrowing it wants a parse-side count that excludes
+//! calls through a receiver bound outside the repository, which the extractor
+//! cannot produce because externality is a linker fact; that is tracked
+//! separately and is not this module's to assume.
 //!
 //! ## Why it is scoped to a family rather than to the store
 //!
@@ -253,6 +262,26 @@ impl CallerArrival {
 /// file in its own source, so a call from it could have reached the focal.
 const FAMILY_KINDS: [RelationKind; 2] = [RelationKind::Imports, RelationKind::Includes];
 
+/// The second way a file names another one, and the one this reading was blind
+/// to until FIR-2821.
+///
+/// `from . import linkgraph` binds a MODULE, not any name inside it, so it
+/// produces no `Imports` edge into any entity of `linkgraph.py`. What it
+/// produces is a `References` edge into that file's `Module` entity, one per
+/// referencing entity. The family was built from [`FAMILY_KINDS`] alone, so a
+/// file reached only this way had an EMPTY family and took the empty-family
+/// branch, which certifies. That is the exact shape of the finding: on the
+/// v0.6.1 stranger corpus `notekeeper/linkgraph.py` is named by 35 such edges
+/// from `cli.py` and `tests/test_linkgraph.py`, and this reading answered
+/// `accounted` with `family_files: 0` over it. A gate that certifies the one
+/// shape it was added to catch is a check that cannot fail.
+///
+/// Narrow on purpose: only a reference whose destination is a `Module` entity
+/// of the focal's own file counts. A `References` edge into a function or a
+/// type is a mention rather than a module binding, and admitting those would
+/// put most of the repository in most families.
+const MODULE_BINDING_KIND: RelationKind = RelationKind::References;
+
 /// Read the per-file parse-side call count the extractor stamped on every
 /// entity of the file. `None` means unmeasured, never zero.
 fn parsed_call_sites(entity: &Entity) -> Option<u64> {
@@ -312,7 +341,7 @@ fn language_links_imports<G: GraphStore>(store: &G, language: kin_model::Languag
 fn file_entities<G: GraphStore>(
     store: &G,
     file: &FilePathId,
-) -> Option<(Vec<EntityId>, Option<u64>)> {
+) -> Option<(Vec<(EntityId, kin_model::EntityKind)>, Option<u64>)> {
     let entities = store
         .query_entities(&EntityFilter {
             file_path: Some(file.clone()),
@@ -321,7 +350,10 @@ fn file_entities<G: GraphStore>(
         .ok()?;
     let parsed = entities.iter().find_map(parsed_call_sites);
     Some((
-        entities.into_iter().map(|entity| entity.id).collect(),
+        entities
+            .into_iter()
+            .map(|entity| (entity.id, entity.kind))
+            .collect(),
         parsed,
     ))
 }
@@ -348,7 +380,15 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
             "the entity index could not be read for the focal's file",
         );
     };
-    let focal_owned: HashSet<EntityId> = focal_file_entities.iter().copied().collect();
+    let focal_owned: HashSet<EntityId> = focal_file_entities.iter().map(|(id, _)| *id).collect();
+    // The destinations a module binding may land on. Kept separate from
+    // `focal_owned` so the widened edge class cannot admit a bare mention of a
+    // function in this file as if it were an import of the file.
+    let focal_modules: HashSet<EntityId> = focal_file_entities
+        .iter()
+        .filter(|(_, kind)| *kind == kin_model::EntityKind::Module)
+        .map(|(id, _)| *id)
+        .collect();
 
     // The family: files holding an import edge into an entity of the focal's
     // file. Walked from the focal's file outward, because the focal's file owns
@@ -360,22 +400,31 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
     // needed to establish it.
     let mut family: HashSet<FilePathId> = HashSet::new();
     let mut focal_file_imports_something = false;
-    for entity_id in &focal_file_entities {
+    for (entity_id, _) in &focal_file_entities {
         let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
             return CallerArrival::unmeasured(
                 "the relation index could not be read for the focal's file",
             );
         };
         for relation in relations {
-            if !FAMILY_KINDS.contains(&relation.kind) {
-                continue;
-            }
+            let named_by_import = FAMILY_KINDS.contains(&relation.kind);
             let (Some(source), Some(destination)) =
                 (relation.src.as_entity(), relation.dst.as_entity())
             else {
                 continue;
             };
-            if focal_owned.contains(&source) {
+            // A module binding counts only when it lands on a `Module` entity of
+            // the focal's own file, which is what `from . import mod` produces
+            // and what a mention of a function in this file does not.
+            let named_by_module_binding =
+                relation.kind == MODULE_BINDING_KIND && focal_modules.contains(&destination);
+            if !named_by_import && !named_by_module_binding {
+                continue;
+            }
+            // The cheap half of the empty-family control stays keyed on import
+            // edges alone. It answers "does import linking work in this file",
+            // and only an import edge is evidence about import linking.
+            if named_by_import && focal_owned.contains(&source) {
                 focal_file_imports_something = true;
             }
             // An import edge out of this file says nothing about who can reach
@@ -448,7 +497,7 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
             family_measured += 1;
         }
         let mut resolved = 0u64;
-        for entity_id in &entity_ids {
+        for (entity_id, _) in &entity_ids {
             let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
                 return CallerArrival::unmeasured(
                     "the relation index could not be read for a file in the focal's family",
@@ -684,6 +733,121 @@ mod tests {
                 .unwrap();
         }
         (store, focal)
+    }
+
+    /// The same entity, but minted as the `Module` a Python file always carries.
+    ///
+    /// `entity_in` builds a `Function` for every name, which is what the other
+    /// arms want. A module binding lands on a `Module`, and the difference is
+    /// the whole of what separates the widened family from a bare mention.
+    fn module_entity_in(name: &str, file: &str, parsed_calls: Option<u64>) -> Entity {
+        Entity {
+            kind: EntityKind::Module,
+            id: EntityId::from_content(file, name, "Module", 0),
+            ..entity_in(name, file, parsed_calls)
+        }
+    }
+
+    /// The FIR-2821 shape, built the way the graph actually records it.
+    ///
+    /// `from . import linkgraph` then `linkgraph.to_dot(conn)` binds the module
+    /// and no name inside it, so the caller holds a `References` edge into the
+    /// focal file's `Module` entity and NO `Imports` edge into any entity of
+    /// that file. `dst_kind` is what the reference lands on, which is the one
+    /// thing the two arms below differ by.
+    fn store_with_module_binding(
+        caller_parsed_calls: Option<u64>,
+        caller_resolved_calls: usize,
+        reference_lands_on_module: bool,
+    ) -> (InMemoryGraph, Entity) {
+        let store = InMemoryGraph::new();
+        let focal = entity_in("to_dot", FOCAL_FILE, Some(2));
+        let focal_module = module_entity_in("linkgraph", FOCAL_FILE, Some(2));
+        let neighbour = entity_in("resolve_key", FOCAL_FILE, Some(2));
+        let caller = entity_in("_cmd_graph", CALLER_FILE, caller_parsed_calls);
+        for entity in [&focal, &focal_module, &neighbour, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        let destination = if reference_lands_on_module {
+            &focal_module
+        } else {
+            &neighbour
+        };
+        store
+            .upsert_relation(&edge(RelationKind::References, &caller, destination))
+            .unwrap();
+        for index in 0..caller_resolved_calls {
+            store
+                .upsert_relation(&Relation {
+                    id: RelationId::from_content(
+                        &caller.id.0.to_string(),
+                        &neighbour.id.0.to_string(),
+                        &format!("Calls{index}"),
+                    ),
+                    ..edge(RelationKind::Calls, &caller, &neighbour)
+                })
+                .unwrap();
+        }
+        (store, focal)
+    }
+
+    #[test]
+    fn a_module_binding_puts_its_file_in_the_family() {
+        // THE ARM FIR-2821 BOUGHT. Before the module-binding class existed here,
+        // this store's family was EMPTY, the empty-family branch certified, and
+        // the gate answered `accounted` over the one shape it exists to catch.
+        // On the v0.6.1 stranger corpus that is 35 real edges answering
+        // `family_files: 0`.
+        let (store, focal) = store_with_module_binding(Some(4), 1, true);
+        let arrival = observe_caller_arrival(&store, &focal);
+
+        assert_eq!(
+            arrival.family_files, 1,
+            "a file that named this module in its own source can reach the focal, \
+             whether it named it by specifier or by module"
+        );
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Unaccounted,
+            "three of the caller's four parsed call sites became no edge, and the \
+             focal could be among them"
+        );
+        assert_eq!(arrival.unaccounted.len(), 1);
+        assert_eq!(arrival.unaccounted[0].file, CALLER_FILE);
+        assert_eq!(arrival.unaccounted[0].unaccounted_call_sites, Some(3));
+    }
+
+    #[test]
+    fn a_reference_that_is_not_a_module_binding_does_not_build_a_family() {
+        // THE CONTROL, and it is what stops the widening from becoming "any
+        // References edge". A reference landing on a FUNCTION of the focal's
+        // file is a mention, not a binding of the file, and admitting it would
+        // put most of a repository in most families and floor every absence.
+        // This arm is the one that stays green only while the class is narrow.
+        let (store, focal) = store_with_module_binding(Some(4), 1, false);
+        let arrival = observe_caller_arrival(&store, &focal);
+
+        assert_eq!(
+            arrival.family_files, 0,
+            "a mention of a sibling function is not the caller naming this file"
+        );
+    }
+
+    #[test]
+    fn a_module_binding_whose_caller_resolved_every_call_still_certifies() {
+        // The other half of the control. The widened class must be able to
+        // answer `accounted`, or it is a gate that never certifies, which is the
+        // failure this module's own header warns against.
+        let (store, focal) = store_with_module_binding(Some(1), 1, true);
+        let arrival = observe_caller_arrival(&store, &focal);
+
+        assert_eq!(arrival.family_files, 1);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Accounted,
+            "every call site the caller parsed became an edge, so an absence over \
+             these edges is the whole set"
+        );
     }
 
     #[test]
