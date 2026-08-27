@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (499 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (500 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -73,6 +73,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_REMOTE_AUTH_TOKEN` | secret | *(unset)* | secret | fallback KinLab auth token read after KIN_REMOTE_BEARER_TOKEN |
 | `KIN_REMOTE_BASE_URL` | url | *(unset)* | operational | KinLab base URL for remote and federation calls |
 | `KIN_REMOTE_BEARER_TOKEN` | secret | *(unset)* | secret | KinLab bearer token used when no stored auth session is present |
+| `KIN_REMOTE_HTTP_TIMEOUT_SECS` | seconds>=0 | 600 | operational | HTTP timeout for native Kin remote repository transfer endpoints, in whole seconds; defaults to 600 |
 | `KIN_REMOTE_URL` | url | *(unset)* | operational | native remote endpoint URL |
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |
 | `KIN_REPO_IDS` | string | *(unset)* | operational | comma-separated repo ids the daemon should serve |
