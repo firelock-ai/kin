@@ -774,6 +774,25 @@ struct ReconcileProbesInner {
     untracked_path_count: u64,
     /// A bounded sample of those paths.
     untracked_paths_sample: Vec<String>,
+    /// When the reading above was taken.
+    ///
+    /// The count alone cannot be read. Zero is written by a pass that genuinely
+    /// found nothing untracked AND by an explicit seam that admitted everything,
+    /// and neither record expires, so a zero from a commit five minutes ago is
+    /// indistinguishable from one measured this instant while the working copy
+    /// holds a module the graph has never met (FIR-2820). The stamp is what
+    /// separates them, and it is what lets a surface refresh the reading rather
+    /// than restate it.
+    ///
+    /// Carries no message; it is a clock, and `RecordedFault` is reused for the
+    /// pair of instants it already keeps.
+    untracked_observed: Option<RecordedFault>,
+    /// What the last measurement of that reading cost.
+    ///
+    /// The refresh rate is derived from it rather than fixed, so the walk can
+    /// never take more than a bounded share of the daemon's own time on a
+    /// working copy large enough for it to matter.
+    untracked_measurement_cost: Option<Duration>,
     /// What the most recent complete walk deliberately did not observe.
     excluded: ExcludedHostContent,
     /// The publication error that left a commit's deferred tree unpublished.
@@ -810,6 +829,20 @@ pub struct ExcludedHostContent {
     /// the set that used to fail the whole admission instead of being skipped.
     pub policy_excluded: u64,
 }
+
+/// The shortest interval between two measurements of untracked host content.
+///
+/// One second is the window a caller who writes a file and asks about it in the
+/// same breath can still fall inside, and it is disclosed rather than hidden:
+/// every surface carrying the count carries the age of the reading beside it.
+const UNTRACKED_REFRESH_FLOOR: Duration = Duration::from_secs(1);
+
+/// The share of its own time the refresh may spend, as a divisor.
+///
+/// A walk that costs three milliseconds refreshes on the floor above. One that
+/// costs half a second refreshes every five, so the measurement can never take
+/// more than a tenth of the daemon under continuous polling.
+const UNTRACKED_REFRESH_DUTY_DIVISOR: u32 = 10;
 
 /// How many untracked paths a disclosure names outright.
 ///
@@ -921,6 +954,73 @@ impl ReconcileProbes {
         inner.untracked_path_count = count;
         inner.untracked_paths_sample = sample;
         inner.excluded = excluded;
+        inner.untracked_observed = Some(RecordedFault::new(String::new(), Instant::now()));
+    }
+
+    /// How long ago the untracked reading was taken, or `None` if none has been.
+    ///
+    /// The question a surface asks before it repeats the reading as a fact about
+    /// now. `None` is the strongest answer here and not the weakest: a daemon
+    /// that has never measured has no basis at all for the zero its counter
+    /// carries.
+    pub fn untracked_observation_age(&self, now: Instant) -> Option<Duration> {
+        self.lock()
+            .untracked_observed
+            .as_ref()
+            .map(|observed| now.saturating_duration_since(observed.at))
+    }
+
+    /// Whether the untracked reading is old enough to be worth measuring again.
+    ///
+    /// The interval is derived from what the last measurement cost rather than
+    /// fixed, because the two working copies this has to serve are three
+    /// milliseconds apart and a thousand. The floor is what a caller writing a
+    /// file and asking about it immediately can be behind by; the duty rule is
+    /// the ceiling on what the walk may spend, so a large repository refreshes
+    /// less often instead of continuously.
+    ///
+    /// A reading nothing has ever taken is always due. That is the case with no
+    /// measurement behind it at all, and it is the one a fixed interval would
+    /// have treated as freshly measured.
+    pub fn untracked_refresh_due(&self, now: Instant) -> bool {
+        let inner = self.lock();
+        let Some(observed) = inner.untracked_observed.as_ref() else {
+            return true;
+        };
+        let interval = inner
+            .untracked_measurement_cost
+            .map(|cost| cost * UNTRACKED_REFRESH_DUTY_DIVISOR)
+            .unwrap_or(UNTRACKED_REFRESH_FLOOR)
+            .max(UNTRACKED_REFRESH_FLOOR);
+        now.saturating_duration_since(observed.at) >= interval
+    }
+
+    /// Record a measurement of untracked host paths taken outside a reconcile
+    /// pass.
+    ///
+    /// Deliberately narrower than [`Self::record_untracked_observation`]: it
+    /// replaces the untracked reading and its clock and leaves the excluded
+    /// counts exactly as the last complete walk measured them. This pass did not
+    /// measure exclusions, so restating them would be a second authority for a
+    /// fact it never observed.
+    pub fn record_untracked_measurement<T: std::fmt::Display>(
+        &self,
+        paths: impl IntoIterator<Item = T>,
+        cost: Duration,
+    ) {
+        let mut count: u64 = 0;
+        let mut sample = Vec::new();
+        for path in paths {
+            count = count.saturating_add(1);
+            if sample.len() < UNTRACKED_SAMPLE_LIMIT {
+                sample.push(path.to_string());
+            }
+        }
+        let mut inner = self.lock();
+        inner.untracked_path_count = count;
+        inner.untracked_paths_sample = sample;
+        inner.untracked_measurement_cost = Some(cost);
+        inner.untracked_observed = Some(RecordedFault::new(String::new(), Instant::now()));
     }
 
     /// The disclosure surfaces' view of all of it.
@@ -951,6 +1051,11 @@ impl ReconcileProbes {
                 .map(|since| now.saturating_duration_since(since).as_secs()),
             untracked_path_count: inner.untracked_path_count,
             untracked_paths_sample: inner.untracked_paths_sample.clone(),
+            untracked_observed_age_seconds: inner.untracked_observed.as_ref().map(age),
+            untracked_observed_at: inner
+                .untracked_observed
+                .as_ref()
+                .map(|observed| observed.wall_clock.to_rfc3339()),
             ignored_path_count: inner.excluded.ignored,
             unsupported_path_count: inner.excluded.unsupported,
             policy_excluded_path_count: inner.excluded.policy_excluded,
@@ -1600,5 +1705,132 @@ mod tests {
         assert_eq!(report.backlog_age_seconds, None);
         assert!(!report.degraded());
         assert!(report.degraded_reasons().is_empty());
+    }
+
+    /// FIR-2820. A zero nobody measured is not a zero, and it is the reading
+    /// three surfaces repeated as an all-clear.
+    ///
+    /// The counter starts at zero because a `u64` does. Until something walks
+    /// the working copy, that zero stands for nothing at all, so the surfaces
+    /// need a way to tell it from a measured one and the probe needs to know a
+    /// refresh is due. Both hang off the same stamp.
+    #[test]
+    fn an_unmeasured_untracked_reading_carries_no_clock_and_is_always_due() {
+        let probes = ReconcileProbes::default();
+        let now = Instant::now();
+
+        let report = probes.report(now);
+        assert_eq!(
+            report.untracked_path_count, 0,
+            "the counter's initial value, which is the whole problem"
+        );
+        assert_eq!(
+            report.untracked_observed_age_seconds, None,
+            "and nothing measured it, which is what the surfaces have to be told"
+        );
+        assert_eq!(report.untracked_observed_at, None);
+        assert!(
+            probes.untracked_observation_age(now).is_none(),
+            "there is no age because there is no observation"
+        );
+        assert!(
+            probes.untracked_refresh_due(now),
+            "a reading nothing has ever taken is due the first time anyone asks"
+        );
+    }
+
+    /// FIR-2820. A measurement stamps its own clock, and the stamp is what
+    /// stops the next caller re-walking the working copy.
+    #[test]
+    fn a_measurement_stamps_its_clock_and_holds_off_the_next_one() {
+        let probes = ReconcileProbes::default();
+        probes.record_untracked_measurement(
+            ["notekeeper/linkgraph.py", "notekeeper/search.py"],
+            Duration::from_millis(3),
+        );
+        let now = Instant::now();
+
+        let report = probes.report(now);
+        assert_eq!(report.untracked_path_count, 2);
+        assert_eq!(
+            report.untracked_paths_sample,
+            vec![
+                "notekeeper/linkgraph.py".to_string(),
+                "notekeeper/search.py".to_string()
+            ]
+        );
+        assert_eq!(
+            report.untracked_observed_age_seconds,
+            Some(0),
+            "a measurement taken this instant is zero seconds old, which is a reading and not \
+             an absent one"
+        );
+        assert!(report.untracked_observed_at.is_some());
+        assert!(
+            !probes.untracked_refresh_due(now),
+            "a reading taken this instant is not due again"
+        );
+        assert!(
+            probes.untracked_refresh_due(now + UNTRACKED_REFRESH_FLOOR),
+            "and it is due once the floor has passed"
+        );
+    }
+
+    /// FIR-2820. What the walk costs sets how often it may run, so a working
+    /// copy large enough for the measurement to matter cannot be walked
+    /// continuously by a client polling health.
+    #[test]
+    fn an_expensive_measurement_stretches_its_own_interval() {
+        let cheap = ReconcileProbes::default();
+        cheap.record_untracked_measurement(std::iter::empty::<&str>(), Duration::from_millis(3));
+        let costly = ReconcileProbes::default();
+        costly.record_untracked_measurement(std::iter::empty::<&str>(), Duration::from_millis(500));
+        let now = Instant::now();
+
+        let just_past_the_floor = now + UNTRACKED_REFRESH_FLOOR + Duration::from_millis(10);
+        assert!(
+            cheap.untracked_refresh_due(just_past_the_floor),
+            "a three-millisecond walk refreshes on the floor"
+        );
+        assert!(
+            !costly.untracked_refresh_due(just_past_the_floor),
+            "a half-second walk does not, or continuous polling would spend the daemon on it"
+        );
+        assert!(
+            costly.untracked_refresh_due(
+                now + Duration::from_millis(500) * UNTRACKED_REFRESH_DUTY_DIVISOR
+            ),
+            "it comes due at its own duty interval, which is the ceiling and not a refusal"
+        );
+    }
+
+    /// FIR-2820. The measurement pass observed no exclusions, so it restates
+    /// none.
+    ///
+    /// Two authorities for one fact is what this avoids. The excluded counts
+    /// answer "why will nothing ever index my file" and only a complete walk
+    /// measures them; a measurement that zeroed them would turn a real
+    /// `.kinignore` rule into silence every time anyone read health.
+    #[test]
+    fn a_measurement_leaves_the_excluded_counts_to_the_walk_that_measured_them() {
+        let probes = ReconcileProbes::default();
+        probes.record_untracked_observation(
+            ["left/behind.py"],
+            ExcludedHostContent {
+                ignored: 7,
+                unsupported: 2,
+                policy_excluded: 4,
+            },
+        );
+        probes.record_untracked_measurement(["fresh.py", "fresher.py"], Duration::from_millis(1));
+
+        let report = probes.report(Instant::now());
+        assert_eq!(
+            report.untracked_path_count, 2,
+            "the untracked reading moved"
+        );
+        assert_eq!(report.ignored_path_count, 7, "the exclusions did not");
+        assert_eq!(report.unsupported_path_count, 2);
+        assert_eq!(report.policy_excluded_path_count, 4);
     }
 }
