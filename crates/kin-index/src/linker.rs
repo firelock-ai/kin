@@ -1562,24 +1562,6 @@ fn resolve_one_file(
             continue;
         }
 
-        // (e) Unresolvable receiver. A member call whose receiver names neither
-        // a module this repository owns nor an object whose type any tier
-        // settled has no destination to bind, but it is still a call the source
-        // makes and the reader needs. Recording it as the weakest edge the
-        // linker emits keeps it visible without claiming a resolution; dropping
-        // it made an unresolvable call and an absent one look the same.
-        let repository_defines_symbol = repository_defines_symbol_elsewhere(
-            ctx.entity_by_name.get(dst_lookup),
-            ctx.entity_by_bare_name.get(dst_lookup),
-            src_id,
-        );
-        if let Some(unresolved) =
-            make_unresolved_receiver_relation(rel, src_id, repository_defines_symbol)
-        {
-            accumulate_relation(&mut resolved, &mut relation_indices, unresolved);
-            continue;
-        }
-
         debug!(
             src = %rel.src_name,
             dst = %rel.dst_name,
@@ -4293,26 +4275,6 @@ const EXTERNAL_REFERENCE_KIND_TAG: &str = "ExternalReference";
 /// Calls/References relation also has a non-empty import source and this rule.
 pub const EXTERNAL_IMPORT_REFERENCE_RULE: &str = "external_import_reference";
 
-/// Confidence the unresolved-receiver placeholder tier persists.
-///
-/// Below every tier that settles anything, so `RelationResolution::of` reads it
-/// as `name_only` and nothing that counts by resolution can mistake it for an
-/// edge the linker resolved. It is deliberately the weakest thing the linker
-/// emits: the edge asserts that a call happened and that this repository cannot
-/// say what it reached, which is strictly more than the silence it replaces.
-const UNRESOLVED_RECEIVER_CONFIDENCE: f32 = 0.1;
-
-/// Synthetic tag used to derive a deterministic id for the destination of a
-/// member call whose receiver this repository cannot resolve. Never a real
-/// `EntityKind`, so the id cannot collide with a locally indexed entity, and
-/// distinct from the cross-repo tag so the two placeholder classes never share
-/// a node.
-const UNRESOLVED_RECEIVER_KIND_TAG: &str = "UnresolvedReceiver";
-
-/// Linker evidence rule identifying a member call whose receiver resolves to
-/// nothing this repository defines.
-pub const UNRESOLVED_RECEIVER_CALL_RULE: &str = "unresolved_receiver_call";
-
 /// Evidence marker for a call the parser read as the operand of a `raise`.
 ///
 /// `raise SSLError(...)` in an `except` block is a call edge like any other and
@@ -4350,8 +4312,14 @@ pub struct TraceCrossing {
     #[serde(default)]
     pub specifier: Option<String>,
     /// The receiver the call was written through, when the edge recorded one
-    /// and no specifier is available. `this.router` says more than nothing
-    /// about where to look without claiming to name a package.
+    /// and no specifier is available.
+    ///
+    /// Always `None` since the unresolved-receiver placeholder tier was removed:
+    /// the only edge class that ever recorded a receiver here was the one that
+    /// minted a destination entity out of the receiver's own spelling, and a
+    /// resolver-bound specifier is the only provenance left. The key stays in
+    /// the payload because the object's keys are uniform across both statuses,
+    /// for the same reason the step's are.
     #[serde(default)]
     pub receiver: Option<String>,
     /// Why the status reads the way it does, in a sentence a caller can act on.
@@ -4391,10 +4359,9 @@ pub fn is_raise_target_edge(rel: &Relation) -> bool {
 /// The crossing record for a step, built from the edge that reached it.
 ///
 /// Reads only what the graph already persisted: `import_source`, set by the
-/// cross-repo tier when the parser pinned the module a symbol came from, and
-/// the unresolved-receiver evidence token, which carries the receiver as source
-/// spells it. Nothing is inferred from a name, so a symbol the graph cannot
-/// place reports `unknown` rather than a guess.
+/// cross-repo tier when the parser pinned the module a symbol came from.
+/// Nothing is inferred from a name, so a symbol the graph cannot place reports
+/// `unknown` rather than a guess.
 pub fn trace_crossing_for(entity: &Entity, reached_by: Option<&Relation>) -> Option<TraceCrossing> {
     if entity.file_origin.is_some() {
         return None;
@@ -4414,27 +4381,11 @@ pub fn trace_crossing_for(entity: &Entity, reached_by: Option<&Relation>) -> Opt
             receiver: None,
         });
     }
-    let receiver = reached_by
-        .and_then(|rel| {
-            rel.evidence
-                .iter()
-                .find(|e| e.parser_rule.as_deref() == Some(UNRESOLVED_RECEIVER_CALL_RULE))
-        })
-        .and_then(|e| e.token.as_deref())
-        .and_then(|token| token.rsplit_once('.').map(|(receiver, _)| receiver))
-        .filter(|receiver| !receiver.is_empty())
-        .map(str::to_string);
-    let note = match receiver.as_deref() {
-        Some(receiver) => format!(
-            "the call was written through `{receiver}` and no edge records which module it comes from, so this symbol could be a package, a builtin or a typo"
-        ),
-        None => "no edge into this symbol records a module, so this symbol could be a package, a builtin or a typo".to_string(),
-    };
     Some(TraceCrossing {
         status: "unknown".to_string(),
         specifier: None,
-        receiver,
-        note,
+        receiver: None,
+        note: "no edge into this symbol records a module, so this symbol could be a package, a builtin or a typo".to_string(),
     })
 }
 
@@ -4507,160 +4458,6 @@ pub fn is_external_import_placeholder(relation: &Relation) -> bool {
 /// import, not a cross-repo reference: a symbol that fails local resolution
 /// there (e.g. a moved or deleted local definition) must not be mis-attributed
 /// as an external edge. Only module sources that do not resolve locally qualify.
-/// Whether this repository defines the called member on something other than
-/// the caller itself.
-///
-/// The caller is excluded deliberately. `app.handle` in express calls
-/// `this.router.handle`, and the two share a leaf name, so counting the caller
-/// would have the function's own definition stand as proof that the repository
-/// answers to `handle` and suppress the placeholder for the one call it exists
-/// to record. A member whose only local namesake is the caller has still found
-/// no destination here; recursion through an unresolvable receiver is not a
-/// self-call.
-///
-/// Generic over the key type because the batch index borrows its file paths and
-/// the incremental one owns them; the answer depends on neither.
-fn repository_defines_symbol_elsewhere<P>(
-    exact: Option<&Vec<(P, EntityId)>>,
-    bare: Option<&Vec<(P, EntityId)>>,
-    caller: EntityId,
-) -> bool {
-    [exact, bare]
-        .into_iter()
-        .flatten()
-        .any(|candidates| candidates.iter().any(|(_, candidate)| *candidate != caller))
-}
-
-/// Split the member expression an unresolved-receiver placeholder records back
-/// into the receiver it was written on and the member it named.
-///
-/// The evidence carries the expression as written, `this.router.handle`, which
-/// is one lexical token at the evidence site and needs no field used against
-/// its documented meaning to hold it. The receiver is everything before the
-/// final separator and the member is what follows.
-pub fn split_unresolved_receiver_token(token: &str) -> Option<(&str, &str)> {
-    let (receiver, symbol) = token.rsplit_once('.')?;
-    if receiver.is_empty() || symbol.is_empty() {
-        return None;
-    }
-    Some((receiver, symbol))
-}
-
-/// How an unresolved-receiver target is named where a reader will see it.
-///
-/// The full expression is `this.router.handle`, but `this` is the calling
-/// object and says nothing about the destination, so the name keeps the last
-/// receiver segment and the member: `router.handle`. That is what a reader
-/// recognizes in a walk, and it is derived rather than stored so one rule
-/// governs every display of it.
-pub fn unresolved_receiver_display_name(receiver: &str, symbol: &str) -> String {
-    let leaf = receiver.rsplit('.').next().unwrap_or(receiver);
-    let leaf = if leaf.is_empty() { receiver } else { leaf };
-    format!("{leaf}.{symbol}")
-}
-
-/// Whether a relation exactly matches the unresolved-receiver placeholder
-/// contract. Like the cross-repo predicate beside it, this does not inspect
-/// graph membership; a caller establishes separately that the destination is
-/// absent from the local entity set.
-pub fn is_unresolved_receiver_placeholder(relation: &Relation) -> bool {
-    if relation.kind != RelationKind::Calls
-        || relation.origin != RelationOrigin::Inferred
-        || relation.confidence.to_bits() != UNRESOLVED_RECEIVER_CONFIDENCE.to_bits()
-        || relation.import_source.is_some()
-    {
-        return false;
-    }
-    let Some(src) = relation.src.as_entity() else {
-        return false;
-    };
-    let Some(dst) = relation.dst.as_entity() else {
-        return false;
-    };
-    let [evidence] = relation.evidence.as_slice() else {
-        return false;
-    };
-    if evidence.parser_rule.as_deref() != Some(UNRESOLVED_RECEIVER_CALL_RULE)
-        || evidence.source_path.is_some()
-        || evidence.resolved_path.is_some()
-        || evidence.source_span.is_some()
-        || evidence.call_shape.is_some()
-        || evidence.occurrence_count == 0
-    {
-        return false;
-    }
-    let Some(token) = evidence.token.as_deref() else {
-        return false;
-    };
-    if token != token.trim() {
-        return false;
-    }
-    let Some((receiver, symbol)) = split_unresolved_receiver_token(token) else {
-        return false;
-    };
-    let expected_dst = EntityId::from_content(receiver, symbol, UNRESOLVED_RECEIVER_KIND_TAG, 0);
-    dst == expected_dst && relation.id == stable_relation_id(&src, &expected_dst, &relation.kind)
-}
-
-/// Record a member call whose receiver resolves to nothing this repository
-/// defines, instead of dropping it.
-///
-/// `app.handle` in express ends in `this.router.handle(req, res, done)`, the
-/// line the function exists for. `this.router` is a property bound to a package
-/// outside the tree, so no tier above can name a destination, and the call used
-/// to disappear: a reader got every minor callee and missed the hand-off, with
-/// nothing disclosing the omission. An absent call and an unresolvable one were
-/// indistinguishable, which is the failure this repairs.
-///
-/// The placeholder states only what was observed. A call happened, it was
-/// written on this receiver, it named this member, and the destination is not
-/// here. It carries the weakest confidence the linker emits, so it reads as
-/// `name_only` and is excluded from every count that keys on resolution, which
-/// is what keeps presence from becoming fabrication.
-///
-/// `repository_defines_symbol` is what keeps the claim true. When this
-/// repository defines something by that name, the tiers above declined to pick
-/// among the candidates on purpose, and saying the destination is elsewhere
-/// would be a second guess dressed as a fact: `req.copy()` against three local
-/// `copy` methods stays unbound, exactly as before. Only a member this tree
-/// defines nowhere can honestly be called external, which is the express case,
-/// where no `handle` exists outside the `app.handle` that makes the call.
-fn make_unresolved_receiver_relation(
-    rel: &ExtractedRelation,
-    src: EntityId,
-    repository_defines_symbol: bool,
-) -> Option<Relation> {
-    if rel.kind != RelationKind::Calls || repository_defines_symbol {
-        return None;
-    }
-    let receiver = rel
-        .receiver
-        .as_deref()
-        .map(str::trim)
-        .filter(|receiver| !receiver.is_empty() && !receiver.contains(char::is_whitespace))?;
-    let symbol = rel.dst_name.trim();
-    if symbol.is_empty() || symbol.contains('.') {
-        return None;
-    }
-    let dst = EntityId::from_content(receiver, symbol, UNRESOLVED_RECEIVER_KIND_TAG, 0);
-    let id = stable_relation_id(&src, &dst, &rel.kind);
-    Some(Relation {
-        id,
-        kind: rel.kind,
-        src: GraphNodeId::Entity(src),
-        dst: GraphNodeId::Entity(dst),
-        confidence: UNRESOLVED_RECEIVER_CONFIDENCE,
-        origin: RelationOrigin::Inferred,
-        created_in: None,
-        import_source: None,
-        evidence: vec![RelationEvidence {
-            token: Some(format!("{receiver}.{symbol}")),
-            parser_rule: Some(UNRESOLVED_RECEIVER_CALL_RULE.to_string()),
-            ..RelationEvidence::default()
-        }],
-    })
-}
-
 fn make_external_reference_relation<S>(
     rel: &ExtractedRelation,
     src: EntityId,
@@ -7097,21 +6894,6 @@ fn resolve_one_file_incremental(
             make_external_reference_relation(rel, src_id, &file.file_path, &linker.known_files)
         {
             accumulate_relation(&mut resolved, &mut relation_indices, external);
-            continue;
-        }
-
-        // (e) Unresolvable receiver, mirroring the batch resolver. The two
-        // chains must end the same way or an incremental reparse would silently
-        // retract every placeholder the batch pass recorded.
-        let repository_defines_symbol = repository_defines_symbol_elsewhere(
-            linker.entity_by_name.get(dst_lookup),
-            linker.entity_by_bare_name.get(dst_lookup),
-            src_id,
-        );
-        if let Some(unresolved) =
-            make_unresolved_receiver_relation(rel, src_id, repository_defines_symbol)
-        {
-            accumulate_relation(&mut resolved, &mut relation_indices, unresolved);
             continue;
         }
     }
@@ -12487,15 +12269,19 @@ void f();
         }
     }
 
-    // ── An unresolvable member call is recorded, not dropped ──────────────
+    // ── An unresolvable member call names no node ─────────────────────────
     //
-    // `app.handle` in express ends in `this.router.handle(...)`, the line the
-    // function exists for, and the receiver is bound to a package outside the
-    // tree. Every tier declines, and the call used to vanish with nothing
-    // disclosing it, so a reader got every minor callee and missed the hand-off.
+    // The tier that used to answer here minted a destination entity out of the
+    // receiver's own spelling, so `sig_str.join` and `"a.rs".into` became
+    // `Module` entities carrying no file. Half of every repository's entity
+    // count was that class. `kin-model`'s external-reference module states the
+    // rule it broke: parser spelling stays relation evidence until a resolver
+    // can bind it, and only a resolver-issued coordinate earns a persisted
+    // identity. A receiver this repository cannot resolve has no coordinate, so
+    // it gets no node, and with no node it can carry no edge.
 
     #[test]
-    fn a_member_call_this_repository_cannot_resolve_is_recorded_as_unproven() {
+    fn a_member_call_this_repository_cannot_resolve_names_no_node() {
         let caller = py_method("app.handle", "lib/application.js", EntityRole::Source);
         let files = vec![FileParseData {
             file_path: "lib/application.js".to_string(),
@@ -12505,38 +12291,28 @@ void f();
         }];
 
         let result = link_cross_file(&files);
-        let edges = calls_edges_from(&result, &caller);
 
-        assert_eq!(edges.len(), 1, "the call must be recorded: {result:#?}");
-        let edge = edges[0];
         assert!(
-            is_unresolved_receiver_placeholder(edge),
-            "and recorded as the unresolved-receiver placeholder: {edge:#?}"
-        );
-        assert_eq!(
-            crate::resolution::RelationResolution::of(edge),
-            crate::resolution::RelationResolution::NameOnly,
-            "an unresolvable call must never read as something the linker settled"
-        );
-        assert_ne!(
-            edge.dst,
-            GraphNodeId::Entity(caller.id),
-            "the placeholder destination is not a local entity"
-        );
-        assert_eq!(
-            edge.evidence[0].token.as_deref(),
-            Some("this.router.handle"),
-            "the evidence carries the member expression as written"
+            calls_edges_from(&result, &caller).is_empty(),
+            "a receiver nothing here resolves must produce no edge, because the only \
+             destination available is the receiver's own spelling: {result:#?}"
         );
     }
 
-    /// The claim has to be true, so it is only made when nothing here answers
-    /// to the name. This is the same shape as the case above and must produce
-    /// nothing, because the repository does define a `handle`.
+    /// The other half of the same claim, and the one that fails if the removal
+    /// went too far: a call whose destination this repository really does
+    /// define still resolves, to that definition.
+    ///
+    /// This is the control the entity fix is worth nothing without. Removing
+    /// the tier that answered when nothing was found must not touch a call that
+    /// had a real answer, so this asserts the edge exists AND that its
+    /// destination is the local definition, rather than merely that some edge
+    /// appeared.
     #[test]
-    fn a_member_call_whose_name_this_repository_defines_is_left_alone() {
+    fn a_call_this_repository_defines_still_resolves_to_that_definition() {
         let caller = py_method("app.handle", "lib/application.js", EntityRole::Source);
-        let local = py_method("Router.handle", "lib/router.js", EntityRole::Source);
+        let local = py_method("route", "lib/router.js", EntityRole::Source);
+        let local_id = local.id;
         let files = vec![
             FileParseData {
                 file_path: "lib/router.js".to_string(),
@@ -12547,26 +12323,41 @@ void f();
             FileParseData {
                 file_path: "lib/application.js".to_string(),
                 entities: vec![caller.clone()],
-                relations: vec![py_receiver_call("app.handle", "this.router", "handle")],
+                relations: vec![ExtractedRelation {
+                    site: None,
+                    receiver: None,
+                    call_shape: None,
+                    kind: RelationKind::Calls,
+                    src_name: "app.handle".to_string(),
+                    dst_name: "route".to_string(),
+                    import_source: None,
+                }],
                 imports: vec![],
             },
         ];
 
         let result = link_cross_file(&files);
 
-        assert!(
-            !calls_edges_from(&result, &caller)
+        assert_eq!(
+            calls_edges_from(&result, &caller)
                 .iter()
-                .any(|edge| is_unresolved_receiver_placeholder(edge)),
-            "calling a member this repository defines is not evidence it is elsewhere: {result:#?}"
+                .map(|edge| edge.dst)
+                .collect::<Vec<_>>(),
+            vec![GraphNodeId::Entity(local_id)],
+            "the call must reach the definition this repository holds, and reach \
+             nothing beside it: {result:#?}"
         );
     }
 
-    /// The negative control the fix is worth nothing without: a function that
-    /// makes no such call gains no step. Presence has to come from the source,
-    /// not from the tier existing.
+    /// The negative control: a function that writes no call gains no edge.
+    /// Presence has to come from the source, not from a tier existing.
+    ///
+    /// It shares its assertion with the unresolvable case above and is not
+    /// redundant with it, because the two separate under the mutation that
+    /// matters: restoring the placeholder tier turns that one red and leaves
+    /// this one green, since there is no call here for a tier to answer.
     #[test]
-    fn a_function_that_makes_no_unresolvable_call_gains_no_placeholder() {
+    fn a_function_that_makes_no_call_gains_no_edge() {
         let caller = py_method("app.listen", "lib/application.js", EntityRole::Source);
         let files = vec![FileParseData {
             file_path: "lib/application.js".to_string(),
