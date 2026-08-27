@@ -1593,6 +1593,24 @@ fn write_registry_atomically(
 /// The supervisor directory is deliberately *not* this path's parent. It is a
 /// machine-level singleton and comes from [`supervisor_root`]; see
 /// [`managed_kin_home`] for the boundary each variable actually draws.
+/// The identity a repository publishes for itself, read from its own manifest.
+///
+/// One function because two producers need the same answer and a second copy of
+/// the rule is how they came apart: the manifest mints a UUID and the registry
+/// used to record the directory name, so the daemon's startup identity check
+/// compared two alphabets and could never pass.
+///
+/// `None` when the repository has no readable manifest, which is the case a
+/// caller has to decide for itself. A registry writer falls back to the
+/// directory name, because a row that names the path badly is better than no row
+/// at all; the daemon does not, because it has already opened the manifest by
+/// the time it needs this.
+pub fn published_repository_identity(repo_root: &Path) -> Option<String> {
+    let manifest =
+        crate::manifest::KinManifest::load(&repo_root.join(".kin/manifest.json")).ok()?;
+    Some(manifest.repo_id).filter(|repo_id| !repo_id.trim().is_empty())
+}
+
 pub fn registry_path() -> PathBuf {
     resolve_registry_path(|key| std::env::var_os(key), managed_kin_home)
 }

@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (498 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (499 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -85,6 +85,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_SEARCH_INCREMENTAL_PERSIST` | bool | true | operational | kin-search segmented/incremental persistence, on by default; only 0/false/no/off keep the monolithic full-rewrite path, and because load auto-detects the on-disk format the flag governs write strategy and dirty-tracking only, so toggling it is safe in both directions |
 | `KIN_SEARCH_MODE` | enum | *(unset)* | correctness | search strictness; 'precise' rejects broad show-body searches |
 | `KIN_SEARCH_SEGMENT_COUNT` | usize | 64 | operational | kin-search segment count for a newly established segmented index only; must be >= 1, an unparseable value falls back to 64, and an existing index keeps whatever count it was built with |
+| `KIN_SPINE_MAX_EAGER_SIBLINGS` | usize | 16 | operational | how many registered sibling repositories the daemon loads eagerly into the cross-repo spine at startup, each of which opens that sibling's whole workspace graph serially. Unset keeps 16; zero disables eager sibling loading entirely and the spine answers over the primary alone. A capture stopped here is BOUNDED, not incomplete: the spine says so with captured-of-registered counts and edges between captured repos stay valid, which is what separates a deliberate cap from a sibling that failed to load |
 | `KIN_STORAGE` | string | local | operational | daemon storage backend selector (e.g. local, gcs) |
 | `KIN_STRICT_BEHAVIOR_ENV` | bool | false | operational | escalate a CLI/daemon behavior-env divergence from a warning to a hard error |
 | `KIN_STRICT_BUILD_MATCH` | bool | false | correctness | require a strict historical build match when resolving a ref view |

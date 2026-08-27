@@ -43,6 +43,13 @@ KIN_HEAP_REPO
 KIN_INC2_SCALE_COMMITS
 KIN_INC2_SCALE_REPO
 KIN_INC2_SCALE_STEPS
+# Size and steer the FIR-2763 eager-sibling measurement, which is #[ignore]d and
+# reports rather than asserting a ceiling. BOUNDS names the bounds to sweep;
+# REVERSE flips the iteration order, which is the discriminator that separates a
+# one-time initialization from one expensive repository. Nothing runs without the
+# test being asked for by name and no runtime behaviour keys on either.
+KIN_SPINE_ATTRIBUTE_REVERSE
+KIN_SPINE_MEASURE_BOUNDS
 KIN_INIT_INTERRUPTED_TEST_BARRIER
 KIN_INIT_INTERRUPTED_TEST_SOURCE
 KIN_INIT_STAGING_SIGNAL_TEST_PARENT
