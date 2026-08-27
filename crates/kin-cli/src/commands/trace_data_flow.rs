@@ -47,7 +47,10 @@ use kin_mcp::budget::Elision;
 /// neither the chain nor a way to ask for less, which is why the number exists at
 /// all — see the definition for what it was measured against.
 pub use kin_mcp::handlers::common::TRACE_DEFAULT_MAX_RESPONSE_CHARS as DEFAULT_MAX_RESPONSE_CHARS;
-use kin_mcp::handlers::common::{trace_response_budget, TRACE_DISCLOSURE_RESERVE_CHARS};
+use kin_mcp::handlers::common::{
+    relation_reference_lines, trace_response_budget, ReferenceLinesAbsent,
+    TRACE_DISCLOSURE_RESERVE_CHARS,
+};
 
 /// Wall-clock ceiling for one trace walk.
 ///
@@ -405,6 +408,10 @@ pub struct TraceEntityRecord {
 }
 
 /// One step in the data-flow chain.
+fn legacy_trace_reference_lines_absent_reason() -> Option<String> {
+    Some("unreported_by_daemon".to_string())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TraceStep {
     /// 1-based step index (0 is reserved for the focal entity).
@@ -428,6 +435,20 @@ pub struct TraceStep {
     /// Depth from the focal (1 = direct neighbor of focal, 2 = neighbor of
     /// neighbor, etc.).
     pub depth: usize,
+    /// 1-based source lines of the edge that introduced this step, accumulated
+    /// across every contributing relation and deduplicated.
+    ///
+    /// These are call/reference sites, not this entity's definition lines. For
+    /// a `callee` step they live in its parent's file; for a `caller` step they
+    /// live in this step's own `entity_file`. The role and `parent_step` make
+    /// that file explicit without repeating a path on every row.
+    #[serde(default)]
+    pub reference_lines: Vec<u32>,
+    /// Why `reference_lines` is empty, and null when at least one line is
+    /// present. Uses the same vocabulary as `find_references` so an absent
+    /// parser span and an unusable cross-file span never collapse together.
+    #[serde(default = "legacy_trace_reference_lines_absent_reason")]
+    pub reference_lines_absent_reason: Option<String>,
     /// This step's identity, location, and (when served) body.
     #[serde(flatten)]
     pub entity: TraceEntityRecord,
@@ -1018,7 +1039,7 @@ pub fn build_trace_data_flow_response_within(
                     continue;
                 }
 
-                match candidate_index.get(&(next_id, role)) {
+                let candidate_at = match candidate_index.get(&(next_id, role)) {
                     // The same neighbor reached twice, by two edges of different
                     // kinds or confidences. One step, described by the stronger
                     // edge, rather than one candidate per edge.
@@ -1056,6 +1077,7 @@ pub fn build_trace_data_flow_response_within(
                                 candidate.crossing = Some(named);
                             }
                         }
+                        existing
                     }
                     None => {
                         let Some(entity) = graph
@@ -1080,9 +1102,28 @@ pub fn build_trace_data_flow_response_within(
                             confidence: rel.confidence,
                             resolution: RelationResolution::of(rel),
                             crossing,
+                            reference_lines: Vec::new(),
+                            reference_spans_outside_caller_file: 0,
                         });
+                        candidates.len() - 1
                     }
-                }
+                };
+
+                // The syntax site belongs to the referencing entity. Walking
+                // out to a callee means the caller is the parent node; walking
+                // in to a caller means the caller is the child step itself.
+                // A candidate can collect several edges, so the lines collect
+                // beside them rather than moving with whichever edge is ranked
+                // strongest for display.
+                let caller_file = if role == "callee" {
+                    node.file_origin.as_ref()
+                } else {
+                    candidates[candidate_at].entity.file_origin.as_ref()
+                };
+                let tally = relation_reference_lines(rel, caller_file);
+                candidates[candidate_at].reference_lines.extend(tally.lines);
+                candidates[candidate_at].reference_spans_outside_caller_file +=
+                    tally.outside_caller_file;
             }
 
             // This node's relations were read to the end, so what the graph
@@ -1139,7 +1180,7 @@ pub fn build_trace_data_flow_response_within(
                 });
             }
 
-            for candidate in callees.into_iter().chain(callers) {
+            for mut candidate in callees.into_iter().chain(callers) {
                 if chain.len() >= MAX_TOTAL_STEPS {
                     truncated = true;
                     break;
@@ -1222,6 +1263,8 @@ pub fn build_trace_data_flow_response_within(
                     candidate.relation_kind,
                     include_type_edges,
                 );
+                candidate.normalize_reference_lines();
+                let reference_lines_absent_reason = candidate.reference_lines_absent_reason();
                 chain.push(TraceStep {
                     step: step_index,
                     role: candidate.role.to_string(),
@@ -1229,6 +1272,8 @@ pub fn build_trace_data_flow_response_within(
                     resolution: candidate.resolution.as_str().to_string(),
                     parent_step: node.step,
                     depth: next_depth,
+                    reference_lines: candidate.reference_lines,
+                    reference_lines_absent_reason,
                     entity: entity_record(
                         &candidate.entity,
                         source.as_ref(),
@@ -1683,6 +1728,10 @@ struct FrontierNode {
     id: EntityId,
     depth: usize,
     file: Option<String>,
+    /// The same file as `file`, retained in its graph identity type so relation
+    /// evidence can be checked against the caller file without reconstructing
+    /// one from presentation text.
+    file_origin: Option<kin_model::ids::FilePathId>,
     dir: Option<String>,
 }
 
@@ -1693,6 +1742,7 @@ impl FrontierNode {
             id: entity.id,
             depth,
             file: entity.file_origin.as_ref().map(|path| path.0.clone()),
+            file_origin: entity.file_origin.clone(),
             dir: kin_ranking::entity_ranking::entity_directory(entity),
         }
     }
@@ -1737,6 +1787,14 @@ struct FanoutCandidate {
     /// requested depth. False for every candidate when no target was named, so
     /// an untargeted walk orders exactly as it did before this existed.
     reaches_target: bool,
+    /// Every source site carried by every edge that reaches this one step.
+    /// These accumulate even when a different, stronger edge supplies the
+    /// displayed relation kind.
+    reference_lines: Vec<u32>,
+    /// Evidence spans that could not be reported because they named a file
+    /// other than the caller's. Counted so an empty list can say whether the
+    /// parser recorded no span or recorded an unusable one.
+    reference_spans_outside_caller_file: usize,
 }
 
 impl FanoutCandidate {
@@ -1748,6 +1806,25 @@ impl FanoutCandidate {
     /// repository with a language server installed.
     fn is_raise_target(&self) -> bool {
         self.call_edges > 0 && self.raise_call_edges == self.call_edges
+    }
+
+    fn normalize_reference_lines(&mut self) {
+        self.reference_lines.sort_unstable();
+        self.reference_lines.dedup();
+    }
+
+    fn reference_lines_absent_reason(&self) -> Option<String> {
+        if !self.reference_lines.is_empty() {
+            None
+        } else if self.reference_spans_outside_caller_file > 0 {
+            Some(
+                ReferenceLinesAbsent::SpanOutsideCallerFile
+                    .as_str()
+                    .to_string(),
+            )
+        } else {
+            Some(ReferenceLinesAbsent::NoEvidenceSpan.as_str().to_string())
+        }
     }
 }
 
@@ -2112,7 +2189,7 @@ mod tests {
         Visibility,
     };
     use kin_model::ids::{FilePathId, Hash256, LanguageId, RelationId, RepositoryId, WorkspaceId};
-    use kin_model::relation::{Relation, RelationOrigin};
+    use kin_model::relation::{Relation, RelationEvidence, RelationOrigin};
     use std::sync::Arc;
 
     pub(super) fn make_entity(name: &str, file: &str) -> Entity {
@@ -2201,6 +2278,29 @@ mod tests {
             import_source: None,
             evidence: vec![],
         }
+    }
+
+    fn make_relation_with_site(
+        src: EntityId,
+        dst: EntityId,
+        kind: RelationKind,
+        file: &str,
+        row: u32,
+    ) -> Relation {
+        let mut relation = make_relation(src, dst, kind);
+        relation.evidence = vec![RelationEvidence {
+            source_span: Some(kin_model::entity::SourceSpan {
+                file: FilePathId::new(file),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: row,
+                start_col: 0,
+                end_line: row,
+                end_col: 1,
+            }),
+            ..RelationEvidence::default()
+        }];
+        relation
     }
 
     /// Synthesize an absent repository authority. The body itself isn't
@@ -3294,6 +3394,122 @@ mod tests {
         );
     }
 
+    /// FIR-2824's second half. A chain is only actionable when each hop names
+    /// the syntax site that created it, not only the callee's definition.
+    /// Outgoing and incoming steps have different callers, duplicate edges must
+    /// accumulate, and an empty list must explain which absence occurred.
+    #[test]
+    fn every_chain_step_carries_its_call_site_lines_or_an_explicit_reason() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("focal", "src/focal.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        let caller = make_entity("caller", "src/caller.rs");
+        let missing = make_entity("missing_site", "src/missing.rs");
+        let outside = make_entity("outside_site", "src/outside.rs");
+        for entity in [&focal, &callee, &caller, &missing, &outside] {
+            graph.upsert_entity(entity).unwrap();
+        }
+
+        // Two sites on two edges into one callee. They must union even though
+        // one displayed step can name only one strongest relation.
+        graph
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::Calls,
+                "src/focal.rs",
+                11,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::References,
+                "src/focal.rs",
+                41,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::Imports,
+                "src/focal.rs",
+                41,
+            ))
+            .unwrap();
+        // An incoming step's call site lives in the CHILD/caller's file.
+        graph
+            .upsert_relation(&make_relation_with_site(
+                caller.id,
+                focal.id,
+                RelationKind::Calls,
+                "src/caller.rs",
+                7,
+            ))
+            .unwrap();
+        // One parser edge carried no span; one carried a span in the wrong
+        // file. The reasons have to stay distinguishable.
+        graph
+            .upsert_relation(&make_relation(focal.id, missing.id, RelationKind::Calls))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                outside.id,
+                RelationKind::Calls,
+                "src/not-the-caller.rs",
+                19,
+            ))
+            .unwrap();
+
+        let mut request = trace_request(&focal.id, 1, TraceDirection::Both, 25);
+        request.include_body = Some(false);
+        let response = traced(&graph, &request);
+        let step = |name: &str| {
+            response
+                .chain
+                .iter()
+                .find(|step| step.entity.entity_name == name)
+                .unwrap_or_else(|| panic!("missing {name} in {:?}", step_names(&response)))
+        };
+
+        assert_eq!(step("callee").reference_lines, vec![12, 42]);
+        assert_eq!(step("callee").reference_lines_absent_reason, None);
+        assert_eq!(step("caller").reference_lines, vec![8]);
+        assert_eq!(step("caller").reference_lines_absent_reason, None);
+        assert!(step("missing_site").reference_lines.is_empty());
+        assert_eq!(
+            step("missing_site")
+                .reference_lines_absent_reason
+                .as_deref(),
+            Some("no_evidence_span")
+        );
+        assert!(step("outside_site").reference_lines.is_empty());
+        assert_eq!(
+            step("outside_site")
+                .reference_lines_absent_reason
+                .as_deref(),
+            Some("span_outside_caller_file")
+        );
+
+        let mut old_payload = serde_json::to_value(&response).unwrap();
+        for item in old_payload["chain"].as_array_mut().unwrap() {
+            item.as_object_mut().unwrap().remove("reference_lines");
+            item.as_object_mut()
+                .unwrap()
+                .remove("reference_lines_absent_reason");
+        }
+        let parsed: TraceDataFlowResponse = serde_json::from_value(old_payload)
+            .expect("a daemon predating call-site fields must remain readable");
+        assert!(parsed
+            .chain
+            .iter()
+            .all(|step| step.reference_lines.is_empty()
+                && step.reference_lines_absent_reason.as_deref() == Some("unreported_by_daemon")));
+    }
+
     /// The regression a character count is the only guard against: a change that
     /// re-inlines bodies on a shape query is invisible to every assertion about
     /// chain contents.
@@ -3347,6 +3563,10 @@ mod tests {
                 resolution: RelationResolution::TypeResolved.as_str().to_string(),
                 parent_step: index.saturating_sub(1),
                 depth: 1,
+                reference_lines: Vec::new(),
+                reference_lines_absent_reason: Some(
+                    ReferenceLinesAbsent::NoEvidenceSpan.as_str().to_string(),
+                ),
                 entity: record,
                 fanout_truncated: false,
                 fanout_dropped: 0,
@@ -3503,6 +3723,10 @@ mod tests {
                 resolution: RelationResolution::TypeResolved.as_str().to_string(),
                 parent_step: parent,
                 depth,
+                reference_lines: Vec::new(),
+                reference_lines_absent_reason: Some(
+                    ReferenceLinesAbsent::NoEvidenceSpan.as_str().to_string(),
+                ),
                 entity: record,
                 fanout_truncated: false,
                 fanout_dropped: 0,
@@ -3603,6 +3827,61 @@ mod tests {
         assert!(
             serde_json::to_string_pretty(&response).unwrap().len() <= response.max_response_chars,
             "the payload must end up inside the budget it reports"
+        );
+    }
+
+    /// FIR-2824 at the typed response arm. The target is a shallow leaf that
+    /// ordinary depth-first preservation gives up before the deeper branch, so
+    /// target-aware walk ordering alone cannot make this pass. At one explicit
+    /// response cut the unnamed arm loses it and the named arm keeps it.
+    #[test]
+    fn a_named_target_survives_the_cli_response_budget_that_drops_it_unnamed() {
+        let fixture = wide_then_deep_response(12, 2, 900);
+        let target = "neighbour_12";
+        let found = (kin_mcp::handlers::common::TRACE_MIN_MAX_RESPONSE_CHARS
+            ..=kin_mcp::handlers::common::TRACE_MAX_MAX_RESPONSE_CHARS)
+            .step_by(250)
+            .find_map(|budget| {
+                let mut unnamed = fixture.clone();
+                unnamed.max_response_chars = budget;
+                enforce_response_budget(&mut unnamed);
+
+                let mut targeted = fixture.clone();
+                targeted.target_name = Some(target.to_string());
+                targeted.max_response_chars = budget;
+                enforce_response_budget(&mut targeted);
+
+                let unnamed_names = step_names(&unnamed);
+                let targeted_names = step_names(&targeted);
+                (unnamed.steps_omitted > 0
+                    && targeted.steps_omitted > 0
+                    && !unnamed_names.iter().any(|name| name == target)
+                    && targeted_names.iter().any(|name| name == target))
+                .then_some((budget, unnamed, targeted))
+            })
+            .expect(
+                "no accepted response budget separated the unnamed and targeted arms; either the \
+                 fixture no longer reaches branch narrowing or the named branch is not protected",
+            );
+
+        let (budget, unnamed, targeted) = found;
+        assert!(
+            unnamed.fanout_narrowed > 0 && targeted.fanout_narrowed > 0,
+            "both arms must exercise branch narrowing at budget {budget}"
+        );
+        let target_step = targeted
+            .chain
+            .iter()
+            .find(|step| step.entity.entity_name == target)
+            .expect("the protected target survives");
+        assert_eq!(
+            target_step.parent_step, 0,
+            "the target must not survive with a missing parent"
+        );
+        assert!(
+            !step_names(&unnamed).iter().any(|name| name == target),
+            "the unnamed control kept {target} at budget {budget}: {:?}",
+            step_names(&unnamed)
         );
     }
 
@@ -3917,6 +4196,8 @@ mod tests {
             "relation_kind",
             "parent_step",
             "depth",
+            "reference_lines",
+            "reference_lines_absent_reason",
             "entity_id",
             "entity_name",
             "entity_kind",
