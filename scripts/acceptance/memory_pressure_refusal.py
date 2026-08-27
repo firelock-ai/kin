@@ -286,6 +286,26 @@ def descendants_of(pid):
     return sorted(found)
 
 
+def settle_descendants(read, attempts=20, gap=0.5, sleep_fn=time.sleep):
+    """The descendant set once two consecutive reads agree, else None.
+
+    Pure over the injected `read`, so the agreement rule is falsifiable
+    without a daemon. A freshly initialized daemon holds short-lived children,
+    and a single before/after pair taken half a second apart lands exactly in
+    that churn: the first hosted run of check 12 read 4 then 1 and refused.
+    Two consecutive equal reads bound the claim to a quiet tree; a tree that
+    never quiets inside `attempts` reads returns None and the caller refuses.
+    """
+    previous = read()
+    for _ in range(max(attempts - 1, 1)):
+        sleep_fn(gap)
+        current = read()
+        if current == previous:
+            return current
+        previous = current
+    return None
+
+
 def thread_count(pid):
     """How many threads `pid` runs, out of `/proc/<pid>/status`.
 
@@ -314,12 +334,24 @@ def footprint_child_verdict(child_count, real_children, threads):
     accountings apart, because counting its threads and counting its child
     processes give the same answer, so a match there is evidence of nothing and
     the caller must say so rather than bank it.
+
+    `over` requires the thread-counting shape, `child_count >= threads - 1`,
+    because the defect this grades sums the task rows and those exclude the
+    main thread. A smaller disagreement is `drifted`: the record was minted at
+    a different instant than the tree reading, which a daemon holding
+    short-lived children produces honestly, and grading it as `over` is how
+    this check false-alarmed on its first hosted run (child_count 4 against a
+    settled tree of 1 under 12 threads). Drifted is refused, never banked.
     """
     if child_count is None or real_children is None or threads is None:
         return "cannot-grade"
     if threads < 2:
         return "cannot-grade"
-    return "matches" if child_count == real_children else "over"
+    if child_count == real_children:
+        return "matches"
+    if child_count >= threads - 1:
+        return "over"
+    return "drifted"
 
 
 def binding_cgroup_dir(pid):
@@ -1865,10 +1897,12 @@ def check_12(suite):
     UNREADABLE unless the daemon it measured was actually running more than one
     thread.
 
-    The kernel tree is read twice, before and after the published standing, and
-    graded only where the two agree. A daemon holds short-lived children during
-    `kin init`, and one exiting between the readings is a different tree rather
-    than a defect.
+    The kernel tree is read until it settles, two consecutive equal reads
+    inside a bound, and graded only then. A daemon holds short-lived children
+    during `kin init`, and the record is minted on the daemon's own cadence, so
+    a sub-thread disagreement between the record and the settled tree is the
+    two instants differing rather than the defect; only the thread-counting
+    shape, `child_count >= threads - 1`, grades as over.
     """
     result = Result(
         "12", TICKET_THREADS,
@@ -1901,17 +1935,20 @@ def check_12(suite):
     child_count = footprint.get("child_count")
     threads = thread_count(pid)
 
-    # Twice, because a daemon holds short-lived children during a sweep and one
-    # exiting between the record and this read is a different tree rather than a
-    # defect. Disagreement is reported, never averaged away.
-    before = descendants_of(pid)
-    time.sleep(0.5)
-    after = descendants_of(pid)
-    if before != after:
+    # Settled, because a daemon holds short-lived children during a sweep and a
+    # single pair taken half a second apart lands exactly in that churn, which
+    # is how this check refused on its first hosted run (4 then 1). The claim
+    # is bound to a quiet tree: two consecutive equal reads, bounded, and a
+    # tree that never quiets is reported, never averaged away.
+    trail = []
+    after = settle_descendants(
+        lambda: trail.append(descendants_of(pid)) or trail[-1]
+    )
+    if after is None:
         result.unknown(
-            "the daemon's child processes changed under the reading (%d then %d), so the "
+            "the daemon's child processes changed under the reading (%s), so the "
             "published count and this one describe different trees"
-            % (len(before), len(after))
+            % " then ".join(str(len(t)) for t in trail)
         )
         return result
     if threads is None or child_count is None:
@@ -1922,6 +1959,15 @@ def check_12(suite):
         return result
 
     verdict = footprint_child_verdict(child_count, len(after), threads)
+    if verdict == "drifted":
+        result.unknown(
+            "the record's child_count %d disagrees with the settled tree's %d by less than "
+            "its %d threads, which is the shape of a record minted while short-lived "
+            "children came or went, not of thread-counting; a record and a tree from "
+            "different instants are not graded against each other"
+            % (child_count, len(after), threads)
+        )
+        return result
     if verdict == "cannot-grade":
         result.unknown(
             "this daemon ran %s thread(s), and a process with one thread counts its threads "
@@ -2293,12 +2339,44 @@ def self_test():
         ("cannot-grade", (0, 0, None)),
         ("cannot-grade", (None, 0, 12)),
         ("cannot-grade", (5, None, 12)),
+        # the first hosted run: a record minted while four short-lived children
+        # lived, read against a settled tree of one, under twelve threads. The
+        # disagreement is smaller than the thread count, so it is two instants,
+        # not thread-counting, and it must refuse rather than false-alarm.
+        ("drifted", (4, 1, 12)),
+        # a record minted before a child spawned drifts the other way.
+        ("drifted", (0, 2, 12)),
+        # the boundary: task rows exclude the main thread, so the defect's
+        # smallest shape is threads minus one.
+        ("over", (11, 0, 12)),
+        ("drifted", (10, 0, 12)),
     ]
     for want, (child_count, real_children, threads) in child_cases:
         got = footprint_child_verdict(child_count, real_children, threads)
         if got != want:
             failures.append("footprint_child_verdict(%s, %s, %s) = %s, wanted %s"
                             % (child_count, real_children, threads, got, want))
+
+    # FIR-2823, the reading protocol. Pure over an injected reader, so the
+    # agreement rule is falsifiable here: a settle that returned its first
+    # read, or one that never gave up, fails these in seconds.
+    def scripted_reader(sequence):
+        reads = list(sequence)
+        return lambda: reads.pop(0) if len(reads) > 1 else reads[0]
+    settle_cases = [
+        # a quiet tree settles on the second read.
+        ([1], [[1], [1]], "stable"),
+        # churn first, then quiet: the first hosted run's shape, 4 then 1.
+        ([1], [[1, 2, 3, 4], [1], [1]], "late"),
+        # a tree that never quiets returns None inside the bound.
+        (None, [[1], [2], [1], [2], [1], [2]], "never"),
+    ]
+    for want, sequence, name in settle_cases:
+        got = settle_descendants(scripted_reader(sequence),
+                                 attempts=5, gap=0, sleep_fn=lambda _: None)
+        if got != want:
+            failures.append("settle_descendants(%s case) = %s, wanted %s"
+                            % (name, got, want))
 
     grade_cases = [
         (PASS, [(PASS, "a")]),
@@ -2322,7 +2400,8 @@ def self_test():
              + len(memory_cases) + len(idle_cases) + len(enrichment_cases)
              + len(kill_row_cases) + len(warning_cases) + len(line_cases)
              + len(tail_cases) + len(grade_cases)
-             + len(proportional_cases) + len(charge_cases))
+             + len(proportional_cases) + len(charge_cases)
+             + len(child_cases) + len(settle_cases))
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0
