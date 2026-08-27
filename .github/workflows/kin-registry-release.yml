@@ -3,22 +3,17 @@
 
 name: Kin Registry Release Receiver
 
-# repository_dispatch resolves this workflow from the default branch. The
-# sender uses one exact event type, and the validation job below refuses any
-# payload that does not bind an allowed crate to its owning source repository.
+# Both events resolve this workflow from the default branch. Dispatch validates
+# the exact package boundary. The hourly eventless arm reconciles the full pin
+# set when a notification was missed or safely coalesced.
 on:
   repository_dispatch:
     types: [kin-registry-release]
+  schedule:
+    - cron: "17 * * * *"
 
 permissions:
   contents: read
-
-# GitHub keeps at most one pending run per concurrency group. Every surviving
-# run refreshes the complete allowed pin set, so replacing an older pending
-# event cannot strand that event's crate on its old registry version.
-concurrency:
-  group: kin-registry-release-${{ github.repository }}
-  cancel-in-progress: false
 
 jobs:
   validate-dispatch:
@@ -47,19 +42,57 @@ jobs:
             --ref "$GITHUB_REF" \
             --workflow-sha "$GITHUB_SHA"
 
-  dependency-wave:
-    name: Refresh Kin registry pins
+  disarm-wave:
+    name: Disarm inherited Kin registry landing state
     needs: validate-dispatch
+    concurrency:
+      group: kin-registry-release-disarm-${{ github.repository }}
+      cancel-in-progress: false
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 10
     environment: release-tag
     permissions:
       contents: read
     env:
-      KIN_ACTIONS_SHA: 398595fa14ba1eaebca6eb176facd8a57ce9db05 # v0.1.33
+      BASE_BRANCH: main
       WAVE_BRANCH: automation/kin-registry-dependency-wave
     steps:
-      - name: Mint repository-scoped dependency-wave token
+      - name: Bind early disarm to the queued workflow policy
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base_sha="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
+            --jq .object.sha)"
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] ||
+             [ "$base_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::early disarm is not bound to exact queued protected main"
+            exit 1
+          fi
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact policy for early disarm
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.base.outputs.base_sha }}
+          persist-credentials: false
+
+      - name: Refuse protected-main movement before early-disarm token mint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_base="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
+            --jq .object.sha)"
+          if [ "$current_base" != "$GITHUB_SHA" ]; then
+            echo "::error::protected main moved before early disarm"
+            exit 1
+          fi
+
+      - name: Mint repository-scoped early-disarm token
         id: app-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -67,14 +100,71 @@ jobs:
           private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
           owner: firelock-ai
           repositories: kin
-          permission-contents: write
           permission-pull-requests: write
-          permission-issues: write
 
-      - name: Checkout exact trusted Kin main
+      - name: Verify exact early-disarm App identity and scope
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-kin-release-app-token.py \
+            --app-slug "$APP_SLUG" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Clear inherited landing state before dependency preparation
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ensure-kin-registry-wave-no-automerge.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --branch "$WAVE_BRANCH" \
+            --base "$BASE_BRANCH"
+
+  prepare-wave:
+    name: Prepare and compile Kin registry pins
+    needs: [validate-dispatch, disarm-wave]
+    # Invalid dispatches never enter this queue. Every admitted run reconciles
+    # the complete dependency set, so GitHub's pending-run coalescing is safe.
+    concurrency:
+      group: kin-registry-release-prepare-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.update.outputs.changed }}
+      title: ${{ steps.update.outputs.title }}
+      base_sha: ${{ steps.base.outputs.base_sha }}
+    env:
+      KIN_ACTIONS_SHA: 398595fa14ba1eaebca6eb176facd8a57ce9db05 # v0.1.33
+      BASE_BRANCH: main
+    steps:
+      - name: Bind preparation to the queued workflow policy
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base_sha="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
+            --jq .object.sha)"
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::protected main returned invalid object id $base_sha"
+            exit 1
+          fi
+          if [ "$base_sha" != "$GITHUB_SHA" ]; then
+            echo "::error::queued receiver policy $GITHUB_SHA is not protected main $base_sha"
+            exit 1
+          fi
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact queued protected main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ steps.base.outputs.base_sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -95,10 +185,10 @@ jobs:
           cargo_home="$RUNNER_TEMP/kin-cargo-home"
           echo "CARGO_HOME=$cargo_home" >> "$GITHUB_ENV"
           mkdir -p "$cargo_home"
-          cat > "$cargo_home/config.toml" <<'TOML'
-          [registries.kin]
-          index = "sparse+https://kinlab.ai/registry/cargo/"
-          TOML
+          printf '%s\n' \
+            '[registries.kin]' \
+            'index = "sparse+https://kinlab.ai/registry/cargo/"' \
+            > "$cargo_home/config.toml"
 
       - name: Update the allowed root-manifest pins
         id: update
@@ -107,27 +197,42 @@ jobs:
           EVENT_VERSION: ${{ github.event.client_payload.crate_version }}
         run: |
           set -uo pipefail
+          crate_args=(
+            --crate kin-blobs
+            --crate kin-model
+            --crate kin-db
+            --crate kin-lsp
+            --crate kin-vfs-core
+          )
+          title="refresh Kin registry dependency pins"
+          case "$GITHUB_EVENT_NAME" in
+            repository_dispatch)
+              if [ -z "$EVENT_CRATE" ] || [ -z "$EVENT_VERSION" ]; then
+                echo "::error::validated dispatch lost its crate or version"
+                exit 1
+              fi
+              crate_args+=(
+                --event-crate "$EVENT_CRATE"
+                --version "$EVENT_VERSION"
+              )
+              title="refresh Kin registry pins after ${EVENT_CRATE}@${EVENT_VERSION}"
+              ;;
+            schedule) ;;
+            *)
+              echo "::error::unsupported dependency-wave event $GITHUB_EVENT_NAME"
+              exit 1
+              ;;
+          esac
           set +e
           output="$(python3 .kin-actions/scripts/update-cargo-registry-deps.py \
             --manifest Cargo.toml \
-            --crate kin-blobs \
-            --crate kin-model \
-            --crate kin-db \
-            --crate kin-lsp \
-            --crate kin-vfs-core \
-            --crate "$EVENT_CRATE" \
-            --event-crate "$EVENT_CRATE" \
-            --version "$EVENT_VERSION" 2>&1)"
+            "${crate_args[@]}" 2>&1)"
           code=$?
           set -e
           printf '%s\n' "$output"
           case "$code" in
-            0)
-              echo "changed=true" >> "$GITHUB_OUTPUT"
-              ;;
-            2)
-              echo "changed=false" >> "$GITHUB_OUTPUT"
-              ;;
+            0) echo "changed=true" >> "$GITHUB_OUTPUT" ;;
+            2) echo "changed=false" >> "$GITHUB_OUTPUT" ;;
             3)
               reason="$(printf '%s\n' "$output" \
                 | sed -n 's/^dependency wave blocked: //p' | head -1)"
@@ -143,8 +248,7 @@ jobs:
               exit "$code"
               ;;
           esac
-          echo "title=refresh Kin registry pins after ${EVENT_CRATE}@${EVENT_VERSION}" \
-            >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
 
       - name: Snapshot the exact generated dependency delta
         id: generated
@@ -163,11 +267,7 @@ jobs:
           echo "expected_tree=$(jq -r .tree <<<"$generated")" \
             >> "$GITHUB_OUTPUT"
 
-      - name: Verify the updated Kin consumers
-        if: steps.update.outputs.changed == 'true'
-        run: cargo check -p kin-core -p kin-cli -p kin-daemon -p kin-mcp
-
-      - name: Admit the exact verified dependency delta
+      - name: Admit the generated dependency delta before compilation
         id: admission
         if: steps.update.outputs.changed == 'true'
         env:
@@ -184,19 +284,176 @@ jobs:
             --bump-own-version false \
             --expected-tree "$EXPECTED_TREE" \
             --ephemeral-path .kin-actions)"
+          echo "expected_tree=$(jq -r .tree <<<"$admission")" \
+            >> "$GITHUB_OUTPUT"
+
+      - name: Clean trusted updater checkout before the handoff
+        if: steps.update.outputs.changed == 'true'
+        run: rm -rf -- .kin-actions
+
+      - name: Build the hash-bound data-only candidate handoff
+        if: steps.update.outputs.changed == 'true'
+        env:
+          ADMITTED_BASE: ${{ steps.base.outputs.base_sha }}
+          EXPECTED_TREE: ${{ steps.admission.outputs.expected_tree }}
+        run: |
+          set -euo pipefail
+          candidate_dir="$RUNNER_TEMP/kin-registry-candidate"
+          python3 scripts/kin-registry-wave-artifact.py prepare \
+            --workspace "$GITHUB_WORKSPACE" \
+            --output-dir "$candidate_dir" \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --base "$ADMITTED_BASE" \
+            --expected-tree "$EXPECTED_TREE"
+
+      - name: Upload the exact candidate before dependency code executes
+        if: steps.update.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kin-registry-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kin-registry-candidate
+          if-no-files-found: error
+          retention-days: 7
+
+      # This must remain the final step. Newly resolved registry code can run
+      # build scripts and proc macros, so nothing on this runner may consume a
+      # credential, PATH, GITHUB_ENV, or artifact after compilation begins.
+      - name: Verify the updated Kin consumers on the credential-free runner
+        if: steps.update.outputs.changed == 'true'
+        run: cargo check --locked -p kin-core -p kin-cli -p kin-daemon -p kin-mcp
+
+  mutate-wave:
+    name: Update the fixed Kin registry PR
+    needs: [validate-dispatch, prepare-wave]
+    concurrency:
+      group: kin-registry-release-mutate-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: release-tag
+    permissions:
+      actions: read
+      contents: read
+    env:
+      KIN_RELEASE_APP_API_ID: "4370197"
+      KIN_RELEASE_APP_OWNER_ID: "69090636"
+      KIN_RELEASE_BOT_USER_ID: "308181894"
+      BASE_BRANCH: main
+      WAVE_BRANCH: automation/kin-registry-dependency-wave
+      ADMITTED_BASE: ${{ needs.prepare-wave.outputs.base_sha }}
+    steps:
+      - name: Rebind the fresh mutation runner to queued policy
+        id: base
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          base_sha="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
+            --jq .object.sha)"
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]] ||
+             [ "$base_sha" != "$GITHUB_SHA" ] ||
+             [ "$base_sha" != "$ADMITTED_BASE" ]; then
+            echo "::error::fresh mutation runner is not bound to exact queued protected main"
+            exit 1
+          fi
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout exact protected main for trusted mutation code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ steps.base.outputs.base_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Refuse protected-main movement immediately before token mint
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_base="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
+            --jq .object.sha)"
+          if [ "$current_base" != "$GITHUB_SHA" ] ||
+             [ "$current_base" != "$ADMITTED_BASE" ]; then
+            echo "::error::protected main moved before dependency-wave token mint"
+            exit 1
+          fi
+
+      - name: Mint repository-scoped dependency-wave token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+          permission-contents: write
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Verify exact App installation identity and scope
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-kin-release-app-token.py \
+            --app-slug "$APP_SLUG" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Clear inherited landing state before candidate handling
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ensure-kin-registry-wave-no-automerge.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --branch "$WAVE_BRANCH" \
+            --base "$BASE_BRANCH"
+
+      - name: Download the compiled data-only candidate
+        if: needs.prepare-wave.outputs.changed == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: kin-registry-candidate-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kin-registry-candidate
+
+      - name: Revalidate and apply only the admitted manifest bytes
+        id: admission
+        if: needs.prepare-wave.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          candidate="$(python3 scripts/kin-registry-wave-artifact.py apply \
+            --workspace "$GITHUB_WORKSPACE" \
+            --artifact-dir "$RUNNER_TEMP/kin-registry-candidate" \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --base "$ADMITTED_BASE")"
           {
-            echo "expected_tree=$(jq -r .tree <<<"$admission")"
-            echo "add_paths<<KIN_PATHS"
-            jq -r '.paths[]' <<<"$admission"
-            echo "KIN_PATHS"
+            echo "expected_tree=$(jq -r .tree <<<"$candidate")"
+            echo "delta_sha256=$(jq -r .delta_sha256 <<<"$candidate")"
+            echo "package_version=$(jq -r .package_version <<<"$candidate")"
+            echo "workspace_version=$(jq -r .workspace_version <<<"$candidate")"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Clean helper checkout
-        if: always()
-        run: rm -rf .kin-actions
+      - name: Refuse protected-main movement before repository mutation
+        if: needs.prepare-wave.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          current_base="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/git/ref/heads/${BASE_BRANCH}" \
+            --jq .object.sha)"
+          if [ "$current_base" != "$ADMITTED_BASE" ]; then
+            echo "::error::protected main moved before the fixed PR write"
+            exit 1
+          fi
 
       - name: Ensure dependency-wave labels exist
-        if: steps.update.outputs.changed == 'true'
+        if: needs.prepare-wave.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
@@ -208,33 +465,65 @@ jobs:
 
       - name: Open or update the dependency bump PR
         id: open-pr
-        if: steps.update.outputs.changed == 'true'
+        if: needs.prepare-wave.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6.1.0
         with:
           token: ${{ steps.app-token.outputs.token }}
           branch: ${{ env.WAVE_BRANCH }}
-          base: ${{ github.event.repository.default_branch }}
-          add-paths: ${{ steps.admission.outputs.add_paths }}
+          base: ${{ env.BASE_BRANCH }}
+          add-paths: |
+            Cargo.lock
+            Cargo.toml
           delete-branch: true
           signoff: true
           labels: release:consumer-bump,proof-impacting
           author: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
           committer: "github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>"
-          commit-message: "chore(deps): ${{ steps.update.outputs.title }}"
-          title: "chore(deps): ${{ steps.update.outputs.title }}"
+          commit-message: |
+            chore(deps): ${{ needs.prepare-wave.outputs.title }}
+
+            Kin-Registry-Dependency-Wave: v1
+          title: "chore(deps): ${{ needs.prepare-wave.outputs.title }}"
           body: |
             Automated Kin registry dependency wave.
 
-            This PR updates the allowed root-manifest registry pins after a validated Kin registry publish and verifies the affected Kin consumers before opening or updating the fixed automation branch.
+            This PR updates the allowed root-manifest registry pins from registry authority after a validated notification or hourly recovery run, then verifies the affected Kin consumers before updating the fixed automation branch.
+
+            Dispatch source_sha and delivery_id values are sender-supplied correlation metadata. They are not treated as source provenance.
+
+      - name: Clear and verify landing state on the generated PR
+        if: needs.prepare-wave.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          PR: ${{ steps.open-pr.outputs.pull-request-number }}
+          ACTION_HEAD: ${{ steps.open-pr.outputs.pull-request-head-sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ensure-kin-registry-wave-no-automerge.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --branch "$WAVE_BRANCH" \
+            --base "$BASE_BRANCH" \
+            --expected-number "$PR" \
+            --expected-head "$ACTION_HEAD"
+
+      - name: Verify no-change reconciliation left no landing state
+        if: needs.prepare-wave.outputs.changed == 'false'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ensure-kin-registry-wave-no-automerge.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --branch "$WAVE_BRANCH" \
+            --base "$BASE_BRANCH"
 
       - name: Verify exact first-party generated PR
-        if: steps.update.outputs.changed == 'true'
+        if: needs.prepare-wave.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR: ${{ steps.open-pr.outputs.pull-request-number }}
           ACTION_HEAD: ${{ steps.open-pr.outputs.pull-request-head-sha }}
           EXPECTED_TREE: ${{ steps.admission.outputs.expected_tree }}
-          EXPECTED_BASE: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           if [[ ! "$PR" =~ ^[1-9][0-9]*$ ||
@@ -248,7 +537,9 @@ jobs:
           if [ "$(jq -r .state <<<"$pull")" != open ] ||
              [ "$(jq -r .head.repo.full_name <<<"$pull")" != "$GITHUB_REPOSITORY" ] ||
              [ "$(jq -r .head.ref <<<"$pull")" != "$WAVE_BRANCH" ] ||
-             [ "$(jq -r .base.ref <<<"$pull")" != "$EXPECTED_BASE" ] ||
+             [ "$(jq -r .base.ref <<<"$pull")" != "$BASE_BRANCH" ] ||
+             [ "$(jq -r .base.sha <<<"$pull")" != "$ADMITTED_BASE" ] ||
+             ! jq -e '.auto_merge == null' >/dev/null <<<"$pull" ||
              [ "$api_head" != "$ACTION_HEAD" ]; then
             echo "::error::dependency PR is not the exact first-party automation branch"
             exit 1
@@ -259,3 +550,43 @@ jobs:
             echo "::error::dependency PR tree $api_tree differs from admitted $EXPECTED_TREE"
             exit 1
           fi
+
+      - name: Build the post-completion admission record
+        if: needs.prepare-wave.outputs.changed == 'true'
+        env:
+          PR: ${{ steps.open-pr.outputs.pull-request-number }}
+          PR_HEAD: ${{ steps.open-pr.outputs.pull-request-head-sha }}
+        run: |
+          set -euo pipefail
+          python3 scripts/kin-registry-wave-artifact.py finalize \
+            --artifact-dir "$RUNNER_TEMP/kin-registry-candidate" \
+            --output-file "$RUNNER_TEMP/kin-registry-result/result.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --base "$ADMITTED_BASE" \
+            --pull "$PR" \
+            --head "$PR_HEAD" \
+            --workflow-path .github/workflows/kin-registry-release.yml \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Build the post-completion no-change record
+        if: needs.prepare-wave.outputs.changed == 'false'
+        run: |
+          set -euo pipefail
+          python3 scripts/kin-registry-wave-artifact.py finalize-no-change \
+            --output-file "$RUNNER_TEMP/kin-registry-result/result.json" \
+            --repository "$GITHUB_REPOSITORY" \
+            --policy-sha "$GITHUB_SHA" \
+            --base "$ADMITTED_BASE" \
+            --workflow-path .github/workflows/kin-registry-release.yml \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Upload exact result for the post-completion attester
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kin-registry-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kin-registry-result/result.json
+          if-no-files-found: error
+          retention-days: 30

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate Kin registry-release dispatches before granting write authority."""
+"""Validate Kin registry-release triggers before granting write authority."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from pathlib import Path
 from typing import Any
 
 
-EXPECTED_EVENT = "repository_dispatch"
+DISPATCH_EVENT = "repository_dispatch"
+SCHEDULE_EVENT = "schedule"
 EXPECTED_ACTION = "kin-registry-release"
 EXPECTED_REPOSITORY = "firelock-ai/kin"
 EXPECTED_DEFAULT_BRANCH = "main"
@@ -48,20 +49,28 @@ def validate_context(
     default_branch: str,
     ref: str,
     workflow_sha: str,
-) -> None:
-    """Validate GitHub-owned dispatch context before loading write credentials."""
+) -> str:
+    """Validate GitHub-owned trigger context before loading write credentials."""
 
-    _require_exact("event name", event_name, EXPECTED_EVENT)
-    _require_exact("event action", event_action, EXPECTED_ACTION)
     _require_exact("repository", repository, EXPECTED_REPOSITORY)
     _require_exact("default branch", default_branch, EXPECTED_DEFAULT_BRANCH)
     _require_exact("workflow ref", ref, f"refs/heads/{EXPECTED_DEFAULT_BRANCH}")
-    if actor not in ALLOWED_ACTORS:
-        raise ValidationError(f"actor {actor!r} is not authorized")
     if LOWER_SHA.fullmatch(workflow_sha) is None:
         raise ValidationError(
             f"workflow sha must be 40-character lowercase hex, got {workflow_sha!r}"
         )
+    if event_name == DISPATCH_EVENT:
+        _require_exact("event action", event_action, EXPECTED_ACTION)
+        if actor not in ALLOWED_ACTORS:
+            raise ValidationError(f"actor {actor!r} is not authorized")
+        return DISPATCH_EVENT
+    if event_name == SCHEDULE_EVENT:
+        _require_exact("scheduled event action", event_action, "")
+        return SCHEDULE_EVENT
+    raise ValidationError(
+        f"event name must be {DISPATCH_EVENT!r} or {SCHEDULE_EVENT!r}, "
+        f"got {event_name!r}"
+    )
 
 
 def validate_payload(payload: Any) -> dict[str, str]:
@@ -135,10 +144,7 @@ def main(argv: list[str]) -> int:
             event = json.load(stream)
         if not isinstance(event, dict):
             raise ValidationError("event document must be an object")
-        _require_exact(
-            "event document action", str(event.get("action", "")), args.event_action
-        )
-        validate_context(
+        event_mode = validate_context(
             event_name=args.event_name,
             event_action=args.event_action,
             actor=args.actor,
@@ -147,7 +153,15 @@ def main(argv: list[str]) -> int:
             ref=args.ref,
             workflow_sha=args.workflow_sha,
         )
-        payload = validate_payload(event.get("client_payload"))
+        if event_mode == DISPATCH_EVENT:
+            _require_exact(
+                "event document action",
+                str(event.get("action", "")),
+                args.event_action,
+            )
+            payload = validate_payload(event.get("client_payload"))
+        else:
+            payload = None
     except (OSError, json.JSONDecodeError, ValidationError) as error:
         print(
             f"::error title=Invalid Kin registry release::{error}",
@@ -155,11 +169,18 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
-    print(
-        "validated Kin registry release "
-        f"{payload['crate_name']}@{payload['crate_version']} from "
-        f"{payload['source_repo']}@{payload['source_sha']}"
-    )
+    if payload is None:
+        print(
+            "validated scheduled Kin registry reconciliation from protected main "
+            f"at {args.workflow_sha}"
+        )
+    else:
+        print(
+            "validated Kin registry release "
+            f"{payload['crate_name']}@{payload['crate_version']} from "
+            f"{payload['source_repo']}; source_sha and delivery_id are "
+            "sender-supplied correlation metadata, not source provenance"
+        )
     return 0
 
 
