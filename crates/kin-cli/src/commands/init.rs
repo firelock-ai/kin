@@ -1512,7 +1512,6 @@ mod tests {
         }
     }
 
-
     /// What the word over the counts is allowed to claim.
     ///
     /// The measured FIR-2787 run: entities and relations both nonzero, no

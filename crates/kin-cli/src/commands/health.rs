@@ -4034,14 +4034,23 @@ fn memory_floor_check_for(
 
     let available = format_health_bytes(evidence.limit_bytes);
     let ceiling_source = evidence.limit_source.describe();
-    let budget = kin_core::memory_pressure::FootprintBudget::derived_from(evidence.limit_bytes);
+    // Resolved rather than derived, so an operator who named a budget is told
+    // their own number. `kin doctor` runs before the conversion, so the daemon
+    // this row is describing is one this shell has not started yet and will
+    // start with this environment.
+    let budget = kin_core::memory_pressure::FootprintBudget::resolve(Some(evidence.limit_bytes))
+        .unwrap_or(kin_core::memory_pressure::FootprintBudget {
+            bytes: kin_core::memory_pressure::FootprintBudget::derived_from(evidence.limit_bytes),
+            source: kin_core::memory_pressure::BudgetSource::Derived,
+        });
     let daemon_clause = format!(
-        "one repository daemon is allowed {} of that, half the ceiling, and its background \
-         embedding is the first work held back once that is spent; a second repository gets its \
-         own daemon and its own {}, so two of them are allowed {} here",
-        format_health_bytes(budget),
-        format_health_bytes(budget),
-        format_health_bytes(budget.saturating_mul(2)),
+        "one repository daemon is allowed {} of that, {}, and its background embedding is the \
+         first work held back once that is spent; a second repository gets its own daemon and \
+         its own {}, so two of them are allowed {} here",
+        format_health_bytes(budget.bytes),
+        describe_daemon_budget(&budget, evidence.limit_bytes),
+        format_health_bytes(budget.bytes),
+        format_health_bytes(budget.bytes.saturating_mul(2)),
     );
 
     let (tier_clause, tier_is_full) = memory_floor_tier_clause(detection);
@@ -4057,7 +4066,10 @@ fn memory_floor_check_for(
         None => (None, true),
         Some(point) => {
             let comfortable = point.peak_bytes.saturating_add(
-                point.peak_bytes.saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT) / 100,
+                point
+                    .peak_bytes
+                    .saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT)
+                    / 100,
             );
             let clears = evidence.limit_bytes >= comfortable;
             let clause = if clears {
@@ -4088,7 +4100,8 @@ fn memory_floor_check_for(
         }
     };
 
-    let mut detail = format!("{available} of memory here ({ceiling_source}); {daemon_clause}. {tier_clause}");
+    let mut detail =
+        format!("{available} of memory here ({ceiling_source}); {daemon_clause}. {tier_clause}");
     if let Some(commit_clause) = commit_clause {
         detail.push_str(". ");
         detail.push_str(&commit_clause);
@@ -4115,7 +4128,10 @@ fn memory_floor_check_for(
             format_health_bytes(
                 cheapest
                     .map(|point| point.peak_bytes.saturating_add(
-                        point.peak_bytes.saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT) / 100,
+                        point
+                            .peak_bytes
+                            .saturating_mul(COMMIT_PEAK_COMFORT_MARGIN_PERCENT)
+                            / 100,
                     ))
                     .unwrap_or(evidence.limit_bytes)
             )
@@ -4133,6 +4149,42 @@ fn memory_floor_check_for(
         "Before converting a repository here: {}.",
         moves.join(", or ")
     ))
+}
+
+/// Where a daemon's budget came from, in the four shapes it can take.
+///
+/// "Half the ceiling" is true of a 12 GiB container and false of a 128 GiB
+/// workstation, where half is 64 and the derived budget is capped at 8. The row
+/// printed the half sentence over both, which is a claim eight times the size of
+/// the fact on the second machine, and a reader who trusted it would size their
+/// host for a daemon Kin will never let grow that large.
+fn describe_daemon_budget(
+    budget: &kin_core::memory_pressure::FootprintBudget,
+    ceiling_bytes: u64,
+) -> String {
+    if budget.source == kin_core::memory_pressure::BudgetSource::Operator {
+        return format!(
+            "the figure {} names rather than anything derived from this ceiling",
+            kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV
+        );
+    }
+    let half = ceiling_bytes / 2;
+    if budget.bytes >= kin_core::memory_pressure::DERIVED_BUDGET_CEILING_BYTES
+        && half > budget.bytes
+    {
+        return format!(
+            "the most a derived budget ever allows one daemon rather than half of {}, because a \
+             repository daemon holding more than that is pathological whatever the host has spare",
+            format_health_bytes(ceiling_bytes)
+        );
+    }
+    if budget.bytes <= kin_core::memory_pressure::DERIVED_BUDGET_FLOOR_BYTES && half < budget.bytes
+    {
+        return "the least a derived budget ever allows, because a smaller one would back off \
+                before it could do anything useful"
+            .to_string();
+    }
+    "half the ceiling".to_string()
 }
 
 /// The tier half of the row, and whether this machine is over the line.
@@ -4792,7 +4844,6 @@ mod tests {
         }
     }
 
-
     /// Build a detection the way the host probe would have, so a row's numbers
     /// come from a shape the real reader produces rather than from a literal.
     fn detected(
@@ -4808,6 +4859,84 @@ mod tests {
         }
     }
 
+    /// "Half the ceiling" is true of a small container and false of a big host.
+    ///
+    /// The first draft of this row said it over both. On the 128 GiB machine it
+    /// was written on, half is 64 GiB and the budget a daemon actually gets is
+    /// 8, so the sentence was eight times the size of the fact and pointed a
+    /// reader at a host they would never need. Caught by printing the row rather
+    /// than by reading it, which is why this arm exists.
+    ///
+    /// Falsify by restoring the unconditional "half the ceiling": the clamped
+    /// arm goes red and the container arm stays green, which is exactly how the
+    /// defect read.
+    #[test]
+    #[serial]
+    fn the_budget_clause_says_half_only_where_the_budget_really_is_half() {
+        let container = memory_floor_check_for(
+            &capped_memory(12288 * MIB),
+            &detected(crate::capability::LocateProfile::Standard, 5, 12.0),
+        );
+        assert!(
+            container
+                .detail
+                .contains("6.0 GiB of that, half the ceiling"),
+            "on a 12 GiB box the derived budget really is half of it: {}",
+            container.detail
+        );
+
+        let workstation = memory_floor_check_for(
+            &memory(128 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Performance, 18, 128.0),
+        );
+        assert!(
+            !workstation.detail.contains("half the ceiling"),
+            "half of 128 GiB is 64 and the cap holds a daemon to 8, so this machine is not \
+             getting half of anything: {}",
+            workstation.detail
+        );
+        assert!(
+            workstation.detail.contains("8.0 GiB of that")
+                && workstation
+                    .detail
+                    .contains("the most a derived budget ever allows"),
+            "and the row names the cap that decided it: {}",
+            workstation.detail
+        );
+    }
+
+    /// A budget an operator named is theirs, not a number this row derived.
+    ///
+    /// Doctor runs before the conversion, so the daemon being described is one
+    /// this shell has not started and will start with this environment. Quoting
+    /// a derived figure over an operator's own would misreport the machine they
+    /// configured.
+    #[test]
+    #[serial]
+    fn a_budget_an_operator_named_is_reported_as_theirs() {
+        let _guard = EnvVarGuard::set(
+            kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV,
+            (3 * 1024 * MIB).to_string(),
+        );
+        let check = memory_floor_check_for(
+            &memory(128 * 1024 * MIB),
+            &detected(crate::capability::LocateProfile::Performance, 18, 128.0),
+        );
+        assert!(
+            check.detail.contains("3.0 GiB of that")
+                && check
+                    .detail
+                    .contains(kin_core::memory_pressure::FOOTPRINT_BUDGET_ENV),
+            "the row quotes the operator's number and names where it came from: {}",
+            check.detail
+        );
+        assert!(
+            !check.detail.contains("half the ceiling"),
+            "and never calls it a fraction of anything: {}",
+            check.detail
+        );
+    }
+
     /// The stranger's own box, and the reading nobody was given until after an
     /// eleven-minute conversion had spent itself.
     ///
@@ -4820,6 +4949,7 @@ mod tests {
     /// registration: the constrained arm goes quiet, which is the state this
     /// row exists to end.
     #[test]
+    #[serial]
     fn the_memory_floor_row_reads_a_constrained_container_before_any_repository_exists() {
         let check = memory_floor_check_for(
             &capped_memory(12288 * MIB),
@@ -4854,6 +4984,7 @@ mod tests {
     /// are allowed the whole machine, which is the sentence the stranger
     /// assembled for themselves out of four surfaces over several hours.
     #[test]
+    #[serial]
     fn the_row_states_what_two_repository_daemons_come_to_against_this_ceiling() {
         let check = memory_floor_check_for(
             &capped_memory(12288 * MIB),
@@ -4872,12 +5003,17 @@ mod tests {
     /// A warning that fires on every machine is wallpaper by the second run.
     /// This is a developer host clear of both lines, and it has to be silent.
     #[test]
+    #[serial]
     fn a_machine_over_both_lines_keeps_a_quiet_row_and_offers_no_repair() {
         let check = memory_floor_check_for(
             &memory(64 * 1024 * MIB),
             &detected(crate::capability::LocateProfile::Performance, 10, 64.0),
         );
-        assert!(matches!(check.status, HealthStatus::Healthy), "{}", check.detail);
+        assert!(
+            matches!(check.status, HealthStatus::Healthy),
+            "{}",
+            check.detail
+        );
         assert!(
             check.manual_fix.is_none(),
             "there is nothing to repair on a machine that clears both lines: {check:?}"
@@ -4899,6 +5035,7 @@ mod tests {
     /// for. The two arms are asserted against each other so neither can quietly
     /// become the other's text.
     #[test]
+    #[serial]
     fn the_fix_line_names_the_shortfall_this_machine_has_and_not_the_other_one() {
         let tier_only = memory_floor_check_for(
             &memory(32 * 1024 * MIB),
@@ -4950,6 +5087,7 @@ mod tests {
     /// Falsify by hardcoding the pair in `memory_floor_tier_clause` and then
     /// changing either constant: this goes red and nothing else does.
     #[test]
+    #[serial]
     fn the_tier_line_the_row_quotes_is_the_one_the_scorer_uses() {
         let check = memory_floor_check_for(
             &memory(64 * 1024 * MIB),
@@ -4974,6 +5112,7 @@ mod tests {
     /// forced arm is the same rule from the other side: an operator who named
     /// the tier was not measured either.
     #[test]
+    #[serial]
     fn a_tier_from_an_unread_host_or_an_operator_says_so_instead_of_quoting_numbers() {
         let misread = memory_floor_check_for(
             &memory(64 * 1024 * MIB),

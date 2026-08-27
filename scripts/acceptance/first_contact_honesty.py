@@ -4,9 +4,10 @@
 
 """First-contact honesty: what a stranger meets before the graph answers anything.
 
-Three defects the npm0549 green stranger hit on shipped 0.5.49, each on a surface
-that runs before any semantic question is asked, and none of them visible to the
-suites that grade answers:
+Four defects strangers hit on shipped builds, each on a surface that runs before
+any semantic question is asked, and none of them visible to the suites that grade
+answers. Checks 0 to 2 come from the npm0549 green stranger on 0.5.49; check 3
+comes from the rc060n brown stranger on 0.6.0:
 
   CHECK 0 (FIR-2627)  `kin commit --help` never said a Kin commit is not a git
                       commit, so the write-through assumption formed at help and
@@ -23,6 +24,12 @@ suites that grade answers:
                       Probed through `kin setup --install-language-servers`,
                       which reaches the same installer without needing a store;
                       check 2's own docstring says why and what pins the rest.
+  CHECK 3 (FIR-2787)  `kin doctor` said nothing about memory until a repository
+                      existed, so a stranger on a 12 GiB container learned what
+                      the machine could not do only after an eleven-minute
+                      conversion had already spent itself. Graded outside a
+                      repository, which is the only place the question is asked
+                      in time.
 
 A new suite rather than three rows bolted onto the graph suites, for one reason:
 none of these needs a store, a daemon or a corpus, and all three are minutes
@@ -536,7 +543,136 @@ def check_2(suite):
     return res
 
 
-CHECKS = [("0", check_0), ("1", check_1), ("2", check_2)]
+def doctor_rows(suite, extra_env=None):
+    """(rows_by_id, detail) from one `kin doctor --json` run outside a repository.
+
+    Outside, deliberately. The row this check grades is the one FIR-2787 says
+    has to answer before `kin init` runs, and every other memory row on that
+    page reads n/a there, so a run inside a repository would grade a different
+    question entirely.
+    """
+    env = suite.base_env()
+    if extra_env:
+        env.update(extra_env)
+    work = os.path.join(suite.workdir, "no-repository")
+    if not os.path.isdir(work):
+        os.makedirs(work)
+    rc, out, err = run([suite.kin, "doctor", "--json"], cwd=work, env=env, timeout=600)
+    if not out.strip():
+        return None, "`kin doctor --json` exited %d and printed nothing: %s" % (
+            rc, flatten(err)[:200])
+    try:
+        report = json.loads(strip_ansi(out))
+    except ValueError as exc:
+        return None, "`kin doctor --json` did not print JSON: %s" % exc
+    return {row.get("id"): row for row in report.get("checks", [])}, ""
+
+
+def check_3(suite):
+    """FIR-2787: the memory this box affords is on the page before `kin init` runs.
+
+    The stranger converting two mid-sized repositories inside a 12 GiB container
+    was told four separate things, on four surfaces, after each had already cost
+    them something. `kin doctor` on that box flagged two rows and neither was
+    that the daemons would not fit, because every memory row there needs a store
+    and no store existed yet.
+
+    What this grades, and what it does not. The row's shape and its presence
+    outside a repository are graded here, on whatever host runs the suite. The
+    MEMORY band, the one that separates a 12 GiB container from a 32 GiB laptop,
+    is not: nothing on this host can move the ceiling `MemoryEvidence` reads, and
+    a check that pretended to constrain it would be grading its own stand-in. The
+    bands are pinned instead by the unit tests in
+    `crates/kin-cli/src/commands/health.rs`, against the container's exact
+    readings, and this check exists to prove the wiring those tests cannot see.
+
+    The tier band IS constrained here, because `KIN_LOCATE_PROFILE` is a real
+    lever a reader can set, and it moves the row for a reason a reader can act
+    on. Its control is the same command with the tier forced the other way: a
+    row that warned under both would be wallpaper, which is the failure mode
+    this ticket is about in the first place.
+    """
+    res = Result("3", "FIR-2787",
+                 "kin doctor states this machine's memory floor before any repository exists")
+
+    rows, detail = doctor_rows(suite)
+    if rows is None:
+        res.unknown(detail)
+        return res
+    row = rows.get("memory_floor")
+    if row is None:
+        res.bad("`kin doctor` outside a repository carries no memory_floor row; the page still "
+                "says nothing about memory until a store exists, which is FIR-2787 itself")
+        return res
+    res.ok("the row answers outside a repository, where every other memory row reads n/a")
+
+    flat = flatten(row.get("detail", ""))
+    for wanted, why in (
+            ("of memory here", "the ceiling this process runs under"),
+            ("repository daemon is allowed", "what one daemon will hold inside it"),
+            ("two of them are allowed", "what a second converted repository comes to"),
+            ("multihop", "what the capability tier does to retrieval"),
+    ):
+        if wanted in flat:
+            res.ok("the row states %s" % why)
+        else:
+            res.bad("the row does not state %s (looked for %r in: %s)" % (why, wanted, flat[:400]))
+
+    # Every non-green row on this page carries the fix it needs, and every green
+    # one offers none. That pairing is the doctor's own register, and a row that
+    # broke it in either direction would read as a defect in the page rather
+    # than in the machine.
+    green = row.get("status") == "healthy"
+    has_fix = bool(row.get("manual_fix"))
+    if green and has_fix:
+        res.bad("a green row offers a repair for a machine that needs none: %r"
+                % row.get("manual_fix"))
+    elif not green and not has_fix:
+        res.bad("the row needs attention (%s) and carries no fix: %s"
+                % (row.get("status"), flat[:300]))
+    else:
+        res.ok("the row holds the page's register: %s, fix %s"
+               % (row.get("status"), "present" if has_fix else "absent"))
+
+    # The constrained fixture, and its control. `minimal` narrows the multihop
+    # budget for real, so the row has to say so and hand back a move; forcing
+    # the full tier removes exactly that reason to warn.
+    narrowed, detail = doctor_rows(suite, {"KIN_LOCATE_PROFILE": "minimal"})
+    if narrowed is None:
+        res.unknown("the constrained arm could not be read: %s" % detail)
+        return res
+    row = narrowed.get("memory_floor") or {}
+    fix = flatten(row.get("manual_fix") or "")
+    if row.get("status") == "healthy":
+        res.bad("a machine pinned to the minimal tier reads green, so the row cannot report a "
+                "narrowed retrieval budget at all: %s" % flatten(row.get("detail", ""))[:300])
+    elif "multihop" not in fix:
+        res.bad("the constrained row's fix does not name the narrowed budget: %r" % fix)
+    else:
+        res.ok("a tier pinned below the line reads %s and its fix names the multihop budget"
+               % row.get("status"))
+
+    full, detail = doctor_rows(suite, {"KIN_LOCATE_PROFILE": "performance"})
+    if full is None:
+        res.unknown("the control arm could not be read: %s" % detail)
+        return res
+    row = full.get("memory_floor") or {}
+    fix = flatten(row.get("manual_fix") or "")
+    if "multihop" in fix:
+        res.bad("the row still asks for a bigger machine after the tier reason is gone, so it "
+                "warns whatever the host is: %r" % fix)
+    elif row.get("status") == "healthy":
+        res.ok("with the tier at full budget this host's row is green and silent")
+    else:
+        # Honest rather than green: this host's own ceiling is under a measured
+        # commit total. That is the row working, not failing, and saying so
+        # beats grading the suite on which laptop ran it.
+        res.ok("the tier reason is gone and this host's remaining reason is its own ceiling: %s"
+               % flatten(row.get("detail", ""))[:200])
+    return res
+
+
+CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3)]
 
 
 # ----------------------------------------------------------------------- suite

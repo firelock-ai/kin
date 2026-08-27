@@ -973,7 +973,10 @@ mod tests {
             noisy.lines().take(2).collect::<Vec<_>>(),
             "the summary and the git-status note are unchanged by the third line"
         );
-        assert!(noisy.ends_with("Cross-file enrichment is behind."), "{noisy}");
+        assert!(
+            noisy.ends_with("Cross-file enrichment is behind."),
+            "{noisy}"
+        );
     }
 
     /// The announcement this command publishes before it does anything else,
