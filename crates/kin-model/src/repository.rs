@@ -312,19 +312,33 @@ impl AuthorityRoot {
     }
 }
 
-/// Exhaustive root partition for replicated and local repository authority.
+/// Exhaustive root partition for replicated and receiver-local repository authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RootBundle {
+    /// Schema version for this complete root bundle and each authority root.
     pub version: u32,
+    /// Receiver-local transaction sequence. This may advance without changing
+    /// transferred repository truth.
     pub generation: u64,
+    /// Replicated semantic change history.
     pub history: AuthorityRoot,
+    /// Replicated authority for the current refs, their exact targets, and the
+    /// default ref.
     pub ref_state: AuthorityRoot,
+    /// Receiver-local operation receipt history.
+    ///
+    /// This root binds the operations accepted by one receiver, including the
+    /// destination operation identity and receiver commit time. It is not
+    /// portable ref history and does not override `ref_state`. It remains in the
+    /// complete root bundle so receipt and operation chains retain their exact
+    /// local identity, but it does not participate in replicated-truth equality.
     pub ref_log: AuthorityRoot,
+    /// Replicated collaboration authority.
     pub collaboration: AuthorityRoot,
+    /// Replicated external, Git, alias, and replication authority.
     pub replication: AuthorityRoot,
-    /// Local workspace/session/overlay authority. Never compare this field when
-    /// deciding whether two replicas have identical replicated truth.
+    /// Receiver-local workspace, session, and overlay authority.
     pub local_state: AuthorityRoot,
 }
 
@@ -357,15 +371,24 @@ impl RootBundle {
     /// Whether two authority bundles name the same replicated repository truth.
     ///
     /// `generation` advances for every repository transaction, including
-    /// local-only workspace transitions, and `local_state` deliberately roots
-    /// workspace/session/overlay authority. Neither field participates in
-    /// replica truth equality. Schema version and every replicated partition
-    /// remain exact.
+    /// local-only workspace transitions. `ref_log` roots receiver-specific
+    /// operation receipts rather than portable ref history. `local_state` roots
+    /// workspace, session, and overlay authority. Those three fields do not
+    /// participate in replicated-truth equality.
+    ///
+    /// Schema version and every transferred partition remain exact. In
+    /// particular, `ref_state` remains the replicated authority for current ref
+    /// names, targets, and the default ref. The complete `RootBundle` still
+    /// includes every receiver-local root for validation and root-chain
+    /// integrity.
+    ///
+    /// This predicate does not validate either bundle. An untrusted bundle must
+    /// pass [`RootBundle::validate`] first, including schema-version validation
+    /// for the receiver-local roots excluded here.
     pub fn has_same_replicated_truth(&self, other: &Self) -> bool {
         self.version == other.version
             && self.history == other.history
             && self.ref_state == other.ref_state
-            && self.ref_log == other.ref_log
             && self.collaboration == other.collaboration
             && self.replication == other.replication
     }
@@ -2086,47 +2109,88 @@ mod tests {
     }
 
     #[test]
-    fn replicated_truth_equality_excludes_generation_and_local_state_only() {
+    fn replicated_truth_equality_classifies_every_root_bundle_field() {
         let expected = roots();
-        let mut local_only = expected.clone();
-        local_only.generation = expected.generation + 9;
-        local_only.local_state = root(0x70);
-        assert!(expected.has_same_replicated_truth(&local_only));
-        assert_ne!(expected, local_only);
 
-        let mut variants = Vec::new();
-        let mut version = expected.clone();
-        version.version += 1;
-        variants.push(version);
-        let mut history = expected.clone();
-        history.history = root(0x71);
-        variants.push(history);
-        let mut ref_state = expected.clone();
-        ref_state.ref_state = root(0x72);
-        variants.push(ref_state);
-        let mut ref_log = expected.clone();
-        ref_log.ref_log = root(0x73);
-        variants.push(ref_log);
-        let mut collaboration = expected.clone();
-        collaboration.collaboration = root(0x74);
-        variants.push(collaboration);
-        let mut replication = expected.clone();
-        replication.replication = root(0x75);
-        variants.push(replication);
+        type Case = (&'static str, bool, fn(&mut RootBundle));
+        let cases: [Case; 8] = [
+            ("version", false, |bundle| bundle.version += 1),
+            ("generation", true, |bundle| bundle.generation += 9),
+            ("history", false, |bundle| bundle.history = root(0x71)),
+            ("ref_state", false, |bundle| bundle.ref_state = root(0x72)),
+            ("ref_log", true, |bundle| bundle.ref_log = root(0x73)),
+            ("collaboration", false, |bundle| {
+                bundle.collaboration = root(0x74)
+            }),
+            ("replication", false, |bundle| {
+                bundle.replication = root(0x75)
+            }),
+            ("local_state", true, |bundle| {
+                bundle.local_state = root(0x76)
+            }),
+        ];
 
-        for changed in variants {
-            assert!(!expected.has_same_replicated_truth(&changed));
+        assert_eq!(
+            messagepack_array_len(&rmp_serde::to_vec(&expected).unwrap()),
+            cases.len(),
+            "RootBundle gained or lost a field; classify it explicitly as replicated or receiver-local"
+        );
+
+        let expected_wire = rmp_serde::to_vec(&expected).unwrap();
+        for (field, expects_same_replicated_truth, mutate) in cases {
+            let mut changed = expected.clone();
+            mutate(&mut changed);
+
+            assert_ne!(changed, expected, "{field} mutation must change the bundle");
+            assert_ne!(
+                rmp_serde::to_vec(&changed).unwrap(),
+                expected_wire,
+                "{field} must remain bound by complete RootBundle identity"
+            );
+            assert_eq!(
+                expected.has_same_replicated_truth(&changed),
+                expects_same_replicated_truth,
+                "{field} has the wrong replicated-truth classification"
+            );
         }
+
+        let mut another_receiver = expected.clone();
+        another_receiver.generation += 9;
+        another_receiver.ref_log = root(0x77);
+        another_receiver.local_state = root(0x78);
+        assert!(expected.has_same_replicated_truth(&another_receiver));
+        assert_ne!(expected, another_receiver);
+        assert_ne!(expected_wire, rmp_serde::to_vec(&another_receiver).unwrap());
+
+        another_receiver.ref_state = root(0x79);
+        assert!(
+            !expected.has_same_replicated_truth(&another_receiver),
+            "receiver-local receipt differences must not hide a real ref-state move"
+        );
     }
 
     #[test]
-    fn root_bundle_rejects_mixed_partition_schema_versions() {
-        let mut invalid = roots();
-        invalid.replication.version += 1;
-        let error = invalid.validate().unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("unsupported replication authority root version"));
+    fn root_bundle_rejects_mixed_schema_version_in_every_partition() {
+        type Case = (&'static str, fn(&mut RootBundle));
+        let cases: [Case; 6] = [
+            ("history", |bundle| bundle.history.version += 1),
+            ("ref_state", |bundle| bundle.ref_state.version += 1),
+            ("ref_log", |bundle| bundle.ref_log.version += 1),
+            ("collaboration", |bundle| bundle.collaboration.version += 1),
+            ("replication", |bundle| bundle.replication.version += 1),
+            ("local_state", |bundle| bundle.local_state.version += 1),
+        ];
+
+        for (partition, mutate) in cases {
+            let mut invalid = roots();
+            mutate(&mut invalid);
+            let error = invalid.validate().unwrap_err();
+            let expected = format!("unsupported {partition} authority root version");
+            assert!(
+                error.to_string().contains(expected.as_str()),
+                "{partition} must remain version-validated even when it is receiver-local"
+            );
+        }
     }
 
     fn admission_policy(
