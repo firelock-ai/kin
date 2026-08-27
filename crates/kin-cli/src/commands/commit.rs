@@ -47,7 +47,7 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 async fn pending_enrichment(layout: &kin_core::KinLayout) -> Option<String> {
     let url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
     let client = crate::daemon_client::DaemonClient::from_base_url_for_layout(url, layout).ok()?;
-    let status = client.lsp_sweep_status().await.ok()?;
+    let status = probe_sweep_status(&client).await?;
     let field = |name: &str| status.get(name).and_then(|value| value.as_u64());
     let done = field("files_done")?;
     let total = field("files_total")?;
@@ -56,6 +56,27 @@ async fn pending_enrichment(layout: &kin_core::KinLayout) -> Option<String> {
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
     pending_enrichment_line(running, done, total)
+}
+
+/// Ask the daemon how its sweep is going, under a bound of this command's own.
+///
+/// A function rather than an inline `timeout`, so a test can drive the real
+/// call against a real socket that never answers. Asserting the bound by
+/// wrapping the client in the test would pin the constant and nothing else, and
+/// would keep passing on the day this call site stopped using it.
+///
+/// The client's own ceiling is 300 s. The endpoint is an atomics read and
+/// answers instantly on a daemon that is well, but the daemon this line is
+/// ABOUT is a busy one, and five minutes of silence after a commit that already
+/// landed is a worse surface than no line at all. An answer that does not
+/// arrive in the window is treated exactly like one that could not be read.
+async fn probe_sweep_status(
+    client: &crate::daemon_client::DaemonClient,
+) -> Option<serde_json::Value> {
+    tokio::time::timeout(PENDING_ENRICHMENT_PROBE, client.lsp_sweep_status())
+        .await
+        .ok()?
+        .ok()
 }
 
 /// The sentence, split from the probe so both branches are testable without a
@@ -153,6 +174,13 @@ struct DaemonCommitResult {
     relation_count: usize,
     file_count: usize,
 }
+
+/// How long the post-commit enrichment probe is allowed to take.
+///
+/// Short on purpose. The commit has landed by the time this runs, so every
+/// second here is a second a user waits to be told their write succeeded, and
+/// the sentence it buys is an advisory one.
+const PENDING_ENRICHMENT_PROBE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// How often the phase tail is read while the commit request is outstanding.
 const PHASE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
@@ -977,6 +1005,45 @@ mod tests {
             noisy.ends_with("Cross-file enrichment is behind."),
             "{noisy}"
         );
+    }
+
+    /// A landed commit is never held hostage by the probe that annotates it.
+    ///
+    /// The daemon client's own ceiling is 300 s, and `/lsp/sweep/status` is an
+    /// atomics read that answers instantly on a daemon that is well. The daemon
+    /// this line is about is a busy one, so the well case is not the one to
+    /// size for: five minutes of silence after a write that already succeeded
+    /// is worse than no line at all.
+    ///
+    /// Driven against a socket that accepts and then says nothing, which is the
+    /// shape a wedged daemon presents, so the bound is proved by a hang rather
+    /// than asserted about a constant.
+    #[tokio::test]
+    async fn a_probe_that_never_answers_gives_up_long_before_the_client_would() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let silent = tokio::spawn(async move {
+            // Accept and hold. Never reply.
+            let _held = listener.accept().await;
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+        });
+
+        let client =
+            crate::daemon_client::DaemonClient::from_base_url(format!("http://{addr}")).unwrap();
+        let started = std::time::Instant::now();
+        let answered = probe_sweep_status(&client).await;
+        let waited = started.elapsed();
+
+        assert!(
+            answered.is_none(),
+            "a socket that never replies must trip the bound, not return a reading"
+        );
+        assert!(
+            waited < std::time::Duration::from_secs(30),
+            "the probe waited {waited:?}; the client's own ceiling is 300s and this line is not \
+             worth any of it"
+        );
+        silent.abort();
     }
 
     /// The announcement this command publishes before it does anything else,
