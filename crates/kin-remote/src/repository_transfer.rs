@@ -79,7 +79,13 @@ pub const REPOSITORY_TRANSFER_PROTOCOL: &str = "kin-repository-v6-fast-forward";
 /// between replicas whose imported-Git authority already matches, and no push
 /// could establish one, so a repository that came from Git had no route into a
 /// hosted store at all. A version 2 peer is refused by name, same as version 1.
-pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 3;
+///
+/// Version 4 makes the transfer identity a deterministic manifest over the
+/// content-addressed identities the receiver independently verifies. Version
+/// 3 hashed raw JSON for the whole pack, including unordered entity metadata
+/// maps. A receiver reconstructing one of those maps could therefore reject a
+/// semantically identical pack under a different byte order.
+pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = 4;
 pub const FEATURE_EXACT_TREES: &str = "exact-trees-v1";
 pub const FEATURE_IMMUTABLE_SOURCE_CAS: &str = "immutable-source-cas-v1";
 pub const FEATURE_REF_CAS: &str = "ref-cas-v1";
@@ -1954,12 +1960,78 @@ fn transfer_receipt(
     }
 }
 
+#[derive(Serialize)]
+struct RepositoryTransferIdentity<'a> {
+    schema_version: u32,
+    protocol: &'a str,
+    operation_id: &'a OperationId,
+    repository_id: &'a RepositoryId,
+    source_ref: &'a RefName,
+    destination_ref: &'a RefName,
+    source_head: SemanticChangeId,
+    transfer_target_head: SemanticChangeId,
+    source_tree_hash: Hash256,
+    expected_destination_target: &'a Option<RefTarget>,
+    expected_destination_head: Option<SemanticChangeId>,
+    expected_destination_roots: &'a RootBundle,
+    expected_destination_default_ref: &'a Option<RefName>,
+    source_git_authority_hash: Option<Hash256>,
+    expected_destination_git_authority_hash: Option<Hash256>,
+    git_authority_bootstrap_hash: Option<Hash256>,
+    required_features: &'a [String],
+    changes: Vec<SemanticChangeId>,
+    trees: &'a [RepositoryTransferTreeIdentity],
+    external_objects: &'a [ExternalObjectRecord],
+    aliases: &'a [ExternalChangeAlias],
+    bodies: Vec<RepositoryTransferBodyIdentity>,
+}
+
+#[derive(Serialize)]
+struct RepositoryTransferBodyIdentity {
+    hash: Hash256,
+    byte_len: u64,
+}
+
 fn compute_transfer_id(pack: &RepositoryTransferPack) -> Result<Hash256> {
-    let mut canonical = pack.clone();
-    canonical.transfer_id = Hash256::from_bytes([0; 32]);
-    let payload = serde_json::to_vec(&canonical)
+    // Semantic changes and bodies are already content-addressed objects. Their
+    // declared identities are recomputed below by `validate_pack`, so carrying
+    // those identities here binds the exact content without serializing an
+    // unordered metadata map or copying every base64 body into a second large
+    // allocation. The remaining envelope fields are ordered model values.
+    let identity = RepositoryTransferIdentity {
+        schema_version: pack.schema_version,
+        protocol: &pack.protocol,
+        operation_id: &pack.operation_id,
+        repository_id: &pack.repository_id,
+        source_ref: &pack.source_ref,
+        destination_ref: &pack.destination_ref,
+        source_head: pack.source_head,
+        transfer_target_head: pack.transfer_target_head,
+        source_tree_hash: pack.source_tree_hash,
+        expected_destination_target: &pack.expected_destination_target,
+        expected_destination_head: pack.expected_destination_head,
+        expected_destination_roots: &pack.expected_destination_roots,
+        expected_destination_default_ref: &pack.expected_destination_default_ref,
+        source_git_authority_hash: pack.source_git_authority_hash,
+        expected_destination_git_authority_hash: pack.expected_destination_git_authority_hash,
+        git_authority_bootstrap_hash: hash_git_authority(pack.git_authority_bootstrap.as_ref())?,
+        required_features: &pack.required_features,
+        changes: pack.changes.iter().map(|change| change.id).collect(),
+        trees: &pack.trees,
+        external_objects: &pack.external_objects,
+        aliases: &pack.aliases,
+        bodies: pack
+            .bodies
+            .iter()
+            .map(|body| RepositoryTransferBodyIdentity {
+                hash: body.hash,
+                byte_len: body.byte_len,
+            })
+            .collect(),
+    };
+    let payload = serde_json::to_vec(&identity)
         .map_err(|error| invalid(format!("serialize transfer identity: {error}")))?;
-    Ok(domain_hash(b"kin-repository-transfer-v1\0", &payload))
+    Ok(domain_hash(b"kin-repository-transfer-v2\0", &payload))
 }
 
 fn hash_git_authority(authority: Option<&GitExternalAuthority>) -> Result<Option<Hash256>> {
@@ -2092,14 +2164,16 @@ impl ChangeStore for TransferChangeStore {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     use kin_db::LocalFileBackend;
     use kin_model::{
-        compute_semantic_change_id, ArtifactId, ExternalObjectKind, GitExternalAuthorityDelta,
-        GitObjectBodyLoader, GitObjectFormat, GitObjectId, GitRawRef, GitRawTarget, LocatedEntry,
-        RepoPath, Timestamp, TreeDelta,
+        compute_semantic_change_id, ArtifactId, Entity, EntityDelta, EntityId, EntityKind,
+        EntityMetadata, EntityRole, ExternalObjectKind, FingerprintAlgorithm,
+        GitExternalAuthorityDelta, GitObjectBodyLoader, GitObjectFormat, GitObjectId, GitRawRef,
+        GitRawTarget, LanguageId, LocatedEntry, RepoPath, SemanticFingerprint, Timestamp,
+        TreeDelta, Visibility,
     };
     use sha1::{Digest as _, Sha1};
     use tempfile::TempDir;
@@ -2130,6 +2204,57 @@ mod tests {
 
     fn digest(bytes: &[u8]) -> Hash256 {
         Hash256::from_bytes(Sha256::digest(bytes).into())
+    }
+
+    fn entity_with_metadata(extra: HashMap<String, serde_json::Value>) -> Entity {
+        Entity {
+            id: EntityId(Uuid::from_u128(9_001)),
+            kind: EntityKind::Function,
+            name: "metadata_order_probe".to_string(),
+            language: LanguageId::Rust,
+            fingerprint: SemanticFingerprint {
+                algorithm: FingerprintAlgorithm::V1TreeSitter,
+                ast_hash: Hash256::from_bytes([0x11; 32]),
+                signature_hash: Hash256::from_bytes([0x22; 32]),
+                behavior_hash: Hash256::from_bytes([0x33; 32]),
+                equivalence_hash: Hash256::from_bytes([0x44; 32]),
+                stability_score: 1.0,
+            },
+            file_origin: None,
+            span: None,
+            signature: "fn metadata_order_probe()".to_string(),
+            visibility: Visibility::Private,
+            role: EntityRole::Source,
+            doc_summary: None,
+            metadata: EntityMetadata { extra },
+            lineage_parent: None,
+            created_in: None,
+            superseded_by: None,
+        }
+    }
+
+    fn pack_with_metadata(
+        base: &RepositoryTransferPack,
+        extra: HashMap<String, serde_json::Value>,
+    ) -> RepositoryTransferPack {
+        let mut pack = base.clone();
+        assert_eq!(pack.changes.len(), 1);
+        assert_eq!(pack.trees.len(), 1);
+        assert!(pack.aliases.is_empty());
+
+        let old_change_id = pack.changes[0].id;
+        pack.changes[0].entity_deltas.push(EntityDelta::Added {
+            new: entity_with_metadata(extra),
+        });
+        let new_change_id = compute_semantic_change_id(&pack.changes[0]).unwrap();
+        pack.changes[0].id = new_change_id;
+        pack.source_head = new_change_id;
+        pack.transfer_target_head = new_change_id;
+        assert_eq!(pack.trees[0].change_id, old_change_id);
+        pack.trees[0].change_id = new_change_id;
+        pack.transfer_id = Hash256::from_bytes([0; 32]);
+        pack.transfer_id = compute_transfer_id(&pack).unwrap();
+        pack
     }
 
     fn manager(
@@ -3863,6 +3988,67 @@ mod tests {
         duplicate.transfer_id = compute_transfer_id(&duplicate).unwrap();
         let error = validate_pack(&duplicate, &RepositoryTransferLimits::default()).unwrap_err();
         assert!(error.to_string().contains("duplicate source body"));
+    }
+
+    #[test]
+    fn transfer_identity_survives_metadata_map_reconstruction() {
+        let fixture = fixture();
+
+        // Entity metadata is intentionally extensible and therefore uses a
+        // HashMap. Find two maps with the same values and observably different
+        // iteration orders, as happens when a receiver deserializes a pack.
+        let entries = (0..16)
+            .map(|index| {
+                (
+                    format!("metadata_key_{index:02}"),
+                    serde_json::json!({ "index": index, "stable": true }),
+                )
+            })
+            .collect::<Vec<_>>();
+        let first = entries.iter().cloned().collect::<HashMap<_, _>>();
+        let first_bytes = serde_json::to_vec(&EntityMetadata {
+            extra: first.clone(),
+        })
+        .unwrap();
+        let second = (0..256)
+            .map(|rotation| {
+                entries
+                    .iter()
+                    .cycle()
+                    .skip(rotation % entries.len())
+                    .take(entries.len())
+                    .cloned()
+                    .collect::<HashMap<_, _>>()
+            })
+            .find(|candidate| {
+                serde_json::to_vec(&EntityMetadata {
+                    extra: candidate.clone(),
+                })
+                .unwrap()
+                    != first_bytes
+            })
+            .expect("independent HashMaps expose a different JSON key order");
+        assert_eq!(first, second);
+
+        let first_pack = pack_with_metadata(&fixture.pack, first);
+        let second_pack = pack_with_metadata(&fixture.pack, second);
+
+        // The semantic change contract already canonicalizes metadata keys, so
+        // both spellings declare one exact change and differ only in map order.
+        assert_eq!(first_pack.changes[0].id, second_pack.changes[0].id);
+        assert_ne!(
+            serde_json::to_vec(&first_pack).unwrap(),
+            serde_json::to_vec(&second_pack).unwrap(),
+            "the control must exercise different raw pack bytes"
+        );
+        assert_eq!(
+            first_pack.transfer_id, second_pack.transfer_id,
+            "reconstructing an unordered metadata map must not change transfer identity"
+        );
+
+        let reconstructed: RepositoryTransferPack =
+            serde_json::from_slice(&serde_json::to_vec(&first_pack).unwrap()).unwrap();
+        validate_pack(&reconstructed, &RepositoryTransferLimits::default()).unwrap();
     }
 
     #[test]
