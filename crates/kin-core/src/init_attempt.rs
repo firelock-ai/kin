@@ -785,7 +785,9 @@ pub fn reclaimed_stage_lines(recovered: usize, retained: usize) -> Vec<String> {
             ("directories", "are", "them")
         };
         lines.push(format!(
-            "  {retained} more repository staging {noun} {verb} still on disk and this run left              {pronoun} alone, because it could not prove {pronoun} unused; delete {pronoun} by              hand once no `kin init` is running here"
+            "  {retained} more repository staging {noun} {verb} still on disk and this run left \
+             {pronoun} alone, because it could not prove {pronoun} unused; delete {pronoun} by \
+             hand once no `kin init` is running here"
         ));
     }
     lines
@@ -858,6 +860,88 @@ fn human_seconds(seconds: u64) -> String {
 mod tests {
     use super::*;
     use crate::memory_pressure::PressureSource;
+
+    /// A pass that touched nothing says nothing.
+    ///
+    /// The load-bearing half. Every ordinary `kin init` reclaims no stage, so a
+    /// line here would print under every conversion anyone ever runs and be
+    /// skipped by the third one. It has to be readable on the first conversion
+    /// after a kill, which means it cannot appear on the others.
+    ///
+    /// Falsify by dropping either `> 0` guard: this goes red and the two arms
+    /// below stay green, which is exactly how a warning becomes wallpaper.
+    #[test]
+    fn a_reclaim_pass_that_touched_nothing_prints_nothing() {
+        assert!(
+            reclaimed_stage_lines(0, 0).is_empty(),
+            "an ordinary conversion reclaims nothing and must say nothing"
+        );
+    }
+
+    /// What was taken back, and what is still costing the operator disk.
+    ///
+    /// Two separate lines because they call for opposite actions: one is news
+    /// about disk that came back on its own, the other is a directory the
+    /// operator has to decide about. Folding them into one total would report
+    /// the second as though this run had handled it.
+    #[test]
+    fn a_reclaim_says_what_it_took_back_and_names_what_it_left_with_the_reason() {
+        let took = reclaimed_stage_lines(1, 0);
+        assert_eq!(took.len(), 1, "{took:?}");
+        assert!(
+            took[0].contains("reclaimed 1 repository staging directory"),
+            "the count and what it counts are both the point: {}",
+            took[0]
+        );
+
+        let left = reclaimed_stage_lines(0, 2);
+        assert_eq!(left.len(), 1, "{left:?}");
+        assert!(
+            left[0].contains("2 more repository staging directories are still on disk"),
+            "a directory this run declined to touch is still costing disk: {}",
+            left[0]
+        );
+        assert!(
+            left[0].contains("could not prove them unused"),
+            "and the reason it was left is what makes deleting it safe: {}",
+            left[0]
+        );
+        assert!(
+            left[0].contains("delete them by hand"),
+            "every non-quiet line here carries what to do about it: {}",
+            left[0]
+        );
+
+        // Printed, not read. A Rust line continuation drops the newline and the
+        // indentation after it, and a literal assembled by anything that ate
+        // the backslash first keeps the indentation as a run of spaces inside
+        // the sentence. The source looks right either way, so the only reading
+        // that settles it is the rendered line. This caught exactly that on the
+        // line above.
+        for line in [&took[0], &left[0]] {
+            let body = line.trim_start();
+            assert!(
+                !body.contains("  "),
+                "a rendered line carries a run of spaces, so its continuation was assembled \
+                 wrong: {line:?}"
+            );
+        }
+
+        let both = reclaimed_stage_lines(3, 1);
+        assert_eq!(
+            both.len(),
+            2,
+            "what came back and what stayed are never one line: {both:?}"
+        );
+        assert!(
+            both[0].contains("reclaimed 3 repository staging directories"),
+            "{both:?}"
+        );
+        assert!(
+            both[1].contains("1 more repository staging directory is still on disk"),
+            "{both:?}"
+        );
+    }
 
     fn record() -> InitAttemptRecord {
         InitAttemptRecord {

@@ -3383,8 +3383,8 @@ mod tests {
 
             assert_eq!(
                 recover_orphaned_repository_stages(&parent, &final_kin)
-                .unwrap()
-                .recovered,
+                    .unwrap()
+                    .recovered,
                 1,
                 "an abandoned {label} stage must be reclaimed, not walked past"
             );
@@ -3397,6 +3397,73 @@ mod tests {
                 "the {label} owner record must be gone after recovery"
             );
         }
+    }
+
+    /// The two tallies, joined to the sentence an operator actually reads.
+    ///
+    /// Both numbers were already computed and neither left this function: the
+    /// return value was dropped at both call sites and the retained count went
+    /// to an `info!`. So a stage came off somebody's disk and appeared in no
+    /// sentence anywhere, which is the silence FIR-2639 removed from the
+    /// capture side and left standing here.
+    ///
+    /// The counts are read out of the pass and handed straight to the renderer
+    /// rather than being written twice. A test that asserted `recovered == 1`
+    /// here and `"reclaimed 1"` in the wording test would leave both green on
+    /// the day the two stopped meaning the same thing.
+    ///
+    /// Unix-only for the reason its neighbours are: off Unix the pass returns
+    /// zero unconditionally, so a nonzero count there would measure the
+    /// platform.
+    #[cfg(unix)]
+    #[test]
+    fn a_reclaimed_stage_reaches_the_operator_and_a_clean_parent_stays_silent() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let final_kin = parent.join(".kin");
+
+        // The control first, and on the same parent, so the silence is a fact
+        // about having nothing to report rather than about a different
+        // directory. A line printed here would print under every conversion.
+        let quiet = recover_orphaned_repository_stages(&parent, &final_kin).unwrap();
+        assert_eq!(quiet, ReclaimedStages::default(), "nothing is stranded yet");
+        assert!(
+            crate::init_attempt::reclaimed_stage_lines(quiet.recovered, quiet.retained).is_empty(),
+            "an ordinary conversion reclaims nothing and must say nothing"
+        );
+
+        // Now strand one the way a kill does: nothing runs on the way out, and
+        // what is on disk is all the next pass has to go on.
+        let mut prepared = prepare_repository_layout_with_origin(
+            &parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4())),
+            &final_kin,
+            KinConfig::default(),
+            KinManifest::new(),
+            RepositoryIdentityOrigin::Minted,
+        )
+        .unwrap();
+        let stage_root = prepared.layout.root().to_path_buf();
+        prepared.cleanup_armed = false;
+        drop(prepared);
+        assert!(stage_root.is_dir(), "the stage must exist to be reclaimed");
+
+        let reclaimed = recover_orphaned_repository_stages(&parent, &final_kin).unwrap();
+        assert!(
+            reclaimed.recovered > 0,
+            "the pass took a stage back: {reclaimed:?}"
+        );
+        assert!(!stage_root.exists(), "and its disk is gone");
+
+        let lines =
+            crate::init_attempt::reclaimed_stage_lines(reclaimed.recovered, reclaimed.retained);
+        assert!(
+            !lines.is_empty(),
+            "a stage that came off this disk has to appear in a sentence: {reclaimed:?}"
+        );
+        assert!(
+            lines[0].contains(&format!("reclaimed {}", reclaimed.recovered)),
+            "the sentence carries the count the pass actually returned, not a literal: {lines:?}"
+        );
     }
 
     #[test]
