@@ -8306,6 +8306,11 @@ mod tests {
         assert!(json.contains("\"platform\""));
         assert!(json.contains("\"healthy\""));
         assert!(json.contains("\"retrieval_profile\""));
+        // The row FIR-2787 is about answers with no repository in sight, so a
+        // run outside one is exactly where it has to appear. Every unit test
+        // above calls its core directly and would stay green if nobody ever
+        // registered it, which is the shape of a check that cannot fail.
+        assert!(json.contains("\"memory_floor\""));
     }
 
     #[cfg(unix)]
