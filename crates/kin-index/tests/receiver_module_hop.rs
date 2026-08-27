@@ -410,6 +410,37 @@ fn a_real_repository_recovers_calls_through_a_package_index_receiver() {
     println!("RECEIVER_HOP_CORPUS {}", root.display());
     println!("RECEIVER_HOP_FILES {}", files.len());
     println!("RECEIVER_HOP_CROSS_FILE_CALLS {cross_file}");
+
+    // The ticket's own question, asked of whatever symbol the caller names:
+    // how many callers does the graph hold for it, and from which files. A
+    // count of zero here is the shape that certified a false absence.
+    if let Ok(focal) = std::env::var("KIN_RECEIVER_HOP_FOCAL") {
+        let targets: Vec<EntityId> = files
+            .iter()
+            .flat_map(|f| f.entities.iter())
+            .filter(|e| e.name == focal)
+            .map(|e| e.id)
+            .collect();
+        println!("RECEIVER_HOP_FOCAL {focal} declarations={}", targets.len());
+        let mut callers: Vec<String> = relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .filter_map(|r| match (&r.src, &r.dst) {
+                (GraphNodeId::Entity(src), GraphNodeId::Entity(dst))
+                    if targets.contains(dst) =>
+                {
+                    entity_files.get(src).cloned()
+                }
+                _ => None,
+            })
+            .collect();
+        callers.sort();
+        callers.dedup();
+        println!("RECEIVER_HOP_FOCAL_INCOMING {}", callers.len());
+        for caller in &callers {
+            println!("RECEIVER_HOP_FOCAL_CALLER {caller}");
+        }
+    }
     assert!(
         cross_file > 0,
         "a real Python repository must produce at least one cross-file call edge; \
