@@ -37,7 +37,7 @@ pub use backend::{
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };
-pub use format::{CompactionStats, GraphSnapshot};
+pub use format::{CompactionStats, GraphSnapshot, WorkspaceGraphFacts};
 #[cfg(feature = "gcs")]
 pub use gcs::GcsBackend;
 pub use index::ReadIndex;

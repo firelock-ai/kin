@@ -396,11 +396,11 @@ where
 /// nothing is validated through it, and every value in it is the value the
 /// snapshot's own field carried.
 #[derive(Debug)]
-pub(crate) struct WorkspaceGraphFacts {
-    pub(crate) entities: HashMap<EntityId, Entity>,
-    pub(crate) relations: HashMap<RelationId, Relation>,
-    pub(crate) external_references: HashMap<ExternalReferenceId, ExternalReference>,
-    pub(crate) resolved_tree: ResolvedTree,
+pub struct WorkspaceGraphFacts {
+    pub entities: HashMap<EntityId, Entity>,
+    pub relations: HashMap<RelationId, Relation>,
+    pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
+    pub resolved_tree: ResolvedTree,
 }
 
 impl WorkspaceGraphFacts {
@@ -409,7 +409,7 @@ impl WorkspaceGraphFacts {
     /// Consuming rather than borrowing is the point: the domains move out and
     /// everything else is freed at the call, instead of staying alive beside
     /// the four fields a caller went on to read.
-    pub(crate) fn from_snapshot(snapshot: GraphSnapshot) -> Self {
+    pub fn from_snapshot(snapshot: GraphSnapshot) -> Self {
         Self {
             entities: snapshot.entities,
             relations: snapshot.relations,
