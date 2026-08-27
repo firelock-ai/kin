@@ -2983,6 +2983,18 @@ def check_22(suite):
     candidate and carries no caveat, which is what stops arm 4's gate from
     passing by labelling everything.
 
+    Arm 1 asserts an OUTCOME and is not a falsification of the linker tier that
+    produces it, which was measured rather than assumed. Reverting that tier and
+    rebuilding leaves this check green, because on a daemon-backed store the
+    edge has a second producer: reading the mutated run's own store back,
+    `connect` still carried `main @ pkg/cli.py [Calls, References]
+    (type_resolved)`, and `type_resolved` is the language-server origin label
+    (`kin-index/src/resolution.rs`). So this arm is a regression gate on the
+    answer a user gets, which is worth having and is what the ticket's
+    acceptance names. The tier itself is falsified where only one producer
+    exists, in `kin-index`'s `receiver_module_hop` arms and its corpus census,
+    both linker-only with no daemon and no language server.
+
     The gate's own arms are NOT here, and that is a finding rather than a
     shortcut. The reading it keys on subtracts a file's resolved call edges from
     the call sites the parser read there, and on a converted store the parse

@@ -311,16 +311,46 @@ fn build_dead_code_report(
     // the focal only through its file of origin and its language, and it walks
     // up to `FAMILY_FILE_CAP` importing files per reading, so a scan listing
     // forty rows out of three files takes three readings and not forty.
-    let mut arrival_by_file: std::collections::HashMap<kin_model::FilePathId, Option<String>> =
+    type ArrivalGap = (&'static str, String);
+    let mut arrival_by_file: std::collections::HashMap<kin_model::FilePathId, Option<ArrivalGap>> =
         std::collections::HashMap::new();
-    let mut arrival_rows: std::collections::HashSet<EntityId> = std::collections::HashSet::new();
-    let mut arrival_reasons: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut arrival_rows: std::collections::HashMap<EntityId, ArrivalGap> =
+        std::collections::HashMap::new();
     for entity in unreferenced.iter().chain(test_only.iter()) {
         let Some(file) = entity.file_origin.clone() else {
             continue;
         };
         let gap = arrival_by_file.entry(file).or_insert_with(|| {
             let arrival = kin_mcp::caller_arrival::observe_caller_arrival(graph, entity);
+            // A reading that DECLINED gates the row too, and this branch is the
+            // one a consumer forgets. `observe_caller_arrival` refuses to
+            // truncate: over `FAMILY_FILE_CAP` importing files, or on an index
+            // it could not read, or in a language that links no imports at all,
+            // it returns `Unmeasured` and names the reason rather than
+            // examining part of the family and reporting `accounted`. But it
+            // carries that refusal in `unmeasured_reason` and leaves the
+            // shortfall list EMPTY, so a consumer reading only the list drops
+            // the refusal on the floor and prints the row as a find. Unmeasured
+            // is not accounted, on this surface least of all.
+            //
+            // This does not reopen the blanket-refusal problem the measured
+            // filter below exists to avoid, because that is a different state:
+            // the common case today is `Unaccounted` reached through a family
+            // file carrying no parse count. On the corpus this ticket came from
+            // every reading was `Accounted` or `Unaccounted` and none was
+            // `Unmeasured`.
+            if arrival.state == kin_mcp::caller_arrival::ArrivalState::Unmeasured {
+                return Some((
+                    kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR,
+                    format!(
+                        "the set of files that can reach it could not be established ({})",
+                        arrival
+                            .unmeasured_reason
+                            .as_deref()
+                            .unwrap_or("no reason recorded")
+                    ),
+                ));
+            }
             // `unaccounted_call_sites` is `Some(n)` only where both sides of the
             // subtraction were read. `None` is a file the store holds no parse
             // count for, and that is a gap in this reading rather than evidence
@@ -343,18 +373,19 @@ fn build_dead_code_report(
             if measured.is_empty() {
                 return None;
             }
-            Some(format!(
-                "{}: {} of the {} file(s) that can reach it hold call sites the linker \
-                 recorded no edge for, so a caller may be among them: {}",
+            Some((
                 kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR,
-                measured.len(),
-                arrival.family_files,
-                measured.join(", ")
+                format!(
+                    "{} of the {} file(s) that can reach it hold call sites the linker recorded \
+                     no edge for, so a caller may be among them: {}",
+                    measured.len(),
+                    arrival.family_files,
+                    measured.join(", ")
+                ),
             ))
         });
-        if let Some(reason) = gap.clone() {
-            arrival_rows.insert(entity.id);
-            arrival_reasons.insert(reason);
+        if let Some(gap) = gap.clone() {
+            arrival_rows.insert(entity.id, gap);
         }
     }
     let row_is_unverified = |entity: &kin_model::Entity| {
@@ -362,7 +393,7 @@ fn build_dead_code_report(
             || name_only_ids.contains(&entity.id)
             || unsupportable.contains_key(&entity.language.to_string())
             || method_row(entity)
-            || arrival_rows.contains(&entity.id)
+            || arrival_rows.contains_key(&entity.id)
     };
     let unverified_rows = unreferenced.iter().filter(|e| row_is_unverified(e)).count();
     let mut unverified_reasons: Vec<String> = unsupportable.values().cloned().collect();
@@ -394,14 +425,16 @@ fn build_dead_code_report(
     // Counted across both lists for the same reason methods are: a test-only row
     // claims no PRODUCTION caller exists, and an unaccounted arrival is exactly
     // the shape a production caller goes missing in.
-    let arrival_row_count = unreferenced
-        .iter()
-        .chain(test_only.iter())
-        .filter(|entity| arrival_rows.contains(&entity.id))
-        .count();
-    for reason in &arrival_reasons {
+    let mut arrival_row_counts: std::collections::BTreeMap<ArrivalGap, usize> =
+        std::collections::BTreeMap::new();
+    for entity in unreferenced.iter().chain(test_only.iter()) {
+        if let Some(gap) = arrival_rows.get(&entity.id) {
+            *arrival_row_counts.entry(gap.clone()).or_insert(0) += 1;
+        }
+    }
+    for ((factor, reason), rows) in &arrival_row_counts {
         unverified_reasons.push(format!(
-            "{arrival_row_count} listed entities sit in a file where {reason}"
+            "{rows} listed entities sit in a file where {reason}, and {factor}"
         ));
     }
     unverified_reasons.extend(manifest_gap.clone());
@@ -501,11 +534,8 @@ fn build_dead_code_report(
                 "  [unverified: {}] ",
                 kin_core::reference_coverage::METHOD_ABSENCE_LIMITING_FACTOR
             )
-        } else if arrival_rows.contains(&entity.id) {
-            format!(
-                "  [unverified: {}] ",
-                kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR
-            )
+        } else if let Some((factor, _)) = arrival_rows.get(&entity.id) {
+            format!("  [unverified: {factor}] ")
         } else if row_is_unverified(entity) {
             "  [unverified] ".to_string()
         } else {
@@ -1302,6 +1332,59 @@ mod tests {
             !response.verified,
             "a delete list carrying a row whose callers may not all be visible is not a \
              verified answer: {output}"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_family_could_not_be_established_is_not_read_as_a_find() {
+        // THE DECLINE, and it is the branch a consumer forgets.
+        // `observe_caller_arrival` refuses to truncate: over its family cap, on
+        // an index it cannot read, or in a language that links no imports at
+        // all, it returns `Unmeasured` and names the reason instead of
+        // examining part of the family and reporting `accounted`. It carries
+        // that refusal in `unmeasured_reason` and leaves the shortfall list
+        // EMPTY, so a gate keyed only on the shortfall reads the decline as
+        // nothing to report and prints the row as a find. Unmeasured is not
+        // accounted, and on a delete list least of all.
+        let graph = InMemoryGraph::new();
+        let dead_target = measured(make_entity("dead_target", "src/store.rs"), 0, 0);
+        let caller = measured(make_entity("caller", "src/cli.rs"), 1, 0);
+        let neighbour = measured(make_entity("neighbour", "src/cli.rs"), 1, 0);
+        for entity in [&dead_target, &caller, &neighbour] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // One resolved call and no edge of any kind between the two files, so
+        // the family cannot be established at all.
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                neighbour.id,
+                RelationKind::Calls,
+                0.9,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("dead_target"),
+            "the row must still be listed, or every assertion below passes for the wrong \
+             reason: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "[unverified: {}] dead_target",
+                kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+            )),
+            "the reading declined to establish which files can reach this row, and a row \
+             that says nothing about that is a delete instruction drawn from a walk that \
+             never finished: {output}"
+        );
+        assert!(
+            !response.verified,
+            "a scan carrying a row whose reachable-caller set was never established is not \
+             a verified answer: {output}"
         );
     }
 
