@@ -5300,7 +5300,7 @@ mod tests {
                     if source_cursor == cursor(41)
             ),
             "a second writer committing the identical publication must converge as \
-             already committed at cursor 41, got {converged:?}"
+             already committed at cursor 41; candidate id {first_id}, got {converged:?}"
         );
         assert_eq!(second.source_cursor("repo"), Some(cursor(41)));
     }
