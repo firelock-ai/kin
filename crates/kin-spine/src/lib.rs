@@ -19,6 +19,11 @@ pub mod publication;
 pub mod query;
 pub mod routing;
 pub mod store;
+
+/// In-memory durable spine store for this crate's tests and for consumers that
+/// enable `test-support`. Not part of the product surface.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod xref;
 
 /// Wire-format version of the spine HTTP payloads (`/spine/impact`, `/spine/xref`).
