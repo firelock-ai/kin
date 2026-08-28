@@ -16,8 +16,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use kin_db::{
-    AuthorityReadLease, LocalFileBackend, PersistedRepositoryAuthority,
-    RepositoryAuthorityManager, RepositoryAuthorityState, StorageBackend,
+    AuthorityReadLease, LocalFileBackend, PersistedRepositoryAuthority, RepositoryAuthorityManager,
+    RepositoryAuthorityState, StorageBackend,
 };
 use kin_model::{
     ExternalObjectKind, GitObjectId, Hash256, RefName, RefTarget, RepositoryId, RepositoryRef,

@@ -10,8 +10,7 @@ use std::time::{Duration, Instant};
 use kin_blobs::{BlobError, BlobStore};
 use kin_core::KinLayout;
 use kin_db::{
-    LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager, SnapshotCursor,
-    StorageBackend,
+    LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager, StorageBackend,
 };
 use kin_model::ChangeStore;
 use kin_model::{
@@ -1945,10 +1944,16 @@ pub struct DaemonState {
 }
 
 /// Server-side authority carried by one opaque hosted semantic cursor.
+///
+/// The wire token names this record and nothing else, so the repository and the
+/// publication a cursor is bound to are held here rather than handed to the
+/// caller. `snapshot_identity` is the opaque digest of that publication: an
+/// equality is the only question a paging cursor asks of it, and the backend
+/// generation it replaced answered that question while also disclosing an
+/// order.
 pub struct HostedSemanticCursor {
     pub repo_id: String,
-    pub snapshot_cursor: SnapshotCursor,
-    pub graph_root: String,
+    pub snapshot_identity: String,
     pub inner_cursor: String,
     pub created: Instant,
 }

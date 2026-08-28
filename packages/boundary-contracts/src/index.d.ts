@@ -70,7 +70,11 @@ export type RepoScopedSemanticToolCall =
 
 export interface RepoScopedSemanticAuthority {
   repo_id: string;
-  snapshot_cursor: number;
+  /**
+   * Opaque 64-hex identity of the publication that answered. Equality is the
+   * only comparison it supports; it deliberately does not order.
+   */
+  snapshot_identity: string;
   graph_root: string;
   selected_change_id: string;
 }

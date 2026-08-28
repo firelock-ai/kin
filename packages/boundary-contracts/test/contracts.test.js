@@ -171,7 +171,7 @@ test('repo-scoped semantic contracts bind the path authority and fail closed', a
     capability: 'repo_scoped_semantic_tools_v1',
     repository: {
       repo_id: 'repo-a',
-      snapshot_cursor: 41,
+      snapshot_identity: 'c'.repeat(64),
       graph_root: 'a'.repeat(64),
       selected_change_id: 'b'.repeat(64)
     },
@@ -187,6 +187,32 @@ test('repo-scoped semantic contracts bind the path authority and fail closed', a
       capability: 'unscoped_semantic_tools'
     })).ok,
     false
+  );
+  // The authority a hosted response reports is an identity, never an order. A
+  // backend generation on the wire lets a caller count and watch a repository's
+  // publications, so the contract refuses the old field outright rather than
+  // tolerating it alongside the new one.
+  const orderedAuthority = {
+    ...response,
+    repository: {
+      repo_id: 'repo-a',
+      snapshot_cursor: 41,
+      graph_root: 'a'.repeat(64),
+      selected_change_id: 'b'.repeat(64)
+    }
+  };
+  assert.equal(
+    (await validateContract('repoScopedSemanticToolResponse', orderedAuthority)).ok,
+    false,
+    'an ordered snapshot cursor is not a hosted authority identity'
+  );
+  assert.equal(
+    (await validateContract('repoScopedSemanticToolResponse', {
+      ...response,
+      repository: { ...response.repository, snapshot_identity: 'not-hex' }
+    })).ok,
+    false,
+    'a hosted authority identity is a 64-character hex digest'
   );
 
   const error = {

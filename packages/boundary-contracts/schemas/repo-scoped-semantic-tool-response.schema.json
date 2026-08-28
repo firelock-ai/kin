@@ -9,10 +9,10 @@
     "capability": { "const": "repo_scoped_semantic_tools_v1" },
     "repository": {
       "type": "object",
-      "required": ["repo_id", "snapshot_cursor", "graph_root", "selected_change_id"],
+      "required": ["repo_id", "snapshot_identity", "graph_root", "selected_change_id"],
       "properties": {
         "repo_id": { "type": "string" },
-        "snapshot_cursor": { "type": "integer", "minimum": 0 },
+        "snapshot_identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "graph_root": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
         "selected_change_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
       },
