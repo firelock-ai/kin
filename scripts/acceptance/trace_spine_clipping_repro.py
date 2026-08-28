@@ -172,6 +172,15 @@ SELFTEST_RESPONSE_BUDGET = 1300
 WIDE_RESPONSE_BUDGET = 60000
 ELISION_DEPTH = 3
 ELISION_LIMIT = 25
+# The cap the spine checks run under. Measured against built binaries on
+# 2026-08-28: the fan-out ranking promotes one cross-file candidate into the
+# last kept slot, so at a cap of 3 or more send_via_adapter always survives, the
+# walk reports no module-crossing loss at all, and checks 1 and 2 have no loss
+# to classify or recover. At 1 and 2 the crossing hop is genuinely dropped and
+# spine_dropped_crossing_file reads 1. Two is chosen over one because it leaves
+# a three-step chain rather than a two-step one, and it sits one step from the
+# promotion boundary, so a ranking drift shows up here first.
+SPINE_CLIP_LIMIT = 2
 
 
 def fixture_line(source, needle):
@@ -927,7 +936,7 @@ class Result(object):
 
 
 def check_says_the_absence_proves_nothing(suite):
-    payload = suite.trace(limit=3)
+    payload = suite.trace(limit=SPINE_CLIP_LIMIT)
     if payload is None:
         return Result("0", UNREADABLE, "the narrow walk returned nothing readable")
     status, detail = grade_says_the_absence_proves_nothing(payload)
@@ -935,7 +944,7 @@ def check_says_the_absence_proves_nothing(suite):
 
 
 def check_separates_the_class_of_loss(suite):
-    payload = suite.trace(limit=3)
+    payload = suite.trace(limit=SPINE_CLIP_LIMIT)
     if payload is None:
         return Result("1", UNREADABLE, "the narrow walk returned nothing readable")
     status, detail = grade_separates_the_class_of_loss(payload)
@@ -943,8 +952,8 @@ def check_separates_the_class_of_loss(suite):
 
 
 def check_the_target_is_what_delivers_the_hop(suite):
-    untargeted = suite.trace(limit=3)
-    targeted = suite.trace(limit=3, target=CROSSING_HOP)
+    untargeted = suite.trace(limit=SPINE_CLIP_LIMIT)
+    targeted = suite.trace(limit=SPINE_CLIP_LIMIT, target=CROSSING_HOP)
     if untargeted is None or targeted is None:
         return Result("2", UNREADABLE, "one of the two walks returned nothing readable")
     status, detail = grade_the_target_is_what_delivers_the_hop(untargeted, targeted)
@@ -959,10 +968,42 @@ def check_a_complete_walk_is_not_qualified(suite):
     return Result("3", status, "A walk no cap cut carries none of this. " + detail)
 
 
+def elision_premise_not_run(targeted):
+    """Why checks 4 and 5 graded nothing, or None when the mechanism was exercised.
+
+    The budget these two run at is calibrated, and calibration rots. If the
+    response collapses to a single step, or the cut was the suffix fallback
+    rather than branch narrowing, then whether the target came back says nothing
+    about target-governed narrowing: at a small enough budget the arm keeps one
+    step and it is either the target or it is not. That is a coin flip, and a
+    coin flip that lands right reads exactly like a passing check. So these
+    report UNREADABLE, which the gate treats as graded-nothing rather than as
+    a pass or a failure, and which exits 2 rather than 0.
+    """
+    if not isinstance(targeted, dict) or not isinstance(targeted.get("chain"), list):
+        return "the targeted arm carries no readable chain"
+    kept = len(targeted["chain"])
+    if kept <= 1:
+        return (
+            "the targeted arm came back with %d step(s), so keeping the target is a coin flip "
+            "rather than a narrowing decision; recalibrate RESPONSE_BUDGET" % kept
+        )
+    narrowed = targeted.get("fanout_narrowed")
+    if not isinstance(narrowed, int) or narrowed <= 0:
+        return (
+            "the targeted arm reports fanout_narrowed=%r, so its cut was the suffix fallback "
+            "rather than branch narrowing; recalibrate RESPONSE_BUDGET" % (narrowed,)
+        )
+    return None
+
+
 def check_the_named_target_survives_response_elision(suite):
     wide, targeted, _ = suite.elision_arms()
     if wide is None or targeted is None:
         return Result("4", UNREADABLE, "the wide or targeted bounded walk returned nothing readable")
+    not_run = elision_premise_not_run(targeted)
+    if not_run:
+        return Result("4", UNREADABLE, "The named branch survives response elision. " + not_run)
     status, detail = grade_named_target_survives_response_budget(
         wide, targeted, RESPONSE_BUDGET)
     return Result("4", status, "The named branch survives response elision. " + detail)
@@ -972,6 +1013,9 @@ def check_the_unnamed_budget_drops_the_same_target(suite):
     wide, targeted, unnamed = suite.elision_arms()
     if wide is None or targeted is None or unnamed is None:
         return Result("5", UNREADABLE, "one of the three response-budget arms returned nothing readable")
+    not_run = elision_premise_not_run(targeted)
+    if not_run:
+        return Result("5", UNREADABLE, "The unnamed control loses the same branch. " + not_run)
     status, detail = grade_unnamed_response_budget_drops_the_target(
         wide, targeted, unnamed, RESPONSE_BUDGET)
     return Result("5", status, "The unnamed control loses the same branch. " + detail)
@@ -1252,6 +1296,23 @@ def self_test():
     lost_targeted["elisions"]["chain"] = {
         "kept": 1, "elided": 4, "total": 5, "reason": "response_budget",
     }
+    # The plateau guard. These two report graded-nothing rather than a verdict when the
+    # calibrated budget has drifted far enough that the arm is no longer narrowing.
+    expect_none = elision_premise_not_run(TARGETED_ELISION)
+    if expect_none is not None:
+        failures.append("plateau guard: a healthy targeted arm was refused (%s)" % expect_none)
+    graded.append("plateau guard passes a healthy targeted arm")
+    one_step = json.loads(json.dumps(TARGETED_ELISION))
+    one_step["chain"] = one_step["chain"][:1]
+    if elision_premise_not_run(one_step) is None:
+        failures.append("plateau guard: a one-step targeted arm was graded rather than refused")
+    graded.append("plateau guard refuses a one-step targeted arm")
+    suffix_cut = json.loads(json.dumps(TARGETED_ELISION))
+    suffix_cut["fanout_narrowed"] = 0
+    if elision_premise_not_run(suffix_cut) is None:
+        failures.append("plateau guard: a suffix-cut targeted arm was graded rather than refused")
+    graded.append("plateau guard refuses a suffix-cut targeted arm")
+
     # A discovery universe that already fits the budget cannot overflow it, so a response
     # that trimmed anyway trimmed for some other reason and labelled it response_budget.
     # The universe still has to be a sound wide premise and still has to be larger than
