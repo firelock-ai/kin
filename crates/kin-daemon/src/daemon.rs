@@ -7841,6 +7841,26 @@ mod enrichment_marker_tests {
         unbounded.graph.upsert_entity(&source).unwrap();
         bounded.graph.upsert_entity(&source).unwrap();
         let relations = derived_relations(source.id, 600);
+        // Admit the destination of every derived edge. The fixture left them
+        // out and the write path had no reason to care, but it does now: an
+        // edge into an entity the graph does not hold is refused by kin-db's
+        // transaction gate on every LATER transition, which wedges the
+        // repository for writes, so enrichment drops it rather than writing it
+        // (FIR-2838). The real path cannot produce one either, since the
+        // language-server index is built from graph entities and the live
+        // cross-file pass skips the one shape kin sanctions with an absent
+        // entity destination. What this test is about, that the bounded and
+        // unbounded paths agree and that a re-sweep writes nothing, is
+        // unchanged.
+        for relation in &relations {
+            let mut target = entity("target");
+            target.id = relation
+                .dst
+                .as_entity()
+                .expect("a derived edge names an entity destination");
+            unbounded.graph.upsert_entity(&target).unwrap();
+            bounded.graph.upsert_entity(&target).unwrap();
+        }
 
         // The unbounded path: every relation offered on its own, which is what
         // one language-server query arm used to do.
