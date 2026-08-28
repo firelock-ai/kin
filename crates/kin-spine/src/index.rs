@@ -756,17 +756,18 @@ impl SpineIndex {
     /// refresh in flight as readily as for an authority that is genuinely short,
     /// so a caller reporting WHY cross-repo answers are empty needs the startup
     /// pin's own reading beside it, not this alone.
-    /// The exact set holding `authority_is_complete` false, for diagnosis.
     ///
-    /// The boolean says only that something is dirty; deciding whether that is
-    /// a repository with a pending edge publication or one that never publishes
-    /// edges at all needs the set. Test-only: it clones, and a product caller
-    /// wanting this is asking the wrong question.
-    #[cfg(any(test, feature = "test-support"))]
-    pub fn dirty_edge_repos(&self) -> std::collections::BTreeSet<RepoId> {
-        self.inner.read().dirty_edge_repos.iter().cloned().collect()
-    }
-
+    /// It requires a CURRENT edge publication from every registered repository.
+    /// A repository whose latest publication is metadata-only holds this false
+    /// for as long as that is true, and hydration does not clear it either.
+    /// That follows from what the phase means:
+    /// [`RepoPublicationPhase`](crate::publication::RepoPublicationPhase)
+    /// documents that Metadata "keeps cross-repo topology incomplete", so such
+    /// a repository's outgoing edges are unresolved rather than known-empty.
+    /// Certifying that fleet would answer "what does this repository reference"
+    /// with an empty set and call the empty set authoritative, which is the
+    /// false negative wearing an authoritative verdict that the health route's
+    /// three readings exist to prevent.
     pub fn authority_is_complete(&self) -> bool {
         let inner = self.inner.read();
         let roots = inner
@@ -775,6 +776,19 @@ impl SpineIndex {
             .map(|(repo, root)| (repo.clone(), root.clone()))
             .collect::<BTreeMap<_, _>>();
         Self::authority_complete(&inner, &roots)
+    }
+
+    /// The exact set holding [`Self::authority_is_complete`] false, for
+    /// diagnosis.
+    ///
+    /// The boolean says only that something is dirty; whether that is a
+    /// repository with a pending edge publication or one that never publishes
+    /// edges at all needs the set, and only the first is a transient.
+    /// Test-only: it clones, and a product caller wanting this is asking the
+    /// wrong question.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dirty_edge_repos(&self) -> std::collections::BTreeSet<RepoId> {
+        self.inner.read().dirty_edge_repos.iter().cloned().collect()
     }
 
     fn authority_complete(inner: &SpineInner, roots: &BTreeMap<RepoId, String>) -> bool {
