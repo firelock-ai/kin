@@ -35263,13 +35263,18 @@ mod tests {
             .unwrap();
         assert_eq!(before.status(), StatusCode::OK);
         let before: serde_json::Value = serde_json::from_slice(
-            &axum::body::to_bytes(before.into_body(), usize::MAX).await.unwrap(),
+            &axum::body::to_bytes(before.into_body(), usize::MAX)
+                .await
+                .unwrap(),
         )
         .unwrap();
         assert_eq!(before["enforced"], serde_json::json!(true));
         assert_eq!(before["overlap_open"], serde_json::json!(true));
         assert_eq!(before["previous_accepted"], serde_json::json!(0));
-        assert_eq!(before["previous_last_accepted_unix"], serde_json::Value::Null);
+        assert_eq!(
+            before["previous_last_accepted_unix"],
+            serde_json::Value::Null
+        );
 
         // Spend the retired token once, then read the route again. This is what
         // proves the route and the guard share one counter rather than each
@@ -35296,7 +35301,9 @@ mod tests {
             )
             .await
             .unwrap();
-        let body = axum::body::to_bytes(after.into_body(), usize::MAX).await.unwrap();
+        let body = axum::body::to_bytes(after.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let rendered = String::from_utf8(body.to_vec()).unwrap();
         let after: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(after["previous_accepted"], serde_json::json!(1));

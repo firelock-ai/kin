@@ -3764,11 +3764,8 @@ mod tests {
             SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
         )
         .unwrap();
-        let app = router_with_rotation_tokens(
-            Arc::new(SupervisorState::new()),
-            tokens.clone(),
-            None,
-        );
+        let app =
+            router_with_rotation_tokens(Arc::new(SupervisorState::new()), tokens.clone(), None);
 
         for token in ["current-token", "retired-token"] {
             let response = app
@@ -3781,7 +3778,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{token} should be accepted");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{token} should be accepted"
+            );
         }
         assert_eq!(tokens.previous_accepted_count(), 1);
 

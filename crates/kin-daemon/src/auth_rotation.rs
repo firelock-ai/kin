@@ -86,26 +86,38 @@ pub enum RotationConfigError {
     /// value as the sole authority is the opposite of what its name says and
     /// would leave a rotation looking complete while the retired credential is
     /// the only one that works.
-    PreviousWithoutPrimary { previous_env: String, primary_env: String },
+    PreviousWithoutPrimary {
+        previous_env: String,
+        primary_env: String,
+    },
     /// The two configured tokens are the same value.
     ///
     /// Refused because it reads as an open overlap window and is not one: the
     /// previous-token counter can never move, so the reading an operator closes
     /// the window on would be a permanent zero whether or not anything is still
     /// presenting the old value.
-    PreviousEqualsPrimary { previous_env: String, primary_env: String },
+    PreviousEqualsPrimary {
+        previous_env: String,
+        primary_env: String,
+    },
 }
 
 impl std::fmt::Display for RotationConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::PreviousWithoutPrimary { previous_env, primary_env } => write!(
+            Self::PreviousWithoutPrimary {
+                previous_env,
+                primary_env,
+            } => write!(
                 f,
                 "{previous_env} is set but {primary_env} is not. The superseded token is never \
                  promoted to sole authority: set {primary_env} to the token this surface should \
                  primarily expect, or unset {previous_env}."
             ),
-            Self::PreviousEqualsPrimary { previous_env, primary_env } => write!(
+            Self::PreviousEqualsPrimary {
+                previous_env,
+                primary_env,
+            } => write!(
                 f,
                 "{previous_env} and {primary_env} carry the same value, which is not a rotation \
                  overlap: the superseded-token counter can never move, so it cannot tell you \
@@ -195,7 +207,11 @@ impl std::fmt::Debug for RotationTokens {
 impl RotationTokens {
     /// A surface with no enforcement.
     pub fn disabled() -> Self {
-        Self { primary: None, previous: None, counters: Arc::new(RotationCounters::default()) }
+        Self {
+            primary: None,
+            previous: None,
+            counters: Arc::new(RotationCounters::default()),
+        }
     }
 
     /// Build a token set, refusing the two configurations that cannot mean what
@@ -258,7 +274,10 @@ impl RotationTokens {
     /// Unix seconds of the most recent accept on the superseded token, or `None`
     /// if it has never been presented.
     pub fn previous_last_accepted_unix(&self) -> Option<i64> {
-        let stamp = self.counters.previous_last_accepted_unix.load(Ordering::Relaxed);
+        let stamp = self
+            .counters
+            .previous_last_accepted_unix
+            .load(Ordering::Relaxed);
         (stamp != 0).then_some(stamp)
     }
 
@@ -278,8 +297,11 @@ impl RotationTokens {
         let presented = TokenDigest::of(provided);
 
         let matches_primary = presented.ct_eq(primary);
-        let matches_previous =
-            self.previous.as_ref().map(|retired| presented.ct_eq(retired)).unwrap_or(false);
+        let matches_previous = self
+            .previous
+            .as_ref()
+            .map(|retired| presented.ct_eq(retired))
+            .unwrap_or(false);
 
         if matches_primary {
             return TokenVerdict::Primary;
@@ -292,7 +314,9 @@ impl RotationTokens {
     }
 
     fn record_previous_accept(&self) {
-        self.counters.previous_accepted.fetch_add(1, Ordering::Relaxed);
+        self.counters
+            .previous_accepted
+            .fetch_add(1, Ordering::Relaxed);
         self.counters
             .previous_last_accepted_unix
             .store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
@@ -300,7 +324,9 @@ impl RotationTokens {
 }
 
 fn normalize(token: Option<String>) -> Option<String> {
-    token.map(|value| value.trim().to_string()).filter(|value| !value.is_empty())
+    token
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
 }
 
 #[cfg(test)]
@@ -384,10 +410,15 @@ mod tests {
         assert_eq!(set.classify(Some("retired")), TokenVerdict::Previous);
         assert_eq!(set.previous_accepted_count(), 2);
 
-        let stamp = set.previous_last_accepted_unix().expect("a stamp after a superseded accept");
+        let stamp = set
+            .previous_last_accepted_unix()
+            .expect("a stamp after a superseded accept");
         // Not asserting an exact instant, only that it is a real timestamp
         // rather than the zero sentinel: this daemon cannot be serving in 1970.
-        assert!(stamp > 1_600_000_000, "stamp {stamp} is not a plausible unix time");
+        assert!(
+            stamp > 1_600_000_000,
+            "stamp {stamp} is not a plausible unix time"
+        );
     }
 
     #[test]
@@ -501,7 +532,10 @@ mod tests {
         let rendered = format!("{set:?}");
         assert!(rendered.contains("primary_configured: true"), "{rendered}");
         assert!(rendered.contains("previous_configured: true"), "{rendered}");
-        assert!(!rendered.contains("super-secret"), "Debug leaked token material: {rendered}");
+        assert!(
+            !rendered.contains("super-secret"),
+            "Debug leaked token material: {rendered}"
+        );
     }
 
     #[test]
