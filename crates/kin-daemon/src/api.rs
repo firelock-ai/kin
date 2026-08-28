@@ -6145,6 +6145,15 @@ async fn locate(
     Json(req): Json<kin_cli::daemon_client::LocateRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let session_id = extract_session_id_from_headers(&headers)?;
+    if req.page_size == Some(0) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "locate page_size must be a positive integer".to_string(),
+        ));
+    }
+    let requested_queries = req.queries.clone().unwrap_or_default();
+    let include_tests = req.include_tests.unwrap_or(false);
+    let explain = req.explain.unwrap_or(false);
 
     // Resolve the bounded-snippet projection for this request. Off by default
     // (CLI human path, legacy clients); the agent JSON surface sets it so each
@@ -6167,45 +6176,184 @@ async fn locate(
     // Graph version stamps the paging cursor: any mutation bumps `vfs_version`,
     // so a stale cursor can never page a ranking built against different truth.
     let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-    let page_size = req
-        .page_size
-        .filter(|n| *n > 0)
-        .unwrap_or_else(kin_cli::commands::locate::entity_page_size);
+    let requested_page_size = req.page_size;
+    let page_size = requested_page_size.unwrap_or_else(kin_cli::commands::locate::entity_page_size);
 
-    // Paging fast path: a valid cursor whose ranking is still cached at the
-    // current graph version AND in this request's body mode is windowed straight
-    // from cache, with NO retrieval. The mode is checked and not merely keyed:
-    // the cursor token carries the key, so a caller can present the other mode's
-    // key and would otherwise be served that mode's ranking.
+    // Paging fast path: the cursor names the response projection it came from,
+    // so a bare `kin locate --next` reuses that held mode instead of recomputing
+    // one from the follow-up command's absent flags.
     if let Some(cursor_token) = req.cursor.as_deref() {
+        // A malformed token proves neither its query nor an absolute position.
+        // POST already identifies the fused arm, but that is not enough to
+        // reinterpret arbitrary bytes as a request for fresh page zero. Only a
+        // decoded, now-stale cursor may use the repeated query restart below.
+        if kin_cli::commands::locate::LocateCursor::decode(cursor_token).is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "locate cursor is invalid; re-run the original query without the cursor"
+                    .to_string(),
+            ));
+        }
         if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
             let cached = {
                 let cache = state.locate_rankings.lock().unwrap();
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
-                    .filter(|entry| entry.mode == snippet_opts.projection_mode())
-                    .map(|entry| (entry.entities.clone(), entry.queries.clone()))
+                    .map(|entry| {
+                        (
+                            entry.query.clone(),
+                            entry.entities.clone(),
+                            entry.files.clone(),
+                            entry.debug.clone(),
+                            entry.queries.clone(),
+                            entry.requested_queries.clone(),
+                            entry.include_tests,
+                            entry.reference.clone(),
+                            entry.max_files,
+                            entry.explain,
+                            entry.semantic_coverage.clone(),
+                            entry.degradations.clone(),
+                            entry.file_granularity,
+                            entry.page_size,
+                            entry.mode,
+                        )
+                    })
             };
-            if let Some((entities, queries)) = cached {
+            if let Some((
+                cached_query,
+                entities,
+                files,
+                debug,
+                queries,
+                cached_requested_queries,
+                cached_include_tests,
+                cached_reference,
+                cached_max_files,
+                cached_explain,
+                semantic_coverage,
+                degradations,
+                file_granularity,
+                cached_page_size,
+                cached_mode,
+            )) = cached
+            {
+                if file_granularity {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "locate cursor belongs to semantic_locate file granularity; continue it through semantic_locate"
+                            .to_string(),
+                    ));
+                }
+                if !req.text.trim().is_empty() && req.text != cached_query {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "locate cursor belongs to a different query; re-run the requested query"
+                            .to_string(),
+                    ));
+                }
+                if let Some(explicit_queries) = req.queries.as_ref() {
+                    if explicit_queries != &cached_requested_queries {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "locate cursor preserves its original query variants; re-run the original query to change them"
+                                .to_string(),
+                        ));
+                    }
+                }
+                if let Some(explicit_include_tests) = req.include_tests {
+                    if explicit_include_tests != cached_include_tests {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "locate cursor preserves its original test-role scope; re-run the original query to change it"
+                                .to_string(),
+                        ));
+                    }
+                }
+                if req.reference.is_some() && req.reference != cached_reference {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "locate cursor preserves its original reference scope; re-run the original query to change it"
+                            .to_string(),
+                    ));
+                }
+                if req.max_files_explicit && req.max_files != cached_max_files {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "locate cursor preserves its original retrieval breadth; use page_size to change only the continuation width"
+                            .to_string(),
+                    ));
+                }
+                if let Some(explicit_explain) = req.explain {
+                    if explicit_explain && !cached_explain {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "locate cursor cannot expand a ranking whose explanation was not built; re-run the original query with --explain"
+                                .to_string(),
+                        ));
+                    }
+                }
+                if let Some(requested_snippets) = req.snippet_override {
+                    let cached_snippets =
+                        cached_mode == kin_cli::commands::locate::projection_mode(true, true);
+                    if requested_snippets != cached_snippets {
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            "locate cursor preserves its original snippet projection; re-run the original query to change it"
+                                .to_string(),
+                        ));
+                    }
+                }
                 // The variant echo travels with the ranking, so a page reports the
                 // same fan-out the first page did instead of dropping it.
                 let mut result = kin_cli::commands::locate::LocateResult {
                     entities,
+                    files,
+                    debug,
                     queries,
+                    semantic_coverage,
+                    degradations,
                     ..Default::default()
                 };
-                kin_cli::commands::locate::apply_entity_page(
+                if req.explain == Some(false) {
+                    result.debug = None;
+                }
+                result.all_fallback =
+                    kin_cli::commands::locate::locate_entities_are_all_fallback(&result.entities);
+                if !file_granularity && result.all_fallback {
+                    kin_cli::commands::locate::record_description_query_guidance(
+                        &mut result.degradations,
+                    );
+                }
+                let (page_size, start) = continuation_window(
+                    requested_page_size,
+                    parsed.page_size,
+                    parsed.next_offset,
+                    parsed.page,
+                    cached_page_size,
+                );
+                if let Err(error) = validate_held_locate_offset(start, result.entities.len()) {
+                    return Err((StatusCode::BAD_REQUEST, error));
+                }
+                kin_cli::commands::locate::apply_entity_page_at_offset(
                     &mut result,
                     &parsed.key,
                     parsed.page,
                     page_size,
+                    start,
                 );
                 return Ok(Json(result));
             }
         }
-        // Cache miss / stale / undecodable cursor: fall through to a fresh run
-        // (returns page 0) rather than silently failing the page.
+        // Cache miss / stale decoded cursor: fall through to a fresh run only
+        // when the caller repeated the query, so the replacement page is still
+        // an answer to the same request.
+        if req.text.trim().is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "locate cursor expired or is unavailable; re-run the original query".to_string(),
+            ));
+        }
     }
 
     // Scope token for the cursor key (explicit ref, else the session's temporal
@@ -6231,11 +6379,11 @@ async fn locate(
     // Two-or-more distinct variants trigger RRF fusion; otherwise the single
     // path runs exactly as before (byte-identical).
     let (variants, auto_fanout) =
-        with_auto_sharp_variant(build_locate_variants(&req.text, &req.queries));
+        with_auto_sharp_variant(build_locate_variants(&req.text, &requested_queries));
     let multi_query = variants.len() >= 2;
     // The caller's role ask, resolved once so every arm below runs the same
     // scope. Absent on an older client, which is the documented default.
-    let scope = kin_cli::commands::locate::LocateScope::with_tests(req.include_tests);
+    let scope = kin_cli::commands::locate::LocateScope::with_tests(include_tests);
 
     let mut result = if let Some(reference) = req.reference.as_deref() {
         // Explicit --ref always takes precedence over session scope. Ref
@@ -6258,7 +6406,7 @@ async fn locate(
                 reference,
                 &variants,
                 auto_fanout,
-                req.explain,
+                explain,
                 req.max_files,
                 req.max_files_explicit,
                 snippet_opts,
@@ -6272,7 +6420,7 @@ async fn locate(
                 &head,
                 reference,
                 &req.text,
-                req.explain,
+                explain,
                 req.max_files,
                 req.max_files_explicit,
                 snippet_opts,
@@ -6290,7 +6438,7 @@ async fn locate(
                 graph.as_ref(),
                 &variants,
                 auto_fanout,
-                req.explain,
+                explain,
                 req.max_files,
                 req.max_files_explicit,
                 snippet_opts,
@@ -6303,7 +6451,7 @@ async fn locate(
                 session_id.as_ref(),
                 graph.as_ref(),
                 &req.text,
-                req.explain,
+                explain,
                 req.max_files,
                 req.max_files_explicit,
                 snippet_opts,
@@ -6339,11 +6487,24 @@ async fn locate(
         cache_locate_ranking(
             &state,
             &key,
-            &result.entities,
-            &result.queries,
-            graph_version,
-            snippet_opts.projection_mode(),
+            &req.text,
+            &result,
+            CachedLocateShape {
+                file_granularity: false,
+                snippet_alias: false,
+                requested_queries: requested_queries.clone(),
+                include_tests,
+                reference: req.reference.clone(),
+                max_files: req.max_files,
+                explain,
+                page_size,
+                graph_version,
+                mode: snippet_opts.projection_mode(),
+            },
         );
+    }
+    if snippet_opts.enabled && result.all_fallback {
+        kin_cli::commands::locate::record_description_query_guidance(&mut result.degradations);
     }
     kin_cli::commands::locate::apply_entity_page(&mut result, &key, 0, page_size);
     Ok(Json(result))
@@ -6482,8 +6643,68 @@ fn multiquery_cursor_text(variants: &[String]) -> String {
     variants.join("\u{1f}")
 }
 
-/// Read a JSON string-array MCP argument into an owned `Vec<String>`, dropping
-/// non-string and blank entries. Absent or non-array → empty (single-query).
+/// Validate the request-shape fields the `semantic_locate` schema declares.
+///
+/// MCP clients normally validate against the advertised schema, but the daemon
+/// endpoint is also callable directly. Presence must therefore survive here:
+/// a present value of the wrong type cannot become indistinguishable from an
+/// omitted field and silently select a different scope, body mode, ranking, or
+/// response width.
+fn validate_semantic_locate_argument_types(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Result<(), String> {
+    for key in ["query", "cursor", "granularity", "pipeline"] {
+        if arguments.get(key).is_some_and(|value| !value.is_string()) {
+            return Err(format!("invalid {key}: expected a string"));
+        }
+    }
+
+    for key in [
+        "compact",
+        "include_snippet",
+        "snippet_alias",
+        "include_tests",
+        "explain",
+    ] {
+        if arguments.get(key).is_some_and(|value| !value.is_boolean()) {
+            return Err(format!("invalid {key}: expected a boolean"));
+        }
+    }
+
+    for key in ["limit", "page_size"] {
+        if let Some(value) = arguments.get(key) {
+            let Some(value) = value.as_u64() else {
+                return Err(format!("invalid {key}: expected a positive integer"));
+            };
+            if value == 0 {
+                return Err(format!("invalid {key}: expected a positive integer"));
+            }
+        }
+    }
+
+    for key in ["max_chars", "max_response_chars"] {
+        if arguments
+            .get(key)
+            .is_some_and(|value| value.as_u64().is_none())
+        {
+            return Err(format!("invalid {key}: expected a non-negative integer"));
+        }
+    }
+
+    if let Some(queries) = arguments.get("queries") {
+        let Some(queries) = queries.as_array() else {
+            return Err("invalid queries: expected an array of strings".to_string());
+        };
+        if queries.iter().any(|query| !query.is_string()) {
+            return Err("invalid queries: expected every item to be a string".to_string());
+        }
+    }
+
+    Ok(())
+}
+
+/// Read a validated JSON string-array MCP argument into an owned `Vec<String>`.
+/// Absent means no additional variants.
 fn arg_string_array(arguments: &HashMap<String, serde_json::Value>, key: &str) -> Vec<String> {
     arguments
         .get(key)
@@ -6636,13 +6857,26 @@ fn run_multiquery_locate_at_ref(
 /// Insert a full locate ranking into the paging cache, evicting the oldest entry
 /// when the cache is at capacity (a fresh key past the cap). The cache is bounded
 /// to [`LOCATE_RANKING_CACHE_CAP`], so the linear eviction scan stays cheap.
+#[derive(Clone)]
+struct CachedLocateShape {
+    file_granularity: bool,
+    snippet_alias: bool,
+    requested_queries: Vec<String>,
+    include_tests: bool,
+    reference: Option<String>,
+    max_files: usize,
+    explain: bool,
+    page_size: usize,
+    graph_version: u64,
+    mode: &'static str,
+}
+
 fn cache_locate_ranking(
     state: &DaemonState,
     key: &str,
-    entities: &[kin_cli::commands::locate::LocateEntity],
-    queries: &[String],
-    graph_version: u64,
-    mode: &'static str,
+    query: &str,
+    result: &kin_cli::commands::locate::LocateResult,
+    shape: CachedLocateShape,
 ) {
     let mut cache = state.locate_rankings.lock().unwrap();
     if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(key) {
@@ -6657,10 +6891,23 @@ fn cache_locate_ranking(
     cache.insert(
         key.to_string(),
         CachedLocateRanking {
-            entities: entities.to_vec(),
-            queries: queries.to_vec(),
-            graph_version,
-            mode,
+            query: query.to_string(),
+            entities: result.entities.clone(),
+            files: result.files.clone(),
+            debug: result.debug.clone(),
+            queries: result.queries.clone(),
+            requested_queries: shape.requested_queries,
+            include_tests: shape.include_tests,
+            reference: shape.reference,
+            max_files: shape.max_files,
+            explain: shape.explain,
+            semantic_coverage: result.semantic_coverage.clone(),
+            degradations: result.degradations.clone(),
+            file_granularity: shape.file_granularity,
+            snippet_alias: shape.snippet_alias,
+            page_size: shape.page_size.max(1),
+            graph_version: shape.graph_version,
+            mode: shape.mode,
             created: std::time::Instant::now(),
         },
     );
@@ -7745,10 +7992,21 @@ fn fused_match_evidence(
     query: &str,
     entity: &kin_cli::commands::locate::LocateEntity,
 ) -> serde_json::Value {
+    let mut name_match = semloc_name_match(query, &entity.name);
+    for variant in &entity.matched_queries {
+        match semloc_name_match(variant, &entity.name) {
+            "exact" => {
+                name_match = "exact";
+                break;
+            }
+            "partial" if name_match == "none" => name_match = "partial",
+            _ => {}
+        }
+    }
     let mut evidence = json!({
         "ranker": "fused-v1",
         "score_source": "fused_composite",
-        "name_match": semloc_name_match(query, &entity.name),
+        "name_match": name_match,
         "definition": entity.definition,
     });
     if !entity.provenance.origin.is_empty() {
@@ -7814,29 +8072,221 @@ fn write_locate_variant_indexes(
 /// of returning an apparently complete hit without its graph-owned body;
 /// snippets are omitted only when `include_snippet` is false or a hit has no
 /// entity body.
-/// Max entity pages retained for a single `semantic_locate` ranking. Bounds the
-/// per-query snippet/projection work while still letting a cursor walk well past
-/// the first page.
-const SEMANTIC_LOCATE_MAX_PAGES: usize = 5;
-
 /// Window a full ranked row list to page `page` of `page_size`, returning the
 /// slice, the total, and whether more rows remain. Pure paging arithmetic shared
 /// by the fresh and cached `semantic_locate` paths.
 fn window_semantic_rows(
     rows: &[serde_json::Value],
-    page: usize,
+    start: usize,
     page_size: usize,
-) -> (Vec<serde_json::Value>, usize, bool) {
+) -> (Vec<serde_json::Value>, usize, bool, usize) {
     let page_size = page_size.max(1);
     let total = rows.len();
-    let start = page.saturating_mul(page_size);
     let end = start.saturating_add(page_size).min(total);
     let window = if start < total {
         rows[start..end].to_vec()
     } else {
         Vec::new()
     };
-    (window, total, end < total)
+    (window, total, end < total, end)
+}
+
+/// Page width for a held ranking continuation.
+///
+/// A bare cursor keeps page zero's width, which is what `kin locate --next`
+/// promises. An explicit width still wins: the response budget can trim page
+/// zero and instruct the caller to re-issue its cursor with the number that
+/// survived, recovering every withheld row instead of jumping past them.
+fn continuation_window(
+    explicit: Option<usize>,
+    cursor_page_size: Option<usize>,
+    cursor_offset: Option<usize>,
+    page: usize,
+    cached: usize,
+) -> (usize, usize) {
+    let explicit = explicit.filter(|size| *size > 0);
+    let cursor_page_size = cursor_page_size.filter(|size| *size > 0);
+    let page_size = explicit.or(cursor_page_size).unwrap_or(cached.max(1));
+    let start = match cursor_offset {
+        // Version 2 carries the absolute next row. Page width affects only how
+        // many rows this response emits; changing it can never move the resume
+        // position. The response budget rebases this offset when it withholds a
+        // suffix, before the cursor reaches the caller.
+        Some(next_offset) => next_offset,
+        // Backward compatibility for the old key.page cursor. Released tokens
+        // encoded a page number against the ranking's cached width. A new width
+        // override may change only how many rows this response emits; using it
+        // to derive the start repeats on narrowing and skips on widening.
+        None => page.saturating_mul(cached.max(1)),
+    };
+    (page_size, start)
+}
+
+/// Refuse a syntactically valid cursor that does not name a row in its held
+/// ranking.
+///
+/// A genuine continuation is minted only while at least one row remains, so an
+/// offset at or beyond `total` can only be stale, fabricated, or corrupted. An
+/// empty success here is especially dangerous: the negative envelope can read
+/// it as an authoritative no-match even though the cache still holds ranked
+/// rows. Keep the low-level window helpers pure, but make every cache-backed
+/// protocol path fail loud before it calls them.
+fn validate_held_locate_offset(start: usize, total: usize) -> Result<(), String> {
+    if start < total {
+        Ok(())
+    } else {
+        Err(
+            "locate cursor offset is outside its held ranking; re-run the original query without the cursor"
+                .to_string(),
+        )
+    }
+}
+
+/// Validate the projection fields a caller explicitly repeats with a cursor.
+/// Omitted fields inherit the held ranking. A conflicting explicit field cannot
+/// be honored without rerunning retrieval or leaking a body the caller declined,
+/// so fail loud and ask for a fresh query instead of silently ignoring it.
+fn validate_cursor_projection(
+    arguments: &HashMap<String, serde_json::Value>,
+    cached_query: &str,
+    cached_file_granularity: bool,
+    cached_mode: &str,
+    cached_snippet_alias: Option<bool>,
+) -> Result<(), String> {
+    if let Some(query) = arguments
+        .get("query")
+        .and_then(serde_json::Value::as_str)
+        .filter(|query| !query.trim().is_empty())
+    {
+        if query != cached_query {
+            return Err(
+                "semantic_locate cursor belongs to a different query; re-run the requested query"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(granularity) = arguments
+        .get("granularity")
+        .and_then(serde_json::Value::as_str)
+    {
+        let requested_file = match granularity {
+            value if value.eq_ignore_ascii_case("file") => true,
+            value if value.eq_ignore_ascii_case("entity") => false,
+            other => {
+                return Err(format!(
+                    "invalid granularity '{other}': expected \"entity\" or \"file\""
+                ));
+            }
+        };
+        if requested_file != cached_file_granularity {
+            return Err(
+                "semantic_locate cursor preserves its original granularity; re-run the original query to change it"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(requested) = arguments
+        .get("include_snippet")
+        .and_then(serde_json::Value::as_bool)
+    {
+        let cached = cached_mode == kin_cli::commands::locate::projection_mode(true, true);
+        let requested = requested && !cached_file_granularity;
+        if requested != cached {
+            return Err(
+                "semantic_locate cursor preserves its original snippet projection; re-run the original query to change it"
+                    .to_string(),
+            );
+        }
+    }
+    if let (Some(cached), Some(requested)) = (
+        cached_snippet_alias,
+        arguments
+            .get("snippet_alias")
+            .and_then(serde_json::Value::as_bool),
+    ) {
+        // Fresh requests normalize alias off whenever snippets or entity
+        // granularity are off. Repeat that normalization before comparing, so
+        // repeating the exact contradictory raw flags does not reject its own
+        // cursor after page zero cached the effective false value.
+        let cached_has_snippets =
+            cached_mode == kin_cli::commands::locate::projection_mode(true, true);
+        let requested = requested && !cached_file_granularity && cached_has_snippets;
+        if requested != cached {
+            return Err(
+                "semantic_locate cursor preserves its original snippet alias setting; re-run the original query to change it"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Whether this MCP page's presentation requires fused explanation data.
+///
+/// This matches [`kin_mcp::budget::ResponseBudget::from_arguments`]: explicit
+/// compact wins, otherwise explain opts out of the compact default.
+fn fused_explanation_requested(arguments: &HashMap<String, serde_json::Value>) -> bool {
+    match arguments
+        .get("compact")
+        .and_then(serde_json::Value::as_bool)
+    {
+        // Match ResponseBudget exactly: an explicit compact value wins over
+        // explain, including the contradictory `compact: true, explain: true`
+        // pair a schema-defaulting client can materialize.
+        Some(compact) => !compact,
+        None => {
+            arguments
+                .get("explain")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+        }
+    }
+}
+
+/// Validate the fused retrieval inputs a continuation explicitly repeats.
+///
+/// Omitted inputs inherit the held ranking. Repeated inputs must describe that
+/// same ranking because variants, test scope, and explanation availability are
+/// decided during retrieval. Compaction can shed a held explanation per page;
+/// it cannot expand a ranking that never built one.
+fn validate_fused_cursor_shape(
+    arguments: &HashMap<String, serde_json::Value>,
+    cached_requested_queries: &[String],
+    cached_include_tests: bool,
+    cached_explain: bool,
+) -> Result<(), String> {
+    if arguments.contains_key("queries") {
+        let requested = arg_string_array(arguments, "queries");
+        if requested != cached_requested_queries {
+            return Err(
+                "semantic_locate cursor preserves its original query variants; re-run the original query to change them"
+                    .to_string(),
+            );
+        }
+    }
+    if let Some(requested) = arguments
+        .get("include_tests")
+        .and_then(serde_json::Value::as_bool)
+    {
+        if requested != cached_include_tests {
+            return Err(
+                "semantic_locate cursor preserves its original test-role scope; re-run the original query to change it"
+                    .to_string(),
+            );
+        }
+    }
+    // Explanation data is cache authority, while its presentation is per page.
+    // A continuation may shed held debug safely, but cannot synthesize debug a
+    // fresh ranking did not build. Normalize the same way as the fresh path so
+    // `explain: false, compact: false` is an effective request for explanation.
+    let requests_explanation = fused_explanation_requested(arguments);
+    if requests_explanation && !cached_explain {
+        return Err(
+            "semantic_locate cursor cannot expand a ranking whose explanation was not built; re-run the original query with explain: true"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Serialize a windowed `semantic_locate` page into the tool result payload.
@@ -7846,15 +8296,23 @@ fn semantic_locate_payload(
     semantic_coverage: &kin_cli::commands::locate::SemanticCoverage,
     key: &str,
     page: usize,
+    start: usize,
     page_size: usize,
     rows: &[serde_json::Value],
     degradations: &[kin_cli::commands::locate::RetrievalDegradation],
 ) -> kin_mcp::ToolCallResult {
-    let (window, total, has_more) = window_semantic_rows(rows, page, page_size);
+    let all_fallback = !file_granularity && locate_rows_are_all_fallback(rows);
+    let mut degradations = degradations.to_vec();
+    if all_fallback {
+        kin_cli::commands::locate::record_description_query_guidance(&mut degradations);
+    }
+    let (window, total, has_more, next_offset) = window_semantic_rows(rows, start, page_size);
     let next_cursor = has_more.then(|| {
         kin_cli::commands::locate::LocateCursor {
             key: key.to_string(),
             page: page + 1,
+            page_size: Some(page_size.max(1)),
+            next_offset: Some(next_offset),
         }
         .encode()
     });
@@ -7874,17 +8332,30 @@ fn semantic_locate_payload(
         "page": page,
         "total_ranked": total,
         "next_cursor": next_cursor,
-        "results": window,
     });
+    if file_granularity {
+        // File mode already deduped `rows` to one representative per path.
+        // Page that same window into the shared file shape and omit `results`,
+        // so the cursor, `total_ranked`, and response budget all count the
+        // collection the caller asked for. Re-emitting the whole roll-up on
+        // every continuation repeated files while advancing an unrelated row
+        // cursor.
+        payload["files"] = json!(cosine_file_surface(&window));
+    } else {
+        payload["results"] = json!(&window);
+        // At entity granularity `files[]` remains a query-wide provenance
+        // summary. It is secondary to the paged entity results and intentionally
+        // stable across pages.
+        payload["files"] = json!(cosine_file_surface(rows));
+    }
     // The file surface, in the same `files[]` shape `kin locate --json`, `POST
     // /locate`, and the fused arm already emit, so one consumer parses every Kin
     // locate surface. Serialized unconditionally, including as `[]` for an empty
     // ranking, because the fused arm serializes it unconditionally too and a key
     // that appears only when non-empty makes absence and emptiness the same
     // reading.
-    payload["files"] = json!(cosine_file_surface(rows));
     if !degradations.is_empty() {
-        payload["degradations"] = json!(degradations);
+        payload["degradations"] = json!(&degradations);
     }
     // The page-level half of the disclosure: not one ranked entity carries a
     // name the query asked for.
@@ -7895,7 +8366,7 @@ fn semantic_locate_payload(
     // reasoning the fused arm already refuses. Emitted only when true, and only
     // for entity granularity, so both arms of this tool carry the field on the
     // same terms.
-    if !file_granularity && locate_rows_are_all_fallback(rows) {
+    if all_fallback {
         payload["all_fallback"] = json!(true);
     }
     match serde_json::to_string_pretty(&payload) {
@@ -7937,6 +8408,61 @@ fn locate_rows_are_all_fallback(rows: &[serde_json::Value]) -> bool {
         })
 }
 
+/// Disclose that cosine retrieval filled the requested candidate window.
+///
+/// Equality cannot prove there are more candidates, but it also cannot prove
+/// there are not. The weaker statement is the honest one, and because this is a
+/// real ranking bound it remains a verdict input rather than query-shape advice.
+fn record_cosine_candidate_cap(
+    fetch_limit: usize,
+    fetched: usize,
+    sink: &mut Vec<kin_cli::commands::locate::RetrievalDegradation>,
+) {
+    if fetched < fetch_limit {
+        return;
+    }
+    kin_cli::commands::locate::record_degradation(
+        sink,
+        kin_cli::commands::locate::RetrievalDegradation {
+            component: "ranking_window".to_string(),
+            reason: "candidate_cap_reached".to_string(),
+            detail: format!(
+                "semantic retrieval returned its {fetch_limit}-candidate fetch cap, so the held \
+                 ranking considered the full fetched candidate window and retained every \
+                 successfully projected unique row, but cannot prove no lower candidate exists"
+            ),
+            remediation: "narrow the query or use the fused pipeline when completeness beyond \
+                          the cosine candidate window matters"
+                .to_string(),
+        },
+    );
+}
+
+/// Fetch, reorder and project one entire cosine candidate window without a
+/// second, hidden page-count ceiling.
+///
+/// Production does not receive the raw candidates outside this helper, so it
+/// cannot reintroduce the former `page_size * 5` cap between retrieval and the
+/// held cache while leaving the retention control green. The projector may
+/// honestly reject an unresolved, duplicate, historical, or unreadable
+/// candidate by returning `None`; every successful projection is retained in
+/// order. Paging happens only after this helper returns.
+fn search_and_project_all_cosine_candidates<C, E>(
+    query: &str,
+    fetch_limit: usize,
+    search: impl FnOnce(&str, usize) -> Result<Vec<C>, E>,
+    reorder: impl FnOnce(Vec<C>) -> Vec<C>,
+    mut project: impl FnMut(C) -> Option<serde_json::Value>,
+) -> Result<(Vec<serde_json::Value>, usize), E> {
+    let candidates = search(query, fetch_limit)?;
+    let fetched = candidates.len();
+    let rows = reorder(candidates)
+        .into_iter()
+        .filter_map(|candidate| project(candidate))
+        .collect();
+    Ok((rows, fetched))
+}
+
 /// Roll the retained cosine ranking up into the shared `files[]` surface.
 ///
 /// This arm is entity-centric: it demotes the file to `provenance.file` on each
@@ -7962,10 +8488,10 @@ fn locate_rows_are_all_fallback(rows: &[serde_json::Value]) -> bool {
 /// than porting a surface onto it. Flipping the default is separately refused on
 /// measured evidence, and this change deliberately leaves that verdict alone.
 ///
-/// Derived from `rows`, the whole retained ranking, never from the returned page
-/// window — the same rule `all_fallback` follows. Which files a query is about is
-/// a property of the ranking, so it must not change as the caller pages through
-/// it, and `total_ranked` beside it already reports that same whole.
+/// At entity granularity this is derived from the whole retained ranking and is
+/// a stable secondary provenance summary. At file granularity the caller passes
+/// the current one-row-per-file window instead, making `files[]` the paged
+/// primary collection with no repeats across continuations.
 fn cosine_file_surface(
     rows: &[serde_json::Value],
 ) -> Vec<kin_cli::commands::locate::LocateFileEntry> {
@@ -8246,17 +8772,24 @@ fn build_semantic_locate_result(
         .map(|value| value as usize)
         .filter(|value| *value > 0)
         .unwrap_or(20);
-    // Entities per page: `page_size` if given, else the historical `limit`.
-    let page_size = arguments
+    // Primary rows per page: `page_size` if given, else the historical `limit`.
+    // Keep the explicit value separate so a budget-directed continuation can
+    // override the width encoded by the cursor that page zero minted.
+    let requested_page_size = arguments
         .get("page_size")
+        .or_else(|| arguments.get("limit"))
         .and_then(serde_json::Value::as_u64)
         .map(|value| value as usize)
-        .filter(|value| *value > 0)
-        .unwrap_or(limit);
+        .filter(|value| *value > 0);
+    let page_size = requested_page_size.unwrap_or(limit);
     let file_granularity = arguments
         .get("granularity")
         .and_then(serde_json::Value::as_str)
         .map(|value| value.eq_ignore_ascii_case("file"))
+        .unwrap_or(false);
+    let include_tests = arguments
+        .get("include_tests")
+        .and_then(serde_json::Value::as_bool)
         .unwrap_or(false);
     // Inline a bounded code snippet on each entity hit by default, so a single
     // `semantic_locate` is act-on-able without a follow-up `get_entity_source`.
@@ -8267,6 +8800,100 @@ fn build_semantic_locate_result(
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(true)
         && !file_granularity;
+    let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+    let granularity_token = format!(
+        "sem:{}:{}",
+        if file_granularity { "file" } else { "entity" },
+        if include_tests { "tests" } else { "source" }
+    );
+
+    // Paging fast path: a valid cursor whose ranking is still cached at the
+    // current graph version is windowed straight from cache — no re-search.
+    if let Some(cursor_token) = arguments.get("cursor").and_then(serde_json::Value::as_str) {
+        if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
+            let cached = {
+                let cache = state.semantic_locate_pages.lock().unwrap();
+                cache
+                    .get(&parsed.key)
+                    .filter(|entry| entry.graph_version == graph_version)
+                    .map(|entry| {
+                        (
+                            entry.query.clone(),
+                            entry.rows.clone(),
+                            entry.semantic_coverage.clone(),
+                            entry.degradations.clone(),
+                            entry.file_granularity,
+                            entry.include_tests,
+                            entry.page_size,
+                            entry.mode,
+                        )
+                    })
+            };
+            if let Some((
+                cached_query,
+                rows,
+                cached_coverage,
+                degradations,
+                cached_file_granularity,
+                cached_include_tests,
+                cached_page_size,
+                cached_mode,
+            )) = cached
+            {
+                if let Err(error) = validate_cursor_projection(
+                    arguments,
+                    &cached_query,
+                    cached_file_granularity,
+                    cached_mode,
+                    None,
+                ) {
+                    return kin_mcp::ToolCallResult::error(error);
+                }
+                if let Some(requested) = arguments
+                    .get("include_tests")
+                    .and_then(serde_json::Value::as_bool)
+                {
+                    if requested != cached_include_tests {
+                        return kin_mcp::ToolCallResult::error(
+                            "semantic_locate cursor preserves its original test-role scope; re-run the original query to change it"
+                                .to_string(),
+                        );
+                    }
+                }
+                let (page_size, start) = continuation_window(
+                    requested_page_size,
+                    parsed.page_size,
+                    parsed.next_offset,
+                    parsed.page,
+                    cached_page_size,
+                );
+                if let Err(error) = validate_held_locate_offset(start, rows.len()) {
+                    return kin_mcp::ToolCallResult::error(error);
+                }
+                return semantic_locate_payload(
+                    &cached_query,
+                    cached_file_granularity,
+                    &cached_coverage,
+                    &parsed.key,
+                    parsed.page,
+                    start,
+                    page_size,
+                    &rows,
+                    &degradations,
+                );
+            }
+        }
+        // A cursor-only request cannot be reconstructed after eviction or a
+        // graph-version change. Searching an empty query and returning page
+        // zero would be a different answer disguised as a continuation.
+        if query.trim().is_empty() {
+            return kin_mcp::ToolCallResult::error(
+                "semantic_locate cursor expired or is unavailable; re-run the original query"
+                    .to_string(),
+            );
+        }
+    }
+
     let repository_authority = if include_snippet {
         match require_mcp_local_repository_authority(state) {
             Ok(binding) => Some(binding),
@@ -8284,9 +8911,6 @@ fn build_semantic_locate_result(
     let held_authority =
         kin_mcp::handlers::common::HeldSourceAuthority::new(graph, repository_authority.as_ref());
 
-    let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-    let granularity_token = format!("sem:{}", if file_granularity { "file" } else { "entity" });
-
     // Coverage is reported, never gated: a partially-embedded graph still
     // returns whatever the index can answer (graceful degradation per R5).
     //
@@ -8297,40 +8921,6 @@ fn build_semantic_locate_result(
     // just printed.
     let semantic_coverage = kin_cli::commands::locate::local_semantic_coverage(graph, None);
 
-    // Paging fast path: a valid cursor whose ranking is still cached at the
-    // current graph version is windowed straight from cache — no re-search.
-    if let Some(cursor_token) = arguments.get("cursor").and_then(serde_json::Value::as_str) {
-        if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
-            let cached = {
-                let cache = state.semantic_locate_pages.lock().unwrap();
-                cache
-                    .get(&parsed.key)
-                    .filter(|entry| entry.graph_version == graph_version)
-                    // Cached rows already carry (or omit) `snippet`, and the
-                    // cursor supplies the key, so a mode mismatch has to miss the
-                    // cache and re-search rather than replay the other mode.
-                    .filter(|entry| {
-                        entry.mode
-                            == kin_cli::commands::locate::projection_mode(true, include_snippet)
-                    })
-                    .map(|entry| entry.rows.clone())
-            };
-            if let Some(rows) = cached {
-                return semantic_locate_payload(
-                    &query,
-                    file_granularity,
-                    &semantic_coverage,
-                    &parsed.key,
-                    parsed.page,
-                    page_size,
-                    &rows,
-                    &[],
-                );
-            }
-        }
-        // Cache miss / stale cursor: fall through to a fresh search (page 0).
-    }
-
     // Over-fetch so post-resolution dedupe can still fill the page: by file for
     // file granularity, by resolved entity for entity granularity.
     // Every entity carries both an `Entity(E)` and an `EntityRevision(head)`
@@ -8339,54 +8929,17 @@ fn build_semantic_locate_result(
     // would halve.
     let fetch_limit = page_size.saturating_mul(8).max(page_size);
 
-    let raw = match graph.semantic_search(&query, fetch_limit) {
-        Ok(hits) => hits,
-        Err(error) => {
-            return kin_mcp::ToolCallResult::error(format!("semantic search failed: {error}"));
-        }
-    };
+    // One scope decision feeds both the actual reranker and its evidence. An
+    // explicit include-tests request must not leave Test rows demoted while the
+    // response claims the demotion was lifted.
+    let is_test_query = include_tests || semloc_query_is_test_related(&query);
 
-    // Opt-in (KIN_SEMLOC_RERANK=1): role-aware demotion + exact-name boost over the
-    // cosine hit set ONLY. Resolve once for scoring, then stable-sort by priority with
-    // the original cosine order as the deterministic tiebreak (no nondeterminism).
-    let raw = if semloc_rerank_enabled() {
-        let is_test_q = semloc_query_is_test_related(&query);
-        let mut scored: Vec<_> = raw
-            .into_iter()
-            .enumerate()
-            .map(|(idx, (key, distance))| {
-                let prio = match graph.resolve_retrieval_key(&key) {
-                    Some(kin_db::ResolvedRetrievalItem::Entity(entity)) => semloc_rerank_priority(
-                        Some(entity.role),
-                        &entity.name,
-                        &query,
-                        is_test_q,
-                        distance,
-                    ),
-                    _ => semloc_rerank_priority(None, "", &query, is_test_q, distance),
-                };
-                (prio, idx, key, distance)
-            })
-            .collect();
-        scored.sort_by(|a, b| {
-            a.0.partial_cmp(&b.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.1.cmp(&b.1))
-        });
-        scored
-            .into_iter()
-            .map(|(_, _, key, distance)| (key, distance))
-            .collect()
-    } else {
-        raw
-    };
-
-    // Build the full (bounded) ranking once; page 0 is returned and the rest is
-    // cached for `--next`. Cap the retained ranking so per-query projection work
-    // stays bounded regardless of how deep the over-fetch ran. The opt-in re-rank
-    // above has already reordered `raw`, so paging windows the re-ranked set.
-    let max_rows = page_size.saturating_mul(SEMANTIC_LOCATE_MAX_PAGES);
-    let mut rows: Vec<serde_json::Value> = Vec::with_capacity(page_size);
+    // Build the entire fetched ranking once; page 0 is returned and every
+    // projected remainder is cached for `--next`. A second five-page retention
+    // cap used to discard part of the already-fetched ordering without saying
+    // so, making page five look terminal and allowing a name hit in the hidden
+    // suffix to be treated as absent. The search fetch bound remains explicit
+    // below when it saturates.
     let mut degradations: Vec<kin_cli::commands::locate::RetrievalDegradation> = Vec::new();
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut seen_entities: HashSet<String> = HashSet::new();
@@ -8394,182 +8947,233 @@ fn build_semantic_locate_result(
     // the opt-in re-rank reordered `raw` above, and whether the query is itself
     // about test code (so Test-role hits are not treated as demoted).
     let rerank_active = semloc_rerank_enabled();
-    let is_test_query = semloc_query_is_test_related(&query);
     // Sidecar keys that named nothing this graph still holds. Counted rather
     // than passed over, because a ranking that quietly drops most of its
     // candidates and a ranking that genuinely found little look identical from
     // the outside, and the difference is the whole diagnosis.
     let mut unresolved_keys = 0usize;
     let mut retired_entity_keys = 0usize;
-    for (key, distance) in raw {
-        if rows.len() >= max_rows {
-            break;
-        }
-        let Some(item) = graph.resolve_retrieval_key(&key) else {
-            // FIR-2727. A key that resolves to nothing is TWO different facts
-            // and they take opposite remediations, so they are separated here
-            // rather than collapsed into one count.
-            //
-            // kin-db refuses a revision key whose entity was retired, which is
-            // correct: nothing may be handed back as live when it is gone. But
-            // "retired" and "never held" arrive identically as `None`, and
-            // reporting the first as the second sends an operator to `kin
-            // admit` for a retirement, which does nothing.
-            //
-            // `entity_id_for_revision` is liveness-blind on purpose and exists
-            // for exactly this question. It is asked only on the `None` path
-            // and only for revision keys, so it costs nothing on a healthy
-            // ranking where every key resolves.
-            if unresolved_key_is_retired(graph, &key) {
-                retired_entity_keys += 1;
+    let projected = search_and_project_all_cosine_candidates(
+        &query,
+        fetch_limit,
+        |query, fetch_limit| graph.semantic_search(query, fetch_limit),
+        |raw| {
+            // Opt-in (KIN_SEMLOC_RERANK=1): role-aware demotion + exact-name
+            // boost over the cosine hit set only. Resolve once for scoring,
+            // then stable-sort by priority with original cosine order as the
+            // deterministic tiebreak.
+            if rerank_active {
+                let mut scored: Vec<_> = raw
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, (key, distance))| {
+                        let prio = match graph.resolve_retrieval_key(&key) {
+                            Some(kin_db::ResolvedRetrievalItem::Entity(entity)) => {
+                                semloc_rerank_priority(
+                                    Some(entity.role),
+                                    &entity.name,
+                                    &query,
+                                    is_test_query,
+                                    distance,
+                                )
+                            }
+                            _ => semloc_rerank_priority(None, "", &query, is_test_query, distance),
+                        };
+                        (prio, idx, key, distance)
+                    })
+                    .collect();
+                scored.sort_by(|a, b| {
+                    a.0.partial_cmp(&b.0)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(a.1.cmp(&b.1))
+                });
+                scored
+                    .into_iter()
+                    .map(|(_, _, key, distance)| (key, distance))
+                    .collect()
             } else {
-                unresolved_keys += 1;
+                raw
             }
-            continue;
-        };
-        // Entity-centric projection: the ENTITY (kind + name + signature) is the
-        // result; the file is demoted to provenance. The snippet projection
-        // below already dropped retired entities, but only when snippets were
-        // on; under `include_snippet: false` or file granularity nothing
-        // filtered them at all.
-        //
-        // FIR-2727: kin-db's resolve arm now enforces liveness upstream, so a
-        // retired entity should never reach this check at all. It stays anyway,
-        // as the SECOND layer the tripwire watches. Do not delete it as
-        // redundant: the tripwire's zero is what will prove the redundancy
-        // empirically, and a later cleanup can cite that measured zero rather
-        // than an argument. Deleting a working guard as a side effect of fixing
-        // what it guarded against is how the guard's absence gets discovered by
-        // a user instead of by a test.
-        let entity_is_live = match &item {
-            kin_db::ResolvedRetrievalItem::Entity(entity) => {
-                graph.get_entity(&entity.id).ok().flatten().is_some()
-            }
-            _ => false,
-        };
-        let Some(identity) = locate_hit_identity(&item, entity_is_live) else {
-            retired_entity_keys += 1;
-            continue;
-        };
-        let LocateHitIdentity {
-            name,
-            file,
-            kind,
-            signature,
-            ..
-        } = identity.clone();
-        let dedupe_id = identity.dedupe_key();
-
-        if file_granularity {
-            match &file {
-                Some(path) => {
-                    if !seen_files.insert(path.clone()) {
-                        continue;
-                    }
+        },
+        |(key, distance)| {
+            let Some(item) = graph.resolve_retrieval_key(&key) else {
+                // FIR-2727. A key that resolves to nothing is TWO different facts
+                // and they take opposite remediations, so they are separated here
+                // rather than collapsed into one count.
+                //
+                // kin-db refuses a revision key whose entity was retired, which is
+                // correct: nothing may be handed back as live when it is gone. But
+                // "retired" and "never held" arrive identically as `None`, and
+                // reporting the first as the second sends an operator to `kin
+                // admit` for a retirement, which does nothing.
+                //
+                // `entity_id_for_revision` is liveness-blind on purpose and exists
+                // for exactly this question. It is asked only on the `None` path
+                // and only for revision keys, so it costs nothing on a healthy
+                // ranking where every key resolves.
+                if unresolved_key_is_retired(graph, &key) {
+                    retired_entity_keys += 1;
+                } else {
+                    unresolved_keys += 1;
                 }
-                // File granularity requires a file path; skip pathless hits.
-                None => continue,
-            }
-        } else if !seen_entities.insert(dedupe_id.clone()) {
-            // Collapse the two index keys per entity (`Entity(E)` +
-            // `EntityRevision(head)`) into a single result. `raw` is rank-ordered
-            // by distance, so the first occurrence of an entity is its best hit.
-            continue;
-        }
+                return None;
+            };
+            // Entity-centric projection: the ENTITY (kind + name + signature) is the
+            // result; the file is demoted to provenance. The snippet projection
+            // below already dropped retired entities, but only when snippets were
+            // on; under `include_snippet: false` or file granularity nothing
+            // filtered them at all.
+            //
+            // FIR-2727: kin-db's resolve arm now enforces liveness upstream, so a
+            // retired entity should never reach this check at all. It stays anyway,
+            // as the SECOND layer the tripwire watches. Do not delete it as
+            // redundant: the tripwire's zero is what will prove the redundancy
+            // empirically, and a later cleanup can cite that measured zero rather
+            // than an argument. Deleting a working guard as a side effect of fixing
+            // what it guarded against is how the guard's absence gets discovered by
+            // a user instead of by a test.
+            let entity_is_live = match &item {
+                kin_db::ResolvedRetrievalItem::Entity(entity) => {
+                    graph.get_entity(&entity.id).ok().flatten().is_some()
+                }
+                _ => false,
+            };
+            let Some(identity) = locate_hit_identity(&item, entity_is_live) else {
+                retired_entity_keys += 1;
+                return None;
+            };
+            let LocateHitIdentity {
+                name,
+                file,
+                kind,
+                signature,
+                ..
+            } = identity.clone();
+            let dedupe_id = identity.dedupe_key();
 
-        // Project the bounded snippet from graph-owned content — no working-tree
-        // read and no silent graph-gap downgrade.
-        let snippet = if include_snippet {
-            if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
-                match kin_mcp::handlers::common::read_bounded_entity_snippet_held(
-                    &held_authority,
-                    entity,
-                    source_scope,
-                ) {
-                    Ok(snippet) => snippet,
-                    // A candidate the current workspace does not contain is
-                    // history, not a failure. Whole-history ingest means every
-                    // repository that ever deleted or renamed a file carries
-                    // such entities, so failing the call here made retrieval
-                    // unusable on essentially every real repository. The
-                    // candidate is dropped from a current-workspace ranking and
-                    // the page fills from the ones below it.
-                    Err(error) if kin_mcp::handlers::common::is_absent_at_generation(&error) => {
-                        continue;
+            if file_granularity {
+                match &file {
+                    Some(path) => {
+                        if !seen_files.insert(path.clone()) {
+                            return None;
+                        }
                     }
-                    Err(error) => {
-                        kin_cli::commands::locate::record_degradation(
-                            &mut degradations,
-                            kin_cli::commands::locate::RetrievalDegradation {
-                                component: "entity_source".to_string(),
-                                reason: "source_unreadable".to_string(),
-                                detail: format!(
-                                    "could not read graph-owned source for entity {}: {error}",
-                                    entity.id
-                                ),
-                                remediation: "re-ingest repository or reconcile graph".to_string(),
-                            },
-                        );
-                        continue;
+                    // File granularity requires a file path; skip pathless hits.
+                    None => return None,
+                }
+            } else if !seen_entities.insert(dedupe_id.clone()) {
+                // Collapse the two index keys per entity (`Entity(E)` +
+                // `EntityRevision(head)`) into a single result. `raw` is rank-ordered
+                // by distance, so the first occurrence of an entity is its best hit.
+                return None;
+            }
+
+            // Project the bounded snippet from graph-owned content — no working-tree
+            // read and no silent graph-gap downgrade.
+            let snippet = if include_snippet {
+                if let kin_db::ResolvedRetrievalItem::Entity(entity) = &item {
+                    match kin_mcp::handlers::common::read_bounded_entity_snippet_held(
+                        &held_authority,
+                        entity,
+                        source_scope,
+                    ) {
+                        Ok(snippet) => snippet,
+                        // A candidate the current workspace does not contain is
+                        // history, not a failure. Whole-history ingest means every
+                        // repository that ever deleted or renamed a file carries
+                        // such entities, so failing the call here made retrieval
+                        // unusable on essentially every real repository. The
+                        // candidate is dropped from a current-workspace ranking and
+                        // the page fills from the ones below it.
+                        Err(error)
+                            if kin_mcp::handlers::common::is_absent_at_generation(&error) =>
+                        {
+                            return None;
+                        }
+                        Err(error) => {
+                            kin_cli::commands::locate::record_degradation(
+                                &mut degradations,
+                                kin_cli::commands::locate::RetrievalDegradation {
+                                    component: "entity_source".to_string(),
+                                    reason: "source_unreadable".to_string(),
+                                    detail: format!(
+                                        "could not read graph-owned source for entity {}: {error}",
+                                        entity.id
+                                    ),
+                                    remediation: "re-ingest repository or reconcile graph"
+                                        .to_string(),
+                                },
+                            );
+                            return None;
+                        }
                     }
+                } else {
+                    None
                 }
             } else {
                 None
-            }
-        } else {
-            None
-        };
+            };
 
-        let score = 1.0_f32 - distance;
-        let span = match &item {
-            kin_db::ResolvedRetrievalItem::Entity(entity) => entity.span.as_ref(),
-            _ => None,
-        };
-        let role = match &item {
-            kin_db::ResolvedRetrievalItem::Entity(entity) => Some(entity.role),
-            _ => None,
-        };
-        let match_evidence =
-            cosine_match_evidence(&query, &name, role, rerank_active, is_test_query);
-        let mut hit = json!({
-            "kind": kind,
-            "name": name,
-            "signature": signature,
-            "score": score,
-            "provenance": { "file": file },
-            "match_evidence": match_evidence,
-        });
-        // The disclosure field the tool description promises on every hit.
-        //
-        // Retrieval always returns its best candidates, so a query for a symbol
-        // that exists nowhere comes back as a full page of confidently-scored
-        // rows that is indistinguishable, field for field, from a page that
-        // found it. `match_kind` is the caller's defence against that, and this
-        // arm serves every stock daemon while emitting it on no row at all.
-        //
-        // Only two values are reachable here, and that is the honest set: this
-        // arm ranks from the vector index alone, so a hit the query did not name
-        // came from embedding similarity rather than a lexical pool.
-        // `TextFallback` would claim a pool that never ran.
-        //
-        // Derived from the same predicate `match_evidence.name_match` reports,
-        // which is the one rule `kin-cli` uses for the fused arm's own
-        // `match_kind`, so the field cannot disagree with the evidence object
-        // printed beside it or with the other arm.
-        if !file_granularity {
-            hit["match_kind"] = json!(cosine_match_kind(&query, &name));
+            let score = 1.0_f32 - distance;
+            let span = match &item {
+                kin_db::ResolvedRetrievalItem::Entity(entity) => entity.span.as_ref(),
+                _ => None,
+            };
+            let role = match &item {
+                kin_db::ResolvedRetrievalItem::Entity(entity) => Some(entity.role),
+                _ => None,
+            };
+            let match_evidence =
+                cosine_match_evidence(&query, &name, role, rerank_active, is_test_query);
+            let mut hit = json!({
+                "kind": kind,
+                "name": name,
+                "signature": signature,
+                "score": score,
+                "provenance": { "file": file },
+                "match_evidence": match_evidence,
+            });
+            // The disclosure field the tool description promises on every hit.
+            //
+            // Retrieval always returns its best candidates, so a query for a symbol
+            // that exists nowhere comes back as a full page of confidently-scored
+            // rows that is indistinguishable, field for field, from a page that
+            // found it. `match_kind` is the caller's defence against that, and this
+            // arm serves every stock daemon while emitting it on no row at all.
+            //
+            // Only two values are reachable here, and that is the honest set: this
+            // arm ranks from the vector index alone, so a hit the query did not name
+            // came from embedding similarity rather than a lexical pool.
+            // `TextFallback` would claim a pool that never ran.
+            //
+            // Derived from the same predicate `match_evidence.name_match` reports,
+            // which is the one rule `kin-cli` uses for the fused arm's own
+            // `match_kind`, so the field cannot disagree with the evidence object
+            // printed beside it or with the other arm.
+            if !file_granularity {
+                hit["match_kind"] = json!(cosine_match_kind(&query, &name));
+            }
+            write_locate_hit_identity(&mut hit, &identity);
+            if let Some(span) = span {
+                let (start_line, end_line) =
+                    kin_mcp::handlers::common::presentation_span_lines(span);
+                hit["start_line"] = json!(start_line);
+                hit["end_line"] = json!(end_line);
+            }
+            if let Some(snippet) = snippet {
+                hit["snippet"] = json!(snippet);
+            }
+            Some(hit)
+        },
+    );
+    let (rows, fetched) = match projected {
+        Ok(projected) => projected,
+        Err(error) => {
+            return kin_mcp::ToolCallResult::error(format!("semantic search failed: {error}"));
         }
-        write_locate_hit_identity(&mut hit, &identity);
-        if let Some(span) = span {
-            let (start_line, end_line) = kin_mcp::handlers::common::presentation_span_lines(span);
-            hit["start_line"] = json!(start_line);
-            hit["end_line"] = json!(end_line);
-        }
-        if let Some(snippet) = snippet {
-            hit["snippet"] = json!(snippet);
-        }
-        rows.push(hit);
-    }
+    };
+
+    record_cosine_candidate_cap(fetch_limit, fetched, &mut degradations);
 
     // Report the sidecar/graph gap rather than serving a short page as if the
     // index had simply ranked little. A store whose graph fell behind its
@@ -8644,7 +9248,13 @@ fn build_semantic_locate_result(
         cache.insert(
             key.clone(),
             CachedSemanticPage {
+                query: query.clone(),
                 rows: rows.clone(),
+                semantic_coverage: semantic_coverage.clone(),
+                degradations: degradations.clone(),
+                file_granularity,
+                include_tests,
+                page_size: page_size.max(1),
                 graph_version,
                 mode: kin_cli::commands::locate::projection_mode(true, include_snippet),
                 created: std::time::Instant::now(),
@@ -8657,6 +9267,7 @@ fn build_semantic_locate_result(
         file_granularity,
         &semantic_coverage,
         &key,
+        0,
         0,
         page_size,
         &rows,
@@ -8688,11 +9299,25 @@ fn build_semantic_locate_result(
 ///
 /// [`LocateResult`]: kin_cli::commands::locate::LocateResult
 fn fused_semantic_locate_payload(
-    result: kin_cli::commands::locate::LocateResult,
+    mut result: kin_cli::commands::locate::LocateResult,
     query: &str,
     file_granularity: bool,
     snippet_alias: bool,
 ) -> kin_mcp::ToolCallResult {
+    if file_granularity {
+        // `all_fallback` classifies entity-name evidence. A file-granularity
+        // answer intentionally asks the caller to read `files[]`, so carrying
+        // that entity-only verdict would let negative logic label a successful
+        // file answer `no_named_match`. Keep both locate arms symmetric.
+        result.entities.clear();
+        result.all_fallback = false;
+        result.degradations.retain(|entry| {
+            entry.component != kin_mcp::negative::QUERY_SHAPE_COMPONENT
+                || entry.reason != kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+        });
+    } else if result.all_fallback {
+        kin_cli::commands::locate::record_description_query_guidance(&mut result.degradations);
+    }
     // The variant list every hit indexes, serialized ONCE per response. Seeded
     // from the fused echo the `LocateResult` already carries, then extended with
     // any variant a hit names that the echo does not, so an index can never point
@@ -8847,14 +9472,15 @@ async fn build_fused_semantic_locate_result(
         .map(|value| value as usize)
         .filter(|value| *value > 0)
         .unwrap_or(20);
-    // Entities per page: `page_size` if given, else the historical `limit` — the
+    // Primary rows per page: `page_size` if given, else the historical `limit` — the
     // same default the cosine arm uses, so the two arms page symmetrically.
-    let page_size = arguments
+    let requested_page_size = arguments
         .get("page_size")
+        .or_else(|| arguments.get("limit"))
         .and_then(serde_json::Value::as_u64)
         .map(|value| value as usize)
-        .filter(|value| *value > 0)
-        .unwrap_or(limit);
+        .filter(|value| *value > 0);
+    let page_size = requested_page_size.unwrap_or(limit);
     let file_granularity = arguments
         .get("granularity")
         .and_then(serde_json::Value::as_str)
@@ -8882,10 +9508,7 @@ async fn build_fused_semantic_locate_result(
             .get("snippet_alias")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-    let explain = arguments
-        .get("explain")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let explain = fused_explanation_requested(arguments);
 
     // `entities[]` is the graph-native surface this tool answers with, so it is
     // projected either way. Only the body text follows `include_snippet`. The
@@ -8927,52 +9550,139 @@ async fn build_fused_semantic_locate_result(
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
-                    // The cursor carries the cache key, so a caller can present a
-                    // key minted in the other body mode. Keying is not enough;
-                    // the held ranking's mode has to match this request's.
-                    .filter(|entry| entry.mode == snippet_opts.projection_mode())
-                    .map(|entry| (entry.entities.clone(), entry.queries.clone()))
+                    .map(|entry| {
+                        (
+                            entry.query.clone(),
+                            entry.entities.clone(),
+                            entry.files.clone(),
+                            entry.debug.clone(),
+                            entry.queries.clone(),
+                            entry.requested_queries.clone(),
+                            entry.include_tests,
+                            entry.explain,
+                            entry.semantic_coverage.clone(),
+                            entry.degradations.clone(),
+                            entry.file_granularity,
+                            entry.snippet_alias,
+                            entry.page_size,
+                            entry.mode,
+                        )
+                    })
             };
-            if let Some((entities, queries)) = cached {
+            if let Some((
+                cached_query,
+                entities,
+                files,
+                debug,
+                queries,
+                cached_requested_queries,
+                cached_include_tests,
+                cached_explain,
+                semantic_coverage,
+                degradations,
+                cached_file_granularity,
+                cached_snippet_alias,
+                cached_page_size,
+                cached_mode,
+            )) = cached
+            {
+                if let Err(error) = validate_cursor_projection(
+                    arguments,
+                    &cached_query,
+                    cached_file_granularity,
+                    cached_mode,
+                    Some(cached_snippet_alias),
+                ) {
+                    return kin_mcp::ToolCallResult::error(error);
+                }
+                if let Err(error) = validate_fused_cursor_shape(
+                    arguments,
+                    &cached_requested_queries,
+                    cached_include_tests,
+                    cached_explain,
+                ) {
+                    return kin_mcp::ToolCallResult::error(error);
+                }
                 // The variant echo travels with the ranking, so a paged response
                 // carries the list its hits' `matched_variant_indexes` point into.
                 let mut result = kin_cli::commands::locate::LocateResult {
                     entities,
+                    files,
+                    debug,
                     queries,
+                    semantic_coverage,
+                    degradations,
                     ..Default::default()
                 };
-                kin_cli::commands::locate::apply_entity_page(
-                    &mut result,
-                    &parsed.key,
+                if !explain {
+                    result.debug = None;
+                }
+                result.all_fallback =
+                    kin_cli::commands::locate::locate_entities_are_all_fallback(&result.entities);
+                let (page_size, start) = continuation_window(
+                    requested_page_size,
+                    parsed.page_size,
+                    parsed.next_offset,
                     parsed.page,
-                    page_size,
+                    cached_page_size,
                 );
-                // A cache hit runs no retrieval, so re-report coverage from the
-                // live embedding status — the same struct the fresh page carried.
-                result.semantic_coverage =
-                    Some(kin_cli::commands::locate::local_semantic_coverage(
-                        graph,
-                        Some(state.graph.as_ref()),
-                    ));
+                let total = if cached_file_granularity {
+                    result.files.len()
+                } else {
+                    result.entities.len()
+                };
+                if let Err(error) = validate_held_locate_offset(start, total) {
+                    return kin_mcp::ToolCallResult::error(error);
+                }
+                if cached_file_granularity {
+                    kin_cli::commands::locate::apply_file_page_at_offset(
+                        &mut result,
+                        &parsed.key,
+                        parsed.page,
+                        page_size,
+                        start,
+                    );
+                } else {
+                    kin_cli::commands::locate::apply_entity_page_at_offset(
+                        &mut result,
+                        &parsed.key,
+                        parsed.page,
+                        page_size,
+                        start,
+                    );
+                }
+                // Older cache entries can lack coverage; only then use the live
+                // status as an explicit compatibility fallback. Current entries
+                // retain the query-time observation that produced these rows.
+                if result.semantic_coverage.is_none() {
+                    result.semantic_coverage =
+                        Some(kin_cli::commands::locate::local_semantic_coverage(
+                            graph,
+                            Some(state.graph.as_ref()),
+                        ));
+                }
                 return fused_semantic_locate_payload(
                     result,
-                    &query,
-                    file_granularity,
-                    snippet_alias,
+                    &cached_query,
+                    cached_file_granularity,
+                    cached_snippet_alias,
                 );
             }
         }
-        // Cache miss / stale / undecodable cursor: fall through to a fresh run
-        // (returns page 0) rather than silently failing the page.
+        if query.trim().is_empty() {
+            return kin_mcp::ToolCallResult::error(
+                "semantic_locate cursor expired or is unavailable; re-run the original query"
+                    .to_string(),
+            );
+        }
     }
 
     // Multi-query fan-out: `query` plus any additional `queries` variants,
     // deduped. Two-or-more distinct variants trigger RRF fusion; otherwise the
     // single fused path runs exactly as before.
-    let (variants, auto_fanout) = with_auto_sharp_variant(build_locate_variants(
-        &query,
-        &arg_string_array(arguments, "queries"),
-    ));
+    let requested_queries = arg_string_array(arguments, "queries");
+    let (variants, auto_fanout) =
+        with_auto_sharp_variant(build_locate_variants(&query, &requested_queries));
     let multi_query = variants.len() >= 2;
 
     // The agent asked for `limit` ranked hits; give the fused pipeline the
@@ -9033,12 +9743,26 @@ async fn build_fused_semantic_locate_result(
     cache_locate_ranking(
         state,
         &key,
-        &locate_result.entities,
-        &locate_result.queries,
-        graph_version,
-        snippet_opts.projection_mode(),
+        &query,
+        &locate_result,
+        CachedLocateShape {
+            file_granularity,
+            snippet_alias,
+            requested_queries,
+            include_tests: scope.include_tests,
+            reference: None,
+            max_files: limit,
+            explain,
+            page_size,
+            graph_version,
+            mode: snippet_opts.projection_mode(),
+        },
     );
-    kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
+    if file_granularity {
+        kin_cli::commands::locate::apply_file_page(&mut locate_result, &key, 0, page_size);
+    } else {
+        kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
+    }
 
     fused_semantic_locate_payload(locate_result, &query, file_granularity, snippet_alias)
 }
@@ -9484,18 +10208,109 @@ async fn mcp_tools_call_inner(
     // Both paths return partial results plus `semantic_coverage` rather than
     // hard-gating on full embedding coverage (graceful degradation per R5).
     if request.name == "semantic_locate" {
-        let pipeline_override = request
-            .arguments
-            .get("pipeline")
-            .and_then(serde_json::Value::as_str);
+        if let Err(error) = validate_semantic_locate_argument_types(&request.arguments) {
+            return Ok(Json(kin_mcp::ToolCallResult::error(error)));
+        }
+        if let Some(granularity) = request.arguments.get("granularity") {
+            let valid = granularity.as_str().is_some_and(|value| {
+                value.eq_ignore_ascii_case("entity") || value.eq_ignore_ascii_case("file")
+            });
+            if !valid {
+                return Ok(Json(kin_mcp::ToolCallResult::error(
+                    "invalid granularity: expected \"entity\" or \"file\"".to_string(),
+                )));
+            }
+        }
+        let pipeline_override = match request.arguments.get("pipeline") {
+            None => None,
+            Some(serde_json::Value::String(value)) => Some(value.as_str()),
+            Some(_) => {
+                return Ok(Json(kin_mcp::ToolCallResult::error(
+                    "invalid pipeline: expected \"fused\" or \"cosine\"".to_string(),
+                )));
+            }
+        };
+        let cursor_token = match request.arguments.get("cursor") {
+            None => None,
+            Some(serde_json::Value::String(value)) => Some(value.as_str()),
+            Some(_) => {
+                return Ok(Json(kin_mcp::ToolCallResult::error(
+                    "invalid cursor: expected a string token".to_string(),
+                )));
+            }
+        };
+        let decoded_cursor = cursor_token.and_then(kin_cli::commands::locate::LocateCursor::decode);
+        if cursor_token.is_some()
+            && decoded_cursor.is_none()
+            && !(request
+                .arguments
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|query| !query.trim().is_empty())
+                && pipeline_override.is_some())
+        {
+            return Ok(Json(kin_mcp::ToolCallResult::error(
+                "semantic_locate cursor is invalid; repeat the original query and its explicit pipeline to start a fresh ranking"
+                    .to_string(),
+            )));
+        }
+        // A cursor-only continuation must route back to the arm that minted its
+        // held ranking. Defaulting before looking at the cache sent a cosine
+        // cursor into fused lookup, where it became an empty-query fresh search.
+        let cursor_pipeline = decoded_cursor
+            .map(|cursor| {
+                let cosine = state
+                    .semantic_locate_pages
+                    .lock()
+                    .unwrap()
+                    .contains_key(&cursor.key);
+                let fused = state
+                    .locate_rankings
+                    .lock()
+                    .unwrap()
+                    .contains_key(&cursor.key);
+                match (cosine, fused) {
+                    (true, false) => Ok(Some(false)),
+                    (false, true) => Ok(Some(true)),
+                    // With an explicit query and arm, the caller supplied
+                    // everything needed to rerun safely. Let that arm's cache-
+                    // miss path return a fresh page zero. Without both facts,
+                    // guessing an arm or searching an empty query would turn a
+                    // stale continuation into a different answer.
+                    (false, false)
+                        if request
+                            .arguments
+                            .get("query")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|query| !query.trim().is_empty())
+                            && pipeline_override.is_some() =>
+                    {
+                        Ok(None)
+                    }
+                    (false, false) => Err(
+                        "semantic_locate cursor expired or is unavailable; repeat the original query and its explicit pipeline to start a fresh ranking"
+                            .to_string(),
+                    ),
+                    (true, true) => Err(
+                        "semantic_locate cursor is ambiguous across pipeline caches; re-run the original query"
+                            .to_string(),
+                    ),
+                }
+            })
+            .transpose()
+            .map(Option::flatten);
+        let cursor_pipeline = match cursor_pipeline {
+            Ok(pipeline) => pipeline,
+            Err(error) => return Ok(Json(kin_mcp::ToolCallResult::error(error))),
+        };
         // Multi-query fan-out (`queries`) is inherently a multi-signal fusion, so
         // it is served by the fused arm regardless of the default profile — the
         // legacy single-vector cosine arm does not fuse variant rankings. An
         // explicit `pipeline: "cosine"` alongside `queries` is a genuine conflict
         // and is rejected rather than silently dropping the extra variants.
         let has_extra_queries = !arg_string_array(&request.arguments, "queries").is_empty();
-        let use_fused = match pipeline_override {
-            Some(value) if value.eq_ignore_ascii_case("fused") => true,
+        let requested_pipeline = match pipeline_override {
+            Some(value) if value.eq_ignore_ascii_case("fused") => Some(true),
             Some(value) if value.eq_ignore_ascii_case("cosine") => {
                 if has_extra_queries {
                     return Ok(Json(kin_mcp::ToolCallResult::error(
@@ -9504,18 +10319,30 @@ async fn mcp_tools_call_inner(
                             .to_string(),
                     )));
                 }
-                false
+                Some(false)
             }
             Some(other) => {
                 return Ok(Json(kin_mcp::ToolCallResult::error(format!(
                     "invalid pipeline '{other}': expected \"fused\" or \"cosine\""
                 ))));
             }
-            // No explicit pipeline: fused, unconditionally. Routing is not a
-            // profile decision; profiles supply lever defaults read inside the
-            // pipeline, and `POST /locate` has never consulted one either.
-            None => true,
+            None => None,
         };
+        if let (Some(cached), Some(requested)) = (cursor_pipeline, requested_pipeline) {
+            if cached != requested {
+                return Ok(Json(kin_mcp::ToolCallResult::error(format!(
+                    "semantic_locate cursor belongs to the {} pipeline; omit `pipeline` or use that value",
+                    if cached { "fused" } else { "cosine" }
+                ))));
+            }
+        }
+        let use_fused = cursor_pipeline.or(requested_pipeline).unwrap_or(true);
+        if !use_fused && has_extra_queries {
+            return Ok(Json(kin_mcp::ToolCallResult::error(
+                "multi-query `queries` requires the fused pipeline; omit `pipeline` or set it to \"fused\""
+                    .to_string(),
+            )));
+        }
         if use_fused {
             return Ok(Json(
                 build_fused_semantic_locate_result(
@@ -14257,6 +15084,188 @@ mod tests {
         assert!(locate_rows_are_all_fallback(&[json!({ "name": "x" })]));
     }
 
+    #[test]
+    fn saturated_cosine_candidate_window_is_a_real_degradation() {
+        let mut degradations = Vec::new();
+        record_cosine_candidate_cap(8, 7, &mut degradations);
+        assert!(degradations.is_empty());
+
+        record_cosine_candidate_cap(8, 8, &mut degradations);
+        assert_eq!(degradations.len(), 1);
+        assert_eq!(degradations[0].component, "ranking_window");
+        assert_eq!(degradations[0].reason, "candidate_cap_reached");
+        assert!(degradations[0]
+            .detail
+            .contains("considered the full fetched candidate window"));
+        assert!(degradations[0]
+            .detail
+            .contains("retained every successfully projected unique row"));
+    }
+
+    #[test]
+    fn cosine_projection_retains_and_pages_rows_beyond_five_pages() {
+        let (rows, fetched) = search_and_project_all_cosine_candidates(
+            "held query",
+            8,
+            |query, fetch_limit| {
+                assert_eq!(query, "held query");
+                assert_eq!(fetch_limit, 8);
+                Ok::<_, ()>((0..7).collect())
+            },
+            |raw| raw,
+            |index| Some(json!({ "name": format!("row_{index}") })),
+        )
+        .unwrap();
+        assert_eq!(
+            fetched, 7,
+            "the whole mocked search window reaches retention"
+        );
+        assert_eq!(rows.len(), 7, "all successful projections must be held");
+
+        let (page_five, total, more, next) = window_semantic_rows(&rows, 5, 1);
+        assert_eq!(page_five[0]["name"], "row_5");
+        assert_eq!(total, 7);
+        assert!(more);
+        assert_eq!(next, 6);
+
+        let (page_six, total, more, next) = window_semantic_rows(&rows, next, 1);
+        assert_eq!(page_six[0]["name"], "row_6");
+        assert_eq!(total, 7);
+        assert!(!more);
+        assert_eq!(next, 7);
+    }
+
+    #[test]
+    fn continuation_offsets_survive_repeated_budget_width_recovery() {
+        // Ordinary width changes never move the absolute resume position.
+        let (width, start) = continuation_window(Some(2), Some(6), Some(6), 1, 6);
+        assert_eq!((width, start), (2, 6));
+
+        // The response budget repairs the cursor itself. Page zero was six rows
+        // wide and four were withheld, so the next absolute row becomes two.
+        let mut first = kin_core::LocateCursor {
+            key: "k".to_string(),
+            page: 1,
+            next_offset: Some(6),
+            page_size: Some(6),
+        };
+        assert!(first.rebase_after_withheld(4, 2));
+        let (width, start) =
+            continuation_window(None, first.page_size, first.next_offset, first.page, 6);
+        assert_eq!((width, start), (2, 2));
+
+        // A later page cut is the same arithmetic over its absolute offset.
+        let mut second = kin_core::LocateCursor {
+            key: "k".to_string(),
+            page: 2,
+            next_offset: Some(4),
+            page_size: Some(2),
+        };
+        assert!(second.rebase_after_withheld(1, 1));
+        let (width, start) =
+            continuation_window(None, second.page_size, second.next_offset, second.page, 6);
+        assert_eq!((width, start), (1, 3));
+
+        // With no cut, the absolute offset is authoritative and the width
+        // encoded by the cursor persists on a bare continuation.
+        let (width, start) = continuation_window(None, Some(1), Some(4), 3, 6);
+        assert_eq!((width, start), (1, 4));
+
+        // Released two-part cursors have no offset or width, so retain their old
+        // page-times-effective-width fallback.
+        let (width, start) = continuation_window(Some(5), None, None, 2, 20);
+        assert_eq!((width, start), (5, 40));
+    }
+
+    #[test]
+    fn fused_cursor_explanation_can_contract_but_cannot_expand() {
+        let mut arguments = HashMap::new();
+        assert!(validate_fused_cursor_shape(&arguments, &[], false, false).is_ok());
+
+        arguments.insert("explain".to_string(), json!(true));
+        assert!(validate_fused_cursor_shape(&arguments, &[], false, false).is_err());
+
+        arguments.insert("explain".to_string(), json!(false));
+        assert!(
+            validate_fused_cursor_shape(&arguments, &[], false, true).is_ok(),
+            "a page may omit explanation data its held ranking already carries"
+        );
+
+        arguments.remove("explain");
+        arguments.insert("compact".to_string(), json!(false));
+        assert!(
+            validate_fused_cursor_shape(&arguments, &[], false, false).is_err(),
+            "compact:false cannot synthesize explanation the held ranking never built"
+        );
+        assert!(validate_fused_cursor_shape(&arguments, &[], false, true).is_ok());
+
+        // Clients commonly materialize the schema's `explain: false` default.
+        // With `compact: false`, the fresh call normalized that exact pair to
+        // an explanation-bearing ranking, so its cursor must accept the same
+        // pair rather than comparing the raw false to the cached effective true.
+        arguments.insert("explain".to_string(), json!(false));
+        assert!(validate_fused_cursor_shape(&arguments, &[], false, true).is_ok());
+        assert!(validate_fused_cursor_shape(&arguments, &[], false, false).is_err());
+
+        arguments.insert("compact".to_string(), json!(true));
+        assert!(validate_fused_cursor_shape(&arguments, &[], false, true).is_ok());
+        assert!(validate_fused_cursor_shape(&arguments, &[], false, false).is_ok());
+
+        arguments.insert("explain".to_string(), json!(true));
+        assert!(
+            !fused_explanation_requested(&arguments),
+            "explicit compact:true wins over explain:true, matching ResponseBudget"
+        );
+        assert!(validate_fused_cursor_shape(&arguments, &[], false, false).is_ok());
+    }
+
+    #[test]
+    fn cursor_projection_inherits_omissions_and_rejects_conflicts() {
+        let omitted = HashMap::new();
+        assert!(validate_cursor_projection(
+            &omitted,
+            "find parser",
+            false,
+            kin_cli::commands::locate::projection_mode(true, true),
+            Some(false),
+        )
+        .is_ok());
+
+        let matching = HashMap::from([
+            ("query".to_string(), json!("find parser")),
+            ("granularity".to_string(), json!("entity")),
+            ("include_snippet".to_string(), json!(true)),
+            ("snippet_alias".to_string(), json!(false)),
+        ]);
+        assert!(validate_cursor_projection(
+            &matching,
+            "find parser",
+            false,
+            kin_cli::commands::locate::projection_mode(true, true),
+            Some(false),
+        )
+        .is_ok());
+
+        for conflicting in [
+            HashMap::from([("query".to_string(), json!("other query"))]),
+            HashMap::from([("granularity".to_string(), json!("file"))]),
+            HashMap::from([("include_snippet".to_string(), json!(false))]),
+            HashMap::from([("snippet_alias".to_string(), json!(true))]),
+        ] {
+            assert!(
+                validate_cursor_projection(
+                    &conflicting,
+                    "find parser",
+                    false,
+                    kin_cli::commands::locate::projection_mode(true, true),
+                    Some(false),
+                )
+                .is_err(),
+                "an explicit cursor-shape conflict must fail loud: {conflicting:?}"
+            );
+        }
+    }
+
     /// One cosine-arm ranked row, in the shape the serving loop builds.
     fn cosine_row(
         name: &str,
@@ -14305,6 +15314,7 @@ mod tests {
             &coverage,
             "cursor-key",
             page,
+            page.saturating_mul(page_size),
             page_size,
             rows,
             &[],
@@ -14364,14 +15374,10 @@ mod tests {
         assert!(cosine_file_surface(&[]).is_empty());
     }
 
-    /// The rule that keeps this field meaning one thing: which files a query is
-    /// about is a property of the RANKING, so it must not change as the caller
-    /// pages through it. Deriving from the returned window instead would look
-    /// correct on page 0 of a short ranking, which is what every casual check
-    /// exercises, and would quietly shrink the answer on exactly the deep
-    /// rankings the surface exists to summarize.
+    /// At entity granularity `files[]` is the query-wide provenance summary, so
+    /// it remains stable while the primary `results[]` ranking pages.
     #[test]
-    fn the_cosine_file_surface_covers_the_whole_ranking_not_the_returned_page() {
+    fn the_cosine_entity_surface_keeps_a_query_wide_file_summary() {
         let rows = vec![
             cosine_row("start_daemon", Some("src/daemon.rs"), 0.9, None),
             cosine_row("serve", Some("src/api.rs"), 0.7, None),
@@ -14402,6 +15408,73 @@ mod tests {
         // the fused arm, whose `files` is always serialized.
         let empty = cosine_locate_body(&[], 0, 20);
         assert_eq!(empty["files"], json!([]));
+    }
+
+    #[test]
+    fn cosine_file_granularity_pages_files_without_results_repeats_or_gaps() {
+        let rows = vec![
+            cosine_row("start_daemon", Some("src/daemon.rs"), 0.9, None),
+            cosine_row("serve", Some("src/api.rs"), 0.7, None),
+            cosine_row("route", Some("src/router.rs"), 0.5, None),
+        ];
+        let coverage = kin_cli::commands::locate::SemanticCoverage {
+            supported: true,
+            indexed: 3,
+            total: 3,
+            pending: 0,
+            complete: true,
+            embedding_state: kin_cli::commands::locate::EmbeddingState::Present,
+            limited_by: Vec::new(),
+            read_at: None,
+            note: None,
+            graph_bodies: None,
+        };
+        let body = |page: usize, start: usize, width: usize| {
+            let tool = semantic_locate_payload(
+                "where does the daemon start",
+                true,
+                &coverage,
+                "file-ranking",
+                page,
+                start,
+                width,
+                &rows,
+                &[],
+            );
+            serde_json::from_str::<serde_json::Value>(
+                tool_result_json(&tool)["content"][0]["text"]
+                    .as_str()
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+
+        let first = body(0, 0, 2);
+        assert!(
+            first.get("results").is_none(),
+            "file mode has one primary: {first}"
+        );
+        assert_eq!(first["total_ranked"], 3);
+        assert_eq!(
+            first["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|file| file["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["src/daemon.rs", "src/api.rs"]
+        );
+        let cursor = kin_core::LocateCursor::decode(first["next_cursor"].as_str().unwrap())
+            .expect("a followable file cursor");
+        assert_eq!(cursor.next_offset, Some(2));
+
+        // Width changes only the number emitted from the absolute offset.
+        let second = body(1, cursor.next_offset.unwrap(), 1);
+        assert_eq!(
+            second["files"][0]["path"], "src/router.rs",
+            "the continuation covers the next file without overlap or a gap"
+        );
+        assert!(second["next_cursor"].is_null());
     }
 
     /// The cosine `files[]` is a rollup of `results`, so every file it names is
@@ -14438,6 +15511,47 @@ mod tests {
         .expect("an empty cosine page must carry a negative");
         assert_eq!(negative["kind"], json!("no_ranked_match"));
         assert_eq!(negative["result_count"], json!(0));
+    }
+
+    /// The cosine arm used to omit the guidance entirely. It now follows the
+    /// same whole-ranking `all_fallback` fact as the fused arm, and a name hit
+    /// remains the control that clears both fields.
+    #[test]
+    fn cosine_description_rankings_carry_file_granularity_guidance() {
+        let mut semantic = cosine_row("serve_request", Some("src/api.rs"), 0.83, None);
+        semantic["match_kind"] = json!("semantic");
+        let advised = cosine_locate_body(&[semantic], 0, 20);
+        assert_eq!(advised["all_fallback"], json!(true));
+        let guidance = advised["degradations"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item["component"] == kin_mcp::negative::QUERY_SHAPE_COMPONENT
+                        && item["reason"] == kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+                })
+            })
+            .expect("the cosine arm must publish description-ranking guidance");
+        assert!(
+            guidance["remediation"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("granularity: \"file\""),
+            "the response names the file-level fallback that remained useful: {guidance}"
+        );
+
+        let mut named = cosine_row("start_daemon", Some("src/daemon.rs"), 0.81, None);
+        named["match_kind"] = json!("name");
+        let control = cosine_locate_body(&[named], 0, 20);
+        assert!(control.get("all_fallback").is_none(), "{control}");
+        assert!(
+            control
+                .get("degradations")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|items| items.iter().all(|item| {
+                    item["reason"] != kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+                })),
+            "a ranking with a name hit does not need description-only guidance: {control}"
+        );
     }
 
     #[test]
@@ -14546,6 +15660,20 @@ mod tests {
         assert!(ev2.get("resolution_origin").is_none());
         assert!(ev2.get("seed_cosine").is_none());
         assert_eq!(ev2["definition"], json!(true));
+
+        // Fusion promotes match_kind from the strongest contributing variant.
+        // Evidence must inspect that same set or the row can say `name` beside
+        // `name_match: none` when only a secondary variant named the entity.
+        let secondary_name = LocateEntity {
+            match_kind: Some(kin_cli::commands::locate::LocateMatchKind::Name),
+            matched_queries: vec![
+                "where is request handling implemented".to_string(),
+                "parse_request".to_string(),
+            ],
+            ..plain
+        };
+        let ev3 = fused_match_evidence("where is request handling implemented", &secondary_name);
+        assert_eq!(ev3["name_match"], json!("exact"));
     }
 
     #[test]
@@ -14608,20 +15736,35 @@ mod tests {
     }
 
     #[test]
-    fn arg_string_array_reads_only_string_items() {
+    fn semantic_locate_argument_types_reject_invalid_query_arrays_before_reading() {
         let mut args: HashMap<String, serde_json::Value> = HashMap::new();
         args.insert(
             "queries".to_string(),
             json!(["alpha", 7, "beta", null, "gamma"]),
         );
-        assert_eq!(
-            arg_string_array(&args, "queries"),
-            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
-        );
-        // Absent or non-array → empty (a single-query call).
+        assert!(validate_semantic_locate_argument_types(&args)
+            .unwrap_err()
+            .contains("every item"));
+
+        // Absence is the only shape that means no additional query variants.
+        args.remove("queries");
+        assert!(validate_semantic_locate_argument_types(&args).is_ok());
         assert!(arg_string_array(&args, "missing").is_empty());
+
         args.insert("queries".to_string(), json!("not-an-array"));
-        assert!(arg_string_array(&args, "queries").is_empty());
+        assert!(validate_semantic_locate_argument_types(&args)
+            .unwrap_err()
+            .contains("array of strings"));
+
+        for key in ["limit", "page_size"] {
+            args.clear();
+            args.insert(key.to_string(), json!(0));
+            let error = validate_semantic_locate_argument_types(&args).unwrap_err();
+            assert!(
+                error.contains(key) && error.contains("positive integer"),
+                "an explicit zero cannot silently select the default: {error}"
+            );
+        }
     }
 
     #[test]
@@ -14880,6 +16023,50 @@ mod tests {
         assert_eq!(negative["interpretation"], json!("unnamed_ranking"));
         assert_eq!(negative["result_count"], json!(1));
         assert_eq!(body["entities"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// The former warning retired at the 60-entity fusion constant; the
+    /// reported wrong ranking held 237 entities. Guidance now follows the
+    /// response fact and remains present above that constant.
+    #[test]
+    fn fused_description_guidance_survives_above_the_fusion_constant() {
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![fused_locate_entity("neighbor_one")],
+            all_fallback: true,
+            total_ranked: 237,
+            ..Default::default()
+        };
+        let advised = fused_locate_body(result, "where is the request routed");
+        assert_eq!(advised["all_fallback"], json!(true));
+        assert_eq!(advised["total_ranked"], json!(237));
+        assert!(
+            advised["degradations"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| {
+                    item["component"] == kin_mcp::negative::QUERY_SHAPE_COMPONENT
+                        && item["reason"] == kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+                })),
+            "guidance must not retire at the rank-fusion constant: {advised}"
+        );
+
+        let control = fused_locate_body(
+            kin_cli::commands::locate::LocateResult {
+                entities: vec![fused_locate_entity("start_daemon")],
+                total_ranked: 237,
+                ..Default::default()
+            },
+            "start_daemon",
+        );
+        assert!(control.get("all_fallback").is_none(), "{control}");
+        assert!(
+            control
+                .get("degradations")
+                .and_then(serde_json::Value::as_array)
+                .is_none_or(|items| items.iter().all(|item| {
+                    item["reason"] != kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+                })),
+            "a name hit remains the no-guidance control: {control}"
+        );
     }
 
     /// The control: a page holding the symbol the query named is not qualified
@@ -24225,6 +25412,7 @@ mod tests {
         std::fs::write(root.join("admitted.rs"), b"pub fn admitted() {}\n").unwrap();
         let app = router(Arc::clone(&state));
         let response = app
+            .clone()
             .oneshot(
                 Request::post("/commands/commit")
                     .header("content-type", "application/json")
@@ -34896,6 +36084,19 @@ mod tests {
         name: &str,
         arguments: serde_json::Value,
     ) -> serde_json::Value {
+        let result = call_mcp_tool_result(app, name, arguments).await;
+        assert_ne!(result.is_error, Some(true), "{name} errored: {result:?}");
+        let text = match result.content.first().unwrap() {
+            kin_mcp::ContentBlock::Text { text } => text,
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
+    async fn call_mcp_tool_result(
+        app: Router,
+        name: &str,
+        arguments: serde_json::Value,
+    ) -> kin_mcp::ToolCallResult {
         let response = app
             .oneshot(
                 Request::post("/mcp/tools/call")
@@ -34911,12 +36112,7 @@ mod tests {
         let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
             .await
             .unwrap();
-        let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
-        assert_ne!(result.is_error, Some(true), "{name} errored: {result:?}");
-        let text = match result.content.first().unwrap() {
-            kin_mcp::ContentBlock::Text { text } => text,
-        };
-        serde_json::from_str(text).unwrap()
+        serde_json::from_slice(&body).unwrap()
     }
 
     // FIR parity gate: the MCP `semantic_locate` fused arm must serve the SAME
@@ -34950,8 +36146,8 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
                             text: "parse config".to_string(),
-                            queries: Vec::new(),
-                            explain: false,
+                            queries: None,
+                            explain: None,
                             max_files: 10,
                             max_files_explicit: true,
                             reference: None,
@@ -34960,7 +36156,8 @@ mod tests {
                             entity_surface: false,
                             cursor: None,
                             page_size: None,
-                            include_tests: false,
+                            snippet_override: None,
+                            include_tests: None,
                         })
                         .unwrap(),
                     ))
@@ -35957,16 +37154,24 @@ mod tests {
 
         // A `LocateRequest` in one of the three projections. `page_size: 1` keeps a
         // cursor live across the interleaving below.
-        let post_locate = |app: Router, snippets: bool, entity_surface: bool, cursor| async move {
+        let post_locate = |app: Router,
+                           snippets: bool,
+                           entity_surface: bool,
+                           cursor: Option<String>| async move {
+            let continuation = cursor.is_some();
             let response = app
                 .oneshot(
                     Request::post("/locate")
                         .header("content-type", "application/json")
                         .body(Body::from(
                             serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
-                                text: "parse config".to_string(),
-                                queries: Vec::new(),
-                                explain: false,
+                                text: if continuation {
+                                    String::new()
+                                } else {
+                                    "parse config".to_string()
+                                },
+                                queries: None,
+                                explain: None,
                                 max_files: 10,
                                 max_files_explicit: true,
                                 reference: None,
@@ -35974,8 +37179,9 @@ mod tests {
                                 snippet_lines: None,
                                 entity_surface,
                                 cursor,
-                                page_size: Some(1),
-                                include_tests: false,
+                                page_size: (!continuation).then_some(1),
+                                snippet_override: None,
+                                include_tests: None,
                             })
                             .unwrap(),
                         ))
@@ -35996,6 +37202,17 @@ mod tests {
             !page0.entities.is_empty(),
             "the agent JSON surface must return the ranking even with bodies declined"
         );
+        let carries_guidance = |result: &kin_cli::commands::locate::LocateResult| {
+            result.degradations.iter().any(|entry| {
+                entry.component == kin_mcp::negative::QUERY_SHAPE_COMPONENT
+                    && entry.reason == kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+            })
+        };
+        assert!(page0.all_fallback, "the descriptive query names no entity");
+        assert!(
+            carries_guidance(&page0),
+            "POST /locate must carry the same entity-ranking guidance as semantic_locate"
+        );
         let Some(cursor) = page0.next_cursor.clone() else {
             panic!(
                 "fixture must issue a cursor: {} entities, total_ranked {}",
@@ -36003,6 +37220,44 @@ mod tests {
                 page0.total_ranked
             );
         };
+        let page0_ids = page0
+            .entities
+            .iter()
+            .map(|entity| entity.entity_id.clone())
+            .collect::<Vec<_>>();
+
+        let wrong_query = app
+            .clone()
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                            text: "a different query".to_string(),
+                            queries: None,
+                            explain: None,
+                            max_files: 10,
+                            max_files_explicit: true,
+                            reference: None,
+                            snippets: false,
+                            snippet_lines: None,
+                            entity_surface: true,
+                            cursor: Some(cursor.clone()),
+                            page_size: None,
+                            snippet_override: None,
+                            include_tests: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            wrong_query.status(),
+            StatusCode::BAD_REQUEST,
+            "a live cursor cannot silently answer a different repeated query"
+        );
 
         // 2. A legacy/human locate for the SAME query at the SAME graph version.
         //    It projects no entities, and must not publish that emptiness anywhere
@@ -36030,6 +37285,25 @@ mod tests {
             "an emptied cached ranking reports total_ranked 0, got {}",
             page1.total_ranked
         );
+        assert!(
+            page1
+                .entities
+                .iter()
+                .all(|entity| !page0_ids.contains(&entity.entity_id)),
+            "a bare cursor continuation must inherit width and resume after page zero: page0={page0_ids:?}, page1={:?}",
+            page1
+                .entities
+                .iter()
+                .map(|entity| entity.entity_id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            page1.all_fallback && carries_guidance(&page1),
+            "cursor rehydration must preserve whole-ranking guidance; page={}, total_ranked={}, degradations={:?}",
+            page1.page,
+            page1.total_ranked,
+            page1.degradations
+        );
     }
 
     // The legacy cosine ranking stays reachable per-call, independent of the
@@ -36055,6 +37329,7 @@ mod tests {
 
         // Unknown pipeline values fail loud, not silently defaulted.
         let response = app
+            .clone()
             .oneshot(
                 Request::post("/mcp/tools/call")
                     .header("content-type", "application/json")
@@ -36074,6 +37349,120 @@ mod tests {
             .unwrap();
         let result: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
         assert_eq!(result.is_error, Some(true));
+
+        // Fresh calls validate the same declared shape as continuations. An
+        // unknown granularity must not silently enter the entity arm merely
+        // because `file` is the only value the builders checked directly.
+        let invalid_granularity = call_mcp_tool_result(
+            app.clone(),
+            "semantic_locate",
+            json!({ "query": "handler", "granularity": "banana" }),
+        )
+        .await;
+        assert_eq!(invalid_granularity.is_error, Some(true));
+        let invalid_granularity_text = match &invalid_granularity.content[0] {
+            kin_mcp::ContentBlock::Text { text } => text,
+        };
+        assert!(invalid_granularity_text.contains("invalid granularity"));
+
+        // Non-string pipeline values are invalid too. Treating them as absent
+        // would silently route fused and make the response disagree with the
+        // request a schema-defaulting client actually sent.
+        let invalid_pipeline = call_mcp_tool_result(
+            app,
+            "semantic_locate",
+            json!({ "query": "handler", "pipeline": 1 }),
+        )
+        .await;
+        assert_eq!(invalid_pipeline.is_error, Some(true));
+        let invalid_pipeline_text = match &invalid_pipeline.content[0] {
+            kin_mcp::ContentBlock::Text { text } => text,
+        };
+        assert!(invalid_pipeline_text.contains("invalid pipeline"));
+    }
+
+    #[tokio::test]
+    async fn mcp_semantic_locate_rejects_present_wrong_argument_types() {
+        let state = test_state();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+
+        for (arguments, field) in [
+            (json!({ "query": 7 }), "query"),
+            (
+                json!({ "query": "handler", "queries": "variant" }),
+                "queries",
+            ),
+            (
+                json!({ "query": "handler", "queries": ["valid", 7] }),
+                "queries",
+            ),
+            (
+                json!({ "query": "handler", "include_tests": "true" }),
+                "include_tests",
+            ),
+            (
+                json!({ "query": "handler", "include_snippet": "false" }),
+                "include_snippet",
+            ),
+            (
+                json!({ "query": "handler", "snippet_alias": 1 }),
+                "snippet_alias",
+            ),
+            (json!({ "query": "handler", "explain": "false" }), "explain"),
+            (json!({ "query": "handler", "compact": "true" }), "compact"),
+            (json!({ "query": "handler", "limit": "20" }), "limit"),
+            (json!({ "query": "handler", "page_size": 1.5 }), "page_size"),
+            (
+                json!({ "query": "handler", "max_chars": "9000" }),
+                "max_chars",
+            ),
+            (
+                json!({ "query": "handler", "max_response_chars": false }),
+                "max_response_chars",
+            ),
+        ] {
+            let result = call_mcp_tool_result(app.clone(), "semantic_locate", arguments).await;
+            assert_eq!(result.is_error, Some(true), "{field} must fail loud");
+            let text = match &result.content[0] {
+                kin_mcp::ContentBlock::Text { text } => text,
+            };
+            assert!(
+                text.contains(field) && text.contains("expected"),
+                "wrong {field} type must name the rejected field and contract: {text}"
+            );
+        }
+
+        let held_cursor = kin_core::LocateCursor {
+            key: "held-width-validation".to_string(),
+            page: 1,
+            next_offset: Some(1),
+            page_size: Some(1),
+        }
+        .encode();
+        for field in ["limit", "page_size"] {
+            for mut arguments in [
+                json!({ "query": "handler" }),
+                json!({ "cursor": held_cursor.clone() }),
+            ] {
+                arguments[field] = json!(0);
+                let result = call_mcp_tool_result(app.clone(), "semantic_locate", arguments).await;
+                assert_eq!(
+                    result.is_error,
+                    Some(true),
+                    "explicit zero {field} must fail on fresh and cursor calls"
+                );
+                let text = match &result.content[0] {
+                    kin_mcp::ContentBlock::Text { text } => text,
+                };
+                assert!(
+                    text.contains(field) && text.contains("positive integer"),
+                    "the refusal names the explicit field and contract: {text}"
+                );
+            }
+        }
     }
 
     /// The default route (no `pipeline` argument) is the fused pipeline on
@@ -36142,8 +37531,8 @@ mod tests {
                     .body(Body::from(
                         serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
                             text: "parse config".to_string(),
-                            queries: Vec::new(),
-                            explain: false,
+                            queries: None,
+                            explain: None,
                             max_files: 10,
                             max_files_explicit: true,
                             reference: None,
@@ -36152,7 +37541,8 @@ mod tests {
                             entity_surface: true,
                             cursor: None,
                             page_size: None,
-                            include_tests: false,
+                            snippet_override: None,
+                            include_tests: None,
                         })
                         .unwrap(),
                     ))
@@ -36201,6 +37591,19 @@ mod tests {
         .await;
         let total = page0["total_ranked"].as_u64().unwrap();
         assert!(total >= 3, "expected >= 3 ranked entities, got {total}");
+        let carries_guidance = |payload: &serde_json::Value| {
+            payload["degradations"].as_array().is_some_and(|items| {
+                items.iter().any(|entry| {
+                    entry["component"] == kin_mcp::negative::QUERY_SHAPE_COMPONENT
+                        && entry["reason"] == kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+                })
+            })
+        };
+        assert_eq!(page0["all_fallback"], json!(true));
+        assert!(
+            carries_guidance(&page0),
+            "the fresh full ranking carries description guidance: {page0}"
+        );
         let first_page: Vec<String> = page0["entities"]
             .as_array()
             .unwrap()
@@ -36218,12 +37621,16 @@ mod tests {
             .to_string();
 
         // Page the cursor (empty query is allowed on a paging continuation).
-        let page1 = call_semantic_locate(
-            app.clone(),
-            json!({ "cursor": cursor, "page_size": 2, "pipeline": "fused" }),
-        )
-        .await;
+        let page1 = call_semantic_locate(app.clone(), json!({ "cursor": cursor.clone() })).await;
+        assert_eq!(page1["routing"], "fused-v1");
+        assert_eq!(page1["query"], "parse");
+        assert_eq!(page1["granularity"], "entity");
         assert_eq!(page1["page"].as_u64().unwrap(), 1);
+        assert_eq!(page1["all_fallback"], json!(true));
+        assert!(
+            carries_guidance(&page1),
+            "a cached page must rehydrate the whole-ranking guidance: {page1}"
+        );
         let second_page: Vec<String> = page1["entities"]
             .as_array()
             .unwrap()
@@ -36240,11 +37647,7 @@ mod tests {
         );
 
         // Cursor stability: the same cursor yields the same page from cache.
-        let page1_again = call_semantic_locate(
-            app,
-            json!({ "cursor": cursor, "page_size": 2, "pipeline": "fused" }),
-        )
-        .await;
+        let page1_again = call_semantic_locate(app, json!({ "cursor": cursor })).await;
         let second_again: Vec<String> = page1_again["entities"]
             .as_array()
             .unwrap()
@@ -36255,6 +37658,419 @@ mod tests {
             second_page, second_again,
             "a stable cursor must return the identical page on re-issue"
         );
+    }
+
+    /// Presentation is decided per page, so a held explanation is reused,
+    /// contracted or withheld by what THIS call asked for.
+    ///
+    /// The cache has to hold real explanation data for any of that to be
+    /// observable, which is why this seeds one rather than ranking fresh. The
+    /// fresh-ranking fixture above upserts entities at paths the graph never
+    /// admitted as artifacts, and building an explanation resolves provenance
+    /// through the graph, so asking that fixture for `compact: false` fails the
+    /// whole locate on an honest graph gap rather than returning a page.
+    #[tokio::test]
+    async fn a_held_explanation_is_reused_contracted_or_withheld_by_the_current_page() {
+        let state = test_state();
+        let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![
+                fused_locate_entity("first"),
+                fused_locate_entity("second"),
+                fused_locate_entity("third"),
+            ],
+            debug: Some(kin_cli::commands::locate::LocateDebugInfo::default()),
+            ..Default::default()
+        };
+        let key = "held-explanation-ranking";
+        cache_locate_ranking(
+            &state,
+            key,
+            "parse",
+            &result,
+            CachedLocateShape {
+                file_granularity: false,
+                snippet_alias: false,
+                requested_queries: Vec::new(),
+                include_tests: false,
+                reference: None,
+                max_files: 10,
+                explain: true,
+                page_size: 1,
+                graph_version,
+                mode: kin_cli::commands::locate::projection_mode(true, false),
+            },
+        );
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let cursor = kin_core::LocateCursor {
+            key: key.to_string(),
+            page: 1,
+            next_offset: Some(1),
+            page_size: Some(1),
+        }
+        .encode();
+
+        let reused = call_semantic_locate(
+            app.clone(),
+            json!({ "cursor": cursor.clone(), "compact": false }),
+        )
+        .await;
+        assert_eq!(reused["page"].as_u64().unwrap(), 1);
+        assert!(
+            reused.get("debug").is_some(),
+            "compact:false must reuse the held explanation: {reused}"
+        );
+
+        let contracted = call_semantic_locate(
+            app.clone(),
+            json!({ "cursor": cursor.clone(), "explain": true, "compact": true }),
+        )
+        .await;
+        assert_eq!(contracted["page"].as_u64().unwrap(), 1);
+        assert!(
+            contracted.get("debug").is_none(),
+            "a compact continuation must not leak held explanation data: {contracted}"
+        );
+
+        let bare = call_semantic_locate(app, json!({ "cursor": cursor })).await;
+        assert!(
+            bare.get("debug").is_none(),
+            "a bare cursor uses compact presentation even when the cache holds debug: {bare}"
+        );
+    }
+
+    /// A cosine cursor-only call must route by the held cache entry, inherit its
+    /// query/shape/width, and resume from the absolute row offset. The released
+    /// two-part cursor remains compatible while that same ranking is cached.
+    #[tokio::test]
+    async fn mcp_semantic_locate_cosine_cursor_inherits_shape_and_absolute_offset() {
+        let state = test_state();
+        let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let key = "cosine-held-ranking".to_string();
+        let rows = (0..7)
+            .map(|index| {
+                json!({
+                    "entity_id": format!("00000000-0000-0000-0000-{index:012}"),
+                    "name": format!("row_{index}"),
+                    "kind": "function",
+                    "score": 1.0 - index as f32 / 10.0,
+                    "match_kind": "semantic",
+                    "provenance": { "file": format!("src/{index}.rs"), "cosine": 0.9 },
+                })
+            })
+            .collect::<Vec<_>>();
+        let coverage = kin_cli::commands::locate::SemanticCoverage {
+            supported: true,
+            indexed: 7,
+            total: 7,
+            pending: 0,
+            complete: true,
+            embedding_state: kin_cli::commands::locate::EmbeddingState::Present,
+            limited_by: Vec::new(),
+            read_at: Some("query-time".to_string()),
+            note: None,
+            graph_bodies: None,
+        };
+        let query_degradation = kin_cli::commands::locate::RetrievalDegradation {
+            component: "fixture_signal".to_string(),
+            reason: "query_time_fact".to_string(),
+            detail: "this fact belongs to the held ranking".to_string(),
+            remediation: "none".to_string(),
+        };
+        state.semantic_locate_pages.lock().unwrap().insert(
+            key.clone(),
+            CachedSemanticPage {
+                query: "held cosine query".to_string(),
+                rows,
+                semantic_coverage: coverage,
+                degradations: vec![query_degradation],
+                file_granularity: false,
+                include_tests: false,
+                page_size: 2,
+                graph_version,
+                mode: kin_cli::commands::locate::projection_mode(true, false),
+                created: std::time::Instant::now(),
+            },
+        );
+        let app = router(state);
+        let cursor = kin_core::LocateCursor {
+            key: key.clone(),
+            page: 1,
+            next_offset: Some(2),
+            page_size: Some(2),
+        }
+        .encode();
+
+        let page = call_semantic_locate(app.clone(), json!({ "cursor": cursor.clone() })).await;
+        assert_eq!(page["routing"], "cosine-v0");
+        assert_eq!(page["query"], "held cosine query");
+        assert_eq!(page["granularity"], "entity");
+        assert_eq!(page["page"], 1);
+        assert_eq!(page["semantic_coverage"]["read_at"], "query-time");
+        assert!(page["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["reason"] == "query_time_fact"));
+        let names = page["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["row_2", "row_3"]);
+
+        let overflow_page = call_mcp_tool_result(
+            app.clone(),
+            "semantic_locate",
+            json!({
+                "cursor": kin_core::LocateCursor {
+                    key: key.clone(),
+                    page: usize::MAX,
+                    next_offset: Some(2),
+                    page_size: Some(2),
+                }.encode()
+            }),
+        )
+        .await;
+        assert_eq!(overflow_page.is_error, Some(true));
+        assert!(matches!(
+            overflow_page.content.first(),
+            Some(kin_mcp::ContentBlock::Text { text })
+                if text.contains("cursor is invalid")
+        ));
+
+        let conflict = app
+            .clone()
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "semantic_locate",
+                            "arguments": {
+                                "cursor": cursor.clone(),
+                                "pipeline": "fused"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let conflict_body = axum::body::to_bytes(conflict.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let conflict: kin_mcp::ToolCallResult = serde_json::from_slice(&conflict_body).unwrap();
+        assert_eq!(
+            conflict.is_error,
+            Some(true),
+            "a cosine cursor cannot be silently reinterpreted by the fused arm"
+        );
+
+        // Width changes only how many rows this response emits. They cannot
+        // move the v2 cursor's absolute start back to page * new_width.
+        let narrow = call_semantic_locate(
+            app.clone(),
+            json!({ "cursor": cursor.clone(), "page_size": 1 }),
+        )
+        .await;
+        assert_eq!(narrow["results"][0]["name"], "row_2");
+        assert_eq!(narrow["results"].as_array().unwrap().len(), 1);
+
+        let legacy_width_override =
+            call_semantic_locate(app.clone(), json!({ "cursor": cursor.clone(), "limit": 1 }))
+                .await;
+        assert_eq!(legacy_width_override["results"][0]["name"], "row_2");
+        assert_eq!(
+            legacy_width_override["results"].as_array().unwrap().len(),
+            1
+        );
+
+        let scope_conflict = call_mcp_tool_result(
+            app.clone(),
+            "semantic_locate",
+            json!({ "cursor": cursor.clone(), "include_tests": true }),
+        )
+        .await;
+        assert_eq!(scope_conflict.is_error, Some(true));
+
+        // Released cursors did not carry an offset or width. While their cache
+        // entry exists they retain the released page-times-cached-width rule.
+        let legacy =
+            call_semantic_locate(app.clone(), json!({ "cursor": format!("{key}.1") })).await;
+        let legacy_names = legacy["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(legacy_names, vec!["row_2", "row_3"]);
+        let legacy_narrow = call_semantic_locate(
+            app.clone(),
+            json!({ "cursor": format!("{key}.1"), "page_size": 1 }),
+        )
+        .await;
+        assert_eq!(
+            legacy_narrow["results"][0]["name"], "row_2",
+            "legacy width override must start at page * cached width, not repeat row one"
+        );
+        assert_eq!(legacy_narrow["results"].as_array().unwrap().len(), 1);
+
+        // The held ranking remains walkable beyond the former five-page
+        // retention ceiling. Page five is not a fabricated terminal page, and
+        // its cursor reaches the final fetched row without a repeat or gap.
+        let deep = call_semantic_locate(
+            app.clone(),
+            json!({
+                "cursor": kin_core::LocateCursor {
+                    key: key.clone(),
+                    page: 5,
+                    next_offset: Some(5),
+                    page_size: Some(1),
+                }.encode()
+            }),
+        )
+        .await;
+        assert_eq!(deep["results"][0]["name"], "row_5");
+        assert_eq!(deep["total_ranked"], 7);
+        let final_cursor = deep["next_cursor"].as_str().expect("row six remains");
+        let final_page = call_semantic_locate(app.clone(), json!({ "cursor": final_cursor })).await;
+        assert_eq!(final_page["results"][0]["name"], "row_6");
+        assert!(final_page["next_cursor"].is_null());
+
+        // A genuine cursor is minted only while another row remains. An
+        // absolute offset at the end (or a legacy page beyond it) is therefore
+        // corrupted, not an authoritative empty page over a non-empty ranking.
+        for damaged in [
+            kin_core::LocateCursor {
+                key: key.clone(),
+                page: 6,
+                next_offset: Some(7),
+                page_size: Some(1),
+            }
+            .encode(),
+            format!("{key}.4"),
+        ] {
+            let refused =
+                call_mcp_tool_result(app.clone(), "semantic_locate", json!({ "cursor": damaged }))
+                    .await;
+            assert_eq!(refused.is_error, Some(true));
+            assert!(matches!(
+                refused.content.first(),
+                Some(kin_mcp::ContentBlock::Text { text })
+                    if text.contains("outside its held ranking")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_semantic_locate_cursor_requires_query_and_explicit_pipeline_to_restart() {
+        let state = test_state();
+        state
+            .graph
+            .upsert_entity(&test_entity("handler", "src/lib.py"))
+            .unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let stale = kin_core::LocateCursor {
+            key: "evicted-ranking".to_string(),
+            page: 1,
+            next_offset: Some(2),
+            page_size: Some(2),
+        }
+        .encode();
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::post("/mcp/tools/call")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "name": "semantic_locate",
+                            "arguments": { "cursor": stale }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let error: kin_mcp::ToolCallResult = serde_json::from_slice(&body).unwrap();
+        assert_eq!(error.is_error, Some(true));
+        assert!(matches!(
+            error.content.first(),
+            Some(kin_mcp::ContentBlock::Text { text })
+                if text.contains("cursor expired")
+        ));
+
+        let non_string = call_mcp_tool_result(
+            app.clone(),
+            "semantic_locate",
+            json!({ "cursor": 7, "query": "handler" }),
+        )
+        .await;
+        assert_eq!(non_string.is_error, Some(true));
+        assert!(matches!(
+            non_string.content.first(),
+            Some(kin_mcp::ContentBlock::Text { text })
+                if text.contains("invalid cursor") && text.contains("string")
+        ));
+
+        for arguments in [
+            json!({ "cursor": "damaged-cursor" }),
+            json!({ "cursor": "damaged-cursor", "query": "handler" }),
+        ] {
+            let malformed = call_mcp_tool_result(app.clone(), "semantic_locate", arguments).await;
+            assert_eq!(malformed.is_error, Some(true));
+            assert!(matches!(
+                malformed.content.first(),
+                Some(kin_mcp::ContentBlock::Text { text })
+                    if text.contains("cursor is invalid")
+            ));
+        }
+
+        let malformed_restart = call_semantic_locate(
+            app.clone(),
+            json!({
+                "cursor": "damaged-cursor",
+                "query": "handler",
+                "pipeline": "cosine",
+                "include_snippet": false
+            }),
+        )
+        .await;
+        assert_eq!(malformed_restart["routing"], "cosine-v0");
+        assert_eq!(malformed_restart["page"], 0);
+
+        let restarted = call_semantic_locate(
+            app,
+            json!({
+                "cursor": kin_core::LocateCursor {
+                    key: "evicted-ranking".to_string(),
+                    page: 1,
+                    next_offset: Some(2),
+                    page_size: Some(2),
+                }.encode(),
+                "query": "handler",
+                "pipeline": "cosine",
+                "include_snippet": false
+            }),
+        )
+        .await;
+        assert_eq!(restarted["routing"], "cosine-v0");
+        assert_eq!(restarted["query"], "handler");
+        assert_eq!(restarted["page"], 0);
     }
 
     // The fused arm's extra top-level fields survive the switch to the
@@ -36604,7 +38420,7 @@ mod tests {
         };
         let make_result = || LocateResult {
             entities: make_entities(),
-            next_cursor: Some("deadbeefdeadbeef.1".to_string()),
+            next_cursor: Some("v2.deadbeefdeadbeef.1.10.10".to_string()),
             page: 0,
             total_ranked: 47,
             files: make_files(),
@@ -36671,7 +38487,7 @@ mod tests {
         );
         assert_eq!(
             payload["next_cursor"],
-            json!("deadbeefdeadbeef.1"),
+            json!("v2.deadbeefdeadbeef.1.10.10"),
             "the rest of the ranking stays reachable through the cursor"
         );
         let cut = payload["degradations"]
@@ -36859,19 +38675,476 @@ mod tests {
         );
     }
 
+    #[test]
+    fn fused_file_granularity_omits_the_entity_only_fallback_verdict() {
+        let mut result = kin_cli::commands::locate::LocateResult {
+            entities: vec![fused_locate_entity("unrelated_helper")],
+            all_fallback: true,
+            ..Default::default()
+        };
+        kin_cli::commands::locate::record_description_query_guidance(&mut result.degradations);
+        let tool = fused_semantic_locate_payload(result, "where is config read", true, false);
+        let payload: serde_json::Value = serde_json::from_str(
+            tool_result_json(&tool)["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload["granularity"], "file");
+        assert!(
+            payload.get("entities").is_none(),
+            "file granularity has one primary collection: {payload}"
+        );
+        assert!(
+            payload.get("all_fallback").is_none(),
+            "file granularity cannot carry an entity-name verdict: {payload}"
+        );
+        assert!(payload
+            .get("degradations")
+            .and_then(serde_json::Value::as_array)
+            .is_none_or(|entries| entries.iter().all(|entry| {
+                entry["component"] != kin_mcp::negative::QUERY_SHAPE_COMPONENT
+                    || entry["reason"] != kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+            })));
+    }
+
+    #[tokio::test]
+    async fn fused_file_cursor_pages_the_file_ranking_without_entities_repeats_or_gaps() {
+        let state = test_state();
+        let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let file = |path: &str, score: f32| {
+            serde_json::from_value::<kin_cli::commands::locate::LocateFileEntry>(json!({
+                "path": path,
+                "score": score,
+                "symbols": [{
+                    "name": format!("symbol_{path}"),
+                    "kind": "function",
+                    "score": score,
+                    "definition": true
+                }]
+            }))
+            .unwrap()
+        };
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![fused_locate_entity("entity_must_not_be_primary")],
+            files: vec![
+                file("src/a.rs", 0.9),
+                file("src/b.rs", 0.8),
+                file("src/c.rs", 0.7),
+            ],
+            ..Default::default()
+        };
+        let key = "held-file-ranking";
+        cache_locate_ranking(
+            &state,
+            key,
+            "where are redirects handled",
+            &result,
+            CachedLocateShape {
+                file_granularity: true,
+                snippet_alias: false,
+                requested_queries: Vec::new(),
+                include_tests: false,
+                reference: None,
+                max_files: 3,
+                explain: false,
+                page_size: 1,
+                graph_version,
+                mode: kin_cli::commands::locate::projection_mode(true, false),
+            },
+        );
+        let app = router(state);
+        let cursor = kin_core::LocateCursor {
+            key: key.to_string(),
+            page: 1,
+            next_offset: Some(1),
+            page_size: Some(1),
+        }
+        .encode();
+
+        // Widening the continuation changes only its length. It still begins
+        // at absolute file offset one and emits no entity-side second primary.
+        let post = app
+            .clone()
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                            text: String::new(),
+                            queries: None,
+                            explain: None,
+                            max_files: 10,
+                            max_files_explicit: false,
+                            reference: None,
+                            snippets: false,
+                            snippet_lines: None,
+                            entity_surface: true,
+                            cursor: Some(cursor.clone()),
+                            page_size: Some(2),
+                            snippet_override: None,
+                            include_tests: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            post.status(),
+            StatusCode::BAD_REQUEST,
+            "POST /locate cannot reinterpret a file cursor as entity offsets"
+        );
+
+        let page =
+            call_semantic_locate(app.clone(), json!({ "cursor": cursor, "page_size": 2 })).await;
+        assert_eq!(page["granularity"], "file");
+        assert!(
+            page.get("entities").is_none(),
+            "file mode has one primary: {page}"
+        );
+        assert_eq!(page["total_ranked"], 3);
+        assert_eq!(
+            page["files"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["src/b.rs", "src/c.rs"]
+        );
+        assert!(page["next_cursor"].is_null());
+
+        let legacy =
+            call_semantic_locate(app.clone(), json!({ "cursor": format!("{key}.1") })).await;
+        assert_eq!(legacy["files"][0]["path"], "src/b.rs");
+        assert_eq!(legacy["next_cursor"].is_string(), true);
+
+        for damaged in [
+            kin_core::LocateCursor {
+                key: key.to_string(),
+                page: 2,
+                next_offset: Some(3),
+                page_size: Some(1),
+            }
+            .encode(),
+            format!("{key}.3"),
+        ] {
+            let refused =
+                call_mcp_tool_result(app.clone(), "semantic_locate", json!({ "cursor": damaged }))
+                    .await;
+            assert_eq!(refused.is_error, Some(true));
+            assert!(matches!(
+                refused.content.first(),
+                Some(kin_mcp::ContentBlock::Text { text })
+                    if text.contains("outside its held ranking")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn post_cursor_distinguishes_omitted_shape_from_explicit_empty_or_false() {
+        let state = test_state();
+        let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![fused_locate_entity("first"), fused_locate_entity("second")],
+            debug: Some(kin_cli::commands::locate::LocateDebugInfo::default()),
+            ..Default::default()
+        };
+        let key = "post-shape-ranking";
+        cache_locate_ranking(
+            &state,
+            key,
+            "primary",
+            &result,
+            CachedLocateShape {
+                file_granularity: false,
+                snippet_alias: false,
+                requested_queries: vec!["variant".to_string()],
+                include_tests: true,
+                reference: None,
+                max_files: 10,
+                explain: true,
+                page_size: 1,
+                graph_version,
+                mode: kin_cli::commands::locate::projection_mode(true, false),
+            },
+        );
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let cursor = kin_core::LocateCursor {
+            key: key.to_string(),
+            page: 1,
+            next_offset: Some(1),
+            page_size: Some(1),
+        }
+        .encode();
+
+        let zero_width = app
+            .clone()
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                            text: "primary".to_string(),
+                            queries: None,
+                            explain: None,
+                            max_files: 10,
+                            max_files_explicit: false,
+                            reference: None,
+                            snippets: false,
+                            snippet_lines: None,
+                            entity_surface: true,
+                            cursor: None,
+                            page_size: Some(0),
+                            snippet_override: None,
+                            include_tests: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(zero_width.status(), StatusCode::BAD_REQUEST);
+        let zero_width_body = axum::body::to_bytes(zero_width.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&zero_width_body).contains("positive integer"));
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "text": "primary",
+                            "queries": ["variant"],
+                            "include_tests": true,
+                            "explain": false,
+                            "max_files": 10,
+                            "max_files_explicit": false,
+                            "snippets": false,
+                            "entity_surface": true,
+                            "cursor": "damaged-cursor"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            malformed.status(),
+            StatusCode::BAD_REQUEST,
+            "POST must not reinterpret malformed bytes as a fresh page zero"
+        );
+        let request = |shape: serde_json::Value| {
+            let mut body = json!({
+                "text": "",
+                "max_files": 10,
+                "max_files_explicit": false,
+                "snippets": false,
+                "entity_surface": true,
+                "cursor": cursor.clone(),
+            });
+            if let Some(entries) = shape.as_object() {
+                body.as_object_mut().unwrap().extend(entries.clone());
+            }
+            Request::post("/locate")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+
+        let bare = app.clone().oneshot(request(json!({}))).await.unwrap();
+        assert_eq!(
+            bare.status(),
+            StatusCode::OK,
+            "omission inherits held shape"
+        );
+        let bare_body = axum::body::to_bytes(bare.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let bare: kin_cli::commands::locate::LocateResult =
+            serde_json::from_slice(&bare_body).unwrap();
+        assert!(
+            bare.debug.is_some(),
+            "omitted explain inherits the held explanation"
+        );
+
+        let outside = app
+            .clone()
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::to_string(&kin_cli::daemon_client::LocateRequest {
+                            text: String::new(),
+                            queries: None,
+                            explain: None,
+                            max_files: 10,
+                            max_files_explicit: false,
+                            reference: None,
+                            snippets: false,
+                            snippet_lines: None,
+                            entity_surface: true,
+                            cursor: Some(
+                                kin_core::LocateCursor {
+                                    key: key.to_string(),
+                                    page: 2,
+                                    next_offset: Some(2),
+                                    page_size: Some(1),
+                                }
+                                .encode(),
+                            ),
+                            page_size: None,
+                            snippet_override: None,
+                            include_tests: None,
+                        })
+                        .unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outside.status(), StatusCode::BAD_REQUEST);
+        let outside_body = axum::body::to_bytes(outside.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&outside_body).contains("outside its held ranking"));
+
+        for conflict in [json!({ "queries": [] }), json!({ "include_tests": false })] {
+            let response = app.clone().oneshot(request(conflict)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+
+        let contracted = app
+            .clone()
+            .oneshot(request(json!({ "explain": false })))
+            .await
+            .unwrap();
+        assert_eq!(contracted.status(), StatusCode::OK);
+        let contracted_body = axum::body::to_bytes(contracted.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let contracted: kin_cli::commands::locate::LocateResult =
+            serde_json::from_slice(&contracted_body).unwrap();
+        assert!(
+            contracted.debug.is_none(),
+            "explicit false may contract cached explanation per page"
+        );
+
+        let exact = app
+            .oneshot(request(json!({
+                "queries": ["variant"],
+                "include_tests": true,
+                "explain": true
+            })))
+            .await
+            .unwrap();
+        assert_eq!(exact.status(), StatusCode::OK, "exact repeats stay valid");
+    }
+
+    #[tokio::test]
+    async fn post_cursor_cannot_expand_missing_explanation() {
+        let state = test_state();
+        let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let key = "post-no-explanation-ranking";
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![fused_locate_entity("held")],
+            ..Default::default()
+        };
+        cache_locate_ranking(
+            &state,
+            key,
+            "primary",
+            &result,
+            CachedLocateShape {
+                file_granularity: false,
+                snippet_alias: false,
+                requested_queries: Vec::new(),
+                include_tests: false,
+                reference: None,
+                max_files: 10,
+                explain: false,
+                page_size: 1,
+                graph_version,
+                mode: kin_cli::commands::locate::projection_mode(true, false),
+            },
+        );
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let cursor = kin_core::LocateCursor {
+            key: key.to_string(),
+            page: 1,
+            next_offset: Some(1),
+            page_size: Some(1),
+        }
+        .encode();
+
+        let response = router(state)
+            .oneshot(
+                Request::post("/locate")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "text": "",
+                            "explain": true,
+                            "max_files": 10,
+                            "max_files_explicit": false,
+                            "snippets": false,
+                            "entity_surface": true,
+                            "cursor": cursor
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("cannot expand"));
+    }
+
     /// The cached ranking holds the variant echo, so a cursor page reports the
     /// fan-out it came from instead of dropping it.
     #[test]
     fn the_ranking_cache_holds_the_variant_echo_with_the_ranking() {
         let state = test_state();
         let variants = vec!["primary text".to_string(), "second variant".to_string()];
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![fused_locate_entity("resolve_redirects")],
+            queries: variants.clone(),
+            ..Default::default()
+        };
         cache_locate_ranking(
             &state,
             "ranking-key",
-            &[fused_locate_entity("resolve_redirects")],
-            &variants,
-            7,
-            "entities+bodies",
+            "primary text",
+            &result,
+            CachedLocateShape {
+                file_granularity: false,
+                snippet_alias: false,
+                requested_queries: Vec::new(),
+                include_tests: false,
+                reference: None,
+                max_files: 10,
+                explain: false,
+                page_size: 4,
+                graph_version: 7,
+                mode: "ranking+bodies",
+            },
         );
         let cache = state.locate_rankings.lock().unwrap();
         let entry = cache.get("ranking-key").expect("the ranking is cached");
@@ -36951,7 +39224,15 @@ mod tests {
                 })
                 .collect(),
             total_ranked: 47,
-            next_cursor: Some("deadbeefdeadbeef.1".to_string()),
+            next_cursor: Some(
+                kin_cli::commands::locate::LocateCursor {
+                    key: "deadbeefdeadbeef".to_string(),
+                    page: 1,
+                    next_offset: Some(hits),
+                    page_size: Some(hits.max(1)),
+                }
+                .encode(),
+            ),
             ..Default::default()
         };
         let query = "where HTTP redirects are actually resolved and followed";
