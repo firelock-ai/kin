@@ -665,7 +665,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           TARGET: ${{ matrix.target }}
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-          EXPECTED_VFS_COMMIT: d6c72979a3837c484ce7a604377df1837f9de8bd
+          EXPECTED_VFS_COMMIT: b1355e67df7dc020002c3a73fb99692c2f3fa7b4
         run: |
           set -euo pipefail
           node <<'NODE'
