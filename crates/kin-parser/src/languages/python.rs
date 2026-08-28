@@ -282,7 +282,15 @@ impl LanguageAdapter for PythonAdapter {
         // entity owns the edge. Keep syntax state and call-coverage completeness
         // separate: carry one reserved negative record to the linker, which
         // fails closed without rejecting the valid file.
-        if call_audit.incomplete || has_unobserved_call(&root, &call_audit.seen_calls) {
+        // One walk answers both questions. `seen_calls` holds one span per call
+        // node extraction visited, so `call_nodes` is at least its size and
+        // exceeds it exactly when a call node was never visited at all. The
+        // decorator half is deliberately not in that comparison: the extractor
+        // emits an edge for each of those without ever visiting a `call` node,
+        // so counting them here would report every decorated file incomplete.
+        let mut census = PythonCallSiteCensus::default();
+        census_python_call_sites(&root, source, &mut census);
+        if call_audit.incomplete || census.call_nodes > call_audit.seen_calls.len() as u64 {
             relations.push(call_extraction_incomplete_marker());
         }
 
@@ -366,6 +374,7 @@ impl LanguageAdapter for PythonAdapter {
             imports,
             tests,
             parse_state,
+            parsed_call_sites: Some(census.total()),
         })
     }
 }
@@ -1344,17 +1353,118 @@ struct PythonCallExtractionAudit {
     incomplete: bool,
 }
 
-fn has_unobserved_call(
+/// The call sites a Python file holds, split into the two kinds that reach the
+/// graph by different routes.
+///
+/// A denominator taken off the emitted relations understates the file, because
+/// a call whose callee the adapter cannot name (`handlers["render"](body)`) and
+/// a call written where no callable entity owns the edge produce no
+/// [`kin_model::RelationKind::Calls`] relation at all. A consumer subtracting
+/// the graph's resolved edges from a short count finds no shortfall on a file
+/// whose calls the graph never saw.
+///
+/// It has to be split rather than summed in one field, because the two halves
+/// answer different questions and one of them is asymmetric in the other
+/// direction. See each field.
+#[derive(Default)]
+struct PythonCallSiteCensus {
+    /// Nodes whose kind is `call`.
+    ///
+    /// This is exactly the set extraction walks, so it is the one the
+    /// completeness check compares against: it exceeds the number of call sites
+    /// the walker visited precisely when one was missed.
+    call_nodes: u64,
+    /// Decorators that produce a `Calls` relation and hold no `call` node of
+    /// their own, meaning every form but `@mod.name(args)`.
+    ///
+    /// Counted apart from `call_nodes` in both directions for a reason. Folding
+    /// them in would report a file carrying a bare decorator as extraction-
+    /// incomplete, because the walker never visits a `call` node for one, and
+    /// that would withhold the count from a file that was measured before.
+    /// Leaving them out of the total is worse: the extractor emits an edge for
+    /// each, so the stamped count lands BELOW the resolved edge count, the
+    /// arrival gate floors that difference at zero, and it certifies an absence
+    /// over a file holding a call site the graph never saw.
+    decorator_sites: u64,
+}
+
+impl PythonCallSiteCensus {
+    /// Every call site the file holds, which is the number stamped on its
+    /// entities.
+    fn total(&self) -> u64 {
+        self.call_nodes + self.decorator_sites
+    }
+}
+
+/// Walk `node` once and count both halves of the census.
+fn census_python_call_sites(
     node: &tree_sitter::Node,
-    seen_calls: &std::collections::HashSet<(usize, usize)>,
-) -> bool {
-    if node.kind() == "call" && !seen_calls.contains(&(node.start_byte(), node.end_byte())) {
+    source: &[u8],
+    census: &mut PythonCallSiteCensus,
+) {
+    if node.kind() == "call" {
+        census.call_nodes += 1;
+    }
+    if node.kind() == "decorated_definition" {
+        census.decorator_sites += bare_decorator_call_sites(node, source);
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        census_python_call_sites(&child, source, census);
+    }
+}
+
+/// Decorators on `definition` that produce a `Calls` relation and carry no
+/// `call` node of their own.
+///
+/// The predicate is the emitter's own, deliberately: the same
+/// [`extract_decorator_payload_name`] and the same [`is_valid_callee_name`]
+/// filter the `decorated_definition` arm applies before it pushes a relation,
+/// and the same requirement that the definition actually decorates a function
+/// or a class. Re-deriving the condition here is what would let the two sides
+/// drift into disagreeing about what a decorator site is, which is the whole
+/// defect this counts.
+///
+/// `@app.route("/")` is excluded because its own `call` node is already counted
+/// and the emitter produces exactly one relation for it, so the two sides
+/// already balance there.
+fn bare_decorator_call_sites(definition: &tree_sitter::Node, source: &[u8]) -> u64 {
+    let mut cursor = definition.walk();
+    let mut decorates_a_definition = false;
+    let mut sites = 0;
+    for child in definition.children(&mut cursor) {
+        match child.kind() {
+            "function_definition" | "class_definition" => decorates_a_definition = true,
+            "decorator" => {
+                let names_a_callee = extract_decorator_payload_name(&child, source)
+                    .is_some_and(|name| is_valid_callee_name(&name));
+                if names_a_callee && !contains_call_node(&child) {
+                    sites += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    if decorates_a_definition {
+        sites
+    } else {
+        0
+    }
+}
+
+/// Whether `node` or anything under it is a `call`.
+fn contains_call_node(node: &tree_sitter::Node) -> bool {
+    if node.kind() == "call" {
         return true;
     }
+    // Bound rather than returned as the tail expression: the iterator borrows
+    // `cursor`, and a temporary at the end of a block outlives the block's own
+    // locals. `has_unobserved_call` carried the same binding for the same
+    // reason before this change replaced it.
     let mut cursor = node.walk();
     let found = node
         .children(&mut cursor)
-        .any(|child| has_unobserved_call(&child, seen_calls));
+        .any(|child| contains_call_node(&child));
     found
 }
 

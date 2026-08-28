@@ -1020,13 +1020,17 @@ fn run_ladder(
             .get(*key)
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
-        // A final semantic-locate page has no cursor. Removing primary rows from
-        // it would make those answers unrecoverable, so keep them and let the
-        // residual-over-budget disclosure tell the caller to narrow the fresh
-        // request. Secondary rollups can still be trimmed safely.
-        if tool == "semantic_locate" && Some(*key) == primary && locate_cursor.is_none() {
-            continue;
-        }
+        // Every collection is cut, including a final page's primary one.
+        // `max_chars` is the caller's context budget rather than a preference,
+        // so nothing licenses exceeding it, and a page with no cursor is not an
+        // exception: it is the case where the caller cannot page to the rest and
+        // therefore most needs to be told what was withheld and how to reach it.
+        // The floor of one entry per list is what keeps this from producing the
+        // empty array FIR-2600 exists to prevent, and the remediation below says
+        // `max_chars` rather than `next_cursor` when there is no cursor to
+        // follow. Retaining rows here instead shipped a response over the
+        // ceiling and published no elision at all, which is what took
+        // `response_budget:3` to UNREADABLE on main.
         let (withheld, narrowed) = trim_collection(payload, key, target, 1);
         if withheld > 0 {
             accounting.bounded = true;
@@ -1068,6 +1072,15 @@ fn run_ladder(
         if primary_withheld > 0 && cursor_rebased && kept > 0 {
             remediations.push(format!(
                 "re-issue with `page_size: {kept}` and follow `next_cursor`"
+            ));
+        } else if tool == "semantic_locate" && primary_withheld > 0 && locate_cursor.is_none() {
+            // Naming a cursor here would be a recovery the response cannot
+            // provide. The two things that do reach the withheld rows are a
+            // larger ceiling and a narrower question, and the caller owns both.
+            remediations.push(format!(
+                "raise `max_chars`, or narrow the request with `{}`; this page has no \
+                 `next_cursor`, so the withheld entries cannot be reached by paging",
+                shape.narrow_param
             ));
         } else {
             remediations.push(format!("narrow the request with `{}`", shape.narrow_param));
@@ -2139,8 +2152,16 @@ mod tests {
         assert!(!disclosure.contains("primary `entities`"), "{disclosure}");
     }
 
+    /// A final page is still bound by the ceiling, and says what it withheld.
+    ///
+    /// `max_chars` is the caller's context budget, so a page with no cursor does
+    /// not get to exceed it. What a final page owes instead is honesty about the
+    /// cut: at least one entry survives per list, the elision is published, and
+    /// the remedy names the ceiling rather than a `next_cursor` it does not
+    /// have. The earlier contract kept the rows and shipped over budget, which
+    /// took `response_budget:3` to UNREADABLE on main because nothing was cut.
     #[test]
-    fn a_null_cursor_never_claims_recovery_or_loses_final_page_rows() {
+    fn a_final_page_is_cut_to_its_ceiling_and_names_no_cursor_recovery() {
         let mut payload = cosine_locate_payload(20);
         payload["next_cursor"] = Value::Null;
         let before = payload["results"].as_array().unwrap().len();
@@ -2148,20 +2169,52 @@ mod tests {
             max_chars: RESPONSE_MIN_MAX_CHARS,
             ..ResponseBudget::default()
         };
-        enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
-        assert_eq!(
-            payload["results"].as_array().unwrap().len(),
-            before,
-            "a final page has no recovery cursor, so its primary rows must remain"
+        let accounting = enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        let kept = payload["results"].as_array().unwrap().len();
+        assert!(
+            kept < before,
+            "a final page over its ceiling must still be cut: kept {kept} of {before}"
         );
-        assert!(payload["degradations"]
+        assert!(
+            kept >= 1,
+            "the cut must leave an entry rather than an empty array"
+        );
+        assert!(
+            accounting.chars_after <= budget.max_chars,
+            "a final page must not ship over its ceiling: {} against {}",
+            accounting.chars_after,
+            budget.max_chars
+        );
+        let elisions = payload["elisions"]["results"]
+            .as_object()
+            .expect("the cut list publishes its elision");
+        assert_eq!(elisions["kept"].as_u64().unwrap() as usize, kept);
+        assert_eq!(elisions["elided"].as_u64().unwrap() as usize, before - kept);
+        let remediations = payload["degradations"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|entry| !entry["remediation"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("follow `next_cursor`")));
+            .filter_map(|entry| entry["remediation"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            remediations
+                .iter()
+                .all(|remedy| !remedy.contains("follow `next_cursor`")),
+            "a final page cannot offer cursor recovery: {remediations:?}"
+        );
+        // `max_chars` alone is not evidence this branch ran. The residual
+        // disclosure names it too, so a bare substring test is satisfied by a
+        // producer this assertion is not about, and the mutation that deletes
+        // the branch survived exactly that test. Key on the clause only the cut
+        // disclosure writes.
+        assert!(
+            remediations.iter().any(|remedy| {
+                remedy.contains("raise `max_chars`")
+                    && remedy.contains("cannot be reached by paging")
+            }),
+            "the cut disclosure itself must name the ceiling and say why paging cannot reach \
+             the withheld rows: {remediations:?}"
+        );
     }
 
     #[test]

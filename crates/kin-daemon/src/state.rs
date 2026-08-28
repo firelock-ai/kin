@@ -5871,7 +5871,10 @@ impl DaemonState {
         Ok(())
     }
 
-    #[cfg(test)]
+    // The only caller is the #[cfg(unix)] test at api.rs, so on Windows this
+    // wrapper has no callers and -D dead-code fails the lib test build. Gate it
+    // to match its caller exactly rather than widening the private method it wraps.
+    #[cfg(all(test, unix))]
     pub(crate) fn finalize_committed_generation_for_test(&self, generation: u64) -> Result<()> {
         self.finalize_committed_generation(generation)
     }
