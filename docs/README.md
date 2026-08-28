@@ -46,6 +46,10 @@ repository, and walks the everyday loop end to end. Once Kin is running, the
   and the filesystem projection.
 - **[Release signing and update trust](security/signing-and-update-trust.md)**
   traces what a downloaded release proves and how install verifies it.
+- **[Code scanning triage](security/code-scanning-triage.md)** explains why the
+  CodeQL check goes red on large pull requests without anything being wrong with
+  them, gives the one command that tells you, and records the standing
+  disposition of every rule that fires here.
 
 ## For contributors
 

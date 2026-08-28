@@ -15,6 +15,7 @@
 //!   report, lifted from the tool payload when the daemon already included it,
 //! - graph freshness (`graph_as_of` plus honest `/health`-derived state),
 //! - degraded flags: daemon-unreachable, `embed_worker_failed` (#11),
+//!   `embed_persistence_unavailable`,
 //!   `mass_deletion_blocked`, offline-fallback, and workspace-mismatch.
 //!
 //! Honesty contract (CLAUDE.md): the envelope NEVER fabricates coverage or
@@ -179,6 +180,12 @@ impl EmbeddingState {
 }
 
 impl SemanticCoverage {
+    /// Whether this observation leaves no embedding work for a disabled
+    /// producer to perform.
+    fn embedding_work_complete(&self) -> bool {
+        self.pending == 0 && self.indexed == self.total
+    }
+
     /// The one embedding verdict every surface in this crate reads.
     ///
     /// Prefers the observation the producing surface published, because that is
@@ -312,6 +319,11 @@ pub struct Degraded {
     /// (#11). The graph still serves; the vector index is frozen until restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed_worker_failed: Option<bool>,
+    /// Daemon `/health`: this graph authority has no durable local vector
+    /// sidecar contract, so the embedding worker is intentionally unavailable.
+    /// This is not a memory refusal and cannot be cleared by freeing memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_persistence_unavailable: Option<bool>,
     /// Daemon `/health`: a suspected mass-deletion wipe is being withheld pending
     /// operator confirmation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -359,6 +371,13 @@ pub struct Degraded {
     /// retires, so it clears itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation_census_loss: Option<bool>,
+    /// The store's recorded creation-time hydration semantics differ from the
+    /// ones this binary derives, or the record is absent or unreadable. The
+    /// payload can still contain true rows, but an absence cannot be certified
+    /// when the store cannot establish that comparison. This record does not
+    /// claim provenance for history a replica later receives over transport.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_semantics_stale: Option<bool>,
     /// This store's last language-server enrichment sweep offered relations the
     /// graph does not hold, or published some without invalidating their
     /// endpoints' embeddings. Either way a producer that was supposed to fill
@@ -376,6 +395,7 @@ impl Degraded {
         [
             self.daemon_unreachable,
             self.embed_worker_failed,
+            self.embed_persistence_unavailable,
             self.mass_deletion_blocked,
             self.offline_fallback,
             self.workspace_mismatch,
@@ -383,6 +403,7 @@ impl Degraded {
             self.sweep_suspended,
             self.memory_pressure,
             self.relation_census_loss,
+            self.hydration_semantics_stale,
             self.enrichment_shortfall,
         ]
         .into_iter()
@@ -399,6 +420,9 @@ impl Degraded {
         }
         if self.embed_worker_failed == Some(true) {
             labels.push("embed_worker_failed");
+        }
+        if self.embed_persistence_unavailable == Some(true) {
+            labels.push("embed_persistence_unavailable");
         }
         if self.mass_deletion_blocked == Some(true) {
             labels.push("mass_deletion_blocked");
@@ -420,6 +444,9 @@ impl Degraded {
         }
         if self.relation_census_loss == Some(true) {
             labels.push("relation_census_loss");
+        }
+        if self.hydration_semantics_stale == Some(true) {
+            labels.push("hydration_semantics_stale");
         }
         if self.enrichment_shortfall == Some(true) {
             labels.push("enrichment_shortfall");
@@ -532,10 +559,13 @@ pub struct Durability {
 /// clock cannot say whether the store fell behind a second ago or a month ago,
 /// and a clock with no count cannot say whether anything is actually missing.
 ///
-/// Present only when the store IS behind. An absent object is not a claim that
-/// it is current: a runtime that reported no reconcile reading has nothing to
-/// say here, and reporting a zero it never verified is the shape of wrong
-/// answer this object exists to stop.
+/// Present when there is something to say, which is two cases and not one:
+/// the store is behind by a measured count, or NOTHING MEASURED the working
+/// copy, so whether it is behind is unknown. An absent object is a measured
+/// all-clear and only that. The second case exists because the first version of
+/// this object gated on the count alone, so a zero nobody had measured read
+/// exactly like a zero somebody had, and reporting a zero it never verified is
+/// the shape of wrong answer this object exists to stop (FIR-2820).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphBehind {
     /// Host paths on disk that no admission has taken.
@@ -547,22 +577,58 @@ pub struct GraphBehind {
     /// you just wrote.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample: Vec<String>,
+    /// Seconds since the walk that produced `unadmitted_paths` ran.
+    ///
+    /// `None` is the whole reason this object can be present with a count of
+    /// zero: it means no walk has stamped a reading, so the count above is a
+    /// default rather than an observation and nothing here is a statement about
+    /// the working copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_age_seconds: Option<u64>,
+    /// Whether a walk produced `unadmitted_paths`.
+    ///
+    /// Always on the wire, unlike the age beside it, and that is the point. The
+    /// unmeasured disclosure reaches a machine consumer as
+    /// `unadmitted_paths: 0`, which is the exact number the object exists to say
+    /// means nothing, and the only other tell was the ABSENCE of the age above,
+    /// which is an inference from an absence rather than a reading. That is the
+    /// field-versus-prose split this whole ticket is about, one object over from
+    /// where it was fixed, so the block now states it positively.
+    pub measured: bool,
     /// One line an agent can act on without reading the counts.
     pub note: String,
 }
 
 impl GraphBehind {
-    /// Read the two halves out of a daemon `/health` body.
+    /// Read the reading, and the basis for it, out of a daemon `/health` body.
     ///
-    /// `None` when the body carries no reconcile reading at all, and `None`
-    /// again when it reports nothing unadmitted. The two are different facts and
-    /// both are correctly silent here: this object speaks only when the store is
-    /// behind, and the gates that consume it treat its silence as no reading
-    /// rather than as an all-clear.
+    /// `None` when the body carries no reconcile block at all, because there is
+    /// then nothing to read rather than something to report.
+    ///
+    /// Otherwise the count alone does not decide this, and that is the fix. A
+    /// zero has three producers and only one of them is an all-clear: a walk
+    /// measured it, this daemon admits nothing from the filesystem so the
+    /// question does not apply, or a walk should have measured it and none has.
+    /// The first two are silence. The third is a disclosure, because a zero
+    /// nobody measured is not a zero, and gating on the count alone published it
+    /// as one on every surface built from this object while `kin status` on the
+    /// same daemon at the same instant correctly answered "not measured"
+    /// (FIR-2820).
     pub fn from_health(health: &Value) -> Option<Self> {
         let reconcile = health.get("reconcile")?;
         let unadmitted_paths = reconcile.get("untracked_path_count")?.as_u64()?;
-        if unadmitted_paths == 0 {
+        let measured_age_seconds = reconcile
+            .get("untracked_observed_age_seconds")
+            .and_then(Value::as_u64);
+        // Named by the daemon, not inferred here. A projected checkout on a
+        // daemon whose graph is its own write authority holds no content
+        // anything failed to admit, so an unstamped zero there is the question
+        // not applying rather than a walk that went missing.
+        let observation_not_applicable = reconcile
+            .get("untracked_observation_not_applicable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if unadmitted_paths == 0 && (measured_age_seconds.is_some() || observation_not_applicable) {
             return None;
         }
         let since = reconcile
@@ -580,26 +646,58 @@ impl GraphBehind {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let note = Self::describe(unadmitted_paths, since.as_deref());
+        let note = Self::describe(unadmitted_paths, since.as_deref(), measured_age_seconds);
         Some(Self {
             unadmitted_paths,
             since,
             sample,
+            measured_age_seconds,
+            measured: measured_age_seconds.is_some(),
             note,
         })
     }
 
-    fn describe(unadmitted_paths: u64, since: Option<&str>) -> String {
+    /// Whether this object is the no-measurement disclosure rather than a count.
+    ///
+    /// Both halves, because they are two facts. [`Self::from_health`] emits a
+    /// zero only when nothing measured the working copy and returns `None` for
+    /// every zero that something did, so the pair is exactly the unmeasured
+    /// shape; a count with no stamp is still a count and still sends a reader to
+    /// `kin admit`. A consumer asks this before naming that remedy, because on
+    /// the unmeasured shape there is no path to admit.
+    pub fn unmeasured(&self) -> bool {
+        !self.measured && self.unadmitted_paths == 0
+    }
+
+    fn describe(
+        unadmitted_paths: u64,
+        since: Option<&str>,
+        measured_age_seconds: Option<u64>,
+    ) -> String {
         let clock = match since {
             Some(since) => format!("the last complete admission was at {since}"),
             None => {
                 "this daemon has not reported when a complete admission last succeeded".to_string()
             }
         };
+        if unadmitted_paths == 0 {
+            return format!(
+                "nothing has measured this working copy, so whether graph truth is level with it \
+                 is unknown, and {clock}. Answers here cover admitted content only. `kin status` \
+                 reports the same, and a commit takes any unadmitted path anyway."
+            );
+        }
+        // The age rides in the sentence as well as the field, because a count
+        // with no clock cannot say whether the store fell behind a second ago
+        // or a month ago, and a reader of the note gets only the sentence.
+        let measured = match measured_age_seconds {
+            Some(age) => format!(", measured {age}s ago,"),
+            None => String::new(),
+        };
         format!(
-            "{unadmitted_paths} host path(s) are on disk that graph truth does not carry, and \
-             {clock}. Answers here cover admitted content only. `kin admit` takes those paths \
-             now, and a commit takes them anyway."
+            "{unadmitted_paths} host path(s) are on disk that graph truth does not carry\
+             {measured} and {clock}. Answers here cover admitted content only. `kin admit` takes \
+             those paths now, and a commit takes them anyway."
         )
     }
 
@@ -615,6 +713,17 @@ impl GraphBehind {
             Some(since) => format!("the last complete admission was at {since}"),
             None => "no complete admission has been reported".to_string(),
         };
+        // Two readings, two reasons, and the reader is sent to a different
+        // lever by each. One says the graph is behind by a known amount; the
+        // other says nobody knows, which is not the same news and must not
+        // borrow the first one's words.
+        if self.unmeasured() {
+            return format!(
+                "working_copy_unmeasured: nothing has measured this working copy, so whether \
+                 graph truth is level with it is unknown and {clock}; an absence here cannot be \
+                 told apart from content the graph has not taken yet"
+            );
+        }
         format!(
             "graph_behind_working_tree: {} host path(s) on disk have never been admitted and \
              {clock}, so an absence here cannot be told apart from content the graph has not \
@@ -783,18 +892,47 @@ impl Durability {
     /// the graph had never met (FIR-2499). The counts are left exactly as
     /// observed, because they were never the wrong part; what changes is the
     /// claim made from them.
+    ///
+    /// The claim is three things and only the prose was withdrawn. `state` kept
+    /// reading `recorded` and `live_only_entities` kept reading zero beside a
+    /// note explaining that neither could be relied on, so a caller keying on
+    /// the fields, which is what fields are for, was told the all-clear the
+    /// sentence had just taken back (FIR-2820). Both move here. The derived
+    /// number goes rather than growing: how many entities an unadmitted file
+    /// holds is not knowable from a graph that never parsed it, and inventing a
+    /// figure is the one thing this object promises never to do.
+    ///
+    /// So the sentence does not state one either. The first version of this
+    /// composed its lead from `live_only_entities` and then withdrew the field,
+    /// which is the FIR-2499 failure with the halves swapped: a reader grepping
+    /// the payload for "0 uncommitted" over an unadmitted module still found it,
+    /// one clause before the note explained that no such number was derivable.
+    /// The lead now states the live count, which is a fact, and nothing else.
     pub fn qualified_by(mut self, behind: &GraphBehind) -> Self {
-        let counts = match (self.live_entities, self.live_only_entities) {
-            (Some(live), Some(live_only)) => format!("{live} entities, {live_only} uncommitted"),
-            (Some(live), None) => format!("{live} entities"),
-            _ => "this graph".to_string(),
+        let counts = match self.live_entities {
+            Some(live) => format!("{live} entities answered here"),
+            None => "this graph answered".to_string(),
         };
-        self.note = format!(
-            "{counts}, and {} host path(s) on disk that no admission has taken; this reading \
-             covers admitted content only. `kin admit` takes those paths now, and a commit takes \
-             them anyway.",
-            behind.unadmitted_paths
-        );
+        // Two readings and two sentences, for the same reason the limiting
+        // factor carries two: a measured count and no measurement at all send a
+        // reader to different levers, and one of them is `kin admit`.
+        self.note = if behind.unmeasured() {
+            format!(
+                "{counts}, and nothing has measured this working copy, so how much of it is \
+                 recorded is unknown; this reading covers admitted content only. `kin status` \
+                 reports the same, and a commit takes any unadmitted path anyway."
+            )
+        } else {
+            format!(
+                "{counts}, and {} host path(s) on disk that no admission has taken, so how much \
+                 of this working copy is recorded is unknown; this reading covers admitted \
+                 content only. `kin admit` takes those paths now, and a commit takes them \
+                 anyway.",
+                behind.unadmitted_paths
+            )
+        };
+        self.state = DURABILITY_UNKNOWN.to_string();
+        self.live_only_entities = None;
         self
     }
 
@@ -1449,6 +1587,76 @@ fn completeness_note(
     }
 }
 
+/// What this store's creation-time replay record says, and what is safe to do
+/// about it.
+///
+/// A boolean was the whole defect. `Behind`, `Ahead`, `Unstamped` and
+/// `Unreadable` need four different actions and only one of them is safe to
+/// re-ingest directly: an `Ahead` store was made by a NEWER build than the one
+/// answering, so re-ingesting with this binary would overwrite a store this
+/// build cannot author, and an unknown record could be either. Publishing all
+/// four under a field named `stale` told automation the one thing that is wrong
+/// in three of the four cases.
+///
+/// Present for agreement as well as for every gap, whenever the comparison was
+/// actually made. An object that appeared only on failure could not prove the
+/// call compared anything at all, which is the difference between "this store
+/// is current" and "nobody looked".
+///
+/// Disclosure, not a second verdict. `degraded.hydration_semantics_stale`
+/// remains the one input the verdict is computed from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HydrationSemanticsObservation {
+    /// The stable standing label from `kin_core`: `current`, `behind`, `ahead`,
+    /// `unstamped` or `unreadable`.
+    pub standing: String,
+    /// The replay-semantics version the build answering this call derives.
+    pub derives: u32,
+    /// The version recorded when the store was created, when a record exists
+    /// and could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_under: Option<u32>,
+    /// Why the record could not be read, on `unreadable` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The direction-safe action, absent when the store is current and there is
+    /// nothing to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+}
+
+impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemanticsObservation {
+    /// Projected from the one comparison authority. Every field is read off the
+    /// standing rather than recomputed here, because a second place that
+    /// compares the numbers or authors the advice is a second answer waiting to
+    /// disagree with the first.
+    fn from(standing: &kin_core::hydration_semantics::HydrationStanding) -> Self {
+        use kin_core::hydration_semantics::HydrationStanding as Standing;
+        // One arm per variant, so a new standing has to be projected here
+        // rather than silently inheriting whichever default it fell through to.
+        let (created_under, derives, reason) = match standing {
+            Standing::Current { version } => (Some(*version), *version, None),
+            Standing::Behind {
+                created_under,
+                derives,
+            }
+            | Standing::Ahead {
+                created_under,
+                derives,
+            } => (Some(*created_under), *derives, None),
+            Standing::Unstamped { derives } => (None, *derives, None),
+            Standing::Unreadable { reason, derives } => (None, *derives, Some(reason.clone())),
+        };
+        Self {
+            standing: standing.label().to_string(),
+            derives,
+            created_under,
+            reason,
+            remedy: standing.remedy(),
+        }
+    }
+}
+
 /// The versioned MCP response envelope shared by every tool family.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Envelope {
@@ -1501,6 +1709,11 @@ pub struct Envelope {
     /// Degraded-state flags (always present; individual flags omitted when not
     /// observed).
     pub degraded: Degraded,
+    /// What this store's creation-time replay record says and what is safe to do
+    /// about it. Absent when no repository is discoverable, so no comparison was
+    /// made. See [`HydrationSemanticsObservation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_semantics: Option<HydrationSemanticsObservation>,
     /// The completeness signal (FIR-2357): what this answer's substrate could
     /// have found, present on every retrieval response whether it came back
     /// empty or full. `negative` guards only the empty case; this guards the
@@ -1542,6 +1755,7 @@ impl Envelope {
                 offline_fallback: Some(true),
                 ..Degraded::default()
             },
+            hydration_semantics: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -1562,6 +1776,7 @@ impl Envelope {
             freshness: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
+            hydration_semantics: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -1625,7 +1840,32 @@ impl Envelope {
             entity_count: Some(entity_count),
             ..GraphState::default()
         };
-        self.degraded = Degraded::default();
+        // The selected report replaces HEAD-scoped health observations, but it
+        // must not erase store-scoped records the stdio boundary already read
+        // for this response. In production these are stamped before graph
+        // status is finalized. Resetting the whole object here made a refused
+        // producer disappear only on `kin_graph_status`, while the same record
+        // remained visible on every other tool.
+        //
+        // The hydration creation-time version is one of them: it belongs to the
+        // store and applies to every graph view it can select.
+        self.degraded = Degraded {
+            embed_persistence_unavailable: if complete {
+                None
+            } else {
+                self.degraded.embed_persistence_unavailable
+            },
+            sweep_suspended: self.degraded.sweep_suspended,
+            memory_pressure: self.degraded.memory_pressure,
+            relation_census_loss: self.degraded.relation_census_loss,
+            hydration_semantics_stale: self.degraded.hydration_semantics_stale,
+            enrichment_shortfall: self.degraded.enrichment_shortfall,
+            ..Degraded::default()
+        };
+        // The structured observation is store-wide for the same reason the flag
+        // is, and dropping it here would leave graph status carrying the
+        // compatibility boolean with none of the direction an agent acts on.
+        // `self.hydration_semantics` is deliberately not reassigned.
         self
     }
 
@@ -1717,6 +1957,30 @@ impl Envelope {
         self
     }
 
+    /// Publish what this store's creation-time replay record says, and stamp the
+    /// compatibility gap flag when it is a gap.
+    ///
+    /// The successful empty answer is the one this changes. Historical deltas
+    /// are not re-derived when the binary's replay semantics change, so an
+    /// absent row may be a property of replay semantics this store cannot show
+    /// match the current build rather than a fact about the repository. Missing
+    /// and unreadable records count as gaps because neither can honestly stand
+    /// in for agreement.
+    ///
+    /// Absent rather than `false` when no repository is discoverable or the
+    /// store is current. `None` makes no claim; a fabricated `false` would claim
+    /// a comparison a call outside a Kin repository never performed.
+    pub fn with_hydration_semantics_observation(
+        mut self,
+        standing: Option<&kin_core::hydration_semantics::HydrationStanding>,
+    ) -> Self {
+        self.hydration_semantics = standing.map(HydrationSemanticsObservation::from);
+        if standing.is_some_and(kin_core::hydration_semantics::HydrationStanding::is_gap) {
+            self.degraded.hydration_semantics_stale = Some(true);
+        }
+        self
+    }
+
     /// Stamp that this store's last enrichment sweep did not publish everything
     /// it offered.
     ///
@@ -1755,6 +2019,7 @@ impl Envelope {
                 daemon_unreachable: Some(true),
                 ..Degraded::default()
             },
+            hydration_semantics: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -1783,6 +2048,7 @@ impl Envelope {
                 workspace_mismatch: Some(true),
                 ..Degraded::default()
             },
+            hydration_semantics: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -1790,12 +2056,18 @@ impl Envelope {
     }
 
     /// Fold honest signals from a daemon `/health` JSON body into the envelope:
-    /// the `embed_worker_failed` / `mass_deletion_blocked` degraded flags and the
-    /// graph freshness state. Missing fields stay unknown (absent), never
+    /// the embedding-worker / persistence / mass-deletion degraded flags and
+    /// the graph freshness state. Missing fields stay unknown (absent), never
     /// fabricated.
     pub fn with_health(mut self, health: &Value) -> Self {
         if let Some(value) = health.get("embed_worker_failed").and_then(Value::as_bool) {
             self.degraded.embed_worker_failed = Some(value);
+        }
+        if let Some(value) = health
+            .get("embed_persistence_unavailable")
+            .and_then(Value::as_bool)
+        {
+            self.degraded.embed_persistence_unavailable = Some(value);
         }
         if let Some(value) = health.get("mass_deletion_blocked").and_then(Value::as_bool) {
             self.degraded.mass_deletion_blocked = Some(value);
@@ -1853,6 +2125,45 @@ impl Envelope {
         self
     }
 
+    /// Read only what the daemon's health body says about the WORKING COPY,
+    /// leaving every count it carries alone.
+    ///
+    /// For the one answer that may not take the rest. `kin_graph_status` reports
+    /// the exact graph view the daemon selected, so borrowing `/health`'s entity
+    /// count or generation would put two authorities for one number in one
+    /// response, and the stdio path therefore skipped the health lift outright.
+    /// It skipped the reconcile block with it, so a graph-status answer could
+    /// never learn that the host holds content the graph has never met, and it
+    /// published "0 uncommitted" over exactly that working copy (FIR-2820).
+    ///
+    /// There is no second authority for these two. Neither describes the
+    /// selected graph: one counts host paths outside it and the other is a clock
+    /// about admissions. Durability is requalified if it is already set, and
+    /// [`Self::with_selected_graph_observation`] requalifies from `behind` when
+    /// it runs after this, so either order reaches the same reading.
+    pub fn with_working_copy_health(mut self, health: &Value) -> Self {
+        self.behind = GraphBehind::from_health(health);
+        self.freshness = GraphFreshness::from_health(health);
+        if let Some(behind) = self.behind.as_ref() {
+            self.durability = self
+                .durability
+                .take()
+                .map(|durability| durability.qualified_by(behind));
+        }
+        self
+    }
+
+    /// Stamp the daemon storage capability without importing HEAD-scoped
+    /// graph observations from `/health`.
+    ///
+    /// Temporal graph status uses this narrow seam because vector persistence
+    /// is a property of the serving daemon's backend, while health's entity
+    /// count, generation, freshness and reconcile state describe HEAD.
+    pub fn with_embed_persistence_unavailable(mut self, unavailable: bool) -> Self {
+        self.degraded.embed_persistence_unavailable = Some(unavailable);
+        self
+    }
+
     /// Lift `semantic_coverage` and `graph_as_of` out of a tool payload when the
     /// daemon already computed them, so they live in one predictable place on the
     /// envelope. Absent fields stay unknown.
@@ -1875,6 +2186,17 @@ impl Envelope {
             {
                 self.semantic_coverage = Some(coverage);
             }
+        }
+        if self
+            .semantic_coverage
+            .as_ref()
+            .is_some_and(SemanticCoverage::embedding_work_complete)
+        {
+            // A backend capability is actionable only while this selected
+            // graph still owes embeddings. This is the same precedence as CLI
+            // semantic readiness: exact complete coverage is healthy even when
+            // no future local vector checkpoint could be written.
+            self.degraded.embed_persistence_unavailable = None;
         }
         if self.graph_as_of.is_none() {
             for key in ["graph_as_of", "as_of"] {
@@ -2234,7 +2556,6 @@ fn annotate_block(
     };
     let mut annotated = annotated;
     apply_response_budget(&mut annotated, tool_name, budget);
-    disclose_self_contradictions(&mut annotated, tool_name);
     let rendered =
         serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
@@ -2276,6 +2597,12 @@ fn annotate_block(
 fn disclose_self_contradictions(annotated: &mut Value, tool_name: &str) {
     let found = crate::verdict::disagreements(annotated);
     if found.is_empty() {
+        if let Some(envelope) = annotated
+            .get_mut(ENVELOPE_KEY)
+            .and_then(Value::as_object_mut)
+        {
+            envelope.remove("self_check");
+        }
         return;
     }
     tracing::warn!(
@@ -2304,20 +2631,28 @@ fn disclose_self_contradictions(annotated: &mut Value, tool_name: &str) {
     );
 }
 
-/// Bound the fully annotated payload and record what that cost under
+/// Bound the fully annotated payload and record its exact final size under
 /// `_kin.response`.
 ///
 /// The accounting stanza is written BEFORE the cut as well as after it. The
 /// number it carries is a property of the object it sits inside, so a stanza
 /// added afterwards would push a response that had just been cut to fit back
-/// over its ceiling by its own length. Writing it first means the ladder
-/// measures the bytes that actually ship. `chars_before` is then restored to the
-/// first measurement, which is the one taken before anything was removed.
+/// over its ceiling by its own length. The budget downgrade and contradiction
+/// check can also grow the envelope after the first cut, so the ladder is rerun
+/// to a stable value and the accounting number is solved to a fixed point. A
+/// final response is therefore either inside the ceiling or carries the
+/// residual-over-budget disclosure, and `chars_after_budget` equals the bytes
+/// that actually ship.
 fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &ResponseBudget) {
     if !crate::budget::is_budgeted(tool_name) {
+        disclose_self_contradictions(annotated, tool_name);
         return;
     }
     let chars_before = crate::budget::measure(annotated);
+    // Resolved once. Two calls in adjacent expressions cannot disagree today,
+    // but a change whose whole argument is that one rule lives in one place
+    // should not keep a second reader of it here.
+    let primary = crate::budget::primary_collection_for(annotated, tool_name);
     let mut accounting = crate::budget::BudgetAccounting {
         max_chars: budget.max_chars,
         chars_before,
@@ -2327,29 +2662,73 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         chars_after: chars_before,
         bounded: false,
         compact: budget.compact,
+        // Seeded with the real values for the same reason the size placeholder
+        // is: the stanza written first has to be the width of the stanza that
+        // ships, or the ladder charges the budget for the wrong bytes.
+        primary_collection: primary.map(str::to_string),
+        primary_rows: primary.map(|key| crate::budget::collection_rows(annotated, key)),
     };
     write_response_accounting(annotated, &accounting);
-    if let Some(applied) = crate::budget::enforce(annotated, tool_name, budget) {
-        accounting = applied;
-        // This arm's own measurement, taken before the placeholder stanza was
-        // written, is the more accurate one for this pass. It loses only to a
-        // larger number the ladder recovered from an earlier arm's disclosure,
-        // which is the size the answer was actually built at.
-        accounting.chars_before = accounting.chars_before.max(chars_before);
-    }
-    write_response_accounting(annotated, &accounting);
-    if accounting.bounded {
-        if let Some(completeness) = annotated
-            .get_mut(ENVELOPE_KEY)
-            .and_then(Value::as_object_mut)
-            .and_then(|envelope| envelope.get_mut("completeness"))
-        {
-            Completeness::mark_response_bounded(completeness);
+    let mut bounded = false;
+    let mut largest_before = chars_before;
+
+    // A pass can add its own disclosure; the epistemic downgrade and self-check
+    // can then add more. Re-run until one whole pass leaves the response
+    // unchanged. Every removable field or row is finite, and the downgrade is
+    // idempotent, so this converges after a handful of passes while preserving
+    // the rule that verdict inputs themselves are never trimmed.
+    for _ in 0..16 {
+        let before = annotated.clone();
+        if let Some(applied) = crate::budget::enforce(annotated, tool_name, budget) {
+            bounded |= applied.bounded;
+            largest_before = largest_before.max(applied.chars_before);
+            accounting = applied;
         }
-        // The verdict and the absence object are downgraded with it. A budget
-        // that removed rows on purpose is the one cut that cannot leave a
-        // response certifying what it no longer carries.
-        crate::verdict::mark_response_bounded(annotated);
+        accounting.bounded = bounded;
+        accounting.chars_before = largest_before;
+
+        if bounded {
+            if let Some(completeness) = annotated
+                .get_mut(ENVELOPE_KEY)
+                .and_then(Value::as_object_mut)
+                .and_then(|envelope| envelope.get_mut("completeness"))
+            {
+                Completeness::mark_response_bounded(completeness);
+            }
+            // The verdict and the absence object are downgraded with it. A
+            // budget that removed rows on purpose is the one cut that cannot
+            // leave a response certifying what it no longer carries.
+            crate::verdict::mark_response_bounded(annotated);
+        }
+        disclose_self_contradictions(annotated, tool_name);
+        settle_response_accounting(annotated, &mut accounting);
+
+        if *annotated == before {
+            break;
+        }
+    }
+
+    // The last accounting rewrite is itself part of the response. Reconcile
+    // the residual marker against that exact shape, then settle its size once
+    // more because adding or removing the marker changes the measured bytes.
+    crate::budget::reconcile_residual(annotated, budget);
+    settle_response_accounting(annotated, &mut accounting);
+}
+
+/// Write `_kin.response` until its `chars_after_budget` field equals the exact
+/// pretty-serialized size of the object that contains it.
+fn settle_response_accounting(
+    annotated: &mut Value,
+    accounting: &mut crate::budget::BudgetAccounting,
+) {
+    write_response_accounting(annotated, accounting);
+    loop {
+        let measured = crate::budget::measure(annotated);
+        if accounting.chars_after == measured {
+            break;
+        }
+        accounting.chars_after = measured;
+        write_response_accounting(annotated, accounting);
     }
 }
 
@@ -2422,6 +2801,7 @@ mod tests {
         let health = serde_json::json!({
             "status": "attention",
             "embed_worker_failed": true,
+            "embed_persistence_unavailable": true,
             "mass_deletion_blocked": false,
             "reconciliation_status": "clean",
             "graph_entity_count": 1234,
@@ -2430,6 +2810,7 @@ mod tests {
         });
         let env = Envelope::daemon().with_health(&health);
         assert_eq!(env.degraded.embed_worker_failed, Some(true));
+        assert_eq!(env.degraded.embed_persistence_unavailable, Some(true));
         assert_eq!(env.degraded.mass_deletion_blocked, Some(false));
         assert_eq!(
             env.graph_state.reconciliation_status.as_deref(),
@@ -2439,6 +2820,51 @@ mod tests {
         assert_eq!(env.graph_state.loaded, Some(true));
         assert_eq!(env.graph_state.initialized, Some(true));
         assert!(env.degraded.any());
+        assert!(env
+            .degraded
+            .active_labels()
+            .contains(&"embed_persistence_unavailable"));
+    }
+
+    #[test]
+    fn unavailable_embed_persistence_qualifies_only_outstanding_embedding_work() {
+        let observed = |pending, indexed, total, complete| {
+            Envelope::daemon()
+                .with_health(&serde_json::json!({
+                    "embed_persistence_unavailable": true,
+                }))
+                .with_payload_metadata(&serde_json::json!({
+                    "semantic_coverage": {
+                        "pending": pending,
+                        "indexed": indexed,
+                        "total": total,
+                        "complete": complete,
+                    }
+                }))
+        };
+
+        let exact = observed(0, 9, 9, false);
+        assert!(
+            exact.degraded.embed_persistence_unavailable.is_none(),
+            "exact embedding completion outranks an unavailable future producer even when scope makes the overall coverage incomplete"
+        );
+
+        for (name, env) in [
+            ("queue-empty short coverage", observed(0, 8, 9, false)),
+            ("live backlog", observed(1, 8, 9, false)),
+            ("over-indexed observation", observed(0, 10, 9, false)),
+        ] {
+            assert_eq!(
+                env.degraded.embed_persistence_unavailable,
+                Some(true),
+                "{name} cannot dismiss the producer blocker"
+            );
+            assert!(env.degraded.any());
+            assert!(env
+                .degraded
+                .active_labels()
+                .contains(&"embed_persistence_unavailable"));
+        }
     }
 
     /// The four states a durability observation can be in, including the two
@@ -2530,6 +2956,7 @@ mod tests {
             "reconcile": {
                 "untracked_path_count": 1,
                 "untracked_paths_sample": ["notekeeper/search.py"],
+                "untracked_observed_age_seconds": 0,
                 "last_admission_success_at": "2026-08-20T13:00:00Z",
             },
         }));
@@ -2561,6 +2988,19 @@ mod tests {
                 .contains("host path(s) on disk that no admission has taken"),
             "the note has to name what it does not cover: {}",
             durability.note
+        );
+        // FIR-2820. The half a caller keys on. Withdrawing the sentence and
+        // leaving `recorded` and a zero standing is telling a reader of the
+        // prose one thing and a reader of the fields the opposite, and the
+        // fields are what an agent branches on.
+        assert_eq!(
+            durability.state, DURABILITY_UNKNOWN,
+            "a store the working copy has outrun cannot report its work recorded"
+        );
+        assert_eq!(
+            durability.live_only_entities, None,
+            "how much of an unadmitted file is uncommitted is not derivable from a graph that \
+             never parsed it, so the number goes rather than growing"
         );
     }
 
@@ -2601,6 +3041,295 @@ mod tests {
             "the note has to keep naming what it does not cover: {}",
             durability.note
         );
+        // FIR-2820, on the second path for the same reason it is asserted on
+        // the first: this call requalifies rather than assigns, so a state that
+        // moved on one path and not the other is exactly the shape that stays
+        // green while shipping the defect.
+        assert_eq!(durability.state, DURABILITY_UNKNOWN, "{}", durability.note);
+        assert_eq!(durability.live_only_entities, None, "{}", durability.note);
+    }
+
+    /// FIR-2820. The one answer that may not take the counts still has to take
+    /// the working copy.
+    ///
+    /// `kin_graph_status` reports the graph view the daemon selected, so
+    /// borrowing `/health`'s entity count would put two authorities for one
+    /// number in one response, and the stdio path skipped the health lift
+    /// outright rather than pick. It skipped the reconcile block with it, and
+    /// published "0 uncommitted" over a working copy holding a module the graph
+    /// had never met.
+    #[test]
+    fn the_working_copy_lift_takes_the_reconcile_block_and_none_of_the_counts() {
+        let health = serde_json::json!({
+            "graph_entity_count": 900,
+            "durable_entity_count": 900,
+            "graph_generation": 77,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["linkgraph/predicates.py"],
+                "last_admission_success_at": "2026-08-27T09:00:00Z",
+            },
+        });
+        let env = Envelope::daemon()
+            .with_working_copy_health(&health)
+            .with_selected_graph_observation(6, 6, 0, 6, Some(6));
+
+        assert_eq!(
+            env.graph_state.entity_count,
+            Some(6),
+            "the selected graph's own count answers, never the health body's 900"
+        );
+        let behind = env.behind.as_ref().expect("the working copy was read");
+        assert_eq!(behind.unadmitted_paths, 1);
+        let durability = env.durability.expect("graph status reports the counts");
+        assert_eq!(
+            durability.state, DURABILITY_UNKNOWN,
+            "the reading has to move, or this lift changed nothing: {}",
+            durability.note
+        );
+        assert_eq!(durability.live_only_entities, None);
+        assert!(
+            durability
+                .note
+                .contains("host path(s) on disk that no admission has taken"),
+            "{}",
+            durability.note
+        );
+
+        // The order the stdio path does not use, asserted because either order
+        // has to reach the same reading or the fix depends on a call sequence
+        // nobody is holding still.
+        let reversed = Envelope::daemon()
+            .with_selected_graph_observation(6, 6, 0, 6, Some(6))
+            .with_working_copy_health(&health)
+            .durability
+            .expect("graph status reports the counts");
+        assert_eq!(reversed.state, DURABILITY_UNKNOWN);
+        assert_eq!(reversed.live_only_entities, None);
+    }
+
+    /// The control for the lift above: a store with nothing unadmitted keeps the
+    /// clean graph-status reading, so this cannot qualify every answer.
+    #[test]
+    fn the_working_copy_lift_leaves_a_level_store_alone() {
+        let env = Envelope::daemon()
+            .with_working_copy_health(&serde_json::json!({
+                // Stamped, which is what makes the zero an all-clear rather
+                // than a default nothing measured.
+                "reconcile": {
+                    "untracked_path_count": 0,
+                    "untracked_observed_age_seconds": 0,
+                },
+            }))
+            .with_selected_graph_observation(6, 6, 0, 6, Some(6));
+
+        assert!(env.behind.is_none(), "nothing unadmitted is nothing to say");
+        let durability = env.durability.expect("graph status reports the counts");
+        assert_eq!(durability.state, DURABILITY_RECORDED);
+        assert_eq!(durability.live_only_entities, Some(0));
+    }
+
+    /// FIR-2820, the review's second finding. A zero nobody measured is not a
+    /// zero, and the first version of this gated on the count alone.
+    ///
+    /// Two routes reach an unstamped zero on a daemon that should have measured:
+    /// a walk that errored, which is logged and swallowed so the previous
+    /// reading stands, and a daemon that has not walked yet. On both,
+    /// `kin status` correctly answered "not measured" while durability, behind
+    /// and negative on the same daemon at the same instant answered
+    /// "0 uncommitted", `recorded` and `authoritative`. That is the ticket's own
+    /// two-readers-disagreeing shape, inverted: the field existed and three of
+    /// its four readers ignored it.
+    #[test]
+    fn an_unmeasured_working_copy_is_a_disclosure_rather_than_a_zero() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": { "untracked_path_count": 0 },
+        }));
+
+        let behind = env
+            .behind
+            .as_ref()
+            .expect("a zero with no measurement behind it is a disclosure");
+        assert!(behind.unmeasured());
+        assert_eq!(behind.measured_age_seconds, None);
+        assert!(
+            behind.limiting_factor().contains("working_copy_unmeasured"),
+            "an unmeasured reading must not borrow the behind-by-a-count words, which send a \
+             reader to `kin admit` for a path that does not exist: {}",
+            behind.limiting_factor()
+        );
+
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(
+            durability.state, DURABILITY_UNKNOWN,
+            "a working copy nobody measured cannot report its work recorded: {}",
+            durability.note
+        );
+        assert_eq!(durability.live_only_entities, None);
+        assert!(
+            durability
+                .note
+                .contains("nothing has measured this working copy"),
+            "{}",
+            durability.note
+        );
+    }
+
+    /// The predicate reads both halves, and this asserts the predicate rather
+    /// than the producer's invariant.
+    ///
+    /// `from_health` never emits a stamped zero, so within that one producer the
+    /// count would be discriminator enough and the `measured` half of the
+    /// conjunct would be a clause no mutation could kill. The clause is there
+    /// for a caller that builds one of these itself, and a check that cannot
+    /// fail is worth nothing, so the object is built here by hand.
+    #[test]
+    fn a_stamped_zero_is_not_the_unmeasured_shape() {
+        let stamped = GraphBehind {
+            unadmitted_paths: 0,
+            since: None,
+            sample: Vec::new(),
+            measured_age_seconds: Some(9),
+            measured: true,
+            note: String::new(),
+        };
+        assert!(
+            !stamped.unmeasured(),
+            "a walk ran and found nothing, which is an all-clear and not an absence of one"
+        );
+
+        let unstamped = GraphBehind {
+            measured_age_seconds: None,
+            measured: false,
+            ..stamped.clone()
+        };
+        assert!(
+            unstamped.unmeasured(),
+            "the same zero with nothing behind it is the disclosure"
+        );
+
+        let counted = GraphBehind {
+            unadmitted_paths: 3,
+            measured_age_seconds: None,
+            measured: false,
+            ..stamped
+        };
+        assert!(
+            !counted.unmeasured(),
+            "a count with no stamp is still a count, and `kin admit` is still the remedy"
+        );
+    }
+
+    /// FIR-2820, the delta review's finding 12. The disclosure has to be honest
+    /// on the wire, not only in Rust.
+    ///
+    /// The unmeasured shape reaches a machine consumer as `unadmitted_paths: 0`,
+    /// which is the exact number it exists to say means nothing, and the only
+    /// other tell was the ABSENCE of `measured_age_seconds`, which
+    /// `skip_serializing_if` drops. Inferring from an absence is what this whole
+    /// ticket is about, so the block states it positively and the serialized
+    /// form is what this test reads.
+    #[test]
+    fn the_serialized_behind_block_says_whether_anything_measured_it() {
+        let unmeasured = GraphBehind::from_health(&serde_json::json!({
+            "reconcile": { "untracked_path_count": 0 },
+        }))
+        .expect("an unstamped zero is a disclosure");
+        let wire = serde_json::to_value(&unmeasured).expect("the block serializes");
+        assert_eq!(
+            wire.get("measured"),
+            Some(&serde_json::json!(false)),
+            "a consumer branching on the count alone reads 0 here: {wire}"
+        );
+        assert_eq!(
+            wire.get("unadmitted_paths"),
+            Some(&serde_json::json!(0)),
+            "and that zero is still what it reads, which is why the flag is beside it: {wire}"
+        );
+        assert!(
+            wire.get("measured_age_seconds").is_none(),
+            "the age is absent on this shape, which is the inference the flag replaces: {wire}"
+        );
+
+        let measured = GraphBehind::from_health(&serde_json::json!({
+            "reconcile": {
+                "untracked_path_count": 2,
+                "untracked_observed_age_seconds": 4,
+            },
+        }))
+        .expect("a nonzero count is a disclosure");
+        let wire = serde_json::to_value(&measured).expect("the block serializes");
+        assert_eq!(
+            wire.get("measured"),
+            Some(&serde_json::json!(true)),
+            "the control: a walk did produce this count: {wire}"
+        );
+        assert_eq!(
+            wire.get("measured_age_seconds"),
+            Some(&serde_json::json!(4))
+        );
+    }
+
+    /// The control that keeps the gate above from firing on every daemon whose
+    /// graph is its own write authority.
+    ///
+    /// Filesystem ingestion off means nothing on disk is ever admitted, so host
+    /// content is not a gap the graph failed to close and there is no walk to
+    /// miss. Gating on the stamp alone would turn every such daemon into a
+    /// permanent disclosure, which is why the daemon names this case rather than
+    /// leaving the envelope to infer it.
+    #[test]
+    fn a_daemon_that_admits_nothing_from_the_filesystem_stays_silent() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observation_not_applicable": true,
+            },
+        }));
+
+        assert!(
+            env.behind.is_none(),
+            "a projected checkout is not evidence about what the graph failed to admit: {:?}",
+            env.behind
+        );
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(durability.state, DURABILITY_RECORDED);
+        assert_eq!(durability.live_only_entities, Some(0));
+    }
+
+    /// The note the fields withdrew must not survive in the sentence.
+    ///
+    /// FIR-2499 withdrew the prose and left the fields; the first version of
+    /// this fix withdrew the fields and left the prose, composing its own lead
+    /// out of `live_only_entities` one statement before setting it to `None`. A
+    /// stranger grepping the payload for "0 uncommitted" over an unadmitted
+    /// module still found it.
+    #[test]
+    fn a_qualified_durability_note_states_no_uncommitted_count() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 6,
+            "durable_entity_count": 6,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["linkgraph/predicates.py"],
+                "untracked_observed_age_seconds": 0,
+            },
+        }));
+        let durability = env.durability.expect("the counts still answer");
+        assert!(
+            !durability.note.contains("uncommitted"),
+            "the field is gone and the sentence has to go with it: {}",
+            durability.note
+        );
+        assert!(
+            durability.note.contains("6 entities answered here"),
+            "the live count is a fact and stays: {}",
+            durability.note
+        );
     }
 
     /// The control for the case above, and the one that keeps this from
@@ -2611,7 +3340,12 @@ mod tests {
         let env = Envelope::daemon().with_health(&serde_json::json!({
             "graph_entity_count": 51,
             "durable_entity_count": 51,
-            "reconcile": { "untracked_path_count": 0 },
+            // Stamped: a measured zero is the all-clear, an unstamped one is the
+            // disclosure the test below this asserts.
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 3,
+            },
         }));
 
         assert!(env.behind.is_none(), "nothing unadmitted is nothing to say");
@@ -3226,6 +3960,46 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("response_bounded")));
+
+        let ContentBlock::Text { text } = annotated.content.first().unwrap();
+        let final_payload: Value = serde_json::from_str(text).unwrap();
+        let final_chars = crate::budget::measure(&final_payload);
+        assert_eq!(
+            envelope["response"]["chars_after_budget"],
+            json!(final_chars),
+            "accounting is measured after the downgrade and every disclosure: {final_payload}"
+        );
+        let residual = final_payload
+            .get("degradations")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.get("reason").and_then(Value::as_str)
+                        == Some(crate::budget::OVER_BUDGET_REASON)
+                })
+            });
+        assert!(
+            final_chars <= budget.max_chars || residual,
+            "a response over the caller ceiling must disclose the residual: {final_payload}"
+        );
+        assert_eq!(
+            final_payload[ENVELOPE_KEY]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .matches("response_bounded:")
+                .count(),
+            1,
+            "reconciliation must not repeat the verdict factor"
+        );
+        assert_eq!(
+            final_payload[crate::negative::NEGATIVE_KEY]["trust_reason"]
+                .as_str()
+                .unwrap()
+                .matches("response_bounded:")
+                .count(),
+            1,
+            "reconciliation must not repeat the negative reason"
+        );
     }
 
     /// One shape, but not one substrate. A ranked answer depends on embeddings
@@ -3740,6 +4514,231 @@ mod tests {
             "an unobserved flag is absent from the wire, not false: {json}"
         );
     }
+
+    /// FIR-2829: replay-version agreement stays silent and every version gap
+    /// becomes a degraded signal that reaches completeness and negative trust.
+    #[test]
+    fn a_hydration_semantics_gap_becomes_a_degraded_signal_and_agreement_does_not() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let current = HydrationStanding::Current { version: 10 };
+        let whole = Envelope::daemon().with_hydration_semantics_observation(Some(&current));
+        assert_eq!(whole.degraded.hydration_semantics_stale, None);
+        assert!(!whole.degraded.any());
+        assert!(!serde_json::to_string(&whole.degraded)
+            .expect("degraded serializes")
+            .contains("hydration_semantics_stale"));
+
+        for standing in [
+            HydrationStanding::Behind {
+                created_under: 9,
+                derives: 10,
+            },
+            HydrationStanding::Ahead {
+                created_under: 11,
+                derives: 10,
+            },
+            HydrationStanding::Unstamped { derives: 10 },
+            HydrationStanding::Unreadable {
+                reason: "truncated".to_string(),
+                derives: 10,
+            },
+        ] {
+            let flagged = Envelope::daemon().with_hydration_semantics_observation(Some(&standing));
+            assert_eq!(flagged.degraded.hydration_semantics_stale, Some(true));
+            assert!(flagged.degraded.any());
+            assert!(flagged
+                .degraded
+                .active_labels()
+                .contains(&"hydration_semantics_stale"));
+            let (trusted, reason) = flagged.negative_trust(NegativeClass::Semantic);
+            assert!(!trusted);
+            assert!(reason.contains("degraded"), "{reason}");
+
+            let selected = flagged.with_selected_graph_observation(4, 4, 0, 4, Some(4));
+            assert_eq!(
+                selected.degraded.hydration_semantics_stale,
+                Some(true),
+                "a store-wide creation-version gap must survive selected-graph qualification"
+            );
+        }
+
+        let outside = Envelope::daemon().with_hydration_semantics_observation(None);
+        assert_eq!(outside.degraded.hydration_semantics_stale, None);
+    }
+
+    /// The four gaps need four different actions and only one of them is safe to
+    /// re-ingest directly, so the wire has to separate them. Each arm asserts
+    /// the exact projection rather than "some observation is present", because a
+    /// builder that stamped every store `behind` would satisfy the weaker check
+    /// and mislead the agent in exactly the direction that destroys a store.
+    #[test]
+    fn every_standing_projects_its_own_direction_versions_and_safe_action() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let observed = |standing: &HydrationStanding| {
+            Envelope::daemon()
+                .with_hydration_semantics_observation(Some(standing))
+                .hydration_semantics
+                .expect("an observed comparison publishes an observation")
+        };
+
+        let current = observed(&HydrationStanding::Current { version: 10 });
+        assert_eq!(current.standing, "current");
+        assert_eq!(current.created_under, Some(10));
+        assert_eq!(current.derives, 10);
+        assert_eq!(current.reason, None);
+        assert_eq!(
+            current.remedy, None,
+            "a current store has nothing to do, and advice on it would send a reader to re-ingest \
+             a healthy store"
+        );
+
+        let behind = observed(&HydrationStanding::Behind {
+            created_under: 9,
+            derives: 10,
+        });
+        assert_eq!(behind.standing, "behind");
+        assert_eq!(behind.created_under, Some(9));
+        assert_eq!(behind.derives, 10);
+        assert_eq!(
+            behind.remedy,
+            HydrationStanding::Behind {
+                created_under: 9,
+                derives: 10
+            }
+            .remedy(),
+            "the projection must carry the core remedy, not a second copy of the advice"
+        );
+
+        let ahead = observed(&HydrationStanding::Ahead {
+            created_under: 11,
+            derives: 10,
+        });
+        assert_eq!(ahead.standing, "ahead");
+        assert_eq!(ahead.created_under, Some(11));
+        assert_eq!(ahead.derives, 10);
+        assert!(
+            ahead.created_under > Some(ahead.derives),
+            "ahead must read as the store being newer than the build"
+        );
+        assert_ne!(
+            ahead.remedy, behind.remedy,
+            "ahead and behind must not share advice: re-ingesting an ahead store with this older \
+             build overwrites a store this build cannot author"
+        );
+
+        let unstamped = observed(&HydrationStanding::Unstamped { derives: 10 });
+        assert_eq!(unstamped.standing, "unstamped");
+        assert_eq!(
+            unstamped.created_under, None,
+            "an unstamped store has no recorded version, and inventing one would be a fabricated \
+             comparison"
+        );
+        assert_eq!(unstamped.reason, None);
+        assert_eq!(unstamped.derives, 10);
+
+        let unreadable = observed(&HydrationStanding::Unreadable {
+            reason: "schema kin.hydration-semantics.v2 is not v1".to_string(),
+            derives: 10,
+        });
+        assert_eq!(unreadable.standing, "unreadable");
+        assert_eq!(unreadable.created_under, None);
+        assert_eq!(
+            unreadable.reason.as_deref(),
+            Some("schema kin.hydration-semantics.v2 is not v1")
+        );
+        assert_eq!(
+            unreadable.remedy, unstamped.remedy,
+            "both unknown-direction cases carry the same upgrade-first advice"
+        );
+
+        // Outside a repository nothing was compared, so the envelope makes no
+        // claim rather than manufacturing a current reading.
+        assert_eq!(
+            Envelope::daemon()
+                .with_hydration_semantics_observation(None)
+                .hydration_semantics,
+            None
+        );
+    }
+
+    /// Graph status rebuilds selected-graph health and discards HEAD-only flags.
+    /// The creation record is store-wide, so it has to survive that pass. The
+    /// compatibility flag already did; the structured observation is the half an
+    /// agent acts on and would have been silently erased.
+    #[test]
+    fn the_structured_observation_survives_selected_graph_requalification() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let standing = HydrationStanding::Ahead {
+            created_under: 11,
+            derives: 10,
+        };
+        let selected = Envelope::daemon()
+            .with_hydration_semantics_observation(Some(&standing))
+            .with_selected_graph_observation(4, 4, 0, 4, Some(4));
+
+        let observation = selected
+            .hydration_semantics
+            .as_ref()
+            .expect("selected-graph status must keep the store-wide observation");
+        assert_eq!(observation.standing, "ahead");
+        assert_eq!(observation.created_under, Some(11));
+        assert_eq!(observation.remedy, standing.remedy());
+        assert_eq!(selected.degraded.hydration_semantics_stale, Some(true));
+    }
+
+    /// The observation is disclosure and the flag is the verdict input. A
+    /// serialized response has to carry both under the names consumers read, and
+    /// a current store must not carry the deprecated boolean at all.
+    #[test]
+    fn the_observation_and_the_compatibility_flag_serialize_under_their_own_names() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let gap = serde_json::to_value(Envelope::daemon().with_hydration_semantics_observation(
+            Some(&HydrationStanding::Unreadable {
+                reason: "truncated".to_string(),
+                derives: 10,
+            }),
+        ))
+        .expect("the envelope serializes");
+        assert_eq!(gap["hydration_semantics"]["standing"], "unreadable");
+        assert_eq!(gap["hydration_semantics"]["derives"], 10);
+        assert_eq!(gap["hydration_semantics"]["reason"], "truncated");
+        assert!(
+            gap["hydration_semantics"].get("created_under").is_none(),
+            "an absent version must be absent from the wire, not null: {gap}"
+        );
+        assert_eq!(gap["degraded"]["hydration_semantics_stale"], true);
+
+        let current = serde_json::to_value(
+            Envelope::daemon().with_hydration_semantics_observation(Some(
+                &HydrationStanding::Current { version: 10 },
+            )),
+        )
+        .expect("the envelope serializes");
+        assert_eq!(current["hydration_semantics"]["standing"], "current");
+        assert_eq!(current["hydration_semantics"]["created_under"], 10);
+        assert!(
+            current["hydration_semantics"].get("remedy").is_none(),
+            "a current store must publish no remedy: {current}"
+        );
+        assert!(
+            current["degraded"]
+                .get("hydration_semantics_stale")
+                .is_none(),
+            "a current store must not carry the gap flag: {current}"
+        );
+
+        let outside =
+            serde_json::to_value(Envelope::daemon().with_hydration_semantics_observation(None))
+                .expect("the envelope serializes");
+        assert!(
+            outside.get("hydration_semantics").is_none(),
+            "a call that compared nothing must claim nothing: {outside}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3817,6 +4816,42 @@ mod self_check_tests {
         assert!(
             value["_kin"].get("self_check").is_none(),
             "an agreeing response disclosed a contradiction: {value}"
+        );
+    }
+
+    #[test]
+    fn response_accounting_includes_the_final_self_check_and_residual_state() {
+        let mut value = agreeing();
+        value["references"] = json!([{"name": "one surviving answer"}]);
+        value["_kin"]["completeness"]["status"] = json!("unknown");
+        value["_kin"]["completeness"]["bound"] = json!("at_least");
+        let budget = ResponseBudget {
+            max_chars: crate::budget::measure(&value) + 100,
+            compact: false,
+            ..ResponseBudget::default()
+        };
+
+        apply_response_budget(&mut value, "find_references", &budget);
+
+        assert_eq!(value["_kin"]["self_check"]["status"], "contradicted");
+        let final_chars = crate::budget::measure(&value);
+        assert_eq!(
+            value["_kin"]["response"]["chars_after_budget"],
+            json!(final_chars),
+            "the self-check is part of the bytes the accounting reports: {value}"
+        );
+        let residual = value
+            .get("degradations")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.get("reason").and_then(Value::as_str)
+                        == Some(crate::budget::OVER_BUDGET_REASON)
+                })
+            });
+        assert!(
+            final_chars <= budget.max_chars || residual,
+            "post-budget self-check growth must fit or disclose: {value}"
         );
     }
 }

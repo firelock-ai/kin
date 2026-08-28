@@ -397,9 +397,9 @@ fn registered_tools() -> ToolsListResult {
                             "items": { "type": "string" },
                             "description": "Optional additional query variants for multi-query fan-out. When present, `query` plus each variant are retrieved independently and their rankings RRF-fused into one deduped result. The response echoes the fan-out once under `queries`, and each hit's `matched_variant_indexes` gives the positions in that list of the variants that surfaced it. Diverse variants (identifiers, behavior, subsystem) recover more relevant hits than any single phrasing. Requires the fused pipeline (automatic when set)."
                         },
-                        "limit": { "type": "integer", "description": "Max ranked entities per page (page size). Default 20.", "default": 20 },
-                        "page_size": { "type": "integer", "description": "Entities per page; overrides `limit` for paging when set." },
-                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`: returns the NEXT page of ranked entities from the cached ranking with no re-search. Omit for a fresh query." },
+                        "limit": { "type": "integer", "minimum": 1, "description": "Max ranked primary rows per page: entities at entity granularity, files at file granularity. Default 20.", "default": 20 },
+                        "page_size": { "type": "integer", "minimum": 1, "description": "Primary rows per page; overrides `limit` for paging when set." },
+                        "cursor": { "type": "string", "description": "Opaque cursor from a prior result's `next_cursor`: returns the NEXT absolute page of the same ranked entity or file collection from cache with no re-search. Omit for a fresh query." },
                         "granularity": {
                             "type": "string",
                             "enum": ["file", "entity"],
@@ -432,7 +432,10 @@ fn registered_tools() -> ToolsListResult {
                             "default": false
                         }
                     },
-                    "required": ["query"]
+                    "anyOf": [
+                        { "required": ["query"] },
+                        { "required": ["cursor"] }
+                    ]
                 }),
             },
             ToolDefinition {
@@ -1505,6 +1508,7 @@ pub fn context_bench_tool_names() -> &'static [&'static str] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::BTreeSet;
 
     /// Every budget number a tool advertises has to be the number the budget
@@ -1569,6 +1573,38 @@ mod tests {
         for tool in &list.tools {
             assert!(!tool.name.is_empty());
             assert!(!tool.description.is_empty());
+        }
+    }
+
+    #[test]
+    fn semantic_locate_schema_accepts_a_query_or_a_cursor() {
+        let tools = tool_definitions();
+        let schema = &tools
+            .tools
+            .iter()
+            .find(|tool| tool.name == "semantic_locate")
+            .expect("semantic_locate is registered")
+            .input_schema;
+        assert!(
+            schema.get("required").is_none(),
+            "query cannot remain unconditionally required when cursor-only paging is documented: {schema}"
+        );
+        let alternatives = schema["anyOf"]
+            .as_array()
+            .expect("semantic_locate declares query-or-cursor alternatives");
+        let required = alternatives
+            .iter()
+            .filter_map(|alternative| alternative["required"].as_array())
+            .filter_map(|items| items.first())
+            .filter_map(serde_json::Value::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(required, BTreeSet::from(["cursor", "query"]));
+        for field in ["limit", "page_size"] {
+            assert_eq!(
+                schema["properties"][field]["minimum"],
+                json!(1),
+                "semantic_locate must advertise the positive width its endpoint enforces"
+            );
         }
     }
 

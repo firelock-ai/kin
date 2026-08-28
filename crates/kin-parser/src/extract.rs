@@ -399,24 +399,39 @@ pub fn attach_file_context_metadata(
 ///
 /// This is the parse side of reference-edge completeness. It is written where
 /// extraction already holds both numbers, so no surface has to re-parse to say
-/// how much of the relation graph resolved. A file whose parser recovery
-/// omitted calls records no call-site count rather than a count it cannot
-/// stand behind, and a reader treats an absent count as unmeasured rather than
-/// as zero.
+/// how much of the relation graph resolved. The call side comes from the
+/// adapter's own census when it took one, which counts every call site the file
+/// holds and not only the ones extraction could represent; where no census was
+/// taken the emitted relations are the count, and a file whose extraction was
+/// incomplete records no count at all, which a reader treats as unmeasured
+/// rather than as zero.
 pub fn attach_file_reference_parse_counts(
     entities: &mut [Entity],
     relations: &[ExtractedRelation],
     imports: &[FileImport],
+    parsed_call_sites: Option<u64>,
 ) {
     if entities.is_empty() {
         return;
     }
 
     let call_extraction_complete = !relations.iter().any(is_call_extraction_incomplete_marker);
-    let call_sites = relations
+    let representable_call_sites = relations
         .iter()
         .filter(|relation| relation.kind == RelationKind::Calls)
-        .count();
+        .count() as u64;
+    // An adapter that censused its call sites reports every one it read, so the
+    // count stands whether or not extraction could represent them all: it is
+    // the file's whole call side, and the sites that reached no relation are
+    // the difference a reader is entitled to see. Without a census the
+    // relations are all there is, and a file whose extraction was incomplete
+    // records no count at all rather than one it cannot stand behind, because a
+    // short count subtracts to zero and reads as a fully accounted file.
+    let call_sites = match parsed_call_sites {
+        Some(census) => Some(census),
+        None if call_extraction_complete => Some(representable_call_sites),
+        None => None,
+    };
     let import_statements = imports.len();
     let external_module_imports = imports
         .iter()
@@ -424,13 +439,16 @@ pub fn attach_file_reference_parse_counts(
         .count();
 
     for entity in entities {
-        if call_extraction_complete {
-            entity.metadata.extra.insert(
-                FILE_PARSED_CALL_SITES_KEY.into(),
-                serde_json::Value::from(call_sites),
-            );
-        } else {
-            entity.metadata.extra.remove(FILE_PARSED_CALL_SITES_KEY);
+        match call_sites {
+            Some(count) => {
+                entity.metadata.extra.insert(
+                    FILE_PARSED_CALL_SITES_KEY.into(),
+                    serde_json::Value::from(count),
+                );
+            }
+            None => {
+                entity.metadata.extra.remove(FILE_PARSED_CALL_SITES_KEY);
+            }
         }
         entity.metadata.extra.insert(
             FILE_PARSED_IMPORT_STATEMENTS_KEY.into(),
@@ -658,6 +676,21 @@ pub struct ParseOutput {
     /// Test functions discovered in this file.
     pub tests: Vec<ExtractedTest>,
     pub parse_state: ParseState,
+    /// Call sites this adapter counted in the file, including every one it
+    /// could not represent as a [`RelationKind::Calls`] relation.
+    ///
+    /// This is the denominator of reference-edge completeness, and it is
+    /// counted rather than derived from the relations because the two differ
+    /// exactly where the answer matters. A subscript or otherwise unnamed
+    /// callee, and a call written where no callable entity owns the edge,
+    /// produce no relation at all, so a denominator taken off the relations
+    /// understates the file and the shortfall it is subtracted from reads as
+    /// zero: a file the graph holds no edge for reports as fully accounted.
+    ///
+    /// `None` from an adapter that does not census its call sites. The
+    /// relations it emitted are the count then, which is the same number
+    /// whenever every call site became one.
+    pub parsed_call_sites: Option<u64>,
 }
 
 #[cfg(test)]
@@ -820,7 +853,7 @@ mod tests {
             import("@scope/thing"),
             import("#internal/shim"),
         ];
-        attach_file_reference_parse_counts(&mut entities, &[], &imports);
+        attach_file_reference_parse_counts(&mut entities, &[], &imports, None);
 
         let extra = &entities[0].metadata.extra;
         assert_eq!(
@@ -847,7 +880,12 @@ mod tests {
         let mut entity = test_entity("app/parsing.py");
         entity.language = LanguageId::Python;
         let mut entities = vec![entity];
-        attach_file_reference_parse_counts(&mut entities, &[], &[import("os"), import("helpers")]);
+        attach_file_reference_parse_counts(
+            &mut entities,
+            &[],
+            &[import("os"), import("helpers")],
+            None,
+        );
 
         let extra = &entities[0].metadata.extra;
         assert_eq!(

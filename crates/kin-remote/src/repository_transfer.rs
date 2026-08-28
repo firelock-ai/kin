@@ -1156,13 +1156,24 @@ fn resolved_tree_body_identities(tree: &kin_model::ResolvedTree) -> Result<BTree
     Ok(identities)
 }
 
-/// Apply a received pack under the ceilings this receiver actually enforces.
+/// Apply a received pack with no admission-provenance policy.
 ///
-/// `limits` is the receiver's EFFECTIVE bound: its configured limits bounded by
-/// whatever the peer advertised. Passing `RepositoryTransferLimits::default()`
-/// is the compiled behaviour and is what a caller with no deployment
-/// configuration should send.
-pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
+/// Crate-visible on purpose. A receiver that owns local state derived from the
+/// history it is admitting has a policy to run at the commit boundary, and the
+/// hydration-semantics creation record is exactly that: the wire carries no
+/// authoring version, so a local receiver has to discard its own creation stamp
+/// before the transported history becomes visible. Leaving a policy-free entry
+/// point reachable from another crate is how that step gets skipped by a path
+/// nobody remembered to route. Out-of-crate callers take
+/// [`apply_repository_transfer_pack_with_pre_commit`] and say what their policy
+/// is, including when it is nothing.
+///
+/// Test-only, because after the daemon and the negotiation convenience both
+/// state their policy there is no production caller left. Keeping it compiled
+/// into the product would leave a policy-free admission one `use` away from
+/// being reachable again.
+#[cfg(test)]
+pub(crate) fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     expected_repository_id: &RepositoryId,
     expected_destination_ref: &RefName,
@@ -1170,6 +1181,50 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     pack: &RepositoryTransferPack,
     limits: &RepositoryTransferLimits,
 ) -> Result<RepositoryTransferReceipt> {
+    apply_repository_transfer_pack_with_pre_commit(
+        authority,
+        expected_repository_id,
+        expected_destination_ref,
+        actor,
+        pack,
+        limits,
+        || Ok(()),
+    )
+}
+
+/// Apply a received pack under the ceilings this receiver actually enforces,
+/// running `before_authority_commit` at the commit boundary.
+///
+/// `limits` is the receiver's EFFECTIVE bound: its configured limits bounded by
+/// whatever the peer advertised. Passing `RepositoryTransferLimits::default()`
+/// is the compiled behaviour and is what a caller with no deployment
+/// configuration should send.
+///
+/// `before_authority_commit` runs exactly once, after every validation and
+/// after the immutable CAS prewrites, immediately before the authority
+/// transaction. That position is the whole point of the hook. Earlier would
+/// degrade local state over a pack this receiver then refuses; later reopens the
+/// crash window where transported history is durable and the receiver still
+/// describes itself by a record that no longer speaks for its contents. Its
+/// failure is returned as [`RepositoryTransferError::Storage`] and the commit is
+/// not started.
+///
+/// It does not run on an idempotent replay. A replay of a transfer this code
+/// committed already ran the policy before that original commit, and running it
+/// again would mutate local state for a transfer that moves nothing.
+pub fn apply_repository_transfer_pack_with_pre_commit<B, P>(
+    authority: &RepositoryAuthorityManager<B>,
+    expected_repository_id: &RepositoryId,
+    expected_destination_ref: &RefName,
+    actor: AuthorId,
+    pack: &RepositoryTransferPack,
+    limits: &RepositoryTransferLimits,
+    before_authority_commit: P,
+) -> Result<RepositoryTransferReceipt>
+where
+    B: StorageBackend + ?Sized + 'static,
+    P: FnOnce() -> std::io::Result<()>,
+{
     validate_pack(pack, limits)?;
     if &pack.repository_id != expected_repository_id {
         return Err(invalid(format!(
@@ -1288,6 +1343,12 @@ pub fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     for (hash, bytes) in decoded {
         authority.save_source_blob(hash, &bytes).map_err(storage)?;
     }
+    // The receiver's admission-provenance policy, at the last point before this
+    // history becomes visible and after everything that could still refuse the
+    // pack. A failure here returns without starting the commit, so the receiver
+    // is never left describing history it now holds by a record that predates
+    // it.
+    before_authority_commit().map_err(storage)?;
     let receipt = authority
         .commit_repository_transaction(transaction)
         .map_err(repository_commit)?;
@@ -4255,5 +4316,193 @@ mod tests {
             build_repository_transfer_pack(&fixture.source, &fixture.main, &non_fast_forward)
                 .unwrap_err();
         assert!(error.to_string().contains(FEATURE_RAW_REPOSITORY_PATHS));
+    }
+
+    /// The pre-commit hook's whole reason to exist sits at one instruction
+    /// boundary, so these four arms fix it there: it runs once, after the last
+    /// refusal, before the commit, and never on a replay.
+    mod admission_provenance_policy {
+        use super::*;
+        use std::cell::Cell;
+
+        /// What the receiver could observe about its own authority before and
+        /// after, so an arm can assert nothing moved without listing the fields
+        /// at every call site.
+        #[derive(Debug, PartialEq)]
+        struct AuthorityShape {
+            generation: u64,
+            roots: RootBundle,
+            default_ref: Option<RefName>,
+            refs: Vec<(RefName, Option<RefTarget>)>,
+            receipts: usize,
+        }
+
+        fn shape_of<B: StorageBackend + ?Sized + 'static>(
+            authority: &RepositoryAuthorityManager<B>,
+        ) -> AuthorityShape {
+            let lease = authority.read_authority();
+            let metadata = lease.authority_metadata();
+            AuthorityShape {
+                generation: lease.roots().generation,
+                roots: lease.roots().clone(),
+                default_ref: metadata.ref_state.default_ref.clone(),
+                refs: metadata
+                    .ref_state
+                    .refs
+                    .iter()
+                    .map(|entry| (entry.name.clone(), Some(entry.target.clone())))
+                    .collect(),
+                receipts: metadata.receipts.len(),
+            }
+        }
+
+        /// A policy failure must cost the receiver nothing. If the commit ran
+        /// anyway, the receiver would hold transported history while its local
+        /// record still described only its own creation, which is the exact
+        /// false all-clear the hook exists to end.
+        #[test]
+        fn a_failing_policy_returns_its_error_and_moves_no_authority() {
+            let fixture = fixture();
+            let before = shape_of(&fixture.destination);
+
+            let error = apply_repository_transfer_pack_with_pre_commit(
+                &fixture.destination,
+                &fixture.repository_id,
+                &fixture.main,
+                AuthorId::new("policy-test"),
+                &fixture.pack,
+                &RepositoryTransferLimits::default(),
+                || Err(std::io::Error::other("sentinel policy refusal")),
+            )
+            .expect_err("a refused policy admitted the pack");
+
+            assert!(
+                matches!(error, RepositoryTransferError::Storage(_)),
+                "a policy failure is a storage failure: {error:?}"
+            );
+            assert!(
+                error.to_string().contains("sentinel policy refusal"),
+                "the receiver's own refusal must survive to the caller: {error}"
+            );
+            assert_eq!(
+                shape_of(&fixture.destination),
+                before,
+                "a refused policy still advanced authority"
+            );
+        }
+
+        /// The ordering the crash table rests on: the policy runs before the
+        /// generation moves, so any visible admitted history was preceded by a
+        /// durable policy step.
+        #[test]
+        fn a_committed_pack_runs_the_policy_exactly_once_and_before_the_commit() {
+            let fixture = fixture();
+            let before = shape_of(&fixture.destination);
+            let calls = Cell::new(0u32);
+            let generation_at_policy = Cell::new(u64::MAX);
+
+            let receipt = apply_repository_transfer_pack_with_pre_commit(
+                &fixture.destination,
+                &fixture.repository_id,
+                &fixture.main,
+                AuthorId::new("policy-test"),
+                &fixture.pack,
+                &RepositoryTransferLimits::default(),
+                || {
+                    calls.set(calls.get() + 1);
+                    generation_at_policy
+                        .set(fixture.destination.read_authority().roots().generation);
+                    Ok(())
+                },
+            )
+            .expect("a valid pack with a passing policy");
+
+            assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+            assert_eq!(calls.get(), 1, "the policy did not run exactly once");
+            assert_eq!(
+                generation_at_policy.get(),
+                before.generation,
+                "the policy observed an already-advanced generation, so it ran after the commit"
+            );
+            assert!(
+                shape_of(&fixture.destination).generation > before.generation,
+                "the commit did not advance authority"
+            );
+        }
+
+        /// A pack this receiver refuses must not move local state either. The
+        /// mirror of the arm above: running the policy early would degrade a
+        /// perfectly good store over a transfer that never happened.
+        #[test]
+        fn a_refused_pack_never_runs_the_policy() {
+            let fixture = fixture();
+            let mut wrong_repository = fixture.pack.clone();
+            wrong_repository.repository_id = RepositoryId::new("some-other-repository").unwrap();
+            let calls = Cell::new(0u32);
+
+            let error = apply_repository_transfer_pack_with_pre_commit(
+                &fixture.destination,
+                &fixture.repository_id,
+                &fixture.main,
+                AuthorId::new("policy-test"),
+                &wrong_repository,
+                &RepositoryTransferLimits::default(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect_err("a pack for another repository was admitted");
+
+            assert!(
+                matches!(error, RepositoryTransferError::Invalid(_)),
+                "expected the identity refusal: {error:?}"
+            );
+            assert_eq!(calls.get(), 0, "the policy ran for a refused pack");
+        }
+
+        /// A replay moves nothing, so it must not re-run the policy. The
+        /// original commit already ran it, and a second run would mutate local
+        /// state for a transfer that changed no history.
+        #[test]
+        fn an_idempotent_replay_never_runs_the_policy() {
+            let fixture = fixture();
+            let calls = Cell::new(0u32);
+            let receipt = apply_repository_transfer_pack_with_pre_commit(
+                &fixture.destination,
+                &fixture.repository_id,
+                &fixture.main,
+                AuthorId::new("policy-test"),
+                &fixture.pack,
+                &RepositoryTransferLimits::default(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect("the first admission");
+            assert_eq!(receipt.outcome, RepositoryTransferApplyOutcome::Committed);
+            assert_eq!(calls.get(), 1, "the first admission did not run the policy");
+
+            let replay = apply_repository_transfer_pack_with_pre_commit(
+                &fixture.destination,
+                &fixture.repository_id,
+                &fixture.main,
+                AuthorId::new("policy-test"),
+                &fixture.pack,
+                &RepositoryTransferLimits::default(),
+                || {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                },
+            )
+            .expect("the replay");
+
+            assert_eq!(
+                replay.outcome,
+                RepositoryTransferApplyOutcome::IdempotentReplay
+            );
+            assert_eq!(calls.get(), 1, "the replay re-ran the policy");
+        }
     }
 }

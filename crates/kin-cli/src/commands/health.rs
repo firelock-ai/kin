@@ -184,7 +184,13 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_setup_ledger());
     checks.push(check_editor());
     checks.push(check_kinlab_connect());
-    checks.push(check_semantic_query_readiness().await);
+    // Keep the exact coverage state beside the check that interpreted it. The
+    // host-pressure row below reads the same fact: an old embed refusal cannot
+    // describe work only after the selected graph is wholly indexed. `None`
+    // remains an unread observation and must never be treated as complete.
+    let semantic_readiness = check_semantic_query_readiness().await;
+    let embedding_coverage = semantic_readiness.embedding_coverage;
+    checks.push(semantic_readiness.check);
     // One `graph status` for the whole run, handed to every row that reads graph
     // truth. `kin graph status` is the slowest surface Kin has on a real store,
     // and it was fetched per row, so each row answering from graph truth added a
@@ -193,6 +199,7 @@ pub async fn run_health_checks() -> HealthReport {
     let graph_status = RunGraphStatus::for_run();
     checks.push(check_reference_edge_coverage(&graph_status).await);
     checks.push(check_relation_census(&graph_status).await);
+    checks.push(check_hydration_semantics());
     checks.push(check_parse_coverage(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
@@ -201,7 +208,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_daemon_kill_record());
     checks.push(check_interrupted_init());
     checks.push(check_suspended_sweep());
-    checks.push(check_host_memory_pressure());
+    checks.push(check_host_memory_pressure(embedding_coverage));
     checks.push(check_retrieval_profile());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
@@ -2910,8 +2917,27 @@ fn check_kinlab_connect() -> HealthCheck {
     }
 }
 
+/// The semantic-readiness row and the exact embedding observation it read.
+///
+/// The count stays optional because a build without vectors, a missing daemon,
+/// or a failed resources request observed no backlog at all. That state must
+/// preserve a durable refusal rather than laundering "unknown" into zero.
+struct SemanticQueryReadinessSample {
+    check: HealthCheck,
+    embedding_coverage: Option<kin_core::memory_pressure::EmbeddingCoverage>,
+}
+
+impl From<HealthCheck> for SemanticQueryReadinessSample {
+    fn from(check: HealthCheck) -> Self {
+        Self {
+            check,
+            embedding_coverage: None,
+        }
+    }
+}
+
 #[cfg(not(feature = "vector"))]
-async fn check_semantic_query_readiness() -> HealthCheck {
+async fn check_semantic_query_readiness() -> SemanticQueryReadinessSample {
     HealthCheck::new(
         "semantic_query_readiness",
         "Semantic query readiness",
@@ -2919,6 +2945,7 @@ async fn check_semantic_query_readiness() -> HealthCheck {
         "semantic vector ranking is not included in this build; lexical and graph queries remain available",
     )
     .with_platform_note("this platform ships the supported vector-free Kin runtime")
+    .into()
 }
 
 /// Render the daemon's background-work disclosure as a health check.
@@ -3625,7 +3652,7 @@ fn semantic_query_health_from_runtime(
 }
 
 #[cfg(feature = "vector")]
-async fn check_semantic_query_readiness() -> HealthCheck {
+async fn check_semantic_query_readiness() -> SemanticQueryReadinessSample {
     let cwd = env::current_dir().unwrap_or_default();
     let layout = match kin_core::KinLayout::discover(&cwd) {
         Some(l) => l,
@@ -3635,13 +3662,14 @@ async fn check_semantic_query_readiness() -> HealthCheck {
                 "Semantic query readiness",
                 HealthStatus::Unsupported,
                 "n/a — not in a Kin repository",
-            );
+            )
+            .into();
         }
     };
 
     let daemon_url = crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await;
     let Some(daemon_url) = daemon_url else {
-        return semantic_query_readiness_without_a_daemon();
+        return semantic_query_readiness_without_a_daemon().into();
     };
 
     let client = match crate::daemon_client::DaemonClient::from_base_url_for_layout(
@@ -3656,7 +3684,8 @@ async fn check_semantic_query_readiness() -> HealthCheck {
                 HealthStatus::Stale,
                 format!("daemon reachable ({daemon_url}), but its URL is invalid: {error}"),
             )
-            .with_manual_fix("run `kin status --json` and resolve the reported daemon error");
+            .with_manual_fix("run `kin status --json` and resolve the reported daemon error")
+            .into();
         }
     };
     let response = match client
@@ -3673,11 +3702,29 @@ async fn check_semantic_query_readiness() -> HealthCheck {
                     "daemon reachable ({daemon_url}), but graph embedding status is unavailable: {error}"
                 ),
             )
-            .with_manual_fix("run `kin status --json` and resolve the reported daemon error");
+            .with_manual_fix("run `kin status --json` and resolve the reported daemon error")
+            .into();
         }
     };
 
-    semantic_query_health_from_runtime(&daemon_url, &response.embed_runtime)
+    semantic_query_readiness_sample_from_runtime(&daemon_url, &response.embed_runtime)
+}
+
+/// Build the response row and retain the exact counter that response used.
+/// Kept pure so the cross-row plumbing can be graded without a live daemon.
+#[cfg(feature = "vector")]
+fn semantic_query_readiness_sample_from_runtime(
+    daemon_url: &str,
+    runtime: &crate::commands::resources::EmbedRuntimeState,
+) -> SemanticQueryReadinessSample {
+    SemanticQueryReadinessSample {
+        check: semantic_query_health_from_runtime(daemon_url, runtime),
+        embedding_coverage: Some(kin_core::memory_pressure::EmbeddingCoverage {
+            pending: runtime.embeddings_pending,
+            indexed: runtime.embeddings_indexed,
+            total: runtime.embeddings_total,
+        }),
+    }
 }
 
 /// Which wired languages have no language server on this host.
@@ -4374,7 +4421,9 @@ fn suspended_sweep_check_for(suspended: Option<&kin_daemon_spawn::SuspendedSweep
 /// suspended-sweep row are: this is the host talking, not the install, and a
 /// `kin doctor` that failed over a busy machine would be reporting the wrong
 /// defect. `Degraded` never blocks readiness.
-fn check_host_memory_pressure() -> HealthCheck {
+fn check_host_memory_pressure(
+    embedding_coverage: Option<kin_core::memory_pressure::EmbeddingCoverage>,
+) -> HealthCheck {
     const ID: &str = "host_memory_pressure";
     const LABEL: &str = "Host memory pressure";
     let cwd = env::current_dir().unwrap_or_default();
@@ -4386,15 +4435,57 @@ fn check_host_memory_pressure() -> HealthCheck {
             "not in a Kin repository, so there is no store whose work could have been held back",
         );
     };
+    let refusals = kin_core::memory_pressure::PressureRefusal::read_all(layout.root());
     host_memory_pressure_check_for(
-        kin_core::memory_pressure::PressureRefusal::read(layout.root()).as_ref(),
+        &refusals,
         kin_core::memory_pressure::DaemonFootprint::read(layout.root()).as_ref(),
+        embedding_coverage,
     )
 }
 
-/// Core of [`check_host_memory_pressure`] with both records as its input, so
-/// every branch is testable without a machine that has actually run out of
-/// memory.
+/// Whether this store's creation-time replay version matches the one this
+/// binary carries.
+///
+/// Advisory in phase one. A gap is real and deserves a red row, but it does not
+/// mean the install or daemon is broken, so [`HealthStatus::Stale`] discloses it
+/// without making the aggregate readiness result fail.
+fn check_hydration_semantics() -> HealthCheck {
+    const ID: &str = "hydration_semantics";
+    const LABEL: &str = "Hydration semantics";
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store whose replay semantics can be compared",
+        );
+    };
+    hydration_semantics_check_for(&kin_core::hydration_semantics::standing(&layout))
+}
+
+/// Core of [`check_hydration_semantics`] with the standing as input, so every
+/// comparison branch is testable without creating a repository.
+fn hydration_semantics_check_for(
+    standing: &kin_core::hydration_semantics::HydrationStanding,
+) -> HealthCheck {
+    const ID: &str = "hydration_semantics";
+    const LABEL: &str = "Hydration semantics";
+    let status = if standing.is_gap() {
+        HealthStatus::Stale
+    } else {
+        HealthStatus::Healthy
+    };
+    let check = HealthCheck::new(ID, LABEL, status, standing.sentence());
+    match standing.remedy() {
+        Some(remedy) => check.with_manual_fix(remedy),
+        None => check,
+    }
+}
+
+/// Core of [`check_host_memory_pressure`] with both records and the exact
+/// coverage observation as its inputs, so every branch is testable without a
+/// machine that has actually run out of memory.
 ///
 /// The healthy branch reports the standing rather than only the absence of a
 /// refusal. "No work has been held back" is true and unusable: a reader whose
@@ -4403,11 +4494,20 @@ fn check_host_memory_pressure() -> HealthCheck {
 /// threshold needs moving. The numbers are already published, so printing them
 /// costs nothing and turns the row from a bell into a gauge.
 fn host_memory_pressure_check_for(
-    refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+    refusals: &[kin_core::memory_pressure::PressureRefusal],
     footprint: Option<&kin_core::memory_pressure::DaemonFootprint>,
+    embedding_coverage: Option<kin_core::memory_pressure::EmbeddingCoverage>,
 ) -> HealthCheck {
     const ID: &str = "host_memory_pressure";
     const LABEL: &str = "Host memory pressure";
+    // Only an exact embedding observation can retire an old embed refusal.
+    // The core predicate deliberately preserves LSP and unknown future work,
+    // while `None` here preserves every refusal because nothing was measured.
+    let refusal = refusals.iter().rev().find(|refusal| {
+        embedding_coverage
+            .map(|coverage| refusal.describes_outstanding_work(coverage))
+            .unwrap_or(true)
+    });
     let standing = footprint.map(|footprint| {
         footprint.line(
             std::time::SystemTime::now()
@@ -8450,6 +8550,20 @@ mod tests {
         // above calls its core directly and would stay green if nobody ever
         // registered it, which is the shape of a check that cannot fail.
         assert!(json.contains("\"memory_floor\""));
+
+        // Assert against the real assembled doctor report so cross-file/LSP
+        // guidance cannot silently move behind embedding availability.
+        let position = |id: &str| {
+            report
+                .checks
+                .iter()
+                .position(|check| check.id == id)
+                .unwrap_or_else(|| panic!("doctor report omitted {id}"))
+        };
+        assert!(
+            position("reference_edge_coverage") < position("embedding_model"),
+            "doctor must explain cross-file/LSP coverage before embedding availability"
+        );
     }
 
     #[cfg(unix)]
@@ -8927,10 +9041,11 @@ mod tests {
     #[tokio::test]
     async fn vector_free_build_reports_semantic_query_as_unsupported() {
         let semantic = check_semantic_query_readiness().await;
-        assert_eq!(semantic.id, "semantic_query_readiness");
-        assert!(matches!(semantic.status, HealthStatus::Unsupported));
-        assert!(!semantic.detail.contains("kin embed"));
-        assert!(semantic.manual_fix.is_none());
+        assert_eq!(semantic.check.id, "semantic_query_readiness");
+        assert!(matches!(semantic.check.status, HealthStatus::Unsupported));
+        assert!(!semantic.check.detail.contains("kin embed"));
+        assert!(semantic.check.manual_fix.is_none());
+        assert_eq!(semantic.embedding_coverage, None);
     }
 
     #[cfg(feature = "vector")]
@@ -8943,7 +9058,16 @@ mod tests {
             ..Default::default()
         };
 
-        let semantic = semantic_query_health_from_runtime("http://daemon", &runtime);
+        let sample = semantic_query_readiness_sample_from_runtime("http://daemon", &runtime);
+        assert_eq!(
+            sample.embedding_coverage,
+            Some(kin_core::memory_pressure::EmbeddingCoverage {
+                pending: 0,
+                indexed: 41,
+                total: 41,
+            })
+        );
+        let semantic = sample.check;
 
         assert!(matches!(semantic.status, HealthStatus::Healthy));
         assert!(semantic.detail.contains("41/41 embeddings indexed"));
@@ -10496,16 +10620,16 @@ mod tests {
         );
     }
 
-    /// The row reports what the daemon declined and stays quiet otherwise, and
-    /// either way it must not change the verdict of the page.
+    /// A refusal remains visible exactly while its own work is outstanding or
+    /// the count is unknown, and it never changes the verdict of the page.
     ///
     /// The second half is the half that could break a release. `kin doctor`'s
     /// aggregate is what the install proof asserts on, so a row that flipped a
     /// healthy store to unhealthy on a busy machine would fail the gate over
     /// the host rather than over the install.
     #[test]
-    fn the_memory_pressure_row_reports_a_refusal_and_never_blocks_readiness() {
-        let quiet = host_memory_pressure_check_for(None, None);
+    fn the_memory_pressure_row_uses_exact_pending_without_muting_other_work() {
+        let quiet = host_memory_pressure_check_for(&[], None, None);
         assert!(matches!(quiet.status, HealthStatus::Healthy));
         assert!(quiet.manual_fix.is_none());
         assert!(!blocks_readiness(&quiet));
@@ -10529,7 +10653,7 @@ mod tests {
                 .map(|elapsed| elapsed.as_secs())
                 .unwrap_or_default(),
         };
-        let gauge = host_memory_pressure_check_for(None, Some(&published));
+        let gauge = host_memory_pressure_check_for(&[], Some(&published), None);
         assert!(matches!(gauge.status, HealthStatus::Healthy));
         assert!(!blocks_readiness(&gauge));
         assert!(
@@ -10538,25 +10662,159 @@ mod tests {
             gauge.detail
         );
 
-        let refusal = kin_core::memory_pressure::PressureRefusal {
-            work: "lsp-sweep".to_string(),
+        let refusal = |work: &str| kin_core::memory_pressure::PressureRefusal {
+            work: work.to_string(),
             level: "critical".to_string(),
-            reason: "host memory pressure is critical: 11.5 GiB of the 12.0 GiB this container \
-                     allows is in use, so the language-server enrichment sweep did not start."
-                .to_string(),
+            reason: format!("host memory pressure held back {work}"),
             at_unix: 4_800,
         };
-        let reported = host_memory_pressure_check_for(Some(&refusal), None);
-        assert!(matches!(reported.status, HealthStatus::Degraded));
-        assert_eq!(reported.detail, refusal.reason);
-        assert!(reported
-            .manual_fix
-            .as_deref()
-            .is_some_and(|fix| fix.contains("more memory")));
-        assert!(
-            !blocks_readiness(&reported),
-            "a busy machine is not a broken install, and this row must never fail the proof"
+        let coverage = |pending, indexed, total| kin_core::memory_pressure::EmbeddingCoverage {
+            pending,
+            indexed,
+            total,
+        };
+
+        let embed = refusal(kin_core::memory_pressure::HeavyWork::EmbedBatch.id());
+        let completed = host_memory_pressure_check_for(
+            std::slice::from_ref(&embed),
+            Some(&published),
+            Some(coverage(0, 9, 9)),
         );
+        assert!(matches!(completed.status, HealthStatus::Healthy));
+        assert!(completed.manual_fix.is_none());
+        assert!(!completed.detail.contains(&embed.reason));
+        assert!(
+            completed.detail.contains("it is allowed")
+                && completed.detail.contains("child processes"),
+            "retiring an old embed refusal must preserve the footprint gauge: {}",
+            completed.detail
+        );
+
+        let live_embed = host_memory_pressure_check_for(
+            std::slice::from_ref(&embed),
+            None,
+            Some(coverage(1, 9, 9)),
+        );
+        let queue_empty_but_short = host_memory_pressure_check_for(
+            std::slice::from_ref(&embed),
+            None,
+            Some(coverage(0, 8, 9)),
+        );
+        let unobserved_embed =
+            host_memory_pressure_check_for(std::slice::from_ref(&embed), None, None);
+        let lsp = refusal(kin_core::memory_pressure::HeavyWork::LspSweep.id());
+        let live_lsp = host_memory_pressure_check_for(
+            std::slice::from_ref(&lsp),
+            None,
+            Some(coverage(0, 9, 9)),
+        );
+        let unknown = refusal("future-heavy-work");
+        let live_unknown = host_memory_pressure_check_for(
+            std::slice::from_ref(&unknown),
+            None,
+            Some(coverage(0, 9, 9)),
+        );
+
+        for reported in [
+            &live_embed,
+            &queue_empty_but_short,
+            &unobserved_embed,
+            &live_lsp,
+            &live_unknown,
+        ] {
+            assert!(matches!(reported.status, HealthStatus::Degraded));
+            assert!(reported
+                .manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("more memory")));
+            assert!(
+                !blocks_readiness(reported),
+                "a busy machine is not a broken install, and this row must never fail the proof"
+            );
+        }
+        assert_eq!(live_embed.detail, embed.reason);
+        assert_eq!(queue_empty_but_short.detail, embed.reason);
+        assert_eq!(unobserved_embed.detail, embed.reason);
+        assert_eq!(live_lsp.detail, lsp.reason);
+        assert_eq!(live_unknown.detail, unknown.reason);
+
+        for independent in [&lsp, &unknown] {
+            for refusals in [
+                vec![(*independent).clone(), embed.clone()],
+                vec![embed.clone(), (*independent).clone()],
+            ] {
+                let reported =
+                    host_memory_pressure_check_for(&refusals, None, Some(coverage(0, 9, 9)));
+                assert!(matches!(reported.status, HealthStatus::Degraded));
+                assert_eq!(
+                    reported.detail, independent.reason,
+                    "a completed embed entry cannot mask {} in either publication order",
+                    independent.work
+                );
+                assert!(!blocks_readiness(&reported));
+            }
+        }
+    }
+
+    /// The hydration row is advisory but never vague: agreement is healthy,
+    /// every other standing is stale, and each gap keeps its direction-specific
+    /// remedy. `Stale` stays outside the aggregate readiness gate in phase one.
+    #[test]
+    fn the_hydration_semantics_row_separates_agreement_from_every_gap() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let current = hydration_semantics_check_for(&HydrationStanding::Current { version: 10 });
+        assert!(matches!(current.status, HealthStatus::Healthy));
+        assert!(current.manual_fix.is_none());
+        assert!(!blocks_readiness(&current));
+
+        let standing = HydrationStanding::Behind {
+            created_under: 9,
+            derives: 10,
+        };
+        let row = hydration_semantics_check_for(&standing);
+        assert!(matches!(row.status, HealthStatus::Stale), "{row:?}");
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("re-ingest")),
+            "a store this build can repair needs the re-ingest remedy: {row:?}"
+        );
+        assert!(
+            !blocks_readiness(&row),
+            "phase-one disclosure must not turn a legacy store into a broken install"
+        );
+
+        for standing in [
+            HydrationStanding::Unstamped { derives: 10 },
+            HydrationStanding::Unreadable {
+                reason: "future schema".to_string(),
+                derives: 10,
+            },
+        ] {
+            let unknown = hydration_semantics_check_for(&standing);
+            assert!(matches!(unknown.status, HealthStatus::Stale));
+            let fix = unknown.manual_fix.as_deref().unwrap_or_default();
+            assert!(
+                fix.starts_with("upgrade Kin before changing this store"),
+                "unknown provenance must not trigger destructive advice: {unknown:?}"
+            );
+            assert!(fix.contains("separate fresh store"));
+            assert!(!blocks_readiness(&unknown));
+        }
+
+        let ahead = hydration_semantics_check_for(&HydrationStanding::Ahead {
+            created_under: 11,
+            derives: 10,
+        });
+        assert!(matches!(ahead.status, HealthStatus::Stale));
+        let fix = ahead.manual_fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("upgrade this Kin build"), "{ahead:?}");
+        assert!(
+            !fix.contains("re-ingest the repository"),
+            "an older binary must not replace a store recorded under newer replay semantics: {ahead:?}"
+        );
+        assert!(!blocks_readiness(&ahead));
     }
 
     /// The row exists because every other row on the page reads healthy after a

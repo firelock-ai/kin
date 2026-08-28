@@ -58,9 +58,19 @@ EXPECTED_SUITES = (
         "acceptance/response_budget.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/trace_spine_clipping_repro.py",
+        "trace_spine",
+        "acceptance/trace_spine.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/parse_hole_repro.py",
         "parsehole",
         "acceptance/parsehole.json",
+    ),
+    ExpectedSuite(
+        "scripts/acceptance/hydration_semantics_repro.py",
+        "hydration_semantics",
+        "acceptance/hydration_semantics.json",
     ),
     ExpectedSuite(
         "scripts/acceptance/same_owner_call_repro.py",
@@ -106,6 +116,11 @@ EXPECTED_SUITES = (
         "scripts/acceptance/verdict_limits_repro.py",
         "verdict_limits",
         "acceptance/verdict_limits.json",
+    ),
+    ExpectedSuite(
+        "scripts/acceptance/working_copy_freshness_repro.py",
+        "working_copy_freshness",
+        "acceptance/working_copy_freshness.json",
     ),
 )
 
@@ -1002,8 +1017,12 @@ def main() -> int:
         print("VIOLATION: %s" % problem)
     if problems:
         return 1
+    # Counted from the reviewed inventory rather than written out. A hardcoded
+    # total drifts the moment a suite is added, and it drifts downward silently:
+    # the guard keeps passing while its own summary understates what it graded.
     print(
-        "workflow authority holds: 13 suite reports reach one always-running verdict in order"
+        "workflow authority holds: %d suite reports reach one always-running verdict in order"
+        % len(EXPECTED_SUITES)
     )
     return 0
 

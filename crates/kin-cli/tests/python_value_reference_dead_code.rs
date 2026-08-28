@@ -397,11 +397,21 @@ fn the_dead_code_list_holds_only_rows_the_collector_cannot_rescue() {
 }
 
 /// The entity names a dead-code response listed, read off its rendered rows.
+///
+/// The renderer puts an `[unverified: <factor>]` label in front of a row it
+/// cannot stand behind, and this reads the name out from behind it. Without
+/// that, a labelled row is read as a name nobody is looking for and the miss
+/// reports the wrong defect: these tests are about which entities the reference
+/// collector rescues, and a row's arrival label says nothing about that.
 fn listed_names(lines: &[String]) -> Vec<String> {
     lines
         .iter()
         .filter_map(|line| {
             let row = line.strip_prefix("  ")?;
+            let row = match row.split_once("] ") {
+                Some((label, rest)) if label.starts_with("[unverified") => rest,
+                _ => row,
+            };
             let (name, rest) = row.split_once(" (")?;
             rest.contains(") - ").then(|| name.to_string())
         })

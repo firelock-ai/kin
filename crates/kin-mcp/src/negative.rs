@@ -934,6 +934,9 @@ fn answer_claims_absence(tool: &str, payload: &Value) -> bool {
         return true;
     }
     if tool == "semantic_locate" {
+        if locate_empty_window_over_nonempty_ranking(payload) {
+            return false;
+        }
         return locate_result_count(payload).is_none_or(|count| count == 0)
             || locate_ranking_names_nothing(payload);
     }
@@ -1187,22 +1190,47 @@ fn collection_len(payload: &Value, field: &str) -> Option<usize> {
 /// than "not this shape". Absence is still never guessed — a payload carrying
 /// neither key returns `None` exactly as before.
 ///
-/// Both surfaces count toward the total because both are answers: a store whose
-/// files rank but whose entities do not project has returned rows, and calling
-/// that an absence would certify a gap the ranking did not report.
+/// The declared granularity selects the primary collection. A file page counts
+/// `files` on either arm; an entity page counts `entities` on fused and
+/// `results` on cosine. Secondary roll-ups do not turn an empty primary page
+/// into a non-empty answer.
 fn locate_result_count(payload: &Value) -> Option<usize> {
-    if payload.get("routing").and_then(Value::as_str) == Some("fused-v1") {
-        let files = payload
-            .get("files")
-            .and_then(Value::as_array)
-            .map(Vec::len)?;
-        let entities = payload
-            .get("entities")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len);
-        return Some(files + entities);
+    let count = locate_primary_count(payload)?;
+
+    // A continuation page cannot prove absence from a non-empty held ranking.
+    // Cache-backed daemon paths reject this shape before serialization, but the
+    // response envelope remains defensive because older daemons and alternate
+    // producers can still hand it an empty window with a positive total. Treat
+    // that contradiction as unknown rather than stamping `no_ranked_match`.
+    (!locate_empty_window_over_nonempty_ranking(payload)).then_some(count)
+}
+
+/// Rows in the response's declared primary locate collection, before applying
+/// cross-field consistency checks.
+fn locate_primary_count(payload: &Value) -> Option<usize> {
+    // Which collection is the answer is decided in one place, by the budget's
+    // own rule, and read here. This block and the response budget's ladder used
+    // to derive it separately, from slightly different rules, so a payload
+    // existed for which the ladder cut one collection while this counted
+    // another.
+    let primary = crate::budget::primary_collection_for(payload, "semantic_locate")?;
+    match collection_len(payload, primary) {
+        Some(count) => Some(count),
+        // A producer that omitted its empty primary still proves the locate
+        // shape through `files`, which `LocateResult` serializes whatever it
+        // holds. An absent primary there is zero rows. A payload carrying
+        // neither is not a locate response, and its count stays unknown rather
+        // than being guessed at zero.
+        None => collection_len(payload, "files").map(|_| 0),
     }
-    collection_len(payload, "results")
+}
+
+fn locate_empty_window_over_nonempty_ranking(payload: &Value) -> bool {
+    locate_primary_count(payload) == Some(0)
+        && payload
+            .get("total_ranked")
+            .and_then(Value::as_u64)
+            .is_some_and(|total| total > 0)
 }
 
 /// True when a query token is identifier-shaped: the caller named a symbol
@@ -1415,6 +1443,13 @@ fn focal_resolution_gap(payload: &Value, subject: &str) -> Option<String> {
              sibling rather than the entity that was asked about"
         )),
         Some(candidates) if candidates > 1 => {
+            // A focal the caller pinned to one entity was not resolved from
+            // anything, so there is no resolution to qualify. See
+            // [`focal_pinned_to_one_entity`] for why both halves of that are
+            // required and what this deliberately stops claiming.
+            if focal_pinned_to_one_entity(resolution) {
+                return None;
+            }
             // Which rule produced the count decides what the gap is ABOUT: a
             // query that matched several entities is an ambiguous question,
             // while several entities carrying one exact name is an ambiguous
@@ -1436,6 +1471,36 @@ fn focal_resolution_gap(payload: &Value, subject: &str) -> Option<String> {
         }
         Some(_) => None,
     }
+}
+
+/// True when the caller pinned the focal to one entity by id AND the resolution
+/// REPORTED, rather than omitted, that it had no other candidate.
+///
+/// Both halves are load-bearing. `addressed_by: "entity_id"` says the caller
+/// named one UUID and the tool answered for that UUID: nothing was chosen, so
+/// there is no choice to qualify, and "not evidence about the others" describes
+/// a question nobody asked. A stranger addressing eleven exports by id got that
+/// downgrade on seven of them because some other entity in the graph happened
+/// to share the string `request`.
+///
+/// The reported-empty half is what says the producer LOOKED. A payload that
+/// omits `other_candidates` made no claim about them, and reading a missing
+/// field as an empty one is exactly the substitution the `unreported` arm above
+/// exists to refuse. `trace_data_flow` publishes such a block, so the omission
+/// is a live shape rather than a hypothetical, and it keeps the gap.
+///
+/// What this stops claiming, said plainly: a name the graph holds twice can
+/// still cost a pinned focal an edge the extractor could not attribute to
+/// either twin, so a pinned reference list is not thereby proven complete. That
+/// is a bound on completeness, and it stays readable as
+/// `focal_resolution.same_name_candidates` on the response. It is not
+/// ambiguity, and the one verdict must not report it as ambiguity.
+fn focal_pinned_to_one_entity(resolution: &Value) -> bool {
+    resolution.get("addressed_by").and_then(Value::as_str) == Some("entity_id")
+        && resolution
+            .get("other_candidates")
+            .and_then(Value::as_array)
+            .is_some_and(|others| others.is_empty())
 }
 
 /// The limiting-factor id a spine-clipped trace reports under.
@@ -1581,41 +1646,37 @@ fn spine_clipping_gap(payload: &Value, spine_clipped: u64) -> String {
     )
 }
 
-/// The component and reason a retrieval payload files its corpus-scale
-/// disclosure under.
+/// Stable label for guidance about a description-shaped query.
 ///
 /// The names live here rather than at the surface that writes them because the
 /// exemption below is what makes them meaningful, and a name that moved without
-/// its exemption would silently start blocking absence claims. `kin-cli`'s
-/// locate path writes entries under this pair; nothing else may.
-pub const CORPUS_SCALE_COMPONENT: &str = "corpus_scale";
-/// See [`CORPUS_SCALE_COMPONENT`].
-pub const SMALL_CORPUS_REASON: &str = "small_corpus";
+/// its exemption would silently start blocking absence claims.
+pub const QUERY_SHAPE_COMPONENT: &str = "query_shape";
+/// See [`QUERY_SHAPE_COMPONENT`].
+pub const DESCRIPTION_ENTITY_RANKING_REASON: &str = "description_entity_ranking";
 
-/// Whether a `component:reason` label describes the STORE rather than the run.
+/// Whether a `component:reason` label advises how to read the result without
+/// reporting that the run lost a capability.
 ///
-/// A corpus-scale disclosure says a graph is too small for a description query
-/// to rank well. Every signal still ran, nothing was cut, and the pipeline
-/// answered at full capability: the corpus simply has little to say. Treating
-/// it as a run degradation would be wrong in the one direction that matters
-/// here, because a small graph makes an absence MORE trustworthy, not less,
-/// and there is less in it to have been missed. Folding it into the gate would
-/// have made every absence claim on a small store uncertifiable on the grounds
-/// that the store was small.
+/// Description-query guidance says no returned entity was literally named by
+/// the query and points at file granularity. Every signal may still have run,
+/// and rows marked `semantic` still prove vector evidence participated. Folding
+/// this advice into the run-quality verdict would manufacture a degraded input
+/// from a query shape while weakening no existing verdict input.
 ///
 /// It stays in the payload's own `degradations[]`, where a caller reads it. This
 /// only keeps it out of the run-quality verdicts below.
-fn describes_the_store_not_the_run(label: &str) -> bool {
+fn describes_advice_not_run_quality(label: &str) -> bool {
     label.split_once(':').is_some_and(|(component, reason)| {
-        component == CORPUS_SCALE_COMPONENT && reason == SMALL_CORPUS_REASON
+        component == QUERY_SHAPE_COMPONENT && reason == DESCRIPTION_ENTITY_RANKING_REASON
     })
 }
 
 /// The degradations a retrieval payload reported about its OWN run, as stable
 /// `component:reason` labels.
 ///
-/// Corpus-scale disclosures are excluded: they describe the store, not the run.
-/// See [`describes_the_store_not_the_run`].
+/// Query-shape guidance is excluded: it advises how to read the result and does
+/// not report a capability failure. See [`describes_advice_not_run_quality`].
 ///
 /// The envelope's [`Degraded`] flags describe the daemon; this array describes
 /// the query that just ran, and the two are not the same fact. A locate page
@@ -1641,7 +1702,7 @@ pub(crate) fn payload_degradation_labels(payload: &Value) -> Vec<String> {
             let reason = entry.get("reason").and_then(Value::as_str)?;
             Some(format!("{component}:{reason}"))
         })
-        .filter(|label| !describes_the_store_not_the_run(label))
+        .filter(|label| !describes_advice_not_run_quality(label))
         .collect()
 }
 
@@ -2690,6 +2751,18 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
         );
     }
 
+    // Host content the graph never met answers every name inside it identically,
+    // for the same reason an empty graph does one gate up. This is the purest
+    // absence claim the product makes, and it was the one that never asked: the
+    // retrieval builder scopes this gap to answers that claim an absence, which
+    // is every answer here, and a focal miss took a different route and skipped
+    // it. So a constant declared and used in an unadmitted module came back
+    // `safe_to_conclude_absent: true`, `structural_authoritative`, beside a
+    // `behind` object in the same envelope naming the file it was in (FIR-2820).
+    if let Some(gap) = unadmitted_host_content_gap(envelope) {
+        push_gap(&mut trustworthy, &mut trust_reason, gap);
+    }
+
     let consequence = if trustworthy {
         "The name is authoritatively absent from this graph: no entity carries it. That is a fact about the name and not about the symbol's usage, because nothing was looked up.".to_string()
     } else {
@@ -3130,6 +3203,47 @@ mod tests {
             reason.contains("match the name that was queried"),
             "an ambiguous QUERY and an ambiguous graph send a reader to different \
              places, so the gap must say which one this is: {reason}"
+        );
+    }
+
+    /// A caller that supplied one entity id made no ambiguous choice, even if
+    /// the graph holds other entities with the same display name. The producer
+    /// must explicitly report an empty candidate list; omission stays
+    /// inconclusive because it proves nothing was checked.
+    #[test]
+    fn an_id_pinned_focal_is_not_downgraded_for_same_named_entities() {
+        let mut pinned = authoritative_empty_references("function");
+        pinned["focal_resolution"] = json!({
+            "addressed_by": "entity_id",
+            "same_name_candidates": 3,
+            "matched": "exact_focal_name",
+            "other_candidates": [],
+        });
+        let negative = negative_for("find_references", &pinned, &structural_ready_envelope())
+            .expect("an empty reference list yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert!(
+            !negative["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("focal_resolution_ambiguous"),
+            "a pinned id was never selected from the same-named entities: {negative}"
+        );
+
+        let mut omitted = pinned;
+        omitted["focal_resolution"]
+            .as_object_mut()
+            .unwrap()
+            .remove("other_candidates");
+        let negative = negative_for("find_references", &omitted, &structural_ready_envelope())
+            .expect("an empty reference list yields a negative");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        assert!(
+            negative["trust_reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("focal_resolution_ambiguous"),
+            "an omitted candidate report made no completeness claim: {negative}"
         );
     }
 
@@ -3825,6 +3939,7 @@ mod tests {
             "reconcile": {
                 "untracked_path_count": unadmitted_paths,
                 "untracked_paths_sample": ["notekeeper/search.py"],
+                "untracked_observed_age_seconds": 0,
                 "last_admission_success_at": "2026-08-20T13:00:00Z",
             },
         }))
@@ -3995,35 +4110,32 @@ mod tests {
             .contains("no degraded signals"));
     }
 
-    /// A small store is a fact about the corpus, not a report that the query
-    /// ran degraded, and an absence found in a small graph is MORE trustworthy
-    /// rather than less: there is less in it to have been missed. Folding the
-    /// disclosure into the run-quality gate would have refused to certify
-    /// absences on exactly the stores where they are most reliable.
+    /// Description-query guidance is advice about how to read a ranking, not a
+    /// report that any capability failed. It must not manufacture a degraded
+    /// verdict, and the control below proves every real degradation still does.
     #[test]
-    fn a_corpus_scale_disclosure_does_not_make_an_absence_inconclusive() {
-        let small = json!({
+    fn description_query_guidance_does_not_make_an_absence_inconclusive() {
+        let advised = json!({
             "query": "where do notes get written to disk",
             "results": [],
             "total_ranked": 0,
             "degradations": [{
-                "component": CORPUS_SCALE_COMPONENT,
-                "reason": SMALL_CORPUS_REASON,
-                "detail": "this graph holds 41 entities, under the 60-entity rank fusion \
-                           constant this ranker scores with",
-                "remediation": "ask by exact entity or file name",
+                "component": QUERY_SHAPE_COMPONENT,
+                "reason": DESCRIPTION_ENTITY_RANKING_REASON,
+                "detail": "no ranked entity was literally named by this query",
+                "remediation": "try file granularity",
             }],
         });
         let negative = negative_for(
             "semantic_locate",
-            &small,
+            &advised,
             &semantic_authoritative_envelope(),
         )
         .expect("empty results yields a negative");
         assert_eq!(
             negative["safe_to_conclude_absent"],
             json!(true),
-            "a small corpus is not a degraded run: {negative}"
+            "query-shape advice is not a degraded run: {negative}"
         );
         assert_eq!(
             negative["degraded_signals"],
@@ -4035,18 +4147,18 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("retrieval_degraded"),
-            "the store's size is not a reason to distrust this run: {negative}"
+            "the query shape is not a reason to distrust this run: {negative}"
         );
 
         // The control that keeps the exemption from swallowing real
         // degradations: one genuine run degradation beside it still blocks.
-        let mut mixed = small.clone();
+        let mut mixed = advised.clone();
         mixed["degradations"] = json!([
             {
-                "component": CORPUS_SCALE_COMPONENT,
-                "reason": SMALL_CORPUS_REASON,
-                "detail": "small",
-                "remediation": "name it",
+                "component": QUERY_SHAPE_COMPONENT,
+                "reason": DESCRIPTION_ENTITY_RANKING_REASON,
+                "detail": "description",
+                "remediation": "use file granularity",
             },
             {
                 "component": "vector_sidecar",
@@ -6172,6 +6284,130 @@ mod tests {
         }
     }
 
+    /// FIR-2820. The purest absence claim the product makes, over a store the
+    /// working copy has outrun.
+    ///
+    /// The v0.6.1 yardstick run asked `find_references` about a constant
+    /// declared and used twice in a module on disk that no admission had taken.
+    /// It came back `safe_to_conclude_absent: true`, `structural_authoritative`,
+    /// beside a `behind` object in the same envelope naming that very file. The
+    /// retrieval builder had this gate and scopes it to answers claiming an
+    /// absence, which is every answer on this path; a focal miss took a
+    /// different route and never asked.
+    #[test]
+    fn resolution_miss_over_unadmitted_host_content_is_inconclusive() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["notekeeper/linkgraph.py"],
+                "last_admission_success_at": "2026-08-27T03:14:08Z",
+            },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a name may be absent from the graph and present in the repository while a module \
+             the graph never read sits on disk"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("graph_behind_working_tree"),
+            "an answer withheld for an unnamed reason sends the reader to the wrong lever: \
+             {reason}"
+        );
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            !advice.contains("authoritatively absent"),
+            "the advice cannot still read as settled: {advice}"
+        );
+    }
+
+    /// The control for the case above, on the same builder. A store with nothing
+    /// unadmitted certifies exactly as it did, because a gate that fires on
+    /// every working copy is one an agent learns to skip.
+    #[test]
+    fn resolution_miss_over_a_level_working_copy_still_certifies() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            // Stamped. An unstamped zero is a different fact and the two tests
+            // below this one are what separate them.
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+            },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert!(!negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("graph_behind_working_tree"));
+    }
+
+    /// FIR-2820, the review's second finding, on the surface a caller acts on.
+    ///
+    /// A walk that errored is logged at debug and swallowed, and a daemon that
+    /// has not walked yet has taken no reading at all. Both leave the count at
+    /// its `u64` default with no stamp, and `kin status` on the same daemon at
+    /// the same instant says "not measured" while this builder certified.
+    #[test]
+    fn resolution_miss_over_an_unmeasured_working_copy_is_inconclusive() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            "reconcile": { "untracked_path_count": 0 },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a zero nobody measured is not a zero, and certifying on it is the whole ticket"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("working_copy_unmeasured"),
+            "the reason has to name the lever, and it is not `kin admit` here: {reason}"
+        );
+    }
+
+    /// The control for the case above. A daemon that admits nothing from the
+    /// filesystem has no walk to miss, so a gate keyed on the stamp alone would
+    /// refuse every absence it ever answers.
+    #[test]
+    fn resolution_miss_over_a_daemon_that_admits_nothing_from_disk_certifies() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observation_not_applicable": true,
+            },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("working_copy_unmeasured"),
+            "there is no working copy to measure here: {reason}"
+        );
+    }
+
     #[test]
     fn resolution_miss_on_an_empty_graph_is_inconclusive() {
         let envelope = Envelope::daemon().with_health(&json!({
@@ -6330,6 +6566,59 @@ mod tests {
     }
 
     #[test]
+    fn empty_window_over_nonempty_locate_ranking_cannot_certify_absence() {
+        // Current daemon cache paths fail these cursors before serializing a
+        // page. The envelope still refuses the contradictory shape so an older
+        // daemon or alternate producer cannot turn an out-of-range window into
+        // an authoritative `no_ranked_match`.
+        for payload in [
+            json!({
+                "query": "where does the daemon start",
+                "routing": "cosine-v0",
+                "page": 4,
+                "total_ranked": 3,
+                "results": [],
+            }),
+            json!({
+                "query": "where does the daemon start",
+                "routing": "fused-v1",
+                "granularity": "entity",
+                "page": 4,
+                "total_ranked": 3,
+                "files": [],
+            }),
+        ] {
+            assert!(
+                negative_for(
+                    "semantic_locate",
+                    &payload,
+                    &semantic_authoritative_envelope(),
+                )
+                .is_none(),
+                "a positive held total contradicts an empty continuation: {payload}"
+            );
+        }
+
+        let truly_empty = json!({
+            "query": "where does the daemon start",
+            "routing": "cosine-v0",
+            "page": 0,
+            "total_ranked": 0,
+            "results": [],
+        });
+        assert_eq!(
+            negative_for(
+                "semantic_locate",
+                &truly_empty,
+                &semantic_authoritative_envelope(),
+            )
+            .unwrap()["kind"],
+            json!("no_ranked_match"),
+            "a genuinely empty ranking keeps its negative"
+        );
+    }
+
+    #[test]
     fn populated_fused_locate_page_carries_no_negative() {
         // The other control: a page that answered is not qualified at all.
         let mut payload = empty_fused_locate_page("run_fused_locate_for_state");
@@ -6344,17 +6633,20 @@ mod tests {
     }
 
     #[test]
-    fn fused_page_with_ranked_files_but_no_entities_is_not_an_absence() {
-        // Rows came back. Calling that an absence would certify a gap the
-        // ranking never reported.
+    fn fused_secondary_files_do_not_make_an_empty_entity_primary_populated() {
+        // The declared entity ranking answered with no entities. A secondary
+        // file roll-up is provenance for that ranking, not a second primary
+        // whose presence can turn the empty entity answer into a populated one.
         let mut payload = empty_fused_locate_page("where does the daemon start");
         payload["files"] = json!([{ "path": "src/lib.rs", "score": 0.5 }]);
-        assert!(negative_for(
+        let negative = negative_for(
             "semantic_locate",
             &payload,
-            &semantic_authoritative_envelope()
+            &semantic_authoritative_envelope(),
         )
-        .is_none());
+        .expect("secondary files cannot hide an empty entity primary");
+        assert_eq!(negative["kind"], json!("no_ranked_match"));
+        assert_eq!(negative["result_count"], json!(0));
     }
 
     #[test]
@@ -6556,6 +6848,138 @@ mod tests {
             &semantic_authoritative_envelope()
         )
         .is_none());
+    }
+
+    #[test]
+    fn cosine_file_granularity_counts_its_file_primary_for_empty_and_populated_pages() {
+        let empty = json!({
+            "query": "where redirects are resolved",
+            "routing": "cosine-v0",
+            "granularity": "file",
+            "page": 0,
+            "total_ranked": 0,
+            "files": [],
+        });
+        let negative = negative_for(
+            "semantic_locate",
+            &empty,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("an empty file page is still an attributable empty locate");
+        assert_eq!(negative["kind"], json!("no_ranked_match"));
+        assert_eq!(negative["result_count"], json!(0));
+
+        let populated = json!({
+            "query": "where redirects are resolved",
+            "routing": "cosine-v0",
+            "granularity": "file",
+            "page": 0,
+            "total_ranked": 1,
+            "files": [{ "path": "src/redirects.rs", "score": 0.9 }],
+        });
+        assert!(negative_for(
+            "semantic_locate",
+            &populated,
+            &semantic_authoritative_envelope(),
+        )
+        .is_none());
+    }
+
+    /// The join, not the two endpoints.
+    ///
+    /// This block's row count and the response budget's ladder have to name one
+    /// collection on every locate shape the daemon produces. Two tests each
+    /// hardcoding the same key string would both stay green while the two sides
+    /// drifted apart, because neither can see the agreement. So this reads what
+    /// the budget chose and requires this block to have counted THAT array,
+    /// which no renaming on either side can satisfy by accident.
+    #[test]
+    fn the_negative_count_and_the_budget_primary_name_one_collection() {
+        let shapes = [
+            (
+                "fused entity page",
+                json!({
+                    "query": "q", "granularity": "entity", "routing": "fused-v1",
+                    "page": 0, "total_ranked": 2, "files": [],
+                    "entities": [{ "name": "a" }, { "name": "b" }],
+                }),
+            ),
+            (
+                "fused entity page that ranked nothing",
+                json!({
+                    "query": "q", "granularity": "entity", "routing": "fused-v1",
+                    "page": 0, "total_ranked": 0,
+                    "files": [{ "path": "src/secondary.rs", "score": 0.4 }],
+                }),
+            ),
+            (
+                "fused entity page that ships its empty primary",
+                json!({
+                    "query": "q", "granularity": "entity", "routing": "fused-v1",
+                    "page": 0, "total_ranked": 0, "entities": [],
+                    "files": [{ "path": "src/secondary.rs", "score": 0.4 }],
+                }),
+            ),
+            (
+                "cosine entity page",
+                json!({
+                    "query": "q", "granularity": "entity", "routing": "cosine-v0",
+                    "page": 0, "total_ranked": 1, "files": [],
+                    "results": [{ "name": "a" }],
+                }),
+            ),
+            (
+                "cosine file page",
+                json!({
+                    "query": "q", "granularity": "file", "routing": "cosine-v0",
+                    "page": 0, "total_ranked": 2,
+                    "files": [{ "path": "a.rs" }, { "path": "b.rs" }],
+                }),
+            ),
+            (
+                "fused file page",
+                json!({
+                    "query": "q", "granularity": "file", "routing": "fused-v1",
+                    "page": 0, "total_ranked": 1, "entities": [],
+                    "files": [{ "path": "a.rs" }],
+                }),
+            ),
+        ];
+        for (label, payload) in shapes {
+            let primary = crate::budget::primary_collection_for(&payload, "semantic_locate")
+                .unwrap_or_else(|| panic!("{label}: the budget named no primary collection"));
+            let counted = locate_primary_count(&payload)
+                .unwrap_or_else(|| panic!("{label}: the negative block counted nothing"));
+            let rows = payload
+                .get(primary)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            assert_eq!(
+                counted, rows,
+                "{label}: the negative counted {counted} rows while the budget's primary \
+                 `{primary}` carries {rows}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_entity_granularity_does_not_count_secondary_files_as_primary_rows() {
+        let payload = json!({
+            "query": "missing_symbol",
+            "routing": "fused-v1",
+            "granularity": "entity",
+            "page": 0,
+            "total_ranked": 0,
+            "files": [{ "path": "src/secondary.rs", "score": 0.4 }],
+        });
+        let negative = negative_for(
+            "semantic_locate",
+            &payload,
+            &semantic_authoritative_envelope(),
+        )
+        .expect("a secondary roll-up cannot hide an empty entity answer");
+        assert_eq!(negative["kind"], json!("no_ranked_match"));
+        assert_eq!(negative["result_count"], json!(0));
     }
 
     #[test]

@@ -23,6 +23,7 @@ pub mod error;
 pub mod exact_tree;
 pub mod git_init;
 pub mod hooks;
+pub mod hydration_semantics;
 pub mod identity;
 pub mod init;
 pub mod init_attempt;
@@ -33,6 +34,7 @@ pub mod last_admission;
 pub mod layout;
 pub mod manifest;
 pub mod memory_pressure;
+pub mod paging;
 pub mod ranking;
 pub mod ref_view;
 pub mod reference_coverage;
@@ -49,6 +51,7 @@ pub mod sync_state;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
 pub mod tree;
+pub mod vector_producer_policy;
 pub mod workspace_carry;
 pub mod workspace_semantics;
 
@@ -85,6 +88,7 @@ pub use init::{
 };
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
+pub use paging::LocateCursor;
 pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolver};
 pub use sync_state::SyncStateStore;
 pub use tree::{

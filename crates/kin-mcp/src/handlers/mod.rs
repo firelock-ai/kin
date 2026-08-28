@@ -20,6 +20,7 @@ pub mod work;
 
 pub use repository_authority::{
     ActiveRepositoryAuthority, LocalRepositoryAuthorityBinding, RequestRepositoryAuthority,
+    HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES,
 };
 
 use std::collections::HashMap;

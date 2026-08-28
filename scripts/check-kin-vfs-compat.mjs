@@ -12,10 +12,20 @@
 // existed, where the tag's own workflows are already resolved and no fix lands
 // without cutting another tag.
 //
-// The pinned commit is read out of release.yml rather than recorded again here.
-// The pin already has five homes in that file; a sixth living in the gate that
-// predicts the release would be the one most likely to drift, and a gate
-// checking a different commit than the release uses is worse than no gate.
+// The pinned commit is read out of the workflows rather than recorded again
+// here. A copy living in the gate that predicts the release would be the one
+// most likely to drift, and a gate checking a different commit than the release
+// uses is worse than no gate.
+//
+// The homes are DISCOVERED rather than listed, because listing them is what went
+// wrong. This gate used to read release.yml alone and its comment said the pin
+// had five homes; a sweep during FIR-2881 found eight. The three it never read
+// were rc-build.yml's own checkout ref and EXPECTED_VFS_COMMIT, which build the
+// candidate archive the release proof loop grades before the cut, and the exact
+// expected_vfs_commit line scripts/test-release-workflow-authority.py asserts.
+// A pin move that skipped rc-build.yml would grade one kin-vfs and ship another.
+// Discovery means a ninth home is read the day it appears rather than the day it
+// breaks a tag.
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -32,42 +42,73 @@ const COMMIT_SHA = /^[0-9a-f]{40}$/;
 // install proof assert against. Requiring them to agree is stronger than
 // reading any one of them, because a half-updated pin (checkout moved, proof
 // left behind) is exactly the shape that reaches a tag before anyone notices.
-export function readPinnedVfsCommit(releaseYaml) {
-  const sites = new Map();
-  const record = (sha, site) => {
-    if (!COMMIT_SHA.test(sha)) {
-      throw new Error(
-        `${site} records "${sha}", which is not a 40-character commit sha; ` +
-        'release inputs must be immutable',
-      );
-    }
-    sites.set(sha, [...(sites.get(sha) ?? []), site]);
-  };
+// Files that may record the pin. Every workflow, plus the release-authority
+// script whose assertion carries the expected commit as a literal. The gate's
+// own source and test are excluded on purpose: a guard that scans the file it
+// lives in matches its own patterns and passes on a tree where nothing else
+// does.
+export const PIN_SOURCE_DIRECTORIES = ['.github/workflows', 'scripts'];
+export const PIN_SOURCE_EXCLUSIONS = new Set([
+  'scripts/check-kin-vfs-compat.mjs',
+  'scripts/check-kin-vfs-compat.test.mjs',
+]);
 
-  for (const step of releaseYaml.split(/^\s*-\s+name:/m).slice(1)) {
+// A bare 40-hex value. `expected_vfs_commit` legitimately appears with no value
+// at all (an input declaration), as an empty string (a caller opting out), as a
+// shell variable, as `process.env` plumbing and inside a regex literal, all of
+// which were read out of the tree before this rule was written. Only a literal
+// sha is a pin site; the rest are not sites and are not errors. A checkout ref
+// is held to a stricter rule below, because a kin-vfs checkout that floats is
+// the failure this gate exists for.
+export function collectVfsPinSites(text, file) {
+  const found = [];
+
+  for (const step of text.split(/^\s*-\s+name:/m).slice(1)) {
     if (!step.includes(`repository: ${VFS_REPOSITORY}`)) {
       continue;
     }
     const ref = step.match(/^\s*ref:\s*(\S+)/m);
     if (!ref) {
       throw new Error(
-        `a ${VFS_REPOSITORY} checkout in release.yml records no ref, so the ` +
+        `a ${VFS_REPOSITORY} checkout in ${file} records no ref, so the ` +
         'release input floats with that repository default branch',
       );
     }
-    record(ref[1], `${VFS_REPOSITORY} checkout ref`);
+    if (!COMMIT_SHA.test(ref[1])) {
+      throw new Error(
+        `${file} records a ${VFS_REPOSITORY} checkout ref "${ref[1]}", which is ` +
+        'not a 40-character commit sha; release inputs must be immutable',
+      );
+    }
+    found.push({ sha: ref[1], site: `${file} ${VFS_REPOSITORY} checkout ref` });
   }
 
-  for (const match of releaseYaml.matchAll(
-    /^\s*(?:EXPECTED_VFS_COMMIT|expected_vfs_commit):\s*(\S+)/gm,
+  for (const match of text.matchAll(
+    /(?:EXPECTED_VFS_COMMIT|expected_vfs_commit):\s*"?([0-9a-f]{40})"?/g,
   )) {
-    record(match[1], 'expected_vfs_commit');
+    found.push({ sha: match[1], site: `${file} expected_vfs_commit` });
+  }
+
+  return found;
+}
+
+// Every site that records the pin, across every file that records one, required
+// to agree. A half-updated pin (release.yml moved, the candidate archive left
+// behind) is exactly the shape that reaches a tag before anyone notices, and it
+// is the shape this returns an error for rather than a commit.
+export function readPinnedVfsCommit(sources) {
+  const sites = new Map();
+  for (const { path: file, text } of sources) {
+    for (const { sha, site } of collectVfsPinSites(text, file)) {
+      sites.set(sha, [...(sites.get(sha) ?? []), site]);
+    }
   }
 
   if (sites.size === 0) {
     throw new Error(
-      `release.yml records no ${VFS_REPOSITORY} pin, so this gate has nothing ` +
-      'to compare against and cannot be trusted to have checked anything',
+      `no ${VFS_REPOSITORY} pin was found in any of ${sources.length} scanned ` +
+      'file(s), so this gate has nothing to compare against and cannot be ' +
+      'trusted to have checked anything',
     );
   }
   if (sites.size > 1) {
@@ -76,11 +117,48 @@ export function readPinnedVfsCommit(releaseYaml) {
       .sort()
       .join(' and ');
     throw new Error(
-      `release.yml records disagreeing ${VFS_REPOSITORY} pins: ${detail}; ` +
-      'the release would build one commit and prove another',
+      `disagreeing ${VFS_REPOSITORY} pins: ${detail}; the release would build ` +
+      'one commit and prove another',
     );
   }
   return [...sites.keys()][0];
+}
+
+// Read every candidate file off disk. Missing directories are not an error, so
+// the gate still runs in a checkout that carries one and not the other, but a
+// scan that found no file at all is, because zero files scanned and zero
+// disagreements look identical from the outside.
+export async function readPinSources(root, { fsImpl = fs } = {}) {
+  const sources = [];
+  for (const dir of PIN_SOURCE_DIRECTORIES) {
+    let entries;
+    try {
+      entries = await fsImpl.readdir(path.join(root, dir));
+    } catch {
+      continue;
+    }
+    for (const entry of entries.sort()) {
+      const rel = `${dir}/${entry}`;
+      if (PIN_SOURCE_EXCLUSIONS.has(rel)) {
+        continue;
+      }
+      if (!/\.(ya?ml|py)$/.test(entry)) {
+        continue;
+      }
+      const text = await fsImpl.readFile(path.join(root, dir, entry), 'utf8');
+      if (!text.includes(VFS_REPOSITORY) && !/expected_vfs_commit/i.test(text)) {
+        continue;
+      }
+      sources.push({ path: rel, text });
+    }
+  }
+  if (sources.length === 0) {
+    throw new Error(
+      'no file mentioning the kin-vfs pin was found; refusing to read an empty ' +
+      'scan as agreement',
+    );
+  }
+  return sources;
 }
 
 // Mirrors release.yml's own lock reader. Kept deliberately identical so the two
@@ -167,18 +245,26 @@ export async function main({
   fetchImpl = fetch,
   log = console.log,
 } = {}) {
-  const releaseYaml = await fs.readFile(
-    path.join(root, '.github', 'workflows', 'release.yml'),
-    'utf8',
-  );
-  const commit = readPinnedVfsCommit(releaseYaml);
+  const sources = await readPinSources(root);
+  const commit = readPinnedVfsCommit(sources);
   const kinLock = await fs.readFile(path.join(root, 'Cargo.lock'), 'utf8');
   const pinnedLock = await fetchPinnedLock(commit, {
     token: env.GH_TOKEN || env.GITHUB_TOKEN,
     fetchImpl,
   });
   const version = compareVfsCore(kinLock, pinnedLock);
-  log(`Verified Kin/kin-vfs compatibility at ${VFS_CORE} ${version} (pinned kin-vfs ${commit})`);
+  // Name how many homes agreed and which files hold them, so a scan that
+  // silently narrowed reads differently from one that checked them all. The
+  // count is of SITES that recorded a sha, not of files opened: several files
+  // mention the pin without recording one, and counting those would report
+  // coverage this gate does not have.
+  const sites = sources.flatMap(({ path: file, text }) => collectVfsPinSites(text, file));
+  const files = [...new Set(sites.map(({ site }) => site.split(' ')[0]))].sort();
+  log(
+    `Verified Kin/kin-vfs compatibility at ${VFS_CORE} ${version} ` +
+    `(pinned kin-vfs ${commit}, agreed across ${sites.length} site(s) in ` +
+    `${files.length} file(s): ${files.join(', ')})`,
+  );
   return version;
 }
 

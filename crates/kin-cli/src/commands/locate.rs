@@ -42,26 +42,26 @@ pub struct LocateResult {
     /// where it is omitted from output. Capped to one page (see `next_cursor`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entities: Vec<LocateEntity>,
-    /// Opaque cursor for the NEXT page of ranked entities. Present iff the full
-    /// ranking holds more entities than this page. Re-issue the query with this
-    /// cursor (`kin locate --next`, or the `cursor` arg) to fetch the next page
-    /// from the daemon's cached ranking — no retrieval re-run. `None` on the last
-    /// page or when paging is not active.
+    /// Opaque cursor for the NEXT page of the primary ranked collection.
+    /// Ordinarily that is `entities`; `semantic_locate` file granularity pages
+    /// `files` instead. Re-issue the cursor to fetch the next absolute slice
+    /// from the daemon's held ranking with no retrieval re-run. `None` on the
+    /// last page or when paging is not active.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
-    /// 0-based index of the entity page in `entities`.
+    /// 0-based index of the primary result page.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub page: usize,
-    /// Total entities in the full ranking behind this paged view.
+    /// Total rows in the full primary ranking behind this paged view.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub total_ranked: usize,
-    /// True when entities were ranked and NOT ONE of them was named by the
-    /// query: every hit is a fallback.
+    /// True when the full held entity ranking is non-empty and NOT ONE entity
+    /// in it was named by the query. Omitted for file granularity.
     ///
     /// The one-field answer to "did this query find anything, or did retrieval
     /// just return its best guesses". A caller asking for a symbol that exists
     /// nowhere gets a full page either way, and this is the difference between
-    /// the two cases. Deliberately a fact about the whole page rather than a
+    /// the two cases. Deliberately a fact about the whole ranking rather than a
     /// relevance floor: a floor would need a threshold on a composite score
     /// whose scale is not comparable across queries, so it would drop real
     /// answers to hide wrong ones. This reports; the caller decides.
@@ -638,10 +638,15 @@ pub fn query_names_entity(query: &str, name: &str) -> bool {
 /// `--explain`) reports `TextFallback`: the honest reading of "no name matched
 /// and this surface cannot say which pool answered" is the weaker claim, not the
 /// stronger one.
-fn classify_locate_match(query: &str, name: &str, origin: &str) -> LocateMatchKind {
+fn classify_locate_match(
+    query: &str,
+    name: &str,
+    origin: &str,
+    cosine: Option<f32>,
+) -> LocateMatchKind {
     if query_names_entity(query, name) {
         LocateMatchKind::Name
-    } else if origin == "vector" {
+    } else if origin == "vector" || cosine.is_some() {
         LocateMatchKind::Semantic
     } else {
         LocateMatchKind::TextFallback
@@ -667,6 +672,19 @@ fn locate_exact_name_tier(entity: &LocateEntity) -> u8 {
     match entity.match_kind {
         Some(LocateMatchKind::Name) => 1,
         _ => 0,
+    }
+}
+
+/// Evidence precedence when several query variants surface one entity.
+///
+/// Fusion carries one representative record, but match kind is a fact about
+/// every contributing variant. A name hit in any variant is stronger than a
+/// semantic hit, which is stronger than an unattributed lexical fallback.
+fn locate_match_kind_strength(kind: LocateMatchKind) -> u8 {
+    match kind {
+        LocateMatchKind::Name => 2,
+        LocateMatchKind::Semantic => 1,
+        LocateMatchKind::TextFallback => 0,
     }
 }
 
@@ -1173,6 +1191,14 @@ const LOCATE_PHASE_BUDGETS: [(&str, &str, f64); 6] = [
 impl LocateBudget {
     /// The budget a real query runs under, resolved from the environment.
     fn from_env() -> Self {
+        Self::from_env_capped(f64::INFINITY)
+    }
+
+    /// The production budget, additionally capped by a caller-owned request
+    /// deadline. Hosted multi-query routing uses this so every variant spends
+    /// from one wall-clock allowance instead of receiving a fresh 90-second
+    /// budget of its own.
+    fn from_env_capped(total_cap_secs: f64) -> Self {
         // Timeout/budget knobs: `0` means unbounded (disable the budget) rather
         // than a real 0 s deadline that would skip every phase and gut retrieval.
         // The unbounded sentinel (`f64::INFINITY`) flows harmlessly through the
@@ -1180,7 +1206,8 @@ impl LocateBudget {
         use kin_core::env_registry::env_secs_bound_f64 as secs_budget;
         Self {
             start: std::time::Instant::now(),
-            total_secs: secs_budget("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0),
+            total_secs: secs_budget("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0)
+                .min(total_cap_secs.max(0.0)),
             phase_budgets: LOCATE_PHASE_BUDGETS
                 .iter()
                 .map(|(phase, knob, default)| (*phase, secs_budget(knob, *default)))
@@ -1912,6 +1939,60 @@ pub fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: Retrieval
     sink.push(event);
 }
 
+/// The producer lineage of the vector index this graph currently serves.
+///
+/// `None` in a build without the vector feature, where no index exists to have
+/// a lineage; the producer-aware search stubs return an empty query producer
+/// set in that shape, so the verdict below is `NotRanked` either way.
+#[cfg(feature = "vector")]
+fn installed_vector_index_lineage(
+    graph: &kin_db::InMemoryGraph,
+) -> Option<kin_db::EmbeddingProducerSet> {
+    graph.vector_actual_producers()
+}
+
+#[cfg(not(feature = "vector"))]
+fn installed_vector_index_lineage(
+    _graph: &kin_db::InMemoryGraph,
+) -> Option<kin_db::EmbeddingProducerSet> {
+    None
+}
+
+/// Compare the runtimes that produced this query's vectors with the lineage of
+/// the index they were ranked against, and record the disagreement.
+///
+/// KinDB attests which runtime actually returned each vector, and the whole
+/// point of carrying that attestation to a query caller is that it can be
+/// checked here rather than discarded. A clean verdict records nothing, so an
+/// empty degradation list keeps meaning the healthy path ran.
+pub fn record_query_producer_verdict(
+    sink: &mut Vec<RetrievalDegradation>,
+    graph: &kin_db::InMemoryGraph,
+    query_producers: &kin_db::EmbeddingProducerSet,
+) -> kin_core::vector_producer_policy::QueryProducerVerdict {
+    let verdict = kin_core::vector_producer_policy::evaluate_query_producers(
+        installed_vector_index_lineage(graph).as_ref(),
+        query_producers,
+    );
+    if let (Some(reason), Some(detail)) = (verdict.reason(), verdict.detail()) {
+        tracing::warn!(
+            reason,
+            detail,
+            "vector ranking is not backed by matching producer evidence"
+        );
+        record_degradation(
+            sink,
+            RetrievalDegradation {
+                component: "vector_index".to_string(),
+                reason: reason.to_string(),
+                detail,
+                remediation: verdict.remediation().unwrap_or_default().to_string(),
+            },
+        );
+    }
+    verdict
+}
+
 /// Record the vector-index state for this query as a structured degradation
 /// when it is absent, empty or partial. The `SemanticCoverage` object already
 /// carries the numbers; this adds the machine-readable
@@ -2015,51 +2096,34 @@ fn record_vector_index_degradation(
     );
 }
 
-/// Disclose that this store is too small for a description query to rank well.
+/// Explain a description-shaped entity ranking that named no returned symbol.
 ///
-/// The threshold is the ranker's own fusion constant, not a number picked to fit
-/// the symptom. A ranked list contributes `1 / (k + rank + 1)` to a fused score,
-/// so across `n` entities the best and worst rows differ by a factor of
-/// `(k + n) / (k + 1)`. While `n` stays under `k` that whole span is under two:
-/// the corpus sits inside the flat part of the curve, rank position carries less
-/// than the constant does, and a description query, whose evidence is diffuse to
-/// begin with, has nothing left to separate candidates with. Tuning
-/// `KIN_LOCATE_RRF_K` therefore moves this disclosure with the behaviour it
-/// describes.
+/// This guidance follows the response fact that makes its advice useful instead
+/// of retiring at the RRF constant. The rc061y fixture ranked correctly at 14
+/// entities while carrying the former small-corpus warning, then ranked the
+/// wrong module at 237 entities after the warning disappeared. The file rollup
+/// stayed useful in both cases. Corpus size was not the deciding measurement;
+/// a full entity ranking with no name hit is.
 ///
-/// Exact names are unaffected and are what the remediation points at: a named
-/// hit sorts by its name tier ABOVE the fused score rather than through it, so
-/// it cannot be outbid by the flat band this entry is about.
-///
-/// This is a fact about the store, not a report that the query ran degraded.
-/// Every signal ran and nothing was cut, which is why
-/// [`kin_mcp::negative`] excludes this pair from the absence gate: a small graph
-/// makes an absence more trustworthy, not less, and gating on it would refuse to
-/// certify absences on exactly the stores where they are most reliable.
-///
-/// Ranking behaviour is deliberately unchanged here. Blending the signals
-/// differently at this scale is a measured project; saying so is not.
-fn record_small_corpus_degradation(entity_count: usize, sink: &mut Vec<RetrievalDegradation>) {
-    let threshold = locate_rrf_k() as usize;
-    if entity_count >= threshold {
-        return;
-    }
+/// This is an advisory about how to read the result, not a claim that a signal
+/// failed. It therefore remains excluded from the run-quality verdict under its
+/// own stable label. A row marked `semantic` still used vector evidence;
+/// `all_fallback` means only that the query did not literally name a returned
+/// entity.
+pub fn record_description_query_guidance(sink: &mut Vec<RetrievalDegradation>) {
     record_degradation(
         sink,
         RetrievalDegradation {
-            component: kin_mcp::negative::CORPUS_SCALE_COMPONENT.to_string(),
-            reason: kin_mcp::negative::SMALL_CORPUS_REASON.to_string(),
-            detail: format!(
-                "this graph holds {entity_count} entities, under the {threshold}-entity rank \
-                 fusion constant this ranker scores with, so a query phrased as a description \
-                 has too little signal to separate candidates and can rank the obvious target \
-                 low or miss it"
-            ),
-            remediation: "at this size ask by exact entity or file name, or by a literal \
-                 string you expect in the code; a description you cannot name a symbol for \
-                 ranks better at granularity: \"file\", where the path heuristics still \
-                 separate candidates; description queries at entity granularity earn their \
-                 accuracy as the graph grows"
+            component: kin_mcp::negative::QUERY_SHAPE_COMPONENT.to_string(),
+            reason: kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON.to_string(),
+            detail: "not one ranked entity was literally named by this query. That does not \
+                 mean embeddings were unused: rows marked `semantic` carry vector evidence. It \
+                 does mean the entity list cannot prove it found the intended symbol from a \
+                 description alone"
+                .to_string(),
+            remediation: "read the existing files[] rollup; semantic_locate callers can request \
+                 granularity: \"file\"; then name the returned entity or file in a narrower \
+                 follow-up query"
                 .to_string(),
         },
     );
@@ -2262,6 +2326,20 @@ fn merge_graph_entity_bodies(
 pub struct LocatePaging {
     pub cursor: Option<String>,
     pub page_size: Option<usize>,
+    /// Explicit `--snippets` / `--no-snippets` on a continuation. `None` means
+    /// the bare `--next` form, which inherits the cached projection.
+    pub snippet_override: Option<bool>,
+}
+
+impl LocatePaging {
+    /// Preserve explicit width presence at the CLI boundary. Zero is not an
+    /// omitted override and must not turn into the daemon default.
+    pub fn validate(&self) -> Result<()> {
+        if self.page_size == Some(0) {
+            anyhow::bail!("--page-size must be a positive integer");
+        }
+        Ok(())
+    }
 }
 
 /// Which entity roles a locate is allowed to return.
@@ -2315,6 +2393,12 @@ pub async fn run(
     paging: LocatePaging,
     scope: LocateScope,
 ) -> Result<()> {
+    // A cursor exists only for the structured entity surface. `kin locate
+    // --next` deliberately lets the caller omit `--json`, so treating the
+    // follow-up flag set as a fresh human projection would hide `entities[]`
+    // and print page zero's cached file rollup again. The cursor carries the
+    // original projection; the CLI must keep rendering it as structured data.
+    let json = locate_outputs_json(json, paging.cursor.as_deref());
     let _span = tracing::info_span!(
         "kin.locate",
         text_len = text.len(),
@@ -2345,6 +2429,19 @@ pub async fn run(
     Ok(())
 }
 
+fn locate_outputs_json(json_requested: bool, cursor: Option<&str>) -> bool {
+    json_requested || cursor.is_some()
+}
+
+/// Preserve explain-shape presence across a CLI cursor continuation.
+///
+/// Fresh calls state their boolean explicitly. A bare `--next` has no
+/// `--no-explain` spelling, so false means omission and inherits the cached
+/// shape; repeating `--explain` remains an explicit true.
+fn locate_explain_request(explain: bool, cursor: Option<&str>) -> Option<bool> {
+    (cursor.is_none() || explain).then_some(explain)
+}
+
 /// Run a locate and return the structured result.
 ///
 /// `snippets` requests source bodies on hits; `entity_surface` requests the
@@ -2365,6 +2462,7 @@ pub async fn capture(
     paging: LocatePaging,
     scope: LocateScope,
 ) -> Result<LocateResult> {
+    paging.validate()?;
     let layout = crate::commands::require_repository_layout()?;
     if locate_env_bool("KIN_LOCATE_FORCE_LOCAL", false) {
         anyhow::bail!(
@@ -2481,10 +2579,11 @@ async fn try_locate_via_daemon(
     let base_url =
         daemon_url.ok_or_else(|| crate::daemon_client::daemon_required_error("locate", layout))?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
+    let explain_request = locate_explain_request(explain, paging.cursor.as_deref());
     let request = crate::daemon_client::LocateRequest {
         text: text.to_string(),
-        queries,
-        explain,
+        queries: (!queries.is_empty()).then_some(queries),
+        explain: explain_request,
         max_files,
         max_files_explicit,
         reference,
@@ -2493,7 +2592,8 @@ async fn try_locate_via_daemon(
         entity_surface,
         cursor: paging.cursor,
         page_size: paging.page_size,
-        include_tests: scope.include_tests,
+        snippet_override: paging.snippet_override,
+        include_tests: scope.include_tests.then_some(true),
     };
     client
         .locate(&request)
@@ -2614,6 +2714,43 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
     )
 }
 
+/// Hosted form of
+/// [`run_with_graph_capture_with_priority_files_and_vector_source`] whose
+/// caller owns the remaining request-wide wall-clock budget. The cap composes
+/// with every existing per-phase/environment limit and never widens one.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_graph_capture_with_priority_files_and_vector_source_capped(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    extra_priority_files: Vec<(String, f32)>,
+    vector_source: Option<&kin_db::InMemoryGraph>,
+    snippet_opts: SnippetOptions,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    scope: LocateScope,
+    total_budget: std::time::Duration,
+) -> Result<LocateResult> {
+    run_with_graph_capture_budgeted(
+        graph,
+        workspace_root,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        extra_priority_files,
+        vector_source,
+        snippet_opts,
+        repository_authority,
+        source_scope,
+        scope,
+        LocateBudget::from_env_capped(total_budget.as_secs_f64()),
+    )
+}
+
 /// Locate over a workspace graph under an explicit retrieval budget.
 ///
 /// The shape tests use when the assertion is about what retrieval returns. The
@@ -2731,9 +2868,6 @@ fn run_with_graph_capture_budgeted(
     // tier some retrieval signals are off, and that must never be silent — nor
     // must a tier that a failed host probe, rather than the host, chose.
     record_capability_tier_degradation(&detection, &mut degradations);
-    // Say when the graph is too small for a description query to rank well,
-    // rather than serving a weak answer that looks like a confident one.
-    record_small_corpus_degradation(graph.entity_count(), &mut degradations);
     // A caller that asked for tests outranks the keyword heuristic. Folding the
     // ask into `test_query` is what makes every stage that already respects the
     // heuristic respect the ask too, rather than adding a second, differently
@@ -4923,6 +5057,7 @@ fn run_with_graph_capture_budgeted(
         &snippet_opts,
         source_scope,
         text,
+        test_query,
     )?;
     Ok(result)
 }
@@ -11169,10 +11304,14 @@ fn extract_embedding_signals(
     }
     .max(locate_env_usize("KIN_LOCATE_SEMANTIC_FETCH_LIMIT", 250));
     let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
-    let all_results = if needs_scope_filter {
+    // The producer-aware variants, not the discarding wrappers. A ranking is
+    // only as trustworthy as the agreement between the runtime that produced
+    // the query vector and the runtimes that produced the index it was ranked
+    // against, and that agreement is unknowable from the configured route.
+    let produced = if needs_scope_filter {
         // We know we are querying the HEAD graph (vector_source).
         // Only return hits that have a matching topological entity in the scoped graph.
-        match search_graph.semantic_search_batch_filtered(
+        match search_graph.semantic_search_batch_filtered_with_producers(
             &query_strings,
             fetch_limit,
             |retrieval_key| {
@@ -11182,7 +11321,10 @@ fn extract_embedding_signals(
         ) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("semantic_search_batch_filtered failed: {:?}", e);
+                tracing::error!(
+                    "semantic_search_batch_filtered_with_producers failed: {:?}",
+                    e
+                );
                 record_degradation(
                     degradations,
                     RetrievalDegradation {
@@ -11197,10 +11339,10 @@ fn extract_embedding_signals(
             }
         }
     } else {
-        match search_graph.semantic_search_batch(&query_strings, fetch_limit) {
+        match search_graph.semantic_search_batch_with_producers(&query_strings, fetch_limit) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("semantic_search_batch failed: {:?}", e);
+                tracing::error!("semantic_search_batch_with_producers failed: {:?}", e);
                 record_degradation(
                     degradations,
                     RetrievalDegradation {
@@ -11215,6 +11357,9 @@ fn extract_embedding_signals(
             }
         }
     };
+
+    record_query_producer_verdict(degradations, search_graph, &produced.query_producers);
+    let all_results = produced.matches;
 
     // Drop weak semantic matches before they enter the signal column. The
     // floor is expressed in RELEVANCE units ((1 + cos) / 2), not raw cosine;
@@ -17094,7 +17239,7 @@ fn artifact_locate_entity(file: &LocateFileEntry, query: &str) -> LocateEntity {
         .and_then(|component| component.to_str())
         .unwrap_or(&file.path)
         .to_string();
-    let match_kind = Some(classify_locate_match(query, &name, "text"));
+    let match_kind = Some(classify_locate_match(query, &name, "text", None));
     LocateEntity {
         entity_id: String::new(),
         id_space: LocateIdSpace::Artifact,
@@ -17194,6 +17339,32 @@ fn apply_entity_surface_penalty(ranked: &mut [(usize, LocateEntity)]) {
     }
 }
 
+/// Carry the role-level path demotions that entity projection otherwise loses.
+///
+/// The full file ranking already applied path authority, priority backing,
+/// generated-file handling, and every other signal-specific adjustment. The
+/// entity surface does not retain enough of that state to recompute the full
+/// [`post_rrf_path_penalty`] honestly. Reapplying it with guessed flags can
+/// demote a priority-backed framework path by twenty times or apply the
+/// generated-file factor twice. Only examples/docs and test paths need a second
+/// factor here: without it their high raw symbol scores jump ahead of ordinary
+/// library symbols when the file ranking is projected into one global entity
+/// list.
+fn entity_projection_role_penalty(path: &str, test_query: bool) -> f32 {
+    let mut penalty = 1.0;
+    if is_test_path(path) {
+        penalty *= if test_query {
+            locate_env_f32("KIN_LOCATE_POST_TEST_QUERY_PENALTY", 1.0)
+        } else {
+            locate_env_f32("KIN_LOCATE_POST_TEST_PENALTY", 0.35)
+        };
+    }
+    if is_docs_or_locale_path(path) {
+        penalty *= locate_env_f32("KIN_LOCATE_DOCS_PATH_PENALTY", 0.01);
+    }
+    penalty
+}
+
 /// The global entity ordering: definitions first, then the exact-name tier
 /// ([`locate_exact_name_tier`]: a hit the query literally named cannot be outbid
 /// by fallback scale), then composite score desc, then owner graph mass for the
@@ -17231,6 +17402,7 @@ pub fn build_entity_view(
     opts: &SnippetOptions,
     source_scope: kin_mcp::handlers::common::EntitySourceScope,
     query: &str,
+    test_query: bool,
 ) -> Result<()> {
     if !opts.enabled {
         return Ok(());
@@ -17255,6 +17427,12 @@ pub fn build_entity_view(
     // it walks every tracked artifact and most rankings never need it.
     let mut tracked_artifacts: Option<HashSet<String>> = None;
     for (file_rank, file) in result.files.iter().enumerate() {
+        // File ordering preserves the full path ranking. Carry only the role
+        // demotions that raw symbol scores otherwise lose at entity projection;
+        // see `entity_projection_role_penalty` for why the full path factor must
+        // not be guessed here. Exact-name hits still sort in the name tier
+        // before score, so an examples/test symbol remains directly addressable.
+        let entity_path_penalty = entity_projection_role_penalty(&file.path, test_query);
         let filter = EntityFilter {
             file_path: Some(kin_model::FilePathId::new(&file.path)),
             ..Default::default()
@@ -17316,7 +17494,7 @@ pub fn build_entity_view(
                 .as_ref()
                 .map(|origin| origin.0.clone())
                 .or_else(|| Some(file.path.clone()));
-            let match_kind = classify_locate_match(query, &entity.name, &sym.origin);
+            let match_kind = classify_locate_match(query, &entity.name, &sym.origin, sym.cosine);
             if match_kind == LocateMatchKind::Name && name_owner_mass.len() < owner_mass_limit {
                 name_owner_mass.insert(
                     entity_id.clone(),
@@ -17332,7 +17510,7 @@ pub fn build_entity_view(
                     kind: format!("{:?}", entity.kind).to_lowercase(),
                     name: entity.name.clone(),
                     signature: entity.signature.clone(),
-                    score: sym.score,
+                    score: sym.score * entity_path_penalty,
                     definition: sym.definition,
                     span: sym.span,
                     body,
@@ -17392,19 +17570,33 @@ pub fn build_entity_view(
     // Computed over the FULL ranking, before the daemon windows a page. A
     // per-page verdict would call a query successful because page 1 happened to
     // hold the one name hit, and a fallback because page 2 did not.
-    result.all_fallback = !result.entities.is_empty()
-        && !result
-            .entities
-            .iter()
-            .any(|entity| entity.match_kind == Some(LocateMatchKind::Name));
+    result.all_fallback = locate_entities_are_all_fallback(&result.entities);
     Ok(())
 }
 
-/// Stable, opaque key for a locate ranking, scoped to the query, the ref/scope it
-/// ran against, the graph version, and the entity projection it was built in.
-/// Embedding the graph version means any edit (a `vfs_version` bump) yields a
-/// different key, so a stale cursor can never page a ranking built against
-/// different graph truth.
+/// Whether a non-empty whole entity ranking contains no literal name hit.
+///
+/// Public for daemon cache rehydration: the cache keeps the full entities, not
+/// this derived response field, and a cursor page must recompute the verdict
+/// before it windows the ranking or a later page will silently lose guidance.
+pub fn locate_entities_are_all_fallback(entities: &[LocateEntity]) -> bool {
+    !entities.is_empty()
+        && !entities
+            .iter()
+            .any(|entity| entity.match_kind == Some(LocateMatchKind::Name))
+}
+
+/// Fresh, opaque key for one locate ranking, prefixed by a fingerprint of the
+/// query, ref/scope, graph version, and entity projection it was built in.
+///
+/// Freshness is part of the contract. Ranking shape includes more than those
+/// four stable fields: caller surface, result width, test-role inclusion,
+/// explanation mode, snippet cap, and adaptive ranking inputs all change what
+/// the held list contains. A deterministic key let a later same-query request
+/// with a different shape overwrite an earlier cursor's ranking. The nonce
+/// isolates every fresh ranking; the fingerprint keeps the useful diagnostic
+/// scope without pretending it is a complete cache identity. Cache entries also
+/// carry and verify the graph version before any page is served.
 ///
 /// `mode` is part of the key because a cached ranking IS the paged answer, so the
 /// projection it was built in decides what every later page returns. Three ways
@@ -17422,18 +17614,29 @@ pub fn build_entity_view(
 ///   real ranking, so an agent's own cursor is then served an empty page from
 ///   cache with no re-run.
 ///
-/// The third is why this takes a [`projection_mode`] token rather than a `bodies`
-/// bool: there are three projections and a bool can only separate two of them.
-/// It is a required parameter rather than something callers fold into `reference`
-/// themselves because every paging surface has to make the same decision, and a
-/// convention that lives in three call sites and is enforced in none is how these
-/// defects arrived.
+/// The third is why this still fingerprints a [`projection_mode`] token rather
+/// than a `bodies` bool: there are three projections and a bool can only separate
+/// two of them. The nonce is the isolation boundary; the mode remains useful in
+/// the key when diagnosing which fresh request minted a cursor.
 pub fn locate_cursor_key(
     text: &str,
     reference: Option<&str>,
     graph_version: u64,
     mode: &str,
 ) -> String {
+    format!(
+        "{:016x}{}",
+        locate_cursor_fingerprint(text, reference, graph_version, mode),
+        uuid::Uuid::new_v4().simple()
+    )
+}
+
+fn locate_cursor_fingerprint(
+    text: &str,
+    reference: Option<&str>,
+    graph_version: u64,
+    mode: &str,
+) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = FxHasher::default();
     text.hash(&mut hasher);
@@ -17443,34 +17646,10 @@ pub fn locate_cursor_key(
     graph_version.hash(&mut hasher);
     0xff_u8.hash(&mut hasher);
     mode.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    hasher.finish()
 }
 
-/// A locate paging cursor: the ranking key plus the page to fetch. Serialized as
-/// `<key>.<page>` (the key is hex, so the last `.` cleanly separates the page).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LocateCursor {
-    pub key: String,
-    pub page: usize,
-}
-
-impl LocateCursor {
-    pub fn encode(&self) -> String {
-        format!("{}.{}", self.key, self.page)
-    }
-
-    pub fn decode(token: &str) -> Option<LocateCursor> {
-        let (key, page) = token.trim().rsplit_once('.')?;
-        if key.is_empty() {
-            return None;
-        }
-        let page = page.parse::<usize>().ok()?;
-        Some(LocateCursor {
-            key: key.to_string(),
-            page,
-        })
-    }
-}
+pub use kin_core::LocateCursor;
 
 /// Window the full ranked `result.entities` down to a single page and set the
 /// paging fields. Pure: the daemon caches the full ranking under `cursor_key`,
@@ -17484,9 +17663,28 @@ pub fn apply_entity_page(
     page_size: usize,
 ) {
     let page_size = page_size.max(1);
+    apply_entity_page_at_offset(
+        result,
+        cursor_key,
+        page,
+        page_size,
+        page.saturating_mul(page_size),
+    );
+}
+
+/// Window a held ranking from an explicit row offset. Cursor continuations use
+/// this form because a budget-trimmed prior page can make the honest next offset
+/// differ from `page * page_size`.
+pub fn apply_entity_page_at_offset(
+    result: &mut LocateResult,
+    cursor_key: &str,
+    page: usize,
+    page_size: usize,
+    start: usize,
+) {
+    let page_size = page_size.max(1);
     let total = result.entities.len();
     result.total_ranked = total;
-    let start = page.saturating_mul(page_size);
     let end = start.saturating_add(page_size).min(total);
     let window = if start < total {
         result.entities[start..end].to_vec()
@@ -17500,6 +17698,61 @@ pub fn apply_entity_page(
         LocateCursor {
             key: cursor_key.to_string(),
             page: page + 1,
+            next_offset: Some(end),
+            page_size: Some(page_size),
+        }
+        .encode()
+    });
+}
+
+/// Window the full ranked `result.files` down to the first file page.
+///
+/// File-granularity callers must page the collection they asked for. Paging
+/// `entities` while re-emitting the complete `files` roll-up would give every
+/// continuation the same answer and mint a cursor whose offset counted a
+/// different collection.
+pub fn apply_file_page(result: &mut LocateResult, cursor_key: &str, page: usize, page_size: usize) {
+    let page_size = page_size.max(1);
+    apply_file_page_at_offset(
+        result,
+        cursor_key,
+        page,
+        page_size,
+        page.saturating_mul(page_size),
+    );
+}
+
+/// Window a held file ranking from an explicit absolute offset.
+///
+/// The entity projection is cleared because `granularity: "file"` makes
+/// `files[]` the primary answer. Keeping a second entity page would make the
+/// response budget select and rebase the wrong collection.
+pub fn apply_file_page_at_offset(
+    result: &mut LocateResult,
+    cursor_key: &str,
+    page: usize,
+    page_size: usize,
+    start: usize,
+) {
+    let page_size = page_size.max(1);
+    let total = result.files.len();
+    result.total_ranked = total;
+    let end = start.saturating_add(page_size).min(total);
+    let window = if start < total {
+        result.files[start..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    let has_more = end < total;
+    result.entities.clear();
+    result.files = window;
+    result.page = page;
+    result.next_cursor = has_more.then(|| {
+        LocateCursor {
+            key: cursor_key.to_string(),
+            page: page + 1,
+            next_offset: Some(end),
+            page_size: Some(page_size),
         }
         .encode()
     });
@@ -17576,14 +17829,16 @@ fn locate_entity_tiebreak_path(entity: &LocateEntity) -> &str {
 /// text (index-aligned with `results`; index 0 is the primary query). Entities
 /// are fused by `entity_id`, files by path; each fused hit records which variant
 /// texts surfaced it in `matched_queries`. Entity ordering honors the exact-name
-/// tier first ([`locate_exact_name_tier`] on the carried record), then RRF score
+/// tier first ([`locate_exact_name_tier`] on the strongest match kind reported
+/// by any contributing variant), then RRF score
 /// descending with deterministic tie-breaks (file path then id); the tier holds
 /// at the fusion layer because a fallback row surfaced by every variant can
 /// out-sum a name hit's rank reciprocals, which would hand the fused rank 1 back
 /// to the lexical neighbor the per-variant tier just demoted. Files stay
 /// RRF-descending (path tie-break). The per-hit composite `score` is preserved
 /// from the hit's best-ranked variant — array order carries the fused ranking.
-/// `degradations` are unioned; the debug object and semantic coverage are taken
+/// All other per-hit fields come from the best-ranked variant. `degradations`
+/// are unioned; the debug object and semantic coverage are taken
 /// from the primary variant. With a single variant this returns that result
 /// unchanged (no fusion, no attribution).
 pub fn fuse_locate_results(
@@ -17599,6 +17854,15 @@ pub fn fuse_locate_results(
     let file_lists: Vec<Vec<LocateFileEntry>> = results.iter().map(|r| r.files.clone()).collect();
 
     let mut fused_entities = rrf_fuse(&entity_lists, |e| e.identity_key().to_string(), rrf_k);
+    for (entity, lists, _) in &mut fused_entities {
+        let identity = entity.identity_key();
+        entity.match_kind = lists
+            .iter()
+            .flat_map(|&list| entity_lists[list].iter())
+            .filter(|candidate| candidate.identity_key() == identity)
+            .filter_map(|candidate| candidate.match_kind)
+            .max_by_key(|kind| locate_match_kind_strength(*kind));
+    }
     fused_entities.sort_by(|(a, _, sa), (b, _, sb)| {
         locate_exact_name_tier(b)
             .cmp(&locate_exact_name_tier(a))
@@ -17928,65 +18192,46 @@ mod tests {
             .expect("a sub-Performance tier must record a capability_tier degradation")
     }
 
-    /// The greenfield stranger stopped trusting description queries on a
-    /// five-module project and fell back to grep, which was the right call and
-    /// one the tool never made for them. Below the fusion constant the whole
-    /// corpus sits in the flat part of the curve, so the honest move is to say
-    /// so rather than serve a weak answer that looks like a confident one.
+    /// The advice stays attached to the query shape that needs it, instead of
+    /// retiring at the RRF constant. The rc061y ranking was right at 14
+    /// entities while warning and wrong at 237 after the old threshold silenced
+    /// the warning.
     #[test]
-    fn a_graph_under_the_fusion_constant_discloses_that_descriptions_rank_weakly() {
-        let threshold = locate_rrf_k() as usize;
-        let small = threshold.saturating_sub(1);
-
+    fn description_query_guidance_is_not_tied_to_the_fusion_constant() {
         let mut sink = Vec::new();
-        record_small_corpus_degradation(small, &mut sink);
+        record_description_query_guidance(&mut sink);
         let entry = sink
             .iter()
-            .find(|entry| entry.component == kin_mcp::negative::CORPUS_SCALE_COMPONENT)
-            .unwrap_or_else(|| {
-                panic!(
-                    "a graph of {small} entities is under the {threshold}-entity fusion \
-                        constant and must disclose it, got {sink:?}"
-                )
-            });
-        assert_eq!(entry.reason, kin_mcp::negative::SMALL_CORPUS_REASON);
+            .find(|entry| entry.component == kin_mcp::negative::QUERY_SHAPE_COMPONENT)
+            .expect("a description-shaped entity ranking must carry its guidance");
         assert!(
-            entry.detail.contains(&format!("{small} entities")),
-            "the entry must name the count it is about: {}",
+            entry
+                .detail
+                .contains("not one ranked entity was literally named"),
+            "the entry must name the response fact it is about: {}",
             entry.detail
         );
+        assert_eq!(
+            entry.reason,
+            kin_mcp::negative::DESCRIPTION_ENTITY_RANKING_REASON
+        );
         assert!(
-            entry.detail.contains(&threshold.to_string()),
-            "and the threshold it is measured against: {}",
+            entry
+                .detail
+                .contains("rows marked `semantic` carry vector evidence"),
+            "all_fallback must not be misread as embeddings unused: {}",
             entry.detail
         );
-        assert!(
-            entry.remediation.contains("exact entity or file name"),
-            "the remediation must name the form that does work at this size: {}",
-            entry.remediation
-        );
-        // FIR-2582: and the granularity that works, which the stranger found by
-        // accident after the run had already gone wrong. The path heuristics
-        // that separate candidates live at file granularity, so a caller with a
-        // description and no symbol to name has somewhere to go besides grep.
         assert!(
             entry.remediation.contains("granularity: \"file\""),
-            "the remediation must name the granularity that ranks under the constant: {}",
+            "the remediation must name the granularity that stayed useful: {}",
             entry.remediation
         );
-
-        // The control that makes the threshold mean something: a graph at the
-        // constant discloses nothing, so this cannot be an entry every store
-        // carries.
-        let mut large = Vec::new();
-        record_small_corpus_degradation(threshold, &mut large);
         assert!(
-            large.is_empty(),
-            "a graph of {threshold} entities is not a small corpus, got {large:?}"
+            entry.remediation.contains("existing files[] rollup"),
+            "the CLI must receive advice it can act on without a granularity flag: {}",
+            entry.remediation
         );
-        let mut much_larger = Vec::new();
-        record_small_corpus_degradation(threshold * 100, &mut much_larger);
-        assert!(much_larger.is_empty(), "{much_larger:?}");
     }
 
     /// The misread host in the surface a caller actually reads. A tier the host
@@ -18161,7 +18406,7 @@ mod tests {
             definition: true,
             span: Some([1, 9]),
             body: None,
-            match_kind: Some(classify_locate_match(query, name, "text")),
+            match_kind: Some(classify_locate_match(query, name, "text", None)),
             provenance: LocateProvenance {
                 file: Some("linkgraph.py".to_string()),
                 origin: "text".to_string(),
@@ -19041,6 +19286,18 @@ mod tests {
             .collect()
     }
 
+    fn file_ranking(n: usize) -> Vec<LocateFileEntry> {
+        (0..n)
+            .map(|index| {
+                serde_json::from_value(serde_json::json!({
+                    "path": format!("src/f{index}.rs"),
+                    "score": 1.0 - index as f32 * 0.01,
+                }))
+                .expect("minimal file entry")
+            })
+            .collect()
+    }
+
     #[test]
     fn locate_entity_serializes_entity_centric_with_file_as_provenance() {
         let result = LocateResult {
@@ -19093,7 +19350,7 @@ mod tests {
         assert_eq!(result.total_ranked, 20);
         // First page holds the top-ranked entity; more remain → next_cursor set.
         assert_eq!(result.entities[0].name, "e0");
-        assert_eq!(result.next_cursor.as_deref(), Some("abc123.1"));
+        assert_eq!(result.next_cursor.as_deref(), Some("v2.abc123.1.6.6"));
     }
 
     #[test]
@@ -19132,41 +19389,146 @@ mod tests {
         // page_size 0 must clamp to 1, not divide-by-zero or return everything.
         apply_entity_page(&mut result, "k", 0, 0);
         assert_eq!(result.entities.len(), 1);
-        assert_eq!(result.next_cursor.as_deref(), Some("k.1"));
+        assert_eq!(result.next_cursor.as_deref(), Some("v2.k.1.1.1"));
     }
 
     #[test]
-    fn locate_cursor_round_trips_and_rejects_garbage() {
+    fn cli_locate_paging_rejects_an_explicit_zero_width() {
+        let paging = LocatePaging {
+            page_size: Some(0),
+            ..Default::default()
+        };
+        let error = paging.validate().unwrap_err().to_string();
+        assert!(error.contains("--page-size") && error.contains("positive integer"));
+
+        assert!(LocatePaging::default().validate().is_ok());
+        assert!(LocatePaging {
+            page_size: Some(1),
+            ..Default::default()
+        }
+        .validate()
+        .is_ok());
+    }
+
+    #[test]
+    fn apply_file_page_counts_files_clears_entities_and_uses_absolute_offset() {
+        let mut result = LocateResult {
+            entities: ranking(7),
+            files: file_ranking(5),
+            ..Default::default()
+        };
+        apply_file_page_at_offset(&mut result, "files", 1, 2, 2);
+        assert!(
+            result.entities.is_empty(),
+            "file mode has one primary collection"
+        );
+        assert_eq!(
+            result
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["src/f2.rs", "src/f3.rs"]
+        );
+        assert_eq!(result.total_ranked, 5, "file count, not entity count");
+        assert_eq!(result.page, 1);
+        assert_eq!(result.next_cursor.as_deref(), Some("v2.files.2.4.2"));
+
+        let mut narrow = LocateResult {
+            files: file_ranking(5),
+            ..Default::default()
+        };
+        apply_file_page_at_offset(&mut narrow, "files", 1, 1, 2);
+        assert_eq!(narrow.files[0].path, "src/f2.rs");
+        assert_eq!(
+            narrow.next_cursor.as_deref(),
+            Some("v2.files.2.3.1"),
+            "a width override changes only how many files are emitted"
+        );
+    }
+
+    #[test]
+    fn locate_cursor_round_trips_width_and_accepts_legacy_tokens() {
         let cursor = LocateCursor {
             key: "deadbeefcafef00d".to_string(),
             page: 7,
+            next_offset: Some(42),
+            page_size: Some(6),
         };
         let token = cursor.encode();
-        assert_eq!(token, "deadbeefcafef00d.7");
+        assert_eq!(token, "v2.deadbeefcafef00d.7.42.6");
         assert_eq!(LocateCursor::decode(&token), Some(cursor));
+        assert_eq!(
+            LocateCursor::decode("deadbeefcafef00d.7"),
+            Some(LocateCursor {
+                key: "deadbeefcafef00d".to_string(),
+                page: 7,
+                next_offset: None,
+                page_size: None,
+            }),
+            "old two-part cursors must keep using the cached-width fallback"
+        );
         // Garbage / non-numeric page / empty key → None (never a silent page 0).
         assert!(LocateCursor::decode("nodelimiter").is_none());
         assert!(LocateCursor::decode("key.notanumber").is_none());
         assert!(LocateCursor::decode(".5").is_none());
+        assert!(LocateCursor::decode("key.1.0").is_none());
+        assert!(LocateCursor::decode("key.nope.6").is_none());
+        assert!(LocateCursor::decode("key.1.6").is_none());
     }
 
     #[test]
-    fn locate_cursor_key_is_deterministic_and_version_scoped() {
+    fn entity_window_can_resume_from_a_budget_adjusted_offset() {
+        let mut result = LocateResult {
+            entities: ranking(20),
+            ..Default::default()
+        };
+        apply_entity_page_at_offset(&mut result, "k", 2, 3, 8);
+        assert_eq!(
+            result
+                .entities
+                .iter()
+                .map(|entity| entity.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["e8", "e9", "e10"]
+        );
+        assert_eq!(result.next_cursor.as_deref(), Some("v2.k.3.11.3"));
+    }
+
+    #[test]
+    fn locate_cursor_keys_are_fresh_and_keep_a_scoped_fingerprint() {
         let a = locate_cursor_key("find the parser", Some("HEAD"), 42, "ranking+bodies");
         let b = locate_cursor_key("find the parser", Some("HEAD"), 42, "ranking+bodies");
-        assert_eq!(a, b, "same inputs must yield the same key");
-        // A graph edit bumps the version → a different key, so a stale cursor can
-        // never page a ranking built against different graph truth.
-        let c = locate_cursor_key("find the parser", Some("HEAD"), 43, "ranking+bodies");
-        assert_ne!(a, c);
-        // Query and ref are part of the identity.
         assert_ne!(
-            a,
-            locate_cursor_key("other query", Some("HEAD"), 42, "ranking+bodies")
+            a, b,
+            "two fresh same-query rankings must not overwrite one cache slot"
         );
         assert_ne!(
-            a,
-            locate_cursor_key("find the parser", Some("main"), 42, "ranking+bodies")
+            &a[16..],
+            &b[16..],
+            "the per-ranking nonce is the cache isolation boundary"
+        );
+        assert_eq!(
+            &a[..16],
+            &b[..16],
+            "equal stable inputs retain one diagnostic fingerprint"
+        );
+        let fingerprint = |text, reference, version, mode| {
+            locate_cursor_fingerprint(text, reference, version, mode)
+        };
+        // Query, ref, graph version, and projection remain visible in the stable
+        // fingerprint even though freshness, not this subset, provides isolation.
+        assert_ne!(
+            fingerprint("find the parser", Some("HEAD"), 42, "ranking+bodies"),
+            fingerprint("other query", Some("HEAD"), 42, "ranking+bodies")
+        );
+        assert_ne!(
+            fingerprint("find the parser", Some("HEAD"), 42, "ranking+bodies"),
+            fingerprint("find the parser", Some("main"), 42, "ranking+bodies")
+        );
+        assert_ne!(
+            fingerprint("find the parser", Some("HEAD"), 42, "ranking+bodies"),
+            fingerprint("find the parser", Some("HEAD"), 43, "ranking+bodies")
         );
     }
 
@@ -19182,7 +19544,7 @@ mod tests {
     /// mutually distinct, which is what this asserts.
     #[test]
     fn locate_cursor_key_separates_every_projection_mode() {
-        let key = |mode| locate_cursor_key("find the parser", Some("HEAD"), 42, mode);
+        let key = |mode| locate_cursor_fingerprint("find the parser", Some("HEAD"), 42, mode);
         let none = key(projection_mode(false, false));
         let ranking = key(projection_mode(true, false));
         let with_bodies = key(projection_mode(true, true));
@@ -19199,12 +19561,30 @@ mod tests {
         );
         assert_ne!(none, with_bodies);
 
-        // Deterministic within a mode; the mode is the ONLY difference above.
+        // Deterministic within a fingerprint; the mode is the ONLY difference above.
         assert_eq!(
             ranking,
             key(projection_mode(true, false)),
-            "the key must still be deterministic within a mode"
+            "the diagnostic fingerprint must stay deterministic within a mode"
         );
+    }
+
+    #[test]
+    fn cursor_continuations_keep_the_structured_output_surface() {
+        assert!(locate_outputs_json(true, None));
+        assert!(
+            locate_outputs_json(false, Some("opaque-cursor")),
+            "documented bare `kin locate --next` must render entities, not replay files[]"
+        );
+        assert!(!locate_outputs_json(false, None));
+    }
+
+    #[test]
+    fn bare_cursor_omits_false_explain_and_explicit_explain_survives() {
+        assert_eq!(locate_explain_request(false, None), Some(false));
+        assert_eq!(locate_explain_request(true, None), Some(true));
+        assert_eq!(locate_explain_request(false, Some("cursor")), None);
+        assert_eq!(locate_explain_request(true, Some("cursor")), Some(true));
     }
 
     /// `bodies` alone cannot distinguish the three projections, which is the whole
@@ -19594,7 +19974,8 @@ mod tests {
             classify_locate_match(
                 "cross_encoder_model_cached",
                 "cross_encoder_model_cached",
-                ""
+                "",
+                None,
             ),
             LocateMatchKind::Name
         );
@@ -19605,14 +19986,15 @@ mod tests {
             classify_locate_match(
                 "where is Cross_Encoder_Model_Cached decided?",
                 "cross_encoder_model_cached",
-                "vector"
+                "vector",
+                Some(0.91),
             ),
             LocateMatchKind::Name
         );
         // A dotted name is named by its last segment, the same way the exact
         // name boost reads it.
         assert_eq!(
-            classify_locate_match("call parse_request", "http.parse_request", ""),
+            classify_locate_match("call parse_request", "http.parse_request", "", None),
             LocateMatchKind::Name
         );
     }
@@ -19623,18 +20005,34 @@ mod tests {
     #[test]
     fn a_nonexistent_symbol_leaves_every_hit_flagged_as_fallback() {
         let absent = "kin_absent_symbol_negative_control";
-        for (name, origin, expected) in [
-            ("candidate", "", LocateMatchKind::TextFallback),
-            ("query_trace_matches", "text", LocateMatchKind::TextFallback),
-            ("exact_name_match", "vector", LocateMatchKind::Semantic),
+        for (name, origin, cosine, expected) in [
+            ("candidate", "", None, LocateMatchKind::TextFallback),
+            (
+                "query_trace_matches",
+                "text",
+                None,
+                LocateMatchKind::TextFallback,
+            ),
+            (
+                "exact_name_match",
+                "vector",
+                Some(0.81),
+                LocateMatchKind::Semantic,
+            ),
+            (
+                "cosine_only_match",
+                "",
+                Some(0.79),
+                LocateMatchKind::Semantic,
+            ),
         ] {
             assert_eq!(
-                classify_locate_match(absent, name, origin),
+                classify_locate_match(absent, name, origin, cosine),
                 expected,
                 "no token of {absent} names {name}"
             );
             assert_ne!(
-                classify_locate_match(absent, name, origin),
+                classify_locate_match(absent, name, origin, cosine),
                 LocateMatchKind::Name
             );
         }
@@ -19648,7 +20046,8 @@ mod tests {
             classify_locate_match(
                 "Where does Kin decide whether to use the reranker?",
                 "decide_review_with_graph",
-                ""
+                "",
+                None,
             ),
             LocateMatchKind::TextFallback
         );
@@ -19859,6 +20258,7 @@ mod tests {
             &SnippetOptions::enabled(None).without_bodies(),
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
             "prune_orphaned_vectors",
+            false,
         )
         .unwrap();
 
@@ -19886,6 +20286,92 @@ mod tests {
             .find(|entity| entity.name == "InMemoryGraph::descriptor")
             .expect("the other symbol still ranks");
         assert_eq!(other.match_kind, Some(LocateMatchKind::TextFallback));
+    }
+
+    /// Entity projection must retain the path demotion that already shaped file
+    /// ranking. The controls prove ordinary source is unchanged, tests stay
+    /// demoted, and an explicitly named examples symbol is still a direct hit
+    /// through the higher name tier.
+    #[test]
+    #[serial_test::serial]
+    fn examples_entities_do_not_outrank_library_code_on_description_queries() {
+        let _penalties =
+            kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_POST_TEST_PENALTY", "0.35")
+                .with("KIN_LOCATE_POST_TEST_QUERY_PENALTY", "1.0")
+                .with("KIN_LOCATE_DOCS_PATH_PENALTY", "0.01")
+                .with("KIN_LOCATE_ENTITY_SURFACE_PENALTY", "0.3");
+        let graph = kin_db::InMemoryGraph::new();
+        let candidates = [
+            ("example_handler", "examples/handler.rs", 0.99_f32),
+            ("test_handler", "tests/handler.rs", 0.98_f32),
+            ("production_handler", "lib/handler.rs", 0.90_f32),
+        ];
+        for (name, path, _) in candidates {
+            graph
+                .upsert_entity(&test_entity(name, path, 10, 20))
+                .unwrap();
+        }
+
+        let rank = |query: &str| {
+            let files = candidates
+                .iter()
+                .map(|(name, path, score)| LocateFileEntry {
+                    path: (*path).to_string(),
+                    score: *score,
+                    signals: vec![],
+                    spans: vec![],
+                    symbols: vec![LocateSymbol {
+                        name: (*name).to_string(),
+                        span: Some([10, 20]),
+                        score: *score,
+                        kind: "function".to_string(),
+                        definition: true,
+                        origin: "text".to_string(),
+                        cosine: None,
+                        snippet: None,
+                    }],
+                    explain: vec![],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                })
+                .collect();
+            let mut result = LocateResult {
+                files,
+                ..Default::default()
+            };
+            build_entity_view(
+                &mut result,
+                &kin_mcp::handlers::common::HeldSourceAuthority::new(&graph, None),
+                &SnippetOptions::enabled(None).without_bodies(),
+                kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+                query,
+                false,
+            )
+            .unwrap();
+            result.entities
+        };
+
+        let described = rank("where is a request handled");
+        assert_eq!(
+            described[0].name, "production_handler",
+            "path-keyed examples and test demotions must survive entity projection: {described:?}"
+        );
+        let scores = described
+            .iter()
+            .map(|entity| (entity.name.as_str(), entity.score))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(scores["production_handler"], 0.90);
+        assert!(scores["test_handler"] < scores["production_handler"]);
+        assert!(scores["example_handler"] < scores["test_handler"]);
+
+        let named = rank("example_handler");
+        assert_eq!(
+            named[0].name, "example_handler",
+            "the name tier must keep a genuinely named examples symbol directly addressable"
+        );
+        assert_eq!(named[0].match_kind, Some(LocateMatchKind::Name));
     }
 
     /// FIR-2338, the per-query half, in the shape the flagship gauntlet
@@ -19966,6 +20452,7 @@ mod tests {
                 &SnippetOptions::enabled(None).without_bodies(),
                 kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
                 "RepositoryAuthorityState::resolve_ref_target",
+                false,
             )
             .unwrap();
             assert_eq!(
@@ -20011,6 +20498,7 @@ mod tests {
             &SnippetOptions::enabled(None).without_bodies(),
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
             "how are refs resolved against repository authority",
+            false,
         )
         .unwrap();
         assert!(
@@ -20176,6 +20664,7 @@ mod tests {
                 &SnippetOptions::enabled(None).without_bodies(),
                 kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
                 "delete_work_item",
+                false,
             )
             .unwrap();
             result
@@ -20323,6 +20812,7 @@ mod tests {
             &SnippetOptions::enabled(None).without_bodies(),
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
             "embed_batch",
+            false,
         )
         .unwrap();
         assert_eq!(
@@ -20384,6 +20874,48 @@ mod tests {
         assert!(!empty.all_fallback);
     }
 
+    /// A shared entity can be best-ranked on a descriptive variant and named
+    /// only by a lower-ranked sharp variant. Fusion must carry the strongest
+    /// match evidence from every contributing variant rather than the record
+    /// RRF happened to retain, or it labels a successful fan-out as fallback.
+    #[test]
+    fn fusion_keeps_a_name_hit_from_a_lower_ranked_variant() {
+        let with_kind = |id: &str, kind| {
+            let mut entity = fusion_entity(id, "src/shared.rs", 1.0);
+            entity.match_kind = Some(kind);
+            entity
+        };
+        let fused = fuse_locate_results(
+            vec![
+                "where is the request routed".to_string(),
+                "route_request".to_string(),
+            ],
+            vec![
+                fusion_result(vec![with_kind("shared", LocateMatchKind::TextFallback)]),
+                fusion_result(vec![
+                    with_kind("other", LocateMatchKind::Semantic),
+                    with_kind("shared", LocateMatchKind::Name),
+                ]),
+            ],
+            60.0,
+        );
+        let shared = fused
+            .entities
+            .iter()
+            .find(|entity| entity.entity_id == "shared")
+            .expect("the shared entity remains in the fused ranking");
+        assert_eq!(
+            shared.match_kind,
+            Some(LocateMatchKind::Name),
+            "the lower-ranked sharp variant still named this entity: {:#?}",
+            shared.matched_queries
+        );
+        assert!(
+            !fused.all_fallback,
+            "one named entity means the multi-query ranking found a named target"
+        );
+    }
+
     #[test]
     fn match_kind_serializes_under_the_search_surface_vocabulary() {
         let mut entity = mk_locate_entity("a", 1.0, true);
@@ -20428,6 +20960,7 @@ mod tests {
             &SnippetOptions::default(),
             kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
             "query",
+            false,
         )
         .unwrap();
         assert!(

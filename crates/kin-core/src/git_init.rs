@@ -2788,4 +2788,116 @@ mod tests {
         );
         String::from_utf8(output.stdout).unwrap()
     }
+
+    /// Every creation door publishes a readable record, read back through the
+    /// product's own reader.
+    ///
+    /// The claim this fixes is that one staging boundary stamps every store. The
+    /// code shape supported it and nothing executed it: a future creation path
+    /// can bypass `prepare_repository_layout_with_origin` while a suite that
+    /// only ever built one store stays green. Each arm below is a separate
+    /// public entry point, and `kin-migrate` is covered because its executor
+    /// calls `init_from_git` and its finalizer calls `init`.
+    #[test]
+    fn every_creation_door_publishes_a_readable_creation_record() {
+        use crate::hydration_semantics::{self, HydrationStanding};
+
+        let adopted = RepositoryId::new(uuid::Uuid::new_v4().to_string()).unwrap();
+
+        let bare = tempfile::tempdir().unwrap();
+        let bare_layout = crate::init(bare.path()).unwrap().layout;
+
+        let bare_replica = tempfile::tempdir().unwrap();
+        let bare_replica_layout = crate::init_replica(bare_replica.path(), "main")
+            .unwrap()
+            .layout;
+
+        let adopting = tempfile::tempdir().unwrap();
+        let adopting_layout = crate::init_adopting(adopting.path(), &adopted)
+            .unwrap()
+            .layout;
+
+        // The door a native clone takes: the empty receiver it creates before
+        // pulling the remote's history into it.
+        let replica_adopting = tempfile::tempdir().unwrap();
+        let replica_adopting_layout =
+            crate::init_replica_adopting(replica_adopting.path(), "main", &adopted)
+                .unwrap()
+                .layout;
+
+        let git_source = tempfile::tempdir().unwrap();
+        initialize_git(git_source.path());
+        std::fs::write(
+            git_source.path().join("lib.py"),
+            b"def door():\n    return 1\n",
+        )
+        .unwrap();
+        git(git_source.path(), ["add", "--all"]);
+        git(git_source.path(), ["commit", "-m", "creation door"]);
+        let git_layout = init_from_git(git_source.path()).unwrap().layout;
+
+        let git_adopting_source = tempfile::tempdir().unwrap();
+        initialize_git(git_adopting_source.path());
+        std::fs::write(
+            git_adopting_source.path().join("lib.py"),
+            b"def adopted_door():\n    return 2\n",
+        )
+        .unwrap();
+        git(git_adopting_source.path(), ["add", "--all"]);
+        git(git_adopting_source.path(), ["commit", "-m", "adopted door"]);
+        let git_adopting_layout = init_from_git_adopting(git_adopting_source.path(), &adopted)
+            .unwrap()
+            .layout;
+
+        let doors = [
+            ("init", &bare_layout),
+            ("init_replica", &bare_replica_layout),
+            ("init_adopting", &adopting_layout),
+            ("init_replica_adopting", &replica_adopting_layout),
+            ("init_from_git", &git_layout),
+            ("init_from_git_adopting", &git_adopting_layout),
+        ];
+        // Named in a list rather than counted, so a door going missing has to be
+        // a deliberate edit to this line and not a silently shorter loop.
+        assert_eq!(
+            doors.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            vec![
+                "init",
+                "init_replica",
+                "init_adopting",
+                "init_replica_adopting",
+                "init_from_git",
+                "init_from_git_adopting",
+            ]
+        );
+
+        for (door, layout) in doors {
+            let read = hydration_semantics::read(layout);
+            let stamp = match &read {
+                hydration_semantics::HydrationSemanticsRead::Recorded(stamp) => stamp,
+                other => panic!("{door} published no readable creation record: {other:?}"),
+            };
+            assert_eq!(
+                stamp.created_under,
+                hydration_semantics::binary_version(),
+                "{door} recorded a version this binary did not author"
+            );
+            assert_eq!(
+                stamp.schema,
+                hydration_semantics::HYDRATION_SEMANTICS_SCHEMA,
+                "{door} wrote an unrecognized schema token"
+            );
+            assert_eq!(
+                hydration_semantics::standing(layout),
+                HydrationStanding::Current {
+                    version: hydration_semantics::binary_version()
+                },
+                "{door} left a freshly created store reading as a gap"
+            );
+            assert!(
+                layout.kindb_hydration_semantics_path().is_file(),
+                "{door} left no file at the path the reader looks in"
+            );
+        }
+    }
 }

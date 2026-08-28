@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kin_model::session::SessionCapabilities;
 use tracing::debug;
@@ -587,19 +587,239 @@ pub(crate) fn suspended_sweep() -> Option<kin_daemon_spawn::SuspendedSweep> {
     kin_daemon_spawn::SuspendedSweep::read(&discover_kin_dir()?)
 }
 
-/// Whether this store's daemon is currently holding heavy work back for want of
-/// memory.
+/// What this store recorded when its daemon held heavy work back for want of
+/// memory, oldest to newest.
 ///
-/// Read from the store on every call for the same reason the sweep tally is:
-/// the record is retired by the pass that runs next, and a server that cached
-/// it would keep telling agents the machine was full after it had emptied.
-pub(crate) fn memory_pressure_refusal() -> Option<kin_core::memory_pressure::PressureRefusal> {
-    kin_core::memory_pressure::PressureRefusal::read(&discover_kin_dir()?)
+/// Durable refusals record past decisions and cannot qualify a response until
+/// either [`outstanding_memory_pressure_refusal`] reconciles the embedding
+/// backlog or the typed graph-status report supplies its own exact coverage.
+/// Reading the whole set is load-bearing: a completed embed refusal must not
+/// hide an outstanding LSP or future-work refusal stored beside it.
+pub(crate) fn recorded_memory_pressure_refusals() -> Vec<kin_core::memory_pressure::PressureRefusal>
+{
+    discover_kin_dir()
+        .map(|kin_root| kin_core::memory_pressure::PressureRefusal::read_all(&kin_root))
+        .unwrap_or_default()
+}
+
+/// Keep a durable pressure refusal only while it still describes outstanding
+/// work for the exact embedding observation a daemon returned.
+///
+/// A missing observation preserves the record. It can mean the daemon is old,
+/// unavailable, or returned a shape this MCP build cannot read, and none of
+/// those is evidence that refused work finished. The canonical predicate also
+/// keeps every non-embedding refusal visible regardless of the embedding count.
+pub(crate) fn pressure_refusal_for_coverage(
+    refusal: kin_core::memory_pressure::PressureRefusal,
+    coverage: Option<kin_core::memory_pressure::EmbeddingCoverage>,
+) -> Option<kin_core::memory_pressure::PressureRefusal> {
+    coverage
+        .map(|coverage| refusal.describes_outstanding_work(coverage))
+        .unwrap_or(true)
+        .then_some(refusal)
+}
+
+/// Qualify durable pressure state against the graph-status report that will be
+/// returned to the caller.
+///
+/// The typed report is the selected-graph authority, so graph status must not
+/// substitute a second `/commands/resources` sample that can be older, newer,
+/// unavailable, or scoped differently. Non-embedding work remains visible.
+/// An embedding refusal published in the same wall-clock second as the report
+/// observation stays visible for this response because second-resolution
+/// timestamps cannot prove that the report observed that exact work cycle.
+pub(crate) fn pressure_refusal_for_selected_graph(
+    refusals: &[kin_core::memory_pressure::PressureRefusal],
+    coverage: kin_core::memory_pressure::EmbeddingCoverage,
+    observation_started_at_unix: u64,
+) -> Option<kin_core::memory_pressure::PressureRefusal> {
+    let embed_work = kin_core::memory_pressure::HeavyWork::EmbedBatch.id();
+    if let Some(refusal) = refusals
+        .iter()
+        .rev()
+        .find(|refusal| refusal.work != embed_work)
+    {
+        return Some(refusal.clone());
+    }
+    let refusal = refusals
+        .iter()
+        .rev()
+        .find(|refusal| refusal.work == embed_work)?
+        .clone();
+    if refusal.at_unix >= observation_started_at_unix {
+        return Some(refusal);
+    }
+    pressure_refusal_for_coverage(refusal, Some(coverage))
+}
+
+/// The wall-clock second at which an external daemon observation starts.
+///
+/// [`PressureRefusal`] records seconds rather than a per-write nonce. Passing
+/// this value into the race guard below keeps the clock itself outside the
+/// policy seam, so equal-record ambiguity is deterministic in tests.
+pub(crate) fn current_unix_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// Apply an exact whole-coverage observation only to the one pressure record it
+/// can settle.
+///
+/// LSP and future work ids have independent backlogs, so they must not pay for
+/// a graph-wide embedding-status request and must not be cleared by its result.
+async fn outstanding_pressure_refusal_with<F, Fut, R>(
+    refusals: Vec<kin_core::memory_pressure::PressureRefusal>,
+    observation_started_at_unix: u64,
+    observe_embedding_coverage: F,
+    read_current_refusal: R,
+) -> Option<kin_core::memory_pressure::PressureRefusal>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Option<kin_core::memory_pressure::EmbeddingCoverage>>,
+    R: FnOnce() -> Vec<kin_core::memory_pressure::PressureRefusal>,
+{
+    let embed_work = kin_core::memory_pressure::HeavyWork::EmbedBatch.id();
+    if let Some(refusal) = refusals
+        .iter()
+        .rev()
+        .find(|refusal| refusal.work != embed_work)
+    {
+        return Some(refusal.clone());
+    }
+    let refusal = refusals
+        .into_iter()
+        .rev()
+        .find(|refusal| refusal.work == embed_work)?;
+    let coverage = observe_embedding_coverage().await;
+
+    // The record is last-writer-wins. A new LSP, unknown-work, or embedding
+    // refusal can replace the one above while the bounded HTTP observation is
+    // in flight, and suppressing that newer fact with the older record's
+    // completion would be the least conservative possible race. A changed record is
+    // returned without applying an observation that was not made for it.
+    // Equality alone is not enough: the record timestamp has one-second
+    // precision, so a clear followed by an identical refusal in the same
+    // second can compare equal to the record whose backlog was observed. An
+    // equal record stamped at or after observation start stays visible for
+    // this response; a later call can settle it after the clock advances.
+    // `None` remains conservative too because a clear followed by a new
+    // publication can interleave with this cross-process read. A true clear is
+    // observed at the start of the next call.
+    let current_refusals = read_current_refusal();
+    if let Some(refusal) = current_refusals
+        .iter()
+        .rev()
+        .find(|refusal| refusal.work != embed_work)
+    {
+        return Some(refusal.clone());
+    }
+    let current_refusal = current_refusals
+        .into_iter()
+        .rev()
+        .find(|refusal| refusal.work == embed_work);
+    match current_refusal {
+        Some(current) if current == refusal && refusal.at_unix < observation_started_at_unix => {
+            pressure_refusal_for_coverage(refusal, coverage)
+        }
+        Some(current) => Some(current),
+        None => Some(refusal),
+    }
+}
+
+/// Read only the exact coverage tuple needed to decide whether a completed
+/// embedding refusal still qualifies this response. Missing and malformed fields remain
+/// unknown rather than being coerced to zero for compatibility with older
+/// daemons.
+fn embedding_coverage_from_resources(
+    value: &serde_json::Value,
+) -> Option<kin_core::memory_pressure::EmbeddingCoverage> {
+    let runtime = value.get("embed_runtime")?;
+    let as_usize = |field: &str| {
+        runtime
+            .get(field)?
+            .as_u64()
+            .and_then(|value| usize::try_from(value).ok())
+    };
+    let coverage = kin_core::memory_pressure::EmbeddingCoverage {
+        pending: as_usize("embeddings_pending")?,
+        indexed: as_usize("embeddings_indexed")?,
+        total: as_usize("embeddings_total")?,
+    };
+    (coverage.indexed <= coverage.total).then_some(coverage)
+}
+
+/// Best-effort, bounded observation of the selected graph's embedding backlog.
+///
+/// This endpoint can inspect the retrievable key set, so it is intentionally
+/// not part of the ordinary envelope path. It is called only when an
+/// `embed-batch` refusal record already exists. The caller's session header is
+/// retained so the observation qualifies the same selected graph as the tool
+/// answer.
+async fn fetch_embedding_coverage_from_resources_at(
+    client: &reqwest::Client,
+    base: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Option<kin_core::memory_pressure::EmbeddingCoverage> {
+    let request = with_session_header(
+        with_auth(client.post(format!("{base}/commands/resources"))),
+        arguments,
+    )
+    .timeout(Duration::from_secs(3))
+    .json(&serde_json::json!({ "json": false }));
+    let response = request.send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let value = response.json::<serde_json::Value>().await.ok()?;
+    embedding_coverage_from_resources(&value)
+}
+
+async fn fetch_embedding_coverage_from_resources(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Option<kin_core::memory_pressure::EmbeddingCoverage> {
+    let client = daemon_client().await?;
+    let base = daemon_base_url()?;
+    fetch_embedding_coverage_from_resources_at(&client, &base, arguments).await
+}
+
+/// What this store currently refuses for memory, filtered by exact daemon
+/// state when and only when the record is for embedding work.
+///
+/// The record is read first, so normal calls and non-embedding refusals perform
+/// no extra request. A failed or legacy observation preserves the refusal.
+pub(crate) async fn outstanding_memory_pressure_refusal(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> Option<kin_core::memory_pressure::PressureRefusal> {
+    let refusals = recorded_memory_pressure_refusals();
+    let observation_started_at_unix = current_unix_seconds();
+    outstanding_pressure_refusal_with(
+        refusals,
+        observation_started_at_unix,
+        || fetch_embedding_coverage_from_resources(arguments),
+        recorded_memory_pressure_refusals,
+    )
+    .await
 }
 
 /// What this store records about being below its own relation census.
 pub(crate) fn relation_census_hold() -> Option<kin_core::relation_census::CensusHold> {
     kin_core::relation_census::CensusHold::read(&discover_kin_dir()?)
+}
+
+/// How this store's recorded creation-time replay version stands against this
+/// binary.
+///
+/// Read on every call because the record belongs to the store, not to this MCP
+/// process. A repository can be re-created while an agent session stays open,
+/// and caching the first reading would keep reporting the replaced store's
+/// creation-time record.
+pub(crate) fn hydration_semantics_standing(
+) -> Option<kin_core::hydration_semantics::HydrationStanding> {
+    Some(kin_core::hydration_semantics::standing_at(
+        &discover_kin_dir()?,
+    ))
 }
 
 /// What this store's last enrichment sweep could not publish.
@@ -1442,13 +1662,37 @@ async fn await_revived_daemon(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "MCP revival: daemon did not become healthy within 15s (port {port}); it was left \
-                 running rather than killed"
-            ));
+            return Err(still_starting_message(port, patience));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// What a revival reports when the daemon it started is alive, has published a
+/// port, and has not finished opening its store inside this caller's patience.
+///
+/// The number is derived from the patience actually waited rather than written
+/// into the sentence. It was written before: the wait beside it was raised to
+/// [`kin_daemon_spawn::daemon_startup_patience`], which floors at 300 s and
+/// shares its override with the CLI, while this message went on saying `15s`.
+/// A stranger run read the sentence, believed the bound, and reported the wait
+/// as the defect that made MCP recovery impossible; the wait had already been
+/// fixed and only the sentence still said fifteen. A number that comes from the
+/// deadline it describes cannot drift from it again, and the test beside this
+/// asserts two different patiences to prove the number is derived rather than
+/// merely correct once.
+///
+/// Worded as a still-starting state rather than a failure, matching
+/// [`kin_daemon_spawn::PortWaitError::StillStarting`] on the port half of the
+/// same revival: the child is alive and was left running, so retrying is the
+/// remedy and killing it is not.
+fn still_starting_message(port: u16, patience: Duration) -> String {
+    format!(
+        "MCP revival: daemon on port {port} is still starting after {}s and was left running \
+         rather than killed. Retry this call, or raise {} to wait longer",
+        patience.as_secs(),
+        kin_daemon_spawn::DAEMON_STARTUP_PATIENCE_ENV
+    )
 }
 
 // ── Seam-based MCP tool dispatch ────────────────────────────────────────
@@ -2352,6 +2596,383 @@ pub async fn forward_check_traffic(
 mod tests {
     use super::*;
 
+    /// Two patiences, because one reading cannot tell a derived number from a
+    /// literal that happens to match it.
+    ///
+    /// The stale sentence said `15s` while the wait resolved to 300 or more, so
+    /// asserting only the real bound would pass a message that had simply been
+    /// re-typed with a different constant. Each patience must name its own
+    /// seconds and must not name the other's.
+    #[test]
+    fn the_still_starting_report_names_the_bound_it_actually_waited() {
+        let short = still_starting_message(40713, Duration::from_secs(15));
+        let real = still_starting_message(40713, Duration::from_secs(300));
+        assert!(
+            short.contains("after 15s"),
+            "a 15 s wait must report 15 s: {short}"
+        );
+        assert!(
+            real.contains("after 300s"),
+            "a 300 s wait must report 300 s, not the literal the sentence used to carry: {real}"
+        );
+        assert!(
+            !real.contains("after 15s"),
+            "the 300 s report still carries the stale 15 s literal: {real}"
+        );
+        assert!(
+            !short.contains("after 300s"),
+            "the 15 s report names a bound it did not wait: {short}"
+        );
+    }
+
+    /// A live daemon that has not finished opening is a retry, not a failure.
+    ///
+    /// The port half of this same revival already reports it that way
+    /// (`PortWaitError::StillStarting`), and the stranger who hit the health
+    /// half was told to restart instead. The message has to say the child was
+    /// left running, offer the retry, and name the lever that widens the wait,
+    /// or the caller has no move but the one that loses the daemon.
+    #[test]
+    fn the_still_starting_report_offers_a_retry_and_the_lever_that_widens_the_wait() {
+        let message = still_starting_message(40713, Duration::from_secs(300));
+        assert!(message.contains("still starting"), "{message}");
+        assert!(message.contains("left running"), "{message}");
+        assert!(message.contains("Retry this call"), "{message}");
+        assert!(
+            message.contains(kin_daemon_spawn::DAEMON_STARTUP_PATIENCE_ENV),
+            "the report names no way to wait longer: {message}"
+        );
+        assert!(
+            message.contains("40713"),
+            "the report names no port: {message}"
+        );
+    }
+
+    fn pressure_refusal(work: &str) -> kin_core::memory_pressure::PressureRefusal {
+        kin_core::memory_pressure::PressureRefusal {
+            work: work.to_string(),
+            level: "constrained".to_string(),
+            reason: format!("{work} was refused"),
+            at_unix: 1,
+        }
+    }
+
+    fn coverage(
+        pending: usize,
+        indexed: usize,
+        total: usize,
+    ) -> kin_core::memory_pressure::EmbeddingCoverage {
+        kin_core::memory_pressure::EmbeddingCoverage {
+            pending,
+            indexed,
+            total,
+        }
+    }
+
+    #[test]
+    fn resources_coverage_extraction_requires_three_exact_nonnegative_integers() {
+        assert_eq!(
+            embedding_coverage_from_resources(&serde_json::json!({
+                "embed_runtime": {
+                    "embeddings_pending": 0,
+                    "embeddings_indexed": 4,
+                    "embeddings_total": 4
+                }
+            })),
+            Some(coverage(0, 4, 4))
+        );
+        assert_eq!(
+            embedding_coverage_from_resources(&serde_json::json!({
+                "embed_runtime": {
+                    "embeddings_pending": 0,
+                    "embeddings_indexed": 4,
+                    "embeddings_total": 5
+                }
+            })),
+            Some(coverage(0, 4, 5)),
+            "an empty queue with short coverage is an exact outstanding-work observation"
+        );
+
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({ "embed_runtime": {} }),
+            serde_json::json!({ "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": 4
+            } }),
+            serde_json::json!({ "embed_runtime": {
+                "embeddings_pending": null,
+                "embeddings_indexed": 4,
+                "embeddings_total": 4
+            } }),
+            serde_json::json!({ "embed_runtime": {
+                "embeddings_pending": "0",
+                "embeddings_indexed": 4,
+                "embeddings_total": 4
+            } }),
+            serde_json::json!({ "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": -1,
+                "embeddings_total": 4
+            } }),
+            serde_json::json!({ "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": 5,
+                "embeddings_total": 4
+            } }),
+        ] {
+            assert_eq!(
+                embedding_coverage_from_resources(&value),
+                None,
+                "an older or malformed resources response stays unobserved: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn graph_status_pressure_uses_its_own_selected_coverage_and_race_boundary() {
+        let embed = pressure_refusal("embed-batch");
+        assert!(
+            pressure_refusal_for_selected_graph(
+                std::slice::from_ref(&embed),
+                coverage(0, 4, 4),
+                2,
+            )
+            .is_none(),
+            "an old embed refusal is settled by the exact complete report being returned"
+        );
+        for selected in [coverage(0, 3, 4), coverage(1, 4, 4), coverage(0, 5, 4)] {
+            assert_eq!(
+                pressure_refusal_for_selected_graph(std::slice::from_ref(&embed), selected, 2,),
+                Some(embed.clone()),
+                "short, live, and impossible selected coverage remain degraded"
+            );
+        }
+
+        for other_work in ["lsp-sweep", "future-heavy-work"] {
+            let other = pressure_refusal(other_work);
+            for refusals in [
+                vec![other.clone(), embed.clone()],
+                vec![embed.clone(), other.clone()],
+            ] {
+                assert_eq!(
+                    pressure_refusal_for_selected_graph(&refusals, coverage(0, 4, 4), 2),
+                    Some(other.clone()),
+                    "embedding completion cannot hide {other_work} in either publication order"
+                );
+            }
+        }
+
+        let mut same_second = embed.clone();
+        same_second.at_unix = 2;
+        assert_eq!(
+            pressure_refusal_for_selected_graph(
+                std::slice::from_ref(&same_second),
+                coverage(0, 4, 4),
+                2,
+            ),
+            Some(same_second),
+            "a report that may predate a same-second refusal cannot settle it"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_embed_refusals_pay_for_the_pending_observation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for work in ["lsp-sweep", "future-heavy-work"] {
+            let calls = AtomicUsize::new(0);
+            let refusal = pressure_refusal(work);
+            let current = refusal.clone();
+            let kept = outstanding_pressure_refusal_with(
+                vec![refusal],
+                2,
+                || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    std::future::ready(Some(coverage(0, 4, 4)))
+                },
+                || vec![current],
+            )
+            .await;
+            assert!(kept.is_some(), "{work} has an independent backlog");
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                0,
+                "{work} must not trigger a graph-wide embedding observation"
+            );
+        }
+
+        let calls = AtomicUsize::new(0);
+        let refusal = pressure_refusal("embed-batch");
+        let current = refusal.clone();
+        let cleared = outstanding_pressure_refusal_with(
+            vec![refusal],
+            2,
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Some(coverage(0, 4, 4)))
+            },
+            || vec![current],
+        )
+        .await;
+        assert!(cleared.is_none(), "completed embed work no longer degrades");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_embed_work_never_hides_an_independent_refusal() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        for other_work in ["lsp-sweep", "future-heavy-work"] {
+            for refusals in [
+                vec![
+                    pressure_refusal(other_work),
+                    pressure_refusal("embed-batch"),
+                ],
+                vec![
+                    pressure_refusal("embed-batch"),
+                    pressure_refusal(other_work),
+                ],
+            ] {
+                let calls = AtomicUsize::new(0);
+                let kept = outstanding_pressure_refusal_with(
+                    refusals.clone(),
+                    2,
+                    || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Some(coverage(0, 4, 4)))
+                    },
+                    || refusals,
+                )
+                .await
+                .expect("independent work remains outstanding");
+                assert_eq!(kept.work, other_work);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    0,
+                    "an independent refusal already requires degraded truth"
+                );
+            }
+
+            let initial_embed = pressure_refusal("embed-batch");
+            let replacement_embed = initial_embed.clone();
+            let replacement_other = pressure_refusal(other_work);
+            let kept = outstanding_pressure_refusal_with(
+                vec![initial_embed],
+                2,
+                || std::future::ready(Some(coverage(0, 4, 4))),
+                || vec![replacement_embed, replacement_other.clone()],
+            )
+            .await;
+            assert_eq!(
+                kept,
+                Some(replacement_other),
+                "work published during the observation outranks the old embed count"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_changed_during_observation_is_never_muted_by_the_old_count() {
+        let initial = pressure_refusal("embed-batch");
+        for replacement in [
+            pressure_refusal("embed-batch"),
+            pressure_refusal("lsp-sweep"),
+            pressure_refusal("future-heavy-work"),
+        ] {
+            let mut replacement = replacement;
+            replacement.at_unix = 2;
+            let expected = replacement.clone();
+            let kept = outstanding_pressure_refusal_with(
+                vec![initial.clone()],
+                2,
+                || std::future::ready(Some(coverage(0, 4, 4))),
+                || vec![replacement],
+            )
+            .await;
+            assert_eq!(
+                kept,
+                Some(expected),
+                "the exact zero described the old record, not its replacement"
+            );
+        }
+
+        let unreadable_or_cleared = outstanding_pressure_refusal_with(
+            vec![initial],
+            2,
+            || std::future::ready(Some(coverage(0, 4, 4))),
+            Vec::new,
+        )
+        .await;
+        assert!(
+            unreadable_or_cleared.is_some(),
+            "a clear and replacement can interleave with the reread, so this response stays \
+             conservative and the next call observes a true clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_equal_same_second_refusal_is_not_settled_by_the_old_observation() {
+        let initial = pressure_refusal("embed-batch");
+        let replacement = initial.clone();
+
+        let kept = outstanding_pressure_refusal_with(
+            vec![initial],
+            1,
+            || std::future::ready(Some(coverage(0, 4, 4))),
+            || vec![replacement.clone()],
+        )
+        .await;
+
+        assert_eq!(
+            kept,
+            Some(replacement),
+            "second-resolution equality cannot prove that a same-second refusal is the one whose \
+             backlog was observed"
+        );
+    }
+
+    #[test]
+    fn coverage_filter_preserves_short_queued_and_unobserved_refusals() {
+        assert!(pressure_refusal_for_coverage(
+            pressure_refusal("embed-batch"),
+            Some(coverage(0, 4, 4)),
+        )
+        .is_none());
+        assert!(
+            pressure_refusal_for_coverage(
+                pressure_refusal("embed-batch"),
+                Some(coverage(0, 4, 5)),
+            )
+            .is_some(),
+            "zero queued cannot hide a refused missing-coverage backfill"
+        );
+        assert!(pressure_refusal_for_coverage(
+            pressure_refusal("embed-batch"),
+            Some(coverage(1, 4, 4)),
+        )
+        .is_some());
+        assert!(
+            pressure_refusal_for_coverage(
+                pressure_refusal("embed-batch"),
+                Some(coverage(0, 5, 4)),
+            )
+            .is_some(),
+            "an impossible over-indexed response cannot authorize suppression"
+        );
+        assert!(pressure_refusal_for_coverage(pressure_refusal("embed-batch"), None).is_some());
+        assert!(pressure_refusal_for_coverage(
+            pressure_refusal("lsp-sweep"),
+            Some(coverage(0, 4, 4)),
+        )
+        .is_some());
+        assert!(pressure_refusal_for_coverage(
+            pressure_refusal("future-heavy-work"),
+            Some(coverage(0, 4, 4)),
+        )
+        .is_some());
+    }
+
     #[test]
     fn windows_daemon_discovery_finds_platform_sibling_without_path() {
         let directory = tempfile::tempdir().unwrap();
@@ -2553,6 +3174,132 @@ mod tests {
             }
         });
         (format!("http://127.0.0.1:{port}"), handle)
+    }
+
+    /// One-shot responder that also returns the exact HTTP request it received.
+    async fn capturing_resources_daemon(
+        body: &'static str,
+    ) -> (
+        String,
+        tokio::sync::oneshot::Receiver<String>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0u8; 2048];
+                let read = socket.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+            let _ = request_tx.send(String::from_utf8_lossy(&request).into_owned());
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
+                 connection: close\r\n\r\n{body}",
+                body.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = socket.shutdown().await;
+        });
+        (format!("http://127.0.0.1:{port}"), request_rx, handle)
+    }
+
+    #[tokio::test]
+    async fn resources_observation_preserves_refusal_on_legacy_and_error_shapes() {
+        let client = probe_client();
+        let arguments = HashMap::new();
+
+        let (exact, exact_handle) = stub_daemon(
+            r#"{"embed_runtime":{"embeddings_pending":0,"embeddings_indexed":4,"embeddings_total":4}}"#,
+        )
+        .await;
+        assert_eq!(
+            fetch_embedding_coverage_from_resources_at(&client, &exact, &arguments).await,
+            Some(coverage(0, 4, 4))
+        );
+        exact_handle.abort();
+
+        let (legacy, legacy_handle) =
+            stub_daemon(r#"{"embed_runtime":{"embeddings_indexed":4}}"#).await;
+        assert_eq!(
+            fetch_embedding_coverage_from_resources_at(&client, &legacy, &arguments).await,
+            None,
+            "an older daemon that omits exact coverage is not proof of completion"
+        );
+        legacy_handle.abort();
+
+        let (malformed, malformed_handle) = stub_daemon("not json").await;
+        assert_eq!(
+            fetch_embedding_coverage_from_resources_at(&client, &malformed, &arguments).await,
+            None
+        );
+        malformed_handle.abort();
+
+        let (failed, failed_handle) =
+            stub_daemon_raw(500, "Internal Server Error", r#"{"error":"old daemon"}"#).await;
+        assert_eq!(
+            fetch_embedding_coverage_from_resources_at(&client, &failed, &arguments).await,
+            None
+        );
+        failed_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn resources_observation_posts_the_default_request_for_the_callers_session() {
+        let client = probe_client();
+        let mut arguments = HashMap::new();
+        arguments.insert(
+            "session_id".to_string(),
+            serde_json::json!("session-selected-graph"),
+        );
+        let (base, request_rx, handle) = capturing_resources_daemon(
+            r#"{"embed_runtime":{"embeddings_pending":0,"embeddings_indexed":4,"embeddings_total":4}}"#,
+        )
+        .await;
+
+        assert_eq!(
+            fetch_embedding_coverage_from_resources_at(&client, &base, &arguments).await,
+            Some(coverage(0, 4, 4))
+        );
+        let request = request_rx.await.expect("captured resources request");
+        let request_lower = request.to_ascii_lowercase();
+        assert!(
+            request.starts_with("POST /commands/resources HTTP/1.1"),
+            "the observation must use the inspect-only resources route: {request}"
+        );
+        assert!(
+            request_lower.contains("x-kin-session: session-selected-graph"),
+            "the count must describe the same selected graph as the tool answer: {request}"
+        );
+        assert!(
+            request.contains(r#"{"json":false}"#),
+            "the observation uses the endpoint's default request shape: {request}"
+        );
+        handle.abort();
     }
 
     /// The intent-release forward reads its response through the shared JSON

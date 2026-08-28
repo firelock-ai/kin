@@ -106,6 +106,10 @@ pub async fn status() -> Result<()> {
         &kin_core::last_admission::read(&layout),
         chrono::Utc::now(),
     );
+    append_hydration_semantics_line(
+        &mut response.lines,
+        &kin_core::hydration_semantics::standing(&layout),
+    );
     // And which projection is showing that truth as files. Read here rather
     // than asked of the daemon for the same reason freshness is: the daemon
     // reports the graph it holds, and whether this host has a mount or an
@@ -137,6 +141,30 @@ fn append_freshness_line(
 ) {
     lines.push(String::new());
     lines.push(format!("ℹ graph truth: {}", freshness.describe(now)));
+}
+
+/// Disclose when the store's creation-time replay version differs from this
+/// binary or cannot establish agreement.
+///
+/// Agreement stays silent. A `hydration semantics` line therefore always names
+/// an actionable gap instead of forcing a reader to parse an always-on label
+/// for a hidden `current` value. Unknown is still a gap: an unreadable record
+/// cannot honestly stand in for agreement.
+fn append_hydration_semantics_line(
+    lines: &mut Vec<String>,
+    standing: &kin_core::hydration_semantics::HydrationStanding,
+) {
+    if !standing.is_gap() {
+        return;
+    }
+    let remedy = standing
+        .remedy()
+        .map(|remedy| format!(" Remedy: {remedy}."))
+        .unwrap_or_default();
+    lines.push(format!(
+        "⚠ hydration semantics: {}.{remedy}",
+        standing.sentence()
+    ));
 }
 
 /// `kin graph validate` — structural integrity checks.
@@ -722,18 +750,26 @@ fn build_graph_status_response_for_store(
         "Embeddings: {}/{} indexed ({} pending)",
         embed_status.indexed, embed_status.total, embed_status.pending
     );
-    if embed_status.pending > 0 {
-        if embedding_runtime.embed_persistence_unavailable {
-            // Outranks every clause below, exactly as it does in
-            // `semantic_query_health_from_runtime`: this store's graph
-            // authority is a remote backend, the embedding worker never starts
-            // and `/embed` refuses, so a backlog here is not filling and no
-            // clause may imply that it is.
-            embeddings_line.push_str(
-                "; this store's graph authority is a remote storage backend, which carries no \
-                 durable local vector-sidecar contract, so nothing will embed here",
-            );
-        } else if let Some(reason) = embedding_runtime.vector_index_discarded.as_ref() {
+    let embedding_coverage = kin_core::memory_pressure::EmbeddingCoverage {
+        pending: embed_status.pending,
+        indexed: embed_status.indexed,
+        total: embed_status.total,
+    };
+    if embedding_persistence_blocks_coverage(
+        embedding_runtime.embed_persistence_unavailable,
+        embedding_coverage,
+    ) {
+        // Outranks every clause below, exactly as it does in
+        // `semantic_query_health_from_runtime`: this store's graph authority is
+        // a remote backend, the embedding worker never starts and `/embed`
+        // refuses, so even an empty current queue is not a filling backlog when
+        // selected-graph coverage remains short.
+        embeddings_line.push_str(
+            "; this store's graph authority is a remote storage backend, which carries no \
+             durable local vector-sidecar contract, so nothing will embed here",
+        );
+    } else if embed_status.pending > 0 {
+        if let Some(reason) = embedding_runtime.vector_index_discarded.as_ref() {
             // A real gap, reported with its cause. Naming the open-time discard
             // and the automatic recovery is what tells the operator no manual
             // GPU pass is owed. The reason is recorded once at open and never
@@ -813,6 +849,8 @@ fn build_graph_status_response_for_store(
         // thing standing in front of all of them right now. Without it the
         // first fill on a fresh machine reports a pending backlog and a worker
         // with nothing to show for several hundred megabytes of egress.
+    }
+    if embed_status.pending > 0 {
         if let Some(clause) = embedding_runtime.model_fetch.status_clause() {
             embeddings_line.push_str(&clause);
         }
@@ -951,12 +989,21 @@ fn build_graph_status_response_for_store(
     // Work the daemon declined for want of memory is invisible in the same way
     // and for the same reason: the counters above report it as pending, and the
     // process that declined it left nothing behind but this record.
-    if let Some(refusal) = kin_root.and_then(kin_core::memory_pressure::PressureRefusal::read) {
-        warnings.push(format!(
-            "{} {}",
-            refusal.cause_sentence(),
-            kin_core::memory_pressure::PRESSURE_REMEDY
-        ));
+    //
+    // "The counters above report it as pending" is the condition, not a given,
+    // and the counter is right here. A store at `952/952 indexed (0 pending)`
+    // printed the embed refusal under its own complete line, so the record is
+    // asked whether it still describes work before it is published.
+    if let Some(kin_root) = kin_root {
+        let refusals = kin_core::memory_pressure::PressureRefusal::read_all(kin_root);
+        let coverage = kin_core::memory_pressure::EmbeddingCoverage {
+            pending: embed_status.pending,
+            indexed: embed_status.indexed,
+            total: embed_status.total,
+        };
+        if let Some(warning) = pressure_refusal_warning(&refusals, coverage) {
+            warnings.push(warning);
+        }
     }
     if warnings.is_empty() && criticals.is_empty() {
         lines.push(String::new());
@@ -991,6 +1038,30 @@ fn build_graph_status_response_for_store(
         reference_edge_coverage: Some(health.reference_edge_coverage.clone()),
         relation_census: Some(census_comparison),
     })
+}
+
+/// Render a pressure refusal only while the coverage beside it says its work
+/// remains. Kept pure so the response rule can be graded without writing a
+/// store record or racing an embedding worker.
+fn pressure_refusal_warning(
+    refusals: &[kin_core::memory_pressure::PressureRefusal],
+    coverage: kin_core::memory_pressure::EmbeddingCoverage,
+) -> Option<String> {
+    refusals
+        .iter()
+        .rev()
+        .find(|refusal| refusal.describes_outstanding_work(coverage))
+        .map(|refusal| format!("{} {}", refusal.cause_sentence(), refusal.remediation()))
+}
+
+/// Whether an unavailable vector checkpoint producer is an active blocker for
+/// this selected graph. Queue depth alone cannot decide: a refused missing-key
+/// backfill may be queue-empty while indexed coverage is still short.
+fn embedding_persistence_blocks_coverage(
+    unavailable: bool,
+    coverage: kin_core::memory_pressure::EmbeddingCoverage,
+) -> bool {
+    unavailable && !coverage.is_complete()
 }
 
 /// Render a health report's notes in the single form every graph reporting
@@ -1656,6 +1727,118 @@ mod tests {
         TransactionDelta, TreeDelta, TreeEntry, VerificationStore, Visibility,
     };
 
+    /// Grade the warning-producing seam, not only the record's predicate: zero
+    /// pending embeddings produce zero warning text, while the three
+    /// distinguishability controls remain visible.
+    #[test]
+    fn a_completed_embedding_index_does_not_repeat_an_old_refusal_warning() {
+        let refusal = |work: &str| kin_core::memory_pressure::PressureRefusal {
+            work: work.to_string(),
+            level: "critical".to_string(),
+            reason: "background work was refused".to_string(),
+            at_unix: 1,
+        };
+        let complete = kin_core::memory_pressure::EmbeddingCoverage {
+            pending: 0,
+            indexed: 9,
+            total: 9,
+        };
+        let queue_empty_but_short = kin_core::memory_pressure::EmbeddingCoverage {
+            pending: 0,
+            indexed: 8,
+            total: 9,
+        };
+        let queued = kin_core::memory_pressure::EmbeddingCoverage {
+            pending: 9,
+            indexed: 9,
+            total: 9,
+        };
+        assert!(
+            pressure_refusal_warning(
+                std::slice::from_ref(&refusal(
+                    kin_core::memory_pressure::HeavyWork::EmbedBatch.id(),
+                )),
+                complete,
+            )
+            .is_none(),
+            "an embed refusal cannot describe a whole-coverage store"
+        );
+        assert!(
+            pressure_refusal_warning(
+                std::slice::from_ref(&refusal(
+                    kin_core::memory_pressure::HeavyWork::EmbedBatch.id(),
+                )),
+                queue_empty_but_short,
+            )
+            .is_some(),
+            "an empty queue cannot hide refused work while indexed coverage is short"
+        );
+        assert!(
+            !embedding_persistence_blocks_coverage(true, complete),
+            "an unavailable future producer is not a blocker once coverage is exact"
+        );
+        assert!(
+            embedding_persistence_blocks_coverage(true, queue_empty_but_short),
+            "an empty queue cannot hide short coverage from a producer that will never start"
+        );
+        assert!(
+            embedding_persistence_blocks_coverage(true, queued),
+            "a live backlog remains blocked"
+        );
+        assert!(
+            !embedding_persistence_blocks_coverage(false, queue_empty_but_short),
+            "short coverage alone does not invent a persistence blocker"
+        );
+        assert!(
+            pressure_refusal_warning(
+                std::slice::from_ref(&refusal(
+                    kin_core::memory_pressure::HeavyWork::EmbedBatch.id(),
+                )),
+                queued,
+            )
+            .is_some(),
+            "a live embed backlog keeps the refusal visible"
+        );
+        assert!(
+            pressure_refusal_warning(
+                std::slice::from_ref(&refusal(
+                    kin_core::memory_pressure::HeavyWork::LspSweep.id(),
+                )),
+                complete,
+            )
+            .is_some(),
+            "embedding completion cannot clear a refused LSP sweep"
+        );
+        assert!(
+            pressure_refusal_warning(
+                std::slice::from_ref(&refusal("future-heavy-work")),
+                complete,
+            )
+            .is_some(),
+            "unknown work remains visible until this build can interpret it"
+        );
+
+        let embed = refusal(kin_core::memory_pressure::HeavyWork::EmbedBatch.id());
+        for independent in [
+            refusal(kin_core::memory_pressure::HeavyWork::LspSweep.id()),
+            refusal("future-heavy-work"),
+        ] {
+            for refusals in [
+                vec![independent.clone(), embed.clone()],
+                vec![embed.clone(), independent.clone()],
+            ] {
+                let warning = pressure_refusal_warning(&refusals, complete)
+                    .expect("independent work remains visible");
+                assert!(
+                    warning.contains(&independent.reason),
+                    "a completed embed entry cannot mask {} in either publication order: \
+                     {warning}",
+                    independent.work
+                );
+            }
+        }
+    }
+
     /// Admit a test case so a `Test` endpoint names something the store holds.
     ///
     /// These fixtures used to mint a `TestId` and relate it without ever
@@ -1763,6 +1946,68 @@ mod tests {
                     "unknown freshness must be stated: {out}"
                 );
             }
+        }
+    }
+
+    mod hydration_semantics {
+        use super::super::append_hydration_semantics_line;
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        fn rendered(standing: &HydrationStanding) -> String {
+            let mut lines = Vec::new();
+            append_hydration_semantics_line(&mut lines, standing);
+            lines.join("\n")
+        }
+
+        #[test]
+        fn agreement_stays_silent() {
+            let out = rendered(&HydrationStanding::Current { version: 10 });
+            assert!(
+                out.is_empty(),
+                "a current store must not manufacture a warning: {out}"
+            );
+        }
+
+        #[test]
+        fn every_gap_is_disclosed_with_its_remedy() {
+            for standing in [
+                HydrationStanding::Behind {
+                    created_under: 9,
+                    derives: 10,
+                },
+                HydrationStanding::Ahead {
+                    created_under: 11,
+                    derives: 10,
+                },
+                HydrationStanding::Unstamped { derives: 10 },
+                HydrationStanding::Unreadable {
+                    reason: "truncated".to_string(),
+                    derives: 10,
+                },
+            ] {
+                let out = rendered(&standing);
+                assert!(
+                    out.contains("hydration semantics:"),
+                    "a gap must name the affected semantics: {out}"
+                );
+                assert!(
+                    out.contains("Remedy:"),
+                    "a gap must carry the standing's remedy: {out}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_ahead_store_is_told_to_upgrade_not_reingest() {
+            let out = rendered(&HydrationStanding::Ahead {
+                created_under: 11,
+                derives: 10,
+            });
+            assert!(out.contains("upgrade this Kin build"), "{out}");
+            assert!(
+                !out.contains("re-ingest the repository"),
+                "an older binary must not replace a store recorded under newer replay semantics: {out}"
+            );
         }
     }
 

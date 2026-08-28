@@ -96,6 +96,7 @@ exists. No binary is built by this script.
 """
 
 import argparse
+import http.server
 import json
 import os
 import signal
@@ -103,6 +104,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 PASS = "PASS"
@@ -123,6 +125,7 @@ TICKET_THREADS = "FIR-2823"
 # The doctor row and the durable record this suite is about.
 ROW_ID = "host_memory_pressure"
 RECORD_NAME = "memory-pressure"
+RECORDS_NAME = "memory-pressure-records"
 FOOTPRINT_NAME = "daemon-footprint"
 
 # The derived budget's own floor, so a published standing can be told from a
@@ -552,6 +555,57 @@ def status_discloses_the_refusal(text):
     return "memory pressure" in text and "⚠" in text
 
 
+def mcp_memory_pressure_state(payload):
+    """True when both MCP carriers disclose pressure, False when both omit it.
+
+    `None` is deliberately unreadable. A flag without the negative label, or a
+    label without the flag, is a split response contract rather than either
+    accepted state.
+    """
+    if not isinstance(payload, dict):
+        return None
+    envelope = payload.get("_kin")
+    negative = payload.get("negative")
+    if not isinstance(envelope, dict) or not isinstance(negative, dict):
+        return None
+    degraded = envelope.get("degraded")
+    labels = negative.get("degraded_signals")
+    if not isinstance(degraded, dict) or not isinstance(labels, list):
+        return None
+    has_flag = "memory_pressure" in degraded
+    flagged = degraded.get("memory_pressure") is True
+    labelled = "memory_pressure" in labels
+    if flagged and labelled:
+        return True
+    if not has_flag and not labelled:
+        return False
+    return None
+
+
+def mcp_memory_pressure_flag(payload):
+    """The MCP envelope's pressure claim when a tool has no negative object."""
+    if not isinstance(payload, dict):
+        return None
+    envelope = payload.get("_kin")
+    if not isinstance(envelope, dict):
+        return None
+    degraded = envelope.get("degraded")
+    if not isinstance(degraded, dict):
+        return None
+    if "memory_pressure" not in degraded:
+        return False
+    return True if degraded.get("memory_pressure") is True else None
+
+
+def resources_received_session(requests, expected):
+    """Whether the resources observation qualified the caller's graph session."""
+    return any(
+        request.get("path") == "/commands/resources"
+        and (request.get("headers") or {}).get("x-kin-session") == expected
+        for request in requests
+    )
+
+
 def offers_the_idle_window(text):
     """Whether the text explains a lost daemon as an idle-window exit.
 
@@ -633,10 +687,118 @@ GRADERS = {
     "enrichment_names_a_kill": enrichment_names_a_kill,
     "row_reports_a_kill": row_reports_a_kill,
     "footprint_child_verdict": footprint_child_verdict,
+    "mcp_memory_pressure_state": mcp_memory_pressure_state,
+    "mcp_memory_pressure_flag": mcp_memory_pressure_flag,
+    "resources_received_session": resources_received_session,
 }
 
 
 # ------------------------------------------------------------------- fixtures
+
+class DaemonStub(object):
+    """A deterministic daemon boundary for one real stdio MCP call.
+
+    The process under test is the shipped `kin mcp start` binary. Only its HTTP
+    peer is synthetic, so the check reaches the real delegation, response
+    annotation and negative-verdict pipeline without opening a graph store or
+    competing for the shared daemon/GPU.
+    """
+    def __init__(self, resources_status, resources_body, graph_status_coverage=None):
+        self.resources_status = resources_status
+        self.resources_body = resources_body
+        self.graph_status_coverage = graph_status_coverage
+        self.requests = []
+        self.server = None
+        self.thread = None
+        self.url = None
+
+    def __enter__(self):
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def _capture(self):
+                length = int(self.headers.get("content-length", "0") or "0")
+                body = self.rfile.read(length) if length else b""
+                decoded = body.decode("utf-8", errors="replace")
+                owner.requests.append({
+                    "path": self.path,
+                    "headers": {key.lower(): value for key, value in self.headers.items()},
+                    "body": decoded,
+                })
+                return decoded
+
+            def _json(self, status, payload):
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                body = self._capture()
+                if self.path == "/mcp/tools/call":
+                    try:
+                        tool = json.loads(body).get("name")
+                    except (AttributeError, TypeError, ValueError):
+                        tool = None
+                    if tool == "kin_graph_status" and owner.graph_status_coverage is not None:
+                        pending, indexed, total = owner.graph_status_coverage
+                        payload = {
+                            "schema": "kin.graph-status.v1",
+                            "view": "daemon_selected_graph",
+                            "scope": "temporal_session",
+                            "authority": "repo-daemon",
+                            "sampling": "point_in_time_selected_graph",
+                            "authority_epoch": 42,
+                            "entity_count": 4,
+                            "relation_count": 0,
+                            "embedding_source": "selected_graph",
+                            "embeddings_indexed": indexed,
+                            "embeddings_pending": pending,
+                            "embeddings_total": total,
+                            "completion_attested": False,
+                        }
+                    else:
+                        payload = {
+                            "query": "missing_authenticator",
+                            "results": [],
+                            "total_ranked": 0,
+                        }
+                    self._json(200, {
+                        "content": [{"type": "text", "text": json.dumps(payload)}],
+                    })
+                    return
+                if self.path == "/commands/resources":
+                    self._json(owner.resources_status, owner.resources_body)
+                    return
+                self._json(404, {"error": "unknown stub route"})
+
+            def do_GET(self):
+                self._capture()
+                if self.path == "/health":
+                    self._json(200, {})
+                    return
+                self._json(404, {"error": "unknown stub route"})
+
+            def log_message(self, _format, *_args):
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever)
+        self.thread.daemon = True
+        self.thread.start()
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        if self.server is not None:
+            self.server.shutdown()
+            self.server.server_close()
+        if self.thread is not None:
+            self.thread.join(timeout=5)
 
 class Suite(object):
     def __init__(self, kin, workdir, daemon=None, verbose=False):
@@ -716,6 +878,9 @@ class Suite(object):
 
     def record_path(self, repo):
         return os.path.join(repo, ".kin", RECORD_NAME)
+
+    def records_path(self, repo):
+        return os.path.join(repo, ".kin", RECORDS_NAME)
 
     def pid_path(self, repo):
         return os.path.join(repo, ".kin", "daemon.pid")
@@ -877,14 +1042,107 @@ class Suite(object):
     def read_record(self, repo):
         """The refusal this store records, or None.
 
-        A record that will not parse is None, matching the product's own rule:
-        a record that exists to report a degradation must never become one.
+        This acceptance reader returns None when it cannot parse the legacy
+        projection. The product itself reads the legacy and current sidecar
+        together and fails closed on either unreadable publication.
         """
         try:
             with open(self.record_path(repo)) as handle:
                 return json.load(handle)
         except (IOError, OSError, ValueError):
             return None
+
+    def write_embed_refusal(self, repo):
+        """Publish the old single-record shape every supported build reads."""
+        try:
+            os.remove(self.records_path(repo))
+        except FileNotFoundError:
+            pass
+        with open(self.record_path(repo), "w") as handle:
+            json.dump({
+                "work": "embed-batch",
+                "level": "critical",
+                "reason": "host memory pressure is critical, so embedding did not start",
+                # Deliberately old. The same-second replacement guard must not
+                # keep a completed refusal visible merely because the fixture
+                # was minted beside the call that reads it.
+                "at_unix": 1,
+            }, handle)
+
+    def write_current_refusals(self, repo, refusals, legacy_projection):
+        """Publish the per-work sidecar plus its old-reader projection."""
+        with open(self.record_path(repo), "w") as handle:
+            json.dump(legacy_projection, handle)
+        with open(self.records_path(repo), "w") as handle:
+            json.dump({
+                "schema": 1,
+                "legacy_projection": {
+                    "record": legacy_projection,
+                    "nonce": None,
+                },
+                "refusals": refusals,
+            }, handle)
+
+    def mcp(self, repo, tool, args, daemon_url, timeout=120):
+        """One real stdio tools/call against the deterministic HTTP peer."""
+        env = dict(self.env)
+        env["KIN_MCP_REPO"] = repo
+        env["KIN_DAEMON_URL"] = daemon_url
+        proc = subprocess.Popen(
+            [self.kin, "mcp", "start", "--repo", repo],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=repo,
+            env=env,
+            text=True,
+        )
+        messages = [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                        "clientInfo": {"name": "kin-memory-pressure-repro", "version": "1"}}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": tool, "arguments": args}},
+        ]
+        try:
+            out, err = proc.communicate(
+                "".join(json.dumps(message) + "\n" for message in messages),
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.communicate()
+            raise RuntimeError("mcp %s timed out after %ss" % (tool, timeout))
+
+        response = None
+        for line in out.splitlines():
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                candidate = json.loads(line)
+            except ValueError:
+                continue
+            if candidate.get("id") == 2:
+                response = candidate
+        if response is None:
+            raise RuntimeError("mcp %s returned no id=2 frame (stderr tail: %s)"
+                               % (tool, tail(err, 300).replace("\n", " ")))
+        if "error" in response:
+            raise RuntimeError("mcp %s protocol error: %s"
+                               % (tool, json.dumps(response["error"])[:300]))
+        content = (response.get("result") or {}).get("content") or []
+        if not content or "text" not in content[0]:
+            raise RuntimeError("mcp %s returned no text content" % tool)
+        try:
+            payload = json.loads(content[0]["text"])
+        except ValueError as error:
+            raise RuntimeError("mcp %s returned non-JSON text: %s"
+                               % (tool, error))
+        if not isinstance(payload, dict):
+            raise RuntimeError("mcp %s returned a non-object payload" % tool)
+        return payload
 
     def fixture(self, name):
         """A small Python library, admitted through `kin init`.
@@ -2029,10 +2287,221 @@ def check_12(suite):
     return result
 
 
+def check_13(suite):
+    """A real MCP response suppresses only an exactly completed embed refusal.
+
+    The deterministic peer controls the selected graph observation; the binary
+    under test still performs the real stdio protocol, daemon delegation,
+    pressure reconciliation, envelope annotation and negative qualification.
+    This is the stranger-class guard for the response that originally said a
+    completed store was degraded, and for the inverse where an empty queue hid
+    a refused backfill whose selected-graph coverage was still short. Graph
+    status is also driven separately so its own typed report, not a second
+    resources sample, is proven to be the coverage authority.
+    """
+    result = Result(
+        "13", TICKET,
+        "MCP suppresses only exact embedding completion and qualifies the selected session",
+    )
+    repo = suite.fixture("mcp-pressure-response")
+    run([suite.kin, "daemon", "stop"], cwd=repo, env=suite.env, timeout=180)
+
+    embed_refusal = {
+        "work": "embed-batch",
+        "level": "critical",
+        "reason": "host memory pressure is critical, so embedding did not start",
+        "at_unix": 1,
+    }
+    lsp_refusal = {
+        "work": "lsp-sweep",
+        "level": "critical",
+        "reason": "host memory pressure is critical, so enrichment did not start",
+        "at_unix": 2,
+    }
+    future_refusal = {
+        "work": "future-heavy-work",
+        "level": "critical",
+        "reason": "host memory pressure is critical, so future work did not start",
+        "at_unix": 3,
+    }
+
+    cases = [
+        ("complete", 200, {
+            "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": 4,
+                "embeddings_total": 4,
+            },
+        }, False, "current", True),
+        ("queue-empty-but-short", 200, {
+            "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": 3,
+                "embeddings_total": 4,
+            },
+        }, True, "legacy", True),
+        ("live-backlog", 200, {
+            "embed_runtime": {
+                "embeddings_pending": 1,
+                "embeddings_indexed": 3,
+                "embeddings_total": 4,
+            },
+        }, True, "legacy", True),
+        # An older daemon does not publish all three fields. That is unknown,
+        # never permission to dismiss a durable refusal.
+        ("legacy-observation", 200, {
+            "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": 4,
+            },
+        }, True, "legacy", True),
+        # A failed observation has the same conservative contract.
+        ("observation-error", 404, {"error": "resources unavailable"}, True,
+         "legacy", True),
+        # A current sidecar may carry several independent producers while its
+        # compatibility projection still names the embed record. A regression
+        # to legacy-only reading would suppress this arm on complete coverage;
+        # the plural reader keeps LSP/future work visible without paying for a
+        # resources observation embeddings cannot settle.
+        ("current-sidecar-plural", 200, {
+            "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": 4,
+                "embeddings_total": 4,
+            },
+        }, True, "plural", False),
+    ]
+    for name, status, body, expected, storage, expects_resources in cases:
+        if storage == "legacy":
+            suite.write_embed_refusal(repo)
+        elif storage == "current":
+            suite.write_current_refusals(repo, [embed_refusal], embed_refusal)
+        else:
+            suite.write_current_refusals(
+                repo,
+                [embed_refusal, lsp_refusal, future_refusal],
+                embed_refusal,
+            )
+        session_id = "memory-pressure-%s" % name
+        with DaemonStub(status, body) as daemon:
+            try:
+                payload = suite.mcp(
+                    repo,
+                    "semantic_locate",
+                    {"query": "missing_authenticator", "session_id": session_id},
+                    daemon.url,
+                )
+            except RuntimeError as error:
+                result.unknown("%s: %s" % (name, error))
+                continue
+
+        state = mcp_memory_pressure_state(payload)
+        if state is None:
+            result.unknown(
+                "%s: MCP returned a split or unreadable pressure contract: %s"
+                % (name, json.dumps(payload)[:500])
+            )
+        elif state != expected:
+            result.bad(
+                "%s: memory_pressure=%s, wanted %s for resources %s"
+                % (name, state, expected, json.dumps(body))
+            )
+        else:
+            result.ok("%s: memory_pressure=%s" % (name, state))
+
+        if expects_resources and not resources_received_session(daemon.requests, session_id):
+            result.bad(
+                "%s: /commands/resources did not receive x-kin-session=%s; requests=%s"
+                % (name, session_id, json.dumps(daemon.requests)[:500])
+            )
+        elif expects_resources:
+            result.ok("%s: resources observation used session %s" % (name, session_id))
+        elif any(request.get("path") == "/commands/resources"
+                 for request in daemon.requests):
+            result.bad(
+                "%s: non-embedding work incorrectly paid for /commands/resources: %s"
+                % (name, json.dumps(daemon.requests)[:500])
+            )
+        else:
+            result.ok("%s: plural non-embedding work needed no resources observation" % name)
+
+    graph_cases = [
+        # A failed resources endpoint cannot keep an old embed refusal alive
+        # beside a graph-status report that itself proves exact completion.
+        ("graph-complete-resources-unavailable", (0, 4, 4), 404,
+         {"error": "resources unavailable"}, False, "legacy"),
+        # The inverse catches a graph-status implementation that asks a second,
+        # newer resources sample and suppresses the short report being returned.
+        ("graph-short-resources-complete", (1, 3, 4), 200, {
+            "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": 4,
+                "embeddings_total": 4,
+            },
+        }, True, "legacy"),
+        # Exact embedding completion still cannot dismiss independent work in
+        # the plural sidecar, regardless of the legacy projection naming embed.
+        ("graph-complete-independent-work", (0, 4, 4), 200, {
+            "embed_runtime": {
+                "embeddings_pending": 0,
+                "embeddings_indexed": 4,
+                "embeddings_total": 4,
+            },
+        }, True, "plural"),
+    ]
+    for name, coverage, status, body, expected, storage in graph_cases:
+        if storage == "legacy":
+            suite.write_embed_refusal(repo)
+        else:
+            suite.write_current_refusals(
+                repo,
+                [embed_refusal, lsp_refusal, future_refusal],
+                embed_refusal,
+            )
+        with DaemonStub(status, body, graph_status_coverage=coverage) as daemon:
+            try:
+                payload = suite.mcp(
+                    repo,
+                    "kin_graph_status",
+                    {"session_id": "memory-pressure-%s" % name},
+                    daemon.url,
+                )
+            except RuntimeError as error:
+                result.unknown("%s: %s" % (name, error))
+                continue
+
+        state = mcp_memory_pressure_flag(payload)
+        if state is None:
+            result.unknown(
+                "%s: graph status returned a split or unreadable pressure contract: %s"
+                % (name, json.dumps(payload)[:500])
+            )
+        elif state != expected:
+            result.bad(
+                "%s: graph-report memory_pressure=%s, wanted %s for coverage %s"
+                % (name, state, expected, coverage)
+            )
+        else:
+            result.ok("%s: graph-report memory_pressure=%s" % (name, state))
+
+        resource_requests = [
+            request for request in daemon.requests
+            if request.get("path") == "/commands/resources"
+        ]
+        if resource_requests:
+            result.bad(
+                "%s: graph status substituted /commands/resources for its typed report: %s"
+                % (name, json.dumps(resource_requests)[:500])
+            )
+        else:
+            result.ok("%s: typed graph report needed no resources observation" % name)
+    return result
+
+
 CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
           ("4", check_4), ("5", check_5), ("6", check_6), ("7", check_7),
           ("8", check_8), ("9", check_9), ("10", check_10), ("11", check_11),
-          ("12", check_12)]
+          ("12", check_12), ("13", check_13)]
 
 
 # ------------------------------------------------------------------ self-test
@@ -2099,6 +2568,70 @@ def self_test():
         if got != want:
             failures.append("status_discloses_the_refusal(%r) = %s, wanted %s"
                             % (text, got, want))
+
+    mcp_cases = [
+        (True, {
+            "_kin": {"degraded": {"memory_pressure": True}},
+            "negative": {"degraded_signals": ["memory_pressure"]},
+        }),
+        (False, {
+            "_kin": {"degraded": {}},
+            "negative": {"degraded_signals": []},
+        }),
+        # Either carrier alone is a split contract, not either accepted state.
+        (None, {
+            "_kin": {"degraded": {"memory_pressure": True}},
+            "negative": {"degraded_signals": []},
+        }),
+        (None, {
+            "_kin": {"degraded": {}},
+            "negative": {"degraded_signals": ["memory_pressure"]},
+        }),
+        # Suppression means omission. A serialized false claims the call looked
+        # and found the condition clear, which this optional carrier never says.
+        (None, {
+            "_kin": {"degraded": {"memory_pressure": False}},
+            "negative": {"degraded_signals": []},
+        }),
+        (None, {"_kin": {"degraded": {}}}),
+        (None, None),
+    ]
+    for want, payload in mcp_cases:
+        got = mcp_memory_pressure_state(payload)
+        if got != want:
+            failures.append("mcp_memory_pressure_state(%r) = %s, wanted %s"
+                            % (payload, got, want))
+
+    mcp_flag_cases = [
+        (True, {"_kin": {"degraded": {"memory_pressure": True}}}),
+        (False, {"_kin": {"degraded": {}}}),
+        (None, {"_kin": {"degraded": {"memory_pressure": False}}}),
+        (None, {"_kin": {}}),
+        (None, None),
+    ]
+    for want, payload in mcp_flag_cases:
+        got = mcp_memory_pressure_flag(payload)
+        if got != want:
+            failures.append("mcp_memory_pressure_flag(%r) = %s, wanted %s"
+                            % (payload, got, want))
+
+    resource_session_cases = [
+        (True, [{"path": "/commands/resources",
+                 "headers": {"x-kin-session": "selected-session"}}]),
+        # A prior unrelated request cannot decide the resources observation.
+        (True, [{"path": "/mcp/tools/call", "headers": {}},
+                {"path": "/commands/resources",
+                 "headers": {"x-kin-session": "selected-session"}}]),
+        (False, [{"path": "/commands/resources",
+                  "headers": {"x-kin-session": "other-session"}}]),
+        (False, [{"path": "/commands/resources", "headers": {}}]),
+        (False, []),
+    ]
+    for want, requests in resource_session_cases:
+        got = resources_received_session(requests, "selected-session")
+        if got != want:
+            failures.append("resources_received_session(%r) = %s, wanted %s"
+                            % (requests, got, want))
 
     budget_cases = [
         (True, "this repository's daemon and the 1 process(es) it started hold 8.4 GiB of the "
@@ -2396,6 +2929,7 @@ def self_test():
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     total = (len(row_cases) + len(healthy_cases) + len(status_cases)
+             + len(mcp_cases) + len(mcp_flag_cases) + len(resource_session_cases)
              + len(budget_cases) + len(standing_cases) + len(death_cases)
              + len(memory_cases) + len(idle_cases) + len(enrichment_cases)
              + len(kill_row_cases) + len(warning_cases) + len(line_cases)

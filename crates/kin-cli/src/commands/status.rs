@@ -1003,8 +1003,85 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
         if let Some(line) = daemon_memory_line(layout.root()) {
             println!("{line}");
         }
+        // What the working copy holds that graph truth does not. Appended for
+        // the same reason as the three lines above, and it is the one this
+        // command was missing: every line before it is authority truth, so a
+        // reader was told the tree matched its base change over a repository
+        // holding a module the graph had never met, and `kin refs` then
+        // certified that module's constant authoritatively absent (FIR-2820).
+        //
+        // Never silent. A count of zero and a daemon that measured nothing are
+        // different facts and this line says which it has, because "no
+        // untracked files were named" is exactly the shape a reader takes for
+        // "there are none".
+        println!("{}", untracked_host_content_line(&layout).await);
     }
     Ok(())
+}
+
+/// The `kin status` reading of host content graph truth does not carry.
+///
+/// Asked of the daemon rather than measured here, so one walk answers for every
+/// surface and two readings of one working copy can never disagree. Each arm
+/// names its own basis: a measured count with the age of the measurement, a
+/// measured nothing with the same age, a daemon that has taken no measurement,
+/// and no daemon at all. Only the first two are statements about the working
+/// copy, and the other two say so rather than rendering as a clean tree.
+async fn untracked_host_content_line(layout: &kin_core::KinLayout) -> String {
+    const LEAD: &str = "Untracked host content:";
+    let Some(base_url) = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await
+    else {
+        return format!(
+            "{LEAD} not measured; no daemon is running for this repository, and this \
+                        command reads durable authority, which cannot see a path no admission has \
+                        taken"
+        );
+    };
+    let Ok(client) = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout)
+    else {
+        return format!("{LEAD} not measured; this repository's daemon could not be addressed");
+    };
+    let Ok(health) = client.health().await else {
+        return format!("{LEAD} not measured; this repository's daemon did not answer");
+    };
+    let reconcile = health.reconcile;
+    // Fifth arm, and the one that is not a gap. A daemon that admits nothing
+    // from the filesystem has no host content waiting to be taken, so counting
+    // its projected checkout would report a shortfall the graph is not in.
+    if reconcile.untracked_observation_not_applicable {
+        return format!(
+            "{LEAD} not applicable; filesystem ingestion is off for this repository's daemon, so \
+             nothing on disk is waiting to be admitted"
+        );
+    }
+    let Some(age) = reconcile.untracked_observed_age_seconds else {
+        return format!(
+            "{LEAD} not measured; this repository's daemon reports no measurement of it, so the \
+             count it carries stands for nothing"
+        );
+    };
+    if reconcile.untracked_path_count == 0 {
+        return format!("{LEAD} none, measured {age}s ago");
+    }
+    let named = if reconcile.untracked_paths_sample.is_empty() {
+        String::new()
+    } else {
+        let more = reconcile
+            .untracked_path_count
+            .saturating_sub(reconcile.untracked_paths_sample.len() as u64);
+        let listed = reconcile.untracked_paths_sample.join(", ");
+        if more > 0 {
+            format!(" ({listed}, and {more} more)")
+        } else {
+            format!(" ({listed})")
+        }
+    };
+    format!(
+        "{LEAD} {} host path(s) on disk that graph truth does not carry{named}, measured {age}s \
+         ago; nothing above describes them, `kin admit` takes them now, and a commit takes them \
+         anyway",
+        reconcile.untracked_path_count
+    )
 }
 
 /// The daemon footprint line, when this store carries a published standing.
