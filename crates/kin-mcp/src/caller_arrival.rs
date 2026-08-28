@@ -107,8 +107,16 @@ const EVIDENCE_ROW_CAP: usize = 10;
 /// focal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArrivalState {
-    /// Every file that can reach the focal had every call site it parsed become
-    /// an edge. An absence answered over these edges is the whole set.
+    /// Every file that IMPORTS the focal's file had every call site it parsed
+    /// become an edge.
+    ///
+    /// Narrower than "nothing could have called the focal without an edge", and
+    /// the difference is load-bearing rather than pedantic. The family is built
+    /// from files that name the focal's file from OUTSIDE it, so the focal's own
+    /// file is excluded by construction and a call from beside the focal that
+    /// the linker dropped is invisible to this arithmetic. A surface whose
+    /// answer is a delete list has to account for the focal's own file too, and
+    /// that is [`absence_gap`]'s job rather than this state's.
     Accounted,
     /// At least one file that can reach the focal holds call sites that became
     /// no edge, so a caller of the focal may be among them.
@@ -358,6 +366,92 @@ fn file_entities<G: GraphStore>(
     ))
 }
 
+/// How many distinct call SITES the graph holds an edge for, among the entities
+/// of one file.
+///
+/// Not the number of `Calls` relations, and the difference is a hole this
+/// reading used to certify over. One source-level call site can fan out to
+/// several same-named destinations, and counting relations lets that fan-out pay
+/// for a DIFFERENT site that produced no edge at all: two parsed sites, two
+/// edges both minted from the first, and the subtraction reads zero missing
+/// while the second site is a hidden caller candidate. The parse side counts
+/// sites, so the resolved side has to count sites too or the two are not
+/// commensurable.
+///
+/// The join is [`kin_model::relation::RelationEvidence::source_span`], the
+/// syntax the parser recorded for each edge, which this crate already reads as a
+/// graph fact rather than something a consumer reconstructs
+/// (`handlers::common::relation_reference_lines`). An edge carrying no span in
+/// this file cannot be joined to a site and keeps its old weight of one rather
+/// than being dropped, so this count is never above the relation count it
+/// replaces and never below the sites the graph can actually witness. Where no
+/// edge carries a span the answer is exactly what it was before, which is why a
+/// store that records no spans reads no differently.
+///
+/// `None` means the relation index could not be read, which is not zero.
+fn resolved_call_sites<G: GraphStore>(
+    store: &G,
+    file: &FilePathId,
+    entity_ids: &[(EntityId, kin_model::EntityKind)],
+) -> Option<u64> {
+    let mut sites: HashSet<(usize, usize)> = HashSet::new();
+    let mut unjoinable = 0u64;
+    for (entity_id, _) in entity_ids {
+        let relations = store.get_all_relations_for_entity(entity_id).ok()?;
+        for relation in relations.iter().filter(|relation| {
+            relation.kind == RelationKind::Calls && relation.src.as_entity() == Some(*entity_id)
+        }) {
+            let mut joined = false;
+            for span in relation
+                .evidence
+                .iter()
+                .filter_map(|evidence| evidence.source_span.as_ref())
+                .filter(|span| &span.file == file)
+            {
+                sites.insert((span.start_byte, span.end_byte));
+                joined = true;
+            }
+            if !joined {
+                unjoinable += 1;
+            }
+        }
+    }
+    Some(sites.len() as u64 + unjoinable)
+}
+
+/// One file's own call-site accounting, the same arithmetic
+/// [`observe_caller_arrival`] runs over a family member.
+///
+/// `Ok(None)` means every call site the parser read in this file became an edge.
+/// `Ok(Some(row))` means it did not, or the store holds no count to check it
+/// against, which are two different gaps and both are gaps. `Err(reason)` means
+/// the file could not be read at all.
+///
+/// Exposed because the family a focal belongs to never contains the focal's own
+/// file, so this is the only way to ask whether a caller sitting BESIDE the
+/// focal could have arrived through a call the linker dropped.
+pub fn observe_file_call_sites<G: GraphStore>(
+    store: &G,
+    file: &FilePathId,
+) -> Result<Option<UnaccountedFile>, &'static str> {
+    let Some((entity_ids, parsed)) = file_entities(store, file) else {
+        return Err("the entity index could not be read for the focal's own file");
+    };
+    let Some(resolved) = resolved_call_sites(store, file, &entity_ids) else {
+        return Err("the relation index could not be read for the focal's own file");
+    };
+    let missing = parsed.map(|parsed| parsed.saturating_sub(resolved));
+    if missing.is_some_and(|missing| missing == 0) {
+        return Ok(None);
+    }
+    Ok(Some(UnaccountedFile {
+        file: file.0.clone(),
+        parsed_call_sites: parsed,
+        resolved_call_edges: resolved,
+        unaccounted_call_sites: missing,
+    }))
+}
+
 /// Whether a caller could reach `focal` through a call this graph does not hold.
 ///
 /// Never fails the request: any error, an oversized family or an unreadable
@@ -496,25 +590,16 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
         if parsed.is_some() {
             family_measured += 1;
         }
-        let mut resolved = 0u64;
-        for (entity_id, _) in &entity_ids {
-            let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
-                return CallerArrival::unmeasured(
-                    "the relation index could not be read for a file in the focal's family",
-                );
-            };
-            resolved += relations
-                .iter()
-                .filter(|relation| {
-                    relation.kind == RelationKind::Calls
-                        && relation.src.as_entity() == Some(*entity_id)
-                })
-                .count() as u64;
-        }
-        // A call site can fan out to several same-named destinations, so the
-        // resolved side can exceed the parsed side; the shortfall floors at
-        // zero rather than wrapping, which is the same cap `call_percent` puts
-        // on the ratio for the same reason.
+        let Some(resolved) = resolved_call_sites(store, file, &entity_ids) else {
+            return CallerArrival::unmeasured(
+                "the relation index could not be read for a file in the focal's family",
+            );
+        };
+        // A call site can still fan out to several same-named destinations that
+        // the graph records without a joinable span, so the resolved side can
+        // exceed the parsed side; the shortfall floors at zero rather than
+        // wrapping, which is the same cap `call_percent` puts on the ratio for
+        // the same reason.
         let missing = parsed.map(|parsed| parsed.saturating_sub(resolved));
         // Two distinct gaps and both count. A positive shortfall is call sites
         // that reached no destination. An absent count is a file whose call
@@ -608,12 +693,174 @@ pub fn arrival_gap(payload: &serde_json::Value) -> Option<String> {
     }
 }
 
+/// Whether an absence claim about `focal` can be supported at all, and the
+/// limiting factor when it cannot.
+///
+/// This is THE rule for a delete list, spelled once so every dead-code surface
+/// reaches the same verdict about the same entity. `kin dead-code`, the MCP
+/// `dead_code` tool, and both seeded implementations used to decide on present
+/// inbound edges alone; wiring the arrival reading into one of them would have
+/// left an agent asking the MCP for removable code and getting the answer the
+/// terminal had already refused to stand behind.
+///
+/// Two things separate it from reading [`ArrivalState`] off
+/// [`observe_caller_arrival`] directly, and both are fail-closed.
+///
+/// First, only [`ArrivalState::Accounted`] licenses an absence, so a family file
+/// carrying NO parse-side count gates the row exactly as a measured shortfall
+/// does. That case is not a rare one: on the store this ticket came from the
+/// reading returned `family_measured: 0` with `parsed_call_sites: null` on every
+/// row, and it is the whole reason a delete list must not read a missing
+/// measurement as a clean one. The two gaps keep different factor ids, because
+/// "some call went nowhere" and "nobody counted" are different news for whoever
+/// reads the row, but neither one certifies.
+///
+/// Second, the focal's own file is accounted here. The family is by construction
+/// the files that name the focal's file from outside it, so a call from BESIDE
+/// the focal that the linker dropped is outside the reading entirely, and on a
+/// delete list that is the caller whose deletion breaks the build. The
+/// candidate scan already drops a row whose own file holds an inbound EDGE; this
+/// covers the same-file call that produced no edge at all.
+///
+/// Scoped to this authority rather than folded into [`observe_caller_arrival`]
+/// on purpose: `find_references` qualifies a reference list, this qualifies a
+/// deletion, and a delete list has always carried the stricter bar.
+pub fn absence_gap<G: GraphStore>(store: &G, focal: &Entity) -> Option<(&'static str, String)> {
+    let arrival = observe_caller_arrival(store, focal);
+    match arrival.state {
+        ArrivalState::Unmeasured => {
+            return Some((
+                UNMEASURED_ARRIVAL_LIMITING_FACTOR,
+                format!(
+                    "the set of files that can reach it could not be established ({})",
+                    arrival
+                        .unmeasured_reason
+                        .as_deref()
+                        .unwrap_or("no reason recorded")
+                ),
+            ));
+        }
+        ArrivalState::Unaccounted => {
+            // `unaccounted_call_sites` is `Some(n)` only where both sides of the
+            // subtraction were read. `None` is a file the store holds no parse
+            // count for. Both are gaps; they differ only in what the row can
+            // tell its reader, so the measured ones are named first and the
+            // absent ones fall back to a factor that says nobody counted.
+            let measured: Vec<String> = arrival
+                .unaccounted
+                .iter()
+                .filter_map(|file| {
+                    file.unaccounted_call_sites
+                        .filter(|missing| *missing > 0)
+                        .map(|missing| {
+                            format!(
+                                "{} ({missing} of {} parsed call sites became no edge)",
+                                file.file,
+                                file.parsed_call_sites.unwrap_or(0)
+                            )
+                        })
+                })
+                .collect();
+            if !measured.is_empty() {
+                return Some((
+                    UNRESOLVED_ARRIVAL_LIMITING_FACTOR,
+                    format!(
+                        "{} of the {} file(s) that can reach it hold call sites the linker \
+                         recorded no edge for, so a caller may be among them: {}",
+                        measured.len(),
+                        arrival.family_files,
+                        measured.join(", ")
+                    ),
+                ));
+            }
+            let uncounted = arrival.unaccounted.len();
+            return Some((
+                UNMEASURED_ARRIVAL_LIMITING_FACTOR,
+                format!(
+                    "the store holds no parse-side call count for {uncounted} of the {} file(s) \
+                     that can reach it, so the calls made there could not be accounted for",
+                    arrival.family_files
+                ),
+            ));
+        }
+        ArrivalState::Accounted => {}
+    }
+
+    // Every file that names this one from outside accounted for its calls. What
+    // remains is the file itself, which is in no family.
+    let file = focal.file_origin.as_ref()?;
+    match observe_file_call_sites(store, file) {
+        Err(reason) => Some((UNMEASURED_ARRIVAL_LIMITING_FACTOR, reason.to_string())),
+        Ok(None) => None,
+        Ok(Some(row)) => match row.unaccounted_call_sites {
+            Some(missing) => Some((
+                UNRESOLVED_ARRIVAL_LIMITING_FACTOR,
+                format!(
+                    "{missing} of the {} call sites the parser read in that same file became no \
+                     edge, so a caller sitting beside it may be among them",
+                    row.parsed_call_sites.unwrap_or(0)
+                ),
+            )),
+            None => Some((
+                UNMEASURED_ARRIVAL_LIMITING_FACTOR,
+                "the store holds no parse-side call count for that file itself, so a call to it \
+                 from beside it could not be accounted for"
+                    .to_string(),
+            )),
+        },
+    }
+}
+
+/// [`absence_gap`] over a scan that classifies many entities at once.
+///
+/// The reading consults the focal only through its file of origin and its
+/// language, and it walks up to [`FAMILY_FILE_CAP`] importing files per reading,
+/// so a scan listing forty rows out of three files takes three readings rather
+/// than forty. Every entity of one file shares that file's language, so the memo
+/// key is the file and nothing finer.
+#[derive(Default)]
+pub struct AbsenceGapMemo {
+    by_file: std::collections::HashMap<FilePathId, Option<(&'static str, String)>>,
+}
+
+impl AbsenceGapMemo {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The gap for one entity, computed once per file.
+    pub fn gap<G: GraphStore>(
+        &mut self,
+        store: &G,
+        focal: &Entity,
+    ) -> Option<(&'static str, String)> {
+        let Some(file) = focal.file_origin.clone() else {
+            return absence_gap(store, focal);
+        };
+        self.by_file
+            .entry(file)
+            .or_insert_with(|| absence_gap(store, focal))
+            .clone()
+    }
+
+    /// The same gap rendered as the one sentence a JSON surface publishes, and
+    /// `None` when the absence is supportable.
+    ///
+    /// Published on every row rather than only on limited ones, so a reader
+    /// never has to tell "checked and fine" from "not reported".
+    pub fn limiting_factor<G: GraphStore>(&mut self, store: &G, focal: &Entity) -> Option<String> {
+        self.gap(store, focal)
+            .map(|(factor, reason)| format!("{factor}: {reason}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use kin_db::InMemoryGraph;
     use kin_model::graph::EntityStore;
+    use kin_model::relation::RelationEvidence;
     use kin_model::{
         EntityKind, EntityMetadata, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId,
         Relation, RelationId, RelationOrigin, SemanticFingerprint, SourceSpan, Visibility,
@@ -1216,6 +1463,224 @@ mod tests {
                 ),
             ),
         ]
+    }
+
+    /// A `Calls` edge carrying the exact source syntax the linker bound.
+    ///
+    /// `start_byte` is what separates two edges minted from ONE call site from
+    /// two edges minted from two, which is the whole subject of the fan-out arm.
+    fn call_edge_at(src: &Entity, dst: &Entity, file: &str, start_byte: usize) -> Relation {
+        Relation {
+            id: RelationId::from_content(
+                &src.id.0.to_string(),
+                &dst.id.0.to_string(),
+                &format!("Calls@{start_byte}"),
+            ),
+            evidence: vec![RelationEvidence {
+                source_span: Some(SourceSpan {
+                    file: FilePathId::new(file),
+                    start_byte,
+                    end_byte: start_byte + 8,
+                    start_line: start_byte as u32,
+                    start_col: 0,
+                    end_line: start_byte as u32,
+                    end_col: 8,
+                }),
+                parser_rule: None,
+                token: None,
+                source_path: None,
+                resolved_path: None,
+            }],
+            ..edge(RelationKind::Calls, src, dst)
+        }
+    }
+
+    /// One caller file whose two parsed call sites became two edges, either from
+    /// one site fanning out to two same-named destinations or from two separate
+    /// sites.
+    ///
+    /// The review counterexample this exists for: with `fan_out` the aggregate
+    /// relation count is 2 against 2 parsed sites, so a reading that counts
+    /// relations subtracts to zero and certifies while one parsed site produced
+    /// no edge at all.
+    fn store_with_call_sites(fan_out: bool) -> (InMemoryGraph, Entity) {
+        let store = InMemoryGraph::new();
+        // The focal's own file parses no calls, so its own accounting is clean
+        // and this arm reads only the family.
+        let focal = entity_in("note_body", FOCAL_FILE, Some(0));
+        let focal_module = entity_in("storage", FOCAL_FILE, Some(0));
+        let find_note = entity_in("find_note", FOCAL_FILE, Some(0));
+        let caller_module = entity_in("test_storage", CALLER_FILE, Some(2));
+        let caller = entity_in("test_bodies_round_trip", CALLER_FILE, Some(2));
+        for entity in [&focal, &focal_module, &find_note, &caller_module, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&edge(RelationKind::Imports, &caller_module, &focal_module))
+            .unwrap();
+        store
+            .upsert_relation(&call_edge_at(&caller, &find_note, CALLER_FILE, 100))
+            .unwrap();
+        let second_site = if fan_out { 100 } else { 200 };
+        store
+            .upsert_relation(&call_edge_at(
+                &caller,
+                &focal_module,
+                CALLER_FILE,
+                second_site,
+            ))
+            .unwrap();
+        (store, focal)
+    }
+
+    /// FIR-2821 review, third P1, second counterexample. One parsed call site
+    /// can fan out to several same-named destinations, and counting relations
+    /// lets that fan-out pay for a DIFFERENT site that produced no edge.
+    #[test]
+    fn two_edges_minted_from_one_call_site_do_not_account_for_two() {
+        let (store, focal) = store_with_call_sites(true);
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Unaccounted,
+            "two edges from one span account for one site, so one of the two parsed sites \
+             became no edge: {:?}",
+            arrival.unaccounted
+        );
+        let row = &arrival.unaccounted[0];
+        assert_eq!(row.resolved_call_edges, 1, "{row:?}");
+        assert_eq!(row.unaccounted_call_sites, Some(1), "{row:?}");
+    }
+
+    /// The control, and it is the half that makes the arm above a measurement
+    /// rather than a refusal: the same two edges at two distinct sites account
+    /// for both parsed sites and still certify.
+    #[test]
+    fn two_edges_at_two_call_sites_account_for_both() {
+        let (store, focal) = store_with_call_sites(false);
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Accounted,
+            "two distinct spans are two accounted sites: {:?}",
+            arrival.unaccounted
+        );
+    }
+
+    /// A store recording no span at all reads exactly as it did before this
+    /// join existed, so the change cannot quietly move a graph it cannot join.
+    #[test]
+    fn edges_carrying_no_span_keep_their_old_weight_of_one() {
+        // `store_with` builds spanless edges, which is what a store that does
+        // not record call-site evidence looks like.
+        let (store, focal) = store_with(Some(2), 2, true);
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Accounted,
+            "two spanless edges still count as two: {:?}",
+            arrival.unaccounted
+        );
+    }
+
+    /// The delete-list fixture: one family file, counts present on both sides,
+    /// and the focal's own file accounted for. `family_parsed` is what the
+    /// parser read in the caller and `focal_parsed` what it read beside the
+    /// focal, so each arm names which side it moved.
+    fn store_for_absence(
+        family_parsed: Option<u64>,
+        focal_parsed: Option<u64>,
+    ) -> (InMemoryGraph, Entity) {
+        let store = InMemoryGraph::new();
+        let focal = entity_in("note_body", FOCAL_FILE, focal_parsed);
+        let focal_module = entity_in("storage", FOCAL_FILE, focal_parsed);
+        let caller_module = entity_in("test_storage", CALLER_FILE, family_parsed);
+        let caller = entity_in("test_bodies_round_trip", CALLER_FILE, family_parsed);
+        for entity in [&focal, &focal_module, &caller_module, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&edge(RelationKind::Imports, &caller_module, &focal_module))
+            .unwrap();
+        // The caller's one parsed call site, bound. Nothing calls the focal.
+        store
+            .upsert_relation(&call_edge_at(&caller, &focal_module, CALLER_FILE, 100))
+            .unwrap();
+        (store, focal)
+    }
+
+    /// FIR-2821 review, first P1. A family file the store holds no parse-side
+    /// count for is `Unaccounted`, and only `Accounted` licenses an absence, so
+    /// a delete list may not read the missing measurement as a clean one. This
+    /// is the state a converted store is in for nearly every file today.
+    #[test]
+    fn a_family_file_with_no_parse_count_does_not_license_a_delete() {
+        let (store, focal) = store_for_absence(None, Some(0));
+        assert_eq!(
+            observe_caller_arrival(&store, &focal).state,
+            ArrivalState::Unaccounted,
+            "the reading itself refuses; the gate under test is whether the consumer agrees"
+        );
+        let (factor, reason) = absence_gap(&store, &focal)
+            .expect("a family file with no parse count cannot license a delete");
+        assert_eq!(factor, UNMEASURED_ARRIVAL_LIMITING_FACTOR);
+        assert!(
+            reason.contains("no parse-side call count for 1 of the 1 file(s)"),
+            "the reason states what is missing rather than naming a cause it cannot know: \
+             {reason}"
+        );
+    }
+
+    /// The control the arm above needs: the identical shape with the count
+    /// present and every site accounted for licenses the delete. Without it a
+    /// gate that refused everything would pass that arm.
+    #[test]
+    fn a_fully_accounted_family_licenses_a_delete() {
+        let (store, focal) = store_for_absence(Some(1), Some(0));
+        assert_eq!(
+            observe_caller_arrival(&store, &focal).state,
+            ArrivalState::Accounted
+        );
+        assert_eq!(absence_gap(&store, &focal), None);
+    }
+
+    /// FIR-2821 review, third P1, first counterexample. The family is by
+    /// construction the files that name the focal's file from OUTSIDE it, so a
+    /// call sitting beside the focal that the linker dropped is invisible to the
+    /// family arithmetic. A delete list has to account for that file too.
+    #[test]
+    fn a_dropped_call_beside_the_focal_does_not_license_a_delete() {
+        let (store, focal) = store_for_absence(Some(1), Some(2));
+        assert_eq!(
+            observe_caller_arrival(&store, &focal).state,
+            ArrivalState::Accounted,
+            "the family accounts for itself, which is exactly why the family alone is not \
+             enough"
+        );
+        let (factor, reason) = absence_gap(&store, &focal).expect(
+            "two call sites beside the focal became no edge, and one of them could be a \
+                     call to the focal",
+        );
+        assert_eq!(factor, UNRESOLVED_ARRIVAL_LIMITING_FACTOR);
+        assert!(
+            reason.contains("2 of the 2 call sites the parser read in that same file"),
+            "{reason}"
+        );
+    }
+
+    /// The other half of the same-file rule: a focal whose own file holds no
+    /// parse-side count cannot be certified either, because the call beside it
+    /// was not counted rather than counted at zero.
+    #[test]
+    fn a_focal_file_with_no_parse_count_does_not_license_a_delete() {
+        let (store, focal) = store_for_absence(Some(1), None);
+        let (factor, reason) =
+            absence_gap(&store, &focal).expect("an uncounted focal file cannot license a delete");
+        assert_eq!(factor, UNMEASURED_ARRIVAL_LIMITING_FACTOR);
+        assert!(
+            reason.contains("no parse-side call count for that file itself"),
+            "{reason}"
+        );
     }
 
     #[test]

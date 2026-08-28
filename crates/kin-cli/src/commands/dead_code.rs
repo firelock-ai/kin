@@ -74,6 +74,22 @@ pub struct DeadCodeSeededCandidate {
     #[serde(default)]
     pub proven_reference_count: usize,
     pub dead: bool,
+    /// Why an absence claim about this row cannot be stood behind, or `null`
+    /// when it can.
+    ///
+    /// The same `kin_mcp::caller_arrival::absence_gap` verdict the whole-repo
+    /// scan and both MCP dead-code tools apply, so one entity does not read
+    /// deletable on one surface and unverifiable on another. `dead: true` beside
+    /// a populated factor means the graph holds no proven inbound edge AND could
+    /// not account for the ways a caller reaches this entity, which is a
+    /// candidate rather than a find.
+    ///
+    /// Serialized on every row, populated or null, so a reader never has to tell
+    /// "checked and fine" from "not reported". Defaulted so a new CLI reading an
+    /// older daemon's response does not fail to parse it; that older response
+    /// reads as null, which is why the daemon and CLI ship together.
+    #[serde(default)]
+    pub absence_limiting_factor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -296,98 +312,32 @@ fn build_dead_code_report(
     // eleven live functions with no caveat at all while carefully hedging the
     // one row it could resolve.
     //
-    // Within `ArrivalState::Unaccounted`, only a MEASURED shortfall gates a row
-    // here. That state also covers a family file carrying no parse-side call
-    // count at all, and on a converted store today that is nearly every file:
-    // measured on the stranger's corpus, `kin graph status` reports the python
-    // parse side "measured on 1 of 14 files". A row label that fires on a count
-    // the store does not hold would land on every row of every scan, which is a
-    // label a reader learns to skip. A separate `Unmeasured` state means the
-    // reading itself declined, and that gates through its own branch below
-    // because a declined walk cannot certify absence either. So the positive
-    // shortfall branch gates only when some reachable file parsed MORE call
-    // sites than the graph holds edges for, which is a fact, while the
-    // store-wide absent-count gap stays disclosed in the reference-edge coverage
-    // block this scan prints below.
+    // On a store that holds no parse-side call count this gates every row, and
+    // that is the honest reading rather than a blanket refusal: the count is
+    // absent for a named reason the response prints once, the refusal is still
+    // scoped to the files that can reach each row, and it lifts per row the
+    // moment the count exists. Certifying instead, because the common cause is
+    // inconvenient, is this ticket's own failure one level down.
     //
-    // Memoized per FILE rather than per row. `observe_caller_arrival` consults
-    // the focal only through its file of origin and its language, and it walks
-    // up to `FAMILY_FILE_CAP` importing files per reading, so a scan listing
-    // forty rows out of three files takes three readings and not forty.
+    // Decided by `kin_mcp::caller_arrival::absence_gap`, which is the one rule
+    // every dead-code surface applies, rather than by reading the arrival state
+    // here. A second reading of the same evidence beside the first is how the
+    // MCP `dead_code` tool and this command came to answer differently about the
+    // same entity, so there is one function and four callers.
+    //
+    // What that rule adds over the raw state is fail-closed in both directions a
+    // consumer forgets. A family file carrying no parse-side count gates the row
+    // exactly as a measured shortfall does, because a missing measurement is not
+    // a clean one and on a converted store today it is the common case. And the
+    // focal's own file is accounted too, because the family is by construction
+    // the files that name this one from outside it, so a call from beside the
+    // row that the linker dropped is otherwise outside the reading entirely.
     type ArrivalGap = (&'static str, String);
-    let mut arrival_by_file: std::collections::HashMap<kin_model::FilePathId, Option<ArrivalGap>> =
-        std::collections::HashMap::new();
+    let mut arrival_memo = kin_mcp::caller_arrival::AbsenceGapMemo::new();
     let mut arrival_rows: std::collections::HashMap<EntityId, ArrivalGap> =
         std::collections::HashMap::new();
     for entity in unreferenced.iter().chain(test_only.iter()) {
-        let Some(file) = entity.file_origin.clone() else {
-            continue;
-        };
-        let gap = arrival_by_file.entry(file).or_insert_with(|| {
-            let arrival = kin_mcp::caller_arrival::observe_caller_arrival(graph, entity);
-            // A reading that DECLINED gates the row too, and this branch is the
-            // one a consumer forgets. `observe_caller_arrival` refuses to
-            // truncate: over `FAMILY_FILE_CAP` importing files, or on an index
-            // it could not read, or in a language that links no imports at all,
-            // it returns `Unmeasured` and names the reason rather than
-            // examining part of the family and reporting `accounted`. But it
-            // carries that refusal in `unmeasured_reason` and leaves the
-            // shortfall list EMPTY, so a consumer reading only the list drops
-            // the refusal on the floor and prints the row as a find. Unmeasured
-            // is not accounted, on this surface least of all.
-            //
-            // This does not reopen the blanket-refusal problem the measured
-            // filter below exists to avoid, because that is a different state:
-            // the common case today is `Unaccounted` reached through a family
-            // file carrying no parse count. On the corpus this ticket came from
-            // every reading was `Accounted` or `Unaccounted` and none was
-            // `Unmeasured`.
-            if arrival.state == kin_mcp::caller_arrival::ArrivalState::Unmeasured {
-                return Some((
-                    kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR,
-                    format!(
-                        "the set of files that can reach it could not be established ({})",
-                        arrival
-                            .unmeasured_reason
-                            .as_deref()
-                            .unwrap_or("no reason recorded")
-                    ),
-                ));
-            }
-            // `unaccounted_call_sites` is `Some(n)` only where both sides of the
-            // subtraction were read. `None` is a file the store holds no parse
-            // count for, and that is a gap in this reading rather than evidence
-            // about the focal.
-            let measured: Vec<String> = arrival
-                .unaccounted
-                .iter()
-                .filter_map(|file| {
-                    file.unaccounted_call_sites
-                        .filter(|missing| *missing > 0)
-                        .map(|missing| {
-                            format!(
-                                "{} ({missing} of {} parsed call sites became no edge)",
-                                file.file,
-                                file.parsed_call_sites.unwrap_or(0)
-                            )
-                        })
-                })
-                .collect();
-            if measured.is_empty() {
-                return None;
-            }
-            Some((
-                kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR,
-                format!(
-                    "{} of the {} file(s) that can reach it hold call sites the linker recorded \
-                     no edge for, so a caller may be among them: {}",
-                    measured.len(),
-                    arrival.family_files,
-                    measured.join(", ")
-                ),
-            ))
-        });
-        if let Some(gap) = gap.clone() {
+        if let Some(gap) = arrival_memo.gap(graph, entity) {
             arrival_rows.insert(entity.id, gap);
         }
     }
@@ -880,6 +830,7 @@ pub fn build_dead_code_seeded_response(
 
     let mut candidates: Vec<DeadCodeSeededCandidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut arrival_memo = kin_mcp::caller_arrival::AbsenceGapMemo::new();
 
     for record in search_response.records.iter() {
         if candidates.len() >= limit {
@@ -913,6 +864,10 @@ pub fn build_dead_code_seeded_response(
         // `dead_code` tool apply. Deciding it on the raw count here would make
         // one entity dead on one surface and live on another.
         let dead = counts.proven == 0;
+        // And the same arrival authority, for the same reason. A `dead` boolean
+        // with no limiting factor is what let an agent act on this surface after
+        // the terminal one had already refused to stand behind the identical row.
+        let absence_limiting_factor = arrival_memo.limiting_factor(graph, &entity);
 
         candidates.push(DeadCodeSeededCandidate {
             id: entity.id.to_string(),
@@ -923,6 +878,7 @@ pub fn build_dead_code_seeded_response(
             reference_count: counts.total,
             proven_reference_count: counts.proven,
             dead,
+            absence_limiting_factor,
         });
     }
 
@@ -1317,19 +1273,36 @@ mod tests {
         }
     }
 
+    /// A file entity carrying its import count but NOT the parse-side call
+    /// count, which is what every file of a converted store looks like today:
+    /// `kin graph status` reported the python parse side "measured on 1 of 14
+    /// files" on the corpus this ticket came from (FIR-2828).
+    fn uncounted(entity: Entity, import_statements: u64) -> Entity {
+        let mut entity = measured(entity, 0, import_statements);
+        entity
+            .metadata
+            .extra
+            .remove(kin_parser::FILE_PARSED_CALL_SITES_KEY);
+        entity
+    }
+
     /// The FIR-2821 shape as a graph: a file reached only by a module binding,
     /// whose one caller parsed more call sites than the graph holds edges for.
     ///
-    /// `caller_parsed` is what the parser read in `src/cli.rs`. One of those
-    /// became an edge in every arm, so the arm with a higher count is the one
-    /// where calls went missing and a caller of `dead_target` could be among
-    /// them.
-    fn graph_with_module_binding(caller_parsed: u64) -> (InMemoryGraph, Entity) {
+    /// `caller_parsed` is what the parser read in `src/cli.rs`, and `None` is a
+    /// store that holds no count for it at all. One call became an edge in every
+    /// arm, so a higher count is the arm where calls went missing and a caller of
+    /// `dead_target` could be among them.
+    fn graph_with_module_binding(caller_parsed: Option<u64>) -> (InMemoryGraph, Entity) {
         let graph = InMemoryGraph::new();
         let dead_target = measured(make_entity("dead_target", "src/store.rs"), 0, 0);
         let store_module = measured(make_module_entity("store", "src/store.rs"), 0, 0);
-        let caller = measured(make_entity("caller", "src/cli.rs"), caller_parsed, 1);
-        let neighbour = measured(make_entity("neighbour", "src/cli.rs"), caller_parsed, 1);
+        let count = |entity| match caller_parsed {
+            Some(parsed) => measured(entity, parsed, 1),
+            None => uncounted(entity, 1),
+        };
+        let caller = count(make_entity("caller", "src/cli.rs"));
+        let neighbour = count(make_entity("neighbour", "src/cli.rs"));
         for entity in [&dead_target, &store_module, &caller, &neighbour] {
             graph.upsert_entity(entity).unwrap();
         }
@@ -1362,7 +1335,7 @@ mod tests {
         // stranger's scan printed exactly this row with no caveat at all while
         // hedging the one row it could resolve, and deleting on it would have
         // taken out a live function.
-        let (graph, _) = graph_with_module_binding(3);
+        let (graph, _) = graph_with_module_binding(Some(3));
         let response = scan(&graph);
         let output = response.lines.join("\n");
 
@@ -1384,6 +1357,40 @@ mod tests {
             !response.verified,
             "a delete list carrying a row whose callers may not all be visible is not a \
              verified answer: {output}"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_family_holds_no_parse_count_is_not_read_as_a_find() {
+        // THE ARM THE REVIEW BOUGHT. `src/cli.rs` can reach `src/store.rs` and
+        // the store holds no count of the call sites parsed there, so nothing
+        // ruled out a caller of `dead_target` among them. The reading says
+        // `Unaccounted`, which is not a state that licenses an absence, and a
+        // consumer that kept only the files with a MEASURED shortfall turned
+        // that into a plain row under a confident verdict. On a converted store
+        // this is not an edge case: it is nearly every file.
+        let (graph, _) = graph_with_module_binding(None);
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("dead_target"),
+            "the row must still be listed, or every assertion below passes for the wrong \
+             reason: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "[unverified: {}] dead_target",
+                kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+            )),
+            "the row names the factor, and it is the uncounted one rather than the shortfall \
+             one, because nobody counted is different news from some call went nowhere: \
+             {output}"
+        );
+        assert!(
+            !response.verified,
+            "a delete list over a store that never counted the calls that could reach these \
+             rows is not a verified answer: {output}"
         );
     }
 
@@ -1448,7 +1455,7 @@ mod tests {
         // rather than a candidate. A gate that cannot stay silent teaches a
         // reader to skip its label, which is the FIR-2821 inversion one level
         // down.
-        let (graph, _) = graph_with_module_binding(1);
+        let (graph, _) = graph_with_module_binding(Some(1));
         let response = scan(&graph);
         let output = response.lines.join("\n");
 
@@ -1652,6 +1659,85 @@ mod tests {
             said.contains("Kin cannot rule out seed matches it did not see"),
             "an empty seeded scan on a degraded daemon must carry its own noun rather than \
              impact's 'dependents': {said}"
+        );
+    }
+
+    /// FIR-2821 review, second P1. The seeded surface reaches the same verdict
+    /// about the same entity as the whole-repo scan, and it says so on the row.
+    ///
+    /// Before this, one dead-code surface applied the arrival authority and
+    /// three did not, so an agent could ask for removable code and be handed a
+    /// row the terminal surface had already refused to stand behind. The
+    /// assertion is the AGREEMENT rather than either endpoint: the whole-repo
+    /// scan's label for `dead_target` and the seeded candidate's limiting factor
+    /// are read off the same store and required to name the same factor, so
+    /// neither surface can drift without the other.
+    #[test]
+    fn the_seeded_surface_reaches_the_same_arrival_verdict_as_the_scan() {
+        let (graph, dead_target) = graph_with_module_binding(Some(3));
+        let scanned = scan(&graph);
+        let output = scanned.lines.join("\n");
+        let factor = kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR;
+        assert!(
+            output.contains(&format!("[unverified: {factor}] dead_target")),
+            "the whole-repo endpoint of this agreement must hold first, or the seeded \
+             assertion below passes over a scan that gated nothing: {output}"
+        );
+
+        let response = build_dead_code_seeded_response(
+            &graph,
+            &DeadCodeSeededRequest {
+                query: "dead_target".to_string(),
+                limit: Some(10),
+                name_pattern: None,
+            },
+            &dead_code_test_envelope(),
+        )
+        .unwrap();
+        let row = response
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == dead_target.id.to_string())
+            .expect("the seed names the entity the scan listed");
+        assert!(
+            row.dead,
+            "the row has no proven inbound edge, so it is still offered as a candidate: {row:?}"
+        );
+        let said = row
+            .absence_limiting_factor
+            .as_deref()
+            .expect("a candidate the graph cannot account for carries its limiting factor");
+        assert!(
+            said.starts_with(factor),
+            "the seeded surface names the same factor the scan put on the row, or one entity \
+             reads deletable here and unverifiable there: {said}"
+        );
+    }
+
+    /// The control, and the half that keeps the arm above from passing over a
+    /// surface that qualifies everything: the same shape with every call site
+    /// accounted for carries no factor at all.
+    #[test]
+    fn a_seeded_candidate_the_graph_can_account_for_carries_no_factor() {
+        let (graph, dead_target) = graph_with_module_binding(Some(1));
+        let response = build_dead_code_seeded_response(
+            &graph,
+            &DeadCodeSeededRequest {
+                query: "dead_target".to_string(),
+                limit: Some(10),
+                name_pattern: None,
+            },
+            &dead_code_test_envelope(),
+        )
+        .unwrap();
+        let row = response
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == dead_target.id.to_string())
+            .expect("the seed names the entity");
+        assert_eq!(
+            row.absence_limiting_factor, None,
+            "every call site this graph parsed became an edge, so nothing licenses a caveat"
         );
     }
 

@@ -2992,17 +2992,26 @@ def check_22(suite):
     exists, in `kin-index`'s `receiver_module_hop` arms and its corpus census,
     both linker-only with no daemon and no language server.
 
-    The measured-gap gate's input arm is not here, and that is a finding rather
-    than a shortcut. The reading subtracts a file's resolved call edges from the
-    call sites the parser read there, and on a converted store the parse side is
-    not present to subtract: on this fixture's own shape `kin graph status`
-    reports the python parse side "measured on 1 of 14 files". So an end-to-end
-    positive-shortfall arm could only assert the absent-count branch, which
-    fires on every file and would pin the missing plumbing as correct. That arm
-    is falsified where its inputs can be set, in
-    `dead_code::tests::a_row_whose_callers_could_arrive_unaccounted_says_so_on_the_row`
-    and its silent-control sibling. What this suite can say end to end is exact:
-    over a store where nothing went missing, no row is labelled.
+    The third arm grades the arrival consumer itself, and it does it as a JOIN
+    rather than as a fixed expectation. `find_references(connect)` publishes the
+    arrival reading for `pkg/store.py`, which is the file `orphaned_helper` also
+    lives in, so the two surfaces are reading one store about one file. The
+    check derives from that block what the dead-code row and the top-level
+    verdict have to say, and then requires exactly that. A store that accounted
+    for every arrival owes an empty label and a confident `Found`; a store that
+    could not owes the matching `caller_arrival_` factor on the row and a verdict
+    that is not confident.
+
+    That join is what a fixed expectation could not do. Requiring an exactly
+    empty label passed whether or not dead-code consulted the reading at all,
+    because the already-fixed linker keeps `connect` off the list on its own and
+    a clean row is clean either way. Under the join, removing the consumer leaves
+    the row bare while the reading still says the arrival could not be accounted
+    for, and the two halves contradict. Which branch runs is a property of the
+    store rather than of this check, so the result names the branch it took: only
+    the non-accounted branch grades the consumer, and today it is the branch this
+    fixture takes, because the parse-side call count does not reach a converted
+    store (FIR-2828).
     """
     res = Result("22", "FIR-2821",
                  "dead-code over a relative module import, and its arrival gate")
@@ -3081,7 +3090,9 @@ def check_22(suite):
         res.unknown("kin dead-code rc=%d printed no verdict sentence this suite can read: %s"
                     % (clean["rc"], excerpt[-300:] or "(no output)"))
         return res
-    confident_verdict = verdict.startswith("Found ")
+    # `Found N unreferenced entities, M of them UNVERIFIED:` also starts with
+    # `Found `, and it is not a confident verdict. Both halves are required.
+    confident_verdict = verdict.startswith("Found ") and "UNVERIFIED" not in verdict
 
     # The dead positive control. A scan that listed nothing satisfies
     # "connect is not listed" for the wrong reason.
@@ -3104,23 +3115,59 @@ def check_22(suite):
         res.ok("%s is reached through the relative module import and is not listed"
                % RELIMPORT_LIVE_FUNCTION)
 
-    # The gate must be able to stay exactly silent, or it is a gate that never
-    # certifies and a reader learns to skip its label. Exact emptiness catches a
-    # generic refusal and future factor renames as well as both current arrival
-    # spellings.
+    # The join. `orphaned_helper` and `connect` share pkg/store.py, so the
+    # arrival block find_references published for one is the reading dead-code
+    # owes an answer to for the other.
+    arrival = live_refs.get("caller_arrival")
+    if not isinstance(arrival, dict) or not arrival.get("state"):
+        res.unknown("find_references(%s) published no readable caller_arrival block, so the "
+                    "arrival consumer cannot be graded against it: %r"
+                    % (RELIMPORT_LIVE_FUNCTION, arrival))
+        return res
+    state = arrival["state"]
+    unaccounted_files = arrival.get("unaccounted_files") or []
+    measured_shortfall = [
+        row for row in unaccounted_files
+        if isinstance(row.get("unaccounted_call_sites"), int)
+        and row["unaccounted_call_sites"] > 0
+    ]
+    if state == "accounted":
+        expected_label = ""
+    elif state == "unmeasured":
+        expected_label = "[unverified: caller_arrival_unmeasured]"
+    elif state == "unaccounted":
+        expected_label = ("[unverified: caller_arrival_unresolved]" if measured_shortfall
+                          else "[unverified: caller_arrival_unmeasured]")
+    else:
+        res.unknown("find_references(%s) reported an arrival state this check cannot map to a "
+                    "row label: %r" % (RELIMPORT_LIVE_FUNCTION, state))
+        return res
+
     clean_label = listed[RELIMPORT_DEAD_FUNCTION]
-    if clean_label:
-        res.bad("the row for %s is labeled %s over a fixture where every call site became an "
-                "edge, so the clean gate cannot certify exactly and its label carries no "
-                "information" % (RELIMPORT_DEAD_FUNCTION, clean_label))
+    if clean_label != expected_label:
+        res.bad("find_references reports caller_arrival state %r for pkg/store.py, so the "
+                "dead-code row for %s owes the label %r and carries %r instead; the two "
+                "surfaces are reading one store about one file and disagree"
+                % (state, RELIMPORT_DEAD_FUNCTION, expected_label, clean_label))
+    elif expected_label:
+        res.ok("the dead row carries exactly the label its own file's arrival state (%s) owes: "
+               "%s" % (state, expected_label))
     else:
-        res.ok("on a fixture with no unresolved call site the dead row carries no arrival "
-               "caveat (label: %r)" % clean_label)
-    if confident_verdict:
-        res.ok("the fully resolved fixture prints a confident verdict: %s" % verdict)
+        res.ok("arrival is accounted for this file and the dead row carries no caveat, which "
+               "grades the gate's ability to stay silent rather than its consumer")
+
+    # And the top-level verdict, which is the other half of the same claim: a row
+    # the graph cannot stand behind must not sit under a confident heading.
+    if expected_label and confident_verdict:
+        res.bad("the row for %s is not supportable (%s) yet the scan printed a confident "
+                "verdict: %s" % (RELIMPORT_DEAD_FUNCTION, expected_label, verdict))
+    elif expected_label:
+        res.ok("the scan withholds a confident verdict over the unsupportable row: %s" % verdict)
+    elif confident_verdict:
+        res.ok("the fully accounted fixture prints a confident verdict: %s" % verdict)
     else:
-        res.bad("the fully resolved clean fixture did not print a confident Found verdict: %s"
-                % verdict)
+        res.bad("arrival is accounted for this file and no row is labelled, yet the scan did "
+                "not print a confident Found verdict: %s" % verdict)
 
     return res
 

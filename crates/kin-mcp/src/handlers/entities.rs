@@ -3009,11 +3009,58 @@ Only a PROVEN inbound edge counts as life. An edge the linker chose by matching 
 name across the repository is a candidate, not evidence, so it does not keep an entity \
 off this list; that makes the list longer rather than shorter, which is why you must \
 read coverage before acting on it. \
+Every row carries an `absence_limiting_factor`, null when this graph can account for the \
+ways a caller reaches that entity and a sentence naming the gap when it cannot. A row \
+with a populated factor is a CANDIDATE, not a find: the graph holds no proven inbound \
+edge for it and also could not rule out a caller arriving through a call it recorded no \
+edge for, so deleting on that row is acting on evidence the graph itself declines to \
+stand behind. It is the same verdict `kin dead-code` prints and the same one \
+find_dead_code_seeded carries, so one entity never reads deletable here and unverifiable \
+there. \
 The response carries an additive `negative` object whose `safe_to_conclude_absent` flag \
 says whether \"nothing dead found\" is authoritative or limited by index freshness — \
 check it before concluding everything is reachable. Absence is only as good as the \
 graph's reference-edge coverage: read that from `kin graph status` before deleting \
 anything this reports.";
+
+/// One row of either `dead_code` scope: the entity, plus why an absence claim
+/// about it cannot be stood behind.
+///
+/// The factor comes from `caller_arrival::absence_gap`, the same rule
+/// `kin dead-code` and both seeded implementations apply, so an agent asking
+/// this tool for removable code cannot be handed a row the terminal surface has
+/// already refused to stand behind. It is written on every row, `null` included,
+/// so a reader never has to tell "checked and fine" from "not reported".
+fn dead_code_row<G: GraphStore>(
+    store: &G,
+    entity: &kin_model::entity::Entity,
+    memo: &mut crate::caller_arrival::AbsenceGapMemo,
+) -> Result<serde_json::Value> {
+    let factor = memo.limiting_factor(store, entity);
+    let mut row = serde_json::to_value(entity).map_err(McpError::Json)?;
+    match row.as_object_mut() {
+        Some(object) => {
+            object.insert(
+                "absence_limiting_factor".to_string(),
+                match factor {
+                    Some(factor) => serde_json::Value::String(factor),
+                    None => serde_json::Value::Null,
+                },
+            );
+        }
+        // An entity that did not serialize as an object cannot carry the field,
+        // and dropping the qualifier silently is the failure this whole reading
+        // exists to prevent, so the row refuses instead.
+        None => {
+            return Err(McpError::Context(
+                "a dead-code candidate did not serialize as an object, so its absence \
+                 qualifier could not be attached"
+                    .into(),
+            ))
+        }
+    }
+    Ok(row)
+}
 
 pub fn handle_dead_code<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
@@ -3025,9 +3072,10 @@ pub fn handle_dead_code<G: GraphStore>(
     // entities are classified; it must not change what "dead" means, or the two
     // modes answer different questions under one tool name.
     let incoming_kinds = default_reference_kinds();
+    let mut arrival_memo = crate::caller_arrival::AbsenceGapMemo::new();
 
     if !files.is_empty() {
-        let mut dead = Vec::new();
+        let mut dead: Vec<serde_json::Value> = Vec::new();
 
         for file in files {
             let mut entities = store
@@ -3074,7 +3122,7 @@ pub fn handle_dead_code<G: GraphStore>(
                 if has_incoming_reference_edge(store, &entity.id, &incoming_kinds)? {
                     continue;
                 }
-                dead.push(entity);
+                dead.push(dead_code_row(store, &entity, &mut arrival_memo)?);
                 if dead.len() >= limit {
                     let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
                     return Ok(ToolCallResult::text(json));
@@ -3093,7 +3141,7 @@ pub fn handle_dead_code<G: GraphStore>(
     // only the candidates that have none, read through the same reference kinds
     // `find_references` defaults to. An entry point is referenced by the runtime
     // rather than by an edge, so it is not a candidate either.
-    let mut dead = Vec::new();
+    let mut dead: Vec<serde_json::Value> = Vec::new();
     for entity in store.find_dead_code().map_err(McpError::graph)? {
         if dead.len() >= limit {
             break;
@@ -3104,7 +3152,7 @@ pub fn handle_dead_code<G: GraphStore>(
         if has_incoming_reference_edge(store, &entity.id, &incoming_kinds)? {
             continue;
         }
-        dead.push(entity);
+        dead.push(dead_code_row(store, &entity, &mut arrival_memo)?);
     }
 
     let json = serde_json::to_string_pretty(&dead).map_err(McpError::Json)?;
@@ -3164,6 +3212,10 @@ then the dead filter — into one response, so you don't loop find_references ov
 candidate and exhaust your round-trips on a large repo. Use dead_code instead when you \
 want a whole-repo or file-scoped sweep rather than a concept-seeded one, and \
 bulk_check_references when you already hold the exact set of entity IDs to classify. \
+Every candidate carries an `absence_limiting_factor`, null when this graph can account for \
+the ways a caller reaches it and a sentence naming the gap when it cannot; a `dead: true` \
+beside a populated factor is a candidate rather than a find, and it is the same verdict \
+`dead_code` and `kin dead-code` apply. \
 When the seed matches nothing the response carries an additive `negative` object beside \
 an `edge_coverage` naming the languages the graph holds. Nothing measures a coverage \
 class for them yet, so that absence is never certified: a seed that matched no \
@@ -3213,6 +3265,7 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
 
     let mut candidates: Vec<serde_json::Value> = Vec::new();
     let mut seen: std::collections::HashSet<kin_model::EntityId> = std::collections::HashSet::new();
+    let mut arrival_memo = crate::caller_arrival::AbsenceGapMemo::new();
 
     for entity in entities.into_iter().take(limit) {
         if !seen.insert(entity.id) {
@@ -3246,6 +3299,10 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
         // live on another, and the row carries both counts so a reader can see
         // which edges were discarded rather than infer it.
         let dead = proven_reference_count == 0;
+        // And the same arrival authority `dead_code` and the CLI scan apply. A
+        // `dead` boolean with no limiting factor is what let this surface hand
+        // an agent a row the terminal one had already refused to stand behind.
+        let absence_limiting_factor = arrival_memo.limiting_factor(store, &entity);
         candidates.push(serde_json::json!({
             "id": entity.id.to_string(),
             "name": entity.name,
@@ -3255,6 +3312,7 @@ pub fn handle_find_dead_code_seeded<G: GraphStore>(
             "reference_count": reference_count,
             "proven_reference_count": proven_reference_count,
             "dead": dead,
+            "absence_limiting_factor": absence_limiting_factor,
         }));
     }
 
@@ -5426,6 +5484,107 @@ mod tests {
         GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
     };
     use kin_spine::SpineBackend as _;
+
+    /// FIR-2821 review, second P1. The agent-facing `dead_code` tool reaches the
+    /// same absence verdict as `caller_arrival::absence_gap` and publishes it on
+    /// every row.
+    ///
+    /// This tool told agents to use it to find removable code and classified on
+    /// present inbound edges alone, so once the terminal scan started consulting
+    /// the arrival reading an agent could be handed the row the human surface
+    /// had already refused to stand behind. The assertion is the AGREEMENT with
+    /// the shared rule, read off the same store, rather than a copy of the
+    /// expected sentence: a string written twice cannot detect the two drifting
+    /// apart.
+    #[test]
+    fn the_dead_code_tool_publishes_the_shared_absence_verdict_on_every_row() {
+        let store = InMemoryGraph::new();
+        // `cli.rs` names `store.rs` in its own source, so it can reach the
+        // focal, and the store holds no count of the call sites parsed there.
+        let dead_target = make_entity("probe_dead_target", "src/store.rs");
+        let mut store_module = make_entity("store", "src/store.rs");
+        store_module.kind = EntityKind::Module;
+        let caller = make_entity("probe_caller", "src/cli.rs");
+        for entity in [&dead_target, &store_module, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(
+                caller.id,
+                store_module.id,
+                RelationKind::References,
+            ))
+            .unwrap();
+
+        let args = HashMap::from([("files".to_string(), serde_json::json!(["src/store.rs"]))]);
+        let result = handle_dead_code(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["name"] == "probe_dead_target")
+            .unwrap_or_else(|| panic!("the tool must still list the candidate: {text}"));
+
+        // The endpoint this row has to agree with, computed rather than copied.
+        let expected = crate::caller_arrival::absence_gap(&store, &dead_target)
+            .map(|(factor, reason)| format!("{factor}: {reason}"));
+        assert!(
+            expected.is_some(),
+            "this fixture must be one the shared rule refuses, or the agreement below holds \
+             for the wrong reason"
+        );
+        assert!(
+            row.get("absence_limiting_factor").is_some(),
+            "the field is written on every row, populated or null, so a reader never has to \
+             tell checked-and-fine from not-reported: {row}"
+        );
+        assert_eq!(
+            row["absence_limiting_factor"],
+            serde_json::json!(expected),
+            "the agent-facing tool and the shared rule read one store about one entity: {row}"
+        );
+    }
+
+    /// The control, and the half that stops the arm above from passing over a
+    /// tool that qualifies every row: a store that accounts for its arrivals
+    /// publishes the field as null.
+    #[test]
+    fn the_dead_code_tool_publishes_a_null_factor_when_arrival_is_accounted() {
+        let store = InMemoryGraph::new();
+        let mut dead_target = make_entity("probe_dead_target", "src/store.rs");
+        // Nothing imports this file and the language links imports elsewhere, so
+        // the family is empty for a reason the reading can stand behind, and the
+        // file's own parse side is measured at zero against zero edges.
+        dead_target.metadata.extra.insert(
+            kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+            serde_json::json!(0),
+        );
+        store.upsert_entity(&dead_target).unwrap();
+        seed_cross_file_call_witness(&store);
+
+        let args = HashMap::from([("files".to_string(), serde_json::json!(["src/store.rs"]))]);
+        let result = handle_dead_code(&args, &store).unwrap();
+        let text = match &result.content[0] {
+            crate::types::ContentBlock::Text { text } => text.clone(),
+        };
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&text).unwrap();
+        let row = rows
+            .iter()
+            .find(|row| row["name"] == "probe_dead_target")
+            .unwrap_or_else(|| panic!("the tool must still list the candidate: {text}"));
+        assert_eq!(
+            crate::caller_arrival::absence_gap(&store, &dead_target),
+            None,
+            "this control is only a control while the shared rule certifies here"
+        );
+        assert_eq!(
+            row["absence_limiting_factor"],
+            serde_json::Value::Null,
+            "a row the graph can account for carries no caveat: {row}"
+        );
+    }
 
     /// A row as the wire carries it, so the field cannot be added to the struct
     /// and dropped by the serializer.
