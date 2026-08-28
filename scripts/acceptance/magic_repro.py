@@ -421,6 +421,35 @@ class Suite(object):
             raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
         self._kin_init(repo)
 
+    def _build_relimport(self, repo):
+        """A package whose CLI reaches its modules by relative module import.
+
+        The stranger's own shape, trimmed to three files. `pkg/cli.py` writes
+        `from . import store` and then `store.connect(path)`, which is ordinary
+        Python and is the shape that produced no Calls edge at all before
+        kin#1181: the receiver resolved to `pkg/__init__.py` and the callee lives
+        in the sibling `pkg/store.py`.
+
+        Every call in this fixture resolves, deliberately. It is the arm that
+        says a genuinely dead function still reads dead and reads dead WITHOUT a
+        caveat, so the gate the sibling fixture exercises cannot pass here by
+        labelling everything.
+        """
+        self._relimport_files(repo)
+
+    def _relimport_files(self, repo):
+        self.git(["init", "-q", "."], repo)
+        self._write(repo, "pkg/__init__.py",
+                    '"""pkg: a tiny package reached through a relative module '
+                    'import."""\n\n__version__ = "0.1.0"\n')
+        self._write(repo, "pkg/store.py", RELIMPORT_STORE_PY)
+        self._write(repo, "pkg/cli.py", RELIMPORT_CLI_PY)
+        self.git(["add", "-A"], repo)
+        rc, out, err = self.git(["commit", "-q", "-m", "initial relimport fixture"], repo)
+        if rc != 0:
+            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+        self._kin_init(repo)
+
     def _build_venv(self, repo):
         self.git(["init", "-q", "."], repo)
         self._write(repo, ".gitignore", "*.log\n")
@@ -486,14 +515,25 @@ class Suite(object):
         return {"raw": text, "relations": rels}
 
     def dead_code(self, repo):
+        """`kin dead-code`, with every listed row parsed off the output.
+
+        Rows are read with DEAD_CODE_ROW rather than a pattern of this method's
+        own, because the renderer puts an `[unverified: <factor>]` label in front
+        of a row it cannot stand behind and a pattern that does not tolerate one
+        reads a labelled row as no row at all. That is not a cosmetic miss: a
+        check that grades an empty `rows` list passes both its arms on nothing.
+        The label is carried on the row rather than discarded, so a caller can
+        assert on it instead of re-parsing `raw`.
+        """
         rc, out, err = self.kin_run(["dead-code"], repo)
         text = out + "\n" + err
         rows = []
         for line in text.splitlines():
-            match = re.match(r"\s+(\S+)\s+\((\w+),\s*(\w+)\)\s+-\s+(.+?)\s*$", line)
+            match = DEAD_CODE_ROW.match(line)
             if match:
-                rows.append({"name": match.group(1), "kind": match.group(2),
-                             "file": match.group(4)})
+                rows.append({"name": match.group(2), "kind": match.group(3),
+                             "file": match.group(5),
+                             "label": (match.group(1) or "").strip()})
         return {"raw": text, "rows": rows, "rc": rc}
 
     def references(self, repo, query, settle=2, relation_kinds=None):
@@ -959,6 +999,15 @@ This file has no language adapter. Nothing can enumerate it, so nothing may
 certify an enumeration of it.
 """
 
+# FIR-2821. `from . import store` binds the MODULE and no name inside it, so the
+# graph records a References edge into store.py's Module entity and no Imports
+# edge into any of its entities. Every function reached that way looked
+# uncalled: the v0.6.1 stranger's `kin dead-code` listed eleven live functions,
+# two of which run on every invocation of the program, with no caveat on any of
+# them while the one row it could resolve carried a careful one.
+RELIMPORT_LIVE_FUNCTION = "connect"
+RELIMPORT_DEAD_FUNCTION = "orphaned_helper"
+
 REEXPORT_BENIGN_FILE = "src/prelude.rs"
 REEXPORT_DEAD_FUNCTION = "legacy_shim"
 
@@ -992,6 +1041,30 @@ pub fn legacy_shim(text: &str) -> String {
 
 REEXPORT_PRELUDE_RS = '''pub use crate::core::load;
 '''
+
+RELIMPORT_STORE_PY = '''"""Storage helpers, reached only through a relative module import."""
+
+
+def connect(path):
+    """Open the store. Called from cli.py as `store.connect(path)`."""
+    return {"path": path}
+
+
+def orphaned_helper(value):
+    """Nothing in this repository calls this. It is the genuinely dead one."""
+    return value
+'''
+
+RELIMPORT_CLI_PY = '''"""The command line, which reaches its modules by relative module import."""
+
+from . import store
+
+
+def main(path):
+    """Every call here resolves, so this file leaves no arrival gap."""
+    return store.connect(path)
+'''
+
 
 # The verdict sentence `kin dead-code` opens with. A run whose output matches
 # none of these is unreadable rather than passing: the check cannot grade an
@@ -1235,6 +1308,37 @@ def check_4(suite):
     repo = suite.fixture("incremental")
     dead = suite.dead_code(repo)
     names = [row["name"] for row in dead["rows"]]
+
+    # Both graded arms below run over `names`, and an empty `names` passes them
+    # both while proving nothing: the entry point is not in an empty list, and
+    # the contradiction loop iterates nothing. That is not hypothetical. The row
+    # parser was blind to the `[unverified: <factor>]` label the renderer puts on
+    # a row it cannot stand behind, so on any store where every row is labelled
+    # this check stopped grading its own ticket and said so in the affirmative.
+    #
+    # So the parse is joined to the verdict sentence, which counts rows in prose
+    # and cannot be read by the same pattern. A verdict claiming candidates over
+    # a parse that found none is a blind parser, and it refuses here rather than
+    # passing two arms over nothing.
+    #
+    # Measured on 2026-08-28, this arm is a guard rather than a live assertion:
+    # this fixture's store lists no dead code at all, so the run reads "0 claimed,
+    # 0 row(s) read" and the two arms below have always graded an empty list here.
+    # The consumer that can catch a blind parser today is check 12, whose store
+    # does list labelled rows. Said out loud so nobody reads this arm's green as
+    # evidence the parse was exercised.
+    claimed = re.search(r"^(?:Found (\d+) unreferenced entit|UNVERIFIED: (\d+) candidate)",
+                        dead["raw"], re.M)
+    claimed_rows = int(claimed.group(1) or claimed.group(2)) if claimed else 0
+    if claimed_rows and not names:
+        res.bad("the verdict claims %d candidate row(s) and this suite parsed none, so the "
+                "arms below would grade an empty list and pass on nothing; the row parser "
+                "cannot read the output it was handed. Verdict: %s"
+                % (claimed_rows, (claimed.group(0) if claimed else "")))
+        return res
+    res.ok("the parse agrees with the verdict sentence: %d claimed, %d row(s) read"
+           % (claimed_rows, len(names)))
+
     if "main" in names:
         res.bad("dead-code lists 'main', the declared console entry point in pyproject.toml")
     else:
@@ -1823,21 +1927,32 @@ def check_12(suite):
     because no fixture in this suite held such a file. This is that fixture.
 
     Four arms, and the third is what makes the others falsifiable. The scan
-    answers ordinarily; the benign file is named nowhere in the answer; the one
-    function nothing calls is still listed, so the check cannot pass by the
-    scan reporting nothing at all; and that row carries no label saying the
-    graph cannot stand behind it.
+    must not REFUSE, which replaces the answer outright; the benign file is
+    named nowhere in the answer; the one function nothing calls is still listed,
+    so the check cannot pass by the scan reporting nothing at all; and any label
+    that row carries names an arrival factor rather than anything a file
+    declaring nothing could have caused.
+
+    The first and fourth arms used to forbid an UNVERIFIED verdict and any label
+    at all. That stopped grading this ticket the day the arrival reading began
+    declining over call edges that record no call-site span, which this fixture's
+    language does not emit: every row here is now labelled for a reason that has
+    nothing to do with a re-export file, and a check red for someone else's cause
+    is measuring the wrong thing. So the arms name the cause instead of the
+    symptom. A regression of the FIR-2605 class labels rows because a file
+    produced no entity, and that label is not an arrival factor, so it still goes
+    red here; a REFUSED verdict still goes red outright.
     """
     res = Result("12", "FIR-2605", "dead-code answers over a benign re-export file")
     repo = suite.fixture("reexport")
 
+    # Read through Suite.dead_code's own parse rather than a second copy of it.
+    # A duplicated parser is only ever wrong in a way that looks like a passing
+    # run, and this fixture lists labelled rows, which makes it the consumer that
+    # can actually catch the shared parser going blind to a label. Check 4 cannot:
+    # its store lists nothing at all, so its arms grade an empty list either way.
     def listed_rows(scan):
-        found = {}
-        for line in scan["raw"].splitlines():
-            match = DEAD_CODE_ROW.match(line)
-            if match:
-                found[match.group(2)] = (match.group(1) or "").strip()
-        return found
+        return {row["name"]: row["label"] for row in scan["rows"]}
 
     dead = suite.dead_code(repo)
     listed = listed_rows(dead)
@@ -1867,14 +1982,15 @@ def check_12(suite):
                     % (dead["rc"], excerpt[-300:] or "(no output)"))
         return res
 
-    # The first arm. REFUSED replaces the answer outright and an UNVERIFIED
-    # opener withholds the whole list. The mixed "Found N, M of them UNVERIFIED"
-    # form withholds only some rows, and the fourth arm reads that one per row.
-    if verdict.startswith("REFUSED") or verdict.startswith("UNVERIFIED"):
-        res.bad("kin dead-code withheld its answer over a store whose only unusual file is a "
-                "pure re-export: %s" % verdict)
+    # The first arm. REFUSED replaces the answer outright, which is what this
+    # ticket forbids however the store looks. An UNVERIFIED opener is allowed
+    # only when every reason behind it is one the fourth arm recognizes, and it
+    # is read there per row rather than guessed at from the opener.
+    if verdict.startswith("REFUSED"):
+        res.bad("kin dead-code replaced its answer with a refusal over a store whose only "
+                "unusual file is a pure re-export: %s" % verdict)
     else:
-        res.ok("kin dead-code answered ordinarily: %s" % verdict)
+        res.ok("kin dead-code answered rather than refusing: %s" % verdict)
 
     # The second arm. The benign file holds no entity, so it can be neither a
     # row nor a reason; naming it at all means the scan read "declares nothing"
@@ -1897,14 +2013,38 @@ def check_12(suite):
     res.ok("the one function nothing calls is listed (%d row(s): %s)"
            % (len(listed), ", ".join(sorted(listed))))
 
-    # The fourth arm. A row the scan cannot stand behind is a candidate rather
-    # than a find, and nothing about this fixture makes that true.
+    # A disclosure rather than a graded arm, so the run says which branch of the
+    # spanless rule answered for this fixture instead of leaving a reader to
+    # infer it from the absence of a label. The rule certifies when a file parses
+    # at most one call site, discloses a floor when it parses more sites than it
+    # holds edges of any kind, and declines only when the fan-out decides.
+    try:
+        arrival = (suite.references(repo, REEXPORT_DEAD_FUNCTION).get("caller_arrival")
+                   or {})
+    except McpError as exc:
+        arrival = {"state": "unreadable: %s" % exc}
+    res.ok("arrival state for this fixture reads %r, which is the branch of the spanless "
+           "rule that answered here" % arrival.get("state", "absent"))
+
+    # The fourth arm, and the one that carries this ticket's claim now. A label
+    # is allowed, because this fixture's language emits no call-site span and the
+    # arrival reading declines over that for every row in every such store. What
+    # is not allowed is a label naming any other cause, because the only thing
+    # unusual about this store is a file that declares nothing, and that must
+    # never be what costs a row its standing.
     label = listed[REEXPORT_DEAD_FUNCTION]
-    if label:
-        res.bad("the row for %s is labeled %s over a store whose only unusual file declares "
-                "nothing" % (REEXPORT_DEAD_FUNCTION, label))
-    else:
+    arrival_labels = ["caller_arrival_unmeasured", "caller_arrival_unresolved"]
+    if not label:
         res.ok("the row for %s carries no unverified label" % REEXPORT_DEAD_FUNCTION)
+    elif any(factor in label for factor in arrival_labels):
+        res.ok("the row for %s is labeled %s, which names the arrival reading rather than "
+               "anything a file that declares nothing could have caused"
+               % (REEXPORT_DEAD_FUNCTION, label))
+    else:
+        res.bad("the row for %s is labeled %s over a store whose only unusual file declares "
+                "nothing, and that factor is not the arrival reading, so something about the "
+                "benign file cost this row its standing"
+                % (REEXPORT_DEAD_FUNCTION, label))
     return res
 
 
@@ -3017,6 +3157,237 @@ def check_22(suite):
     return res
 
 
+def check_23(suite):
+    """FIR-2821: a function reached by relative module import is not dead code.
+
+    The v0.6.1 stranger asked the one question a graph is supposed to answer
+    better than grep, and `kin dead-code` named twelve entities of which eleven
+    were live. `connect` and `ingest_directory` run on every invocation of the
+    program. The shape is `from . import store` then `store.connect(path)`: the
+    receiver resolves to the package `__init__` and the callee is defined in the
+    sibling module, so before kin#1181 no Calls edge was produced at all. What
+    made it the worst failure of that session was where the hedging went. The one
+    row the tool could resolve carried a careful caveat and the eleven wrong ones
+    carried none.
+
+    Both halves are pinned here and each has its own control, because either
+    alone leaves a stranger deletable. Before grading absence from dead-code,
+    the precondition resolves `connect` itself and its incoming `main @
+    pkg/cli.py` Calls edge. `connect` must then not be listed, and
+    `orphaned_helper` must be listed so a scan returning nothing cannot pass.
+    The clean scan must exit zero under a confident `Found` verdict, and the
+    dead row's label must be exactly empty. That exact silence stops a generic
+    refusal or a renamed arrival caveat from passing by labelling everything.
+
+    Arm 1 asserts an OUTCOME and is not a falsification of the linker tier that
+    produces it, which was measured rather than assumed. Reverting that tier and
+    rebuilding leaves this check green, because on a daemon-backed store the
+    edge has a second producer: reading the mutated run's own store back,
+    `connect` still carried `main @ pkg/cli.py [Calls, References]
+    (type_resolved)`, and `type_resolved` is the language-server origin label
+    (`kin-index/src/resolution.rs`). So this arm is a regression gate on the
+    answer a user gets, which is worth having and is what the ticket's
+    acceptance names. The tier itself is falsified where only one producer
+    exists, in `kin-index`'s `receiver_module_hop` arms and its corpus census,
+    both linker-only with no daemon and no language server.
+
+    The third arm grades the arrival consumer itself, and it does it as a JOIN
+    rather than as a fixed expectation. `find_references(connect)` publishes the
+    arrival reading for `pkg/store.py`, which is the file `orphaned_helper` also
+    lives in, so the two surfaces are reading one store about one file. The
+    check derives from that block what the dead-code row and the top-level
+    verdict have to say, and then requires exactly that. A store that accounted
+    for every arrival owes an empty label and a confident `Found`; a store that
+    could not owes the matching `caller_arrival_` factor on the row and a verdict
+    that is not confident.
+
+    That join is what a fixed expectation could not do. Requiring an exactly
+    empty label passed whether or not dead-code consulted the reading at all,
+    because the already-fixed linker keeps `connect` off the list on its own and
+    a clean row is clean either way. Under the join, removing the consumer leaves
+    the row bare while the reading still says the arrival could not be accounted
+    for, and the two halves contradict. Which branch runs is a property of the
+    store rather than of this check, so the result names the branch it took: only
+    the non-accounted branch grades the consumer, and this fixture takes the
+    accounted one, because the graph accounts for every arrival into the file
+    both functions live in. So what this arm grades here is the gate's ability to
+    stay silent, and the consumer itself is graded on check 12's re-export
+    fixture, whose arrival state reads unmeasured and whose row carries the
+    matching label. Said out loud so nobody reads this arm's green as evidence
+    the consumer ran.
+    """
+    res = Result("23", "FIR-2821",
+                 "dead-code over a relative module import, and its arrival gate")
+
+    def listed_rows(repo):
+        # Suite.dead_code's own parse, for the reason check 12 states: a second
+        # copy of a row parser cannot fail in a way anyone notices.
+        scan = suite.dead_code(repo)
+        found = {row["name"]: row["label"] for row in scan["rows"]}
+        if not found:
+            # A conversion's enrichment lands asynchronously, so a scan fired
+            # straight after `kin init` can read a graph that has not resolved
+            # the fixture's cross-file call yet. Bounded, and a scan that
+            # withholds its answer keeps withholding it across the retry.
+            time.sleep(3)
+            scan = suite.dead_code(repo)
+            found = {row["name"]: row["label"] for row in scan["rows"]}
+        return scan, found
+
+    repo = suite.fixture("relimport")
+
+    # Preconditions before absence. `connect` missing from the dead-code rows
+    # means something only after graph truth proves the subject exists and the
+    # expected caller reaches it through a Calls edge. Otherwise dropping the
+    # live entity during parsing satisfies the check for the wrong reason.
+    try:
+        live_refs = suite.references(
+            repo, RELIMPORT_LIVE_FUNCTION, relation_kinds=["calls"])
+    except McpError as exc:
+        res.unknown("find_references(%s) unreadable: %s"
+                    % (RELIMPORT_LIVE_FUNCTION, exc))
+        return res
+    miss = resolution_miss(live_refs, RELIMPORT_LIVE_FUNCTION)
+    if miss:
+        res.bad(miss)
+        return res
+    focal = live_refs.get("focal_entity") or {}
+    if (focal.get("name") != RELIMPORT_LIVE_FUNCTION
+            or not (focal.get("file_path") or "").endswith("pkg/store.py")):
+        res.bad("find_references(%s) resolved the wrong focal: %r"
+                % (RELIMPORT_LIVE_FUNCTION, focal))
+        return res
+    expected_callers = [
+        row for row in live_refs.get("references") or []
+        if row.get("name") == "main"
+        and (row.get("file_path") or "").endswith("pkg/cli.py")
+        and "calls" in (row.get("relation_kinds") or [])
+    ]
+    if not expected_callers:
+        res.bad("find_references(%s, calls) did not return main @ pkg/cli.py; "
+                "the live edge precondition is absent. Rows: %r"
+                % (RELIMPORT_LIVE_FUNCTION, live_refs.get("references") or []))
+        return res
+    res.ok("graph truth contains %s and its incoming main @ pkg/cli.py Calls edge"
+           % RELIMPORT_LIVE_FUNCTION)
+
+    clean, listed = listed_rows(repo)
+    if clean["rc"] != 0:
+        res.bad("kin dead-code exited %d on the clean fixture: %s"
+                % (clean["rc"], clean["raw"].strip()[-300:] or "(no output)"))
+        return res
+    verdict = ""
+    for line in clean["raw"].splitlines():
+        stripped = line.strip()
+        if DEAD_CODE_VERDICT.match(stripped):
+            verdict = stripped
+            break
+    if not verdict:
+        excerpt = " / ".join(line.strip() for line in clean["raw"].splitlines()
+                             if line.strip() and "WARN" not in line)
+        res.unknown("kin dead-code rc=%d printed no verdict sentence this suite can read: %s"
+                    % (clean["rc"], excerpt[-300:] or "(no output)"))
+        return res
+    # `Found N unreferenced entities, M of them UNVERIFIED:` also starts with
+    # `Found `, and it is not a confident verdict. Both halves are required.
+    confident_verdict = verdict.startswith("Found ") and "UNVERIFIED" not in verdict
+
+    # The dead positive control. A scan that listed nothing satisfies
+    # "connect is not listed" for the wrong reason.
+    if RELIMPORT_DEAD_FUNCTION not in listed:
+        res.bad("%s is called by nothing in this fixture and was not listed, so this check "
+                "would pass over a scan that reports nothing at all. Verdict: %s. Listed: %s"
+                % (RELIMPORT_DEAD_FUNCTION, verdict,
+                   ", ".join(sorted(listed)) or "(nothing)"))
+        return res
+    res.ok("the one function nothing calls is listed (%d row(s): %s)"
+           % (len(listed), ", ".join(sorted(listed))))
+
+    # The whole finding, after the positive graph precondition above.
+    if RELIMPORT_LIVE_FUNCTION in listed:
+        res.bad("%s is called from pkg/cli.py through `from . import store` and dead-code "
+                "lists it as unreferenced; a stranger acting on this row deletes a live "
+                "function. Row label: %r"
+                % (RELIMPORT_LIVE_FUNCTION, listed[RELIMPORT_LIVE_FUNCTION]))
+    else:
+        res.ok("%s is reached through the relative module import and is not listed"
+               % RELIMPORT_LIVE_FUNCTION)
+
+    # The join. `orphaned_helper` and `connect` share pkg/store.py, so the
+    # arrival block find_references published for one is the reading dead-code
+    # owes an answer to for the other.
+    arrival = live_refs.get("caller_arrival")
+    if not isinstance(arrival, dict) or not arrival.get("state"):
+        res.unknown("find_references(%s) published no readable caller_arrival block, so the "
+                    "arrival consumer cannot be graded against it: %r"
+                    % (RELIMPORT_LIVE_FUNCTION, arrival))
+        return res
+    state = arrival["state"]
+    unaccounted_files = arrival.get("unaccounted_files") or []
+    measured_shortfall = [
+        row for row in unaccounted_files
+        if isinstance(row.get("unaccounted_call_sites"), int)
+        and row["unaccounted_call_sites"] > 0
+    ]
+    if state == "accounted":
+        expected_label = ""
+    elif state == "unmeasured":
+        expected_label = "[unverified: caller_arrival_unmeasured]"
+    elif state == "unaccounted":
+        expected_label = ("[unverified: caller_arrival_unresolved]" if measured_shortfall
+                          else "[unverified: caller_arrival_unmeasured]")
+    else:
+        res.unknown("find_references(%s) reported an arrival state this check cannot map to a "
+                    "row label: %r" % (RELIMPORT_LIVE_FUNCTION, state))
+        return res
+
+    clean_label = listed[RELIMPORT_DEAD_FUNCTION]
+    # The published block carries the FAMILY reading. The delete-list authority
+    # also accounts the focal's own file, which is in no family and which this
+    # suite therefore cannot see, so an accounted family may still owe a label
+    # for a call beside the row. That one combination is graded on the coupling
+    # below rather than on a derived value the suite cannot compute.
+    same_file_only = (state == "accounted"
+                      and clean_label.startswith("[unverified: caller_arrival_"))
+    if same_file_only:
+        res.ok("join branch=same-file (does not grade the consumer): the family accounted for "
+               "its arrivals and the row still carries %s, which is the focal's own file; this "
+               "suite grades that through the verdict coupling below rather than against a "
+               "value it cannot compute" % clean_label)
+    elif clean_label != expected_label:
+        res.bad("find_references reports caller_arrival state %r for pkg/store.py, so the "
+                "dead-code row for %s owes the label %r and carries %r instead; the two "
+                "surfaces are reading one store about one file and disagree"
+                % (state, RELIMPORT_DEAD_FUNCTION, expected_label, clean_label))
+    elif expected_label:
+        res.ok("join branch=non-accounted (grades the consumer): the dead row carries exactly "
+               "the label its own file's arrival state (%s) owes, %s, and removing the consumer "
+               "leaves it bare while the reading still reports the gap"
+               % (state, expected_label))
+    else:
+        res.ok("join branch=accounted (does not grade the consumer): arrival is accounted for "
+               "this file and the dead row carries no caveat, which grades the gate's ability "
+               "to stay silent")
+
+    # And the coupling, which is the half that holds whichever branch ran: a row
+    # this graph cannot stand behind must not sit under a confident heading, and
+    # a scan that labelled nothing must not withhold one. Stated over the label
+    # the scan actually printed rather than the derived one, so it grades the
+    # same-file case the suite cannot derive.
+    if clean_label and confident_verdict:
+        res.bad("the row for %s is not supportable (%s) yet the scan printed a confident "
+                "verdict: %s" % (RELIMPORT_DEAD_FUNCTION, clean_label, verdict))
+    elif clean_label:
+        res.ok("the scan withholds a confident verdict over the unsupportable row: %s" % verdict)
+    elif confident_verdict:
+        res.ok("the fully accounted fixture prints a confident verdict: %s" % verdict)
+    else:
+        res.bad("no row carries an arrival caveat, yet the scan did not print a confident "
+                "Found verdict: %s" % verdict)
+
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -3041,6 +3412,7 @@ CHECKS = [
     ("20", check_20),
     ("21", check_21),
     ("22", check_22),
+    ("23", check_23),
 ]
 
 

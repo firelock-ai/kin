@@ -23,9 +23,11 @@ pub struct DeadCodeResponse {
     pub lines: Vec<String>,
     /// Whether the graph this scan read can support an absence claim at all.
     ///
-    /// False means every row is a candidate the graph cannot stand behind, and
-    /// the rendered lines say so on each row. Defaulted so a new CLI reading an
-    /// older daemon's response does not read a missing field as a verdict.
+    /// False means at least one listed row is a candidate the graph cannot stand
+    /// behind. Each affected row carries its own rendered label so a mixed
+    /// response keeps the supported finds distinct from the candidates.
+    /// Defaulted so a new CLI reading an older daemon's response does not read a
+    /// missing field as a verdict.
     #[serde(default)]
     pub verified: bool,
     /// Why the scan could not be verified, one reason per gap, in the same words
@@ -72,6 +74,22 @@ pub struct DeadCodeSeededCandidate {
     #[serde(default)]
     pub proven_reference_count: usize,
     pub dead: bool,
+    /// Why an absence claim about this row cannot be stood behind, or `null`
+    /// when it can.
+    ///
+    /// The same `kin_mcp::caller_arrival::absence_gap` verdict the whole-repo
+    /// scan and both MCP dead-code tools apply, so one entity does not read
+    /// deletable on one surface and unverifiable on another. `dead: true` beside
+    /// a populated factor means the graph holds no proven inbound edge AND could
+    /// not account for the ways a caller reaches this entity, which is a
+    /// candidate rather than a find.
+    ///
+    /// Serialized on every row, populated or null, so a reader never has to tell
+    /// "checked and fine" from "not reported". Defaulted so a new CLI reading an
+    /// older daemon's response does not fail to parse it; that older response
+    /// reads as null, which is why the daemon and CLI ship together.
+    #[serde(default)]
+    pub absence_limiting_factor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -282,13 +300,68 @@ fn build_dead_code_report(
     let method_row = |entity: &kin_model::Entity| {
         kin_core::reference_coverage::kind_under_resolves_incoming_calls(entity.kind)
     };
+    //
+    // The fifth trigger, and the one the v0.6.1 stranger run bought (FIR-2821).
+    // The four above ask whether the graph can support an absence claim in
+    // general. None of them asks the question a delete list actually turns on:
+    // could a caller of THIS row have arrived through a call the linker
+    // recorded no edge for? `find_references` has refused to certify an empty
+    // result on that ground since FIR-2775, reading `kin_mcp::caller_arrival`.
+    // This command read the same edges and applied none of it, so on a package
+    // whose CLI reached its modules through `from . import mod` the scan listed
+    // eleven live functions with no caveat at all while carefully hedging the
+    // one row it could resolve.
+    //
+    // On a store that holds no parse-side call count this gates every row, and
+    // that is the honest reading rather than a blanket refusal: the count is
+    // absent for a named reason the response prints once, the refusal is still
+    // scoped to the files that can reach each row, and it lifts per row the
+    // moment the count exists. Certifying instead, because the common cause is
+    // inconvenient, is this ticket's own failure one level down.
+    //
+    // Decided by `kin_mcp::caller_arrival::absence_gap`, which is the one rule
+    // every dead-code surface applies, rather than by reading the arrival state
+    // here. A second reading of the same evidence beside the first is how the
+    // MCP `dead_code` tool and this command came to answer differently about the
+    // same entity, so there is one function and four callers.
+    //
+    // What that rule adds over the raw state is fail-closed in both directions a
+    // consumer forgets. A family file carrying no parse-side count gates the row
+    // exactly as a measured shortfall does, because a missing measurement is not
+    // a clean one and on a converted store today it is the common case. And the
+    // focal's own file is accounted too, because the family is by construction
+    // the files that name this one from outside it, so a call from beside the
+    // row that the linker dropped is otherwise outside the reading entirely.
+    type ArrivalGap = (&'static str, String);
+    let mut arrival_memo = kin_mcp::caller_arrival::AbsenceGapMemo::new();
+    let mut arrival_rows: std::collections::HashMap<EntityId, ArrivalGap> =
+        std::collections::HashMap::new();
+    for entity in unreferenced.iter().chain(test_only.iter()) {
+        if let Some(gap) = arrival_memo.gap(graph, entity) {
+            arrival_rows.insert(entity.id, gap);
+        }
+    }
     let row_is_unverified = |entity: &kin_model::Entity| {
         manifest_gap.is_some()
             || name_only_ids.contains(&entity.id)
             || unsupportable.contains_key(&entity.language.to_string())
             || method_row(entity)
+            || arrival_rows.contains_key(&entity.id)
     };
-    let unverified_rows = unreferenced.iter().filter(|e| row_is_unverified(e)).count();
+    // The unreferenced heading describes only that section, while the serialized
+    // verdict describes every row the response lists. Keep those populations
+    // separate: a test-only row still claims that no production caller exists,
+    // and an unverified one cannot coexist with `verified: true` merely because
+    // it prints under the second heading.
+    let unverified_unreferenced_rows = unreferenced
+        .iter()
+        .filter(|entity| row_is_unverified(entity))
+        .count();
+    let unverified_listed_rows = unreferenced
+        .iter()
+        .chain(test_only.iter())
+        .filter(|entity| row_is_unverified(entity))
+        .count();
     let mut unverified_reasons: Vec<String> = unsupportable.values().cloned().collect();
     let name_only_rows = unreferenced
         .iter()
@@ -315,12 +388,27 @@ fn build_dead_code_report(
             kin_core::reference_coverage::method_absence_limiting_factor("an empty result")
         ));
     }
+    // Counted across both lists for the same reason methods are: a test-only row
+    // claims no PRODUCTION caller exists, and an unaccounted arrival is exactly
+    // the shape a production caller goes missing in.
+    let mut arrival_row_counts: std::collections::BTreeMap<ArrivalGap, usize> =
+        std::collections::BTreeMap::new();
+    for entity in unreferenced.iter().chain(test_only.iter()) {
+        if let Some(gap) = arrival_rows.get(&entity.id) {
+            *arrival_row_counts.entry(gap.clone()).or_insert(0) += 1;
+        }
+    }
+    for ((factor, reason), rows) in &arrival_row_counts {
+        unverified_reasons.push(format!(
+            "{rows} listed entities sit in a file where {reason}, and {factor}"
+        ));
+    }
     unverified_reasons.extend(manifest_gap.clone());
     // The verdict is about the rows this run printed. A gap in a language nothing
     // was listed for is still disclosed below, but it does not make the listed
     // rows unverified: missing edges make this scan over-report, never
     // under-report, so a row whose own language resolved is unaffected by it.
-    let verified = unverified_rows == 0;
+    let verified = unverified_listed_rows == 0;
 
     if unreferenced.is_empty() && test_only.is_empty() {
         lines.push("No dead code found.".to_string());
@@ -342,26 +430,26 @@ fn build_dead_code_report(
         ));
     } else if unreferenced.is_empty() {
         lines.push("No unreferenced entities.".to_string());
-    } else if verified {
+    } else if unverified_unreferenced_rows == 0 {
         lines.push(format!(
             "Found {} unreferenced entities:",
             unreferenced.len()
         ));
-    } else if unverified_rows == unreferenced.len() {
+    } else if unverified_unreferenced_rows == unreferenced.len() {
         lines.push(format!(
             "UNVERIFIED: {} candidates. This graph cannot support a delete list:",
             unreferenced.len()
         ));
     } else {
         lines.push(format!(
-            "Found {} unreferenced entities, {unverified_rows} of them UNVERIFIED:",
-            unreferenced.len()
+            "Found {} unreferenced entities, {unverified_unreferenced_rows} of them UNVERIFIED:",
+            unreferenced.len(),
         ));
     }
     for reason in &unverified_reasons {
         lines.push(format!("  incomplete: {reason}"));
     }
-    if unverified_rows > 0 {
+    if unverified_listed_rows > 0 {
         lines.push(
             "  An UNVERIFIED row is a candidate this graph cannot stand behind: an entity with no \
              edge here may still be used. Do not delete on this evidence."
@@ -412,6 +500,8 @@ fn build_dead_code_report(
                 "  [unverified: {}] ",
                 kin_core::reference_coverage::METHOD_ABSENCE_LIMITING_FACTOR
             )
+        } else if let Some((factor, _)) = arrival_rows.get(&entity.id) {
+            format!("  [unverified: {factor}] ")
         } else if row_is_unverified(entity) {
             "  [unverified] ".to_string()
         } else {
@@ -436,9 +526,10 @@ fn build_dead_code_report(
     if !test_only.is_empty() {
         lines.push(format!("Referenced only by tests: {}", test_only.len()));
         lines.push(
-            "  Every reference to a row below comes from a test-role entity, so no production \
-             caller reaches it. These rows are not unreferenced, and deleting one deletes the \
-             subject of a passing test."
+            "  Every proven reference recorded for a row below comes from a test-role entity, \
+             so the graph currently records no production caller. A labelled row says that \
+             this absence is not authoritative. These rows are not unreferenced, and deleting \
+             one deletes the subject of a passing test."
                 .to_string(),
         );
         for e in &test_only {
@@ -739,6 +830,7 @@ pub fn build_dead_code_seeded_response(
 
     let mut candidates: Vec<DeadCodeSeededCandidate> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut arrival_memo = kin_mcp::caller_arrival::AbsenceGapMemo::new();
 
     for record in search_response.records.iter() {
         if candidates.len() >= limit {
@@ -772,6 +864,10 @@ pub fn build_dead_code_seeded_response(
         // `dead_code` tool apply. Deciding it on the raw count here would make
         // one entity dead on one surface and live on another.
         let dead = counts.proven == 0;
+        // And the same arrival authority, for the same reason. A `dead` boolean
+        // with no limiting factor is what let an agent act on this surface after
+        // the terminal one had already refused to stand behind the identical row.
+        let absence_limiting_factor = arrival_memo.limiting_factor(graph, &entity);
 
         candidates.push(DeadCodeSeededCandidate {
             id: entity.id.to_string(),
@@ -782,6 +878,7 @@ pub fn build_dead_code_seeded_response(
             reference_count: counts.total,
             proven_reference_count: counts.proven,
             dead,
+            absence_limiting_factor,
         });
     }
 
@@ -882,20 +979,10 @@ mod tests {
         // the clean arm. A one-way edge leaves the caller itself unreferenced,
         // which is a populated answer and a different test.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                live.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &live, 0.9))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                live.id,
-                caller.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&live, &caller, 0.9))
             .unwrap();
 
         let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
@@ -936,20 +1023,10 @@ mod tests {
         // the clean arm. A one-way edge leaves the caller itself unreferenced,
         // which is a populated answer and a different test.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                live.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &live, 0.9))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                live.id,
-                caller.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&live, &caller, 0.9))
             .unwrap();
 
         let coverage =
@@ -1060,6 +1137,56 @@ mod tests {
         }
     }
 
+    /// A distinct call-site offset per edge, so two `Calls` edges from one file
+    /// are two sites unless a fixture deliberately puts them at the same one.
+    static NEXT_CALL_SITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+    /// A `Calls` edge carrying the call-site span an adapter that records sites
+    /// produces.
+    ///
+    /// The arrival reading counts distinct call SITES on the resolved side and
+    /// refuses to measure a file whose call edges record no span, because giving
+    /// a spanless edge weight one is the relation count that lets a fan-out pay
+    /// for a site that became no edge. A fixture meaning "this call resolved"
+    /// therefore has to say where, or it is a fixture about the refusal instead.
+    fn make_call_relation(src: &Entity, dst: &Entity) -> Relation {
+        make_call_relation_with(src, dst, 1.0)
+    }
+
+    /// The same edge at an explicit linker confidence tier.
+    fn make_call_relation_with(src: &Entity, dst: &Entity, confidence: f32) -> Relation {
+        let start_byte = NEXT_CALL_SITE.fetch_add(16, std::sync::atomic::Ordering::Relaxed);
+        let file = src
+            .file_origin
+            .clone()
+            .expect("a call edge is minted from an entity that has a file");
+        Relation {
+            confidence,
+            origin: if confidence < 1.0 {
+                RelationOrigin::Inferred
+            } else {
+                RelationOrigin::Parsed
+            },
+            evidence: vec![kin_model::relation::RelationEvidence {
+                source_span: Some(kin_model::entity::SourceSpan {
+                    file,
+                    start_byte,
+                    end_byte: start_byte + 8,
+                    start_line: start_byte as u32,
+                    start_col: 0,
+                    end_line: start_byte as u32,
+                    end_col: 8,
+                }),
+                ..kin_model::relation::RelationEvidence::default()
+            }],
+            // NOT `make_call_relation`, which is this function's own caller. The
+            // rewrite that spanned every fixture edge matched this line too and
+            // made the helper call itself; the suite caught it as a stack
+            // overflow rather than a wrong answer, which is the good outcome.
+            ..make_relation(src.id, dst.id, RelationKind::Calls)
+        }
+    }
+
     /// Stamp the graph-owned parse side onto an entity, the way ingestion does.
     ///
     /// A fixture without it reads as an unmeasured graph, which the scan refuses
@@ -1075,6 +1202,41 @@ mod tests {
             serde_json::Value::from(import_statements),
         );
         entity
+    }
+
+    /// Give a synthetic language an honest cross-file import-linking witness.
+    ///
+    /// Both endpoints are dedicated Module entities, which cannot enter the
+    /// dead-code candidate set. The importer records the one import statement
+    /// its edge represents. Nothing touches a subject file, so this establishes
+    /// only the language-wide capability without accidentally taking a focal's
+    /// cheap outgoing-import control.
+    fn add_cross_file_import_witness(
+        graph: &InMemoryGraph,
+        language: LanguageId,
+        importer_file: &str,
+        imported_file: &str,
+    ) {
+        let mut importer = measured(make_entity("__importer_module", importer_file), 0, 1);
+        importer.kind = EntityKind::Module;
+        importer.language = language;
+        let mut imported = measured(make_entity("__imported_module", imported_file), 0, 0);
+        imported.kind = EntityKind::Module;
+        imported.language = language;
+        assert_ne!(
+            importer.file_origin.as_ref(),
+            imported.file_origin.as_ref(),
+            "an import-linking witness must cross a file boundary"
+        );
+        graph.upsert_entity(&importer).unwrap();
+        graph.upsert_entity(&imported).unwrap();
+        graph
+            .upsert_relation(&make_relation(
+                importer.id,
+                imported.id,
+                RelationKind::Imports,
+            ))
+            .unwrap();
     }
 
     fn scan(graph: &InMemoryGraph) -> DeadCodeResponse {
@@ -1129,6 +1291,205 @@ mod tests {
     /// `kin_db::find_dead_code` builds the candidate set by excluding anything
     /// with a cross-file inbound edge, at any resolution, so a cross-file
     /// name-only edge removes an entity before this filter ever sees it. That
+    /// A module entity for a file, which is what `from . import mod` binds.
+    ///
+    /// The arrival family is built from files that named the focal's file in
+    /// their own source, and a module binding names it by landing a `References`
+    /// edge on this entity rather than an `Imports` edge on any function in it.
+    fn make_module_entity(name: &str, file: &str) -> Entity {
+        Entity {
+            kind: EntityKind::Module,
+            ..make_entity(name, file)
+        }
+    }
+
+    /// A file entity carrying its import count but NOT the parse-side call
+    /// count, which is what every file of a converted store looks like today:
+    /// `kin graph status` reported the python parse side "measured on 1 of 14
+    /// files" on the corpus this ticket came from (FIR-2828).
+    fn uncounted(entity: Entity, import_statements: u64) -> Entity {
+        let mut entity = measured(entity, 0, import_statements);
+        entity
+            .metadata
+            .extra
+            .remove(kin_parser::FILE_PARSED_CALL_SITES_KEY);
+        entity
+    }
+
+    /// The FIR-2821 shape as a graph: a file reached only by a module binding,
+    /// whose one caller parsed more call sites than the graph holds edges for.
+    ///
+    /// `caller_parsed` is what the parser read in `src/cli.rs`, and `None` is a
+    /// store that holds no count for it at all. One call became an edge in every
+    /// arm, so a higher count is the arm where calls went missing and a caller of
+    /// `dead_target` could be among them.
+    fn graph_with_module_binding(caller_parsed: Option<u64>) -> (InMemoryGraph, Entity) {
+        let graph = InMemoryGraph::new();
+        let dead_target = measured(make_entity("dead_target", "src/store.rs"), 0, 0);
+        let store_module = measured(make_module_entity("store", "src/store.rs"), 0, 0);
+        let count = |entity| match caller_parsed {
+            Some(parsed) => measured(entity, parsed, 1),
+            None => uncounted(entity, 1),
+        };
+        let caller = count(make_entity("caller", "src/cli.rs"));
+        let neighbour = count(make_entity("neighbour", "src/cli.rs"));
+        for entity in [&dead_target, &store_module, &caller, &neighbour] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // The module binding: cli.rs named store.rs in its own source.
+        graph
+            .upsert_relation(&make_relation_at(
+                caller.id,
+                store_module.id,
+                RelationKind::References,
+                0.9,
+            ))
+            .unwrap();
+        // The one call of the caller's that the linker did bind.
+        graph
+            .upsert_relation(&make_call_relation_with(&caller, &neighbour, 0.9))
+            .unwrap();
+        (graph, dead_target)
+    }
+
+    #[test]
+    fn a_row_whose_callers_could_arrive_unaccounted_says_so_on_the_row() {
+        // THE ARM FIR-2821 BOUGHT. `src/cli.rs` parsed three call sites and the
+        // graph holds one edge from it, and cli.rs can reach store.rs, so a
+        // caller of `dead_target` may be among the two that went missing. The
+        // stranger's scan printed exactly this row with no caveat at all while
+        // hedging the one row it could resolve, and deleting on it would have
+        // taken out a live function.
+        let (graph, _) = graph_with_module_binding(Some(3));
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("dead_target"),
+            "the scan must still list the row; a check over a scan that listed nothing \
+             would pass every assertion below for the wrong reason: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "[unverified: {}] dead_target",
+                kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR
+            )),
+            "a row is read alone, pasted into a ticket or acted on by an agent that never saw \
+             the reasons above it, so it names the factor rather than only that one applies: \
+             {output}"
+        );
+        assert!(
+            !response.verified,
+            "a delete list carrying a row whose callers may not all be visible is not a \
+             verified answer: {output}"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_family_holds_no_parse_count_is_not_read_as_a_find() {
+        // THE ARM THE REVIEW BOUGHT. `src/cli.rs` can reach `src/store.rs` and
+        // the store holds no count of the call sites parsed there, so nothing
+        // ruled out a caller of `dead_target` among them. The reading says
+        // `Unaccounted`, which is not a state that licenses an absence, and a
+        // consumer that kept only the files with a MEASURED shortfall turned
+        // that into a plain row under a confident verdict. On a converted store
+        // this is not an edge case: it is nearly every file.
+        let (graph, _) = graph_with_module_binding(None);
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("dead_target"),
+            "the row must still be listed, or every assertion below passes for the wrong \
+             reason: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "[unverified: {}] dead_target",
+                kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+            )),
+            "the row names the factor, and it is the uncounted one rather than the shortfall \
+             one, because nobody counted is different news from some call went nowhere: \
+             {output}"
+        );
+        assert!(
+            !response.verified,
+            "a delete list over a store that never counted the calls that could reach these \
+             rows is not a verified answer: {output}"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_family_could_not_be_established_is_not_read_as_a_find() {
+        // THE DECLINE, and it is the branch a consumer forgets.
+        // `observe_caller_arrival` refuses to truncate: over its family cap, on
+        // an index it cannot read, or in a language that links no imports at
+        // all, it returns `Unmeasured` and names the reason instead of
+        // examining part of the family and reporting `accounted`. It carries
+        // that refusal in `unmeasured_reason` and leaves the shortfall list
+        // EMPTY, so a gate keyed only on the shortfall reads the decline as
+        // nothing to report and prints the row as a find. Unmeasured is not
+        // accounted, and on a delete list least of all.
+        let graph = InMemoryGraph::new();
+        let dead_target = measured(make_entity("dead_target", "src/store.rs"), 0, 0);
+        let caller = measured(make_entity("caller", "src/cli.rs"), 1, 0);
+        let neighbour = measured(make_entity("neighbour", "src/cli.rs"), 1, 0);
+        for entity in [&dead_target, &caller, &neighbour] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // One resolved call and no edge of any kind between the two files, so
+        // the family cannot be established at all.
+        graph
+            .upsert_relation(&make_call_relation_with(&caller, &neighbour, 0.9))
+            .unwrap();
+
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("dead_target"),
+            "the row must still be listed, or every assertion below passes for the wrong \
+             reason: {output}"
+        );
+        assert!(
+            output.contains(&format!(
+                "[unverified: {}] dead_target",
+                kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+            )),
+            "the reading declined to establish which files can reach this row, and a row \
+             that says nothing about that is a delete instruction drawn from a walk that \
+             never finished: {output}"
+        );
+        assert!(
+            !response.verified,
+            "a scan carrying a row whose reachable-caller set was never established is not \
+             a verified answer: {output}"
+        );
+    }
+
+    #[test]
+    fn a_row_whose_callers_all_resolved_carries_no_arrival_caveat() {
+        // THE CONTROL, and it is the half that stops the gate from becoming a
+        // blanket refusal. Every call site cli.rs parsed became an edge, so an
+        // absence over those edges is the whole set and this row is a find
+        // rather than a candidate. A gate that cannot stay silent teaches a
+        // reader to skip its label, which is the FIR-2821 inversion one level
+        // down.
+        let (graph, _) = graph_with_module_binding(Some(1));
+        let response = scan(&graph);
+        let output = response.lines.join("\n");
+
+        assert!(
+            output.contains("dead_target"),
+            "the row must still be listed: {output}"
+        );
+        assert!(
+            !output.contains(kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR),
+            "no call site went missing in this graph, so nothing licenses an arrival caveat \
+             on any row of it: {output}"
+        );
+    }
+
     /// bound lives in kin-db, not here.
     #[test]
     fn a_name_only_edge_does_not_rescue_an_entity_and_its_row_says_why() {
@@ -1143,21 +1504,17 @@ mod tests {
         // 0.3 is the receiver-method fan-out tier: every same-named method in
         // the repo. 0.9 is module-known, symbol-selected-inside-it.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                guessed.id,
-                RelationKind::Calls,
-                0.3,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &guessed, 0.3))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                proven.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &proven, 0.9))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            caller.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         let output = response.lines.join("\n");
@@ -1201,13 +1558,14 @@ mod tests {
         graph.upsert_entity(&live).unwrap();
         graph.upsert_entity(&orphan).unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                live.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &live, 0.9))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            caller.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         let output = response.lines.join("\n");
@@ -1306,6 +1664,85 @@ mod tests {
             said.contains("Kin cannot rule out seed matches it did not see"),
             "an empty seeded scan on a degraded daemon must carry its own noun rather than \
              impact's 'dependents': {said}"
+        );
+    }
+
+    /// FIR-2821 review, second P1. The seeded surface reaches the same verdict
+    /// about the same entity as the whole-repo scan, and it says so on the row.
+    ///
+    /// Before this, one dead-code surface applied the arrival authority and
+    /// three did not, so an agent could ask for removable code and be handed a
+    /// row the terminal surface had already refused to stand behind. The
+    /// assertion is the AGREEMENT rather than either endpoint: the whole-repo
+    /// scan's label for `dead_target` and the seeded candidate's limiting factor
+    /// are read off the same store and required to name the same factor, so
+    /// neither surface can drift without the other.
+    #[test]
+    fn the_seeded_surface_reaches_the_same_arrival_verdict_as_the_scan() {
+        let (graph, dead_target) = graph_with_module_binding(Some(3));
+        let scanned = scan(&graph);
+        let output = scanned.lines.join("\n");
+        let factor = kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR;
+        assert!(
+            output.contains(&format!("[unverified: {factor}] dead_target")),
+            "the whole-repo endpoint of this agreement must hold first, or the seeded \
+             assertion below passes over a scan that gated nothing: {output}"
+        );
+
+        let response = build_dead_code_seeded_response(
+            &graph,
+            &DeadCodeSeededRequest {
+                query: "dead_target".to_string(),
+                limit: Some(10),
+                name_pattern: None,
+            },
+            &dead_code_test_envelope(),
+        )
+        .unwrap();
+        let row = response
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == dead_target.id.to_string())
+            .expect("the seed names the entity the scan listed");
+        assert!(
+            row.dead,
+            "the row has no proven inbound edge, so it is still offered as a candidate: {row:?}"
+        );
+        let said = row
+            .absence_limiting_factor
+            .as_deref()
+            .expect("a candidate the graph cannot account for carries its limiting factor");
+        assert!(
+            said.starts_with(factor),
+            "the seeded surface names the same factor the scan put on the row, or one entity \
+             reads deletable here and unverifiable there: {said}"
+        );
+    }
+
+    /// The control, and the half that keeps the arm above from passing over a
+    /// surface that qualifies everything: the same shape with every call site
+    /// accounted for carries no factor at all.
+    #[test]
+    fn a_seeded_candidate_the_graph_can_account_for_carries_no_factor() {
+        let (graph, dead_target) = graph_with_module_binding(Some(1));
+        let response = build_dead_code_seeded_response(
+            &graph,
+            &DeadCodeSeededRequest {
+                query: "dead_target".to_string(),
+                limit: Some(10),
+                name_pattern: None,
+            },
+            &dead_code_test_envelope(),
+        )
+        .unwrap();
+        let row = response
+            .candidates
+            .iter()
+            .find(|candidate| candidate.id == dead_target.id.to_string())
+            .expect("the seed names the entity");
+        assert_eq!(
+            row.absence_limiting_factor, None,
+            "every call site this graph parsed became an edge, so nothing licenses a caveat"
         );
     }
 
@@ -1435,6 +1872,12 @@ mod tests {
                 RelationKind::Implements,
             ))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            orphan.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         assert!(
@@ -1530,35 +1973,25 @@ mod tests {
         }
         // Intra-file callers, the edges the two surfaces disagreed about.
         graph
-            .upsert_relation(&make_relation(
-                parse_note.id,
-                extract_tags.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_call_relation(&parse_note, &extract_tags))
             .unwrap();
         graph
-            .upsert_relation(&make_relation(
-                parse_note.id,
-                strip_code.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_call_relation(&parse_note, &strip_code))
             .unwrap();
         graph
-            .upsert_relation(&make_relation(
-                ingest_dir.id,
-                ingest_note.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_call_relation(&ingest_dir, &ingest_note))
             .unwrap();
         // One cross-file edge, so the graph can support an absence claim at all
         // and this test is about agreement rather than about the gate.
         graph
-            .upsert_relation(&make_relation(
-                ingest_dir.id,
-                parse_note.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_call_relation(&ingest_dir, &parse_note))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            ingest_dir.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         assert!(
@@ -1624,13 +2057,17 @@ mod tests {
         }
         // Only the intra-file calls resolved, exactly as the 0.5.36 graph held
         // them: 16 intra-file Calls edges and not one crossing a file.
+        // Spanned, so this fixture's `unmeasured` has exactly one producer: it
+        // holds no import family. Leaving these edges span-free would make the
+        // reading decline on the join too, and the arm below would pass while
+        // naming a reason that was no longer the only one in play.
         for (src, dst) in [
-            (main.id, cmd_ingest.id),
-            (parse_note.id, extract_tags.id),
-            (ingest_dir.id, ingest_note.id),
+            (&main, &cmd_ingest),
+            (&parse_note, &extract_tags),
+            (&ingest_dir, &ingest_note),
         ] {
             graph
-                .upsert_relation(&make_relation(src, dst, RelationKind::Calls))
+                .upsert_relation(&make_call_relation(src, dst))
                 .unwrap();
         }
 
@@ -1675,21 +2112,24 @@ mod tests {
             .filter(|line| line.contains(" (Function, ") || line.contains(" (Method, "))
         {
             assert!(
-                row.contains("[unverified]"),
-                "every row carries its own label, because a row read alone is what gets acted \
-                 on: {row}"
+                row.contains(&format!(
+                    "[unverified: {}]",
+                    kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+                )),
+                "every row names the arrival reading this fixture deliberately leaves \
+                 unmeasured: {row}"
             );
         }
 
         // Same project, cross-file edges resolved: the graph can now support the
         // claim, and there is nothing left to report.
         for (src, dst) in [
-            (cmd_ingest.id, ingest_dir.id),
-            (ingest_dir.id, parse_note.id),
-            (suite.id, parse_note.id),
+            (&cmd_ingest, &ingest_dir),
+            (&ingest_dir, &parse_note),
+            (&suite, &parse_note),
         ] {
             graph
-                .upsert_relation(&make_relation(src, dst, RelationKind::Calls))
+                .upsert_relation(&make_call_relation(src, dst))
                 .unwrap();
         }
         let repaired = scan(&graph);
@@ -1713,9 +2153,16 @@ mod tests {
     fn a_gap_in_one_language_does_not_label_another_languages_rows() {
         let graph = InMemoryGraph::new();
 
-        let caller = measured(make_entity("run_task", "src/tasks.rs"), 2, 1);
-        let called = measured(make_entity("spawn_task", "src/spawn.rs"), 2, 1);
-        let rust_orphan = measured(make_entity("retired_task", "src/retired.rs"), 1, 1);
+        // Every rust file's own parse side matches the edges the graph holds from
+        // it, so rust is accounted end to end and any label on a rust row would
+        // have to come from python. Giving them a count they cannot back is not
+        // a harmless fixture detail: the delete-list authority accounts the
+        // focal's own file, so a rust file parsing more call sites than it
+        // resolved is a genuine same-file gap and would label these rows for a
+        // reason that has nothing to do with the claim under test.
+        let caller = measured(make_entity("run_task", "src/tasks.rs"), 1, 1);
+        let called = measured(make_entity("spawn_task", "src/spawn.rs"), 0, 1);
+        let rust_orphan = measured(make_entity("retired_task", "src/retired.rs"), 0, 1);
 
         let mut python_orphan = measured(make_entity("legacy_import", "tools/legacy.py"), 2, 2);
         python_orphan.language = LanguageId::Python;
@@ -1731,10 +2178,19 @@ mod tests {
         ] {
             graph.upsert_entity(entity).unwrap();
         }
-        // Rust resolves a cross-file call; python resolves nothing.
+        // Rust resolves a cross-file call and has a genuine cross-file module
+        // import witness; python resolves neither. The Module destination is not
+        // a dead-code candidate, so this changes only whether Rust arrival was
+        // measured.
         graph
-            .upsert_relation(&make_relation(caller.id, called.id, RelationKind::Calls))
+            .upsert_relation(&make_call_relation(&caller, &called))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            caller.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         let joined = response.lines.join("\n");
@@ -1747,11 +2203,15 @@ mod tests {
             joined.contains("  retired_task ("),
             "the rust row prints plainly, because rust cross-file edges resolved: {joined}"
         );
-        assert!(
-            joined.contains("[unverified] legacy_helper (")
-                && joined.contains("[unverified] legacy_import ("),
-            "the python rows carry the label: {joined}"
-        );
+        for name in ["legacy_helper", "legacy_import"] {
+            assert!(
+                joined.contains(&format!(
+                    "[unverified: {}] {name} (",
+                    kin_mcp::caller_arrival::UNMEASURED_ARRIVAL_LIMITING_FACTOR
+                )),
+                "the python row names the arrival reading that declined: {joined}"
+            );
+        }
         assert!(
             joined.contains("4 unreferenced entities, 2 of them UNVERIFIED"),
             "the header counts both, because a mixed answer is what this is: {joined}"
@@ -1766,6 +2226,12 @@ mod tests {
         let graph = InMemoryGraph::new();
         let orphan = measured(make_entity("never_called", "nk/legacy.py"), 0, 0);
         graph.upsert_entity(&orphan).unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            orphan.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
@@ -1800,6 +2266,12 @@ mod tests {
         let orphan = measured(make_entity("never_called", "nk/legacy.py"), 0, 0);
         graph.upsert_entity(&launcher).unwrap();
         graph.upsert_entity(&orphan).unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            launcher.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let coverage =
             kin_core::reference_coverage::collect_reference_edge_coverage(&graph).unwrap();
@@ -1943,23 +2415,19 @@ mod tests {
         // language reads as unsupportable and every row would be labelled for a
         // different reason, which would make this test unable to fail.
         graph
-            .upsert_relation(&make_relation_at(
-                cmd_ingest.id,
-                parse_file.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&cmd_ingest, &parse_file, 0.9))
             .unwrap();
         // `main` dispatches to the subcommand, so the caller is itself reached
         // and the list is the three the mechanism is about.
         graph
-            .upsert_relation(&make_relation_at(
-                main.id,
-                cmd_ingest.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&main, &cmd_ingest, 0.9))
             .unwrap();
+        add_cross_file_import_witness(
+            &graph,
+            cmd_ingest.language,
+            "__fixture__/importer.py",
+            "__fixture__/imported.py",
+        );
 
         let response = scan(&graph);
         let joined = response.lines.join("\n");
@@ -2044,33 +2512,35 @@ mod tests {
         // rather than dropping it upstream.
         let mut suite = measured(make_entity("renders_a_row", "src/report.rs"), 2, 0);
         suite.role = EntityRole::Test;
-        let format_row = measured(make_entity("format_row", "src/report.rs"), 0, 0);
-        let caller = measured(make_entity("print_report", "src/report.rs"), 0, 0);
-        let render_header = measured(make_entity("render_header", "src/report.rs"), 0, 0);
+        // Parse-side counts are file facts, so every entity in report.rs carries
+        // the same two calls this fixture inserts below.
+        let format_row = measured(make_entity("format_row", "src/report.rs"), 2, 0);
+        let caller = measured(make_entity("print_report", "src/report.rs"), 2, 0);
+        let render_header = measured(make_entity("render_header", "src/report.rs"), 2, 0);
         let orphan = measured(make_entity("legacy_row", "src/legacy.rs"), 0, 0);
 
         for entity in [&suite, &format_row, &caller, &render_header, &orphan] {
             graph.upsert_entity(entity).unwrap();
         }
         graph
-            .upsert_relation(&make_relation_at(
-                suite.id,
-                format_row.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&suite, &format_row, 0.9))
             .unwrap();
         // A production caller for the third function, so the in-file exclusion
         // is exercised in the same run and the two dispositions can be told
         // apart.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                render_header.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &render_header, 0.9))
             .unwrap();
+        // This fixture is about the test-only bucket, not about a graph that
+        // cannot establish caller arrival. Give the language a genuine
+        // cross-file module import witness whose destination cannot enter the
+        // dead-code candidate set.
+        add_cross_file_import_witness(
+            &graph,
+            caller.language,
+            "__fixture__/importer.rs",
+            "__fixture__/imported.rs",
+        );
 
         let response = scan(&graph);
         let joined = response.lines.join("\n");
@@ -2114,8 +2584,107 @@ mod tests {
             "an entity a production caller reaches is not reported at all: {joined}"
         );
         assert!(
-            joined.contains("no production caller reaches it"),
-            "the section says what the rows mean: {joined}"
+            joined.contains("the graph currently records no production caller"),
+            "the section states the graph evidence without overclaiming it: {joined}"
+        );
+        assert!(
+            !joined.contains("so no production caller reaches it"),
+            "recorded absence is not categorical absence: {joined}"
+        );
+        assert!(
+            response.verified,
+            "a fully measured test-only row remains a supported classification: {joined}"
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line == "  format_row (Function, rust) - src/report.rs"),
+            "the clean test-only row carries no blanket unverified label: {joined}"
+        );
+        assert!(
+            !joined.contains("Do not delete on this evidence"),
+            "the clean control does not print the refusal reserved for an unverified row: \
+             {joined}"
+        );
+    }
+
+    /// A test-only row still claims that no production caller exists. If a
+    /// production file that can reach it holds unresolved calls, the serialized
+    /// verdict and safety guidance must agree with its label without relabelling
+    /// a supported find in the unreferenced section.
+    #[test]
+    fn a_test_only_arrival_gap_does_not_relabel_a_supported_find() {
+        let graph = InMemoryGraph::new();
+
+        let mut suite = measured(make_entity("renders_a_row", "src/report.rs"), 1, 0);
+        suite.role = EntityRole::Test;
+        let format_row = measured(make_entity("format_row", "src/report.rs"), 1, 0);
+        let main = measured(make_entity("main", "src/main.rs"), 2, 1);
+        let orphan = measured(make_entity("legacy_row", "src/legacy.rs"), 0, 0);
+        let mut report_module = measured(make_entity("report", "src/report.rs"), 1, 0);
+        report_module.kind = EntityKind::Module;
+
+        for entity in [&suite, &format_row, &main, &orphan, &report_module] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        // The same-file test call keeps `format_row` in the test-only bucket.
+        graph
+            .upsert_relation(&make_call_relation(&suite, &format_row))
+            .unwrap();
+        // The production entry point can reach report.rs, but its two parsed
+        // calls produced no Calls edge. Either missing call could target
+        // `format_row`, so the graph cannot support the section's claim that no
+        // production caller reaches it. `main` is excluded as a conventional
+        // entry point, which keeps the fixture's listed populations exact.
+        graph
+            .upsert_relation(&make_relation(
+                main.id,
+                report_module.id,
+                RelationKind::Imports,
+            ))
+            .unwrap();
+
+        let response = scan(&graph);
+        let joined = response.lines.join("\n");
+
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line == "Found 1 unreferenced entities:"),
+            "the plain find keeps a confident unreferenced heading of its own: {joined}"
+        );
+        assert!(
+            response
+                .lines
+                .iter()
+                .any(|line| line == "  legacy_row (Function, rust) - src/legacy.rs"),
+            "the supported unreferenced row stays unlabelled: {joined}"
+        );
+        assert!(
+            joined.contains("Referenced only by tests: 1"),
+            "the subject remains in the test-only bucket: {joined}"
+        );
+        assert!(
+            joined.contains("the graph currently records no production caller")
+                && !joined.contains("so no production caller reaches it"),
+            "the section must not contradict the row that says a caller may be missing: {joined}"
+        );
+        assert!(
+            joined.contains(&format!(
+                "[unverified: {}] format_row (",
+                kin_mcp::caller_arrival::UNRESOLVED_ARRIVAL_LIMITING_FACTOR
+            )),
+            "the row names its measured arrival gap: {joined}"
+        );
+        assert!(
+            !response.verified,
+            "an unverified test-only row makes the complete response unverified: {joined}"
+        );
+        assert!(
+            joined.contains("Do not delete on this evidence"),
+            "the safety guidance follows every unverified listed row: {joined}"
         );
     }
 
@@ -2160,20 +2729,10 @@ mod tests {
             graph.upsert_entity(entity).unwrap();
         }
         graph
-            .upsert_relation(&make_relation_at(
-                off_path_suite.id,
-                format_row.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&off_path_suite, &format_row, 0.9))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                render_header.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &render_header, 0.9))
             .unwrap();
         graph
             .upsert_relation(&make_relation(

@@ -38,8 +38,22 @@ reference line a caller reports must still carry the call when read against the
 file on disk, and an answer taken over a graph short of its own census must
 disclose that rather than presenting as clean. Each of the three runs its own
 control, and they share one experiment because the experiment is destructive.
-Every check names the ticket it is about, so a failure is attributable without
-reading the code.
+Check 23 covers FIR-2821. A function reached only through `from . import store`
+must first resolve as a graph entity with the expected incoming `main` call,
+then must not be listed, and the one function nothing calls must be listed. The
+v0.6.1 stranger's scan listed eleven live functions with no caveat at all while
+hedging the one row it could resolve, and those first two arms are that finding
+in one assertion each. The third arm grades the arrival consumer as a join
+between two surfaces rather than against a fixed expectation: `find_references`
+publishes the arrival reading for the file both functions live in, and the check
+derives from that block what the dead-code row label and the top-level verdict
+owe, then requires exactly that. An expectation of an exactly empty label passed
+whether or not dead-code consulted the reading at all, because the already-fixed
+linker keeps the live function off the list on its own; under the join, removing
+the consumer leaves the row bare while the reading still says the arrival could
+not be accounted for, and the two halves contradict. Which branch of the join
+runs is a property of the store, and the result names it. Every check names the
+ticket it is about, so a failure is attributable without reading the code.
 
 `parse_hole_repro.py` covers what the others cannot see: a file the
 repository admits that produced no entity at all. It builds a JavaScript library
