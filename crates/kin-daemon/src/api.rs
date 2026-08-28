@@ -35593,7 +35593,7 @@ mod tests {
     /// receives.
     #[tokio::test]
     async fn a_trace_over_its_budget_drops_bodies_and_keeps_every_edge() {
-        const BUDGET: usize = 6_000;
+        const ORIGINAL_BUDGET: usize = 6_000;
         let state = test_state();
         let ids = install_trace_chain(&state, 6);
         // The chain links only its calls. Every requested class decides
@@ -35616,8 +35616,48 @@ mod tests {
             json!({ "focal": ids[0].to_string(), "depth": 5, "direction": "calls" }),
         )
         .await;
+
+        // Keep the original 6k fixture load-bearing after the trace step gained
+        // its two uniform call-site fields. The old shape still has to fit the
+        // exact target this ladder used before the call-site contract. Only the serialized
+        // cost of those two fields is added back to the exercised budget, and
+        // that increment has its own ceiling, so unrelated per-step growth
+        // cannot hide inside a raised magic number.
+        let compact = call_mcp_tool_text(
+            app.clone(),
+            "trace_data_flow",
+            json!({
+                "focal": ids[0].to_string(),
+                "depth": 5,
+                "direction": "calls",
+                "include_body": false,
+            }),
+        )
+        .await;
+        let mut without_site_contract: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        for step in without_site_contract["chain"].as_array_mut().unwrap() {
+            let row = step.as_object_mut().unwrap();
+            row.remove("reference_lines");
+            row.remove("reference_lines_absent_reason");
+        }
+        let old_shape_chars = serde_json::to_string_pretty(&without_site_contract)
+            .unwrap()
+            .len();
+        let original_target =
+            ORIGINAL_BUDGET.saturating_sub(kin_mcp::budget::RESPONSE_DISCLOSURE_RESERVE_CHARS);
         assert!(
-            unbounded.len() > BUDGET,
+            old_shape_chars <= original_target,
+            "the pre-call-site shape must still fit the original ladder target: {old_shape_chars} \
+             chars against {original_target}"
+        );
+        let site_contract_chars = compact.len().saturating_sub(old_shape_chars);
+        assert!(
+            (1..1_000).contains(&site_contract_chars),
+            "the two uniform site fields added {site_contract_chars} chars to this five-step chain"
+        );
+        let budget = ORIGINAL_BUDGET + site_contract_chars;
+        assert!(
+            unbounded.len() > budget,
             "the fixture must exceed the budget under test or this proves nothing: {} chars",
             unbounded.len()
         );
@@ -35630,15 +35670,15 @@ mod tests {
                 "focal": ids[0].to_string(),
                 "depth": 5,
                 "direction": "calls",
-                "max_response_chars": BUDGET,
+                "max_response_chars": budget,
             }),
         )
         .await;
         let cut: serde_json::Value = serde_json::from_str(&bounded).unwrap();
 
         assert!(
-            bounded.len() <= BUDGET,
-            "the tool must return what it promised to fit: {} chars against {BUDGET}",
+            bounded.len() <= budget,
+            "the tool must return what it promised to fit: {} chars against {budget}",
             bounded.len()
         );
         assert_eq!(

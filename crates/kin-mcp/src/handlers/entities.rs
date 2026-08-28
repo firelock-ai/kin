@@ -9325,7 +9325,7 @@ mod tests {
         assert_eq!(targeted["target_name"], "HTTPAdapter.send");
     }
 
-    /// FIR-2824's call-site contract on the generic GraphStore arm. The line
+    /// The call-site contract on the generic GraphStore arm. The line
     /// belongs to the referencing entity, which is the parent for a callee and
     /// the child for a caller. Duplicate edges contribute every site, and an
     /// empty list states whether evidence was missing or unusable.
@@ -9903,7 +9903,7 @@ mod tests {
         assert_eq!(disclosure["reason"], serde_json::json!("steps_omitted"));
     }
 
-    /// FIR-2824 at the GraphStore arm's first response-boundary stage. The
+    /// At the GraphStore arm's first response-boundary stage, the
     /// target branch is shallower than the distractor, so ordinary deep-branch
     /// preservation gives it up. Reading `target_name` is the only thing that
     /// can make the named and unnamed arms choose differently.

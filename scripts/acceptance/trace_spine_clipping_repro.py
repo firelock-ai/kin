@@ -22,7 +22,7 @@ something. It is that a chain missing its point reads exactly like a complete
 one, because the honest label the tool already carried ("treat this as a lower
 bound") is the same label a complete walk carries.
 
-FIR-2824 adds checks 4 through 7. A target that steers discovery must also
+The extension adds checks 4 through 7. A target that steers discovery must also
 survive both response-budget decisions, and each surviving step must carry the
 exact graph-owned call-site lines that make the hop actionable.
 

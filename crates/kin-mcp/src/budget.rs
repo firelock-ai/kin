@@ -1727,7 +1727,7 @@ mod tests {
         );
     }
 
-    /// FIR-2824, the defect itself. A branch the caller named survives the trim
+    /// A branch the caller named survives the trim
     /// that gives up "least relevant" branches, and the arm beside it is what
     /// makes that mean anything: the SAME walk at the SAME budget loses that
     /// branch when nothing names it.
@@ -2004,7 +2004,7 @@ mod tests {
         })
     }
 
-    /// FIR-2824 at the surface a caller reads. The sentence is COMPOSED from
+    /// At the surface a caller reads, the sentence is COMPOSED from
     /// clauses and joined, so it is probed rather than reasoned about: reading
     /// the code says what each clause holds, and only printing the join says
     /// what a caller receives.

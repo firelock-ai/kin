@@ -3394,7 +3394,7 @@ mod tests {
         );
     }
 
-    /// FIR-2824's second half. A chain is only actionable when each hop names
+    /// A chain is only actionable when each hop names
     /// the syntax site that created it, not only the callee's definition.
     /// Outgoing and incoming steps have different callers, duplicate edges must
     /// accumulate, and an empty list must explain which absence occurred.
@@ -3849,7 +3849,7 @@ mod tests {
         );
     }
 
-    /// FIR-2824 at the typed response arm. The target is a shallow leaf that
+    /// At the typed response arm, the target is a shallow leaf that
     /// ordinary depth-first preservation gives up before the deeper branch, so
     /// target-aware walk ordering alone cannot make this pass. At one explicit
     /// response cut the unnamed arm loses it and the named arm keeps it.
@@ -3874,6 +3874,8 @@ mod tests {
                 let targeted_names = step_names(&targeted);
                 (unnamed.steps_omitted > 0
                     && targeted.steps_omitted > 0
+                    && unnamed.fanout_narrowed > 0
+                    && targeted.fanout_narrowed > 0
                     && !unnamed_names.iter().any(|name| name == target)
                     && targeted_names.iter().any(|name| name == target))
                 .then_some((budget, unnamed, targeted))
