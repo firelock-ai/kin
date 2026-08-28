@@ -146,6 +146,28 @@ impl KinLayout {
         self.kindb_dir().join("last-admission")
     }
 
+    /// `.kin/kindb/hydration-semantics` — the replay-semantics version this
+    /// store was created under.
+    ///
+    /// Durable rather than in-process because the fact it records is about the
+    /// store's creation and not about any daemon's life. A local conversion's
+    /// initial historical deltas use one revision of the replay algorithm and no
+    /// path re-derives them in place. Native transport can later add history
+    /// authored elsewhere, so this records only the creation-time version and
+    /// does not claim provenance for everything the store later receives.
+    ///
+    /// Written into the STAGED layout, before the rename that publishes `.kin`,
+    /// so a store and its own creation-time record become visible in the same
+    /// instant. An absent record does not establish agreement: the store may
+    /// predate this record or the file may have been removed, and admitting a
+    /// native transfer pack removes it on purpose because the wire carries no
+    /// authoring version for the history it moves. See
+    /// [`crate::hydration_semantics`] for the full producer enumeration.
+    pub fn kindb_hydration_semantics_path(&self) -> PathBuf {
+        self.kindb_dir()
+            .join(crate::hydration_semantics::HYDRATION_SEMANTICS_FILE_NAME)
+    }
+
     /// `.kin/kindb/relation-census` — the relation-kind histogram as it stood
     /// when the graph's relations were last settled.
     ///

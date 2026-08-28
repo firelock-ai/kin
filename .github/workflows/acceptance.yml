@@ -116,6 +116,14 @@ jobs:
       - name: Falsify the parse-hole verdict graders
         run: python3 scripts/acceptance/parse_hole_repro.py --self-test
 
+      # FIR-2829. A fresh store is the control that keeps a replay-version
+      # comparator from satisfying the invariant by warning on every store, and
+      # behind, ahead, absent and unreadable are the four distinct standings the
+      # product must disclose. Drive each grader against its inverse before
+      # building.
+      - name: Falsify the hydration-semantics disclosure graders
+        run: python3 scripts/acceptance/hydration_semantics_repro.py --self-test
+
       # FIR-1826. The suite's verdicts are decided by two graders: one that reads
       # the callers out of a `kin graph inspect`, and one that turns a caller set
       # into PASS or FAIL. Both are driven against the input that must produce
@@ -486,6 +494,34 @@ jobs:
             echo "::warning title=Parse-hole acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Hydration-semantics acceptance suite (verdict comes from the gate step)
+        id: hydrationsemantics
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/hydration_semantics_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/hydration_semantics.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/hydration_semantics.log 2>&1 || rc=$?
+          cat acceptance/hydration_semantics.log
+          {
+            echo "### Hydration-semantics acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/hydration_semantics.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Hydration-semantics acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       # The end-to-end arm of FIR-1826. The unit arm drives the linker directly
       # in crates/kin-index; this asks the built binary what calls what, in two
       # languages that must bind and one that must not. The negative is what
@@ -835,6 +871,7 @@ jobs:
             --report response_budget=acceptance/response_budget.json \
             --report trace_spine=acceptance/trace_spine.json \
             --report parsehole=acceptance/parsehole.json \
+            --report hydration_semantics=acceptance/hydration_semantics.json \
             --report sameowner=acceptance/sameowner.json \
             --report memory_pressure=acceptance/memory_pressure.json \
             --report memory_footprint=acceptance/memory_footprint.json \

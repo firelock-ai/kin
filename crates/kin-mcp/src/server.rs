@@ -1293,6 +1293,13 @@ async fn handle_tools_call_daemon(
     // and a set that is not whole, and nothing in the payload can tell the two
     // apart.
     base_env = base_env.with_relation_census_loss(daemon_delegate::relation_census_hold().as_ref());
+    // Stamped on every answer because a replay-version gap qualifies a graph
+    // that otherwise looks complete. Historical deltas are not re-derived in
+    // place, so the answer affected most is a successful absence whose missing
+    // row may reflect replay semantics the store cannot show match this build.
+    base_env = base_env.with_hydration_semantics_observation(
+        daemon_delegate::hydration_semantics_standing().as_ref(),
+    );
     // Stamped on every answer for the same reason as the three above, and it
     // qualifies the same kind of answer the census-loss flag does: one that came
     // back looking complete. A sweep that offered relations the graph does not

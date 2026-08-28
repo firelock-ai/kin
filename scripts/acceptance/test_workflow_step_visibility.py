@@ -68,6 +68,11 @@ EXPECTED_SUITES = (
         "acceptance/parsehole.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/hydration_semantics_repro.py",
+        "hydration_semantics",
+        "acceptance/hydration_semantics.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/same_owner_call_repro.py",
         "sameowner",
         "acceptance/sameowner.json",

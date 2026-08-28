@@ -11014,6 +11014,57 @@ fn configured_transfer_limits() -> kin_remote::repository_transfer::RepositoryTr
     }
 }
 
+/// Admit one received pack, running this daemon's admission-provenance policy
+/// at the commit boundary.
+///
+/// Every native receiver in this process goes through here: the inbound receive
+/// route, which is also where a `kin push` lands, and `pull_into_replica`, which
+/// CLI pull and native clone both share and which calls this once per pack of a
+/// segmented gap. One wrapper rather than a policy repeated at each site,
+/// because the failure this repairs was a receiver that admitted history and
+/// left the store describing itself by a record that predates it.
+///
+/// The policy is to discard the hydration creation stamp. The transfer protocol
+/// carries no authoring version beside the history it moves, so a receiver that
+/// kept its own creation number would certify replay semantics for deltas
+/// authored on another host by another build. Deleting the record is the
+/// conservative half of that trade: the store reads unstamped and every surface
+/// discloses it, instead of reading current and certifying an absence over
+/// history whose provenance nothing recorded.
+///
+/// A hosted daemon runs no policy. Its storage backend is not a local `.kin`
+/// layout, and the scaffolding directory beside it belongs to no repository
+/// whose provenance this transfer touched.
+fn apply_received_repository_transfer_pack(
+    state: &DaemonState,
+    authority: &RepositoryAuthorityManager<dyn StorageBackend>,
+    repository_id: &RepositoryId,
+    destination_ref: &kin_model::RefName,
+    actor: kin_model::AuthorId,
+    pack: &kin_remote::repository_transfer::RepositoryTransferPack,
+) -> std::result::Result<
+    kin_remote::repository_transfer::RepositoryTransferReceipt,
+    kin_remote::repository_transfer::RepositoryTransferError,
+> {
+    let local_kindb = state
+        .storage_backend
+        .is_none()
+        .then(|| state.local_kindb_capability())
+        .flatten();
+    kin_remote::repository_transfer::apply_repository_transfer_pack_with_pre_commit(
+        authority,
+        repository_id,
+        destination_ref,
+        actor,
+        pack,
+        &configured_transfer_limits(),
+        || match local_kindb {
+            Some(kindb) => kindb.invalidate_for_unversioned_transfer(),
+            None => Ok(()),
+        },
+    )
+}
+
 pub(crate) fn repository_transfer_authority(
     state: &DaemonState,
     repo_id: &str,
@@ -11190,13 +11241,13 @@ async fn repo_transfer_receive(
     Json(request): Json<RepositoryTransferReceiveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
-    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
+    let receipt = apply_received_repository_transfer_pack(
+        &state,
         &authority,
         &repository_id,
         &request.destination_ref,
         kin_model::AuthorId::new("kin-daemon:repository-transfer-receiver"),
         &request.pack,
-        &configured_transfer_limits(),
     )
     .map_err(repository_transfer_error)?;
 
@@ -11421,13 +11472,13 @@ pub(crate) async fn pull_into_replica(
                 &source_ref,
                 &destination_ref,
                 |pack| {
-                    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
+                    let receipt = apply_received_repository_transfer_pack(
+                        &blocking_state,
                         &authority,
                         &repository_id,
                         &destination_ref,
                         kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
                         pack,
-                        &configured_transfer_limits(),
                     )?;
                     admitted_packs += 1;
                     if local_derived_views && !refresh.is_stale() {
@@ -19809,6 +19860,9 @@ mod tests {
         url: String,
         repository_id: RepositoryId,
         head: kin_model::SemanticChangeId,
+        /// The peer's own `.kin`, kept so a test can seed further history into
+        /// it and read the creation record it was stamped with.
+        layout: kin_core::KinLayout,
         _working: tempfile::TempDir,
     }
 
@@ -19839,6 +19893,7 @@ mod tests {
         let storage = layout.kindb_dir();
         let root = seed_replica_change(&storage, &repository_id, None, 1, "root the line");
         let head = seed_replica_change(&storage, &repository_id, Some(root), 2, "advance the line");
+        let peer_layout = layout.clone();
         let url = serve_replica(Arc::new(
             DaemonState::open_with_repo_id(layout, None).unwrap(),
         ))
@@ -19848,6 +19903,7 @@ mod tests {
             url,
             repository_id,
             head,
+            layout: peer_layout,
             _working: working,
         }
     }
@@ -20179,6 +20235,323 @@ mod tests {
             !destination.path().join(".kin").exists(),
             "a negotiation the peer refused creates no replica"
         );
+    }
+
+    /// Native transfer and the store's own creation record.
+    ///
+    /// The defect these close: a version-10 client cloning a repository whose
+    /// history was authored under version 9 stamped its empty receiver with 10,
+    /// pulled the version-9 deltas in, and then had every surface read `Current`
+    /// over history whose authoring version nothing on the wire carried. Each
+    /// arm below drives a real product route and reads the record afterwards,
+    /// because a unit test of the unlink cannot prove clone, pull or receive
+    /// routes through it.
+    mod hydration_semantics_on_native_transfer {
+        use super::*;
+        use kin_core::hydration_semantics::{self, HydrationStanding};
+
+        /// Put the store back to `Current` so the next arm starts from the
+        /// standing the defect produced, rather than from a gap left by a
+        /// previous transfer.
+        fn restamp_current(layout: &kin_core::KinLayout) {
+            hydration_semantics::stamp_staged(layout).expect("restamping the fixture store");
+            assert!(
+                !hydration_semantics::standing(layout).is_gap(),
+                "the fixture did not start current"
+            );
+        }
+
+        /// Record a creation version this binary did not author, as transport
+        /// provenance setup. The wire carries no such field; this only proves
+        /// the receiver's own record is not what travelled.
+        fn stamp_one_version_behind(layout: &kin_core::KinLayout) {
+            let stamp = hydration_semantics::HydrationSemanticsStamp::new(
+                hydration_semantics::binary_version() - 1,
+                chrono::Utc::now(),
+            );
+            hydration_semantics::write(layout, &stamp).expect("writing the mismatched stamp");
+        }
+
+        fn assert_unstamped(layout: &kin_core::KinLayout, what: &str) {
+            let standing = hydration_semantics::standing(layout);
+            assert_eq!(
+                standing,
+                HydrationStanding::Unstamped {
+                    derives: hydration_semantics::binary_version()
+                },
+                "{what} left the store claiming a creation-time version it can no longer speak for"
+            );
+            assert!(
+                standing.is_gap(),
+                "{what}: an unstamped store must read as a gap"
+            );
+        }
+
+        /// A pack aimed at one exact local destination, built from its live
+        /// authority rather than from a bare empty store, because a local
+        /// replica opens past genesis and a stale expectation is refused before
+        /// the commit boundary this exercises.
+        fn pack_for_local_destination(
+            repository_id: &RepositoryId,
+            destination_kindb: &FsPath,
+            operation: u128,
+        ) -> kin_remote::repository_transfer::RepositoryTransferPack {
+            let source_storage = tempfile::tempdir().unwrap();
+            let source_head = seed_replica_change(
+                source_storage.path(),
+                repository_id,
+                None,
+                operation,
+                "hydration transfer source",
+            );
+            let source = RepositoryAuthorityManager::open(
+                repository_id.clone(),
+                Arc::new(kin_db::LocalFileBackend::new(source_storage.path())),
+            )
+            .unwrap();
+            let destination = RepositoryAuthorityManager::open(
+                repository_id.clone(),
+                Arc::new(kin_db::LocalFileBackend::new(
+                    destination_kindb.to_path_buf(),
+                )),
+            )
+            .unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let status = kin_remote::repository_transfer::repository_transfer_status(
+                &destination,
+                repository_id,
+                &destination_ref,
+            )
+            .unwrap();
+            let expectation =
+                kin_remote::repository_transfer::RepositoryTransferExpectation::try_from(status)
+                    .unwrap();
+            let segment = kin_remote::repository_transfer::build_repository_transfer_segment(
+                &source,
+                &destination_ref,
+                &expectation,
+            )
+            .unwrap();
+            assert!(
+                segment.is_final(),
+                "the one-change fixture fits one segment"
+            );
+            assert_eq!(segment.pack.source_head, source_head);
+            segment.pack
+        }
+
+        async fn post_receive(
+            state: Arc<DaemonState>,
+            repo_id: &str,
+            destination_ref: &kin_model::RefName,
+            pack: &kin_remote::repository_transfer::RepositoryTransferPack,
+        ) -> (StatusCode, String) {
+            let response = router(state)
+                .oneshot(
+                    Request::post(format!("/repos/{repo_id}/transfer/receive"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&serde_json::json!({
+                                "destination_ref": destination_ref,
+                                "pack": pack,
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).to_string())
+        }
+
+        fn local_replica() -> (Arc<DaemonState>, kin_core::KinLayout, tempfile::TempDir) {
+            install_test_registry_override();
+            let working = tempfile::tempdir().unwrap();
+            let layout = kin_core::init(working.path()).unwrap().layout;
+            let state = Arc::new(DaemonState::open_with_repo_id(layout.clone(), None).unwrap());
+            (state, layout, working)
+        }
+
+        /// Inbound receive, which is also where a `kin push` lands.
+        #[tokio::test]
+        async fn an_http_receive_discards_the_receivers_creation_record() {
+            let (state, layout, _working) = local_replica();
+            let repo_id = state.cached_repo_id.clone();
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let pack = pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2829);
+            let admitted_head = pack.source_head;
+            restamp_current(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_eq!(status, StatusCode::OK, "the receive must commit: {body}");
+
+            let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+                serde_json::from_str(&body).expect("the route answers a receipt");
+            assert_eq!(
+                receipt.destination_head, admitted_head,
+                "the fixture must prove history actually moved"
+            );
+            assert_unstamped(&layout, "an inbound receive");
+        }
+
+        /// The control that makes the arm above mean something: a receiver that
+        /// discarded its record on every request, refusal included, would pass
+        /// that test and degrade every healthy store that ever refused a pack.
+        #[tokio::test]
+        async fn a_refused_receive_leaves_the_creation_record_intact() {
+            let (state, layout, _working) = local_replica();
+            let repo_id = state.cached_repo_id.clone();
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let mut pack = pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2830);
+            // A destination ref the route did not ask for. Refused by identity,
+            // well before anything durable moves.
+            pack.destination_ref = kin_model::RefName::branch(b"not-the-route").unwrap();
+            restamp_current(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_ne!(status, StatusCode::OK, "the refusal did not fire: {body}");
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a refused pack degraded a healthy store's creation record"
+            );
+        }
+
+        /// A hosted daemon owns no local store's record. Its scaffolding
+        /// directory belongs to no repository this transfer touched, so nothing
+        /// there may move.
+        #[tokio::test]
+        async fn a_hosted_receive_leaves_its_scaffolding_record_alone() {
+            let repo_id = format!("hosted-hydration-{}", Uuid::new_v4());
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let pack = transfer_pack_for_unborn_destination(&repository_id);
+            let (state, working, _storage) = replica_state(&repo_id);
+            let layout = state.layout.clone();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            restamp_current(&layout);
+            let before = hydration_semantics::read(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an empty hosted store must admit a native transfer: {body}"
+            );
+
+            assert_eq!(
+                hydration_semantics::read(&layout),
+                before,
+                "a hosted receive touched the scaffolding store's creation record"
+            );
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a hosted receive degraded a record it does not own"
+            );
+            drop(working);
+        }
+
+        /// The control on the pull path: a pull that admits nothing must leave
+        /// the record alone.
+        ///
+        /// A receiver that discarded its record on every pull rather than on
+        /// every admission would pass the clone arm below and degrade a healthy
+        /// store on each no-op sync. The admitting half of `pull_into_replica`
+        /// is what the clone arm exercises, because a native clone's first pull
+        /// is that function, and the acceptance suite drives a second replica's
+        /// real `kin pull` against the shipped binaries.
+        #[tokio::test]
+        async fn a_pull_that_admits_nothing_leaves_the_creation_record_alone() {
+            let peer = native_clone_peer().await;
+            let destination = tempfile::tempdir().unwrap();
+            let cloned = crate::replica_adoption::clone_native_replica(
+                destination.path(),
+                clone_endpoint(&peer.url),
+                &peer.repository_id,
+            )
+            .await
+            .expect("a native clone of a served peer");
+
+            // The clone already admitted everything the peer holds, so put the
+            // receiver back to current and ask for the same history again.
+            let layout = cloned.state.layout.clone();
+            restamp_current(&layout);
+
+            let repo_id = cloned.state.cached_repo_id.clone();
+            let request = pull_request(&peer.url, &repo_id);
+            let (status, body) =
+                transfer_command(Arc::clone(&cloned.state), "pull", &request).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+            let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+                serde_json::from_slice(&body).unwrap();
+            assert!(
+                !pulled.outcome.moved_history(),
+                "the fixture admitted a pack, so this is not the no-admission control"
+            );
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a pull that admitted nothing discarded the creation record"
+            );
+        }
+
+        /// Native clone, with the transported-history mismatch control the
+        /// review named. The source records a creation version this binary did
+        /// not author; the clone's receiver is created by this binary and would
+        /// have been stamped current. The finished replica must disclose that
+        /// it cannot speak for what it just admitted.
+        #[tokio::test]
+        async fn a_native_clone_of_a_mismatched_source_leaves_the_replica_unstamped() {
+            let peer = native_clone_peer().await;
+            stamp_one_version_behind(&peer.layout);
+            assert_eq!(
+                hydration_semantics::standing(&peer.layout),
+                HydrationStanding::Behind {
+                    created_under: hydration_semantics::binary_version() - 1,
+                    derives: hydration_semantics::binary_version(),
+                },
+                "the provenance setup did not take"
+            );
+
+            // What a freshly created receiver reads before its first pull, which
+            // is the reading the defect then let stand over transported history.
+            let unrelated = tempfile::tempdir().unwrap();
+            let fresh = kin_core::init(unrelated.path()).unwrap().layout;
+            assert!(
+                !hydration_semantics::standing(&fresh).is_gap(),
+                "a freshly created store must be current, or this arm proves nothing"
+            );
+
+            let destination = tempfile::tempdir().unwrap();
+            let cloned = crate::replica_adoption::clone_native_replica(
+                destination.path(),
+                clone_endpoint(&peer.url),
+                &peer.repository_id,
+            )
+            .await
+            .expect("a native clone of a served peer");
+            assert!(
+                cloned.transfer.outcome.moved_history(),
+                "the clone admitted no history, so it says nothing about the commit boundary"
+            );
+
+            assert_unstamped(&cloned.state.layout, "a native clone");
+            assert_eq!(
+                hydration_semantics::standing(&peer.layout),
+                HydrationStanding::Behind {
+                    created_under: hydration_semantics::binary_version() - 1,
+                    derives: hydration_semantics::binary_version(),
+                },
+                "the transfer moved the source's own creation record, which it must never do"
+            );
+        }
     }
 
     fn pull_request(
