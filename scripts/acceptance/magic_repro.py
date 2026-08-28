@@ -3208,9 +3208,13 @@ def check_23(suite):
     the row bare while the reading still says the arrival could not be accounted
     for, and the two halves contradict. Which branch runs is a property of the
     store rather than of this check, so the result names the branch it took: only
-    the non-accounted branch grades the consumer, and today it is the branch this
-    fixture takes, because the parse-side call count does not reach a converted
-    store (FIR-2828).
+    the non-accounted branch grades the consumer, and this fixture takes the
+    accounted one, because the graph accounts for every arrival into the file
+    both functions live in. So what this arm grades here is the gate's ability to
+    stay silent, and the consumer itself is graded on check 12's re-export
+    fixture, whose arrival state reads unmeasured and whose row carries the
+    matching label. Said out loud so nobody reads this arm's green as evidence
+    the consumer ran.
     """
     res = Result("23", "FIR-2821",
                  "dead-code over a relative module import, and its arrival gate")
