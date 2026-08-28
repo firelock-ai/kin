@@ -8350,12 +8350,18 @@ fn build_semantic_locate_result(
     // would halve.
     let fetch_limit = page_size.saturating_mul(8).max(page_size);
 
-    let raw = match graph.semantic_search(&query, fetch_limit) {
-        Ok(hits) => hits,
+    // The producer-aware variant, not the discarding wrapper. The runtime that
+    // actually returned this query vector is the only thing that can be
+    // compared against the lineage of the index it ranks over, and the
+    // configured route is not that runtime.
+    let produced = match graph.semantic_search_with_producers(&query, fetch_limit) {
+        Ok(produced) => produced,
         Err(error) => {
             return kin_mcp::ToolCallResult::error(format!("semantic search failed: {error}"));
         }
     };
+    let query_producers = produced.query_producers;
+    let raw = produced.matches;
 
     // Opt-in (KIN_SEMLOC_RERANK=1): role-aware demotion + exact-name boost over the
     // cosine hit set ONLY. Resolve once for scoring, then stable-sort by priority with
@@ -8399,6 +8405,11 @@ fn build_semantic_locate_result(
     let max_rows = page_size.saturating_mul(SEMANTIC_LOCATE_MAX_PAGES);
     let mut rows: Vec<serde_json::Value> = Vec::with_capacity(page_size);
     let mut degradations: Vec<kin_cli::commands::locate::RetrievalDegradation> = Vec::new();
+    kin_cli::commands::locate::record_query_producer_verdict(
+        &mut degradations,
+        graph,
+        &query_producers,
+    );
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut seen_entities: HashSet<String> = HashSet::new();
     // Constant across the page and reported per hit in `match_evidence`: whether

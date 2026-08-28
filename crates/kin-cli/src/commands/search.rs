@@ -252,6 +252,13 @@ pub struct DaemonSearchResponse {
     /// reader is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub absence_qualifier: Vec<String>,
+    /// Why the vector half of this answer is not fully trustworthy, or empty
+    /// when it is. Populated when the runtime that produced the query vector
+    /// disagrees with the runtimes that produced the index it was ranked
+    /// against; the numbers alone cannot show that, because a mismatch ranks
+    /// perfectly happily and just ranks wrong.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradations: Vec<crate::commands::locate::RetrievalDegradation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -577,6 +584,7 @@ pub fn collect_daemon_search_response(
         records,
         semantic_coverage: None,
         absence_qualifier,
+        degradations: Vec::new(),
     })
 }
 
@@ -600,7 +608,17 @@ fn collect_daemon_semantic_search_response(
 ) -> Result<DaemonSearchResponse> {
     let coverage = evaluate_semantic_coverage(graph)?;
     let limit = request.limit.unwrap_or(10);
-    let vector_results = graph.semantic_search(&request.query, limit)?;
+    // The producer-aware variant, not the discarding wrapper: the caller has
+    // to be able to compare the runtime that produced this query vector with
+    // the lineage of the index it is about to rank against.
+    let produced = graph.semantic_search_with_producers(&request.query, limit)?;
+    let mut degradations: Vec<crate::commands::locate::RetrievalDegradation> = Vec::new();
+    crate::commands::locate::record_query_producer_verdict(
+        &mut degradations,
+        graph,
+        &produced.query_producers,
+    );
+    let vector_results = produced.matches;
 
     if vector_results.is_empty() {
         let mut response = collect_daemon_search_response(
@@ -616,6 +634,7 @@ fn collect_daemon_semantic_search_response(
         response.semantic = true;
         response.text_fallback = true;
         response.semantic_coverage = Some(coverage);
+        response.degradations = degradations;
         return Ok(response);
     }
 
@@ -732,6 +751,7 @@ fn collect_daemon_semantic_search_response(
         records,
         semantic_coverage: Some(coverage),
         absence_qualifier,
+        degradations,
     })
 }
 
@@ -1962,6 +1982,7 @@ mod tests {
 
         let response = DaemonSearchResponse {
             absence_qualifier: Vec::new(),
+            degradations: Vec::new(),
             query: "zzz_this_symbol_does_not_exist_anywhere_9f3a".into(),
             semantic: false,
             text_fallback: true,
