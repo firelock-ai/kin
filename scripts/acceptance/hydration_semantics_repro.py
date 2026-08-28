@@ -858,15 +858,18 @@ class Suite(object):
         # all, so a Git-admitted source is refused at export with a
         # repository-v6 conflict. Both sides are native here, so the only
         # divergence is the history the transfer exists to move.
+        # Init FIRST, on an empty directory: non-Git admission refuses a
+        # directory with contents rather than deriving authority from files
+        # nobody committed. The content arrives afterwards and reaches graph
+        # authority through `kin admit`, which is the native equivalent of the
+        # Git admission the other doors take.
         os.makedirs(source, exist_ok=True)
-        with open(os.path.join(source, "transported.py"), "w") as handle:
-            handle.write("def transported():\n    return 3\n")
         rc, out = self.kin_in(source, ["init"])
         if rc != 0:
             raise RuntimeError("kin init on the transfer source failed: %s" % tail(out))
         self._stop_repos.append(source)
-        # `kin init` on a bare directory admits no history, so the source has
-        # nothing to publish until its working tree reaches graph authority.
+        with open(os.path.join(source, "transported.py"), "w") as handle:
+            handle.write("def transported():\n    return 3\n")
         rc, out = self.kin_in(source, ["admit"])
         if rc != 0:
             raise RuntimeError("kin admit on the transfer source failed: %s" % tail(out))
