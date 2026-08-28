@@ -8978,7 +8978,7 @@ fn build_semantic_locate_result(
         |query, fetch_limit| {
             let produced = graph.semantic_search_with_producers(query, fetch_limit)?;
             query_producers = produced.query_producers;
-            Ok(produced.matches)
+            Ok::<_, kin_db::KinDbError>(produced.matches)
         },
         |raw| {
             // Opt-in (KIN_SEMLOC_RERANK=1): role-aware demotion + exact-name

@@ -1847,14 +1847,17 @@ mod tests {
             "the factor must name the producer mismatch itself: {factor}"
         );
 
-        // The separating control: a store-scale disclosure is a real
-        // degradation entry and must leave the verdict certified. If this went
+        // The separating control: query-shape guidance is a real degradation
+        // entry that advises how to read the result rather than reporting a
+        // lost capability, so it must leave the verdict certified. If this went
         // inconclusive, the arm above would prove only that the array was
-        // non-empty.
+        // non-empty. The pair is read from the constants the exemption itself
+        // keys on, so a rename there breaks this control rather than silently
+        // turning it into a second copy of the arm above.
         let mut corpus = clean();
         corpus["degradations"] = json!([{
-            "component": crate::negative::CORPUS_SCALE_COMPONENT,
-            "reason": crate::negative::SMALL_CORPUS_REASON,
+            "component": crate::negative::QUERY_SHAPE_COMPONENT,
+            "reason": crate::negative::DESCRIPTION_ENTITY_RANKING_REASON,
         }]);
         let scaled = compute(&corpus);
         assert_eq!(scaled["state"], json!(CERTIFIED), "{scaled}");
