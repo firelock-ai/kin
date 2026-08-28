@@ -4816,9 +4816,31 @@ mod tests {
         );
     }
 
+    /// What the cleanup-snapshot race leaves behind, at both surfaces.
+    ///
+    /// Completeness is reported for the writer's live cache and for a reopened
+    /// backend separately, with the dirty set beside each, because the boolean
+    /// alone cannot say whether a repository is dirty for having a pending edge
+    /// publication or for never publishing edges at all.
+    struct CleanupSnapshotRace {
+        deleted: usize,
+        reopen_succeeded: bool,
+        writer_complete: bool,
+        writer_dirty: std::collections::BTreeSet<String>,
+        reopened_complete: bool,
+        reopened_dirty: std::collections::BTreeSet<String>,
+    }
+
     fn run_cleanup_snapshot_before_head_commit_race(
         disable_stage_head_precondition: bool,
-    ) -> (usize, bool, bool) {
+    ) -> CleanupSnapshotRace {
+        run_cleanup_snapshot_race(disable_stage_head_precondition, false)
+    }
+
+    fn run_cleanup_snapshot_race(
+        disable_stage_head_precondition: bool,
+        provider_publishes_edges: bool,
+    ) -> CleanupSnapshotRace {
         let store = Arc::new(FakeSpineStore::default());
         let backend = FirestoreSpineBackend::with_store(store.clone());
         publish_success(
@@ -4829,6 +4851,19 @@ mod tests {
             &backend,
             metadata_publication("source", 7, "source-r7", Vec::new()),
         );
+        if provider_publishes_edges {
+            publish_success(
+                &backend,
+                edge_publication(
+                    "provider",
+                    1,
+                    "provider-r1",
+                    Vec::new(),
+                    Vec::new(),
+                    [("provider", "provider-r1"), ("source", "source-r7")],
+                ),
+            );
+        }
         publish_success(
             &backend,
             edge_publication(
@@ -4881,26 +4916,75 @@ mod tests {
         seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
         let reopen_succeeded = reopened.hydrate().is_ok();
-        (deleted, reopen_succeeded, backend.authority_complete())
+        CleanupSnapshotRace {
+            deleted,
+            reopen_succeeded,
+            writer_complete: backend.authority_complete(),
+            writer_dirty: backend.cache.index().dirty_edge_repos(),
+            reopened_complete: reopened.authority_complete(),
+            reopened_dirty: reopened.cache.index().dirty_edge_repos(),
+        }
     }
 
     #[test]
     fn committed_marker_revision_defeats_a_cleanup_snapshot_from_the_old_head() {
-        let (deleted, reopen_succeeded, complete) =
-            run_cleanup_snapshot_before_head_commit_race(false);
-        assert_eq!(deleted, 0, "cleanup's old marker revision must lose");
-        assert!(reopen_succeeded, "the committed winner must reopen cold");
-        assert!(complete);
+        let race = run_cleanup_snapshot_before_head_commit_race(false);
+        assert_eq!(race.deleted, 0, "cleanup's old marker revision must lose");
+        assert!(
+            race.reopen_succeeded,
+            "the committed winner must reopen cold"
+        );
+        assert!(race.writer_complete);
     }
 
     #[test]
     fn committed_marker_mutant_lets_old_cleanup_delete_the_new_winner() {
-        let (deleted, reopen_succeeded, _complete) =
-            run_cleanup_snapshot_before_head_commit_race(true);
-        assert!(deleted > 0, "the mutant cleanup must delete winner rows");
+        let race = run_cleanup_snapshot_before_head_commit_race(true);
         assert!(
-            !reopen_succeeded,
+            race.deleted > 0,
+            "the mutant cleanup must delete winner rows"
+        );
+        assert!(
+            !race.reopen_succeeded,
             "the mutant durable head must fail cold reopen"
+        );
+    }
+
+    /// Print the dirty set at both surfaces, with a control.
+    ///
+    /// Ordered before either side of the completeness question is changed:
+    /// `authority_complete()` being false says only that something is dirty,
+    /// and whether that is a repository with a pending edge publication or one
+    /// that never publishes edges at all decides which surface the property
+    /// belongs on. The control arm gives the provider its own edge publication,
+    /// so a reading that shows both sets empty there and only the provider
+    /// dirty in the main arm isolates the metadata-only case as the cause.
+    ///
+    /// This asserts only what it is sure of, that the control converges. The
+    /// main arm's sets are printed for the ruling, not asserted.
+    #[test]
+    fn dirty_edge_repos_are_printed_at_both_surfaces_with_a_control() {
+        let main = run_cleanup_snapshot_race(false, false);
+        println!(
+            "MAIN provider-metadata-only: writer_complete={} writer_dirty={:?} reopened_complete={} reopened_dirty={:?}",
+            main.writer_complete, main.writer_dirty, main.reopened_complete, main.reopened_dirty
+        );
+
+        let control = run_cleanup_snapshot_race(false, true);
+        println!(
+            "CONTROL provider-publishes-edges: writer_complete={} writer_dirty={:?} reopened_complete={} reopened_dirty={:?}",
+            control.writer_complete,
+            control.writer_dirty,
+            control.reopened_complete,
+            control.reopened_dirty
+        );
+
+        assert!(
+            control.writer_dirty.is_empty() && control.reopened_dirty.is_empty(),
+            "the control must converge at both surfaces, or it cannot isolate the \
+             metadata-only case: writer {:?}, reopened {:?}",
+            control.writer_dirty,
+            control.reopened_dirty
         );
     }
 

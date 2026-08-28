@@ -756,6 +756,17 @@ impl SpineIndex {
     /// refresh in flight as readily as for an authority that is genuinely short,
     /// so a caller reporting WHY cross-repo answers are empty needs the startup
     /// pin's own reading beside it, not this alone.
+    /// The exact set holding `authority_is_complete` false, for diagnosis.
+    ///
+    /// The boolean says only that something is dirty; deciding whether that is
+    /// a repository with a pending edge publication or one that never publishes
+    /// edges at all needs the set. Test-only: it clones, and a product caller
+    /// wanting this is asking the wrong question.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dirty_edge_repos(&self) -> std::collections::BTreeSet<RepoId> {
+        self.inner.read().dirty_edge_repos.iter().cloned().collect()
+    }
+
     pub fn authority_is_complete(&self) -> bool {
         let inner = self.inner.read();
         let roots = inner
