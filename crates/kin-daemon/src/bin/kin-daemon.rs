@@ -262,14 +262,13 @@ fn create_state(
                     &prefix,
                 ),
             );
-            let publication_control = Arc::new(
-                kin_daemon::publication_lease::PublicationControl::new(
+            let publication_control =
+                Arc::new(kin_daemon::publication_lease::PublicationControl::new(
                     scope,
                     runtime_reader_identity,
                     fleet_repositories,
                     control_store,
-                )?,
-            );
+                )?);
             let bootstrap = match publication_control.bootstrap_runtime_if_absent() {
                 Ok(bootstrap) => bootstrap,
                 Err(error) => {
@@ -312,20 +311,19 @@ fn create_state(
                     let fence = publication_control
                         .spine_rollout_fence(&proof)
                         .map_err(|error| error.to_string())?;
-                    let evidence = runtime
-                        .block_on(state.advance_hosted_spine_rollout_fence(fence))?;
+                    let evidence =
+                        runtime.block_on(state.advance_hosted_spine_rollout_fence(fence))?;
                     publication_control
                         .checkpoint_spine_rollout_fence(&proof, &evidence)
                         .map_err(|error| error.to_string())?;
                     publication_control
                         .complete_rollout_acquisition(&proof)
                         .map_err(|error| error.to_string())?;
-                    let legacy_writer_drain_proof_sha256 = env::var(
-                        "KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL",
-                    )
-                    .ok()
-                    .map(|digest| digest.trim().to_string())
-                    .filter(|digest| !digest.is_empty());
+                    let legacy_writer_drain_proof_sha256 =
+                        env::var("KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL")
+                            .ok()
+                            .map(|digest| digest.trim().to_string())
+                            .filter(|digest| !digest.is_empty());
                     let admission = kin_daemon::publication_lease::AdmitReaderRequest {
                         lease: proof.clone(),
                         repositories: publication_control.fleet_repositories().to_vec(),
@@ -341,9 +339,7 @@ fn create_state(
                     runtime.block_on(state.prepare_hosted_spine_rollout(&admission))?;
                     runtime.block_on(state.admit_hosted_spine_rollout_fence(admission))?;
                     runtime.block_on(state.release_hosted_spine_rollout(
-                        kin_daemon::publication_lease::ReleaseRolloutLeaseRequest {
-                            lease: proof,
-                        },
+                        kin_daemon::publication_lease::ReleaseRolloutLeaseRequest { lease: proof },
                     ))?;
                     Ok(())
                 })()
@@ -776,13 +772,7 @@ async fn async_main() -> i32 {
             ));
             // A failed open drops both handles here, which closes the socket. No
             // endpoint was published for it, so nothing outlives the failure.
-            let state = create_state(
-                bind_layout,
-                &storage,
-                &repo_id,
-                &runtime,
-                allowed_repo_ids,
-            )?;
+            let state = create_state(bind_layout, &storage, &repo_id, &runtime, allowed_repo_ids)?;
             Ok((state, api_listener, bound_port, ready_tx))
         })
         // The boxed startup error is not `Send`, and this result crosses back
@@ -1046,7 +1036,11 @@ mod tests {
             &StorageMode::Gcs,
             "kin",
             runtime.handle(),
-            Some(["kin".to_string(), "kin-db".to_string()].into_iter().collect()),
+            Some(
+                ["kin".to_string(), "kin-db".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
         );
         let Err(error) = result else {
             panic!("GCS publication control must not start without API authentication");
@@ -1080,7 +1074,11 @@ mod tests {
             &StorageMode::Gcs,
             "kin",
             runtime.handle(),
-            Some(["kin".to_string(), "kin-db".to_string()].into_iter().collect()),
+            Some(
+                ["kin".to_string(), "kin-db".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
         );
         let Err(error) = result else {
             panic!("GCS publication control must not share ordinary daemon authentication");
@@ -1116,7 +1114,11 @@ mod tests {
             &StorageMode::Gcs,
             "kin",
             runtime.handle(),
-            Some(["kin".to_string(), "kin-db".to_string()].into_iter().collect()),
+            Some(
+                ["kin".to_string(), "kin-db".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
         );
         let Err(error) = result else {
             panic!("GCS publication control must refuse a shared administrator credential");

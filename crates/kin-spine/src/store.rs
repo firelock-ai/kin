@@ -235,7 +235,8 @@ impl PreparedStorePublication {
                             || canonical.head.root_hash != head.root_hash
                             || canonical.head.metadata_sha256 != head.metadata_sha256
                             || (canonical.head.phase == head.phase
-                                && (canonical.head.phase != crate::publication::RepoPublicationPhase::Edges
+                                && (canonical.head.phase
+                                    != crate::publication::RepoPublicationPhase::Edges
                                     || canonical.head.resolution_roots
                                         == head.resolution_roots)))) =>
             {

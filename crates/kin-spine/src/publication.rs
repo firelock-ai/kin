@@ -19,20 +19,16 @@ use crate::index::{CrossRepoEdge, EntityEntry};
 /// Version of the durable publication manifest and its canonical hash domain.
 pub const REPO_PUBLICATION_SCHEMA_VERSION: u32 = 2;
 pub const SPINE_ROLLOUT_FENCE_SCHEMA: &str = "kin.spine-rollout-fence.v1";
-pub const LEGACY_SPINE_WRITER_DRAIN_SCHEMA: &str =
-    "kin.spine-legacy-writer-drain.v1";
+pub const LEGACY_SPINE_WRITER_DRAIN_SCHEMA: &str = "kin.spine-legacy-writer-drain.v1";
 const SPINE_ROLLOUT_TOKEN_HASH_DOMAIN: &[u8] = b"kin.spine-rollout-token.v1\0";
-const SPINE_ROLLOUT_FENCE_PAYLOAD_HASH_DOMAIN: &[u8] =
-    b"kin.spine-rollout-fence-payload.v1\0";
+const SPINE_ROLLOUT_FENCE_PAYLOAD_HASH_DOMAIN: &[u8] = b"kin.spine-rollout-fence-payload.v1\0";
 
 /// The exact backend generation from which one spine publication was derived.
 ///
 /// This mirrors `kin_db::SnapshotCursor::backend_generation()` without making
 /// `kin-spine` depend on the database crate. Generation zero is KinDB's
 /// authoritative initial cursor, including a proved-empty initial snapshot.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct SpineSourceCursor(u64);
 
@@ -253,9 +249,7 @@ impl SpineRolloutFence {
     }
 }
 
-fn validate_rollout_repository_fence(
-    row: &SpineRolloutRepositoryFence,
-) -> Result<(), SpineError> {
+fn validate_rollout_repository_fence(row: &SpineRolloutRepositoryFence) -> Result<(), SpineError> {
     validate_identifier("rollout repository id", &row.repo_id)?;
     if row.snapshot_schema == 0 {
         return Err(SpineError::Serialization(format!(
@@ -348,8 +342,7 @@ impl LegacySpineWriterDrainAttestation {
             || self.rollout_fence_evidence.update_time.is_empty()
         {
             return Err(SpineError::Serialization(
-                "legacy spine writer-drain attestation has incomplete rollout evidence"
-                    .to_string(),
+                "legacy spine writer-drain attestation has incomplete rollout evidence".to_string(),
             ));
         }
         validate_sha256(
@@ -388,9 +381,7 @@ pub enum SpineRolloutFenceCommit {
 /// Metadata makes entity resolution possible but keeps cross-repo topology
 /// incomplete. Edges is a same-cursor upgrade whose outgoing edge set was
 /// resolved against the recorded repository roots.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepoPublicationPhase {
     Metadata,
@@ -555,9 +546,10 @@ impl RepoSpinePublication {
             ))
         })?;
         let metadata_sha256 = format!("sha256:{}", hex::encode(Sha256::digest(&metadata_bytes)));
-        let manifest_bytes = serde_json::to_vec(&(REPO_PUBLICATION_SCHEMA_VERSION, &self)).map_err(|error| {
-            SpineError::Serialization(format!("failed to serialize spine publication: {error}"))
-        })?;
+        let manifest_bytes = serde_json::to_vec(&(REPO_PUBLICATION_SCHEMA_VERSION, &self))
+            .map_err(|error| {
+                SpineError::Serialization(format!("failed to serialize spine publication: {error}"))
+            })?;
         let digest = hex::encode(Sha256::digest(&manifest_bytes));
         let head = RepoPublicationHead {
             schema_version: REPO_PUBLICATION_SCHEMA_VERSION,

@@ -49,8 +49,8 @@ pub use query::{classify_spine_probe, SpineProbe, SpineQuery};
 pub use routing::{RepoEndpoint, RoutingTable};
 pub use store::{
     LoadedRepo, LoadedRepoPublication, LoadedSpineRolloutFence, PreparedStorePublication,
-    RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition,
-    StorePublicationStageGuard, StoreRepoHeadGuard,
+    RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition, StorePublicationStageGuard,
+    StoreRepoHeadGuard,
 };
 pub use xref::{
     collect_unresolved_imports, materialize_edges, resolve_imports, ResolveResult, UnresolvedImport,

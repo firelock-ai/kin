@@ -22,13 +22,12 @@ use kin_spine::federation::federated_impact;
 use kin_spine::index::{CrossRepoEdge, EntityEntry, SpineIndex};
 use kin_spine::routing::{RepoEndpoint, RoutingTable};
 use kin_spine::{
-    FirestoreSpineBackend, LegacySpineWriterDrainAttestation, LoadedRepo,
-    LoadedRepoPublication, LoadedSpineRolloutFence, PreparedStorePublication,
-    RepoPublicationCleanupProgress, RepoPublicationCommit, RepoPublicationConflict,
-    RepoPublicationHead, RepoSpinePublication, SpineError, SpineRolloutFence,
-    SpineRolloutFenceCommit, SpineRolloutFenceEvidence, SpineRolloutRepositoryFence,
-    SpineSourceCursor, SpineStore, StoreHeadPrecondition, StorePublicationStageGuard,
-    StoreRepoHeadGuard, LEGACY_SPINE_WRITER_DRAIN_SCHEMA,
+    FirestoreSpineBackend, LegacySpineWriterDrainAttestation, LoadedRepo, LoadedRepoPublication,
+    LoadedSpineRolloutFence, PreparedStorePublication, RepoPublicationCleanupProgress,
+    RepoPublicationCommit, RepoPublicationConflict, RepoPublicationHead, RepoSpinePublication,
+    SpineError, SpineRolloutFence, SpineRolloutFenceCommit, SpineRolloutFenceEvidence,
+    SpineRolloutRepositoryFence, SpineSourceCursor, SpineStore, StoreHeadPrecondition,
+    StorePublicationStageGuard, StoreRepoHeadGuard, LEGACY_SPINE_WRITER_DRAIN_SCHEMA,
 };
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -711,8 +710,7 @@ impl SpineStore for HostedFakeStore {
             || sealed_ids != expected_ids
         {
             return Err(SpineError::Backend(
-                "hosted integration migration seal does not match active authority"
-                    .to_string(),
+                "hosted integration migration seal does not match active authority".to_string(),
             ));
         }
         Ok(true)
@@ -726,8 +724,7 @@ impl SpineStore for HostedFakeStore {
         writer_drain.validate()?;
         if writer_drain.rollout_fence_evidence != rollout_fence.evidence() {
             return Err(SpineError::Backend(
-                "hosted integration writer-drain evidence does not match rollout fence"
-                    .to_string(),
+                "hosted integration writer-drain evidence does not match rollout fence".to_string(),
             ));
         }
         let state = self.publications.lock().unwrap();
@@ -749,8 +746,7 @@ impl SpineStore for HostedFakeStore {
             .collect::<Vec<_>>();
         if observed_ids != expected_ids {
             return Err(SpineError::Backend(
-                "hosted integration migration seal requires exact fleet heads"
-                    .to_string(),
+                "hosted integration migration seal requires exact fleet heads".to_string(),
             ));
         }
         drop(state);
@@ -759,8 +755,7 @@ impl SpineStore for HostedFakeStore {
         if let Some(existing) = seal.as_ref() {
             if existing != &candidate {
                 return Err(SpineError::Backend(
-                    "a different hosted integration migration seal already exists"
-                        .to_string(),
+                    "a different hosted integration migration seal already exists".to_string(),
                 ));
             }
             return Ok(());
@@ -832,10 +827,7 @@ impl SpineStore for HostedFakeStore {
                 },
             );
             let publication_id = prepared.candidate_head().publication_id.clone();
-            let revision = state
-                .stage_revisions
-                .entry(publication_id)
-                .or_insert(1);
+            let revision = state.stage_revisions.entry(publication_id).or_insert(1);
             prepared = prepared.bind_stage_guard(StorePublicationStageGuard {
                 stage_sequence: 1,
                 revision_sha256: format!("hosted-integration-stage-{revision}"),
@@ -854,9 +846,7 @@ impl SpineStore for HostedFakeStore {
             return Ok(RepoPublicationCommit::Conflict(conflict));
         }
         let prepared_fence = prepared.rollout_fence().ok_or_else(|| {
-            SpineError::Backend(
-                "hosted integration publication has no rollout fence".to_string(),
-            )
+            SpineError::Backend("hosted integration publication has no rollout fence".to_string())
         })?;
         let fence_state = self.rollout_fence.lock().unwrap();
         let mut state = self.publications.lock().unwrap();
@@ -876,9 +866,7 @@ impl SpineStore for HostedFakeStore {
         }
         if prepared.requires_staging() {
             let stage_guard = prepared.stage_guard().ok_or_else(|| {
-                SpineError::Backend(
-                    "hosted integration publication has no stage guard".to_string(),
-                )
+                SpineError::Backend("hosted integration publication has no stage guard".to_string())
             })?;
             let stage_matches = state
                 .stage_revisions
@@ -1519,8 +1507,7 @@ fn publish_repo(backend: &FirestoreSpineBackend, publication: RepoSpinePublicati
         backend
             .commit_repo_publication(prepared)
             .expect("commit hosted publication"),
-        RepoPublicationCommit::Committed { .. }
-            | RepoPublicationCommit::AlreadyCommitted { .. }
+        RepoPublicationCommit::Committed { .. } | RepoPublicationCommit::AlreadyCommitted { .. }
     ));
 }
 

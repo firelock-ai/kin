@@ -232,31 +232,30 @@ impl From<PublicationControlRecord> for PublicationControlStatus {
             reader: record.reader,
             last_authority_fenced_at: record.last_authority_fenced_at,
             last_authority_fence: record.last_authority_fence,
-            spine_rollout_fence_payload_sha256: record
-                .spine_rollout_fence_payload_sha256,
+            spine_rollout_fence_payload_sha256: record.spine_rollout_fence_payload_sha256,
             spine_rollout_fence_update_time: record.spine_rollout_fence_update_time,
             reader_spine_rollout_fence_payload_sha256: record
                 .reader_spine_rollout_fence_payload_sha256,
-            reader_spine_rollout_fence_update_time: record
-                .reader_spine_rollout_fence_update_time,
-            active_lease: record.active_lease.map(|active| ActivePublicationLeaseStatus {
-                kind: active.kind,
-                holder: active.holder,
-                request_id: active.request_id,
-                fence: active.fence,
-                repo_id: active.repo_id,
-                target_repositories: active.target_repositories,
-                previous_repositories: active.previous_repositories,
-                fence_repositories: active.fence_repositories,
-                acquired_at: active.acquired_at,
-                expires_at: active.expires_at,
-                authority_fencing_in_progress: active.authority_fencing_token.is_some(),
-                authority_fenced_at: active.authority_fenced_at,
-                authority_fence: active.authority_fence,
-                spine_rollout_fence_payload_sha256: active
-                    .spine_rollout_fence_payload_sha256,
-                spine_rollout_fence_update_time: active.spine_rollout_fence_update_time,
-            }),
+            reader_spine_rollout_fence_update_time: record.reader_spine_rollout_fence_update_time,
+            active_lease: record
+                .active_lease
+                .map(|active| ActivePublicationLeaseStatus {
+                    kind: active.kind,
+                    holder: active.holder,
+                    request_id: active.request_id,
+                    fence: active.fence,
+                    repo_id: active.repo_id,
+                    target_repositories: active.target_repositories,
+                    previous_repositories: active.previous_repositories,
+                    fence_repositories: active.fence_repositories,
+                    acquired_at: active.acquired_at,
+                    expires_at: active.expires_at,
+                    authority_fencing_in_progress: active.authority_fencing_token.is_some(),
+                    authority_fenced_at: active.authority_fenced_at,
+                    authority_fence: active.authority_fence,
+                    spine_rollout_fence_payload_sha256: active.spine_rollout_fence_payload_sha256,
+                    spine_rollout_fence_update_time: active.spine_rollout_fence_update_time,
+                }),
         }
     }
 }
@@ -378,9 +377,7 @@ impl PublicationControlError {
 }
 
 pub trait PublicationControlStore: Send + Sync {
-    fn load(
-        &self,
-    ) -> Result<Option<StoredPublicationControlRecord>, PublicationControlError>;
+    fn load(&self) -> Result<Option<StoredPublicationControlRecord>, PublicationControlError>;
 
     fn create(
         &self,
@@ -455,11 +452,11 @@ impl RolloutFencingFlightGuard {
         flights: Arc<Mutex<BTreeSet<u64>>>,
         fence: u64,
     ) -> Result<Self, PublicationControlError> {
-        let mut active = flights
-            .lock()
-            .map_err(|_| PublicationControlError::Store(
+        let mut active = flights.lock().map_err(|_| {
+            PublicationControlError::Store(
                 "rollout fencing single-flight state is poisoned".to_string(),
-            ))?;
+            )
+        })?;
         if !active.insert(fence) {
             return Err(PublicationControlError::Conflict(format!(
                 "rollout fence {fence} resource-fencing attempt is already in progress in this daemon"
@@ -659,9 +656,12 @@ impl PublicationControl {
     ) -> Result<RuntimeSpineAuthority, PublicationControlError> {
         let stored = self.load_required()?;
         self.validate_record(&stored.record)?;
-        if stored.record.active_lease.as_ref().is_some_and(|active| {
-            active.kind == LeaseKind::Rollout
-        }) {
+        if stored
+            .record
+            .active_lease
+            .as_ref()
+            .is_some_and(|active| active.kind == LeaseKind::Rollout)
+        {
             return Ok(RuntimeSpineAuthority::RolloutActive);
         }
         require_complete_record_authority_fence(&stored.record)?;
@@ -816,8 +816,7 @@ impl PublicationControl {
                                 .clone()
                                 .unwrap_or_else(|| target_repositories.clone());
                             if active.target_repositories != target_repositories
-                                || active.previous_repositories
-                                    != retried_previous_repositories
+                                || active.previous_repositories != retried_previous_repositories
                             {
                                 return Err(PublicationControlError::Invalid(
                                     "rollout request_id was reused with different fleet membership"
@@ -843,10 +842,8 @@ impl PublicationControl {
                             previous_repositories, current_repositories
                         )));
                     }
-                    let fence_repositories = repository_union(
-                        &current_repositories,
-                        &target_repositories,
-                    );
+                    let fence_repositories =
+                        repository_union(&current_repositories, &target_repositories);
                     if fence_repositories.len() > MAX_FLEET_REPOSITORIES {
                         return Err(PublicationControlError::Invalid(format!(
                             "fleet transition fence union contains {} entries, above the bounded fleet limit {MAX_FLEET_REPOSITORIES}",
@@ -915,12 +912,8 @@ impl PublicationControl {
         'recapture: for _ in 0..MAX_CAS_ATTEMPTS {
             let stored = self.load_required()?;
             self.validate_record(&stored.record)?;
-            let active = require_lease(
-                &stored.record,
-                &proof,
-                LeaseKind::Rollout,
-                self.clock.now(),
-            )?;
+            let active =
+                require_lease(&stored.record, &proof, LeaseKind::Rollout, self.clock.now())?;
             if active.authority_fenced_at.is_some() {
                 require_complete_authority_fence(active, &active.fence_repositories)?;
                 return Ok(active.clone());
@@ -945,8 +938,7 @@ impl PublicationControl {
                     let capture = self.store.capture_authority(&repositories)?;
                     validate_authority_capture(&capture, &repositories)?;
                     let fencing_token = Uuid::new_v4().to_string();
-                    let claimed =
-                        self.claim_fencing_attempt(&proof, &fencing_token, &capture)?;
+                    let claimed = self.claim_fencing_attempt(&proof, &fencing_token, &capture)?;
                     (fencing_token, capture, claimed.authority_fence)
                 };
 
@@ -958,11 +950,7 @@ impl PublicationControl {
                             PublicationControlError::Conflict(_)
                                 | PublicationControlError::Fenced(_)
                         ) {
-                            self.restart_fencing_capture(
-                                &proof,
-                                &fencing_token,
-                                &repositories,
-                            )?;
+                            self.restart_fencing_capture(&proof, &fencing_token, &repositories)?;
                             continue 'recapture;
                         }
                         return Err(error);
@@ -978,22 +966,14 @@ impl PublicationControl {
                                 | PublicationControlError::Fenced(_)
                         ) =>
                     {
-                        self.restart_fencing_capture(
-                            &proof,
-                            &fencing_token,
-                            &repositories,
-                        )?;
+                        self.restart_fencing_capture(&proof, &fencing_token, &repositories)?;
                         continue 'recapture;
                     }
                     Err(error) => return Err(error),
                 };
                 validate_authority_fence_entry(captured, &fenced)?;
-                let checkpointed = self.checkpoint_fencing_attempt(
-                    &proof,
-                    &fencing_token,
-                    &capture,
-                    fenced,
-                )?;
+                let checkpointed =
+                    self.checkpoint_fencing_attempt(&proof, &fencing_token, &capture, fenced)?;
                 progress = checkpointed.authority_fence;
             }
 
@@ -1011,12 +991,7 @@ impl PublicationControl {
     ) -> Result<ActivePublicationLease, PublicationControlError> {
         let stored = self.load_required()?;
         self.validate_record(&stored.record)?;
-        let active = require_lease(
-            &stored.record,
-            proof,
-            LeaseKind::Rollout,
-            self.clock.now(),
-        )?;
+        let active = require_lease(&stored.record, proof, LeaseKind::Rollout, self.clock.now())?;
         if active.authority_fenced_at.is_some() {
             require_complete_authority_fence(active, &active.fence_repositories)?;
             return Ok(active.clone());
@@ -1043,12 +1018,7 @@ impl PublicationControl {
         self.validate_scope(&proof.scope)?;
         let stored = self.load_required()?;
         self.validate_record(&stored.record)?;
-        let active = require_lease(
-            &stored.record,
-            proof,
-            LeaseKind::Rollout,
-            self.clock.now(),
-        )?;
+        let active = require_lease(&stored.record, proof, LeaseKind::Rollout, self.clock.now())?;
         if active.authority_fenced_at.is_none() {
             if active.authority_fencing_token.is_none() {
                 return Err(PublicationControlError::Fenced(format!(
@@ -1059,10 +1029,8 @@ impl PublicationControl {
             validate_authority_capture(&active.authority_capture, &active.fence_repositories)?;
         }
         validate_authority_fence(&active.authority_fence, &active.fence_repositories)?;
-        let target = authority_fence_for_repositories(
-            &active.authority_fence,
-            &active.target_repositories,
-        )?;
+        let target =
+            authority_fence_for_repositories(&active.authority_fence, &active.target_repositories)?;
         let rows = target
             .into_iter()
             .map(|row| kin_spine::SpineRolloutRepositoryFence {
@@ -1105,12 +1073,8 @@ impl PublicationControl {
         for _ in 0..MAX_CAS_ATTEMPTS {
             let stored = self.load_required()?;
             self.validate_record(&stored.record)?;
-            let active = require_lease(
-                &stored.record,
-                proof,
-                LeaseKind::Rollout,
-                self.clock.now(),
-            )?;
+            let active =
+                require_lease(&stored.record, proof, LeaseKind::Rollout, self.clock.now())?;
             validate_authority_fence(&active.authority_fence, &active.fence_repositories)?;
             match active_spine_rollout_fence_evidence(active)? {
                 Some(current) if current == *evidence => return Ok(active.clone()),
@@ -1129,8 +1093,7 @@ impl PublicationControl {
                 None => {}
             }
             let mut checkpointed = active.clone();
-            checkpointed.spine_rollout_fence_payload_sha256 =
-                Some(evidence.payload_sha256.clone());
+            checkpointed.spine_rollout_fence_payload_sha256 = Some(evidence.payload_sha256.clone());
             checkpointed.spine_rollout_fence_update_time = Some(evidence.update_time.clone());
             let mut record = stored.record;
             record.revision = checked_revision(record.revision)?;
@@ -1155,12 +1118,7 @@ impl PublicationControl {
         self.validate_scope(&proof.scope)?;
         let stored = self.load_required()?;
         self.validate_record(&stored.record)?;
-        let active = require_lease(
-            &stored.record,
-            proof,
-            LeaseKind::Rollout,
-            self.clock.now(),
-        )?;
+        let active = require_lease(&stored.record, proof, LeaseKind::Rollout, self.clock.now())?;
         if active.authority_fenced_at.is_some() {
             require_complete_authority_fence(active, &active.fence_repositories)?;
             active_spine_rollout_fence_evidence(active)?.ok_or_else(|| {
@@ -1187,13 +1145,7 @@ impl PublicationControl {
         self.validate_scope(&proof.scope)?;
         let stored = self.load_required()?;
         self.validate_record(&stored.record)?;
-        Ok(require_lease(
-            &stored.record,
-            proof,
-            LeaseKind::Rollout,
-            self.clock.now(),
-        )?
-        .clone())
+        Ok(require_lease(&stored.record, proof, LeaseKind::Rollout, self.clock.now())?.clone())
     }
 
     pub fn rollout_spine_fence_evidence(
@@ -1230,12 +1182,8 @@ impl PublicationControl {
         for _ in 0..MAX_CAS_ATTEMPTS {
             let stored = self.load_required()?;
             self.validate_record(&stored.record)?;
-            let active = require_lease(
-                &stored.record,
-                proof,
-                LeaseKind::Rollout,
-                self.clock.now(),
-            )?;
+            let active =
+                require_lease(&stored.record, proof, LeaseKind::Rollout, self.clock.now())?;
             if active.authority_fencing_token.as_deref() != Some(fencing_token) {
                 return Err(PublicationControlError::Fenced(format!(
                     "rollout fence {} resource-fencing claim changed before recapture",
@@ -1315,12 +1263,8 @@ impl PublicationControl {
         for _ in 0..MAX_CAS_ATTEMPTS {
             let stored = self.load_required()?;
             self.validate_record(&stored.record)?;
-            let active = require_lease(
-                &stored.record,
-                proof,
-                LeaseKind::Rollout,
-                self.clock.now(),
-            )?;
+            let active =
+                require_lease(&stored.record, proof, LeaseKind::Rollout, self.clock.now())?;
             if active.authority_fenced_at.is_some() {
                 require_complete_authority_fence(active, &active.fence_repositories)?;
                 return Ok(active.clone());
@@ -1352,7 +1296,10 @@ impl PublicationControl {
             })?;
             validate_authority_fence_entry(expected, &fenced)?;
             let mut checkpointed = active.clone();
-            checkpointed.authority_fence.push(fenced);
+            // A CAS loss retries this whole loop, and the next pass still needs
+            // the fence entry to compare and to name in its refusal, so the
+            // push cannot consume it.
+            checkpointed.authority_fence.push(fenced.clone());
             let mut record = stored.record;
             record.revision = checked_revision(record.revision)?;
             record.active_lease = Some(checkpointed.clone());
@@ -1387,10 +1334,7 @@ impl PublicationControl {
                     active.fence
                 )));
             }
-            validate_authority_capture(
-                &active.authority_capture,
-                &active.fence_repositories,
-            )?;
+            validate_authority_capture(&active.authority_capture, &active.fence_repositories)?;
             validate_authority_fence(&active.authority_fence, &active.fence_repositories)?;
             let evidence = active_spine_rollout_fence_evidence(active)?.ok_or_else(|| {
                 PublicationControlError::Fenced(format!(
@@ -1447,12 +1391,7 @@ impl PublicationControl {
             let now = self.clock.now();
             let stored = self.load_required()?;
             self.validate_record(&stored.record)?;
-            let active = require_lease(
-                &stored.record,
-                &request.lease,
-                LeaseKind::Rollout,
-                now,
-            )?;
+            let active = require_lease(&stored.record, &request.lease, LeaseKind::Rollout, now)?;
             let mut renewed = active.clone();
             renewed.expires_at = checked_expiry(now, request.ttl_seconds)?;
             let mut record = stored.record;
@@ -1481,12 +1420,7 @@ impl PublicationControl {
             let now = self.clock.now();
             let stored = self.load_required()?;
             self.validate_record(&stored.record)?;
-            let active = require_lease(
-                &stored.record,
-                &request.lease,
-                LeaseKind::Rollout,
-                now,
-            )?;
+            let active = require_lease(&stored.record, &request.lease, LeaseKind::Rollout, now)?;
             if requested_repositories != active.target_repositories {
                 return Err(PublicationControlError::Invalid(format!(
                     "reader admission fleet {:?} does not equal rollout target {:?}",
@@ -1494,14 +1428,13 @@ impl PublicationControl {
                 )));
             }
             require_complete_authority_fence(active, &active.fence_repositories)?;
-            let active_spine_evidence = active_spine_rollout_fence_evidence(active)?.ok_or_else(
-                || {
+            let active_spine_evidence =
+                active_spine_rollout_fence_evidence(active)?.ok_or_else(|| {
                     PublicationControlError::Admission(format!(
                         "rollout fence {} cannot admit a reader without Firestore spine evidence",
                         active.fence
                     ))
-                },
-            )?;
+                })?;
             let target_authority_fence = authority_fence_for_repositories(
                 &active.authority_fence,
                 &active.target_repositories,
@@ -1522,8 +1455,7 @@ impl PublicationControl {
             record.reader = candidate;
             record.reader_spine_rollout_fence_payload_sha256 =
                 Some(active_spine_evidence.payload_sha256);
-            record.reader_spine_rollout_fence_update_time =
-                Some(active_spine_evidence.update_time);
+            record.reader_spine_rollout_fence_update_time = Some(active_spine_evidence.update_time);
             match self.store.update(&stored.version, &record) {
                 Ok(_) => return Ok(record),
                 Err(error) if error.is_cas_conflict() => continue,
@@ -1562,12 +1494,7 @@ impl PublicationControl {
         {
             return Ok(RolloutReleaseDisposition::CompletedExact);
         }
-        require_lease(
-            &stored.record,
-            proof,
-            LeaseKind::Rollout,
-            self.clock.now(),
-        )?;
+        require_lease(&stored.record, proof, LeaseKind::Rollout, self.clock.now())?;
         Ok(RolloutReleaseDisposition::Active)
     }
 
@@ -1832,8 +1759,7 @@ impl PublicationControl {
                 fence_repositories: active.fence_repositories,
                 authority_fenced_at: active.authority_fenced_at,
                 authority_fence: active.authority_fence,
-                spine_rollout_fence_payload_sha256: active
-                    .spine_rollout_fence_payload_sha256,
+                spine_rollout_fence_payload_sha256: active.spine_rollout_fence_payload_sha256,
                 spine_rollout_fence_update_time: active.spine_rollout_fence_update_time,
             };
             record.last_completed_lease = Some(completed.clone());
@@ -1844,8 +1770,8 @@ impl PublicationControl {
                 });
                 record.completed_rollout_history.push(completed);
                 if record.completed_rollout_history.len() > MAX_COMPLETED_ROLLOUT_HISTORY {
-                    let excess = record.completed_rollout_history.len()
-                        - MAX_COMPLETED_ROLLOUT_HISTORY;
+                    let excess =
+                        record.completed_rollout_history.len() - MAX_COMPLETED_ROLLOUT_HISTORY;
                     record.completed_rollout_history.drain(..excess);
                 }
             }
@@ -1860,9 +1786,7 @@ impl PublicationControl {
         ))
     }
 
-    fn load_required(
-        &self,
-    ) -> Result<StoredPublicationControlRecord, PublicationControlError> {
+    fn load_required(&self) -> Result<StoredPublicationControlRecord, PublicationControlError> {
         self.store
             .load()?
             .ok_or_else(|| PublicationControlError::Missing(self.scope.clone()))
@@ -1935,8 +1859,7 @@ impl PublicationControl {
             }
             None if record.last_authority_fence.is_empty()
                 && record.active_lease.as_ref().is_some_and(|active| {
-                    active.kind == LeaseKind::Rollout
-                        && active.authority_fenced_at.is_none()
+                    active.kind == LeaseKind::Rollout && active.authority_fenced_at.is_none()
                 }) => {}
             None if !record.last_authority_fence.is_empty() => {
                 return Err(PublicationControlError::Admission(
@@ -2010,12 +1933,8 @@ impl PublicationControl {
                                     .to_string(),
                             ));
                         }
-                        require_complete_authority_fence(
-                            active,
-                            &active.fence_repositories,
-                        )?;
-                        let active_spine_evidence =
-                            active_spine_rollout_fence_evidence(active)?;
+                        require_complete_authority_fence(active, &active.fence_repositories)?;
+                        let active_spine_evidence = active_spine_rollout_fence_evidence(active)?;
                         let target_authority_fence = authority_fence_for_repositories(
                             &active.authority_fence,
                             &active.target_repositories,
@@ -2161,8 +2080,7 @@ impl PublicationControl {
         if let Some(latest) = record.completed_rollout_history.last() {
             if record.last_completed_rollout.as_ref() != Some(latest) {
                 return Err(PublicationControlError::Admission(
-                    "completed rollout history does not end at last_completed_rollout"
-                        .to_string(),
+                    "completed rollout history does not end at last_completed_rollout".to_string(),
                 ));
             }
         }
@@ -2272,9 +2190,7 @@ fn completed_lease_matches(
     completed.kind == kind && completed.token == proof.token && completed.fence == proof.fence
 }
 
-fn canonical_repositories(
-    repositories: &[String],
-) -> Result<Vec<String>, PublicationControlError> {
+fn canonical_repositories(repositories: &[String]) -> Result<Vec<String>, PublicationControlError> {
     if repositories.is_empty() {
         return Err(PublicationControlError::Invalid(
             "fleet repositories must not be empty".to_string(),
@@ -2374,9 +2290,9 @@ fn authority_fence_for_repositories(
 fn validate_repo_id(repo_id: &str) -> Result<(), PublicationControlError> {
     if repo_id.is_empty()
         || repo_id.len() > 128
-        || !repo_id.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-        })
+        || !repo_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
     {
         return Err(PublicationControlError::Invalid(format!(
             "repo_id {repo_id:?} must contain 1 through 128 ASCII letters, digits, '.', '-', or '_'"
@@ -2614,8 +2530,7 @@ fn record_spine_rollout_fence_evidence(
                 && active.authority_fenced_at.is_some()
                 && active.spine_rollout_fence_payload_sha256
                     == record.spine_rollout_fence_payload_sha256
-                && active.spine_rollout_fence_update_time
-                    == record.spine_rollout_fence_update_time
+                && active.spine_rollout_fence_update_time == record.spine_rollout_fence_update_time
         })
         .map(|active| active.fence)
         .or_else(|| {
@@ -2822,9 +2737,9 @@ fn checked_expiry(
 }
 
 fn checked_revision(revision: u64) -> Result<u64, PublicationControlError> {
-    revision.checked_add(1).ok_or_else(|| {
-        PublicationControlError::Fenced("record revision exhausted u64".to_string())
-    })
+    revision
+        .checked_add(1)
+        .ok_or_else(|| PublicationControlError::Fenced("record revision exhausted u64".to_string()))
 }
 
 fn validate_identifier(name: &str, value: &str) -> Result<(), PublicationControlError> {
@@ -2968,12 +2883,9 @@ impl PublicationGatedStorageBackend {
         snapshot_schema: u32,
         operation: impl FnOnce(&dyn StorageBackend) -> Result<T, KinDbError>,
     ) -> Result<T, KinDbError> {
-        let mut guard = StoragePublicationGuard::acquire(
-            Arc::clone(&self.control),
-            repo_id,
-            snapshot_schema,
-        )
-        .map_err(as_storage_error)?;
+        let mut guard =
+            StoragePublicationGuard::acquire(Arc::clone(&self.control), repo_id, snapshot_schema)
+                .map_err(as_storage_error)?;
         guard.renew_and_assert().map_err(as_storage_error)?;
         let fence = guard.lease().fence;
         let outcome = operation(self.inner.as_ref());
@@ -3095,10 +3007,7 @@ impl StorageBackend for PublicationGatedStorageBackend {
         self.inner.load_snapshot_authority(repo_id)
     }
 
-    fn load_recovery_state(
-        &self,
-        repo_id: &str,
-    ) -> Result<SnapshotRecoveryState, KinDbError> {
+    fn load_recovery_state(&self, repo_id: &str) -> Result<SnapshotRecoveryState, KinDbError> {
         self.inner.load_recovery_state(repo_id)
     }
 
@@ -3129,11 +3038,7 @@ impl StorageBackend for PublicationGatedStorageBackend {
             .load_source_blob_bounded(repo_id, digest, max_bytes)
     }
 
-    fn source_blob_len(
-        &self,
-        repo_id: &str,
-        digest: [u8; 32],
-    ) -> Result<Option<u64>, KinDbError> {
+    fn source_blob_len(&self, repo_id: &str, digest: [u8; 32]) -> Result<Option<u64>, KinDbError> {
         self.inner.source_blob_len(repo_id, digest)
     }
 
@@ -3176,12 +3081,7 @@ impl StorageBackend for PublicationGatedStorageBackend {
             Err(error) => return SnapshotSaveOutcome::NotCommitted(error),
         };
         self.with_classified_publication(repo_id, snapshot_schema, |inner| {
-            inner.save_snapshot_validated(
-                repo_id,
-                data,
-                expected_cursor,
-                history_validator_version,
-            )
+            inner.save_snapshot_validated(repo_id, data, expected_cursor, history_validator_version)
         })
     }
 
@@ -3211,20 +3111,11 @@ impl StorageBackend for PublicationGatedStorageBackend {
         )))
     }
 
-    fn save_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-        data: &[u8],
-    ) -> Result<(), KinDbError> {
+    fn save_overlay(&self, repo_id: &str, session_id: &str, data: &[u8]) -> Result<(), KinDbError> {
         self.inner.save_overlay(repo_id, session_id, data)
     }
 
-    fn load_overlay(
-        &self,
-        repo_id: &str,
-        session_id: &str,
-    ) -> Result<Option<Vec<u8>>, KinDbError> {
+    fn load_overlay(&self, repo_id: &str, session_id: &str) -> Result<Option<Vec<u8>>, KinDbError> {
         self.inner.load_overlay(repo_id, session_id)
     }
 
@@ -3253,9 +3144,7 @@ pub struct InMemoryPublicationControlStore {
 }
 
 impl PublicationControlStore for InMemoryPublicationControlStore {
-    fn load(
-        &self,
-    ) -> Result<Option<StoredPublicationControlRecord>, PublicationControlError> {
+    fn load(&self) -> Result<Option<StoredPublicationControlRecord>, PublicationControlError> {
         let state = self
             .state
             .lock()
@@ -3316,9 +3205,10 @@ impl PublicationControlStore for InMemoryPublicationControlStore {
         &self,
         repositories: &[String],
     ) -> Result<Vec<RepositoryAuthorityCapture>, PublicationControlError> {
-        let mut authority = self.authority.lock().map_err(|_| {
-            PublicationControlError::Store("memory authority poisoned".to_string())
-        })?;
+        let mut authority = self
+            .authority
+            .lock()
+            .map_err(|_| PublicationControlError::Store("memory authority poisoned".to_string()))?;
         let mut captured = Vec::with_capacity(repositories.len());
         for repo_id in repositories {
             #[cfg(test)]
@@ -3452,9 +3342,10 @@ impl PublicationControlStore for InMemoryPublicationControlStore {
         fence: &RepositoryAuthorityFence,
     ) -> Result<(), PublicationControlError> {
         validate_authority_fence_entry(capture, fence)?;
-        let authority = self.authority.lock().map_err(|_| {
-            PublicationControlError::Store("memory authority poisoned".to_string())
-        })?;
+        let authority = self
+            .authority
+            .lock()
+            .map_err(|_| PublicationControlError::Store("memory authority poisoned".to_string()))?;
         let current = authority.get(&capture.repo_id).ok_or_else(|| {
             PublicationControlError::Conflict(format!(
                 "repo {} authority disappeared after checkpoint",
@@ -3596,10 +3487,7 @@ mod object_store_control {
             let path = if prefix.is_empty() {
                 ObjectPath::from(".kin-graph-publication-control.json")
             } else {
-                ObjectPath::from(format!(
-                    "{}/.kin-graph-publication-control.json",
-                    prefix
-                ))
+                ObjectPath::from(format!("{}/.kin-graph-publication-control.json", prefix))
             };
             Self {
                 store,
@@ -3776,13 +3664,11 @@ mod object_store_control {
                     "{authority} snapshot body length overflows"
                 ))
             })?;
-            let checksum_end = body_end
-                .checked_add(SNAPSHOT_CHECKSUM_LEN)
-                .ok_or_else(|| {
-                    PublicationControlError::Admission(format!(
-                        "{authority} snapshot body length overflows"
-                    ))
-                })?;
+            let checksum_end = body_end.checked_add(SNAPSHOT_CHECKSUM_LEN).ok_or_else(|| {
+                PublicationControlError::Admission(format!(
+                    "{authority} snapshot body length overflows"
+                ))
+            })?;
             let trailer_end = checksum_end
                 .checked_add(ROOT_HASH_TRAILER_LEN)
                 .ok_or_else(|| {
@@ -3796,7 +3682,8 @@ mod object_store_control {
                     payload.len()
                 )));
             }
-            let body_digest: [u8; 32] = Sha256::digest(&payload[SNAPSHOT_HEADER_LEN..body_end]).into();
+            let body_digest: [u8; 32] =
+                Sha256::digest(&payload[SNAPSHOT_HEADER_LEN..body_end]).into();
             if payload[body_end..checksum_end] != body_digest {
                 return Err(PublicationControlError::Admission(format!(
                     "{authority} snapshot body checksum does not match"
@@ -3880,14 +3767,16 @@ mod object_store_control {
             capture: &RepositoryAuthorityCapture,
         ) -> Result<RepositoryAuthorityFence, PublicationControlError> {
             let path = self.snapshot_path(&capture.repo_id);
-            let current = self.block_on(self.store.get(&path)).map_err(|error| match error {
-                object_store::Error::NotFound { .. } => PublicationControlError::Conflict(
-                    format!("graph authority {path} disappeared after fleet capture"),
-                ),
-                other => PublicationControlError::Store(format!(
-                    "re-read graph authority {path} for fencing: {other}"
-                )),
-            })?;
+            let current = self
+                .block_on(self.store.get(&path))
+                .map_err(|error| match error {
+                    object_store::Error::NotFound { .. } => PublicationControlError::Conflict(
+                        format!("graph authority {path} disappeared after fleet capture"),
+                    ),
+                    other => PublicationControlError::Store(format!(
+                        "re-read graph authority {path} for fencing: {other}"
+                    )),
+                })?;
             if current.meta.size > self.max_authority_fence_object_bytes {
                 return Err(PublicationControlError::Admission(format!(
                     "graph authority {path} grew to {} bytes, above the bounded in-memory fencing limit {}",
@@ -3921,9 +3810,7 @@ mod object_store_control {
                     "graph authority {path} bytes changed after the complete fleet capture"
                 )));
             }
-            if current_generation != capture.generation
-                || current_version.e_tag != capture.e_tag
-            {
+            if current_generation != capture.generation || current_version.e_tag != capture.e_tag {
                 return Err(PublicationControlError::Conflict(format!(
                     "graph authority {path} version changed after the complete fleet capture; reread every repository and conditionally rewrite the new exact generation"
                 )));
@@ -4005,9 +3892,7 @@ mod object_store_control {
     }
 
     impl PublicationControlStore for ObjectStorePublicationControlStore {
-        fn load(
-            &self,
-        ) -> Result<Option<StoredPublicationControlRecord>, PublicationControlError> {
+        fn load(&self) -> Result<Option<StoredPublicationControlRecord>, PublicationControlError> {
             let result = match self.block_on(self.store.get(&self.path)) {
                 Ok(result) => result,
                 Err(object_store::Error::NotFound { .. }) => return Ok(None),
@@ -4285,9 +4170,7 @@ mod tests {
                     .await?;
                 let generation = state.next_generation;
                 state.next_generation += 1;
-                state
-                    .generations
-                    .insert(location.to_string(), generation);
+                state.generations.insert(location.to_string(), generation);
             }
 
             if let PutMode::Update(update) = &opts.mode {
@@ -4308,9 +4191,7 @@ mod tests {
             let mut result = self.inner.put_opts(location, payload, opts).await?;
             let generation = state.next_generation;
             state.next_generation += 1;
-            state
-                .generations
-                .insert(location.to_string(), generation);
+            state.generations.insert(location.to_string(), generation);
             result.version = Some(generation.to_string());
             Ok(result)
         }
@@ -4567,12 +4448,7 @@ mod tests {
         let store = Arc::new(InMemoryPublicationControlStore::default());
         let clock = Arc::new(ManualClock::new());
         let repositories = staging_fleet();
-        let control = control_for_fleet(
-            Arc::clone(&store),
-            clock,
-            READER_A,
-            repositories.clone(),
-        );
+        let control = control_for_fleet(Arc::clone(&store), clock, READER_A, repositories.clone());
 
         let pending = control
             .bootstrap_runtime_if_absent()
@@ -4597,9 +4473,10 @@ mod tests {
             kin_db::GraphSnapshot::CURRENT_VERSION
         );
         assert_eq!(record.last_authority_fence.len(), repositories.len());
-        assert!(record.last_authority_fence.iter().all(|entry| {
-            entry.pre_fence_generation == 1 && entry.fenced_generation == 2
-        }));
+        assert!(record
+            .last_authority_fence
+            .iter()
+            .all(|entry| { entry.pre_fence_generation == 1 && entry.fenced_generation == 2 }));
         control
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap();
@@ -4608,10 +4485,7 @@ mod tests {
         let unchanged = control.status().unwrap();
         assert_eq!(unchanged.revision, record.revision);
         assert_eq!(unchanged.last_fence, record.last_fence);
-        assert_eq!(
-            unchanged.last_authority_fence,
-            record.last_authority_fence
-        );
+        assert_eq!(unchanged.last_authority_fence, record.last_authority_fence);
     }
 
     #[test]
@@ -4619,12 +4493,7 @@ mod tests {
         let store = Arc::new(InMemoryPublicationControlStore::default());
         let clock = Arc::new(ManualClock::new());
         let repositories = staging_fleet();
-        let control = control_for_fleet(
-            Arc::clone(&store),
-            clock,
-            READER_A,
-            repositories.clone(),
-        );
+        let control = control_for_fleet(Arc::clone(&store), clock, READER_A, repositories.clone());
         store.fail_fence_on(Some("kin-vfs"));
 
         let failed = control.bootstrap_runtime_if_absent().unwrap_err();
@@ -4679,9 +4548,8 @@ mod tests {
             };
             let crashed_control = Arc::clone(&control);
             let crashed_request = request.clone();
-            let crashed = std::thread::spawn(move || {
-                crashed_control.acquire_rollout(crashed_request)
-            });
+            let crashed =
+                std::thread::spawn(move || crashed_control.acquire_rollout(crashed_request));
             assert!(
                 crashed.join().is_err(),
                 "the injected process death after row {crash_after} must unwind"
@@ -4745,8 +4613,7 @@ mod tests {
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap_err();
         assert!(
-            refusal.to_string().contains(READER_A)
-                && refusal.to_string().contains(READER_B),
+            refusal.to_string().contains(READER_A) && refusal.to_string().contains(READER_B),
             "{refusal}"
         );
     }
@@ -4757,11 +4624,7 @@ mod tests {
         let clock = Arc::new(ManualClock::new());
         let control = control(Arc::clone(&store), clock, READER_A);
         let gate = store.block_next_fence();
-        let request = rollout_request(
-            "deploy",
-            "same-request",
-            Some(reader(READER_A, 300)),
-        );
+        let request = rollout_request("deploy", "same-request", Some(reader(READER_A, 300)));
         let first_control = Arc::clone(&control);
         let first_request = request.clone();
         let first = std::thread::spawn(move || first_control.acquire_rollout(first_request));
@@ -4802,11 +4665,7 @@ mod tests {
         let first = std::thread::spawn(move || {
             first_control.acquire_rollout(AcquireRolloutLeaseRequest {
                 ttl_seconds: 1,
-                ..rollout_request(
-                    "deploy-one",
-                    "paused-fencer",
-                    Some(reader(READER_A, 300)),
-                )
+                ..rollout_request("deploy-one", "paused-fencer", Some(reader(READER_A, 300)))
             })
         });
 
@@ -4848,24 +4707,26 @@ mod tests {
     fn missing_malformed_and_stale_reader_identity_fail_closed() {
         let store = Arc::new(InMemoryPublicationControlStore::default());
         let clock = Arc::new(ManualClock::new());
-        let control = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
+        // Named `primary` rather than `control`: the module helper that builds
+        // a control is also called `control`, and a local binding of that name
+        // shadows it for the rest of the block, so the second construction
+        // below would try to call an `Arc<PublicationControl>`.
+        let primary = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
 
         assert!(matches!(
-            control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION),
+            primary.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION),
             Err(PublicationControlError::Missing(_))
         ));
         assert!(matches!(
-            control.acquire_rollout(rollout_request("deploy", "first", None)),
+            primary.acquire_rollout(rollout_request("deploy", "first", None)),
             Err(PublicationControlError::Missing(_))
         ));
-        let malformed = PublicationControl::with_clock(
-            SCOPE,
-            "latest",
-            fleet(),
-            store.clone(),
-            clock.clone(),
-        );
-        assert!(matches!(malformed, Err(PublicationControlError::Invalid(_))));
+        let malformed =
+            PublicationControl::with_clock(SCOPE, "latest", fleet(), store.clone(), clock.clone());
+        assert!(matches!(
+            malformed,
+            Err(PublicationControlError::Invalid(_))
+        ));
 
         let malformed_store = Arc::new(InMemoryPublicationControlStore::default());
         let malformed_record = PublicationControlRecord {
@@ -4893,19 +4754,19 @@ mod tests {
             Err(PublicationControlError::Admission(_))
         ));
 
-        let lease = control
+        let lease = primary
             .acquire_rollout(rollout_request(
                 "deploy",
                 "bootstrap",
                 Some(reader(READER_A, 10)),
             ))
             .unwrap();
-        release(&control, &lease);
-        control
+        release(&primary, &lease);
+        primary
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap();
         clock.advance(11);
-        let stale = control
+        let stale = primary
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap_err();
         assert!(
@@ -5131,7 +4992,10 @@ mod tests {
         let retry = control
             .release_rollout(ReleaseRolloutLeaseRequest { lease: first_proof })
             .unwrap();
-        assert_eq!(retry.last_completed_rollout.as_ref().unwrap().fence, second.fence);
+        assert_eq!(
+            retry.last_completed_rollout.as_ref().unwrap().fence,
+            second.fence
+        );
         assert!(retry
             .completed_rollout_history
             .iter()
@@ -5150,11 +5014,7 @@ mod tests {
         let first = control
             .acquire_rollout(AcquireRolloutLeaseRequest {
                 ttl_seconds: 1,
-                ..rollout_request(
-                    "deploy-one",
-                    "crashed",
-                    Some(reader(READER_A, 300)),
-                )
+                ..rollout_request("deploy-one", "crashed", Some(reader(READER_A, 300)))
             })
             .unwrap();
         clock.advance(2);
@@ -5249,7 +5109,9 @@ mod tests {
             "classified refusal must not call the inner backend"
         );
 
-        let malformed = writer.save_snapshot("kin", b"not-a-snapshot", 0).unwrap_err();
+        let malformed = writer
+            .save_snapshot("kin", b"not-a-snapshot", 0)
+            .unwrap_err();
         assert!(malformed.to_string().contains("KNDB"), "{malformed}");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
@@ -5267,18 +5129,12 @@ mod tests {
             ))
             .unwrap();
         release(&control, &bootstrap);
-        let writer = PublicationGatedStorageBackend::new(
-            Box::new(NoopBackend::default()),
-            control,
-        );
+        let writer = PublicationGatedStorageBackend::new(Box::new(NoopBackend::default()), control);
 
         let delta = writer.save_delta("kin", b"delta", 1).unwrap_err();
         assert!(delta.to_string().contains("full graph.kndb"), "{delta}");
         let cleanup = writer.clear_deltas("kin").unwrap_err();
-        assert!(
-            cleanup.to_string().contains("full graph.kndb"),
-            "{cleanup}"
-        );
+        assert!(cleanup.to_string().contains("full graph.kndb"), "{cleanup}");
     }
 
     #[test]
@@ -5312,11 +5168,7 @@ mod tests {
         );
 
         let control = control(store, clock, READER_A);
-        let mut duplicate = rollout_request(
-            "deploy",
-            "duplicate",
-            Some(reader(READER_A, 300)),
-        );
+        let mut duplicate = rollout_request("deploy", "duplicate", Some(reader(READER_A, 300)));
         duplicate.repositories.push("kin".to_string());
         assert!(matches!(
             control.acquire_rollout(duplicate),
@@ -5360,12 +5212,7 @@ mod tests {
             "kinlab".to_string(),
         ])
         .unwrap();
-        let candidate = control_for_fleet(
-            Arc::clone(&store),
-            clock,
-            READER_A,
-            target_repositories,
-        );
+        let candidate = control_for_fleet(Arc::clone(&store), clock, READER_A, target_repositories);
         let before = candidate.status().unwrap();
 
         assert!(candidate.bootstrap_runtime_if_absent().unwrap().is_none());
@@ -5375,7 +5222,10 @@ mod tests {
         let mismatch = candidate
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap_err();
-        assert!(mismatch.to_string().contains("configured fleet"), "{mismatch}");
+        assert!(
+            mismatch.to_string().contains("configured fleet"),
+            "{mismatch}"
+        );
     }
 
     #[test]
@@ -5419,7 +5269,10 @@ mod tests {
         let mismatch = candidate
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap_err();
-        assert!(mismatch.to_string().contains("configured fleet"), "{mismatch}");
+        assert!(
+            mismatch.to_string().contains("configured fleet"),
+            "{mismatch}"
+        );
 
         let base_request = rollout_request_for_fleet(
             target_repositories.clone(),
@@ -5427,18 +5280,15 @@ mod tests {
             "five-repo-transition",
             None,
         );
-        let missing_previous = candidate
-            .acquire_rollout(base_request.clone())
-            .unwrap_err();
+        let missing_previous = candidate.acquire_rollout(base_request.clone()).unwrap_err();
         assert!(
-            missing_previous.to_string().contains("previous_repositories"),
+            missing_previous
+                .to_string()
+                .contains("previous_repositories"),
             "{missing_previous}"
         );
         let mut duplicate_previous = base_request.clone();
-        duplicate_previous.previous_repositories = Some(vec![
-            "kin".to_string(),
-            "kin".to_string(),
-        ]);
+        duplicate_previous.previous_repositories = Some(vec!["kin".to_string(), "kin".to_string()]);
         assert!(matches!(
             candidate.acquire_rollout(duplicate_previous),
             Err(PublicationControlError::Invalid(_))
@@ -5492,7 +5342,9 @@ mod tests {
             )
             .unwrap_err();
         assert!(
-            paused_removed_writer.to_string().contains("expected generation"),
+            paused_removed_writer
+                .to_string()
+                .contains("expected generation"),
             "{paused_removed_writer}"
         );
 
@@ -5536,12 +5388,7 @@ mod tests {
         release(&old, &old_bootstrap);
         let before = old.status().unwrap();
 
-        let candidate = control_for_fleet(
-            Arc::clone(&store),
-            clock,
-            READER_A,
-            target.clone(),
-        );
+        let candidate = control_for_fleet(Arc::clone(&store), clock, READER_A, target.clone());
         let refused = candidate
             .acquire_rollout(AcquireRolloutLeaseRequest {
                 scope: SCOPE.to_string(),
@@ -5566,12 +5413,7 @@ mod tests {
         let store = Arc::new(InMemoryPublicationControlStore::default());
         let clock = Arc::new(ManualClock::new());
         let repositories = staging_fleet();
-        let control = control_for_fleet(
-            Arc::clone(&store),
-            clock,
-            READER_A,
-            repositories.clone(),
-        );
+        let control = control_for_fleet(Arc::clone(&store), clock, READER_A, repositories.clone());
         store.mark_authority_missing(Some("kin-editor"));
         let request = rollout_request_for_fleet(
             repositories.clone(),
@@ -5668,12 +5510,7 @@ mod tests {
         let store = Arc::new(InMemoryPublicationControlStore::default());
         let clock = Arc::new(ManualClock::new());
         let repositories = staging_fleet();
-        let control = control_for_fleet(
-            Arc::clone(&store),
-            clock,
-            READER_A,
-            repositories.clone(),
-        );
+        let control = control_for_fleet(Arc::clone(&store), clock, READER_A, repositories.clone());
         store.fail_fence_on(Some("kin-vfs"));
         let request = rollout_request_for_fleet(
             repositories.clone(),
@@ -5911,13 +5748,8 @@ mod tests {
             expected_cursor: SnapshotCursor,
             history_validator_version: Option<u32>,
         ) -> SnapshotSaveOutcome {
-            *self.last_history_validator_version.lock().unwrap() =
-                Some(history_validator_version);
-            match self.save_snapshot(
-                repo_id,
-                data,
-                expected_cursor.backend_generation(),
-            ) {
+            *self.last_history_validator_version.lock().unwrap() = Some(history_validator_version);
+            match self.save_snapshot(repo_id, data, expected_cursor.backend_generation()) {
                 Ok(generation) => SnapshotSaveOutcome::Committed {
                     cursor: SnapshotCursor::from_backend_generation(generation),
                 },
@@ -6183,7 +6015,10 @@ mod tests {
             )
             .await
             .unwrap();
-        for repo_id in repositories.iter().filter(|repo_id| repo_id.as_str() != "kin") {
+        for repo_id in repositories
+            .iter()
+            .filter(|repo_id| repo_id.as_str() != "kin")
+        {
             raw.put_opts(
                 &ObjectPath::from(format!("fixture/{repo_id}/graph.kndb")),
                 PutPayload::from(current_authority.clone()),
@@ -6195,25 +6030,15 @@ mod tests {
             .await
             .unwrap();
         }
-        let original_generation = original
-            .version
-            .as_deref()
-            .unwrap()
-            .parse::<u64>()
-            .unwrap();
+        let original_generation = original.version.as_deref().unwrap().parse::<u64>().unwrap();
         let future_schema = kin_db::GraphSnapshot::CURRENT_VERSION + 1;
         raw.inject_writer_winner(&kin_path, wrapped_snapshot(future_schema));
 
         let control_store: Arc<dyn PublicationControlStore> = Arc::new(
             ObjectStorePublicationControlStore::new(object_store, "fixture"),
         );
-        let control = PublicationControl::new(
-            SCOPE,
-            READER_A,
-            repositories.clone(),
-            control_store,
-        )
-        .unwrap();
+        let control =
+            PublicationControl::new(SCOPE, READER_A, repositories.clone(), control_store).unwrap();
         let request = rollout_request_for_fleet(
             repositories.clone(),
             "deploy",
@@ -6298,13 +6123,8 @@ mod tests {
         let control_store: Arc<dyn PublicationControlStore> = Arc::new(
             ObjectStorePublicationControlStore::new(object_store, "fixture"),
         );
-        let control = PublicationControl::new(
-            SCOPE,
-            READER_A,
-            repositories.clone(),
-            control_store,
-        )
-        .unwrap();
+        let control =
+            PublicationControl::new(SCOPE, READER_A, repositories.clone(), control_store).unwrap();
         let request = rollout_request_for_fleet(
             repositories.clone(),
             "deploy",
@@ -6368,21 +6188,14 @@ mod tests {
             .unwrap();
         }
 
-        let concrete = Arc::new(
-            ObjectStorePublicationControlStore::with_fence_memory_limit(
-                object_store,
-                "fixture",
-                per_object_limit,
-            ),
-        );
+        let concrete = Arc::new(ObjectStorePublicationControlStore::with_fence_memory_limit(
+            object_store,
+            "fixture",
+            per_object_limit,
+        ));
         let control_store: Arc<dyn PublicationControlStore> = concrete.clone();
-        let control = PublicationControl::new(
-            SCOPE,
-            READER_A,
-            repositories.clone(),
-            control_store,
-        )
-        .unwrap();
+        let control =
+            PublicationControl::new(SCOPE, READER_A, repositories.clone(), control_store).unwrap();
         let rollout = control
             .acquire_rollout(rollout_request_for_fleet(
                 repositories,
@@ -6424,21 +6237,14 @@ mod tests {
             before.insert(repo_id.clone(), result.version);
         }
 
-        let concrete = Arc::new(
-            ObjectStorePublicationControlStore::with_fence_memory_limit(
-                object_store,
-                "fixture",
-                limit,
-            ),
-        );
+        let concrete = Arc::new(ObjectStorePublicationControlStore::with_fence_memory_limit(
+            object_store,
+            "fixture",
+            limit,
+        ));
         let control_store: Arc<dyn PublicationControlStore> = concrete;
-        let control = PublicationControl::new(
-            SCOPE,
-            READER_A,
-            repositories.clone(),
-            control_store,
-        )
-        .unwrap();
+        let control =
+            PublicationControl::new(SCOPE, READER_A, repositories.clone(), control_store).unwrap();
         let refused = control
             .acquire_rollout(rollout_request_for_fleet(
                 repositories.clone(),
@@ -6448,7 +6254,9 @@ mod tests {
             ))
             .unwrap_err();
         assert!(
-            refused.to_string().contains("bounded in-memory fencing limit"),
+            refused
+                .to_string()
+                .contains("bounded in-memory fencing limit"),
             "{refused}"
         );
         let active = control.status().unwrap().active_lease.unwrap();
@@ -6475,11 +6283,8 @@ mod tests {
             .put(&path, PutPayload::from(vec![b'x'; 33]))
             .await
             .unwrap();
-        let control = ObjectStorePublicationControlStore::with_control_record_limit(
-            raw_store,
-            "fixture",
-            32,
-        );
+        let control =
+            ObjectStorePublicationControlStore::with_control_record_limit(raw_store, "fixture", 32);
         let refused = control.load().unwrap_err();
         assert!(
             refused
@@ -6507,7 +6312,9 @@ mod tests {
                 Some(reader(READER_A, 300)),
             ))
             .unwrap();
-        let refused = bounded_writer.create(&logical.status().unwrap()).unwrap_err();
+        let refused = bounded_writer
+            .create(&logical.status().unwrap())
+            .unwrap_err();
         assert!(
             refused
                 .to_string()
@@ -6536,11 +6343,7 @@ mod tests {
             ObjectStorePublicationControlStore::new(Arc::clone(&raw_store), "fixture"),
         );
         let logical_store = Arc::new(InMemoryPublicationControlStore::default());
-        let logical = control(
-            logical_store,
-            Arc::new(ManualClock::new()),
-            READER_A,
-        );
+        let logical = control(logical_store, Arc::new(ManualClock::new()), READER_A);
         let lease = logical
             .acquire_rollout(rollout_request(
                 "deploy-one",

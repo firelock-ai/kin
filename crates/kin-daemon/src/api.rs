@@ -1358,8 +1358,7 @@ async fn daemon_activity(
 
 fn is_publication_control_route(path: &str) -> bool {
     let path = path.strip_prefix("/v2").unwrap_or(path);
-    path == "/authority/publication-control"
-        || path.starts_with("/authority/publication-control/")
+    path == "/authority/publication-control" || path.starts_with("/authority/publication-control/")
 }
 
 fn is_process_liveness_route(path: &str) -> bool {
@@ -1383,8 +1382,7 @@ async fn hosted_reader_admission(
         return next.run(request).await;
     }
     if let Some(control) = state.publication_control.as_ref() {
-        if let Err(error) =
-            control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+        if let Err(error) = control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
         {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1913,17 +1911,16 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     router_with_auth_and_shutdown(state, auth_token, None)
 }
 
+/// Build a router whose publication-control routes carry their own separate
+/// token. Production wires that token through `router_with_auth_and_shutdown`,
+/// so only the direct route tests reach for this shape.
+#[cfg(test)]
 fn router_with_publication_control_auth(
     state: Arc<DaemonState>,
     auth_token: Option<String>,
     publication_control_auth_token: Option<String>,
 ) -> Router {
-    router_with_auth_and_shutdown_internal(
-        state,
-        auth_token,
-        publication_control_auth_token,
-        None,
-    )
+    router_with_auth_and_shutdown_internal(state, auth_token, publication_control_auth_token, None)
 }
 
 fn router_with_auth_and_shutdown(
@@ -2943,7 +2940,9 @@ where
             state.spine_unavailable_reason(),
         ));
     }
-    let spine = spine_authority.as_ref().map(|authority| authority.backend());
+    let spine = spine_authority
+        .as_ref()
+        .map(|authority| authority.backend());
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
             settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
@@ -3008,11 +3007,11 @@ where
     }
     let spine_authority = state.acquire_spine_read_authority().await;
     if state.hosted_spine_readiness_required() && spine_authority.is_none() {
-        return Err(kin_mcp::McpError::Other(
-            state.spine_unavailable_reason(),
-        ));
+        return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
     }
-    let spine = spine_authority.as_ref().map(|authority| authority.backend());
+    let spine = spine_authority
+        .as_ref()
+        .map(|authority| authority.backend());
     let repository_authority = mcp_repository_authority_source(state)?;
     let mut superseded = None;
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
@@ -3168,11 +3167,11 @@ where
 {
     let spine_authority = state.acquire_spine_read_authority().await;
     if state.hosted_spine_readiness_required() && spine_authority.is_none() {
-        return Err(kin_mcp::McpError::Other(
-            state.spine_unavailable_reason(),
-        ));
+        return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
     }
-    let spine = spine_authority.as_ref().map(|authority| authority.backend());
+    let spine = spine_authority
+        .as_ref()
+        .map(|authority| authority.backend());
     let mut superseded = None;
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
@@ -23182,9 +23181,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let initialized = kin_core::init(repo.path()).unwrap();
         let backend_root = tempfile::tempdir().unwrap();
-        let store = Arc::new(
-            crate::publication_lease::InMemoryPublicationControlStore::default(),
-        );
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
         let control = Arc::new(
             crate::publication_lease::PublicationControl::new(
                 SCOPE,
@@ -23265,12 +23262,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_health.status(), StatusCode::OK);
-        let missing_health_body =
-            axum::body::to_bytes(missing_health.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-        let missing_health: HealthResponse =
-            serde_json::from_slice(&missing_health_body).unwrap();
+        let missing_health_body = axum::body::to_bytes(missing_health.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let missing_health: HealthResponse = serde_json::from_slice(&missing_health_body).unwrap();
         assert!(!missing_health.reader_admitted);
         assert_eq!(missing_health.status, "attention");
         let missing_readiness = app
@@ -23308,8 +23303,7 @@ mod tests {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         assert!(
-            first_error.contains("GOOGLE_CLOUD_PROJECT")
-                || first_error.contains("durable spine"),
+            first_error.contains("GOOGLE_CLOUD_PROJECT") || first_error.contains("durable spine"),
             "the production route must name its missing durable authority: {lease}"
         );
         let (retry_status, retry) = publication_post(
@@ -23342,8 +23336,7 @@ mod tests {
             "read-only publication status must not disclose live lease capability: {status_text}"
         );
 
-        let (blocked_status, blocked_body) =
-            publication_spine_ingest(app.clone(), "kin").await;
+        let (blocked_status, blocked_body) = publication_spine_ingest(app.clone(), "kin").await;
         assert_eq!(blocked_status, StatusCode::SERVICE_UNAVAILABLE);
         let blocked_body = String::from_utf8_lossy(&blocked_body);
         assert!(blocked_body.contains("rollout fence"), "{blocked_body}");

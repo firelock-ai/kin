@@ -20,10 +20,10 @@ use kin_model::{
     RepositoryId, ResolvedTree, SemanticChange, SemanticChangeId, TransactionDelta, TreeEntry,
     WorkspaceId,
 };
-#[cfg(feature = "firestore")]
-use kin_spine::SpineBackend as _;
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
+#[cfg(feature = "firestore")]
+use kin_spine::SpineBackend as _;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -1347,7 +1347,8 @@ impl HostedPublicationGuard {
     }
 
     fn release(&mut self) -> Result<()> {
-        let (Some(control), Some(lease)) = (self.control.as_ref().cloned(), self.lease.take()) else {
+        let (Some(control), Some(lease)) = (self.control.as_ref().cloned(), self.lease.take())
+        else {
             return Ok(());
         };
         if let Err(error) = control.release_publication(&lease) {
@@ -1438,6 +1439,33 @@ fn authority_holds_entity(
 
 fn exact_source_storage_error(message: impl Into<String>) -> DaemonError {
     DaemonError::Graph(kin_db::KinDbError::StorageError(message.into()))
+}
+
+/// Classify a durable publication outcome where the caller continues on
+/// success.
+///
+/// `commit_captured_spine_publication` already turns a lost compare-and-swap
+/// into an error, so this is a second reader of the same fact rather than the
+/// only one. It exists because the outcome is `#[must_use]` precisely to stop a
+/// caller from proceeding past an unclassified conflict: if that inner
+/// classification is ever removed or bypassed, dropping the value here would
+/// report a successful publication over a head this process does not own, and
+/// the failure would surface as stale reads rather than as a refusal.
+fn require_committed_publication(
+    repo_id: &str,
+    outcome: kin_spine::RepoPublicationCommit,
+) -> std::result::Result<(), String> {
+    match outcome {
+        kin_spine::RepoPublicationCommit::Committed { .. }
+        | kin_spine::RepoPublicationCommit::AlreadyCommitted { .. } => Ok(()),
+        kin_spine::RepoPublicationCommit::Conflict(conflict) => Err(format!(
+            "repo {repo_id} durable spine publication returned an unclassified conflict: attempted cursor {}, observed cursor {:?}, attempted rollout fence {:?}, observed rollout fence {:?}",
+            conflict.attempted_cursor,
+            conflict.observed_cursor,
+            conflict.attempted_rollout_fence,
+            conflict.observed_rollout_fence
+        )),
+    }
 }
 
 fn exact_source_objects<'a>(
@@ -1908,8 +1936,7 @@ pub struct DaemonState {
     /// by the GCS publication-control record. Hosted readers and writers must
     /// bind to this value, never to whichever Firestore fence happens to be
     /// active when they start.
-    hosted_spine_expected_rollout_fence:
-        Mutex<Option<kin_spine::SpineRolloutFenceEvidence>>,
+    hosted_spine_expected_rollout_fence: Mutex<Option<kin_spine::SpineRolloutFenceEvidence>>,
     /// Counts backend factory entry for tests that must prove a fail-closed
     /// hold occurs before construction, hydration, or any durable I/O.
     #[cfg(test)]
@@ -3816,10 +3843,7 @@ impl DaemonState {
         }
         let bucket = std::env::var("KIN_GCS_BUCKET")
             .map_err(|_| "KIN_GCS_BUCKET is required for hosted durable spine".to_string())?;
-        if bucket.is_empty()
-            || bucket.trim() != bucket
-            || bucket.contains('/')
-        {
+        if bucket.is_empty() || bucket.trim() != bucket || bucket.contains('/') {
             return Err("KIN_GCS_BUCKET must be a canonical bucket name".to_string());
         }
         let prefix = std::env::var("KIN_GCS_PREFIX")
@@ -3832,18 +3856,17 @@ impl DaemonState {
         {
             return Err("KIN_GCS_PREFIX must be a non-empty canonical object prefix".to_string());
         }
-        let mut fleet = self.allowed_repo_ids.as_ref().ok_or_else(|| {
-            "KIN_REPO_IDS must name the exact hosted spine fleet".to_string()
-        })?
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
+        let mut fleet = self
+            .allowed_repo_ids
+            .as_ref()
+            .ok_or_else(|| "KIN_REPO_IDS must name the exact hosted spine fleet".to_string())?
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
         fleet.sort();
         if fleet.len() != HOSTED_SPINE_FLEET_SIZE
             || fleet.iter().any(|repo_id| {
-                repo_id.is_empty()
-                    || repo_id.trim() != repo_id
-                    || repo_id.contains('/')
+                repo_id.is_empty() || repo_id.trim() != repo_id || repo_id.contains('/')
             })
         {
             return Err(format!(
@@ -3926,7 +3949,9 @@ impl DaemonState {
             .ok_or_else(|| "hosted publication control is unavailable".to_string())?;
         control
             .assert_rollout_lease(&request.lease)
-            .map_err(|error| format!("reassert hosted rollout before spine publication: {error}"))?;
+            .map_err(|error| {
+                format!("reassert hosted rollout before spine publication: {error}")
+            })?;
         let evidence = control
             .rollout_spine_fence_evidence(&request.lease)
             .map_err(|error| format!("load hosted rollout Firestore evidence: {error}"))?;
@@ -3947,9 +3972,9 @@ impl DaemonState {
                     daemon_image_sha256: control.runtime_reader_identity().to_string(),
                     drain_proof_sha256: drain_proof_sha256.clone(),
                 };
-                attestation
-                    .validate()
-                    .map_err(|error| format!("validate legacy writer-drain attestation: {error}"))?;
+                attestation.validate().map_err(|error| {
+                    format!("validate legacy writer-drain attestation: {error}")
+                })?;
                 Ok::<_, String>(attestation)
             })
             .transpose()?;
@@ -3974,12 +3999,9 @@ impl DaemonState {
 
         let mut publication =
             HostedPublicationGuard::rollout(Arc::clone(&control), request.lease.clone());
-        self.refresh_all_hosted_cross_repo_edges_with_before_commit_hook(
-            &mut publication,
-            || {},
-        )
-        .await
-        .map_err(|error| format!("publish exact hosted spine fleet during rollout: {error}"))?;
+        self.refresh_all_hosted_cross_repo_edges_with_before_commit_hook(&mut publication, || {})
+            .await
+            .map_err(|error| format!("publish exact hosted spine fleet during rollout: {error}"))?;
 
         let _publication_gate = self.spine_refresh_gate.write().await;
         publication
@@ -4030,9 +4052,9 @@ impl DaemonState {
             .hosted_spine_authority_proof
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        if let Err(error) = without_blocking_runtime_worker(|| {
-            self.refresh_hosted_spine_authority(spine)
-        }) {
+        if let Err(error) =
+            without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))
+        {
             *self
                 .hosted_spine_expected_rollout_fence
                 .lock()
@@ -4088,9 +4110,9 @@ impl DaemonState {
             .hosted_spine_authority_proof
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        if let Err(error) = without_blocking_runtime_worker(|| {
-            self.refresh_hosted_spine_authority(spine)
-        }) {
+        if let Err(error) =
+            without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))
+        {
             *self
                 .hosted_spine_expected_rollout_fence
                 .lock()
@@ -4099,7 +4121,9 @@ impl DaemonState {
         }
         control
             .assert_rollout_lease(&request.lease)
-            .map_err(|error| format!("rollout moved during hosted spine admission proof: {error}"))?;
+            .map_err(|error| {
+                format!("rollout moved during hosted spine admission proof: {error}")
+            })?;
         control
             .admit_reader(request)
             .map_err(|error| format!("checkpoint hosted reader admission: {error}"))
@@ -4173,22 +4197,20 @@ impl DaemonState {
             // advances into the expected value. Snapshot cursors are monotonic,
             // so the shared collector requires two identical complete sorted
             // collections. The same helper is driven by the A-out/B-in mutant.
-            let repositories = collect_stable_hosted_spine_authority_vector(
-                &fleet,
-                1,
-                |repo_id| {
+            let repositories =
+                collect_stable_hosted_spine_authority_vector(&fleet, 1, |repo_id| {
                     let loaded = self.load_repo_graph(repo_id).map_err(|error| {
                         format!("load {repo_id} for hosted spine root proof: {error}")
                     })?;
                     let loaded_cursor = loaded.publication_cursor;
-                    let observed_cursor = self.probe_repo_publication(repo_id).map_err(|error| {
-                        format!("re-probe {repo_id} after hosted spine root proof: {error}")
-                    })?;
+                    let observed_cursor =
+                        self.probe_repo_publication(repo_id).map_err(|error| {
+                            format!("re-probe {repo_id} after hosted spine root proof: {error}")
+                        })?;
                     if loaded_cursor != observed_cursor {
                         return Ok(None);
                     }
-                    let current_source_cursor =
-                        Self::snapshot_cursor_for_spine(observed_cursor);
+                    let current_source_cursor = Self::snapshot_cursor_for_spine(observed_cursor);
                     let Some(durable_head_cursor) = spine.source_cursor(repo_id) else {
                         return Ok(None);
                     };
@@ -4203,13 +4225,11 @@ impl DaemonState {
                         current_source_cursor,
                         root_hash,
                     }))
-                },
-            )?;
+                })?;
             let Some(repositories) = repositories else {
                 continue 'attempt;
             };
-            if spine.registered_repo_ids()
-                != fleet.iter().cloned().collect::<HashSet<_>>()
+            if spine.registered_repo_ids() != fleet.iter().cloned().collect::<HashSet<_>>()
                 || !spine.authority_complete()
             {
                 return Err(
@@ -4220,9 +4240,7 @@ impl DaemonState {
             let observed_fence = spine
                 .active_rollout_fence()
                 .map_err(|error| format!("re-read active spine rollout fence: {error}"))?;
-            if observed_fence == selected_fence
-                && observed_fence.evidence() == expected_fence
-            {
+            if observed_fence == selected_fence && observed_fence.evidence() == expected_fence {
                 return Ok(HostedSpineAuthorityProof {
                     rollout_fence: selected_fence,
                     repositories,
@@ -4237,8 +4255,7 @@ impl DaemonState {
         spine: &dyn kin_spine::SpineBackend,
     ) -> std::result::Result<(), String> {
         #[cfg(test)]
-        self.spine_backend_hydrations
-            .fetch_add(1, Ordering::SeqCst);
+        self.spine_backend_hydrations.fetch_add(1, Ordering::SeqCst);
         spine
             .refresh_committed_publications()
             .map_err(|error| format!("refresh committed hosted spine heads: {error}"))?;
@@ -4294,7 +4311,20 @@ impl DaemonState {
     /// exact-fleet head exists yet. Hosted publication uses this bootstrap path;
     /// reader readiness additionally requires `refresh_hosted_spine_authority`.
     fn ensure_spine_initialized(&self) -> Option<&dyn kin_spine::SpineBackend> {
-        if self.spine_disabled || self.hosted_persistent_spine_blocked() {
+        // A recovery-only process opened its primary graph before the GCS
+        // generation fence completed, so `self.graph` and every manager derived
+        // from it can already be behind a writer that advanced in between.
+        // Repairing durable state later reloads `repo_graphs`, but nothing
+        // replaces that primary Arc, and dozens of routes read it directly. The
+        // process therefore never becomes reader-ready: it keeps the
+        // authenticated publication-control routes, which reach the backend
+        // through `ensure_hosted_spine_backend_constructed` and not through
+        // here, and a restart is what constructs primary authority from the
+        // fenced generation.
+        if self.spine_disabled
+            || self.hosted_restart_required()
+            || self.hosted_persistent_spine_blocked()
+        {
             return None;
         }
         if self.hosted_spine_readiness_required() {
@@ -4353,9 +4383,7 @@ impl DaemonState {
                 // register/refresh methods or reacquire the publication lease
                 // this caller already holds.
                 self.ensure_hosted_spine_backend_constructed()
-                    .map_err(|error| {
-                        DaemonError::Graph(kin_db::KinDbError::StorageError(error))
-                    })?;
+                    .map_err(|error| DaemonError::Graph(kin_db::KinDbError::StorageError(error)))?;
             } else {
                 // The entire synchronous O(graph) pass belongs inside the
                 // Tokio blocking handoff, not only the sibling thread join
@@ -4382,10 +4410,7 @@ impl DaemonState {
         Ok(Some(spine.as_ref()))
     }
 
-    fn acquire_hosted_publication(
-        &self,
-        repo_id: &str,
-    ) -> Result<HostedPublicationGuard> {
+    fn acquire_hosted_publication(&self, repo_id: &str) -> Result<HostedPublicationGuard> {
         let Some(control) = self.publication_control.as_ref().cloned() else {
             return Ok(HostedPublicationGuard::local());
         };
@@ -4445,8 +4470,9 @@ impl DaemonState {
                 *self
                     .spine_initialization_failure
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(format!("hosted durable spine fleet fence is unavailable: {error}"));
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!(
+                    "hosted durable spine fleet fence is unavailable: {error}"
+                ));
                 return None;
             }
             if active.as_ref().expect("checked active fence").evidence() != expected {
@@ -4473,9 +4499,9 @@ impl DaemonState {
             return Some(spine);
         }
         if self.storage_backend.is_some() {
-            if let Err(error) = without_blocking_runtime_worker(|| {
-                self.refresh_hosted_spine_authority(spine)
-            }) {
+            if let Err(error) =
+                without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))
+            {
                 *self
                     .spine_initialization_failure
                     .lock()
@@ -4489,8 +4515,7 @@ impl DaemonState {
                 *self
                     .spine_initialization_failure
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                    Some(error.to_string());
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.to_string());
                 warn!(%error, "local spine primary refresh failed closed");
                 return None;
             }
@@ -4505,9 +4530,7 @@ impl DaemonState {
     /// Acquire one query authority that remains stable through the caller's
     /// read. Hosted and local writers use the same gate, so the proof cannot be
     /// invalidated in the gap between readiness and response construction.
-    pub(crate) async fn acquire_spine_read_authority(
-        &self,
-    ) -> Option<SpineAuthorityReadGuard<'_>> {
+    pub(crate) async fn acquire_spine_read_authority(&self) -> Option<SpineAuthorityReadGuard<'_>> {
         let publication_gate = self.spine_refresh_gate.read().await;
         if let Some(control) = self.publication_control.as_ref() {
             if let Err(error) =
@@ -4538,6 +4561,14 @@ impl DaemonState {
         &self,
     ) -> std::result::Result<SpineAuthorityReadGuard<'_>, String> {
         let publication_gate = self.spine_refresh_gate.read().await;
+        // Health reads the already-constructed backend rather than entering
+        // `ensure_spine_initialized`, so it needs the recovery-only refusal of
+        // its own. Without it a recovery process that repaired durable state
+        // would report a cached view as current authority over a primary graph
+        // that predates the fence.
+        if self.hosted_restart_required() {
+            return Err(self.spine_unavailable_reason());
+        }
         let backend = self
             .spine
             .get()
@@ -4578,8 +4609,7 @@ impl DaemonState {
                 .map_err(|error| format!("load active Firestore spine fence: {error}"))?;
             if active != cached.rollout_fence || active.evidence() != durable {
                 return Err(
-                    "cached hosted spine proof differs from active Firestore authority"
-                        .to_string(),
+                    "cached hosted spine proof differs from active Firestore authority".to_string(),
                 );
             }
             let registered = backend.registered_repo_ids();
@@ -4647,9 +4677,9 @@ impl DaemonState {
             "hosted authority recovery completed or remains in progress; restart is required before this process may serve semantic graph state"
                 .to_string()
         } else if self.hosted_persistent_spine_blocked() {
-            self.hosted_spine_contract().err().unwrap_or_else(|| {
-                HOSTED_SPINE_CURSOR_CAS_REQUIRED.to_string()
-            })
+            self.hosted_spine_contract()
+                .err()
+                .unwrap_or_else(|| HOSTED_SPINE_CURSOR_CAS_REQUIRED.to_string())
         } else if let Some(error) = self
             .spine_initialization_failure
             .lock()
@@ -4952,9 +4982,7 @@ impl DaemonState {
         let prepared = match expected_rollout_fence.as_ref() {
             Some(expected) => spine
                 .prepare_repo_publication_bound(publication, expected)
-                .map_err(|error| {
-                    format!("prepare GCS-bound durable spine publication: {error}")
-                })?,
+                .map_err(|error| format!("prepare GCS-bound durable spine publication: {error}"))?,
             None => spine
                 .prepare_repo_publication(publication)
                 .map_err(|error| format!("prepare durable spine publication: {error}"))?,
@@ -5050,7 +5078,7 @@ impl DaemonState {
             )
             .map_err(|error| format!("derive durable cross-repo edges: {error}"))?;
         let edge_count = outgoing_edges.len();
-        self.commit_captured_spine_publication(
+        let outcome = self.commit_captured_spine_publication(
             spine,
             capture,
             kin_spine::RepoSpinePublication {
@@ -5062,6 +5090,7 @@ impl DaemonState {
                 resolution_roots: Some(resolution_roots),
             },
         )?;
+        require_committed_publication(&capture.repo_id, outcome)?;
         Ok(edge_count)
     }
 
@@ -5075,10 +5104,7 @@ impl DaemonState {
     ///   on kin-spine: uses `FirestoreSpineBackend` (write-through to Firestore,
     ///   reads from local cache). This enables the stateless daemon pool.
     /// - Otherwise: uses `InMemorySpineBackend` (current behavior, no external deps).
-    fn initialize_spine_lazy(
-        &self,
-        publication: &mut HostedPublicationGuard,
-    ) -> Result<()> {
+    fn initialize_spine_lazy(&self, publication: &mut HostedPublicationGuard) -> Result<()> {
         self.initialize_spine_lazy_under_publication(publication, || {})
     }
 
@@ -5145,7 +5171,9 @@ impl DaemonState {
 
     /// Prepare and publish the lazy spine behind the graph-authority visibility
     /// handshake. The hook is a deterministic seam for the final-validation to
-    /// publication race regression; production callers use the no-op wrapper.
+    /// publication race regression; production callers use the no-op wrapper,
+    /// so only the race regression reaches this shape.
+    #[cfg(test)]
     fn initialize_spine_lazy_with_publication_hook<F>(&self, before_publication: F)
     where
         F: FnMut(),
@@ -5283,7 +5311,7 @@ impl DaemonState {
             Ok(backend) => backend,
             Err(error) => {
                 warn!(error = %error, "spine backend construction failed");
-                return;
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(error)));
             }
         };
         for capture in &mut captures {
@@ -5486,8 +5514,9 @@ impl DaemonState {
             #[cfg(feature = "firestore")]
             {
                 let (scope, fleet) = self.hosted_spine_contract()?;
-                let project_id = std::env::var("GOOGLE_CLOUD_PROJECT")
-                    .map_err(|_| "GOOGLE_CLOUD_PROJECT is required for hosted durable spine".to_string())?;
+                let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").map_err(|_| {
+                    "GOOGLE_CLOUD_PROJECT is required for hosted durable spine".to_string()
+                })?;
                 let database_id = std::env::var("FIRESTORE_DATABASE_ID").ok();
                 info!(
                     project = %project_id,
@@ -5557,12 +5586,8 @@ impl DaemonState {
         repo_id: &str,
         refresh_cross_repo_edges: bool,
     ) -> Result<SpineIngestOutcome> {
-        self.ingest_repo_into_spine_with_capture_hook(
-            repo_id,
-            refresh_cross_repo_edges,
-            |_| {},
-        )
-        .await
+        self.ingest_repo_into_spine_with_capture_hook(repo_id, refresh_cross_repo_edges, |_| {})
+            .await
     }
 
     async fn ingest_repo_into_spine_with_capture_hook<F>(
@@ -5629,9 +5654,8 @@ impl DaemonState {
         let relation_count = capture.relations.len();
         let root_hash = capture.root_hash.clone();
 
-        let source_cursor = Self::spine_source_cursor_for_capture(&capture).map_err(|reason| {
-            DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
-        })?;
+        let source_cursor = Self::spine_source_cursor_for_capture(&capture)
+            .map_err(|reason| DaemonError::Graph(kin_db::KinDbError::StorageError(reason)))?;
         match (spine.source_cursor(repo_id), spine.root_hash(repo_id)) {
             (Some(current), Some(current_root))
                 if current == source_cursor && current_root == root_hash => {}
@@ -5644,7 +5668,13 @@ impl DaemonState {
             }
             _ => {
                 publication.reassert_before_mutation()?;
-                self.publish_spine_metadata(spine, &capture).map_err(|reason| {
+                let outcome = self
+                    .publish_spine_metadata(spine, &capture)
+                    .map_err(|reason| {
+                        spine.invalidate_cross_repo_edges(repo_id);
+                        DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
+                    })?;
+                require_committed_publication(repo_id, outcome).map_err(|reason| {
                     spine.invalidate_cross_repo_edges(repo_id);
                     DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
                 })?;
@@ -5668,9 +5698,7 @@ impl DaemonState {
             publication.reassert_before_mutation()?;
             if let Err(reason) = self.publish_spine_edges(spine, &capture, &registry_ids) {
                 spine.invalidate_cross_repo_edges(repo_id);
-                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
-                    reason,
-                )));
+                return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(reason)));
             }
         }
 
@@ -5689,15 +5717,21 @@ impl DaemonState {
             if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
                 None
             } else {
-                Some(self.expected_hosted_spine_rollout_fence().map_err(|reason| {
-                    DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
-                })?)
+                Some(
+                    self.expected_hosted_spine_rollout_fence()
+                        .map_err(|reason| {
+                            DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
+                        })?,
+                )
             }
             #[cfg(not(test))]
             {
-                Some(self.expected_hosted_spine_rollout_fence().map_err(|reason| {
-                    DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
-                })?)
+                Some(
+                    self.expected_hosted_spine_rollout_fence()
+                        .map_err(|reason| {
+                            DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
+                        })?,
+                )
             }
         } else {
             None
@@ -5739,10 +5773,7 @@ impl DaemonState {
     {
         let mut publication = self.acquire_hosted_publication(&self.cached_repo_id)?;
         let outcome = self
-            .refresh_all_cross_repo_edges_under_publication(
-                &mut publication,
-                before_commit,
-            )
+            .refresh_all_cross_repo_edges_under_publication(&mut publication, before_commit)
             .await;
         self.finish_hosted_publication(publication, outcome)
     }
@@ -5755,17 +5786,15 @@ impl DaemonState {
     where
         F: FnMut(),
     {
-        let storage_error = |reason: String| {
-            DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
-        };
+        let storage_error =
+            |reason: String| DaemonError::Graph(kin_db::KinDbError::StorageError(reason));
         let Some(_) = self.ensure_spine_under_publication(publication)? else {
             return Err(storage_error(self.spine_unavailable_reason()));
         };
         let Some(spine) = self.ensure_spine_for_publication() else {
             return Err(storage_error(self.spine_unavailable_reason()));
         };
-        let (expected_scope, registry_ids) =
-            self.hosted_spine_contract().map_err(storage_error)?;
+        let (expected_scope, registry_ids) = self.hosted_spine_contract().map_err(storage_error)?;
         let expected_rollout_fence = self
             .expected_hosted_spine_rollout_fence()
             .map_err(storage_error)?;
@@ -5784,7 +5813,9 @@ impl DaemonState {
             ));
         }
         let graph_authority_epoch = self.stable_graph_authority_epoch().ok_or_else(|| {
-            storage_error("hosted spine refresh cannot start while graph authority is mutating".to_string())
+            storage_error(
+                "hosted spine refresh cannot start while graph authority is mutating".to_string(),
+            )
         })?;
 
         let mut captures = Vec::with_capacity(registry_ids.len());
@@ -5826,7 +5857,10 @@ impl DaemonState {
                 }
                 _ => {
                     publication.reassert_before_mutation()?;
-                    self.publish_spine_metadata(spine, capture)
+                    let outcome = self
+                        .publish_spine_metadata(spine, capture)
+                        .map_err(storage_error)?;
+                    require_committed_publication(&capture.repo_id, outcome)
                         .map_err(storage_error)?;
                 }
             }
@@ -5846,8 +5880,7 @@ impl DaemonState {
         let expected_ids = registry_ids.iter().cloned().collect::<HashSet<_>>();
         if installed_ids != expected_ids
             || captures.iter().any(|capture| {
-                spine.root_hash(&capture.repo_id).as_deref()
-                    != Some(capture.root_hash.as_str())
+                spine.root_hash(&capture.repo_id).as_deref() != Some(capture.root_hash.as_str())
             })
         {
             return Err(storage_error(
@@ -5874,9 +5907,9 @@ impl DaemonState {
                 .map_err(storage_error)?;
         }
 
-        let observed_fence = spine
-            .active_rollout_fence()
-            .map_err(|error| storage_error(format!("re-read active spine rollout fence: {error}")))?;
+        let observed_fence = spine.active_rollout_fence().map_err(|error| {
+            storage_error(format!("re-read active spine rollout fence: {error}"))
+        })?;
         let captures_current = self.graph_authority_epoch_is_current(graph_authority_epoch)
             && captures
                 .iter()
@@ -5885,8 +5918,7 @@ impl DaemonState {
             Self::spine_source_cursor_for_capture(capture)
                 .ok()
                 .is_some_and(|cursor| spine.source_cursor(&capture.repo_id) == Some(cursor))
-                && spine.root_hash(&capture.repo_id).as_deref()
-                    == Some(capture.root_hash.as_str())
+                && spine.root_hash(&capture.repo_id).as_deref() == Some(capture.root_hash.as_str())
         });
         if observed_fence != selected_fence
             || observed_fence.evidence() != expected_rollout_fence
@@ -5927,6 +5959,10 @@ impl DaemonState {
     where
         F: FnMut(),
     {
+        // Only the test build narrows this, so a production build never
+        // reassigns it and `mut` would be an unused-mut warning under denied
+        // warnings.
+        #[cfg_attr(not(test), allow(unused_mut))]
         let mut durable_hosted = self.storage_backend.is_some();
         #[cfg(test)]
         {
@@ -6107,7 +6143,9 @@ impl DaemonState {
                                 false,
                             );
                         }
-                        Err(error) => warn!(%error, "expired publication lease refused cross-repo refresh cancellation cleanup"),
+                        Err(error) => {
+                            warn!(%error, "expired publication lease refused cross-repo refresh cancellation cleanup")
+                        }
                     }
                 }
             }
@@ -8566,10 +8604,7 @@ mod tests {
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
 
-    fn hosted_repo_proof(
-        generation: u64,
-        root_hash: &str,
-    ) -> HostedSpineRepoAuthorityProof {
+    fn hosted_repo_proof(generation: u64, root_hash: &str) -> HostedSpineRepoAuthorityProof {
         let cursor = kin_spine::SpineSourceCursor::from_backend_generation(generation);
         HostedSpineRepoAuthorityProof {
             durable_head_cursor: cursor,
@@ -8594,17 +8629,13 @@ mod tests {
         // Drive the exact collector called by hosted readiness. The first pass
         // sees A before it advances, then B after B advances into the expected
         // value. The second pass sees A's movement and refuses the snapshot.
-        let collected = collect_stable_hosted_spine_authority_vector(
-            &fleet,
-            1,
-            |repo_id| {
-                let (expected_repo, proof) = observations
-                    .pop_front()
-                    .expect("deterministic two-pass observation");
-                assert_eq!(repo_id, expected_repo);
-                Ok(Some(proof))
-            },
-        )
+        let collected = collect_stable_hosted_spine_authority_vector(&fleet, 1, |repo_id| {
+            let (expected_repo, proof) = observations
+                .pop_front()
+                .expect("deterministic two-pass observation");
+            assert_eq!(repo_id, expected_repo);
+            Ok(Some(proof))
+        })
         .unwrap();
         assert!(
             collected.is_none(),
@@ -8632,17 +8663,15 @@ mod tests {
             ("a", advanced_a),
             ("b", expected_b),
         ]);
-        assert!(collect_stable_hosted_spine_authority_vector(
-            &fleet,
-            1,
-            |repo_id| {
+        assert!(
+            collect_stable_hosted_spine_authority_vector(&fleet, 1, |repo_id| {
                 let (expected_repo, proof) = stable_observations.pop_front().unwrap();
                 assert_eq!(repo_id, expected_repo);
                 Ok(Some(proof))
-            },
-        )
-        .unwrap()
-        .is_some());
+            },)
+            .unwrap()
+            .is_some()
+        );
     }
 
     #[test]
@@ -8656,9 +8685,7 @@ mod tests {
     async fn cancelled_hosted_publication_releases_its_exact_fleet_lease() {
         const READER: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let store = Arc::new(
-            crate::publication_lease::InMemoryPublicationControlStore::default(),
-        );
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
         let control = Arc::new(
             crate::publication_lease::PublicationControl::new(
                 "gcs://fixture/v2",

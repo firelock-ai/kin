@@ -545,27 +545,18 @@ impl SpineIndex {
         let mut next = Self::empty_inner();
         let complete_roots = publications
             .iter()
-            .map(|publication| {
-                (
-                    publication.repo_id.clone(),
-                    publication.root_hash.clone(),
-                )
-            })
+            .map(|publication| (publication.repo_id.clone(), publication.root_hash.clone()))
             .collect::<BTreeMap<_, _>>();
 
         for (index, publication) in publications.iter().enumerate() {
             for entry in &publication.entries {
                 let key = (entry.name.to_lowercase(), entry.kind);
                 next.by_name.entry(key).or_default().push(entry.clone());
-                next.by_id.insert(
-                    (entry.repo_id.clone(), entry.entity_id),
-                    entry.clone(),
-                );
+                next.by_id
+                    .insert((entry.repo_id.clone(), entry.entity_id), entry.clone());
             }
-            next.root_hashes.insert(
-                publication.repo_id.clone(),
-                publication.root_hash.clone(),
-            );
+            next.root_hashes
+                .insert(publication.repo_id.clone(), publication.root_hash.clone());
             next.source_cursors
                 .insert(publication.repo_id.clone(), publication.source_cursor);
             after_staged_repo(index + 1);
@@ -575,11 +566,10 @@ impl SpineIndex {
             let complete_edge_head = publication.outgoing_edges.is_some()
                 && publication.resolution_roots.as_ref() == Some(&complete_roots);
             if let Some(edges) = publication.outgoing_edges {
-                next.cross_repo_edges.extend(
-                    edges.into_iter().filter(|edge| {
+                next.cross_repo_edges
+                    .extend(edges.into_iter().filter(|edge| {
                         edge.src_repo == publication.repo_id && edge.src_repo != edge.dst_repo
-                    }),
-                );
+                    }));
             }
             if !complete_edge_head {
                 next.dirty_edge_repos.insert(publication.repo_id);
@@ -639,7 +629,9 @@ impl SpineIndex {
         inner
             .source_cursors
             .insert(repo_id.to_string(), source_cursor);
-        inner.cross_repo_edges.retain(|edge| edge.src_repo != repo_id);
+        inner
+            .cross_repo_edges
+            .retain(|edge| edge.src_repo != repo_id);
         if let Some(edges) = outgoing_edges {
             inner.cross_repo_edges.extend(
                 edges
@@ -657,13 +649,13 @@ impl SpineIndex {
         }
         let resolved_against_current_roots = has_edge_publication
             && resolution_roots.is_some_and(|expected| {
-            inner
-                .root_hashes
-                .iter()
-                .map(|(repo, root)| (repo.clone(), root.clone()))
-                .collect::<BTreeMap<_, _>>()
-                == *expected
-        });
+                inner
+                    .root_hashes
+                    .iter()
+                    .map(|(repo, root)| (repo.clone(), root.clone()))
+                    .collect::<BTreeMap<_, _>>()
+                    == *expected
+            });
         if resolved_against_current_roots {
             inner.dirty_edge_repos.remove(repo_id);
         } else {
@@ -1403,10 +1395,7 @@ mod tests {
         entry
     }
 
-    fn committed_pair(
-        version: &str,
-        cursor: u64,
-    ) -> Vec<CommittedRepoIndexPublication> {
+    fn committed_pair(version: &str, cursor: u64) -> Vec<CommittedRepoIndexPublication> {
         let roots = [
             ("alpha".to_string(), format!("alpha-{version}")),
             ("beta".to_string(), format!("beta-{version}")),
@@ -1438,15 +1427,12 @@ mod tests {
         let worker_index = Arc::clone(&index);
         let worker_barrier = Arc::clone(&barrier);
         let worker = thread::spawn(move || {
-            worker_index.replace_committed_repo_publications(
-                committed_pair("new", 2),
-                |staged| {
-                    if staged == 1 {
-                        worker_barrier.wait();
-                        worker_barrier.wait();
-                    }
-                },
-            );
+            worker_index.replace_committed_repo_publications(committed_pair("new", 2), |staged| {
+                if staged == 1 {
+                    worker_barrier.wait();
+                    worker_barrier.wait();
+                }
+            });
         });
 
         barrier.wait();

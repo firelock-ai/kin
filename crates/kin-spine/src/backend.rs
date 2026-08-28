@@ -24,8 +24,7 @@ use crate::publication::{
     SpineRolloutFenceEvidence, SpineSourceCursor,
 };
 use crate::store::{
-    LoadedSpineRolloutFence, PreparedStorePublication, StoreHeadPrecondition,
-    StoreRepoHeadGuard,
+    LoadedSpineRolloutFence, PreparedStorePublication, StoreHeadPrecondition, StoreRepoHeadGuard,
 };
 
 /// Error type for spine backend operations.
@@ -76,10 +75,7 @@ pub struct PreparedRepoSpinePublication {
 
 impl PreparedRepoSpinePublication {
     /// Bind a store preparation to the backend instance that staged it.
-    pub fn bind(
-        owner: SpinePublicationBackendId,
-        prepared: PreparedStorePublication,
-    ) -> Self {
+    pub fn bind(owner: SpinePublicationBackendId, prepared: PreparedStorePublication) -> Self {
         Self { owner, prepared }
     }
 
@@ -399,9 +395,7 @@ impl SpineBackend for InMemorySpineBackend {
                 repo_id.clone(),
                 StoreRepoHeadGuard {
                     head: dependency_head,
-                    precondition: StoreHeadPrecondition::Revision(
-                        dependency_revision.to_string(),
-                    ),
+                    precondition: StoreHeadPrecondition::Revision(dependency_revision.to_string()),
                 },
             );
         }
@@ -421,8 +415,7 @@ impl SpineBackend for InMemorySpineBackend {
         &self,
         prepared: PreparedRepoSpinePublication,
     ) -> Result<RepoPublicationCommit, SpineError> {
-        let prepared =
-            prepared.into_store_preparation(self.publication_backend_id)?;
+        let prepared = prepared.into_store_preparation(self.publication_backend_id)?;
         let candidate = prepared.candidate_head().clone();
         let mut heads = self.publication_heads.lock();
         if heads.get(&candidate.repo_id).is_some_and(|(_, head)| {
@@ -498,7 +491,10 @@ impl SpineBackend for InMemorySpineBackend {
             })?,
             None => 1,
         };
-        heads.insert(candidate.repo_id.clone(), (next_revision, candidate.clone()));
+        heads.insert(
+            candidate.repo_id.clone(),
+            (next_revision, candidate.clone()),
+        );
         self.install_committed_publication(&prepared);
         Ok(RepoPublicationCommit::Committed {
             source_cursor: candidate.source_cursor,
