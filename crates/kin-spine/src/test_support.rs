@@ -277,6 +277,20 @@ pub fn merge_fake_immutable_rows<T: Clone + PartialEq>(
 }
 
 impl FakeSpineStore {
+    /// A store with no rollout fence yet, which is what a cold Firestore holds.
+    ///
+    /// `default()` pre-seeds a fence so this crate's own tests can publish
+    /// without establishing one first. A consumer driving the rollout path is
+    /// testing exactly the step that establishes it, and against the seeded
+    /// fence its first advance conflicts on both the scope and the fence
+    /// number, which reads as a broken rollout rather than as a fixture that
+    /// started in the wrong state.
+    pub fn cold() -> Self {
+        let store = Self::default();
+        *store.rollout_fence_state.lock().unwrap() = None;
+        store
+    }
+
     /// Age a stage marker so the TTL reads it as a dead writer's.
     ///
     /// Waiting an hour is not a test. This moves the one input the TTL reads,
