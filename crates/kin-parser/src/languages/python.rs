@@ -282,7 +282,11 @@ impl LanguageAdapter for PythonAdapter {
         // entity owns the edge. Keep syntax state and call-coverage completeness
         // separate: carry one reserved negative record to the linker, which
         // fails closed without rejecting the valid file.
-        if call_audit.incomplete || has_unobserved_call(&root, &call_audit.seen_calls) {
+        // One walk answers both questions. `seen_calls` holds one span per call
+        // node extraction visited, so the census is at least its size and
+        // exceeds it exactly when a call node was never visited at all.
+        let parsed_call_sites = count_python_call_sites(&root);
+        if call_audit.incomplete || parsed_call_sites > call_audit.seen_calls.len() as u64 {
             relations.push(call_extraction_incomplete_marker());
         }
 
@@ -366,7 +370,7 @@ impl LanguageAdapter for PythonAdapter {
             imports,
             tests,
             parse_state,
-            parsed_call_sites: Some(count_python_call_sites(&root)),
+            parsed_call_sites: Some(parsed_call_sites),
         })
     }
 }
@@ -1357,8 +1361,8 @@ struct PythonCallExtractionAudit {
 /// graph's resolved edges from that number finds no shortfall on a file whose
 /// calls the graph never saw.
 ///
-/// The traversal is every child rather than every named child, matching
-/// [`has_unobserved_call`], so the two agree about which nodes are call sites.
+/// The count is also what settles whether extraction was complete: it exceeds
+/// the number of call sites the walker visited exactly when one was missed.
 fn count_python_call_sites(node: &tree_sitter::Node) -> u64 {
     let mut total = u64::from(node.kind() == "call");
     let mut cursor = node.walk();
@@ -1366,20 +1370,6 @@ fn count_python_call_sites(node: &tree_sitter::Node) -> u64 {
         total += count_python_call_sites(&child);
     }
     total
-}
-
-fn has_unobserved_call(
-    node: &tree_sitter::Node,
-    seen_calls: &std::collections::HashSet<(usize, usize)>,
-) -> bool {
-    if node.kind() == "call" && !seen_calls.contains(&(node.start_byte(), node.end_byte())) {
-        return true;
-    }
-    let mut cursor = node.walk();
-    let found = node
-        .children(&mut cursor)
-        .any(|child| has_unobserved_call(&child, seen_calls));
-    found
 }
 
 struct PythonNamedCallee {
