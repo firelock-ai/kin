@@ -870,9 +870,13 @@ class Suite(object):
         self._stop_repos.append(source)
         with open(os.path.join(source, "transported.py"), "w") as handle:
             handle.write("def transported():\n    return 3\n")
-        rc, out = self.kin_in(source, ["admit"])
+        # `kin commit`, not `kin admit`. Admission brings the working tree into
+        # graph authority but moves no ref, and a replica publishes history on a
+        # ref: without one the remote advertises nothing and a pull is refused
+        # with "remote does not publish source ref refs/heads/main".
+        rc, out = self.kin_in(source, ["commit", "-m", "transported change"])
         if rc != 0:
-            raise RuntimeError("kin admit on the transfer source failed: %s" % tail(out))
+            raise RuntimeError("kin commit on the transfer source failed: %s" % tail(out))
         repo_id = self.repository_id_of(source)
 
         source_stamp, why = read_stamp(source)
