@@ -884,9 +884,27 @@ pub fn execute_work_request(
             out
         }
         WorkRequest::TodoImport { path } => {
-            let scan_root = path
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| _layout.working_dir().to_path_buf());
+            // `path` is caller supplied: this arm serves the daemon's POST
+            // /work and POST /note routes and the `kin_todo_import` MCP tool,
+            // so the value arrives in a request body rather than from an
+            // operator's shell. Resolve it against the repository working
+            // directory and refuse anything that lands outside. Joining an
+            // absolute path discards the base, so containment is the test that
+            // rejects it, and `is_within` canonicalizes both sides, which also
+            // resolves `..` before the comparison.
+            let working_dir = _layout.working_dir();
+            let scan_root = match path {
+                Some(requested) => {
+                    let candidate = working_dir.join(requested);
+                    if !crate::commands::managed_config_scope::is_within(working_dir, &candidate) {
+                        anyhow::bail!(
+                            "todo import scan root must stay inside the repository working directory"
+                        );
+                    }
+                    candidate
+                }
+                None => working_dir.to_path_buf(),
+            };
             let todos = kin_parser::extract_todos(&scan_root)?;
             let existing = graph.list_work_items(&WorkFilter::default())?;
             let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
@@ -1462,5 +1480,90 @@ mod tests {
         assert!(report.missing_scope_proof.is_empty());
         assert_eq!(report.direct_work_runs.len(), 1);
         assert_eq!(report.direct_work_runs[0].run_id, run.run_id);
+    }
+
+    // The two tests below drive `execute_work_request` rather than
+    // `todo_import_in_layout_direct`, which is a second copy of this arm's
+    // body and cannot observe a change to the product path.
+
+    #[tokio::test]
+    async fn todo_import_refuses_a_scan_root_outside_the_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        kin_core::init(repo.path()).unwrap();
+        std::fs::write(repo.path().join("inside.rs"), "// TODO: inside the repo\n").unwrap();
+        let layout = kin_core::KinLayout::discover(repo.path()).unwrap();
+
+        // A tree this request has no business reading. The marker text is what
+        // says whether the walk actually reached it.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("secret.rs"),
+            "// TODO: outside the repo\n",
+        )
+        .unwrap();
+
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let graph = snap.graph();
+        let refused = execute_work_request(
+            &layout,
+            graph.as_ref(),
+            WorkRequest::TodoImport {
+                path: Some(outside.path().to_string_lossy().into_owned()),
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "a scan root outside the repository must be refused"
+        );
+
+        let titles: Vec<String> = graph
+            .list_work_items(&WorkFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert!(
+            !titles
+                .iter()
+                .any(|title| title.contains("outside the repo")),
+            "nothing outside the repository may be imported: {titles:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_import_accepts_a_scan_root_inside_the_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        kin_core::init(repo.path()).unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src").join("lib.rs"),
+            "// TODO: inside a subdirectory\n",
+        )
+        .unwrap();
+        let layout = kin_core::KinLayout::discover(repo.path()).unwrap();
+
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let graph = snap.graph();
+        execute_work_request(
+            &layout,
+            graph.as_ref(),
+            WorkRequest::TodoImport {
+                path: Some("src".to_string()),
+            },
+        )
+        .expect("a subdirectory of the repository is a legitimate scan root");
+
+        let titles: Vec<String> = graph
+            .list_work_items(&WorkFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert!(
+            titles
+                .iter()
+                .any(|title| title.contains("inside a subdirectory")),
+            "a legitimate subdirectory scan must still import: {titles:?}"
+        );
     }
 }

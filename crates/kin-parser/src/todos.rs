@@ -29,14 +29,25 @@ const TODO_EXTENSIONS: &[&str] = &["rs", "ts", "js", "tsx", "jsx", "py", "go", "
 /// Regex-like markers we scan for (case-insensitive match on the tag).
 const TODO_MARKERS: &[&str] = &["TODO", "FIXME", "HACK", "NOTE"];
 
+/// Directory depth this walk descends before it stops.
+///
+/// `path.is_dir()` follows symlinks, so a link pointing at any ancestor makes
+/// the recursion below unbounded and overflows the stack. The caller is a
+/// daemon route, so that crash is reachable from a request; a depth ceiling
+/// ends the walk instead. No real source tree approaches this depth.
+const MAX_SCAN_DEPTH: usize = 64;
+
 /// Scan a directory tree for inline TODO/FIXME/HACK/NOTE markers.
 pub fn extract_todos(root: &Path) -> Result<Vec<ExtractedTodo>> {
     let mut todos = Vec::new();
-    scan_dir(root, root, &mut todos)?;
+    scan_dir(root, root, 0, &mut todos)?;
     Ok(todos)
 }
 
-fn scan_dir(base: &Path, dir: &Path, out: &mut Vec<ExtractedTodo>) -> Result<()> {
+fn scan_dir(base: &Path, dir: &Path, depth: usize, out: &mut Vec<ExtractedTodo>) -> Result<()> {
+    if depth >= MAX_SCAN_DEPTH {
+        return Ok(());
+    }
     let read_dir = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return Ok(()),
@@ -54,7 +65,7 @@ fn scan_dir(base: &Path, dir: &Path, out: &mut Vec<ExtractedTodo>) -> Result<()>
         }
 
         if path.is_dir() {
-            scan_dir(base, &path, out)?;
+            scan_dir(base, &path, depth + 1, out)?;
         } else if path.is_file() {
             let has_ext = path
                 .extension()
@@ -223,5 +234,38 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let todos = extract_todos(dir.path()).unwrap();
         assert!(todos.is_empty());
+    }
+
+    #[test]
+    fn the_walk_stops_at_the_depth_ceiling() {
+        let dir = TempDir::new().unwrap();
+        write_file(dir.path(), "shallow.rs", "// TODO: inside the ceiling\n");
+
+        // A chain two levels past the ceiling. Asserting both halves is what
+        // makes this fail for the right reason: a bound set to zero would also
+        // hide the deep marker, and the shallow assertion catches that.
+        let mut chain = PathBuf::new();
+        for _ in 0..MAX_SCAN_DEPTH + 2 {
+            chain.push("d");
+        }
+        let deep = chain.join("deep.rs");
+        write_file(
+            dir.path(),
+            deep.to_str().unwrap(),
+            "// TODO: past the ceiling\n",
+        );
+
+        let todos = extract_todos(dir.path()).unwrap();
+        let bodies: Vec<&str> = todos.iter().map(|todo| todo.body.as_str()).collect();
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains("inside the ceiling")),
+            "a marker above the ceiling must still be found: {bodies:?}"
+        );
+        assert!(
+            !bodies.iter().any(|body| body.contains("past the ceiling")),
+            "the walk must stop at the depth ceiling: {bodies:?}"
+        );
     }
 }
