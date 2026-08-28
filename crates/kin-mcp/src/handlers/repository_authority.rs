@@ -13,15 +13,15 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use kin_db::{
-    LocalFileBackend, PersistedRepositoryAuthority, RepositoryAuthorityManager,
-    RepositoryAuthorityState,
+    AuthorityReadLease, LocalFileBackend, PersistedRepositoryAuthority, RepositoryAuthorityManager,
+    RepositoryAuthorityState, StorageBackend,
 };
 use kin_model::{
-    ExternalObjectKind, GitObjectId, RefName, RefTarget, RepositoryId, RepositoryRef,
-    SemanticChangeId, WorkspaceId, WorkspaceState,
+    ExternalObjectKind, GitObjectId, Hash256, RefName, RefTarget, RepositoryId, RepositoryRef,
+    ResolvedTree, SemanticChangeId, WorkspaceId, WorkspaceState,
 };
 
 use crate::error::{McpError, Result};
@@ -68,10 +68,66 @@ pub(crate) fn discover_for_process() -> Result<Option<RequestRepositoryAuthority
         .map_err(|error| McpError::Context(format!("graph authority gap: {error}")))
 }
 
+/// Hosted semantic reads must never inherit KinDB's 1 GiB general-purpose
+/// source-object ceiling. These surfaces return bounded excerpts, so an object
+/// larger than 8 MiB is an authority gap for this route and is rejected by the
+/// backend before a remote body GET or allocation.
+pub const HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+enum ActiveRepositoryAuthorityManager {
+    Local(RepositoryAuthorityManager<LocalFileBackend>),
+    Hosted {
+        manager: RepositoryAuthorityManager<dyn StorageBackend>,
+        backend: Arc<dyn StorageBackend>,
+    },
+}
+
+impl ActiveRepositoryAuthorityManager {
+    fn read_authority(&self) -> AuthorityReadLease<RepositoryAuthorityState> {
+        match self {
+            Self::Local(manager) => manager.read_authority(),
+            Self::Hosted { manager, .. } => manager.read_authority(),
+        }
+    }
+
+    /// Read one immutable body without permitting an allocation above
+    /// `max_bytes`.
+    ///
+    /// The caller's ceiling is what travels, so a request that derived a
+    /// smaller allowance from its response budget actually gets it. The hosted
+    /// arm still clamps to [`HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES`], because a
+    /// caller asking for more than these surfaces can return is asking for
+    /// something no hosted response has room to ship.
+    fn load_source_blob_bounded(
+        &self,
+        repository_id: &RepositoryId,
+        digest: Hash256,
+        max_bytes: u64,
+    ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+        match self {
+            Self::Local(manager) => manager.load_source_blob(digest),
+            Self::Hosted { backend, .. } => backend.load_source_blob_bounded(
+                repository_id.as_str(),
+                *digest.as_bytes(),
+                max_bytes.min(HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES),
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct HostedAuthorityHead {
+    change_id: SemanticChangeId,
+    tree: ResolvedTree,
+    tree_hash: Hash256,
+    generation: u64,
+}
+
 pub struct ActiveRepositoryAuthority {
-    manager: RepositoryAuthorityManager<LocalFileBackend>,
+    manager: ActiveRepositoryAuthorityManager,
     pub repository_id: RepositoryId,
-    pub workspace_id: WorkspaceId,
+    workspace_id: Option<WorkspaceId>,
+    hosted_head: Option<HostedAuthorityHead>,
 }
 
 /// The repository authority one request reads at, and when it was opened.
@@ -92,8 +148,27 @@ pub struct ActiveRepositoryAuthority {
 /// [`Self::shared`].
 #[derive(Clone)]
 pub struct RequestRepositoryAuthority {
-    binding: LocalRepositoryAuthorityBinding,
+    binding: Option<LocalRepositoryAuthorityBinding>,
     shared: Option<SharedAuthorityResolver>,
+    hosted_source_budget: Option<Arc<HostedSourceProjectionBudget>>,
+}
+
+struct HostedSourceProjectionBudgetState {
+    remaining_bytes: u64,
+    remaining_reads: usize,
+    blobs: std::collections::HashMap<Hash256, Arc<Vec<u8>>>,
+}
+
+/// One request's shared hosted source-object allowance.
+///
+/// Every held source session and every locate query variant cloned from the
+/// request shares this same state. The lock intentionally spans the backend
+/// read: source projection is synchronous already, and serializing it is what
+/// makes the aggregate byte/read ceiling exact rather than advisory under
+/// concurrent projections of one request.
+struct HostedSourceProjectionBudget {
+    max_blob_bytes: u64,
+    state: Mutex<HostedSourceProjectionBudgetState>,
 }
 
 /// A server's promise to produce authority for the publication a request reads
@@ -109,8 +184,9 @@ impl RequestRepositoryAuthority {
     /// Authority this request opens for itself, once, on first use.
     pub fn pinned(binding: LocalRepositoryAuthorityBinding) -> Self {
         Self {
-            binding,
+            binding: Some(binding),
             shared: None,
+            hosted_source_budget: None,
         }
     }
 
@@ -128,8 +204,9 @@ impl RequestRepositoryAuthority {
         resolve: SharedAuthorityResolver,
     ) -> Self {
         Self {
-            binding,
+            binding: Some(binding),
             shared: Some(resolve),
+            hosted_source_budget: None,
         }
     }
 
@@ -146,10 +223,88 @@ impl RequestRepositoryAuthority {
         Self::shared(binding, Arc::new(move || Ok(Arc::clone(&authority))))
     }
 
+    /// Hosted repository authority already opened for one exact publication.
+    ///
+    /// There is deliberately no local binding on this arm. A caller cannot
+    /// fall through to a working directory or reopen from a mutable path if
+    /// the retained hosted authority becomes unavailable.
+    pub fn hosted(authority: Arc<ActiveRepositoryAuthority>) -> Self {
+        Self {
+            binding: None,
+            shared: Some(Arc::new(move || Ok(Arc::clone(&authority)))),
+            hosted_source_budget: None,
+        }
+    }
+
+    /// Derive one request-scoped hosted source capability.
+    ///
+    /// The base hosted authority deliberately carries no allowance, so a new
+    /// route cannot accidentally project object-store bodies without choosing
+    /// limits tied to its own response contract. Clones of the returned value
+    /// share the allowance and immutable-blob memo.
+    pub fn with_hosted_source_projection_budget(
+        &self,
+        max_blob_bytes: u64,
+        total_bytes: u64,
+        max_reads: usize,
+    ) -> Self {
+        Self {
+            binding: self.binding.clone(),
+            shared: self.shared.clone(),
+            hosted_source_budget: Some(Arc::new(HostedSourceProjectionBudget {
+                max_blob_bytes: max_blob_bytes.max(1),
+                state: Mutex::new(HostedSourceProjectionBudgetState {
+                    remaining_bytes: total_bytes.max(1),
+                    remaining_reads: max_reads.max(1),
+                    blobs: std::collections::HashMap::new(),
+                }),
+            })),
+        }
+    }
+
+    pub(crate) fn load_source_blob(
+        &self,
+        authority: &ActiveRepositoryAuthority,
+        digest: Hash256,
+    ) -> Result<Arc<Vec<u8>>> {
+        if authority.hosted_head.is_none() {
+            return authority.load_source_blob(digest).map(Arc::new);
+        }
+        let budget = self.hosted_source_budget.as_ref().ok_or_else(|| {
+            McpError::Context(
+                "graph authority gap: hosted source projection has no request-scoped byte budget"
+                    .to_string(),
+            )
+        })?;
+        let mut state = budget
+            .state
+            .lock()
+            .expect("hosted source projection budget is never poisoned");
+        if let Some(bytes) = state.blobs.get(&digest) {
+            return Ok(Arc::clone(bytes));
+        }
+        if state.remaining_reads == 0 || state.remaining_bytes == 0 {
+            return Err(McpError::Context(format!(
+                "graph authority gap: hosted source projection budget was exhausted before blob {digest}"
+            )));
+        }
+        let max_bytes = budget.max_blob_bytes.min(state.remaining_bytes);
+        state.remaining_reads -= 1;
+        let bytes = authority.load_source_blob_bounded(digest, max_bytes)?;
+        state.remaining_bytes = state
+            .remaining_bytes
+            .saturating_sub(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        let bytes = Arc::new(bytes);
+        state.blobs.insert(digest, Arc::clone(&bytes));
+        Ok(bytes)
+    }
+
     /// The startup-pinned identity and storage capability behind this
     /// authority, for the surfaces that still take a binding.
     pub fn binding(&self) -> &LocalRepositoryAuthorityBinding {
-        &self.binding
+        self.binding
+            .as_ref()
+            .expect("hosted repository authority has no local binding")
     }
 
     /// The open authority to read this request from.
@@ -173,7 +328,13 @@ impl RequestRepositoryAuthority {
     /// re-check. Loading again is the only way to observe a commit that landed
     /// under a separate process since.
     pub(crate) fn open_fresh(&self) -> Result<Arc<ActiveRepositoryAuthority>> {
-        ActiveRepositoryAuthority::open(&self.binding).map(Arc::new)
+        let binding = self.binding.as_ref().ok_or_else(|| {
+            McpError::Context(
+                "graph authority gap: hosted repository authority cannot reopen through a local binding"
+                    .to_string(),
+            )
+        })?;
+        ActiveRepositoryAuthority::open(binding).map(Arc::new)
     }
 }
 
@@ -183,6 +344,7 @@ impl fmt::Debug for RequestRepositoryAuthority {
             .debug_struct("RequestRepositoryAuthority")
             .field("binding", &self.binding)
             .field("shared", &self.shared.is_some())
+            .field("hosted_source_budget", &self.hosted_source_budget.is_some())
             .finish()
     }
 }
@@ -198,11 +360,13 @@ impl fmt::Debug for RequestRepositoryAuthority {
 /// admission between them pairs one generation's bytes with another generation's
 /// provenance. Nothing serializes those two reads, so the only fix is to stop
 /// taking two.
-pub(crate) struct WorkspaceReadSample {
-    pub workspace: WorkspaceState,
-    /// The committed change `workspace.base_target` resolves to, resolved
-    /// against the same snapshot the workspace was read from.
-    pub base_change_id: SemanticChangeId,
+pub(crate) struct AuthorityHeadReadSample {
+    pub tree: ResolvedTree,
+    pub tree_hash: Hash256,
+    pub generation: u64,
+    pub label: String,
+    pub committed: bool,
+    pub source_change_id: SemanticChangeId,
 }
 
 /// How many times this process has opened repository authority.
@@ -264,13 +428,64 @@ impl ActiveRepositoryAuthority {
             ))
         })?;
         Ok(Self {
-            manager,
+            manager: ActiveRepositoryAuthorityManager::Local(manager),
             repository_id: binding.repository_id().clone(),
-            workspace_id: binding.workspace_id(),
+            workspace_id: Some(binding.workspace_id()),
+            hosted_head: None,
+        })
+    }
+
+    /// Bind an already-opened hosted authority to the exact default-ref tree
+    /// selected from that same publication.
+    pub fn hosted(
+        manager: RepositoryAuthorityManager<dyn StorageBackend>,
+        backend: Arc<dyn StorageBackend>,
+        repository_id: RepositoryId,
+        change_id: SemanticChangeId,
+        tree: ResolvedTree,
+        generation: u64,
+    ) -> Result<Self> {
+        let lease = manager.read_authority();
+        let metadata = lease.authority_metadata();
+        if metadata.repository_id != repository_id {
+            return Err(McpError::Context(format!(
+                "graph authority gap: hosted authority belongs to {}, not {}",
+                metadata.repository_id, repository_id
+            )));
+        }
+        if !lease.snapshot().changes.contains_key(&change_id) {
+            return Err(McpError::Context(format!(
+                "graph authority gap: hosted repository {} does not contain selected change {}",
+                repository_id, change_id
+            )));
+        }
+        drop(lease);
+        let tree_hash = kin_model::compute_resolved_tree_hash(&tree).map_err(|error| {
+            McpError::Context(format!(
+                "graph authority gap: cannot hash hosted repository {} tree at {}: {error}",
+                repository_id, change_id
+            ))
+        })?;
+        Ok(Self {
+            manager: ActiveRepositoryAuthorityManager::Hosted { manager, backend },
+            repository_id,
+            workspace_id: None,
+            hosted_head: Some(HostedAuthorityHead {
+                change_id,
+                tree,
+                tree_hash,
+                generation,
+            }),
         })
     }
 
     pub(crate) fn workspace(&self) -> Result<WorkspaceState> {
+        if self.workspace_id.is_none() {
+            return Err(McpError::Context(format!(
+                "graph authority gap: hosted repository {} has no local workspace",
+                self.repository_id
+            )));
+        }
         let lease = self.manager.read_authority();
         self.workspace_in(lease.authority_metadata())
     }
@@ -280,8 +495,18 @@ impl ActiveRepositoryAuthority {
     /// Prefer this over `workspace()` plus a separate change-id accessor
     /// anywhere both the tree and its provenance feed one answer: a single
     /// snapshot cannot straddle an admission, two snapshots can. See
-    /// [`WorkspaceReadSample`].
-    pub(crate) fn workspace_sample(&self) -> Result<WorkspaceReadSample> {
+    /// [`AuthorityHeadReadSample`].
+    pub(crate) fn workspace_sample(&self) -> Result<AuthorityHeadReadSample> {
+        if let Some(hosted) = &self.hosted_head {
+            return Ok(AuthorityHeadReadSample {
+                tree: hosted.tree.clone(),
+                tree_hash: hosted.tree_hash,
+                generation: hosted.generation,
+                label: format!("repository {}", self.repository_id),
+                committed: true,
+                source_change_id: hosted.change_id,
+            });
+        }
         let lease = self.manager.read_authority();
         let metadata = lease.authority_metadata();
         let workspace = self.workspace_in(metadata)?;
@@ -292,22 +517,32 @@ impl ActiveRepositoryAuthority {
             ))
         })?;
         let base_change_id = self.resolve_target_in(metadata, target)?;
-        Ok(WorkspaceReadSample {
-            workspace,
-            base_change_id,
+        Ok(AuthorityHeadReadSample {
+            tree: workspace.tree.clone(),
+            tree_hash: workspace.tree_hash,
+            generation: workspace.generation,
+            label: workspace.workspace_id.to_string(),
+            committed: workspace.base_tree_hash == Some(workspace.tree_hash),
+            source_change_id: base_change_id,
         })
     }
 
     fn workspace_in(&self, metadata: &PersistedRepositoryAuthority) -> Result<WorkspaceState> {
+        let workspace_id = self.workspace_id.ok_or_else(|| {
+            McpError::Context(format!(
+                "graph authority gap: hosted repository {} has no local workspace",
+                self.repository_id
+            ))
+        })?;
         metadata
             .workspaces
             .iter()
-            .find(|workspace| workspace.workspace_id == self.workspace_id)
+            .find(|workspace| workspace.workspace_id == workspace_id)
             .cloned()
             .ok_or_else(|| {
                 McpError::Context(format!(
                     "graph authority gap: repository {} has no workspace {}",
-                    self.repository_id, self.workspace_id
+                    self.repository_id, workspace_id
                 ))
             })
     }
@@ -426,8 +661,16 @@ impl ActiveRepositoryAuthority {
     }
 
     pub(crate) fn load_source_blob(&self, digest: kin_model::Hash256) -> Result<Vec<u8>> {
+        self.load_source_blob_bounded(digest, HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES)
+    }
+
+    pub(crate) fn load_source_blob_bounded(
+        &self,
+        digest: kin_model::Hash256,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
         self.manager
-            .load_source_blob(digest)
+            .load_source_blob_bounded(&self.repository_id, digest, max_bytes)
             .map_err(|error| {
                 McpError::Context(format!(
                     "graph authority gap: cannot load immutable source blob {digest}: {error}"

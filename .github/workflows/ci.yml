@@ -930,6 +930,21 @@ jobs:
       - name: Check the flake quarantine
         run: python3 scripts/check-quarantine.py
 
+      # ADDED here rather than moved out of `check`, deliberately, for two
+      # reasons. `check` carries `github.event_name != 'pull_request'`, so the
+      # thinned six-context pull-request gate never runs it and main failed its
+      # own kin-vfs compatibility guard with no pull-request check ever showing
+      # it (FIR-2887); this job runs on a pull request, so the answer now
+      # arrives while a commit can still change it. And `bin/kin-precheck`
+      # enumerates the gate list out of `check` by name and refuses with no
+      # tally when a script it expects is missing there, so moving the step
+      # would have dropped it from every lane's local gate at the same time. The
+      # cost of running it in both places is one API read on a push.
+      - name: Verify Kin/kin-vfs compatibility at the pinned release input
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/check-kin-vfs-compat.mjs
+
       # Byte-identical to the `check` job's clippy step, deliberately. The two
       # run on different events now and there is no event on which neither runs,
       # so the workspace is linted exactly once per event rather than twice.
