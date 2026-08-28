@@ -4170,6 +4170,56 @@ mod tests {
         );
     }
 
+    /// FIR-2820. The wiring itself, which nothing else covers.
+    ///
+    /// `refresh_untracked_reading` has two early returns and the unit tests
+    /// beside the probes cannot see either of them, because they call the probe
+    /// directly. This one drives the function on a daemon whose filesystem
+    /// ingestion is ON, which is every ordinary daemon, and requires it to take
+    /// a reading rather than declare the question inapplicable. Without it a
+    /// flag stuck true would silence every disclosure this fix exists to make
+    /// and no test would notice.
+    #[test]
+    fn an_ingesting_daemon_measures_rather_than_calling_the_question_inapplicable() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("unadmitted.rs"),
+            b"pub fn unadmitted() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        assert!(
+            !state.filesystem_reconcile_disabled(),
+            "this test is about the ordinary daemon and says so rather than assuming it"
+        );
+        let measured = refresh_untracked_reading(&state).expect("the walk runs");
+        assert!(
+            measured,
+            "a reading nothing has ever taken is due the first time anyone asks"
+        );
+
+        let report = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert!(
+            !report.untracked_observation_not_applicable,
+            "a daemon that admits from disk has a working copy worth measuring: {report:?}"
+        );
+        assert!(
+            report.untracked_observed_age_seconds.is_some(),
+            "the walk ran, so it stamped: {report:?}"
+        );
+        assert!(
+            report
+                .untracked_paths_sample
+                .iter()
+                .any(|path| path == "unadmitted.rs"),
+            "the reading names the file nothing admitted: {report:?}"
+        );
+    }
+
     /// Read the repository-authority generation one admission would advance.
     ///
     /// Every committed repository transaction advances it by exactly one, and

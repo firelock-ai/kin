@@ -574,6 +574,16 @@ pub struct GraphBehind {
     /// the working copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measured_age_seconds: Option<u64>,
+    /// Whether a walk produced `unadmitted_paths`.
+    ///
+    /// Always on the wire, unlike the age beside it, and that is the point. The
+    /// unmeasured disclosure reaches a machine consumer as
+    /// `unadmitted_paths: 0`, which is the exact number the object exists to say
+    /// means nothing, and the only other tell was the ABSENCE of the age above,
+    /// which is an inference from an absence rather than a reading. That is the
+    /// field-versus-prose split this whole ticket is about, one object over from
+    /// where it was fixed, so the block now states it positively.
+    pub measured: bool,
     /// One line an agent can act on without reading the counts.
     pub note: String,
 }
@@ -631,19 +641,21 @@ impl GraphBehind {
             since,
             sample,
             measured_age_seconds,
+            measured: measured_age_seconds.is_some(),
             note,
         })
     }
 
     /// Whether this object is the no-measurement disclosure rather than a count.
     ///
-    /// The count is the discriminator, and there is no third shape:
-    /// [`Self::from_health`] emits a zero only when nothing measured the working
-    /// copy, and returns `None` for every zero that something did. A consumer
-    /// asks this before sending a reader to `kin admit`, because there is no
-    /// path to admit.
+    /// Both halves, because they are two facts. [`Self::from_health`] emits a
+    /// zero only when nothing measured the working copy and returns `None` for
+    /// every zero that something did, so the pair is exactly the unmeasured
+    /// shape; a count with no stamp is still a count and still sends a reader to
+    /// `kin admit`. A consumer asks this before naming that remedy, because on
+    /// the unmeasured shape there is no path to admit.
     pub fn unmeasured(&self) -> bool {
-        self.unadmitted_paths == 0
+        !self.measured && self.unadmitted_paths == 0
     }
 
     fn describe(
@@ -2813,6 +2825,7 @@ mod tests {
             "reconcile": {
                 "untracked_path_count": 1,
                 "untracked_paths_sample": ["notekeeper/search.py"],
+                "untracked_observed_age_seconds": 0,
                 "last_admission_success_at": "2026-08-20T13:00:00Z",
             },
         }));
@@ -3031,6 +3044,53 @@ mod tests {
             "{}",
             durability.note
         );
+    }
+
+    /// FIR-2820, the delta review's finding 12. The disclosure has to be honest
+    /// on the wire, not only in Rust.
+    ///
+    /// The unmeasured shape reaches a machine consumer as `unadmitted_paths: 0`,
+    /// which is the exact number it exists to say means nothing, and the only
+    /// other tell was the ABSENCE of `measured_age_seconds`, which
+    /// `skip_serializing_if` drops. Inferring from an absence is what this whole
+    /// ticket is about, so the block states it positively and the serialized
+    /// form is what this test reads.
+    #[test]
+    fn the_serialized_behind_block_says_whether_anything_measured_it() {
+        let unmeasured = GraphBehind::from_health(&serde_json::json!({
+            "reconcile": { "untracked_path_count": 0 },
+        }))
+        .expect("an unstamped zero is a disclosure");
+        let wire = serde_json::to_value(&unmeasured).expect("the block serializes");
+        assert_eq!(
+            wire.get("measured"),
+            Some(&serde_json::json!(false)),
+            "a consumer branching on the count alone reads 0 here: {wire}"
+        );
+        assert_eq!(
+            wire.get("unadmitted_paths"),
+            Some(&serde_json::json!(0)),
+            "and that zero is still what it reads, which is why the flag is beside it: {wire}"
+        );
+        assert!(
+            wire.get("measured_age_seconds").is_none(),
+            "the age is absent on this shape, which is the inference the flag replaces: {wire}"
+        );
+
+        let measured = GraphBehind::from_health(&serde_json::json!({
+            "reconcile": {
+                "untracked_path_count": 2,
+                "untracked_observed_age_seconds": 4,
+            },
+        }))
+        .expect("a nonzero count is a disclosure");
+        let wire = serde_json::to_value(&measured).expect("the block serializes");
+        assert_eq!(
+            wire.get("measured"),
+            Some(&serde_json::json!(true)),
+            "the control: a walk did produce this count: {wire}"
+        );
+        assert_eq!(wire.get("measured_age_seconds"), Some(&serde_json::json!(4)));
     }
 
     /// The control that keeps the gate above from firing on every daemon whose
