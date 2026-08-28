@@ -23302,12 +23302,15 @@ mod tests {
             .as_u64()
             .unwrap_or_else(|| panic!("acquire must return a lease fence: {lease}"));
 
-        let proof = serde_json::json!({ "scope": scope, "token": token, "fence": fence });
+        // LeaseProof is serde(flatten) on both request types, so scope, token
+        // and fence sit at the top level rather than under a "lease" key.
         let (status, admitted) = publication_post(
             app.clone(),
             "/authority/publication-control/rollout/admit-reader",
             serde_json::json!({
-                "lease": proof,
+                "scope": scope,
+                "token": token,
+                "fence": fence,
                 "repositories": fleet,
                 "reader": {
                     "identity": READER_A,
@@ -23327,7 +23330,7 @@ mod tests {
         let (status, released) = publication_post(
             app.clone(),
             "/authority/publication-control/rollout/release",
-            serde_json::json!({ "lease": proof }),
+            serde_json::json!({ "scope": scope, "token": token, "fence": fence }),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "release must succeed: {released}");
