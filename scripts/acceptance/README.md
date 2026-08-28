@@ -272,6 +272,55 @@ dies of something that is not the network, the check reports UNREADABLE and says
 which reason it got, because a classifier that was never asked the question has
 not answered it.
 
+`working_copy_freshness_repro.py` covers what the product says about a working
+copy it has not read, which the v0.6.1 yardstick run caught three surfaces
+getting wrong at once (FIR-2820). The stranger wrote a module, did not commit it,
+and asked about a constant inside it: the durability block answered "38 entities,
+0 uncommitted", `kin status` answered "12 artifacts, matching its base change",
+and `find_references` answered `safe_to_conclude_absent: true` with
+`structural_authoritative`, while `grep -n` found the constant on two lines. One
+reading sits behind all three. `untracked_path_count` is a record a complete
+reconcile pass leaves behind, and an explicit seam records it EMPTY because the
+seam admitted everything, so a zero written by the last commit answers for the
+rest of the daemon's life and cannot be told from a zero measured this instant.
+
+The fixture reaches that state through a documented product rule rather than a
+race, which is what lets it run on a loaded runner. The daemon's startup
+catch-up walks with `scan_repository_modified_since`, which declines a leaf
+inside a directory graph truth has never met, on the grounds that a directory
+arriving whole is a clone as often as it is authored work. A file written into a
+NEW directory while the daemon is down is therefore never admitted and never
+observed, for as long as nothing touches it again, and that walk's own comment
+says such content "is exactly what the behind disclosure counts and names".
+
+Check `durability` requires the durability block not to read `recorded` with
+`live_only_entities: 0` over that working copy, and to name how many host paths
+it cannot see. It asserts the fields and not only the note, because the fix
+before it withdrew the prose and left `recorded` and a zero standing in exactly
+the two places a caller branches on. Check `status` requires `kin status` to name
+the file with the age of the measurement, since every other line that command
+prints is authority truth and authority cannot see the file at all. Check
+`absence` requires the focal miss not to certify, and its reason to name
+`graph_behind_working_tree` rather than some other gap, because an answer
+withheld for the wrong reason sends the reader to the wrong lever.
+
+Check `committed` is the control and it carries all three: once the tree is
+committed the clean durability read is back with its zero intact, `kin status`
+reports nothing untracked, and a name nothing declares is still authoritatively
+absent. Without it the other three are satisfied by a product that qualifies
+every answer it gives, which is the failure mode that would make this fix
+worthless without ever failing a test.
+
+`--self-test` carries one fixture per assertion, not one per grader, and the
+distinction was bought. The first version's two durability fixtures both read
+`recorded` AND `live_only_entities: 0`, so deleting either field check left the
+other one catching the same input a step later and the self-test stayed green:
+three of four grader mutations survived, and the claim above that this suite
+asserts the fields rather than the note was unfalsifiable for either field
+alone. Every assertion now has an input only it can catch, so deleting a
+defence turns the suite red and nothing else does. Adding inputs is the fix for
+that class; deleting the second assertion never is.
+
 `eject_journal_repro.py` covers the eject archive round trip the rc0552n green
 stranger lost on 0.5.52 (FIR-2664). A finished `kin eject` left its journal in
 the archived `kin/` at the detach phase, `cp -r` of that archive back to `.kin`
@@ -368,6 +417,10 @@ python3 scripts/acceptance/eject_journal_repro.py \
 python3 scripts/acceptance/verdict_limits_repro.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/verdict_limits.json --verbose
+
+python3 scripts/acceptance/working_copy_freshness_repro.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/working_copy_freshness.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer

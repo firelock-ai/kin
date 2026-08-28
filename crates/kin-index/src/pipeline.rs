@@ -145,6 +145,7 @@ impl IndexPipeline {
             imports,
             tests,
             parse_state,
+            parsed_call_sites,
         } = output;
 
         let role = classify_file_role(&file_id.0);
@@ -170,7 +171,12 @@ impl IndexPipeline {
             })
             .collect();
         attach_file_context_metadata(&mut entities, file_id, &imports);
-        attach_file_reference_parse_counts(&mut entities, &extracted_relations, &imports);
+        attach_file_reference_parse_counts(
+            &mut entities,
+            &extracted_relations,
+            &imports,
+            parsed_call_sites,
+        );
         attach_equivalence_class(&mut entities, &tree, source, language);
         if language == LanguageId::Go {
             kin_parser::attach_go_command_effect_contract_metadata(&tree, source, &mut entities);
@@ -298,6 +304,7 @@ impl IndexPipeline {
             imports,
             tests,
             parse_state,
+            parsed_call_sites,
         } = output;
 
         // Convert extracted entities to model entities.
@@ -324,7 +331,12 @@ impl IndexPipeline {
             })
             .collect();
         attach_file_context_metadata(&mut entities, file_id, &imports);
-        attach_file_reference_parse_counts(&mut entities, &extracted_relations, &imports);
+        attach_file_reference_parse_counts(
+            &mut entities,
+            &extracted_relations,
+            &imports,
+            parsed_call_sites,
+        );
         attach_equivalence_class(&mut entities, &tree, &source, language);
         if language == LanguageId::Go {
             kin_parser::attach_go_command_effect_contract_metadata(&tree, &source, &mut entities);

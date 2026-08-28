@@ -176,13 +176,20 @@ fn a_file_with_a_broken_top_level_statement_cannot_certify_its_enumeration() {
 /// Two things are asserted and they are different claims. The first is the
 /// finding itself: the call produces no entity-level `Calls` edge, so
 /// `find_references("note_body")` sees nothing. The second is the one the
-/// certification gate rests on: the parser withholds the file's call-site count
-/// when it could not represent a call, and that withheld count is the signal
-/// `kin_mcp::caller_arrival` reads to decline authority. Without this second
-/// assertion the gate is tested only against a hand-built store and could be
-/// keyed on a signal the real path never emits.
+/// certification gate rests on: the file reports how many call sites it holds,
+/// which is the number `kin_mcp::caller_arrival` subtracts the graph's resolved
+/// edges from. Without this second assertion the gate is tested only against a
+/// hand-built store and could be keyed on a signal the real path never emits.
+///
+/// This arm asserted the opposite until FIR-2828: the extractor used to
+/// withhold the count from any file whose call extraction it could not fully
+/// represent, and the gate keyed on that absence. The absence was the right
+/// refusal for the wrong number, since the count it withheld was taken off the
+/// relations it emitted and understated any file holding a call it could not
+/// name. Counting the call sites instead makes the number safe to report, and a
+/// count that is present is the only one the gate can do arithmetic with.
 #[test]
-fn an_absolute_module_import_attribute_call_leaves_the_files_call_count_withheld() {
+fn an_absolute_module_import_attribute_call_still_counts_the_files_call_sites() {
     let caller = index(
         "tests/test_storage.py",
         "from notekeeper import storage\n\n\ndef test_bodies_round_trip(db, note):\n    assert \"x\" in storage.note_body(db, note.id)\n",
@@ -205,22 +212,26 @@ fn an_absolute_module_import_attribute_call_leaves_the_files_call_count_withheld
         "the call must carry its receiver; the receiver is what the failing tier keys on"
     );
 
-    // The signal the certification gate reads. The extractor removes this key
-    // from every entity of a file whose call extraction it could not represent,
-    // and a reader treats an absent count as unmeasured rather than as zero.
-    // `kin_mcp::caller_arrival` reads exactly this absence.
+    // The number the certification gate subtracts from. It is stamped on every
+    // entity of the file, because a consumer settles the file on whichever one
+    // it reads first, and it counts the call sites the file holds rather than
+    // the relations extraction emitted: this file writes one call, and the
+    // linker records no entity-level edge for it, so the gate must see one
+    // parsed site against zero edges and decline.
     assert!(
         !caller.entities.is_empty(),
         "the fixture must produce entities, or the count would be absent for the wrong reason"
     );
     for entity in &caller.entities {
-        assert!(
-            !entity
+        assert_eq!(
+            entity
                 .metadata
                 .extra
-                .contains_key(kin_parser::FILE_PARSED_CALL_SITES_KEY),
-            "a file whose call extraction was incomplete must withhold its call-site count, \
-             because a zero there reads as a fully accounted file: {} carries {:?}",
+                .get(kin_parser::FILE_PARSED_CALL_SITES_KEY)
+                .and_then(serde_json::Value::as_u64),
+            Some(1),
+            "every entity of the file must carry the file's one call site, or the gate has \
+             nothing to subtract the graph's edges from: {} carries {:?}",
             entity.name,
             entity
                 .metadata
