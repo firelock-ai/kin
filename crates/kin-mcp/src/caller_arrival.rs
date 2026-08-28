@@ -388,13 +388,22 @@ fn file_entities<G: GraphStore>(
 /// edge carries a span the answer is exactly what it was before, which is why a
 /// store that records no spans reads no differently.
 ///
+/// [`kin_model::relation::RelationEvidence::occurrence_count`] is read rather
+/// than ignored, and ignoring it would have been this whole ticket in
+/// miniature: it says how many equivalent occurrences the extractor COLLAPSED
+/// into one record, so a record standing for three of them is three sites
+/// wearing one span. The count for a distinct span is the largest any record
+/// claims for it, because two edges sharing a span and a collapse count
+/// describe one set of occurrences fanned out, not two sets.
+///
 /// `None` means the relation index could not be read, which is not zero.
 fn resolved_call_sites<G: GraphStore>(
     store: &G,
     file: &FilePathId,
     entity_ids: &[(EntityId, kin_model::EntityKind)],
 ) -> Option<u64> {
-    let mut sites: HashSet<(usize, usize)> = HashSet::new();
+    let mut sites: std::collections::HashMap<(usize, usize), u64> =
+        std::collections::HashMap::new();
     let mut unjoinable = 0u64;
     for (entity_id, _) in entity_ids {
         let relations = store.get_all_relations_for_entity(entity_id).ok()?;
@@ -402,13 +411,17 @@ fn resolved_call_sites<G: GraphStore>(
             relation.kind == RelationKind::Calls && relation.src.as_entity() == Some(*entity_id)
         }) {
             let mut joined = false;
-            for span in relation
-                .evidence
-                .iter()
-                .filter_map(|evidence| evidence.source_span.as_ref())
-                .filter(|span| &span.file == file)
-            {
-                sites.insert((span.start_byte, span.end_byte));
+            for evidence in &relation.evidence {
+                let Some(span) = evidence
+                    .source_span
+                    .as_ref()
+                    .filter(|span| &span.file == file)
+                else {
+                    continue;
+                };
+                let collapsed = u64::from(evidence.occurrence_count).max(1);
+                let site = sites.entry((span.start_byte, span.end_byte)).or_insert(0);
+                *site = (*site).max(collapsed);
                 joined = true;
             }
             if !joined {
@@ -416,7 +429,7 @@ fn resolved_call_sites<G: GraphStore>(
             }
         }
     }
-    Some(sites.len() as u64 + unjoinable)
+    Some(sites.values().sum::<u64>() + unjoinable)
 }
 
 /// One file's own call-site accounting, the same arithmetic
@@ -1470,11 +1483,27 @@ mod tests {
     /// `start_byte` is what separates two edges minted from ONE call site from
     /// two edges minted from two, which is the whole subject of the fan-out arm.
     fn call_edge_at(src: &Entity, dst: &Entity, file: &str, start_byte: usize) -> Relation {
+        call_edge_collapsing(src, dst, file, start_byte, 1)
+    }
+
+    /// The same edge whose one evidence record stands for `occurrences`
+    /// equivalent call sites the extractor folded together.
+    ///
+    /// Built from [`RelationEvidence::default`] rather than field by field, so a
+    /// field added to the evidence record cannot leave this helper pinned to a
+    /// stale shape while still compiling.
+    fn call_edge_collapsing(
+        src: &Entity,
+        dst: &Entity,
+        file: &str,
+        start_byte: usize,
+        occurrences: u32,
+    ) -> Relation {
         Relation {
             id: RelationId::from_content(
                 &src.id.0.to_string(),
                 &dst.id.0.to_string(),
-                &format!("Calls@{start_byte}"),
+                &format!("Calls@{start_byte}x{occurrences}"),
             ),
             evidence: vec![RelationEvidence {
                 source_span: Some(SourceSpan {
@@ -1486,10 +1515,8 @@ mod tests {
                     end_line: start_byte as u32,
                     end_col: 8,
                 }),
-                parser_rule: None,
-                token: None,
-                source_path: None,
-                resolved_path: None,
+                occurrence_count: occurrences,
+                ..RelationEvidence::default()
             }],
             ..edge(RelationKind::Calls, src, dst)
         }
@@ -1579,6 +1606,49 @@ mod tests {
             arrival.state,
             ArrivalState::Accounted,
             "two spanless edges still count as two: {:?}",
+            arrival.unaccounted
+        );
+    }
+
+    /// A record standing for several folded occurrences is several sites.
+    ///
+    /// The extractor may fold equivalent call sites into one evidence record and
+    /// say how many through `occurrence_count`. A join keyed on the span alone
+    /// would read three occurrences as one site and report a shortfall that is
+    /// an artifact of the fold rather than a fact about the code.
+    #[test]
+    fn a_folded_evidence_record_counts_every_occurrence_it_stands_for() {
+        let store = InMemoryGraph::new();
+        let focal = entity_in("note_body", FOCAL_FILE, Some(0));
+        let focal_module = entity_in("storage", FOCAL_FILE, Some(0));
+        let find_note = entity_in("find_note", FOCAL_FILE, Some(0));
+        let caller_module = entity_in("test_storage", CALLER_FILE, Some(3));
+        let caller = entity_in("test_bodies_round_trip", CALLER_FILE, Some(3));
+        for entity in [&focal, &focal_module, &find_note, &caller_module, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&edge(RelationKind::Imports, &caller_module, &focal_module))
+            .unwrap();
+        // Three parsed sites: two folded into one record, and one on its own.
+        store
+            .upsert_relation(&call_edge_collapsing(
+                &caller,
+                &find_note,
+                CALLER_FILE,
+                100,
+                2,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&call_edge_at(&caller, &focal_module, CALLER_FILE, 300))
+            .unwrap();
+
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Accounted,
+            "two folded occurrences plus one site account for all three parsed sites: {:?}",
             arrival.unaccounted
         );
     }

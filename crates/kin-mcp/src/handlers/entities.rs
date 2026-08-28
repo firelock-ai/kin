@@ -5566,6 +5566,105 @@ mod tests {
         );
     }
 
+    /// The same agreement on the seeded MCP surface, the fourth and last
+    /// dead-code consumer.
+    ///
+    /// One mutant per consuming surface is what this repair is graded on: a
+    /// surface quietly reverting to inbound-edge certification has to go red on
+    /// its OWN assertion rather than on a sibling's.
+    #[test]
+    fn the_seeded_tool_publishes_the_shared_absence_verdict_on_every_row() {
+        let store = InMemoryGraph::new();
+        let mut dead_target = make_entity("probe_seeded_target", "src/store.rs");
+        dead_target.metadata.extra.insert(
+            kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+            serde_json::json!(0),
+        );
+        let mut store_module = make_entity("store", "src/store.rs");
+        store_module.kind = EntityKind::Module;
+        let mut caller = make_entity("probe_seeded_caller", "src/cli.rs");
+        caller.metadata.extra.insert(
+            kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+            serde_json::json!(2),
+        );
+        for entity in [&dead_target, &store_module, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation(
+                caller.id,
+                store_module.id,
+                RelationKind::References,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(
+                caller.id,
+                store_module.id,
+                RelationKind::Calls,
+            ))
+            .unwrap();
+
+        let args = HashMap::from([(
+            "query".to_string(),
+            serde_json::json!("probe_seeded_target"),
+        )]);
+        let payload = parsed_response(&handle_find_dead_code_seeded(&args, &store).unwrap());
+        let row = payload["candidates"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "probe_seeded_target"))
+            .unwrap_or_else(|| panic!("the seed must match the candidate: {payload}"));
+
+        let expected = crate::caller_arrival::absence_gap(&store, &dead_target)
+            .map(|(factor, reason)| format!("{factor}: {reason}"));
+        assert!(
+            expected.is_some(),
+            "this fixture must be one the shared rule refuses, or the agreement below holds \
+             for the wrong reason"
+        );
+        assert_eq!(
+            row["absence_limiting_factor"],
+            serde_json::json!(expected),
+            "the seeded tool and the shared rule read one store about one entity: {row}"
+        );
+    }
+
+    /// Its control: a store that accounts for its arrivals publishes the field
+    /// present and null, so a surface that stopped publishing cannot pass here
+    /// either.
+    #[test]
+    fn the_seeded_tool_publishes_a_null_factor_when_arrival_is_accounted() {
+        let store = InMemoryGraph::new();
+        let mut dead_target = make_entity("probe_seeded_clean", "src/store.rs");
+        dead_target.metadata.extra.insert(
+            kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+            serde_json::json!(0),
+        );
+        store.upsert_entity(&dead_target).unwrap();
+        seed_cross_file_call_witness(&store);
+
+        let args = HashMap::from([("query".to_string(), serde_json::json!("probe_seeded_clean"))]);
+        let payload = parsed_response(&handle_find_dead_code_seeded(&args, &store).unwrap());
+        let row = payload["candidates"]
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["name"] == "probe_seeded_clean"))
+            .unwrap_or_else(|| panic!("the seed must match the candidate: {payload}"));
+        assert_eq!(
+            crate::caller_arrival::absence_gap(&store, &dead_target),
+            None,
+            "this control is only a control while the shared rule certifies here"
+        );
+        assert!(
+            row.get("absence_limiting_factor").is_some(),
+            "the key is written even when there is no caveat: {row}"
+        );
+        assert_eq!(
+            row["absence_limiting_factor"],
+            serde_json::Value::Null,
+            "a row the graph can account for carries no caveat: {row}"
+        );
+    }
+
     /// The control, and the half that stops the arm above from passing over a
     /// tool that qualifies every row: a store that accounts for its arrivals
     /// publishes the field as null.
