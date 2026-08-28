@@ -65,6 +65,20 @@ pub enum KinError {
     #[error("incompatible .kin/ version: found v{found}, this binary requires v{supported}")]
     IncompatibleVersion { found: u32, supported: u32 },
 
+    /// The conversion was turned away at phase 1 because it forecasts needing
+    /// more memory than this process can read as a ceiling.
+    ///
+    /// Carries no detail on purpose. The numbers, the ceiling and both remedies
+    /// have already been written to stderr as their own lines, in the same
+    /// register and through the same pipe-safe writer as the killed-conversion
+    /// post-mortem, and repeating them inside an `anyhow` cause chain would
+    /// print the whole paragraph a second time under a `Caused by:` heading.
+    #[error(
+        "not enough memory for this conversion; the lines above name the forecast, the ceiling \
+         and what to do about it"
+    )]
+    ConversionBudgetExceeded,
+
     #[error("{0}")]
     Other(String),
 }

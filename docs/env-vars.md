@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (500 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (501 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -240,6 +240,12 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_INFER_STAGE_TIMINGS` | string | *(unset)* | diagnostic | kin-infer splits batched-forward wall time into the device encode/readback stage and the host pooling tail; any present value including '0' enables it, and it is zero-cost while unset |
 | `KIN_INFER_STEEL` | bool | *(unset)* | operational | kin-infer double-buffered K-loop MMA GEMM, numerically identical to the single-buffer path (same fp32 accumulate and per-fragment reduction order, only when the loads are issued differs); unset engages it under the throughput and interactive profiles on Metal, and an explicit 1/0 overrides in either direction |
 | `KIN_INFER_ZERO_ALL` | bool | false | diagnostic | kin-infer zeroes every acquired Metal buffer and its size-class tail so no read can observe stale recycled bytes; only 1/true/yes/on enable it, and the default path is byte-identical |
+
+## Init
+
+| Variable | Kind | Default | Sensitivity | Description |
+| --- | --- | --- | --- | --- |
+| `KIN_INIT_MEMORY_CEILING_BYTES` | usize | *(unset)* | operational | the memory ceiling `kin init` judges a conversion's forecast peak against, in bytes, in place of the container cap or host memory it would otherwise measure. Two audiences share one lever: a machine whose real ceiling Kin reads wrongly can state it, and an operator who has judged the forecast wrong for their repository can get past the refusal without editing anything. An operator value wins outright and is not clamped; zero or an unparseable value is refused rather than ignored, because silently converting under a ceiling nobody set is how a conversion gets killed with no warning. It moves only the up-front refusal and changes nothing about what a conversion holds |
 
 ## Storage
 
