@@ -409,8 +409,18 @@ def verdict_problems(payload, gap):
         gate = inputs.get("absence_gate") if isinstance(inputs, dict) else None
         if gate != "inconclusive":
             problems.append("verdict.inputs.absence_gate is %r, wanted 'inconclusive'" % (gate,))
-        if not isinstance(factor, str) or "degraded" not in factor or FLAG not in factor:
-            problems.append("verdict.limiting_factor does not name the hydration gap: %r" % (factor,))
+        # "degraded" only, and that is a fact about the producer rather than a
+        # concession. `Envelope::negative_trust` returns one fixed sentence for
+        # every degraded signal, "degraded: the daemon reported a degraded
+        # signal, so the index may not reflect current truth", and never names
+        # which flag; naming them is `Degraded::active_labels`, which is what
+        # reaches `negative.degraded_signals` and `completeness.limits`. Both are
+        # asserted above, so the flag-specific evidence is still required, from
+        # the two fields that actually carry it.
+        if not isinstance(factor, str) or "degraded" not in factor:
+            problems.append(
+                "verdict.limiting_factor does not blame a degraded signal: %r" % (factor,)
+            )
         if completeness.get("bound") != "at_least":
             problems.append(
                 "completeness.bound is %r, wanted 'at_least'" % (completeness.get("bound"),)
@@ -787,25 +797,40 @@ class Suite(object):
             raise RuntimeError("%s carries no repo_id in its manifest" % repo)
         return repo_id
 
-    def transfer_endpoint(self, repo_id):
-        """The base URL this KIN_HOME's registry serves `repo_id` on.
+    def transfer_endpoint(self, repo_path, attempts=6, pause=3):
+        """The base URL this KIN_HOME's registry serves `repo_path` on.
 
-        Read out of `kin daemon status`, which is where an operator reads it,
-        rather than out of a registry file this suite would then be the only
-        reader of.
+        Matched on the repository ROOT the daemon line prints, not on the
+        repository identity. The registry's `route` is a local route label such
+        as `local-d91e230c53b7b8da` and is never the repository UUID, so a
+        lookup keyed on identity finds nothing and reads exactly like a daemon
+        that never came up.
+
+        Retried because registration lands a moment after the command that
+        spawned the worker returns, and a single read one second later is a race
+        this suite lost on its first run.
         """
-        rc, out = self.kin_run(["daemon", "status"], timeout=300)
-        if rc != 0:
-            raise RuntimeError("kin daemon status exited %d: %s" % (rc, tail(out)))
-        route = None
-        for line in out.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("route:"):
-                route = stripped.split(":", 1)[1].strip()
-            elif stripped.startswith("endpoint:") and route == repo_id:
-                return stripped.split(":", 1)[1].strip()
+        root = os.path.realpath(repo_path)
+        out = ""
+        for attempt in range(attempts):
+            rc, out = self.kin_run(["daemon", "status"], timeout=300)
+            if rc != 0:
+                raise RuntimeError("kin daemon status exited %d: %s" % (rc, tail(out)))
+            in_block = False
+            for line in out.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("endpoint:"):
+                    if in_block:
+                        return stripped.split(":", 1)[1].strip()
+                elif not line.startswith("    "):
+                    # A daemon's own line, which ends with its repository root.
+                    in_block = os.path.realpath(stripped.split("  ")[-1].strip()) == root
+            if attempt + 1 < attempts:
+                self.kin_in(repo_path, ["graph", "status"])
+                time.sleep(pause)
         raise RuntimeError(
-            "no daemon endpoint is registered for %s; status was: %s" % (repo_id, tail(out))
+            "no daemon endpoint is registered for %s after %d reads; status was: %s"
+            % (root, attempts, tail(out))
         )
 
     def native_transfer(self):
@@ -856,7 +881,7 @@ class Suite(object):
         rc, out = self.kin_in(source, ["graph", "status"])
         if rc != 0:
             raise RuntimeError("the source daemon did not come up: %s" % tail(out))
-        endpoint = self.transfer_endpoint(repo_id)
+        endpoint = self.transfer_endpoint(source)
 
         rc, out = self.kin_in(destination, ["pull", "--url", endpoint, "--json"])
         if rc != 0:
@@ -1696,8 +1721,10 @@ def self_test():
         rejects("verdict gap moving %s" % label, verdict_problems(one_field(mutate), gap=True))
 
     unnamed = retrieval_payload(True)
-    unnamed["_kin"]["verdict"]["limiting_factor"] = "degraded signals something_else"
-    rejects("verdict gap blaming another signal", verdict_problems(unnamed, gap=True))
+    unnamed["_kin"]["verdict"]["limiting_factor"] = (
+        "coverage_unknown: embedding coverage was not reported"
+    )
+    rejects("verdict gap blaming a non-degraded cause", verdict_problems(unnamed, gap=True))
 
     unblamed = retrieval_payload(True)
     unblamed["_kin"]["verdict"]["limiting_factor"] = None
