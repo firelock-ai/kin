@@ -4,7 +4,7 @@
 
 """Prove trace cuts preserve and explain the branch the caller asked for.
 
-FIR-2781 established checks 0 through 3. The v0.6.0 stranger run walked `Session.send` on a converted
+The original suite established checks 0 through 3. The v0.6.0 stranger run walked `Session.send` on a converted
 `psf/requests` with `limit_per_step: 4` and got a chain that stops two hops
 short of where `verify` goes. The per-step cap had discarded eleven of fifteen
 callees, `HTTPAdapter.send` among them, and the response said so only as a count
@@ -162,7 +162,13 @@ SESSIONS_FILE = "sessions.py"
 ADAPTERS_FILE = "adapters.py"
 # Small enough to force branch narrowing on this body-free fixture, while still
 # leaving room for the protected two-hop branch plus the bounder's disclosure.
-RESPONSE_BUDGET = 4000
+# Calibrated against the built binaries on 2026-08-28 by sweeping 3000 to 11000: below 4500
+# nothing separates the arms, at 7000 and above both keep the target, and 5500 to 6500 is the
+# plateau where the named arm keeps it by branch narrowing and the unnamed arm loses it.
+RESPONSE_BUDGET = 6000
+# The synthetic graders run against small payloads, so they get their own budget. The real
+# constant above is the one the product is judged on.
+SELFTEST_RESPONSE_BUDGET = 1300
 WIDE_RESPONSE_BUDGET = 60000
 ELISION_DEPTH = 3
 ELISION_LIMIT = 25
@@ -321,8 +327,17 @@ def grade_a_complete_walk_is_not_qualified(payload):
             "cannot tell an unaffected walk from one that reported nothing"
             % (", ".join(present),)
         )
-    if not chain_names(payload):
+    names = chain_names(payload)
+    if not names:
         return UNREADABLE, "the control walk returned no chain, so it grades nothing"
+    # Absence of the qualifying keys is only good news on a walk that actually reached the
+    # crossing hop. A walk that returned one same-file callee and silently dropped the hop
+    # carries none of these keys either, and that is the loss this suite exists to catch.
+    if CROSSING_HOP not in names:
+        return FAIL, (
+            "the uncapped walk does not contain %s, so an unqualified answer here is the "
+            "silent loss rather than a complete walk: %r" % (CROSSING_HOP, names)
+        )
     return PASS, "no clip, no spine key, no disclosure on a walk the cap never cut"
 
 
@@ -464,7 +479,8 @@ def bounded_subset_problem(payload, wide):
         source = wide_by_identity.get(identity)
         if source is None:
             return "bounded entity_id %s was not discovered by the wide arm" % identity
-        for key in ("entity_name", "role"):
+        for key in ("entity_name", "role", "reference_lines",
+                    "reference_lines_absent_reason"):
             if row.get(key) != source.get(key):
                 return "bounded entity %s changed %s from %r to %r" % (
                     identity, key, source.get(key), row.get(key),
@@ -514,14 +530,23 @@ def wide_premise_problem(payload):
     return problem
 
 
-def bounded_elision_problem(payload, wide):
-    bounds = graph_bounds_problem(payload, RESPONSE_BUDGET)
+def bounded_elision_problem(payload, wide, budget):
+    bounds = graph_bounds_problem(payload, budget)
     if bounds:
         return "bounded bounds drifted: " + bounds
     rendered_chars = pretty_serialized_bytes(payload)
-    if rendered_chars > RESPONSE_BUDGET:
+    if rendered_chars > budget:
         return "the bounded response serializes to %d bytes, above its %d-byte budget" % (
-            rendered_chars, RESPONSE_BUDGET,
+            rendered_chars, budget,
+        )
+    # The cut has to be attributable to the budget. A discovery universe that already
+    # fits cannot overflow it, so a response that trims anyway trimmed for some other
+    # reason and labelled it response_budget.
+    wide_chars = pretty_serialized_bytes(wide)
+    if wide_chars <= budget:
+        return (
+            "the wide discovery serializes to %d bytes, inside the %d-byte budget, so nothing "
+            "here can be attributed to the response budget" % (wide_chars, budget)
         )
     clips = fanout_clip_problem(payload)
     if clips:
@@ -529,6 +554,8 @@ def bounded_elision_problem(payload, wide):
     chain = payload.get("chain")
     if not isinstance(chain, list):
         return "the response carries no chain array"
+    if not chain:
+        return "the bounded arm returned no steps at all, so it answers nothing"
     wide_chain = wide.get("chain")
     if not isinstance(wide_chain, list):
         return "the wide response carries no chain array"
@@ -573,10 +600,15 @@ def bounded_elision_problem(payload, wide):
     problem = parentage_problem(payload, require_target=False)
     if problem:
         return problem
+    # The suite claims each SURVIVING step carries its call sites. Grading that only on
+    # the wide arm proves it on a response nothing cut, which is the opposite of the claim.
+    problem = reference_line_contract_problem(payload)
+    if problem:
+        return problem
     return bounded_subset_problem(payload, wide)
 
 
-def grade_named_target_survives_response_budget(wide, bounded):
+def grade_named_target_survives_response_budget(wide, bounded, budget):
     if not isinstance(wide, dict) or not isinstance(bounded, dict):
         return UNREADABLE, "the wide or bounded response is not an object"
     if not isinstance(wide.get("chain"), list) or not isinstance(bounded.get("chain"), list):
@@ -584,7 +616,7 @@ def grade_named_target_survives_response_budget(wide, bounded):
     problem = wide_premise_problem(wide)
     if problem:
         return FAIL, "the wide discovery premise is not sound: " + problem
-    problem = bounded_elision_problem(bounded, wide)
+    problem = bounded_elision_problem(bounded, wide, budget)
     if problem:
         return FAIL, "the targeted bounded arm is not a coherent response cut: " + problem
     if bounded.get("target_name") != ELISION_TARGET:
@@ -600,15 +632,16 @@ def grade_named_target_survives_response_budget(wide, bounded):
     )
 
 
-def grade_unnamed_response_budget_drops_the_target(wide, targeted, unnamed):
+def grade_unnamed_response_budget_drops_the_target(wide, targeted, unnamed, budget):
     if not all(isinstance(payload, dict) for payload in (wide, targeted, unnamed)):
         return UNREADABLE, "one of the three response arms is not an object"
     if not all(isinstance(payload.get("chain"), list) for payload in (wide, targeted, unnamed)):
         return UNREADABLE, "one of the three response arms carries no readable chain"
-    target_status, target_detail = grade_named_target_survives_response_budget(wide, targeted)
+    target_status, target_detail = grade_named_target_survives_response_budget(
+        wide, targeted, budget)
     if target_status != PASS:
         return FAIL, "the paired targeted arm is not a valid control: " + target_detail
-    problem = bounded_elision_problem(unnamed, wide)
+    problem = bounded_elision_problem(unnamed, wide, budget)
     if problem:
         return FAIL, "the unnamed bounded arm is not a coherent response cut: " + problem
     names = chain_names(unnamed)
@@ -930,7 +963,8 @@ def check_the_named_target_survives_response_elision(suite):
     wide, targeted, _ = suite.elision_arms()
     if wide is None or targeted is None:
         return Result("4", UNREADABLE, "the wide or targeted bounded walk returned nothing readable")
-    status, detail = grade_named_target_survives_response_budget(wide, targeted)
+    status, detail = grade_named_target_survives_response_budget(
+        wide, targeted, RESPONSE_BUDGET)
     return Result("4", status, "The named branch survives response elision. " + detail)
 
 
@@ -938,7 +972,8 @@ def check_the_unnamed_budget_drops_the_same_target(suite):
     wide, targeted, unnamed = suite.elision_arms()
     if wide is None or targeted is None or unnamed is None:
         return Result("5", UNREADABLE, "one of the three response-budget arms returned nothing readable")
-    status, detail = grade_unnamed_response_budget_drops_the_target(wide, targeted, unnamed)
+    status, detail = grade_unnamed_response_budget_drops_the_target(
+        wide, targeted, unnamed, RESPONSE_BUDGET)
     return Result("5", status, "The unnamed control loses the same branch. " + detail)
 
 
@@ -992,7 +1027,20 @@ CLIPPED = {
     }],
 }
 
+# One same-file callee, no crossing hop, and nothing said about it. This is the silent
+# loss the suite exists to catch, so it is a must-FAIL arm for check 3 rather than the
+# unaffected walk it used to stand in for.
 CLEAN = {"chain": [{"entity_name": "get_adapter", "parent_step": 0}], "degradations": []}
+# A walk the cap never cut: it reached the crossing hop and carries none of the
+# qualifying keys, which is the only shape that earns an unqualified answer.
+COMPLETE = {
+    "chain": [
+        {"entity_name": "get_adapter", "parent_step": 0},
+        {"entity_name": CROSSING_HOP, "parent_step": 0},
+        {"entity_name": ELISION_TARGET, "parent_step": 2},
+    ],
+    "degradations": [],
+}
 WIDE_ELISION = {
     "depth": ELISION_DEPTH,
     "direction": "calls",
@@ -1023,13 +1071,15 @@ TARGETED_ELISION = {
     "depth": ELISION_DEPTH,
     "direction": "calls",
     "limit_per_step": ELISION_LIMIT,
-    "max_response_chars": RESPONSE_BUDGET,
+    "max_response_chars": SELFTEST_RESPONSE_BUDGET,
     "bodies_included": False,
     "chain": [
         {"step": 2, "parent_step": 0, "entity_id": "entity-send-via-adapter",
-         "entity_name": CROSSING_HOP, "role": "callee"},
+         "entity_name": CROSSING_HOP, "role": "callee",
+         "reference_lines": [SESSION_ADAPTER_CALL_LINE], "reference_lines_absent_reason": None},
         {"step": 4, "parent_step": 2, "entity_id": "entity-cert-verify",
-         "entity_name": ELISION_TARGET, "role": "callee"},
+         "entity_name": ELISION_TARGET, "role": "callee",
+         "reference_lines": [ADAPTER_CERT_CALL_LINE], "reference_lines_absent_reason": None},
     ],
     "total_steps": 2,
     "target_name": ELISION_TARGET,
@@ -1046,15 +1096,18 @@ UNNAMED_ELISION = {
     "depth": ELISION_DEPTH,
     "direction": "calls",
     "limit_per_step": ELISION_LIMIT,
-    "max_response_chars": RESPONSE_BUDGET,
+    "max_response_chars": SELFTEST_RESPONSE_BUDGET,
     "bodies_included": False,
     "chain": [
         {"step": 1, "parent_step": 0, "entity_id": "entity-get-adapter",
-         "entity_name": "get_adapter", "role": "callee"},
+         "entity_name": "get_adapter", "role": "callee",
+         "reference_lines": [1], "reference_lines_absent_reason": None},
         {"step": 3, "parent_step": 1, "entity_id": "entity-normalize-adapter",
-         "entity_name": "normalize_adapter", "role": "callee"},
+         "entity_name": "normalize_adapter", "role": "callee",
+         "reference_lines": [2], "reference_lines_absent_reason": None},
         {"step": 5, "parent_step": 3, "entity_id": "entity-record-adapter",
-         "entity_name": "record_adapter", "role": "callee"},
+         "entity_name": "record_adapter", "role": "callee",
+         "reference_lines": [3], "reference_lines_absent_reason": None},
     ],
     "total_steps": 3,
     "steps_omitted": 2,
@@ -1104,11 +1157,17 @@ def self_test():
     failures = []
     graded = []
 
-    def expect(label, got, want):
+    def expect(label, got, want, want_detail=None):
         graded.append(label)
         status = got[0]
         if status != want:
             failures.append("%s: expected %s, got %s (%s)" % (label, want, status, got[1]))
+            return
+        # Status alone cannot separate two branches that both report a failure, so an arm
+        # may name the assertion it means to provoke and is graded on that too.
+        if want_detail is not None and want_detail not in (got[1] or ""):
+            failures.append("%s: %s for the wrong reason, wanted %r in %r" % (
+                label, status, want_detail, got[1]))
 
     expect("0 passes an honest clipped walk",
            grade_says_the_absence_proves_nothing(CLIPPED), PASS)
@@ -1154,7 +1213,10 @@ def self_test():
            grade_the_target_is_what_delivers_the_hop(without, unechoed), FAIL)
 
     expect("3 passes an unaffected walk",
-           grade_a_complete_walk_is_not_qualified(CLEAN), PASS)
+           grade_a_complete_walk_is_not_qualified(COMPLETE), PASS)
+    expect("3 fails a walk that never reached the crossing hop and said nothing",
+           grade_a_complete_walk_is_not_qualified(CLEAN), FAIL,
+           "does not contain %s" % (CROSSING_HOP,))
     expect("3 fails a walk carrying the disclosure anyway",
            grade_a_complete_walk_is_not_qualified(CLIPPED), FAIL)
     zeroed = {"chain": [{"entity_name": "get_adapter"}], "degradations": [],
@@ -1165,26 +1227,79 @@ def self_test():
            grade_a_complete_walk_is_not_qualified({"degradations": []}), UNREADABLE)
 
     expect("4 passes a discovered named branch that survives a real cut",
-           grade_named_target_survives_response_budget(WIDE_ELISION, TARGETED_ELISION), PASS)
+           grade_named_target_survives_response_budget(WIDE_ELISION, TARGETED_ELISION, SELFTEST_RESPONSE_BUDGET), PASS)
     renumbered_targeted = json.loads(json.dumps(TARGETED_ELISION))
     renumbered_targeted["chain"][0]["step"] = 20
     renumbered_targeted["chain"][1]["step"] = 40
     renumbered_targeted["chain"][1]["parent_step"] = 20
     expect("4 accepts renumbering when canonical entity and parent identities are unchanged",
            grade_named_target_survives_response_budget(
-               WIDE_ELISION, renumbered_targeted), PASS)
+               WIDE_ELISION, renumbered_targeted, SELFTEST_RESPONSE_BUDGET), PASS)
     no_cut_targeted = json.loads(json.dumps(TARGETED_ELISION))
     no_cut_targeted["steps_omitted"] = 0
     expect("4 fails a targeted arm whose response budget never bit",
-           grade_named_target_survives_response_budget(WIDE_ELISION, no_cut_targeted), FAIL)
+           grade_named_target_survives_response_budget(WIDE_ELISION, no_cut_targeted, SELFTEST_RESPONSE_BUDGET), FAIL)
+    # Renaming the row leaves its entity_id in place, and the wide-versus-bounded identity
+    # check catches that one step earlier and for a different reason. Dropping the row is
+    # the mutation that actually removes the property this check is named for.
     lost_targeted = json.loads(json.dumps(TARGETED_ELISION))
-    lost_targeted["chain"][1]["entity_name"] = "other_target"
+    lost_targeted["chain"] = [
+        row for row in lost_targeted["chain"] if row["entity_name"] != ELISION_TARGET
+    ]
+    lost_targeted["total_steps"] = len(lost_targeted["chain"])
+    lost_targeted["steps_omitted"] = 4
+    lost_targeted["fanout_narrowed"] = 4
+    lost_targeted["elisions"]["chain"] = {
+        "kept": 1, "elided": 4, "total": 5, "reason": "response_budget",
+    }
+    # A discovery universe that already fits the budget cannot overflow it, so a response
+    # that trimmed anyway trimmed for some other reason and labelled it response_budget.
+    # The universe still has to be a sound wide premise and still has to be larger than
+    # the bounded arm, or an earlier check answers instead of this one.
+    small_universe = json.loads(json.dumps(WIDE_ELISION))
+    small_universe["chain"] = [
+        row for row in small_universe["chain"]
+        if row["entity_name"] in ("get_adapter", CROSSING_HOP, ELISION_TARGET)
+    ]
+    small_universe["total_steps"] = len(small_universe["chain"])
+    small_cut = json.loads(json.dumps(TARGETED_ELISION))
+    small_cut["steps_omitted"] = 1
+    small_cut["fanout_narrowed"] = 1
+    small_cut["elisions"]["chain"] = {
+        "kept": 2, "elided": 1, "total": 3, "reason": "response_budget",
+    }
+    expect("4 fails when the wide universe already fits the bounded budget",
+           grade_named_target_survives_response_budget(
+               small_universe, small_cut, SELFTEST_RESPONSE_BUDGET), FAIL,
+           "inside the %d-byte budget" % (SELFTEST_RESPONSE_BUDGET,))
+
+    # The suite's own claim is that each SURVIVING step carries its call sites. These two
+    # arms are the ones that make that claim gradeable on a trimmed response: a fabricated
+    # line the wide arm never reported, and an absence reason outside the vocabulary. They
+    # answer at two different assertions on purpose.
+    fabricated_lines = json.loads(json.dumps(TARGETED_ELISION))
+    for row in fabricated_lines["chain"]:
+        row["reference_lines"] = [999]
+        row["reference_lines_absent_reason"] = None
+    expect("4 fails a trimmed row carrying a call site the wide arm never reported",
+           grade_named_target_survives_response_budget(
+               WIDE_ELISION, fabricated_lines, SELFTEST_RESPONSE_BUDGET), FAIL,
+           "changed reference_lines")
+    invented_absence = json.loads(json.dumps(TARGETED_ELISION))
+    for row in invented_absence["chain"]:
+        row["reference_lines"] = []
+        row["reference_lines_absent_reason"] = "garbage_reason"
+    expect("4 fails a trimmed row whose absence reason is outside the vocabulary",
+           grade_named_target_survives_response_budget(
+               WIDE_ELISION, invented_absence, SELFTEST_RESPONSE_BUDGET), FAIL,
+           "unknown reference_lines_absent_reason")
     expect("4 fails when the named branch was still elided",
-           grade_named_target_survives_response_budget(WIDE_ELISION, lost_targeted), FAIL)
+           grade_named_target_survives_response_budget(WIDE_ELISION, lost_targeted, SELFTEST_RESPONSE_BUDGET), FAIL,
+           "the named target path did not survive intact")
     unechoed_targeted = json.loads(json.dumps(TARGETED_ELISION))
     unechoed_targeted.pop("target_name")
     expect("4 fails when the bounded arm does not echo the target",
-           grade_named_target_survives_response_budget(WIDE_ELISION, unechoed_targeted), FAIL)
+           grade_named_target_survives_response_budget(WIDE_ELISION, unechoed_targeted, SELFTEST_RESPONSE_BUDGET), FAIL)
     wide_without_target = json.loads(json.dumps(WIDE_ELISION))
     wide_without_target["chain"] = [
         row for row in wide_without_target["chain"]
@@ -1192,43 +1307,68 @@ def self_test():
     ]
     wide_without_target["total_steps"] = len(wide_without_target["chain"])
     expect("4 fails a readable wide premise that never discovered the target",
-           grade_named_target_survives_response_budget(wide_without_target, TARGETED_ELISION), FAIL)
-    missing_parent = json.loads(json.dumps(TARGETED_ELISION))
-    missing_parent["chain"][1]["parent_step"] = 0
+           grade_named_target_survives_response_budget(wide_without_target, TARGETED_ELISION, SELFTEST_RESPONSE_BUDGET), FAIL)
+    # Moving the bounded parent alone disagrees with the wide arm, and the identity check
+    # answers first. Moving it in both arms keeps them consistent, so the only thing left
+    # to object is that the target no longer hangs off the surviving crossing hop.
+    reparented_wide = json.loads(json.dumps(WIDE_ELISION))
+    for row in reparented_wide["chain"]:
+        if row["entity_name"] == ELISION_TARGET:
+            row["parent_step"] = 1
+    wrong_parent = json.loads(json.dumps(TARGETED_ELISION))
+    wrong_parent["chain"] = [
+        {"step": 1, "parent_step": 0, "entity_id": "entity-get-adapter",
+         "entity_name": "get_adapter", "role": "callee",
+         "reference_lines": [1], "reference_lines_absent_reason": None},
+        {"step": 2, "parent_step": 0, "entity_id": "entity-send-via-adapter",
+         "entity_name": CROSSING_HOP, "role": "callee",
+         "reference_lines": [SESSION_ADAPTER_CALL_LINE], "reference_lines_absent_reason": None},
+        {"step": 4, "parent_step": 1, "entity_id": "entity-cert-verify",
+         "entity_name": ELISION_TARGET, "role": "callee",
+         "reference_lines": [ADAPTER_CERT_CALL_LINE], "reference_lines_absent_reason": None},
+    ]
+    wrong_parent["total_steps"] = 3
+    wrong_parent["steps_omitted"] = 2
+    wrong_parent["fanout_narrowed"] = 2
+    wrong_parent["elisions"]["chain"] = {
+        "kept": 3, "elided": 2, "total": 5, "reason": "response_budget",
+    }
     expect("4 fails a target row attached to the surviving wrong parent",
-           grade_named_target_survives_response_budget(WIDE_ELISION, missing_parent), FAIL)
+           grade_named_target_survives_response_budget(
+               reparented_wide, wrong_parent, SELFTEST_RESPONSE_BUDGET), FAIL,
+           "does not name surviving %s" % (CROSSING_HOP,))
     orphaned_target = json.loads(json.dumps(TARGETED_ELISION))
     orphaned_target["chain"][1]["parent_step"] = 99
     expect("4 fails a target row that points at a missing parent step",
-           grade_named_target_survives_response_budget(WIDE_ELISION, orphaned_target), FAIL)
+           grade_named_target_survives_response_budget(WIDE_ELISION, orphaned_target, SELFTEST_RESPONSE_BUDGET), FAIL)
     evidence_free = _without(TARGETED_ELISION, "elisions")
     expect("4 fails a cut with no elisions accounting",
-           grade_named_target_survives_response_budget(WIDE_ELISION, evidence_free), FAIL)
+           grade_named_target_survives_response_budget(WIDE_ELISION, evidence_free, SELFTEST_RESPONSE_BUDGET), FAIL)
     no_disclosure = _without(TARGETED_ELISION, "degradations")
     expect("4 fails a cut with no response-budget degradation",
-           grade_named_target_survives_response_budget(WIDE_ELISION, no_disclosure), FAIL)
+           grade_named_target_survives_response_budget(WIDE_ELISION, no_disclosure, SELFTEST_RESPONSE_BUDGET), FAIL)
     cut_wide = json.loads(json.dumps(WIDE_ELISION))
     cut_wide["steps_omitted"] = 1
     expect("4 fails when the wide discovery premise was already cut",
-           grade_named_target_survives_response_budget(cut_wide, TARGETED_ELISION), FAIL)
+           grade_named_target_survives_response_budget(cut_wide, TARGETED_ELISION, SELFTEST_RESPONSE_BUDGET), FAIL)
     oversized_wide = json.loads(json.dumps(WIDE_ELISION))
     oversized_wide["untrimmed_payload"] = "x" * WIDE_RESPONSE_BUDGET
     expect("4 fails a wide premise whose shipped JSON exceeds its budget",
            grade_named_target_survives_response_budget(
-               oversized_wide, TARGETED_ELISION), FAIL)
+               oversized_wide, TARGETED_ELISION, SELFTEST_RESPONSE_BUDGET), FAIL)
     clipped_targeted = json.loads(json.dumps(TARGETED_ELISION))
     clipped_targeted["clipped_steps"] = [{"step": 2}]
     expect("4 fails when fanout clipping can explain the loss",
-           grade_named_target_survives_response_budget(WIDE_ELISION, clipped_targeted), FAIL)
+           grade_named_target_survives_response_budget(WIDE_ELISION, clipped_targeted, SELFTEST_RESPONSE_BUDGET), FAIL)
     wrong_budget = json.loads(json.dumps(TARGETED_ELISION))
-    wrong_budget["max_response_chars"] = RESPONSE_BUDGET + 1
+    wrong_budget["max_response_chars"] = SELFTEST_RESPONSE_BUDGET + 1
     expect("4 fails a bounded arm that echoes a different budget",
-           grade_named_target_survives_response_budget(WIDE_ELISION, wrong_budget), FAIL)
+           grade_named_target_survives_response_budget(WIDE_ELISION, wrong_budget, SELFTEST_RESPONSE_BUDGET), FAIL)
     oversized_targeted = json.loads(json.dumps(TARGETED_ELISION))
-    oversized_targeted["untrimmed_payload"] = "x" * RESPONSE_BUDGET
+    oversized_targeted["untrimmed_payload"] = "x" * SELFTEST_RESPONSE_BUDGET
     expect("4 fails a response whose shipped JSON exceeds the echoed budget",
            grade_named_target_survives_response_budget(
-               WIDE_ELISION, oversized_targeted), FAIL)
+               WIDE_ELISION, oversized_targeted, SELFTEST_RESPONSE_BUDGET), FAIL)
     short_targeted_universe = json.loads(json.dumps(TARGETED_ELISION))
     short_targeted_universe["steps_omitted"] = 2
     short_targeted_universe["fanout_narrowed"] = 2
@@ -1240,48 +1380,83 @@ def self_test():
     }
     expect("4 fails internally coherent accounting for a smaller source universe",
            grade_named_target_survives_response_budget(
-               WIDE_ELISION, short_targeted_universe), FAIL)
+               WIDE_ELISION, short_targeted_universe, SELFTEST_RESPONSE_BUDGET), FAIL)
     invented_target_identity = json.loads(json.dumps(TARGETED_ELISION))
     invented_target_identity["chain"][1]["entity_id"] = "entity-not-in-wide"
     expect("4 fails a coherent target row the wide discovery never returned",
            grade_named_target_survives_response_budget(
-               WIDE_ELISION, invented_target_identity), FAIL)
+               WIDE_ELISION, invented_target_identity, SELFTEST_RESPONSE_BUDGET), FAIL)
 
     expect("5 passes when the unnamed cut loses the widely discovered target",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, UNNAMED_ELISION), PASS)
+               WIDE_ELISION, TARGETED_ELISION, UNNAMED_ELISION, SELFTEST_RESPONSE_BUDGET), PASS)
     no_cut_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
     no_cut_unnamed["steps_omitted"] = 0
     expect("5 fails an unnamed arm whose response budget never bit",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, no_cut_unnamed), FAIL)
+               WIDE_ELISION, TARGETED_ELISION, no_cut_unnamed, SELFTEST_RESPONSE_BUDGET), FAIL)
+    # Renaming a surviving row to the target leaves the original entity_id, which the
+    # identity check answers first. The honest mutation is an unnamed arm that keeps the
+    # target branch with the wide arm's own identities and parentage, which nothing but
+    # the target-absence assertion can object to.
     kept_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
-    kept_unnamed["chain"][-1]["entity_name"] = ELISION_TARGET
+    kept_unnamed["chain"] = [
+        {"step": 1, "parent_step": 0, "entity_id": "entity-get-adapter",
+         "entity_name": "get_adapter", "role": "callee",
+         "reference_lines": [1], "reference_lines_absent_reason": None},
+        {"step": 2, "parent_step": 0, "entity_id": "entity-send-via-adapter",
+         "entity_name": CROSSING_HOP, "role": "callee",
+         "reference_lines": [SESSION_ADAPTER_CALL_LINE], "reference_lines_absent_reason": None},
+        {"step": 4, "parent_step": 2, "entity_id": "entity-cert-verify",
+         "entity_name": ELISION_TARGET, "role": "callee",
+         "reference_lines": [ADAPTER_CERT_CALL_LINE], "reference_lines_absent_reason": None},
+    ]
+    kept_unnamed["total_steps"] = 3
+    kept_unnamed["steps_omitted"] = 2
+    kept_unnamed["fanout_narrowed"] = 2
+    kept_unnamed["elisions"]["chain"] = {
+        "kept": 3, "elided": 2, "total": 5, "reason": "response_budget",
+    }
     expect("5 fails when the unnamed arm already keeps the target",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, kept_unnamed), FAIL)
+               WIDE_ELISION, TARGETED_ELISION, kept_unnamed, SELFTEST_RESPONSE_BUDGET), FAIL,
+           "the unnamed arm still contains")
+    # An arm that returned nothing contains no target either, and the conservation
+    # arithmetic is satisfiable at kept=0, so the absence check passes on it vacuously.
+    empty_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
+    empty_unnamed["chain"] = []
+    empty_unnamed["total_steps"] = 0
+    empty_unnamed["steps_omitted"] = 5
+    empty_unnamed["fanout_narrowed"] = 5
+    empty_unnamed["elisions"]["chain"] = {
+        "kept": 0, "elided": 5, "total": 5, "reason": "response_budget",
+    }
+    expect("5 fails an unnamed arm that returned no steps at all",
+           grade_unnamed_response_budget_drops_the_target(
+               WIDE_ELISION, TARGETED_ELISION, empty_unnamed, SELFTEST_RESPONSE_BUDGET), FAIL,
+           "returned no steps at all")
     lost_target_control = json.loads(json.dumps(TARGETED_ELISION))
     lost_target_control["chain"][1]["entity_name"] = "other_target"
     expect("5 fails when both bounded arms lose the target",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, lost_target_control, UNNAMED_ELISION), FAIL)
+               WIDE_ELISION, lost_target_control, UNNAMED_ELISION, SELFTEST_RESPONSE_BUDGET), FAIL)
     named_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
     named_unnamed["target_name"] = ELISION_TARGET
     expect("5 fails when the unnamed arm claims a target",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, named_unnamed), FAIL)
+               WIDE_ELISION, TARGETED_ELISION, named_unnamed, SELFTEST_RESPONSE_BUDGET), FAIL)
     claiming_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
     claiming_unnamed["degradations"][0]["detail"] = (
         "cut as whole branches, keeping the branch that reaches the named target"
     )
     expect("5 fails when the unnamed disclosure claims it kept a named target",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, claiming_unnamed), FAIL)
+               WIDE_ELISION, TARGETED_ELISION, claiming_unnamed, SELFTEST_RESPONSE_BUDGET), FAIL)
     clipped_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
     clipped_unnamed["chain"][0]["fanout_truncated"] = True
     expect("5 fails when the unnamed arm has a per-step fanout cut",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, clipped_unnamed), FAIL)
+               WIDE_ELISION, TARGETED_ELISION, clipped_unnamed, SELFTEST_RESPONSE_BUDGET), FAIL)
     short_unnamed_universe = json.loads(json.dumps(UNNAMED_ELISION))
     short_unnamed_universe["steps_omitted"] = 1
     short_unnamed_universe["fanout_narrowed"] = 1
@@ -1293,16 +1468,16 @@ def self_test():
     }
     expect("5 fails internally coherent accounting for a smaller source universe",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, short_unnamed_universe), FAIL)
+               WIDE_ELISION, TARGETED_ELISION, short_unnamed_universe, SELFTEST_RESPONSE_BUDGET), FAIL)
     invented_unnamed = json.loads(json.dumps(UNNAMED_ELISION))
     for index, row in enumerate(invented_unnamed["chain"]):
         row["entity_name"] = "invented_%d" % index
     expect("5 fails bounded rows whose identities changed from the wide discovery",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, invented_unnamed), FAIL)
+               WIDE_ELISION, TARGETED_ELISION, invented_unnamed, SELFTEST_RESPONSE_BUDGET), FAIL)
     expect("5 cannot read a non-object response arm",
            grade_unnamed_response_budget_drops_the_target(
-               WIDE_ELISION, TARGETED_ELISION, None), UNREADABLE)
+               WIDE_ELISION, TARGETED_ELISION, None, SELFTEST_RESPONSE_BUDGET), UNREADABLE)
 
     expect("6 passes exact callee sites from both parent files",
            grade_callee_call_sites(WIDE_ELISION), PASS)
