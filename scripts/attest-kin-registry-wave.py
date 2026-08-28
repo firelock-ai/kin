@@ -690,7 +690,15 @@ def _validate_recheck_job(
     *,
     repository: str,
     run_id: int,
-) -> dict[str, Any]:
+    run_status: str,
+) -> dict[str, Any] | None:
+    """Return the run's required fast gate, or None while it is still arriving.
+
+    A run's job listing is empty for the first seconds of its life, so an absent
+    required job on a run that has not completed is news about the clock and not
+    about the run's authority. Returning None keeps that case inside the caller's
+    wait loop; raising would end the step before the wait it was given.
+    """
     jobs = value.get("jobs") if isinstance(value, dict) else None
     total = value.get("total_count") if isinstance(value, dict) else None
     if (
@@ -706,9 +714,17 @@ def _validate_recheck_job(
         for job in jobs
         if isinstance(job, dict) and job.get("name") == CI_REQUIRED_JOB
     ]
-    if len(required) != 1:
+    if len(required) > 1:
         raise AttesterError(
-            "post-attestation CI run does not publish exactly one required fast gate"
+            f"post-attestation CI run {run_id} publishes {len(required)} jobs named "
+            f"{CI_REQUIRED_JOB!r}; the recheck requires exactly one"
+        )
+    if not required:
+        if run_status != "completed":
+            return None
+        raise AttesterError(
+            f"completed post-attestation CI run {run_id} publishes no job named "
+            f"{CI_REQUIRED_JOB!r} among its {len(jobs)} jobs"
         )
     job = required[0]
     job_id = job.get("id")
@@ -734,7 +750,14 @@ def _post_attestation_recheck(
     repository: str,
     admission: dict[str, Any],
     attestation: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> dict[str, Any]:
+    """Report the newest validated recheck, plus the runs still arriving.
+
+    The two are separate answers. A validated recheck ends the wait. A run whose
+    required fast gate has not been listed yet is the reason to keep waiting, and
+    is also the reason not to retrigger, since reopening the pull would cancel
+    the run already in flight.
+    """
     response = gh_json(
         [
             "api",
@@ -758,6 +781,7 @@ def _post_attestation_recheck(
         "attestation comment creation",
     )
     candidates: list[dict[str, Any]] = []
+    arriving: list[dict[str, Any]] = []
     for run in _workflow_run_pages(response):
         if not _is_recheck_run_candidate(
             run,
@@ -771,12 +795,14 @@ def _post_attestation_recheck(
         repository_doc = run.get("repository")
         head_repository = run.get("head_repository")
         run_attempt = run.get("run_attempt")
+        run_status = run.get("status")
         if (
             run.get("name") != CI_WORKFLOW_NAME
             or run.get("path") != CI_WORKFLOW_PATH
             or run.get("event") != "pull_request"
             or run.get("head_branch") != guard.WAVE_BRANCH
             or run.get("head_sha") != admission["head"]
+            or run_status not in RECHECK_STATUSES
             or not isinstance(repository_doc, dict)
             or repository_doc.get("full_name") != repository
             or not isinstance(head_repository, dict)
@@ -787,7 +813,7 @@ def _post_attestation_recheck(
         ):
             raise AttesterError("post-attestation CI run has the wrong authority")
         _validate_recheck_pull(run, repository=repository, admission=admission)
-        jobs = gh_json(
+        job_listing = gh_json(
             [
                 "api",
                 "--method",
@@ -803,10 +829,20 @@ def _post_attestation_recheck(
             ]
         )
         job = _validate_recheck_job(
-            jobs,
+            job_listing,
             repository=repository,
             run_id=int(run["id"]),
+            run_status=str(run_status),
         )
+        if job is None:
+            arriving.append(
+                {
+                    "run_id": int(run["id"]),
+                    "run_status": str(run_status),
+                    "job_count": len(job_listing["jobs"]),
+                }
+            )
+            continue
         candidates.append(
             {
                 "run_id": int(run["id"]),
@@ -817,9 +853,44 @@ def _post_attestation_recheck(
                 "created_at": run["created_at"],
             }
         )
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: int(item["run_id"]))
+    return {
+        "recheck": (
+            max(candidates, key=lambda item: int(item["run_id"]))
+            if candidates
+            else None
+        ),
+        "arriving": sorted(arriving, key=lambda item: int(item["run_id"])),
+    }
+
+
+def _missing_recheck_message(
+    *,
+    head: str,
+    arriving: list[dict[str, Any]],
+    wait_seconds: int,
+) -> str:
+    """Say what the recheck looked for, where it looked, and what it found.
+
+    The old message named none of the three, so the same sentence covered a run
+    whose jobs had not been listed yet and a run that genuinely never published
+    the gate.
+    """
+    where = f"{CI_WORKFLOW_PATH} runs on {guard.WAVE_BRANCH} at head {head}"
+    if not arriving:
+        return (
+            f"no exact required CI recheck materialized after the App attestation: "
+            f"looked for a job named {CI_REQUIRED_JOB!r} on {where} created after the "
+            f"attestation comment, and found no such run within {wait_seconds}s"
+        )
+    described = ", ".join(
+        f"run {item['run_id']} ({item['run_status']}, {item['job_count']} jobs listed)"
+        for item in arriving
+    )
+    return (
+        f"no exact required CI recheck materialized after the App attestation: "
+        f"looked for a job named {CI_REQUIRED_JOB!r} on {where} created after the "
+        f"attestation comment, and within {wait_seconds}s found only {described}"
+    )
 
 
 def recheck_status(
@@ -852,11 +923,13 @@ def recheck_status(
 
     deadline = time.monotonic() + wait_seconds
     while True:
-        recheck = _post_attestation_recheck(
+        observed = _post_attestation_recheck(
             repository=repository,
             admission=admission,
             attestation=attestation,
         )
+        recheck = observed["recheck"]
+        arriving = observed["arriving"]
         if recheck is not None:
             validate_live_admission(
                 workspace=workspace,
@@ -872,10 +945,14 @@ def recheck_status(
         if remaining <= 0:
             if require_recheck:
                 raise AttesterError(
-                    "no exact required CI recheck materialized after the App attestation"
+                    _missing_recheck_message(
+                        head=str(admission["head"]),
+                        arriving=arriving,
+                        wait_seconds=wait_seconds,
+                    )
                 )
             return {
-                "needs_retrigger": True,
+                "needs_retrigger": not arriving,
                 "attestation_comment_id": attestation["comment_id"],
             }
         time.sleep(min(2.0, remaining))

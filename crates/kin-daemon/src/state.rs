@@ -1553,6 +1553,14 @@ pub struct DaemonState {
     /// request; constructing a new backend from the mutable path would bless a
     /// swapped `.kin/kindb` namespace.
     local_repository_backend: Option<Arc<LocalFileBackend>>,
+    /// Startup-opened handle to the same `.kin/kindb` the backend above was
+    /// pinned to, held for the one write that is not an authority write: a
+    /// native transfer discarding this store's hydration creation record before
+    /// the history it carries becomes visible. Resolving that directory again
+    /// at request time would let a swapped `.kin/kindb` take the removal, which
+    /// is the same reason the backend is pinned rather than reconstructed.
+    /// `None` on a hosted daemon, which owns no local store's record.
+    local_kindb_capability: Option<Arc<kin_core::hydration_semantics::HydrationStampCapability>>,
     /// One repository-v6 authority shared by the projection (VFS) routes,
     /// revalidated against the durable publication record before every use so
     /// a commit from this daemon or from a separate process is served as soon
@@ -2133,6 +2141,17 @@ impl DaemonState {
     /// Clone the startup-pinned local storage capability.
     pub(crate) fn local_repository_backend(&self) -> Option<Arc<LocalFileBackend>> {
         self.local_repository_backend.as_ref().map(Arc::clone)
+    }
+
+    /// Clone the startup-pinned handle to this store's `.kin/kindb`.
+    ///
+    /// `None` on a hosted daemon by construction, which is what the transfer
+    /// receiver keys its local-only policy on rather than re-deriving whether
+    /// this process owns a `.kin` layout.
+    pub(crate) fn local_kindb_capability(
+        &self,
+    ) -> Option<Arc<kin_core::hydration_semantics::HydrationStampCapability>> {
+        self.local_kindb_capability.as_ref().map(Arc::clone)
     }
 
     /// Clone the complete repository identity/storage capability pinned when
@@ -2993,6 +3012,22 @@ impl DaemonState {
         // authority bind treats whatever is retained as the baseline.
         kin_core::revalidate_pinned_local_namespace(&local_repository_backend, &repository_id)
             .map_err(|refusal| DaemonError::Graph(refusal.into_error()))?;
+        // The same directory the backend just pinned, retained once for the
+        // hydration creation record. Opened here rather than at request time so
+        // a `.kin/kindb` replaced under a running daemon cannot receive the
+        // removal a native transfer performs.
+        let local_kindb_capability = Arc::new(
+            kin_core::hydration_semantics::HydrationStampCapability::open(&layout.kindb_dir())
+                .map_err(|error| {
+                    DaemonError::Core(kin_core::KinError::io(layout.kindb_dir(), error))
+                })?,
+        );
+        // Revalidated a second time, deliberately. Between the pin above and
+        // this open, a swap would leave the backend and this handle bound to
+        // two different namespaces, and a daemon holding capabilities to two
+        // stores is worse than one that refused to start.
+        kin_core::revalidate_pinned_local_namespace(&local_repository_backend, &repository_id)
+            .map_err(|refusal| DaemonError::Graph(refusal.into_error()))?;
         let lease = authority.read_authority();
         let workspace_id = match manifest_workspace_id {
             Some(recorded) => recorded,
@@ -3154,6 +3189,7 @@ impl DaemonState {
             hosted_authority_envelope: false,
             hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: Some(local_repository_backend),
+            local_kindb_capability: Some(local_kindb_capability),
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
@@ -3420,6 +3456,7 @@ impl DaemonState {
             hosted_authority_envelope,
             hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: None,
+            local_kindb_capability: None,
             projection_authority: crate::api::ProjectionAuthorityCache::default(),
             registered_local_repository_authorities: Vec::new(),
             registered_local_repository_authority_incomplete: false,

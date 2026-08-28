@@ -9672,6 +9672,19 @@ fn fused_semantic_locate_payload(
     // restart from an absent field. The cosine arm always states its page; now both
     // arms answer the question the same way.
     payload.insert("page".to_string(), json!(result.page));
+    // State the primary collection and its total explicitly, for the reason the
+    // line above states the page: `LocateResult` skips `entities` when it is
+    // empty and `total_ranked` when it is zero, so the one page that most needs
+    // to read as empty shipped neither key beside a `files` roll-up that
+    // serializes whatever it holds. A reader taking the first present array read
+    // that as a file answer. At file granularity `files` is the primary and is
+    // already serialized unconditionally, so only the entity arm needs this.
+    if !file_granularity {
+        payload
+            .entry("entities".to_string())
+            .or_insert_with(|| json!([]));
+    }
+    payload.insert("total_ranked".to_string(), json!(result.total_ranked));
     // The one list the per-hit variant attribution indexes. Written explicitly
     // rather than left to the `LocateResult` serialization, because a cursor page
     // restores it from the cached ranking and the two paths must publish the same
@@ -13085,6 +13098,57 @@ fn configured_transfer_limits() -> kin_remote::repository_transfer::RepositoryTr
     }
 }
 
+/// Admit one received pack, running this daemon's admission-provenance policy
+/// at the commit boundary.
+///
+/// Every native receiver in this process goes through here: the inbound receive
+/// route, which is also where a `kin push` lands, and `pull_into_replica`, which
+/// CLI pull and native clone both share and which calls this once per pack of a
+/// segmented gap. One wrapper rather than a policy repeated at each site,
+/// because the failure this repairs was a receiver that admitted history and
+/// left the store describing itself by a record that predates it.
+///
+/// The policy is to discard the hydration creation stamp. The transfer protocol
+/// carries no authoring version beside the history it moves, so a receiver that
+/// kept its own creation number would certify replay semantics for deltas
+/// authored on another host by another build. Deleting the record is the
+/// conservative half of that trade: the store reads unstamped and every surface
+/// discloses it, instead of reading current and certifying an absence over
+/// history whose provenance nothing recorded.
+///
+/// A hosted daemon runs no policy. Its storage backend is not a local `.kin`
+/// layout, and the scaffolding directory beside it belongs to no repository
+/// whose provenance this transfer touched.
+fn apply_received_repository_transfer_pack(
+    state: &DaemonState,
+    authority: &RepositoryAuthorityManager<dyn StorageBackend>,
+    repository_id: &RepositoryId,
+    destination_ref: &kin_model::RefName,
+    actor: kin_model::AuthorId,
+    pack: &kin_remote::repository_transfer::RepositoryTransferPack,
+) -> std::result::Result<
+    kin_remote::repository_transfer::RepositoryTransferReceipt,
+    kin_remote::repository_transfer::RepositoryTransferError,
+> {
+    let local_kindb = state
+        .storage_backend
+        .is_none()
+        .then(|| state.local_kindb_capability())
+        .flatten();
+    kin_remote::repository_transfer::apply_repository_transfer_pack_with_pre_commit(
+        authority,
+        repository_id,
+        destination_ref,
+        actor,
+        pack,
+        &configured_transfer_limits(),
+        || match local_kindb {
+            Some(kindb) => kindb.invalidate_for_unversioned_transfer(),
+            None => Ok(()),
+        },
+    )
+}
+
 pub(crate) fn repository_transfer_authority(
     state: &DaemonState,
     repo_id: &str,
@@ -13261,13 +13325,13 @@ async fn repo_transfer_receive(
     Json(request): Json<RepositoryTransferReceiveRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let (repository_id, authority) = repository_transfer_authority(&state, &repo_id)?;
-    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
+    let receipt = apply_received_repository_transfer_pack(
+        &state,
         &authority,
         &repository_id,
         &request.destination_ref,
         kin_model::AuthorId::new("kin-daemon:repository-transfer-receiver"),
         &request.pack,
-        &configured_transfer_limits(),
     )
     .map_err(repository_transfer_error)?;
 
@@ -13492,13 +13556,13 @@ pub(crate) async fn pull_into_replica(
                 &source_ref,
                 &destination_ref,
                 |pack| {
-                    let receipt = kin_remote::repository_transfer::apply_repository_transfer_pack(
+                    let receipt = apply_received_repository_transfer_pack(
+                        &blocking_state,
                         &authority,
                         &repository_id,
                         &destination_ref,
                         kin_model::AuthorId::new("kin-daemon:repository-transfer-puller"),
                         pack,
-                        &configured_transfer_limits(),
                     )?;
                     admitted_packs += 1;
                     if local_derived_views && !refresh.is_stale() {
@@ -17398,6 +17462,257 @@ mod tests {
         }
     }
 
+    /// The exact refusal each cursor-identity dimension owns.
+    ///
+    /// Asserting the MESSAGE rather than `is_err()` is the whole point of these
+    /// tests. `cursor_projection_inherits_omissions_and_rejects_conflicts` and
+    /// `fused_cursor_explanation_can_contract_but_cannot_expand` already prove
+    /// that a conflict fails, but a validator that answered every conflict with
+    /// one dimension's message would satisfy both of them: a mutation that
+    /// merely redirects a refusal from one branch into another survives an
+    /// `is_err()` assertion, because both branches still error. Naming the
+    /// message per dimension is what makes the dimensions independently
+    /// verifiable, which is what C4 asks for and what an `is_err()` cannot give.
+    const CURSOR_REFUSAL_QUERY: &str =
+        "semantic_locate cursor belongs to a different query; re-run the requested query";
+    const CURSOR_REFUSAL_GRANULARITY: &str =
+        "semantic_locate cursor preserves its original granularity; re-run the original query to change it";
+    const CURSOR_REFUSAL_SNIPPET: &str =
+        "semantic_locate cursor preserves its original snippet projection; re-run the original query to change it";
+    const CURSOR_REFUSAL_ALIAS: &str =
+        "semantic_locate cursor preserves its original snippet alias setting; re-run the original query to change it";
+    const CURSOR_REFUSAL_VARIANTS: &str =
+        "semantic_locate cursor preserves its original query variants; re-run the original query to change them";
+    const CURSOR_REFUSAL_TEST_SCOPE: &str =
+        "semantic_locate cursor preserves its original test-role scope; re-run the original query to change it";
+    const CURSOR_REFUSAL_EXPLAIN: &str =
+        "semantic_locate cursor cannot expand a ranking whose explanation was not built; re-run the original query with explain: true";
+
+    /// Every refusal message a cursor validator can produce, so a test can
+    /// require that the message it expected is the one that answered AND that no
+    /// other dimension's message did. Without the second half, a redirected
+    /// refusal reads exactly like the right one.
+    fn assert_only_this_refusal(error: &str, expected: &str, dimension: &str) {
+        assert_eq!(
+            error, expected,
+            "{dimension} must be refused by its own message"
+        );
+        for other in [
+            CURSOR_REFUSAL_QUERY,
+            CURSOR_REFUSAL_GRANULARITY,
+            CURSOR_REFUSAL_SNIPPET,
+            CURSOR_REFUSAL_ALIAS,
+            CURSOR_REFUSAL_VARIANTS,
+            CURSOR_REFUSAL_TEST_SCOPE,
+            CURSOR_REFUSAL_EXPLAIN,
+        ] {
+            if other != expected {
+                assert_ne!(
+                    error, other,
+                    "{dimension} must not be refused by another dimension's message"
+                );
+            }
+        }
+    }
+
+    /// Query variants are their own cursor-identity dimension.
+    ///
+    /// No unit test reached this branch before: every existing call to
+    /// `validate_fused_cursor_shape` passes an empty held variant list and sets
+    /// no `queries` argument, so only the explanation branch was exercised.
+    #[test]
+    fn cursor_identity_binds_query_variants_independently() {
+        let held = vec!["parse config".to_string(), "config loader".to_string()];
+
+        // Control: an unchanged dimension reuses the held entry. Omitting the
+        // field inherits, and repeating it exactly is not a conflict.
+        assert!(
+            validate_fused_cursor_shape(&HashMap::new(), &held, false, false).is_ok(),
+            "an omitted variant list must inherit the held ranking"
+        );
+        let repeated = HashMap::from([(
+            "queries".to_string(),
+            json!(["parse config", "config loader"]),
+        )]);
+        assert!(
+            validate_fused_cursor_shape(&repeated, &held, false, false).is_ok(),
+            "repeating the held variant list exactly must reuse the held ranking"
+        );
+
+        // Only this dimension changes in each arm below.
+        for (label, arguments) in [
+            (
+                "a reordered list",
+                HashMap::from([(
+                    "queries".to_string(),
+                    json!(["config loader", "parse config"]),
+                )]),
+            ),
+            (
+                "a dropped variant",
+                HashMap::from([("queries".to_string(), json!(["parse config"]))]),
+            ),
+            (
+                "an added variant",
+                HashMap::from([(
+                    "queries".to_string(),
+                    json!(["parse config", "config loader", "settings"]),
+                )]),
+            ),
+            (
+                "an explicitly emptied list",
+                HashMap::from([("queries".to_string(), json!([]))]),
+            ),
+        ] {
+            let error = validate_fused_cursor_shape(&arguments, &held, false, false)
+                .expect_err(label)
+                .to_string();
+            assert_only_this_refusal(&error, CURSOR_REFUSAL_VARIANTS, label);
+        }
+    }
+
+    /// Test-role scope is its own cursor-identity dimension. Also previously
+    /// unreached at the unit level: no existing call sets `include_tests`.
+    #[test]
+    fn cursor_identity_binds_test_scope_independently() {
+        // Control, in both directions, so the assertion cannot be satisfied by a
+        // validator that simply refuses every explicit value.
+        for held in [true, false] {
+            assert!(
+                validate_fused_cursor_shape(&HashMap::new(), &[], held, true).is_ok(),
+                "an omitted test scope must inherit the held ranking"
+            );
+            let repeated = HashMap::from([("include_tests".to_string(), json!(held))]);
+            assert!(
+                validate_fused_cursor_shape(&repeated, &[], held, true).is_ok(),
+                "repeating the held test scope must reuse the held ranking"
+            );
+
+            let flipped = HashMap::from([("include_tests".to_string(), json!(!held))]);
+            let error = validate_fused_cursor_shape(&flipped, &[], held, true)
+                .expect_err("a flipped test scope must be refused")
+                .to_string();
+            assert_only_this_refusal(&error, CURSOR_REFUSAL_TEST_SCOPE, "test scope");
+        }
+    }
+
+    /// Explanation is one-directional identity: a page may shed held explanation
+    /// but cannot expand a ranking that never built one. The existing test proves
+    /// the direction; this one proves the refusal carries its own message and is
+    /// not another dimension's refusal wearing the right shape.
+    #[test]
+    fn cursor_identity_binds_explanation_independently() {
+        let expanding = HashMap::from([("explain".to_string(), json!(true))]);
+        let error = validate_fused_cursor_shape(&expanding, &[], false, false)
+            .expect_err("explain:true over a ranking with no explanation must be refused")
+            .to_string();
+        assert_only_this_refusal(&error, CURSOR_REFUSAL_EXPLAIN, "explanation");
+
+        // Control: the same argument over a ranking that DID build explanation is
+        // not a conflict, so the refusal above is about the held ranking rather
+        // than about the argument being present.
+        assert!(
+            validate_fused_cursor_shape(&expanding, &[], false, true).is_ok(),
+            "a held explanation must still serve an explaining continuation"
+        );
+
+        // `compact` reaches identity only through this branch: it decides whether
+        // the page requests explanation, and owns no refusal of its own. A
+        // continuation may flip it freely over a ranking that built explanation.
+        let compact_off = HashMap::from([("compact".to_string(), json!(false))]);
+        assert!(
+            fused_explanation_requested(&compact_off),
+            "compact:false is an effective request for explanation"
+        );
+        let error = validate_fused_cursor_shape(&compact_off, &[], false, false)
+            .expect_err("compact:false cannot expand a ranking with no explanation")
+            .to_string();
+        assert_only_this_refusal(&error, CURSOR_REFUSAL_EXPLAIN, "compact as explanation");
+        for compact in [true, false] {
+            assert!(
+                validate_fused_cursor_shape(
+                    &HashMap::from([("compact".to_string(), json!(compact))]),
+                    &[],
+                    false,
+                    true,
+                )
+                .is_ok(),
+                "compact is per-page presentation over a ranking that built explanation"
+            );
+        }
+    }
+
+    /// Each projection dimension owns its own refusal.
+    ///
+    /// The existing projection test perturbs the same four dimensions but asserts
+    /// only `is_err()`, so a validator that answered all four with one message
+    /// would pass it. These arms name the message per dimension, and each control
+    /// proves the matching value is accepted rather than refused for some other
+    /// reason.
+    #[test]
+    fn cursor_identity_binds_each_projection_dimension_independently() {
+        let held_query = "find parser";
+        let held_mode = kin_cli::commands::locate::projection_mode(true, true);
+
+        // Control: every dimension repeated at its held value reuses the entry.
+        let matching = HashMap::from([
+            ("query".to_string(), json!(held_query)),
+            ("granularity".to_string(), json!("entity")),
+            ("include_snippet".to_string(), json!(true)),
+            ("snippet_alias".to_string(), json!(false)),
+        ]);
+        assert!(
+            validate_cursor_projection(&matching, held_query, false, held_mode, Some(false))
+                .is_ok(),
+            "every dimension at its held value must reuse the held ranking"
+        );
+
+        for (dimension, expected, arguments) in [
+            (
+                "query",
+                CURSOR_REFUSAL_QUERY,
+                HashMap::from([("query".to_string(), json!("some other query"))]),
+            ),
+            (
+                "granularity",
+                CURSOR_REFUSAL_GRANULARITY,
+                HashMap::from([("granularity".to_string(), json!("file"))]),
+            ),
+            (
+                "snippet projection",
+                CURSOR_REFUSAL_SNIPPET,
+                HashMap::from([("include_snippet".to_string(), json!(false))]),
+            ),
+            (
+                "snippet alias",
+                CURSOR_REFUSAL_ALIAS,
+                HashMap::from([("snippet_alias".to_string(), json!(true))]),
+            ),
+        ] {
+            let error =
+                validate_cursor_projection(&arguments, held_query, false, held_mode, Some(false))
+                    .expect_err(dimension)
+                    .to_string();
+            assert_only_this_refusal(&error, expected, dimension);
+        }
+
+        // An invalid granularity is a different refusal from a conflicting one,
+        // and folding the two together would let a typo read as a cursor
+        // conflict and send a caller to re-run a query that was never the problem.
+        let invalid = HashMap::from([("granularity".to_string(), json!("entities"))]);
+        let error = validate_cursor_projection(&invalid, held_query, false, held_mode, Some(false))
+            .expect_err("an unknown granularity must be refused")
+            .to_string();
+        assert!(
+            error.contains("invalid granularity 'entities'"),
+            "an unknown granularity must name itself, not the cursor: {error}"
+        );
+        assert_ne!(
+            error, CURSOR_REFUSAL_GRANULARITY,
+            "a malformed value and a conflicting value are different news"
+        );
+    }
+
     /// One cosine-arm ranked row, in the shape the serving loop builds.
     fn cosine_row(
         name: &str,
@@ -18115,10 +18430,12 @@ mod tests {
             kin_cli::commands::locate::LocateResult::default(),
             "where does the daemon start",
         );
-        assert!(
-            body.get("entities").is_none(),
-            "an empty fused page omits `entities` entirely: {body}"
+        assert_eq!(
+            body["entities"],
+            json!([]),
+            "an empty fused page states its primary rather than omitting it: {body}"
         );
+        assert_eq!(body["total_ranked"], json!(0));
         assert_eq!(body["files"], json!([]));
         let negative = kin_mcp::negative::negative_for(
             "semantic_locate",
@@ -23855,6 +24172,9 @@ mod tests {
         url: String,
         repository_id: RepositoryId,
         head: kin_model::SemanticChangeId,
+        /// The peer's own `.kin`, kept so a test can seed further history into
+        /// it and read the creation record it was stamped with.
+        layout: kin_core::KinLayout,
         _working: tempfile::TempDir,
     }
 
@@ -23885,6 +24205,7 @@ mod tests {
         let storage = layout.kindb_dir();
         let root = seed_replica_change(&storage, &repository_id, None, 1, "root the line");
         let head = seed_replica_change(&storage, &repository_id, Some(root), 2, "advance the line");
+        let peer_layout = layout.clone();
         let url = serve_replica(Arc::new(
             DaemonState::open_with_repo_id(layout, None).unwrap(),
         ))
@@ -23894,6 +24215,7 @@ mod tests {
             url,
             repository_id,
             head,
+            layout: peer_layout,
             _working: working,
         }
     }
@@ -24225,6 +24547,323 @@ mod tests {
             !destination.path().join(".kin").exists(),
             "a negotiation the peer refused creates no replica"
         );
+    }
+
+    /// Native transfer and the store's own creation record.
+    ///
+    /// The defect these close: a version-10 client cloning a repository whose
+    /// history was authored under version 9 stamped its empty receiver with 10,
+    /// pulled the version-9 deltas in, and then had every surface read `Current`
+    /// over history whose authoring version nothing on the wire carried. Each
+    /// arm below drives a real product route and reads the record afterwards,
+    /// because a unit test of the unlink cannot prove clone, pull or receive
+    /// routes through it.
+    mod hydration_semantics_on_native_transfer {
+        use super::*;
+        use kin_core::hydration_semantics::{self, HydrationStanding};
+
+        /// Put the store back to `Current` so the next arm starts from the
+        /// standing the defect produced, rather than from a gap left by a
+        /// previous transfer.
+        fn restamp_current(layout: &kin_core::KinLayout) {
+            hydration_semantics::stamp_staged(layout).expect("restamping the fixture store");
+            assert!(
+                !hydration_semantics::standing(layout).is_gap(),
+                "the fixture did not start current"
+            );
+        }
+
+        /// Record a creation version this binary did not author, as transport
+        /// provenance setup. The wire carries no such field; this only proves
+        /// the receiver's own record is not what travelled.
+        fn stamp_one_version_behind(layout: &kin_core::KinLayout) {
+            let stamp = hydration_semantics::HydrationSemanticsStamp::new(
+                hydration_semantics::binary_version() - 1,
+                chrono::Utc::now(),
+            );
+            hydration_semantics::write(layout, &stamp).expect("writing the mismatched stamp");
+        }
+
+        fn assert_unstamped(layout: &kin_core::KinLayout, what: &str) {
+            let standing = hydration_semantics::standing(layout);
+            assert_eq!(
+                standing,
+                HydrationStanding::Unstamped {
+                    derives: hydration_semantics::binary_version()
+                },
+                "{what} left the store claiming a creation-time version it can no longer speak for"
+            );
+            assert!(
+                standing.is_gap(),
+                "{what}: an unstamped store must read as a gap"
+            );
+        }
+
+        /// A pack aimed at one exact local destination, built from its live
+        /// authority rather than from a bare empty store, because a local
+        /// replica opens past genesis and a stale expectation is refused before
+        /// the commit boundary this exercises.
+        fn pack_for_local_destination(
+            repository_id: &RepositoryId,
+            destination_kindb: &FsPath,
+            operation: u128,
+        ) -> kin_remote::repository_transfer::RepositoryTransferPack {
+            let source_storage = tempfile::tempdir().unwrap();
+            let source_head = seed_replica_change(
+                source_storage.path(),
+                repository_id,
+                None,
+                operation,
+                "hydration transfer source",
+            );
+            let source = RepositoryAuthorityManager::open(
+                repository_id.clone(),
+                Arc::new(kin_db::LocalFileBackend::new(source_storage.path())),
+            )
+            .unwrap();
+            let destination = RepositoryAuthorityManager::open(
+                repository_id.clone(),
+                Arc::new(kin_db::LocalFileBackend::new(
+                    destination_kindb.to_path_buf(),
+                )),
+            )
+            .unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let status = kin_remote::repository_transfer::repository_transfer_status(
+                &destination,
+                repository_id,
+                &destination_ref,
+            )
+            .unwrap();
+            let expectation =
+                kin_remote::repository_transfer::RepositoryTransferExpectation::try_from(status)
+                    .unwrap();
+            let segment = kin_remote::repository_transfer::build_repository_transfer_segment(
+                &source,
+                &destination_ref,
+                &expectation,
+            )
+            .unwrap();
+            assert!(
+                segment.is_final(),
+                "the one-change fixture fits one segment"
+            );
+            assert_eq!(segment.pack.source_head, source_head);
+            segment.pack
+        }
+
+        async fn post_receive(
+            state: Arc<DaemonState>,
+            repo_id: &str,
+            destination_ref: &kin_model::RefName,
+            pack: &kin_remote::repository_transfer::RepositoryTransferPack,
+        ) -> (StatusCode, String) {
+            let response = router(state)
+                .oneshot(
+                    Request::post(format!("/repos/{repo_id}/transfer/receive"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&serde_json::json!({
+                                "destination_ref": destination_ref,
+                                "pack": pack,
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 8 * 1024 * 1024)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&body).to_string())
+        }
+
+        fn local_replica() -> (Arc<DaemonState>, kin_core::KinLayout, tempfile::TempDir) {
+            install_test_registry_override();
+            let working = tempfile::tempdir().unwrap();
+            let layout = kin_core::init(working.path()).unwrap().layout;
+            let state = Arc::new(DaemonState::open_with_repo_id(layout.clone(), None).unwrap());
+            (state, layout, working)
+        }
+
+        /// Inbound receive, which is also where a `kin push` lands.
+        #[tokio::test]
+        async fn an_http_receive_discards_the_receivers_creation_record() {
+            let (state, layout, _working) = local_replica();
+            let repo_id = state.cached_repo_id.clone();
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let pack = pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2829);
+            let admitted_head = pack.source_head;
+            restamp_current(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_eq!(status, StatusCode::OK, "the receive must commit: {body}");
+
+            let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+                serde_json::from_str(&body).expect("the route answers a receipt");
+            assert_eq!(
+                receipt.destination_head, admitted_head,
+                "the fixture must prove history actually moved"
+            );
+            assert_unstamped(&layout, "an inbound receive");
+        }
+
+        /// The control that makes the arm above mean something: a receiver that
+        /// discarded its record on every request, refusal included, would pass
+        /// that test and degrade every healthy store that ever refused a pack.
+        #[tokio::test]
+        async fn a_refused_receive_leaves_the_creation_record_intact() {
+            let (state, layout, _working) = local_replica();
+            let repo_id = state.cached_repo_id.clone();
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            let mut pack = pack_for_local_destination(&repository_id, &layout.kindb_dir(), 0x2830);
+            // A destination ref the route did not ask for. Refused by identity,
+            // well before anything durable moves.
+            pack.destination_ref = kin_model::RefName::branch(b"not-the-route").unwrap();
+            restamp_current(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_ne!(status, StatusCode::OK, "the refusal did not fire: {body}");
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a refused pack degraded a healthy store's creation record"
+            );
+        }
+
+        /// A hosted daemon owns no local store's record. Its scaffolding
+        /// directory belongs to no repository this transfer touched, so nothing
+        /// there may move.
+        #[tokio::test]
+        async fn a_hosted_receive_leaves_its_scaffolding_record_alone() {
+            let repo_id = format!("hosted-hydration-{}", Uuid::new_v4());
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let pack = transfer_pack_for_unborn_destination(&repository_id);
+            let (state, working, _storage) = replica_state(&repo_id);
+            let layout = state.layout.clone();
+            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+            restamp_current(&layout);
+            let before = hydration_semantics::read(&layout);
+
+            let (status, body) =
+                post_receive(Arc::clone(&state), &repo_id, &destination_ref, &pack).await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "an empty hosted store must admit a native transfer: {body}"
+            );
+
+            assert_eq!(
+                hydration_semantics::read(&layout),
+                before,
+                "a hosted receive touched the scaffolding store's creation record"
+            );
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a hosted receive degraded a record it does not own"
+            );
+            drop(working);
+        }
+
+        /// The control on the pull path: a pull that admits nothing must leave
+        /// the record alone.
+        ///
+        /// A receiver that discarded its record on every pull rather than on
+        /// every admission would pass the clone arm below and degrade a healthy
+        /// store on each no-op sync. The admitting half of `pull_into_replica`
+        /// is what the clone arm exercises, because a native clone's first pull
+        /// is that function, and the acceptance suite drives a second replica's
+        /// real `kin pull` against the shipped binaries.
+        #[tokio::test]
+        async fn a_pull_that_admits_nothing_leaves_the_creation_record_alone() {
+            let peer = native_clone_peer().await;
+            let destination = tempfile::tempdir().unwrap();
+            let cloned = crate::replica_adoption::clone_native_replica(
+                destination.path(),
+                clone_endpoint(&peer.url),
+                &peer.repository_id,
+            )
+            .await
+            .expect("a native clone of a served peer");
+
+            // The clone already admitted everything the peer holds, so put the
+            // receiver back to current and ask for the same history again.
+            let layout = cloned.state.layout.clone();
+            restamp_current(&layout);
+
+            let repo_id = cloned.state.cached_repo_id.clone();
+            let request = pull_request(&peer.url, &repo_id);
+            let (status, body) =
+                transfer_command(Arc::clone(&cloned.state), "pull", &request).await;
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+
+            let pulled: kin_cli::commands::transfer::CommandTransferResponse =
+                serde_json::from_slice(&body).unwrap();
+            assert!(
+                !pulled.outcome.moved_history(),
+                "the fixture admitted a pack, so this is not the no-admission control"
+            );
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a pull that admitted nothing discarded the creation record"
+            );
+        }
+
+        /// Native clone, with the transported-history mismatch control the
+        /// review named. The source records a creation version this binary did
+        /// not author; the clone's receiver is created by this binary and would
+        /// have been stamped current. The finished replica must disclose that
+        /// it cannot speak for what it just admitted.
+        #[tokio::test]
+        async fn a_native_clone_of_a_mismatched_source_leaves_the_replica_unstamped() {
+            let peer = native_clone_peer().await;
+            stamp_one_version_behind(&peer.layout);
+            assert_eq!(
+                hydration_semantics::standing(&peer.layout),
+                HydrationStanding::Behind {
+                    created_under: hydration_semantics::binary_version() - 1,
+                    derives: hydration_semantics::binary_version(),
+                },
+                "the provenance setup did not take"
+            );
+
+            // What a freshly created receiver reads before its first pull, which
+            // is the reading the defect then let stand over transported history.
+            let unrelated = tempfile::tempdir().unwrap();
+            let fresh = kin_core::init(unrelated.path()).unwrap().layout;
+            assert!(
+                !hydration_semantics::standing(&fresh).is_gap(),
+                "a freshly created store must be current, or this arm proves nothing"
+            );
+
+            let destination = tempfile::tempdir().unwrap();
+            let cloned = crate::replica_adoption::clone_native_replica(
+                destination.path(),
+                clone_endpoint(&peer.url),
+                &peer.repository_id,
+            )
+            .await
+            .expect("a native clone of a served peer");
+            assert!(
+                cloned.transfer.outcome.moved_history(),
+                "the clone admitted no history, so it says nothing about the commit boundary"
+            );
+
+            assert_unstamped(&cloned.state.layout, "a native clone");
+            assert_eq!(
+                hydration_semantics::standing(&peer.layout),
+                HydrationStanding::Behind {
+                    created_under: hydration_semantics::binary_version() - 1,
+                    derives: hydration_semantics::binary_version(),
+                },
+                "the transfer moved the source's own creation record, which it must never do"
+            );
+        }
     }
 
     fn pull_request(
@@ -41352,7 +41991,7 @@ mod tests {
     /// receives.
     #[tokio::test]
     async fn a_trace_over_its_budget_drops_bodies_and_keeps_every_edge() {
-        const BUDGET: usize = 6_000;
+        const ORIGINAL_BUDGET: usize = 6_000;
         let state = test_state();
         let ids = install_trace_chain(&state, 6);
         // The chain links only its calls. Every requested class decides
@@ -41375,8 +42014,48 @@ mod tests {
             json!({ "focal": ids[0].to_string(), "depth": 5, "direction": "calls" }),
         )
         .await;
+
+        // Keep the original 6k fixture load-bearing after the trace step gained
+        // its two uniform call-site fields. The old shape still has to fit the
+        // exact target this ladder used before the call-site contract. Only the serialized
+        // cost of those two fields is added back to the exercised budget, and
+        // that increment has its own ceiling, so unrelated per-step growth
+        // cannot hide inside a raised magic number.
+        let compact = call_mcp_tool_text(
+            app.clone(),
+            "trace_data_flow",
+            json!({
+                "focal": ids[0].to_string(),
+                "depth": 5,
+                "direction": "calls",
+                "include_body": false,
+            }),
+        )
+        .await;
+        let mut without_site_contract: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        for step in without_site_contract["chain"].as_array_mut().unwrap() {
+            let row = step.as_object_mut().unwrap();
+            row.remove("reference_lines");
+            row.remove("reference_lines_absent_reason");
+        }
+        let old_shape_chars = serde_json::to_string_pretty(&without_site_contract)
+            .unwrap()
+            .len();
+        let original_target =
+            ORIGINAL_BUDGET.saturating_sub(kin_mcp::budget::RESPONSE_DISCLOSURE_RESERVE_CHARS);
         assert!(
-            unbounded.len() > BUDGET,
+            old_shape_chars <= original_target,
+            "the pre-call-site shape must still fit the original ladder target: {old_shape_chars} \
+             chars against {original_target}"
+        );
+        let site_contract_chars = compact.len().saturating_sub(old_shape_chars);
+        assert!(
+            (1..1_000).contains(&site_contract_chars),
+            "the two uniform site fields added {site_contract_chars} chars to this five-step chain"
+        );
+        let budget = ORIGINAL_BUDGET + site_contract_chars;
+        assert!(
+            unbounded.len() > budget,
             "the fixture must exceed the budget under test or this proves nothing: {} chars",
             unbounded.len()
         );
@@ -41389,15 +42068,15 @@ mod tests {
                 "focal": ids[0].to_string(),
                 "depth": 5,
                 "direction": "calls",
-                "max_response_chars": BUDGET,
+                "max_response_chars": budget,
             }),
         )
         .await;
         let cut: serde_json::Value = serde_json::from_str(&bounded).unwrap();
 
         assert!(
-            bounded.len() <= BUDGET,
-            "the tool must return what it promised to fit: {} chars against {BUDGET}",
+            bounded.len() <= budget,
+            "the tool must return what it promised to fit: {} chars against {budget}",
             bounded.len()
         );
         assert_eq!(

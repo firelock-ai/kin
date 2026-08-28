@@ -58,6 +58,61 @@ separates those from a file an adapter could not read. The doctor row must stay
 `healthy`, and this suite fails if it does not, because a row that went red on
 the count would go red on most JavaScript repositories.
 
+`hydration_semantics_repro.py` covers the durable replay-semantics version
+recorded when a store is created. It builds one fresh repository and requires
+the control to stay silent on `kin graph status`, report a healthy
+`hydration_semantics` doctor row, and omit `hydration_semantics_stale` from the
+stdio MCP envelope. It then plants stamps one version behind and ahead, removes
+the stamp entirely, and plants an incompatible future-schema stamp. All four
+gap arms must disclose on all three surfaces with direction-safe advice. The
+current-store control is what prevents an always-warning comparator or a
+missing writer from satisfying the suite.
+
+Advice is compared against the canonical `HydrationStanding::remedy` text
+exactly, on `kin graph status` and on the doctor row's `manual_fix`. A prefix or
+substring check accepts correct advice followed by advice that destroys the
+store, and the self-test carries a safe-plus-unsafe mutant for every direction
+to prove the comparison rejects it. The MCP arm grades the structured
+`_kin.hydration_semantics` observation, not only the compatibility boolean: the
+standing label, both versions where known, the read failure on an unreadable
+record, and the direction-safe remedy. A boolean named `stale` is wrong for
+three of the four gaps, so a grader that read only the flag could not tell an
+agent which action is safe.
+
+Three checks go beyond the three surfaces. `verdict` drives a real
+negative-capable `find_references` call over the suite's Python fixture and
+requires that the identical answer certifies on a current store and is
+inconclusive under every gap, down to `negative.trust`, `_kin.verdict.state`,
+the absence gate, the limiting factor and the completeness limits.
+`kin_graph_status` is not in the negative registry, so grading its flag could
+never have shown that a successful answer stops being authoritative; a break
+between the flag and the retrieval verdict would have left the suite green. If
+the current control cannot certify, that arm reports `UNREADABLE` and names what
+stopped it rather than weakening the bar.
+
+`creation_doors` builds a store through every creation door the shipped
+binaries expose (`kin init` on a bare directory, `kin init` over a Git checkout,
+`kin init --adopt-repository-id`, and `kin clone` over Git transport) and reads
+the published record back through the product's own path. One door proved
+nothing about the others.
+
+`native_transfer` is present in the script and deliberately NOT wired into its
+check list. No path through the shipped CLI builds its fixture: a Git-admitted
+source into an adopting receiver is refused at export for Git-authority
+divergence, a native source holding real content is refused at pack validation
+because a native change that introduces artifacts needs a bound workspace
+admission context that a transfer's receive transaction does not carry, and
+`kin clone` is Git transport only and fail-closes on a native remote. Its
+docstring records each refusal verbatim. Wiring an arm whose fixture the product
+refuses to build would put a permanent UNREADABLE into the acceptance verdict,
+which fails the gate for a reason that is not about the code under test.
+
+That behaviour is covered by `api::tests::hydration_semantics_on_native_transfer`
+in kin-daemon instead, five arms driving the real production routes: the HTTP
+receive route through `router()`, `pull_into_replica` through
+`clone_native_replica`, a hosted control and a refused-pack control. What is not
+covered anywhere is the same proof against the shipped binaries.
+
 `brownfield_repro.py` covers reference enrichment on two pinned upstream trees,
 `psf/requests` and `expressjs/express`, replayed as single-commit repositories
 holding the exact pinned tree object. Check 0 asserts the run stayed off the GPU
@@ -119,7 +174,27 @@ which is the shape of a `compact` call and of source the graph never had, so it
 now keeps a null `body` beside a marker naming what went. Check 7 drives
 `kin context`, whose rendered lines are the whole of what a reader of that
 surface sees, and asserts the lines and `--json` report the same cut and name the
-lever that recovers it.
+lever that recovers it. Check 8 covers the page a cursor cannot rescue: a final
+page has no continuation, so the rows it withheld are reachable only by raising
+`max_chars` or narrowing the question, and it has to name those rather than a
+cursor it does not have.
+
+Checks 9 to 11 are FIR-2814, and they are the same reading defect one field over.
+A `LocateResult` skips its `entities` array when empty while the secondary
+`files` roll-up serializes whatever it holds, so a fused entity page that ranked
+nothing shipped no primary key at all beside a populated roll-up, and a reader
+taking the first present array read an empty answer as a file answer. Every
+reader had to re-derive which array was the answer from `granularity` and
+`routing`, and two of them did, in two places, under rules that were not the
+same. Check 9 asks each granularity to name the literal collection it answers
+with and to publish a row count that matches the array it ships, and it grades
+both granularities in one check because a server answering `files` to everything
+would satisfy the file half on its own. Check 10 asks a file page to be a window
+over the file ranking rather than the whole roll-up re-emitted under an advancing
+cursor, which reads as paging and is not. Check 11 asks an entity page that
+ranked nothing to still ship its primary as an empty array and count it zero,
+with a populated page as the control, since a server reporting every page empty
+would satisfy the empty arm on every call.
 
 `memory_pressure_refusal.py` covers the back-off Kin owes a machine it is
 running on, and the disclosure it owes the person running it. A daemon that
