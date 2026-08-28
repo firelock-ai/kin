@@ -1994,6 +1994,26 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
         self.store
     }
 
+    /// Read one immutable body through THIS REQUEST's source capability.
+    ///
+    /// The opened authority is shared by every request reading at the same
+    /// publication, so it is the wrong place for a per-request byte allowance
+    /// and deliberately carries none. Reading a blob straight off it walks
+    /// around whatever ceiling the caller derived, which is how a hosted route
+    /// could bound its response and not its reads. The request capability is
+    /// the one that holds the allowance, so the read goes through it whenever
+    /// there is one.
+    fn load_source_blob(
+        &self,
+        authority: &ActiveRepositoryAuthority,
+        digest: Hash256,
+    ) -> Result<Arc<Vec<u8>>> {
+        match self.source.as_ref() {
+            Some(source) => source.load_source_blob(authority, digest),
+            None => authority.load_source_blob(digest).map(Arc::new),
+        }
+    }
+
     fn authority(&self) -> Result<&ActiveRepositoryAuthority> {
         match self.authority.get_or_init(|| {
             let source = self.source.as_ref().ok_or_else(|| {
@@ -2085,7 +2105,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
     scope: EntitySourceScope,
-) -> Result<Option<(ExactEntitySource, Vec<u8>, SourceSpan)>> {
+) -> Result<Option<(ExactEntitySource, Arc<Vec<u8>>, SourceSpan)>> {
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
 
     let Some(recorded_span) = entity.span.as_ref() else {
@@ -2328,7 +2348,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
             span_source_coherence(entity, &hash, &recorded_origin.0)?
         }
     };
-    let bytes = authority.load_source_blob(hash).map_err(|error| {
+    let bytes = held.load_source_blob(authority, hash).map_err(|error| {
         graph_source_gap(format!(
             "blob {hash} for entity {} artifact {:?} is unavailable or corrupt: {error}",
             entity.id, current_artifact.artifact_id

@@ -8495,10 +8495,7 @@ fn build_semantic_locate_result(
     let include_snippet = arguments
         .get("include_snippet")
         .and_then(serde_json::Value::as_bool)
-        // Hosted calls default to coordinates-only. A body is an explicit
-        // object-store projection and is hydrated only after final paging;
-        // local MCP keeps its historical body-by-default contract.
-        .unwrap_or(hosted_view.is_none())
+        .unwrap_or(true)
         && !file_granularity;
     let repository_authority = if include_snippet {
         match require_mcp_local_repository_authority(state) {
@@ -9645,6 +9642,7 @@ impl HostedSemanticRequest {
     }
 }
 
+#[derive(Debug)]
 struct RepoScopedMcpFailure {
     status: StatusCode,
     code: &'static str,
@@ -19443,6 +19441,22 @@ mod tests {
         );
         let app = router(Arc::clone(&state));
 
+        // Warm the view first and take a baseline. Opening repository
+        // authority verifies persisted bodies, and those reads belong to the
+        // open rather than to the tool dispatch this measures.
+        let (status, _, warm) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_id,
+            "semantic_locate",
+            json!({ "query": "bounded source", "include_snippet": false }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{warm}");
+        let baseline_reads = faults.blob_read_ceilings().len();
+        let baseline_unbounded = faults.unbounded_blob_reads();
+        let baseline_bytes = faults.blob_bytes_served();
+
         let (status, _, body) = call_repo_mcp_tool(
             app,
             &repo_id,
@@ -19457,7 +19471,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
 
-        let ceilings = faults.blob_read_ceilings();
+        let ceilings = faults.blob_read_ceilings().split_off(baseline_reads);
         // A run that read nothing grades nothing. This is the NOT RUN guard:
         // without it every assertion below passes over an empty vector.
         assert!(
@@ -19466,8 +19480,8 @@ mod tests {
         );
         assert_eq!(
             faults.unbounded_blob_reads(),
-            0,
-            "the hosted route must never reach the unbounded source-blob arm"
+            baseline_unbounded,
+            "the hosted tool dispatch must never reach the unbounded source-blob arm"
         );
 
         let budget = kin_mcp::budget::ResponseBudget::from_arguments(&HashMap::from([(
@@ -19495,10 +19509,10 @@ mod tests {
                 kin_db::MAX_SOURCE_BLOB_BYTES
             );
         }
+        let materialized = faults.blob_bytes_served() - baseline_bytes;
         assert!(
-            faults.blob_bytes_served() <= total,
-            "the call materialized {} bytes against its {total}-byte allowance",
-            faults.blob_bytes_served()
+            materialized <= total,
+            "the call materialized {materialized} bytes against its {total}-byte allowance"
         );
     }
 
@@ -19573,10 +19587,7 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{warm}");
-        assert!(
-            faults.blob_read_ceilings().is_empty(),
-            "the warm-up must not project source, or it pays the delay armed below"
-        );
+        let baseline_reads = faults.blob_read_ceilings().len();
 
         let held = Duration::from_millis(2_000);
         faults.delay_blob_reads(held);
@@ -19603,7 +19614,7 @@ mod tests {
         let (status, _, body) = call.await.unwrap();
         assert_eq!(status, StatusCode::OK, "{body}");
         assert!(
-            !faults.blob_read_ceilings().is_empty(),
+            faults.blob_read_ceilings().len() > baseline_reads,
             "the measured call must have projected source, or the delay was never held"
         );
         assert!(
@@ -19778,6 +19789,11 @@ mod tests {
         assert!(
             !faults.blob_read_ceilings().is_empty(),
             "the control must prove this call reads source at all"
+        );
+        let healthy_payload = successful_repo_mcp_payload(healthy);
+        assert!(
+            healthy_payload.to_string().contains("source_fault_symbol"),
+            "the control must return the entity whose body the fault below withholds: {healthy_payload}"
         );
 
         faults.start_blob_faulting(&repo_id);
