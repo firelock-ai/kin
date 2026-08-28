@@ -1018,10 +1018,24 @@ impl SpineBackend for FirestoreSpineBackend {
         // winner it must reconcile to; reporting one whose winner is the
         // caller's own publication asks it to reconcile to itself.
         if winner.head.publication_id == prepared.candidate_head().publication_id {
-            if matches!(&outcome, RepoPublicationCommit::Conflict(_)) {
-                outcome = RepoPublicationCommit::AlreadyCommitted {
-                    source_cursor: winner.head.source_cursor,
-                };
+            if let RepoPublicationCommit::Conflict(conflict) = &outcome {
+                // Content equality has two producers and only one of them is
+                // idempotency. A writer refused for a stale rollout fence or a
+                // moved dependency head can carry byte-identical content and
+                // must still lose, because its conflict is about authority and
+                // not about what it wrote: admitting it would let a paused
+                // writer bypass a fence that advanced under it. Those two
+                // constructors are the only ones that populate the fence and
+                // dependency fields, and a plain head CAS leaves every one of
+                // them None, so this separates the cases exactly.
+                let authority_conflict = conflict.attempted_rollout_fence.is_some()
+                    || conflict.observed_rollout_fence.is_some()
+                    || conflict.observed_dependency_repo.is_some();
+                if !authority_conflict {
+                    outcome = RepoPublicationCommit::AlreadyCommitted {
+                        source_cursor: winner.head.source_cursor,
+                    };
+                }
             }
         } else if !matches!(&outcome, RepoPublicationCommit::Conflict(_)) {
             outcome = RepoPublicationCommit::Conflict(
