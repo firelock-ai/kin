@@ -3523,6 +3523,66 @@ mod tests {
                 && step.reference_lines_absent_reason.as_deref() == Some("unreported_by_daemon")));
     }
 
+    /// An annotation edge's span is not a call site, on this arm too.
+    ///
+    /// The generic GraphStore arm has a test for exactly this. The CLI arm
+    /// carried the same edge-class gate with nothing grading it, so restoring
+    /// the old accumulation here went unnoticed on this surface while the other
+    /// surface caught it, which is a guard that cannot fail. The graph holds a
+    /// `UsesType` edge beside the `Calls` edge for the same pair, and its span
+    /// is the annotation's target, which is the callee's own definition rather
+    /// than anywhere the caller calls it.
+    #[test]
+    fn an_annotation_span_is_not_a_call_site() {
+        let graph = InMemoryGraph::new();
+        let focal = make_entity("focal", "src/focal.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        for entity in [&focal, &callee] {
+            graph.upsert_entity(entity).unwrap();
+        }
+        graph
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::Calls,
+                "src/focal.rs",
+                11,
+            ))
+            .unwrap();
+        graph
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::UsesType,
+                "src/focal.rs",
+                4,
+            ))
+            .unwrap();
+
+        let mut request = trace_request(&focal.id, 1, TraceDirection::Calls, 25);
+        request.include_body = Some(false);
+        let response = traced(&graph, &request);
+        let row = response
+            .chain
+            .iter()
+            .find(|step| step.entity.entity_name == "callee")
+            .unwrap_or_else(|| {
+                panic!(
+                    "the annotation edge must still reach the leaf: {:?}",
+                    step_names(&response)
+                )
+            });
+
+        // The premise: the leaf is here at all, which is what `UsesType` being
+        // in the allowed set buys and what this gate must not take away.
+        assert_eq!(
+            row.reference_lines,
+            vec![12],
+            "only the call site belongs here, not the annotation's target: {row:?}"
+        );
+        assert_eq!(row.reference_lines_absent_reason, None);
+    }
+
     /// The regression a character count is the only guard against: a change that
     /// re-inlines bodies on a shape query is invisible to every assertion about
     /// chain contents.
