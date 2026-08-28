@@ -4785,12 +4785,26 @@ mod tests {
             .expect("commit publication")
     }
 
+    /// Publish and require a success outcome, naming what came back instead.
+    ///
+    /// This helper is called from most tests in this module, so a bare
+    /// `assert!(matches!(..))` here reports only "assertion failed" at one
+    /// shared line: it names neither the outcome nor which caller produced it.
+    /// The repo and cursor identify the call site and the Debug outcome says
+    /// whether a conflict, and which one, is what actually happened.
     fn publish_success(backend: &FirestoreSpineBackend, publication: RepoSpinePublication) {
-        assert!(matches!(
-            publish(backend, publication),
-            RepoPublicationCommit::Committed { .. }
-                | RepoPublicationCommit::AlreadyCommitted { .. }
-        ));
+        let repo_id = publication.repo_id.clone();
+        let source_cursor = publication.source_cursor;
+        let outcome = publish(backend, publication);
+        assert!(
+            matches!(
+                outcome,
+                RepoPublicationCommit::Committed { .. }
+                    | RepoPublicationCommit::AlreadyCommitted { .. }
+            ),
+            "publishing repo {repo_id} at cursor {source_cursor} must commit or read as \
+             already committed, got {outcome:?}"
+        );
     }
 
     fn committed_head(store: &FakeSpineStore, repo_id: &str) -> RepoPublicationHead {
@@ -5263,11 +5277,18 @@ mod tests {
             first.commit_repo_publication(first_prepared).unwrap(),
             RepoPublicationCommit::Committed { .. }
         ));
-        assert!(matches!(
-            second.commit_repo_publication(second_prepared).unwrap(),
-            RepoPublicationCommit::AlreadyCommitted { source_cursor }
-                if source_cursor == cursor(41)
-        ));
+        // Named rather than matched bare: a conflict here is the interesting
+        // outcome and `assert!(matches!(..))` would hide which one it was.
+        let converged = second.commit_repo_publication(second_prepared).unwrap();
+        assert!(
+            matches!(
+                converged,
+                RepoPublicationCommit::AlreadyCommitted { source_cursor }
+                    if source_cursor == cursor(41)
+            ),
+            "a second writer committing the identical publication must converge as \
+             already committed at cursor 41, got {converged:?}"
+        );
         assert_eq!(second.source_cursor("repo"), Some(cursor(41)));
     }
 
