@@ -977,6 +977,30 @@ pub(crate) fn auto_embed_enabled() -> bool {
     kin_daemon_spawn::auto_embed_enabled_from(std::env::var(AUTO_EMBED_ENV).ok().as_deref())
 }
 
+/// Whether the selected graph has no queued or unindexed embedding work.
+///
+/// Keeping all three fields explicit prevents an empty in-memory queue from
+/// standing in for coverage. A refused missing-key backfill can have no queued
+/// batch yet while `indexed < total`, and that refusal must remain durable.
+fn embedding_coverage_is_complete(pending: usize, indexed: usize, total: usize) -> bool {
+    kin_core::memory_pressure::EmbeddingCoverage {
+        pending,
+        indexed,
+        total,
+    }
+    .is_complete()
+}
+
+/// Retire a stale memory cause when this daemon cannot run embedding for the
+/// independent persistence reason reported by `/health`.
+///
+/// Exact-work retirement preserves LSP and future-work refusals. Keeping the
+/// embed record would tell MCP and CLI readers that freeing memory can restart
+/// a worker this backend deliberately never starts.
+fn retire_embed_pressure_for_unavailable_persistence(state: &DaemonState) {
+    clear_pressure_refusal_for_work(state, kin_core::memory_pressure::HeavyWork::EmbedBatch);
+}
+
 /// Build the background embedding backlog and announce it, or defer the whole
 /// pass because an operator opted out. Returns whether the backlog was queued.
 ///
@@ -1008,24 +1032,45 @@ fn start_or_defer_background_embed(state: &DaemonState) -> bool {
     // was green there and red on any busy machine.
     if !auto_embed_enabled() {
         state.pause_background_embed();
+        clear_pressure_refusal_for_work(state, kin_core::memory_pressure::HeavyWork::EmbedBatch);
         warn!(
             trigger = AUTO_EMBED_ENV,
             "background embedding deferred by operator opt-out: no vectors will be generated, and semantic coverage stays as it is until an explicit embed request runs"
         );
         return false;
     }
+    // Coverage is the question pressure qualifies, so establish that there is
+    // work before asking whether the host can hold it. Otherwise opening an
+    // already-complete store on a critical host publishes an embed refusal
+    // even though there is no batch to start. Current readers can filter that
+    // contradiction after another daemon round trip, but older readers show it
+    // until the worker's first wake retires it.
+    let embed_status = state.graph.embedding_status();
+    if embedding_coverage_is_complete(
+        embed_status.pending,
+        embed_status.indexed,
+        embed_status.total,
+    ) {
+        clear_pressure_refusal_for_work(state, kin_core::memory_pressure::HeavyWork::EmbedBatch);
+        info!(
+            opt_out = AUTO_EMBED_ENV,
+            indexed = embed_status.indexed,
+            total = embed_status.total,
+            "background embedding coverage already complete: no backlog needs admission"
+        );
+        return true;
+    }
     // Now that the pass is genuinely wanted, ask whether the machine has room
     // for it. Before the queue is built rather than after, because building it
     // walks the graph for everything the index is missing and a machine with no
     // room should not pay for a queue nothing is going to drain. The pass is
-    // deferred exactly the way the opt-out above defers it, so a daemon that
-    // declines here stays eligible for idle shutdown instead of reading as work
-    // in flight.
+    // left unqueued, so a daemon that declines here stays eligible for idle
+    // shutdown. Unlike the operator opt-out, pressure is temporary: the worker
+    // remains runnable and asks again on its next wake.
     let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
     publish_footprint_standing(state, &call);
     if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
         let reason = reason.clone();
-        state.pause_background_embed();
         disclose_pressure_refusal(
             state,
             kin_core::memory_pressure::HeavyWork::EmbedBatch,
@@ -1154,6 +1199,16 @@ enum CoverageDrainVerdict {
     Backfill { missing: usize },
     /// Coverage is short and the last re-queue at this gap produced nothing.
     Stalled { missing: usize },
+}
+
+impl CoverageDrainVerdict {
+    /// Pressure work whose durable refusal this coverage boundary may retire.
+    ///
+    /// Backfill and stalled queues are still outstanding work. Only whole
+    /// coverage authorizes retiring an embedding refusal.
+    fn completed_pressure_work(self) -> Option<kin_core::memory_pressure::HeavyWork> {
+        matches!(self, Self::Complete).then_some(kin_core::memory_pressure::HeavyWork::EmbedBatch)
+    }
 }
 
 fn coverage_drain_verdict(missing: usize, backfilled_gap: Option<usize>) -> CoverageDrainVerdict {
@@ -1459,7 +1514,7 @@ pub fn spawn_shutdown_escalation_watchdog<F>(
                 "kin-daemon: graceful shutdown exceeded {}s grace — forcing process exit to prevent a CPU zombie",
                 grace.as_secs()
             );
-            std::process::exit(0);
+             std::process::exit(0);
         })
     {
         warn!(error = %error, "failed to spawn shutdown-escalation watchdog");
@@ -2172,6 +2227,9 @@ pub(crate) fn publish_footprint_standing(state: &DaemonState, call: &PressureCal
     );
 }
 
+/// Serialize the daemon's only production pressure-record writer and clearer.
+static PRESSURE_REFUSAL_RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Publish a pressure refusal where the surfaces outside this process can read
 /// it, and log it here.
 ///
@@ -2192,6 +2250,9 @@ pub(crate) fn disclose_pressure_refusal(
         "{reason} {}",
         kin_core::memory_pressure::PRESSURE_REMEDY
     );
+    let _record_guard = PRESSURE_REFUSAL_RECORD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     kin_core::memory_pressure::PressureRefusal::record(
         state.layout.root(),
         work,
@@ -2200,18 +2261,101 @@ pub(crate) fn disclose_pressure_refusal(
     );
 }
 
-/// Retire a pressure refusal this store still records, because the work it
-/// describes has just run.
+/// Whether the durable refusal is for the exact work that just completed.
 ///
-/// Read before removing so the ordinary case, a store that never refused
-/// anything, costs one failed open rather than a write. Without this the row
-/// heals only when a store is reinitialized, and a surface reporting last
-/// week's refusal reads exactly like one reporting this second's.
-pub(crate) fn clear_pressure_refusal(state: &DaemonState) {
-    let root = state.layout.root();
-    if kin_core::memory_pressure::PressureRefusal::read(root).is_some() {
-        kin_core::memory_pressure::PressureRefusal::clear(root);
+/// Missing and future work ids never match. A completion has authority to
+/// retire its own disclosure and no other producer's.
+fn pressure_refusal_matches_work(
+    refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+    completed_work: kin_core::memory_pressure::HeavyWork,
+) -> bool {
+    refusal.is_some_and(|refusal| refusal.work == completed_work.id())
+}
+
+/// Retire this work's pressure refusal after the work reaches its completion
+/// boundary.
+///
+/// The same lock serializes the daemon's only production writer. The core
+/// store removes the exact key and atomically republishes every other known or
+/// future-work refusal, so one producer cannot erase another's outstanding
+/// disclosure.
+pub(crate) fn clear_pressure_refusal_for_work(
+    state: &DaemonState,
+    completed_work: kin_core::memory_pressure::HeavyWork,
+) -> bool {
+    let _record_guard = PRESSURE_REFUSAL_RECORD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    kin_core::memory_pressure::PressureRefusal::clear_for_work(state.layout.root(), completed_work)
+}
+
+/// Forget a spoken pressure level only when its durable refusal was retired.
+///
+/// Completion is a lifecycle boundary, not merely another nominal sample. If
+/// this latch survives the retirement, a later backlog refused at the same
+/// pressure level is silently treated as already disclosed even though there
+/// is no longer a record for MCP or CLI readers to see.
+fn pressure_announcement_after_retirement(
+    announced: Option<kin_core::memory_pressure::PressureLevel>,
+    retired: bool,
+) -> Option<kin_core::memory_pressure::PressureLevel> {
+    if retired {
+        None
+    } else {
+        announced
     }
+}
+
+/// Whether this refusal must be published for out-of-process readers.
+///
+/// The level latch suppresses duplicate logging only while the matching
+/// durable record still exists. A missing record, or another producer's
+/// record, must not suppress a fresh refusal at the same level.
+fn pressure_refusal_needs_disclosure(
+    announced: Option<kin_core::memory_pressure::PressureLevel>,
+    current_level: kin_core::memory_pressure::PressureLevel,
+    refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+    work: kin_core::memory_pressure::HeavyWork,
+) -> bool {
+    announced != Some(current_level) || !pressure_refusal_matches_work(refusal, work)
+}
+
+/// Disclose one refused embedding decision and report whether work must stop.
+fn disclose_embed_pressure_refusal_if_needed(
+    state: &DaemonState,
+    announced: &mut Option<kin_core::memory_pressure::PressureLevel>,
+    call: &PressureCall,
+) -> bool {
+    let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict else {
+        return false;
+    };
+    let work = kin_core::memory_pressure::HeavyWork::EmbedBatch;
+    let refusal =
+        kin_core::memory_pressure::PressureRefusal::read_for_work(state.layout.root(), work);
+    if pressure_refusal_needs_disclosure(*announced, call.level, refusal.as_ref(), work) {
+        disclose_pressure_refusal(state, work, call, reason);
+        *announced = Some(call.level);
+    }
+    true
+}
+
+/// Queue a missing-coverage rebuild only after the machine admits the work.
+///
+/// The closure is the graph walk that materializes the backlog. Keeping it
+/// behind this seam makes the ordering testable: sustained critical pressure
+/// retries later without paying for the very walk startup refused to perform.
+fn queue_embedding_backfill_under_pressure(
+    state: &DaemonState,
+    announced: &mut Option<kin_core::memory_pressure::PressureLevel>,
+    queue_backfill: impl FnOnce(),
+) -> bool {
+    let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
+    publish_footprint_standing(state, &call);
+    if disclose_embed_pressure_refusal_if_needed(state, announced, &call) {
+        return false;
+    }
+    queue_backfill();
+    true
 }
 
 /// How many consecutive fruitless interrupted sweeps disable the next one.
@@ -3562,7 +3706,10 @@ pub async fn run_with_authority_on(
             }
             SweepStartDecision::Queue => {
                 sweep_admitted = true;
-                clear_pressure_refusal(&state);
+                clear_pressure_refusal_for_work(
+                    &state,
+                    kin_core::memory_pressure::HeavyWork::LspSweep,
+                );
             }
         }
     }
@@ -4078,6 +4225,7 @@ pub async fn run_with_authority_on(
     let mut embed_cancel = cancel_rx.clone();
     let embed_handle = tokio::spawn(async move {
         if !embed_state.can_persist_embed_progress_locally() {
+            retire_embed_pressure_for_unavailable_persistence(&embed_state);
             warn!(
                 "background embedding worker disabled: storage-backend graph authority has no durable vector-sidecar persistence contract; graph serving remains available"
             );
@@ -4218,18 +4366,30 @@ pub async fn run_with_authority_on(
                     // before believing the drain.
                     let status = embed_state.graph.embedding_status();
                     let missing = status.total.saturating_sub(status.indexed);
-                    match coverage_drain_verdict(missing, backfilled_gap) {
+                    let coverage_verdict = coverage_drain_verdict(missing, backfilled_gap);
+                    match coverage_verdict {
                         CoverageDrainVerdict::Backfill { missing } => {
+                            if !queue_embedding_backfill_under_pressure(
+                                &embed_state,
+                                &mut announced_pressure,
+                                || {
+                                    #[cfg(feature = "embeddings")]
+                                    embed_state.graph.queue_missing_for_embedding();
+                                    embed_state.graph.queue_missing_artifacts_for_embedding();
+                                },
+                            ) {
+                                break;
+                            }
                             warn!(
                                 missing,
                                 indexed = status.indexed,
                                 total = status.total,
                                 "embedding queue drained while coverage is short; re-queueing the missing keys"
                             );
+                            // This latch means a re-queue was actually tried.
+                            // A pressure refusal above tried nothing and must
+                            // remain eligible on the next wake.
                             backfilled_gap = Some(missing);
-                            #[cfg(feature = "embeddings")]
-                            embed_state.graph.queue_missing_for_embedding();
-                            embed_state.graph.queue_missing_artifacts_for_embedding();
                             if embed_state.graph.pending_embeddings() > 0
                                 || embed_state.graph.pending_artifact_embeddings() > 0
                             {
@@ -4253,6 +4413,15 @@ pub async fn run_with_authority_on(
                             // has-ever-completed marker is published. Recording
                             // it on the side that did the work keeps the claim
                             // off a reader that only saw a quiet queue.
+                            let completed_work = coverage_verdict
+                                .completed_pressure_work()
+                                .expect("complete coverage names its completed pressure work");
+                            let retired_refusal =
+                                clear_pressure_refusal_for_work(&embed_state, completed_work);
+                            announced_pressure = pressure_announcement_after_retirement(
+                                announced_pressure,
+                                retired_refusal,
+                            );
                             embed_state.record_embedding_coverage_complete();
                             break;
                         }
@@ -4266,16 +4435,11 @@ pub async fn run_with_authority_on(
                 let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::EmbedBatch);
                 publish_footprint_standing(&embed_state, &call);
                 let pressure_changed = announced_pressure != Some(call.level);
-                if let kin_core::memory_pressure::Verdict::Refuse { reason } = &call.verdict {
-                    if pressure_changed {
-                        disclose_pressure_refusal(
-                            &embed_state,
-                            kin_core::memory_pressure::HeavyWork::EmbedBatch,
-                            &call,
-                            reason,
-                        );
-                        announced_pressure = Some(call.level);
-                    }
+                if disclose_embed_pressure_refusal_if_needed(
+                    &embed_state,
+                    &mut announced_pressure,
+                    &call,
+                ) {
                     break;
                 }
                 if pressure_changed {
@@ -4288,9 +4452,7 @@ pub async fn run_with_authority_on(
                                 "{reason}"
                             );
                         }
-                        kin_core::memory_pressure::Verdict::Proceed => {
-                            clear_pressure_refusal(&embed_state);
-                        }
+                        kin_core::memory_pressure::Verdict::Proceed => {}
                         kin_core::memory_pressure::Verdict::Refuse { .. } => {}
                     }
                     announced_pressure = Some(call.level);
@@ -5998,13 +6160,15 @@ mod tests {
     /// never be read as finished.
     #[test]
     fn a_drained_queue_over_short_coverage_is_not_finished() {
+        let backfill = coverage_drain_verdict(641, None);
+        let complete = coverage_drain_verdict(0, None);
+
+        assert_eq!(backfill, CoverageDrainVerdict::Backfill { missing: 641 });
+        assert_eq!(backfill.completed_pressure_work(), None);
+        assert_eq!(complete, CoverageDrainVerdict::Complete);
         assert_eq!(
-            coverage_drain_verdict(641, None),
-            CoverageDrainVerdict::Backfill { missing: 641 }
-        );
-        assert_eq!(
-            coverage_drain_verdict(0, None),
-            CoverageDrainVerdict::Complete
+            complete.completed_pressure_work(),
+            Some(kin_core::memory_pressure::HeavyWork::EmbedBatch)
         );
     }
 
@@ -6014,9 +6178,12 @@ mod tests {
     /// queue every interval forever.
     #[test]
     fn a_gap_that_requeueing_cannot_close_is_reported_not_retried() {
+        let stalled = coverage_drain_verdict(641, Some(641));
+        assert_eq!(stalled, CoverageDrainVerdict::Stalled { missing: 641 });
         assert_eq!(
-            coverage_drain_verdict(641, Some(641)),
-            CoverageDrainVerdict::Stalled { missing: 641 }
+            stalled.completed_pressure_work(),
+            None,
+            "stalled work stays outstanding and cannot retire its refusal"
         );
         // A different gap is a different question, and gets its own attempt.
         assert_eq!(
@@ -7626,9 +7793,13 @@ fn budget_no_test_can_fill() -> kin_core::test_env::EnvVarGuard {
 #[cfg(test)]
 mod memory_pressure_tests {
     use super::{
-        clear_pressure_refusal, decide_sweep_on_start, embed_batch_under_pressure,
-        pressure_verdict, sample_tree_footprint, start_or_defer_background_embed,
-        tree_footprint_from, ProcessRow, SweepStartDecision,
+        clear_pressure_refusal_for_work, decide_sweep_on_start, embed_batch_under_pressure,
+        embedding_coverage_is_complete, pressure_announcement_after_retirement,
+        pressure_refusal_matches_work,
+        pressure_refusal_needs_disclosure, pressure_verdict,
+        queue_embedding_backfill_under_pressure, retire_embed_pressure_for_unavailable_persistence,
+        sample_tree_footprint, start_or_defer_background_embed, tree_footprint_from, ProcessRow,
+        SweepStartDecision,
     };
     // Gated exactly like its only caller, the walk test that spawns a real
     // child. The daemon itself calls this on every platform; it is the test
@@ -7637,12 +7808,73 @@ mod memory_pressure_tests {
     #[cfg(unix)]
     use super::walk_process_table;
     use crate::state::DaemonState;
-    use kin_core::memory_pressure::{HeavyWork, PressureRefusal, Verdict};
+    use kin_core::memory_pressure::{HeavyWork, PressureLevel, PressureRefusal, Verdict};
     use kin_core::test_env::EnvVarGuard;
+    use kin_model::EntityStore;
 
     fn open_store(repo_dir: &std::path::Path) -> DaemonState {
         let init = kin_core::init(repo_dir).unwrap();
         DaemonState::open(init.layout).unwrap()
+    }
+
+    fn write_pressure_refusal(root: &std::path::Path, work: &str) -> PressureRefusal {
+        let refusal = PressureRefusal {
+            work: work.to_string(),
+            level: "critical".to_string(),
+            reason: format!("{work} was refused"),
+            at_unix: 1,
+        };
+        let mut refusals = PressureRefusal::read_all(root);
+        refusals.retain(|existing| existing.work != refusal.work);
+        refusals.push(refusal.clone());
+        let newest = refusals.last().expect("one refusal").clone();
+        std::fs::write(
+            kin_core::memory_pressure::pressure_record_path(root),
+            serde_json::to_vec(&serde_json::json!({
+                "work": newest.work,
+                "level": newest.level,
+                "reason": newest.reason,
+                "at_unix": newest.at_unix,
+                "refusals": refusals,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        refusal
+    }
+
+    fn install_pending_embedding(state: &DaemonState) {
+        state
+            .graph
+            .upsert_entity(&kin_model::Entity {
+                id: kin_model::EntityId::new(),
+                kind: kin_model::EntityKind::Function,
+                name: "pending_embedding".to_string(),
+                language: kin_model::LanguageId::Rust,
+                fingerprint: kin_model::SemanticFingerprint {
+                    algorithm: kin_model::FingerprintAlgorithm::V1TreeSitter,
+                    ast_hash: kin_model::Hash256::from_bytes([1; 32]),
+                    signature_hash: kin_model::Hash256::from_bytes([2; 32]),
+                    behavior_hash: kin_model::Hash256::from_bytes([3; 32]),
+                    equivalence_hash: kin_model::Hash256::from_bytes([0; 32]),
+                    stability_score: 1.0,
+                },
+                file_origin: Some(kin_model::FilePathId::new("src/lib.rs")),
+                span: None,
+                signature: "fn pending_embedding()".to_string(),
+                visibility: kin_model::Visibility::Private,
+                role: kin_model::EntityRole::Source,
+                doc_summary: None,
+                metadata: kin_model::EntityMetadata::default(),
+                lineage_parent: None,
+                created_in: None,
+                superseded_by: None,
+            })
+            .unwrap();
+        assert!(
+            state.graph.embedding_status().pending > 0,
+            "the fixture must represent real selected-graph work, not just an empty queue"
+        );
     }
 
     fn row(pid: u32, parent: Option<u32>, footprint_bytes: u64) -> ProcessRow {
@@ -8341,6 +8573,7 @@ mod memory_pressure_tests {
         let state = open_store(dir.path());
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
         let _opted_out = EnvVarGuard::set(super::AUTO_EMBED_ENV, "0");
+        write_pressure_refusal(state.layout.root(), HeavyWork::EmbedBatch.id());
 
         assert!(
             !start_or_defer_background_embed(&state),
@@ -8351,6 +8584,16 @@ mod memory_pressure_tests {
             "work nobody asked for must not be reported as work memory prevented: {:?}",
             PressureRefusal::read(state.layout.root())
         );
+
+        for work in [HeavyWork::LspSweep.id(), "future-heavy-work"] {
+            let expected = write_pressure_refusal(state.layout.root(), work);
+            assert!(!start_or_defer_background_embed(&state));
+            assert_eq!(
+                PressureRefusal::read(state.layout.root()),
+                Some(expected),
+                "the embedding opt-out has no authority to retire {work}"
+            );
+        }
     }
 
     /// The same machine with the opt-out absent still refuses for memory, so
@@ -8361,6 +8604,7 @@ mod memory_pressure_tests {
         let _lock = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
+        install_pending_embedding(&state);
         let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
         let _wanted = EnvVarGuard::unset(super::AUTO_EMBED_ENV);
 
@@ -8368,6 +8612,73 @@ mod memory_pressure_tests {
         let record = PressureRefusal::read(state.layout.root())
             .expect("a pass somebody wanted, declined for memory, is disclosed");
         assert_eq!(record.work, "embed-batch");
+        assert!(
+            !state.background_embed_paused(),
+            "pressure is a retryable backoff; only the operator opt-out permanently pauses"
+        );
+    }
+
+    #[test]
+    fn a_pressure_refusal_retries_on_the_next_wake_after_pressure_clears() {
+        let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        install_pending_embedding(&state);
+        let _wanted = EnvVarGuard::unset(super::AUTO_EMBED_ENV);
+
+        {
+            let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+            assert!(!start_or_defer_background_embed(&state));
+            assert!(
+                !state.background_embed_paused(),
+                "the worker must remain eligible for its ambient retry"
+            );
+        }
+        {
+            let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
+            assert!(
+                start_or_defer_background_embed(&state),
+                "the next wake starts the same wanted pass once pressure clears"
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_pressure_refuses_before_materializing_the_backfill_queue() {
+        let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let mut announced = None;
+        let mut queue_ran = false;
+
+        {
+            let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+            assert!(!queue_embedding_backfill_under_pressure(
+                &state,
+                &mut announced,
+                || queue_ran = true,
+            ));
+        }
+        assert!(
+            !queue_ran,
+            "a refused wake must not pay for the graph walk that builds its backlog"
+        );
+        assert!(
+            !state.background_embed_paused(),
+            "the refused worker stays eligible to try again on its next wake"
+        );
+
+        {
+            let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
+            assert!(queue_embedding_backfill_under_pressure(
+                &state,
+                &mut announced,
+                || queue_ran = true,
+            ));
+        }
+        assert!(queue_ran, "the same queue is admitted once pressure clears");
     }
 
     #[test]
@@ -8376,6 +8687,7 @@ mod memory_pressure_tests {
         let _budget = super::budget_no_test_can_fill();
         let dir = tempfile::tempdir().unwrap();
         let state = open_store(dir.path());
+        install_pending_embedding(&state);
         {
             let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "nominal");
             assert!(
@@ -8390,6 +8702,87 @@ mod memory_pressure_tests {
         );
         let record = PressureRefusal::read(state.layout.root()).expect("a disclosed refusal");
         assert_eq!(record.work, "embed-batch");
+    }
+
+    #[test]
+    fn an_empty_queue_is_not_complete_while_indexed_coverage_is_short() {
+        assert!(embedding_coverage_is_complete(0, 9, 9));
+        assert!(
+            !embedding_coverage_is_complete(0, 8, 9),
+            "a refused missing-key backfill has no queued batch yet but still has outstanding work"
+        );
+        assert!(
+            !embedding_coverage_is_complete(1, 9, 9),
+            "queued artifact or entity work keeps the pass live even when indexed reaches total"
+        );
+        assert!(
+            !embedding_coverage_is_complete(0, 10, 9),
+            "an impossible over-indexed observation cannot retire durable work"
+        );
+    }
+
+    #[test]
+    fn unavailable_embed_persistence_retires_only_the_stale_memory_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        write_pressure_refusal(state.layout.root(), HeavyWork::LspSweep.id());
+        write_pressure_refusal(state.layout.root(), HeavyWork::EmbedBatch.id());
+        write_pressure_refusal(state.layout.root(), "future-heavy-work");
+
+        retire_embed_pressure_for_unavailable_persistence(&state);
+
+        assert_eq!(
+            PressureRefusal::read_all(state.layout.root())
+                .into_iter()
+                .map(|record| record.work)
+                .collect::<Vec<_>>(),
+            vec![
+                HeavyWork::LspSweep.id().to_string(),
+                "future-heavy-work".to_string(),
+            ],
+            "a persistence blocker replaces only the embed memory cause"
+        );
+    }
+
+    #[test]
+    fn a_complete_store_does_not_publish_a_refusal_before_looking_for_work() {
+        let _lock = crate::test_env_lock();
+        let _budget = super::budget_no_test_can_fill();
+        let _forced = EnvVarGuard::set("KIN_MEMORY_PRESSURE", "critical");
+        let _wanted = EnvVarGuard::unset(super::AUTO_EMBED_ENV);
+
+        for order in [
+            [HeavyWork::LspSweep.id(), HeavyWork::EmbedBatch.id()],
+            [HeavyWork::EmbedBatch.id(), HeavyWork::LspSweep.id()],
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let state = open_store(dir.path());
+            for work in order {
+                write_pressure_refusal(state.layout.root(), work);
+            }
+            write_pressure_refusal(state.layout.root(), "future-heavy-work");
+
+            assert_eq!(state.graph.embedding_status().pending, 0);
+            assert!(
+                start_or_defer_background_embed(&state),
+                "a complete wanted pass is admitted as a no-op even on a critical host"
+            );
+            assert_eq!(
+                PressureRefusal::read_all(state.layout.root())
+                    .into_iter()
+                    .map(|record| record.work)
+                    .collect::<Vec<_>>(),
+                vec![
+                    HeavyWork::LspSweep.id().to_string(),
+                    "future-heavy-work".to_string(),
+                ],
+                "completion retires only the stale embed refusal and preserves independent work"
+            );
+            assert!(
+                !state.background_embed_paused(),
+                "a no-op completion is not the operator's permanent opt-out"
+            );
+        }
     }
 
     #[test]
@@ -8408,8 +8801,139 @@ mod memory_pressure_tests {
             ));
         }
         assert!(PressureRefusal::read(state.layout.root()).is_some());
-        clear_pressure_refusal(&state);
+        assert!(clear_pressure_refusal_for_work(&state, HeavyWork::LspSweep));
         assert!(PressureRefusal::read(state.layout.root()).is_none());
+    }
+
+    #[test]
+    fn pressure_refusal_matching_is_exact_and_unknown_safe() {
+        let embed = PressureRefusal {
+            work: "embed-batch".to_string(),
+            level: "critical".to_string(),
+            reason: "embed refused".to_string(),
+            at_unix: 1,
+        };
+        let lsp = PressureRefusal {
+            work: "lsp-sweep".to_string(),
+            ..embed.clone()
+        };
+        let future = PressureRefusal {
+            work: "future-heavy-work".to_string(),
+            ..embed.clone()
+        };
+
+        assert!(pressure_refusal_matches_work(
+            Some(&embed),
+            HeavyWork::EmbedBatch
+        ));
+        assert!(!pressure_refusal_matches_work(
+            Some(&lsp),
+            HeavyWork::EmbedBatch
+        ));
+        assert!(!pressure_refusal_matches_work(
+            Some(&future),
+            HeavyWork::EmbedBatch
+        ));
+        assert!(!pressure_refusal_matches_work(None, HeavyWork::EmbedBatch));
+    }
+
+    #[test]
+    fn completed_embedding_retires_only_its_matching_refusal() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let root = state.layout.root();
+
+        write_pressure_refusal(root, "embed-batch");
+        assert!(clear_pressure_refusal_for_work(
+            &state,
+            HeavyWork::EmbedBatch
+        ));
+        assert!(
+            PressureRefusal::read(root).is_none(),
+            "whole embedding coverage retires the embed refusal that would otherwise be probed \
+             on every MCP response"
+        );
+
+        for work in ["lsp-sweep", "future-heavy-work"] {
+            let expected = write_pressure_refusal(root, work);
+            assert!(!clear_pressure_refusal_for_work(
+                &state,
+                HeavyWork::EmbedBatch
+            ));
+            assert_eq!(
+                PressureRefusal::read(root),
+                Some(expected),
+                "embedding completion has no authority to clear {work}"
+            );
+        }
+    }
+
+    #[test]
+    fn one_producer_cannot_retire_the_other_producers_record() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let root = state.layout.root();
+
+        let embed = write_pressure_refusal(root, "embed-batch");
+        assert!(!clear_pressure_refusal_for_work(
+            &state,
+            HeavyWork::LspSweep
+        ));
+        assert_eq!(PressureRefusal::read(root), Some(embed));
+
+        let lsp = write_pressure_refusal(root, "lsp-sweep");
+        assert!(clear_pressure_refusal_for_work(
+            &state,
+            HeavyWork::EmbedBatch
+        ));
+        assert_eq!(PressureRefusal::read(root), Some(lsp));
+        assert!(PressureRefusal::read_for_work(root, HeavyWork::EmbedBatch).is_none());
+        assert!(PressureRefusal::read_for_work(root, HeavyWork::LspSweep).is_some());
+    }
+
+    #[test]
+    fn completed_embedding_rearms_same_level_refusal_disclosure() {
+        let _lock = crate::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let state = open_store(dir.path());
+        let root = state.layout.root();
+        write_pressure_refusal(root, HeavyWork::EmbedBatch.id());
+        let announced = Some(PressureLevel::Critical);
+
+        let retired = clear_pressure_refusal_for_work(&state, HeavyWork::EmbedBatch);
+        let announced = pressure_announcement_after_retirement(announced, retired);
+
+        assert!(retired, "whole coverage retires the matching refusal");
+        assert_eq!(
+            announced, None,
+            "completion re-arms disclosure even when the host remains critical"
+        );
+        assert!(pressure_refusal_needs_disclosure(
+            announced,
+            PressureLevel::Critical,
+            PressureRefusal::read(root).as_ref(),
+            HeavyWork::EmbedBatch,
+        ));
+
+        let lsp = write_pressure_refusal(root, HeavyWork::LspSweep.id());
+        assert!(pressure_refusal_needs_disclosure(
+            Some(PressureLevel::Critical),
+            PressureLevel::Critical,
+            Some(&lsp),
+            HeavyWork::EmbedBatch,
+        ));
+        let embed = write_pressure_refusal(root, HeavyWork::EmbedBatch.id());
+        assert!(
+            !pressure_refusal_needs_disclosure(
+                Some(PressureLevel::Critical),
+                PressureLevel::Critical,
+                Some(&embed),
+                HeavyWork::EmbedBatch,
+            ),
+            "the same level is suppressed only while its matching durable record exists"
+        );
     }
 
     #[test]

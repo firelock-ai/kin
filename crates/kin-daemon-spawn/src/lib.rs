@@ -791,7 +791,7 @@ impl DaemonKillRecord {
     /// whoever runs the CLI. Restarting the MCP server is deliberately not one
     /// of them: the process that would have to be restarted is the one serving
     /// the session asking, and nobody inside that session owns it.
-    pub fn remediation(&self) -> String {
+    fn remediation_for(&self, enrichment_disabled: bool) -> String {
         let more_memory = match self.limit_bytes {
             Some(limit) => format!(
                 "give this container or machine more than the {} it has now",
@@ -802,8 +802,12 @@ impl DaemonKillRecord {
         format!(
             "To recover: {more_memory}, or {}. `kin doctor` reports this store's memory \
              headroom, and `kin daemon status` reports what is running now.",
-            enrichment_remedy_clause()
+            enrichment_remedy_clause_for(enrichment_disabled)
         )
+    }
+
+    pub fn remediation(&self) -> String {
+        self.remediation_for(enrichment_disabled())
     }
 
     /// The cause and the remediation as one sentence-complete line, for a
@@ -8980,7 +8984,10 @@ Shared_Dirty:          0 kB\n";
     #[test]
     fn the_remediation_is_performable_and_names_the_real_switch() {
         let record = fresh_kill(41, 9, counted(2), counted(3), None, 4_320);
-        let remediation = record.remediation();
+        // Grade the explicitly-unset input rather than inheriting this test
+        // process's environment. `kin-core::test_env::EnvVarGuard` cannot be a
+        // dev-dependency here because kin-core depends on kin-daemon-spawn.
+        let remediation = record.remediation_for(enrichment_disabled_by(None));
         assert!(
             remediation.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status"),
             "{remediation}"
@@ -8994,6 +9001,31 @@ Shared_Dirty:          0 kB\n";
             record.summary().starts_with("The daemon for this store"),
             "the summary ends a message, so it starts a sentence: {}",
             record.summary()
+        );
+    }
+
+    /// The switch reader and both advice tenses are one pure contract,
+    /// including the explicitly-unset case that used to inherit the host
+    /// running this test.
+    #[test]
+    fn enrichment_advice_follows_the_switch_value_it_describes() {
+        assert!(!enrichment_disabled_by(None));
+        assert!(!enrichment_disabled_by(Some("0")));
+        assert!(enrichment_disabled_by(Some("1")));
+
+        let unset = enrichment_remedy_clause_for(false);
+        let set = enrichment_remedy_clause_for(true);
+        assert!(
+            unset.contains("KIN_DAEMON_DISABLE_LSP=1 kin graph status"),
+            "the unset arm names the switch and a command that starts the daemon: {unset}"
+        );
+        assert!(
+            set.contains("kin daemon stop") && set.contains("already carries"),
+            "the set arm names the remaining restart action: {set}"
+        );
+        assert!(
+            !set.contains("=1 kin graph status"),
+            "the set arm must not repeat the action already taken: {set}"
         );
     }
 
