@@ -411,7 +411,16 @@ impl RepoSpinePublication {
         }
     }
 
-    pub(crate) fn canonicalize(mut self) -> Result<CanonicalRepoPublication, SpineError> {
+    /// Validate and sort this candidate into its canonical, digest-bearing
+    /// form.
+    ///
+    /// Named `into_canonical` rather than `canonicalize`: this touches no
+    /// filesystem, and `scripts/verify-zero-file-search.py` matches
+    /// `.canonicalize()` as `Path::canonicalize`. Silencing that with an
+    /// allowlist entry would have exempted the expression in this file, so a
+    /// real path resolution added here later would have inherited the
+    /// exemption. Renaming removes the collision instead of hiding it.
+    pub(crate) fn into_canonical(mut self) -> Result<CanonicalRepoPublication, SpineError> {
         validate_identifier("repository id", &self.repo_id)?;
         validate_identifier("root hash", &self.root_hash)?;
 
@@ -726,7 +735,7 @@ impl CanonicalRepoPublication {
                 RepoPublicationPhase::Edges => Some(head.resolution_roots.clone()),
             },
         }
-        .canonicalize()?;
+        .into_canonical()?;
         if candidate.head != head {
             return Err(SpineError::Serialization(format!(
                 "repo {} publication {} failed manifest validation",

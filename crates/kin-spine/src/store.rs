@@ -196,7 +196,7 @@ impl PreparedStorePublication {
         if let Some(head) = &observed_head {
             head.validate()?;
         }
-        let canonical = publication.canonicalize()?;
+        let canonical = publication.into_canonical()?;
         let expected_dependencies = canonical
             .head
             .resolution_roots

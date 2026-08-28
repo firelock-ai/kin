@@ -273,12 +273,12 @@
     },
     {
       "file": "crates/kin-daemon/src/api.rs",
-      "reason": "Daemon RPC surface. This file is the answer authority every agent, editor, and CLI reaches, so it is scanned in full and only four explicit IO-boundary bodies are excused. npm_registry_routes and router_with_auth_and_shutdown materialize package-registry directories; health reports local runtime diagnostics; ensure_loopback_token manages the loopback credential. None derives a semantic query answer. The two expression pins cover a graph-owned blob lease metadata accessor and the durable authority publication-record probe. Locate, search, context, trace, impact, review, verify, MCP handlers, and every newly added handler remain scanned by default.",
+      "reason": "Daemon RPC surface. This file is the answer authority every agent, editor, and CLI reaches, so it is scanned in full and only four explicit IO-boundary bodies are excused. npm_registry_routes and router_with_auth_and_shutdown_internal materialize package-registry directories, the latter renamed when the router gained a second delegating wrapper and the boundary body moved into it; health reports local runtime diagnostics; ensure_loopback_token manages the loopback credential. None derives a semantic query answer. The two expression pins cover a graph-owned blob lease metadata accessor and the durable authority publication-record probe. Locate, search, context, trace, impact, review, verify, MCP handlers, and every newly added handler remain scanned by default.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
         "npm_registry_routes",
-        "router_with_auth_and_shutdown",
+        "router_with_auth_and_shutdown_internal",
         "health",
         "ensure_loopback_token"
       ],

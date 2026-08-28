@@ -3711,7 +3711,7 @@ mod tests {
             drain_proof_sha256: format!("sha256:{}", "b".repeat(64)),
         };
         let head = metadata_publication("repo", 41, "fixture-root", Vec::new())
-            .canonicalize()
+            .into_canonical()
             .unwrap()
             .head;
         let seal = LegacyMigrationSeal::build(&loaded, writer_drain, vec![head]).unwrap();
@@ -5951,7 +5951,7 @@ mod tests {
         );
         let partial_id = partial
             .clone()
-            .canonicalize()
+            .into_canonical()
             .expect("canonical partial publication")
             .head
             .publication_id;
@@ -5997,7 +5997,7 @@ mod tests {
             .map(|index| test_entry("repo", &format!("entity_{index:03}"), EntityKind::Function))
             .collect();
         let large = metadata_publication("repo", 1, "large", entries);
-        let large_id = large.clone().canonicalize().unwrap().head.publication_id;
+        let large_id = large.clone().into_canonical().unwrap().head.publication_id;
         publish_success(&backend, large);
         publish_success(
             &backend,
@@ -6157,7 +6157,7 @@ mod tests {
         );
         let publication_id = publication
             .clone()
-            .canonicalize()
+            .into_canonical()
             .unwrap()
             .head
             .publication_id;
@@ -6615,7 +6615,7 @@ mod tests {
     #[test]
     fn firestore_head_write_always_carries_the_exact_precondition() {
         let head = metadata_publication("repo", 7, "root", Vec::new())
-            .canonicalize()
+            .into_canonical()
             .unwrap()
             .head;
         let missing = firestore_head_write(
@@ -6709,7 +6709,7 @@ mod tests {
             .iter()
             .map(|repo_id| {
                 metadata_publication(repo_id, 41, &format!("{repo_id}-root"), Vec::new())
-                    .canonicalize()
+                    .into_canonical()
                     .unwrap()
                     .head
             })
@@ -7084,7 +7084,7 @@ mod tests {
     fn production_stage_batch_writes_change_marker_bytes_for_distinct_batches() {
         let store = FirestoreStore::new("project".to_string(), None);
         let head = metadata_publication("repo", 7, "root", Vec::new())
-            .canonicalize()
+            .into_canonical()
             .unwrap()
             .head;
         let first_row = serde_json::json!({
@@ -7151,7 +7151,7 @@ mod tests {
     fn production_head_commit_changes_marker_bytes_under_the_exact_stage_revision() {
         let store = FirestoreStore::new("project".to_string(), None);
         let head = metadata_publication("repo", 8, "root", Vec::new())
-            .canonicalize()
+            .into_canonical()
             .unwrap()
             .head;
         let row = serde_json::json!({
