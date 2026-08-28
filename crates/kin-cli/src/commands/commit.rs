@@ -21,31 +21,12 @@ pub async fn run(message: String, quiet: bool) -> Result<()> {
 
     let result = run_daemon_commit(&layout, &message, quiet).await?;
     if !quiet {
-        emit(&render_commit_summary(
-            &result,
-            pending_enrichment(&layout).await.as_deref(),
-        ))?;
+        println!(
+            "{}",
+            render_commit_summary(&result, pending_enrichment(&layout).await.as_deref())
+        );
     }
     Ok(())
-}
-
-/// Hand the finished summary to stdout, tolerating a reader that already left.
-///
-/// The change is in repository authority before a byte of this is written, so a
-/// consumer that closed its pipe must not turn a landed commit into a failure.
-/// `println!` panics on a write error and the panic exit status is 101, which
-/// is how `kin commit ... | head -3` reported a crash on a commit that had
-/// already succeeded (FIR-2838). `kin init` answers the same question the same
-/// way, and for the same reason: progress and summaries are advisory, the work
-/// is not. Every write error that is not a departed reader is still reported.
-fn emit(rendered: &str) -> Result<()> {
-    use std::io::Write as _;
-    let mut stdout = std::io::stdout().lock();
-    match writeln!(stdout, "{rendered}").and_then(|()| stdout.flush()) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        Err(error) => Err(error).context("write the kin commit summary to stdout"),
-    }
 }
 
 /// What this store's cross-file sweep still owes, when it owes anything.
@@ -427,13 +408,10 @@ fn resolve_commit_after_lost_reply(
     ) {
         LostReply::Landed(result) => {
             if !quiet {
-                // Same rule as the summary above: the commit is in repository
-                // authority, so a departed reader must not turn it into a
-                // failure.
-                crate::progress::note(format_args!(
+                eprintln!(
                     "The daemon's reply was lost, and repository authority holds this commit \
-                     (operation {operation_id}). Reporting the change it recorded.\n"
-                ));
+                     (operation {operation_id}). Reporting the change it recorded."
+                );
             }
             Ok(*result)
         }
