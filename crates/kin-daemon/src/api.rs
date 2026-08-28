@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use crate::state::{
     CachedLocateRanking, CachedSemanticPage, CoordinationEventDraft, DaemonEvent, DaemonState,
     HostedSemanticCursor, RequestGraphAuthority, LOCATE_RANKING_CACHE_CAP,
+    LOCATE_RANKING_CACHE_GLOBAL_CAP,
 };
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
