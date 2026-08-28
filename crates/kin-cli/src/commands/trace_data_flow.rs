@@ -1115,15 +1115,28 @@ pub fn build_trace_data_flow_response_within(
                 // A candidate can collect several edges, so the lines collect
                 // beside them rather than moving with whichever edge is ranked
                 // strongest for display.
-                let caller_file = if role == "callee" {
-                    node.file_origin.as_ref()
-                } else {
-                    candidates[candidate_at].entity.file_origin.as_ref()
-                };
-                let tally = relation_reference_lines(rel, caller_file);
-                candidates[candidate_at].reference_lines.extend(tally.lines);
-                candidates[candidate_at].reference_spans_outside_caller_file +=
-                    tally.outside_caller_file;
+                //
+                // Only from a REFERENCE edge, though. `allowed` carries
+                // `UsesType` as well, so an annotation target is a named leaf
+                // rather than a symbol the walk never mentions, and the graph
+                // holds a `UsesType` edge beside the `Calls` edge for the same
+                // pair. Its span is the annotation's target, which is the
+                // callee's own definition, not a site where the caller calls
+                // anything. Accumulating it published `[def_line, call_line]`
+                // on every row and a reader could not tell which was which.
+                // `reference_kinds` is the set the reference surface reads, so
+                // gating on it is what keeps the two answers the same.
+                if reference_kinds.contains(&rel.kind) {
+                    let caller_file = if role == "callee" {
+                        node.file_origin.as_ref()
+                    } else {
+                        candidates[candidate_at].entity.file_origin.as_ref()
+                    };
+                    let tally = relation_reference_lines(rel, caller_file);
+                    candidates[candidate_at].reference_lines.extend(tally.lines);
+                    candidates[candidate_at].reference_spans_outside_caller_file +=
+                        tally.outside_caller_file;
+                }
             }
 
             // This node's relations were read to the end, so what the graph

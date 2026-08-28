@@ -4249,15 +4249,27 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 // outgoing step's caller is the parent node; an incoming
                 // step's caller is the candidate itself. Keep every edge's
                 // site even when another edge ranks stronger for display.
-                let caller_file = if role == "callee" {
-                    node.file_origin.as_ref()
-                } else {
-                    candidates[candidate_at].entity.file_origin.as_ref()
-                };
-                let tally = relation_reference_lines(rel, caller_file);
-                candidates[candidate_at].reference_lines.extend(tally.lines);
-                candidates[candidate_at].reference_spans_outside_caller_file +=
-                    tally.outside_caller_file;
+                //
+                // Every REFERENCE edge, that is. `allowed` also carries
+                // `UsesType` so an annotation target is a named leaf, and the
+                // graph holds one beside the `Calls` edge for the same pair.
+                // Its span is the annotation's target, which is the callee's
+                // own definition rather than a site where the caller calls it,
+                // so accumulating it published `[def_line, call_line]` on every
+                // row with nothing to tell them apart. `reference_kinds` is
+                // what the reference surface reads, so gating on it keeps the
+                // two answers the same.
+                if reference_kinds.contains(&rel.kind) {
+                    let caller_file = if role == "callee" {
+                        node.file_origin.as_ref()
+                    } else {
+                        candidates[candidate_at].entity.file_origin.as_ref()
+                    };
+                    let tally = relation_reference_lines(rel, caller_file);
+                    candidates[candidate_at].reference_lines.extend(tally.lines);
+                    candidates[candidate_at].reference_spans_outside_caller_file +=
+                        tally.outside_caller_file;
+                }
             }
 
             // This node's relations were read to the end, so what the graph held
@@ -9323,6 +9335,73 @@ mod tests {
             traced_step_names(&targeted)
         );
         assert_eq!(targeted["target_name"], "HTTPAdapter.send");
+    }
+
+    /// An annotation edge's span is not a call site.
+    ///
+    /// The graph holds a `UsesType` edge beside the `Calls` edge for the same
+    /// pair, and its span is the annotation's target, which is the callee's own
+    /// definition rather than anywhere the caller calls it. `allowed` admits
+    /// `UsesType` so an annotation target is a named leaf, and the reference
+    /// surface deliberately does not read it, so publishing its span here made
+    /// this tool disagree with `kin refs` about the same pair and gave every row
+    /// a definition line beside its call line with nothing to tell them apart.
+    ///
+    /// Both spans are in the CALLER's file on purpose. The caller-file filter
+    /// can never separate them, so passing this can only mean the edge class
+    /// was consulted.
+    #[test]
+    fn trace_data_flow_offline_leaves_annotation_spans_out_of_call_sites() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("focal", "src/focal.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        for entity in [&focal, &callee] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::Calls,
+                "src/focal.rs",
+                11,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::UsesType,
+                "src/focal.rs",
+                4,
+            ))
+            .unwrap();
+
+        let response = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal.id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+            ],
+        );
+        let steps = response["chain"].as_array().unwrap();
+        let row = steps
+            .iter()
+            .find(|step| step["entity_name"] == "callee")
+            .unwrap_or_else(|| {
+                panic!("the annotation edge must still reach the leaf: {response:#}")
+            });
+
+        // The premise: the leaf is here at all, which is what `UsesType` being
+        // in `allowed` buys and what this fix must not take away.
+        assert_eq!(
+            row["reference_lines"],
+            serde_json::json!([12]),
+            "only the call site belongs here, not the annotation's target: {row}"
+        );
+        assert!(row["reference_lines_absent_reason"].is_null());
     }
 
     /// The call-site contract on the generic GraphStore arm. The line
