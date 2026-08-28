@@ -56,9 +56,19 @@
 //! conversion, creation and historical replay happen in the same operation. It
 //! does not claim anything about history a replica later admits over the native
 //! transport: those deltas were authored on whichever host converted the
-//! repository, and the transport carries no version beside them. That limit is
-//! recorded rather than papered over, and closing it belongs to the phase that
-//! puts the version on the wire.
+//! repository, and the transport carries no version beside them.
+//!
+//! That limit used to be recorded and then contradicted by the runtime. A
+//! version-10 client cloning a repository whose history was authored under
+//! version 9 got a version-10 creation stamp, imported the version-9 deltas
+//! with no provenance beside them, and every surface read `Current` over the
+//! result. [`invalidate_for_unversioned_transfer`] is what ends that: admitting
+//! a native transfer pack durably discards the creation record before the
+//! authority commit that makes the history visible, so the store reads
+//! [`HydrationStanding::Unstamped`] rather than certifying provenance it does
+//! not have. Giving up a creation-time number the store can no longer speak for
+//! is the conservative half of the trade; carrying the authoring version on the
+//! wire is the phase that gets it back.
 //!
 //! ## What this module deliberately does not do
 //!
@@ -73,6 +83,15 @@ use serde::{Deserialize, Serialize};
 /// Schema token carried in the record so a future format change is legible
 /// rather than silently misparsed.
 pub const HYDRATION_SEMANTICS_SCHEMA: &str = "kin.hydration-semantics.v1";
+
+/// The record's file name inside `.kin/kindb`.
+///
+/// One constant rather than one string per caller. [`KinLayout`] joins it to
+/// build the ambient path a reader opens, and [`HydrationStampCapability`]
+/// resolves the same name through a retained directory handle. Two hardcoded
+/// copies of one name would let a rename leave both halves green while they
+/// addressed different files.
+pub const HYDRATION_SEMANTICS_FILE_NAME: &str = "hydration-semantics";
 
 /// The replay-semantics version this binary derives history under.
 ///
@@ -348,6 +367,111 @@ pub fn write(layout: &KinLayout, stamp: &HydrationSemanticsStamp) -> std::io::Re
     Ok(())
 }
 
+/// Which of the two removal outcomes the invalidation observed.
+///
+/// Named rather than folded into a bool because the sync that follows must
+/// happen on both, and a spy in the tests below asserts exactly that. An
+/// earlier attempt can have unlinked the record and then failed its directory
+/// sync, so a retry that treats `NotFound` as already-complete would commit
+/// history before the first unlink is durable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StampRemoval {
+    Removed,
+    NotFound,
+}
+
+/// The invalidation's two halves, with the filesystem passed in.
+///
+/// Split so a test can prove the ordering the transfer commit boundary depends
+/// on without a store: the sync runs after the removal attempt, on both of its
+/// outcomes, and a sync failure is the caller's error rather than a swallowed
+/// one.
+fn invalidate_with_sync(
+    remove: impl FnOnce() -> std::io::Result<()>,
+    sync: impl FnOnce(StampRemoval) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let removal = match remove() {
+        Ok(()) => StampRemoval::Removed,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => StampRemoval::NotFound,
+        Err(error) => return Err(error),
+    };
+    sync(removal)
+}
+
+/// Durably discard the creation record because this store has admitted history
+/// the wire carried no version for.
+///
+/// Deletion rather than a rewrite to some "mixed" value, because there is no
+/// honest value to write. The reader already maps absence to
+/// [`HydrationStanding::Unstamped`], which every surface treats as a gap, so
+/// the store discloses that its provenance is unknown instead of certifying a
+/// creation-time number that no longer speaks for its contents.
+///
+/// The error is returned rather than logged. Its one caller runs it immediately
+/// before the authority commit that publishes the transported history, and a
+/// commit that proceeded over a failed invalidation would leave exactly the
+/// false `Current` this exists to prevent.
+pub fn invalidate_for_unversioned_transfer(layout: &KinLayout) -> std::io::Result<()> {
+    let path = layout.kindb_hydration_semantics_path();
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("hydration semantics path has no parent directory"))?
+        .to_path_buf();
+    invalidate_with_sync(
+        || std::fs::remove_file(&path),
+        |_| sync_directory_metadata(&parent),
+    )
+}
+
+/// A retained handle to one store's `.kin/kindb` directory, for the daemon path
+/// that must not resolve it again at request time.
+///
+/// The local authority is already pinned at startup through a `LocalFileBackend`
+/// opened once, because replacing `.kin/kindb` under a live daemon must not
+/// silently redirect it. A path resolved per request would reintroduce exactly
+/// that: a transfer admitted into the pinned namespace could invalidate the
+/// stamp of whatever directory the display path pointed at by then. This holds
+/// the same directory the backend was pinned to, opened once beside it.
+///
+/// Wrapping the capability here rather than exposing `cap_std` keeps the
+/// dependency in the crate that already carries it, and keeps the Unix
+/// directory `fsync` in one place.
+#[derive(Debug)]
+pub struct HydrationStampCapability {
+    kindb: cap_std::fs::Dir,
+}
+
+impl HydrationStampCapability {
+    /// Retain `kindb_dir`, which is `.kin/kindb` for a local store.
+    pub fn open(kindb_dir: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self {
+            kindb: cap_std::fs::Dir::open_ambient_dir(kindb_dir, cap_std::ambient_authority())?,
+        })
+    }
+
+    /// [`invalidate_for_unversioned_transfer`], through the retained handle.
+    pub fn invalidate_for_unversioned_transfer(&self) -> std::io::Result<()> {
+        invalidate_with_sync(
+            || self.kindb.remove_file(HYDRATION_SEMANTICS_FILE_NAME),
+            |_| self.sync_kindb_metadata(),
+        )
+    }
+
+    /// Make the unlink itself durable before a caller commits over it.
+    #[cfg(unix)]
+    fn sync_kindb_metadata(&self) -> std::io::Result<()> {
+        rustix::fs::fsync(&self.kindb).map_err(std::io::Error::from)
+    }
+
+    /// Same durability boundary the record's writer states for this platform:
+    /// no portable directory handle to sync, so the rename and unlink ordering
+    /// guarantees are all there is.
+    #[cfg(not(unix))]
+    fn sync_kindb_metadata(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Sync the containing directory so the rename that published the record is
 /// itself durable.
 #[cfg(unix)]
@@ -614,5 +738,133 @@ mod tests {
         );
         assert!(!unstamped.contains("older than"), "{unstamped}");
         assert!(!unstamped.contains("was authored"), "{unstamped}");
+    }
+
+    /// The invalidation the native transfer commit boundary depends on. A store
+    /// that reads `Current` before admitting version-unknown history must read
+    /// a gap after it, on the real filesystem and through the capability the
+    /// daemon holds rather than through a path resolved again at request time.
+    #[test]
+    fn invalidating_a_current_store_leaves_it_unstamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        stamp_staged(&layout).unwrap();
+        assert!(!standing(&layout).is_gap(), "the fixture did not start current");
+
+        let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
+        capability.invalidate_for_unversioned_transfer().unwrap();
+
+        assert_eq!(read(&layout), HydrationSemanticsRead::Absent);
+        assert_eq!(
+            standing(&layout),
+            HydrationStanding::Unstamped {
+                derives: binary_version()
+            }
+        );
+        assert!(standing(&layout).is_gap());
+    }
+
+    /// The capability and the layout must address one file. Asserted by writing
+    /// through the layout's own path and requiring the capability to remove what
+    /// that produced, rather than by comparing two hardcoded names, which is the
+    /// shape where a rename leaves both halves green over different files.
+    #[test]
+    fn the_capability_removes_the_record_the_layout_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        write(&layout, &HydrationSemanticsStamp::new(9, at(1))).unwrap();
+        let path = layout.kindb_hydration_semantics_path();
+        assert!(path.exists(), "the writer produced no file at {path:?}");
+
+        HydrationStampCapability::open(&layout.kindb_dir())
+            .unwrap()
+            .invalidate_for_unversioned_transfer()
+            .unwrap();
+
+        assert!(!path.exists(), "{path:?} survived the capability's removal");
+    }
+
+    /// A retry after a failed directory sync arrives with the record already
+    /// gone. It must still succeed, and the sync assertion below is what stops
+    /// that success from being a silent skip.
+    #[test]
+    fn invalidating_an_already_absent_record_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let layout = layout_in(dir.path());
+        assert_eq!(read(&layout), HydrationSemanticsRead::Absent);
+
+        invalidate_for_unversioned_transfer(&layout).unwrap();
+        HydrationStampCapability::open(&layout.kindb_dir())
+            .unwrap()
+            .invalidate_for_unversioned_transfer()
+            .unwrap();
+
+        assert_eq!(read(&layout), HydrationSemanticsRead::Absent);
+    }
+
+    /// The precondition the commit boundary rests on: the directory sync runs on
+    /// BOTH removal outcomes. An earlier attempt can have unlinked the record and
+    /// then failed its sync, so a retry that returned early on `NotFound` would
+    /// let history commit over an unlink that is not yet durable.
+    #[test]
+    fn the_directory_sync_runs_on_both_removal_outcomes() {
+        for (label, removal, expected) in [
+            ("removed", Ok(()), StampRemoval::Removed),
+            (
+                "absent",
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                StampRemoval::NotFound,
+            ),
+        ] {
+            let mut observed: Option<StampRemoval> = None;
+            invalidate_with_sync(
+                || removal,
+                |outcome| {
+                    observed = Some(outcome);
+                    Ok(())
+                },
+            )
+            .unwrap_or_else(|error| panic!("{label} branch failed: {error}"));
+            assert_eq!(observed, Some(expected), "{label} branch skipped the sync");
+        }
+    }
+
+    /// A sync failure is the caller's error. Its one caller runs immediately
+    /// before the authority commit that publishes transported history, and a
+    /// commit that proceeded over a swallowed failure is the false `Current`
+    /// this whole path exists to prevent.
+    #[test]
+    fn a_failed_directory_sync_propagates() {
+        for removal in [
+            Ok(()),
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        ] {
+            let error = invalidate_with_sync(
+                || removal,
+                |_| Err(std::io::Error::other("directory sync refused")),
+            )
+            .expect_err("a failed sync reported success");
+            assert!(
+                error.to_string().contains("directory sync refused"),
+                "{error}"
+            );
+        }
+    }
+
+    /// A removal error that is not `NotFound` stops before the sync and is
+    /// returned, so the caller never commits over an unresolved record.
+    #[test]
+    fn a_removal_error_other_than_not_found_stops_the_invalidation() {
+        let mut synced = false;
+        let error = invalidate_with_sync(
+            || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_| {
+                synced = true;
+                Ok(())
+            },
+        )
+        .expect_err("a refused removal reported success");
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!synced, "the sync ran after a refused removal");
     }
 }

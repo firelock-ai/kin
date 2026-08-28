@@ -159,10 +159,13 @@ impl KinLayout {
     /// Written into the STAGED layout, before the rename that publishes `.kin`,
     /// so a store and its own creation-time record become visible in the same
     /// instant. An absent record does not establish agreement: the store may
-    /// predate this record or the file may have been removed. See
+    /// predate this record or the file may have been removed, and admitting a
+    /// native transfer pack removes it on purpose because the wire carries no
+    /// authoring version for the history it moves. See
     /// [`crate::hydration_semantics`] for the full producer enumeration.
     pub fn kindb_hydration_semantics_path(&self) -> PathBuf {
-        self.kindb_dir().join("hydration-semantics")
+        self.kindb_dir()
+            .join(crate::hydration_semantics::HYDRATION_SEMANTICS_FILE_NAME)
     }
 
     /// `.kin/kindb/relation-census` — the relation-kind histogram as it stood

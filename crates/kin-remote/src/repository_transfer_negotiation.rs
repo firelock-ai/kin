@@ -28,7 +28,8 @@ use kin_model::{AuthorId, RefName, RepositoryId, RootBundle, SemanticChange, Sem
 use serde::{Deserialize, Serialize};
 
 use crate::repository_transfer::{
-    apply_repository_transfer_pack, build_repository_transfer_segment,
+    apply_repository_transfer_pack, apply_repository_transfer_pack_with_pre_commit,
+    build_repository_transfer_segment,
     count_repository_transfer_packs, model, repository_transfer_status,
     require_negotiated_features, validate_limits, verify_transfer_source_readiness,
     RepositoryAuthorityMetadata, RepositoryRefAdvertisement, RepositoryTransferError,
@@ -869,13 +870,21 @@ where
             // configured value and passes it. A caller that wants a raised
             // ceiling uses `pull_from_remote_with` and supplies an admit
             // closure carrying its own limits.
-            apply_repository_transfer_pack(
+            //
+            // The empty admission-provenance policy is stated rather than
+            // inherited. A generic `StorageBackend` cannot be assumed to sit
+            // behind a local `.kin` layout, so this helper has no local
+            // creation record it can honestly claim to own. A receiver that
+            // does own one supplies its own policy through
+            // `pull_from_remote_with`, which is the path the daemon takes.
+            apply_repository_transfer_pack_with_pre_commit(
                 local,
                 repository_id,
                 destination_ref,
                 actor.clone(),
                 pack,
                 &RepositoryTransferLimits::default(),
+                || Ok(()),
             )
         },
     )
