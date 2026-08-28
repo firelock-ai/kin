@@ -1789,7 +1789,76 @@ mod tests {
             .expect("a budget that cannot hold the named branch must still narrow, not refuse");
         assert!(
             named.len() <= 2,
-            "the second pass did not give the protection up: {named:?}"
+            "protecting the named branch still left an answer inside the budget: {named:?}"
+        );
+    }
+
+    /// The give-up fallback, on the only shape that reaches it.
+    ///
+    /// The test above cannot reach it, and its old message claimed otherwise.
+    /// Protecting a target protects its ancestry, and when what fits is counted
+    /// in STEPS that ancestry is never larger than the deepest spine the
+    /// keep-one-child floor would hold anyway, so the first pass always has an
+    /// answer and the second pass is unreachable. Deleting the fallback leaves
+    /// every count-based test green.
+    ///
+    /// A real budget is not a count. It is serialized size, and a shallow
+    /// branch of fat steps can cost more than a deeper branch of thin ones. So
+    /// depth decides which branch the floor holds and cost decides what fits,
+    /// and here the two disagree on purpose: the named target sits in the
+    /// shallow expensive branch, and holding it cannot fit at any price the
+    /// first pass can pay.
+    #[test]
+    fn a_protected_branch_too_expensive_to_hold_is_given_up_rather_than_refused() {
+        // Two branches under the focal: `1 -> 2` is shallow and expensive and
+        // holds the target, `5 -> 6 -> 7` is deeper and cheap.
+        let steps: Vec<(u64, u64)> = vec![(1, 0), (2, 1), (5, 0), (6, 5), (7, 6)];
+        const TARGET: u64 = 2;
+        const BUDGET: usize = 5;
+        let weight = |id: u64| -> usize {
+            if id == 1 || id == TARGET {
+                10
+            } else {
+                1
+            }
+        };
+        let cost = |kept: &[(u64, u64)]| -> usize { kept.iter().map(|step| weight(step.0)).sum() };
+
+        // The premise, asserted rather than assumed: the protected branch alone
+        // is already over budget, so the first pass has nothing it can return.
+        // Without this the test would pass on a fixture that never reached the
+        // second pass at all, which is exactly how the sibling above read as
+        // covered.
+        assert!(
+            weight(1) + weight(TARGET) > BUDGET,
+            "the protected branch must not fit, or the first pass answers and this grades nothing"
+        );
+
+        let narrowed = narrow_fanout_to_fit(
+            &steps,
+            &|step: &(u64, u64)| step.0,
+            &|step: &(u64, u64)| Some(step.1),
+            &|step: &(u64, u64)| step.0 == TARGET,
+            &mut |kept: &[(u64, u64)]| cost(kept) <= BUDGET,
+        );
+
+        // Read as an assertion rather than an expect, so deleting the fallback
+        // fails HERE by name instead of panicking somewhere downstream.
+        assert!(
+            narrowed.is_some(),
+            "protection is a preference, not a refusal: a budget too small to hold the named \
+             branch must still come back with a narrowed answer"
+        );
+        let kept = narrowed.expect("asserted present above");
+        let ids: Vec<u64> = kept.iter().map(|step| step.0).collect();
+        assert!(
+            cost(&kept) <= BUDGET,
+            "the answer must fit the budget it was given: {ids:?} costs {}",
+            cost(&kept)
+        );
+        assert!(
+            !ids.contains(&TARGET),
+            "the second pass gives the protection up, so the target cannot still be here: {ids:?}"
         );
     }
 
