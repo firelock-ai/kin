@@ -883,6 +883,14 @@ class Suite(object):
             raise RuntimeError("the source daemon did not come up: %s" % tail(out))
         endpoint = self.transfer_endpoint(source)
 
+        # And the receiver's own daemon, which is where a pull actually runs:
+        # repository authority and every view derived from it live there, so
+        # `kin pull` against a replica with no daemon refuses before it
+        # negotiates anything. Creating the replica does not leave one running.
+        rc, out = self.kin_in(destination, ["graph", "status"])
+        if rc != 0:
+            raise RuntimeError("the receiver's daemon did not come up: %s" % tail(out))
+
         rc, out = self.kin_in(destination, ["pull", "--url", endpoint, "--json"])
         if rc != 0:
             raise RuntimeError("kin pull exited %d: %s" % (rc, tail(out)))
