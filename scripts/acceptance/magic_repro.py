@@ -278,6 +278,31 @@ class Suite(object):
         self._write(repo, "pkg/cli.py", CLI_PY)
         self._kin_commit(repo, "Add CLI entry point")
 
+    def _build_rename(self, repo):
+        """The incremental shape again, in its own repository.
+
+        Check 22 renames a symbol and then commits an unrelated file, so it
+        cannot share the `incremental` fixture: the rename would reach every
+        later check that reads it. Same modules, same one-at-a-time commits,
+        plus a README the rename check appends to.
+        """
+        self.git(["init", "-q", "."], repo)
+        self._write(repo, ".gitignore", "*.db\n__pycache__/\n")
+        self._write(repo, "README.md", "# nk\n\nA note keeper.\n")
+        self._write(repo, "pyproject.toml",
+                    '[project]\nname = "nk"\nversion = "0.1.0"\n\n'
+                    '[project.scripts]\nnk = "pkg.cli:main"\n')
+        self._write(repo, "pkg/__init__.py", "")
+        self._write(repo, "pkg/parsing.py", PARSING_PY)
+        self._kin_init(repo)
+        self._kin_commit(repo, "Add parsing module")
+        self._write(repo, "pkg/storage.py", STORAGE_PY)
+        self._kin_commit(repo, "Add storage module")
+        self._write(repo, "pkg/linkgraph.py", LINKGRAPH_PY)
+        self._kin_commit(repo, "Add link graph module")
+        self._write(repo, "pkg/cli.py", CLI_PY)
+        self._kin_commit(repo, "Add CLI entry point")
+
     def _build_converted(self, repo):
         """The brownfield shape: a git history converted by kin init.
 
@@ -2896,6 +2921,102 @@ def check_21(suite):
     return res
 
 
+def check_22(suite):
+    """A rename must land in one commit and must not wedge the repository.
+
+    FIR-2838, found by the rc061a green-arm stranger. Renaming one function
+    reported success in 448 ms and did not reach the graph: the old name kept
+    resolving, the new one did not exist, the renamed symbol lost every incoming
+    edge, `kin graph status` reported `Calls slipped 175 to 174` with the entity
+    count unchanged, and then every later commit in that repository failed with
+    HTTP 500 naming a relation whose endpoint was the retired entity. Appending
+    one blank line to `README.md` and committing that alone reproduced the 500,
+    so the blast radius was the whole repository, and the recovery was a daemon
+    restart.
+
+    Two rules kin-db enforces on every transaction were not enforced where the
+    delta is built: a delta may not add a relation identity the store already
+    holds, and a delta may not leave an edge naming an entity it removes. The
+    reconcile caller logs a refused delta and drops it, so a commit that
+    reconciled nothing still exits 0, which is why nothing upstream caught it.
+
+    Four arms, and the last two are the ones a user meets:
+
+    - the new name resolves after ONE commit;
+    - the old name is gone, so the rename is not merely additive;
+    - the renamed symbol keeps its callers, which is what a rename is for;
+    - a later commit to an unrelated file succeeds and `kin graph status`
+      reports no relation census loss.
+
+    The caller arm is what separates this from a graph that quietly dropped the
+    edges: an empty reference list would satisfy "the new name resolves".
+    """
+    res = Result("22", "FIR-2838", "a rename lands in one commit and leaves writes working")
+    repo = suite.fixture("rename")
+
+    for rel in ("pkg/parsing.py", "pkg/storage.py", "pkg/linkgraph.py"):
+        full = os.path.join(repo, rel)
+        with open(full) as handle:
+            text = handle.read()
+        with open(full, "w") as handle:
+            handle.write(text.replace("normalize_title", "canonical_title"))
+    rc, out, err = suite.kin_run(["commit", "-m", "Rename normalize_title to canonical_title"],
+                                 repo)
+    if rc != 0:
+        res.unknown("the rename commit itself failed rc=%d: %s"
+                    % (rc, strip_ansi(err or out)[-300:]))
+        return res
+
+    rc, out, _ = suite.kin_run(["refs", "canonical_title"], repo)
+    new_name = strip_ansi(out)
+    if rc != 0 or "not found" in new_name:
+        res.bad("one commit after the rename the graph still does not hold "
+                "`canonical_title`: rc=%d %r" % (rc, new_name[:300]))
+    else:
+        res.ok("`canonical_title` resolves after one commit")
+
+    rc, out, _ = suite.kin_run(["refs", "normalize_title"], repo)
+    old_name = strip_ansi(out)
+    if "not found" not in old_name:
+        res.bad("the old name still resolves after the rename, so the graph is carrying a "
+                "declaration the file no longer has: %r" % old_name[:300])
+    else:
+        res.ok("the old name is gone from the graph")
+
+    # The callers. Both files that called it were edited in the same commit, so
+    # a rename that landed has both edges; the rc061a run had none.
+    callers = [line for line in new_name.splitlines()
+               if "pkg/storage.py" in line or "pkg/linkgraph.py" in line]
+    if len(callers) < 2:
+        res.bad("the renamed symbol lost its callers: `kin refs canonical_title` names %d of "
+                "the 2 files that call it. Full answer: %r" % (len(callers), new_name[:400]))
+    else:
+        res.ok("the renamed symbol keeps its callers: %s"
+               % "; ".join(line.strip() for line in callers[:3]))
+
+    # The blast radius. One blank line in a file the rename never touched.
+    with open(os.path.join(repo, "README.md"), "a") as handle:
+        handle.write("\n")
+    rc, out, err = suite.kin_run(["commit", "-m", "Append a blank line to the README"], repo)
+    combined = strip_ansi((out or "") + (err or ""))
+    if rc != 0 or "unadmitted" in combined:
+        res.bad("a commit to a file the rename never touched was refused rc=%d, which is the "
+                "whole repository wedged for writes: %s" % (rc, combined[-400:]))
+    else:
+        res.ok("a later commit to an unrelated file still lands")
+
+    rc, out, _ = suite.kin_run(["graph", "status"], repo)
+    status = strip_ansi(out)
+    if "lost edges with no entity removed" in status or "relation_census_loss" in status:
+        loss = [line.strip() for line in status.splitlines()
+                if "lost edges with no entity removed" in line]
+        res.bad("the graph reports its own census loss after the rename: %s"
+                % (loss[0][:300] if loss else status[:300]))
+    else:
+        res.ok("graph status reports no relation census loss")
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -2919,6 +3040,7 @@ CHECKS = [
     ("19", check_19),
     ("20", check_20),
     ("21", check_21),
+    ("22", check_22),
 ]
 
 

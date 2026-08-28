@@ -54,6 +54,96 @@ fn parser_identity_to_keep(bucket: Option<&Vec<Relation>>) -> Option<&Relation> 
     bucket?.iter().find(|relation| is_parser_derived(relation))
 }
 
+/// Every relation the graph holds at one node, in both directions and of every
+/// kind, memoized for the pass.
+///
+/// `EntityStore::get_all_relations_for_entity` answers the entity-to-entity
+/// question and filters everything else out, so an edge with one non-entity
+/// endpoint is invisible through it. `traverse` at depth one reads the
+/// mixed-node edge index instead and returns exactly the edges incident to the
+/// node it starts from, which is the question both callers below are asking:
+/// what identities does the graph already hold here, and what would this
+/// removal strand.
+fn relations_held_at<'a, G: GraphStore>(
+    graph: &G,
+    cache: &'a mut HashMap<GraphNodeId, HashMap<RelationId, Relation>>,
+    node: GraphNodeId,
+) -> Result<&'a HashMap<RelationId, Relation>> {
+    if !cache.contains_key(&node) {
+        let held = graph
+            .traverse(&node, &[], 1)
+            .map_err(|error| ReconcileError::Graph(error.to_string()))?
+            .relations
+            .into_iter()
+            .filter(|relation| relation.src == node || relation.dst == node)
+            .map(|relation| (relation.id, relation))
+            .collect();
+        cache.insert(node, held);
+    }
+    Ok(cache
+        .get(&node)
+        .expect("the entry was just inserted when it was absent"))
+}
+
+/// The relation the graph already holds under this identity, if any.
+fn relation_already_held<G: GraphStore>(
+    graph: &G,
+    cache: &mut HashMap<GraphNodeId, HashMap<RelationId, Relation>>,
+    candidate: &Relation,
+) -> Result<Option<Relation>> {
+    Ok(relations_held_at(graph, cache, candidate.src)?
+        .get(&candidate.id)
+        .cloned())
+}
+
+/// Carry one freshly derived edge into the delta under the identity the graph
+/// actually holds for it.
+///
+/// A `TransactionDelta` may not add an identity the store already carries:
+/// kin-db refuses the whole transition with `transaction adds existing
+/// relation <id>`, and the reconcile caller logs that and drops the delta, so
+/// a rename's entities never land while the other file's pass does. The pass
+/// cannot see every such identity by key, because `existing_relations` is
+/// gathered from the entities of the file being reconciled and the cross-file
+/// pass also folds in edges SOURCED BY the files it just unblocked. Asking the
+/// graph by identity is what closes that gap, and it is the same question
+/// kin-db asks (FIR-2838).
+fn push_relation_addition<G: GraphStore>(
+    graph: &G,
+    cache: &mut HashMap<GraphNodeId, HashMap<RelationId, Relation>>,
+    delta: &mut TransactionDelta,
+    spoken_for: &mut HashSet<RelationId>,
+    new: Relation,
+) -> Result<()> {
+    if !spoken_for.insert(new.id) {
+        debug!(
+            relation_id = %new.id,
+            kind = ?new.kind,
+            "this delta already speaks for the relation identity; skipping the second claim"
+        );
+        return Ok(());
+    }
+    match relation_already_held(graph, cache, &new)? {
+        Some(old) if old == new => {
+            debug!(
+                relation_id = %new.id,
+                "the graph already holds this exact edge; adding it again would refuse the \
+                 whole transition"
+            );
+        }
+        Some(old) => {
+            debug!(
+                relation_id = %new.id,
+                kind = ?new.kind,
+                "the graph already holds this relation identity; carrying it as a modification"
+            );
+            delta.relation_deltas.push(RelationDelta::Modified { old, new });
+        }
+        None => delta.relation_deltas.push(RelationDelta::Added { new }),
+    }
+    Ok(())
+}
+
 /// One entity's declaration position before and after this pass.
 type SpanMove = (kin_model::SourceSpan, kin_model::SourceSpan);
 
@@ -976,6 +1066,15 @@ impl Reconciler {
         // Build set of newly parsed relations keyed by (src, dst, kind).
         let mut new_relation_keys: HashSet<RelationKey> = HashSet::new();
         let mut matched_relation_ids = HashSet::new();
+        // Every relation identity this delta already names, whatever it says
+        // about it. kin-db allows one delta per relation and refuses the whole
+        // transition otherwise, so the invariant is enforced here, once, at the
+        // producer.
+        let mut spoken_for: HashSet<RelationId> = HashSet::new();
+        // Memoized per-node reads of what the graph holds, shared by the
+        // identity check below and the removal collection further down.
+        let mut held_relations: HashMap<GraphNodeId, HashMap<RelationId, Relation>> =
+            HashMap::new();
         for relation in &indexed.relations {
             // Remap src/dst to stable IDs if they were matched to existing entities.
             let stable_src = relation
@@ -1004,6 +1103,7 @@ impl Reconciler {
 
             if let Some(old) = parser_identity_to_keep(existing_relations.get(&key)) {
                 matched_relation_ids.insert(old.id);
+                spoken_for.insert(old.id);
                 stable_relation.id = old.id;
                 stable_relation.created_in = old.created_in;
                 if stable_relation != *old {
@@ -1013,9 +1113,13 @@ impl Reconciler {
                     });
                 }
             } else {
-                delta.relation_deltas.push(RelationDelta::Added {
-                    new: stable_relation,
-                });
+                push_relation_addition(
+                    graph,
+                    &mut held_relations,
+                    &mut delta,
+                    &mut spoken_for,
+                    stable_relation,
+                )?;
             }
         }
 
@@ -1046,7 +1150,16 @@ impl Reconciler {
         // store rejects outright, which would take the whole reconcile of an
         // unrelated file down with it. An endpoint this delta itself adds
         // counts as admitted; anything else must already be in the graph.
+        //
+        // An entity THIS delta removes is not admitted either, and that is the
+        // half the graph-truth read cannot answer: it is still in the store
+        // while the same transaction retires it, so `get_entity` says yes and
+        // kin-db then refuses the transition with `unadmitted destination
+        // endpoint`, which is the repository-wide write wedge (FIR-2838).
         let admits_entity = |id: EntityId| -> bool {
+            if removed_entity_ids.contains(&id) {
+                return false;
+            }
             stable_entity_ids.values().any(|stable| *stable == id)
                 || matches!(graph.get_entity(&id), Ok(Some(_)))
         };
@@ -1078,6 +1191,7 @@ impl Reconciler {
             let mut linked = relation.clone();
             if let Some(old) = parser_identity_to_keep(existing_relations.get(&key)) {
                 matched_relation_ids.insert(old.id);
+                spoken_for.insert(old.id);
                 linked.id = old.id;
                 linked.created_in = old.created_in;
                 if linked != *old {
@@ -1087,9 +1201,13 @@ impl Reconciler {
                     });
                 }
             } else {
-                delta
-                    .relation_deltas
-                    .push(RelationDelta::Added { new: linked });
+                push_relation_addition(
+                    graph,
+                    &mut held_relations,
+                    &mut delta,
+                    &mut spoken_for,
+                    linked,
+                )?;
             }
         }
 
@@ -1166,6 +1284,7 @@ impl Reconciler {
                     || cross_file_source_authoritative
                 {
                     retired_relation_ids.insert(relation.id);
+                    spoken_for.insert(relation.id);
                     delta.relation_deltas.push(RelationDelta::Removed {
                         old: relation.clone(),
                     });
@@ -1176,6 +1295,50 @@ impl Reconciler {
                         "stale relation removed"
                     );
                 }
+            }
+        }
+
+        // A removal collects the edges that name it, all of them.
+        //
+        // The loop above walks `existing_relations`, which is gathered through
+        // `get_all_relations_for_entity` and therefore holds entity-to-entity
+        // edges only. An edge with one non-entity endpoint is invisible to it,
+        // so a departing entity could leave one standing; kin-db then refuses
+        // EVERY later transition on that store with `transaction relation <id>
+        // has unadmitted destination endpoint entity:<id>`, which wedges the
+        // whole repository for writes until the daemon restarts and the store
+        // is rebuilt without the strand. kin's own error text calls that out:
+        // "a removal is supposed to collect these edges itself" (FIR-2838).
+        //
+        // Reading each departing entity's node directly is what makes the
+        // transition self-contained. Redirecting an incoming edge onto a
+        // renamed successor is deliberately NOT done here: this pass holds no
+        // evidence about the source file's current text, the source file's own
+        // reconcile re-derives the edge against the new entity, and the
+        // cross-file linker's waiting index exists to bind it the moment the
+        // new name arrives. Dropping the edge with the entity it names is the
+        // honest transition; inventing one is not.
+        for entity_id in &removed_entity_ids {
+            let node = GraphNodeId::Entity(*entity_id);
+            let stranded: Vec<Relation> = relations_held_at(graph, &mut held_relations, node)?
+                .values()
+                .filter(|relation| !spoken_for.contains(&relation.id))
+                .cloned()
+                .collect();
+            for relation in stranded {
+                retired_relation_ids.insert(relation.id);
+                spoken_for.insert(relation.id);
+                debug!(
+                    relation_id = %relation.id,
+                    src = %relation.src,
+                    dst = %relation.dst,
+                    kind = ?relation.kind,
+                    entity = %entity_id,
+                    "collecting an edge bound to a departing entity so the transition strands none"
+                );
+                delta
+                    .relation_deltas
+                    .push(RelationDelta::Removed { old: relation });
             }
         }
 
@@ -1195,9 +1358,7 @@ impl Reconciler {
         if !entity_span_moves.is_empty() {
             for relations in existing_relations.values() {
                 for relation in relations {
-                    if matched_relation_ids.contains(&relation.id)
-                        || retired_relation_ids.contains(&relation.id)
-                    {
+                    if spoken_for.contains(&relation.id) {
                         continue;
                     }
                     let Some(placed) =
@@ -1210,6 +1371,7 @@ impl Reconciler {
                         kind = ?relation.kind,
                         "preserved relation re-anchored to the declaration that moved"
                     );
+                    spoken_for.insert(relation.id);
                     delta.relation_deltas.push(RelationDelta::Modified {
                         old: relation.clone(),
                         new: placed,
@@ -1224,11 +1386,10 @@ impl Reconciler {
         // them at all. Reconcile them against graph truth: the pass re-derived
         // the complete import set of every file it resolved, from those files'
         // own declarations.
-        let mut claimed_relation_ids: HashSet<RelationId> = delta
-            .relation_deltas
-            .iter()
-            .map(RelationDelta::target_id)
-            .collect();
+        // `spoken_for` already names every identity the deltas above claimed,
+        // which is what this loop used to rebuild for itself out of
+        // `delta.relation_deltas`. One set, so the artifact half and the entity
+        // half cannot disagree about what has been claimed.
         if cross_file.ran {
             let produced_by_id: HashMap<RelationId, &Relation> = cross_file
                 .artifact_imports
@@ -1253,7 +1414,7 @@ impl Reconciler {
                     match produced_by_id.get(&relation.id) {
                         Some(current) if **current == relation => {}
                         Some(current) => {
-                            if claimed_relation_ids.insert(relation.id) {
+                            if spoken_for.insert(relation.id) {
                                 delta.relation_deltas.push(RelationDelta::Modified {
                                     old: relation.clone(),
                                     new: (*current).clone(),
@@ -1272,7 +1433,7 @@ impl Reconciler {
                             };
                             if cross_file.referenced.is_complete()
                                 && destination_known
-                                && claimed_relation_ids.insert(relation.id)
+                                && spoken_for.insert(relation.id)
                             {
                                 delta.relation_deltas.push(RelationDelta::Removed {
                                     old: relation.clone(),
@@ -1308,12 +1469,13 @@ impl Reconciler {
                 if !endpoints_admitted {
                     continue;
                 }
-                if !claimed_relation_ids.insert(relation.id) {
-                    continue;
-                }
-                delta.relation_deltas.push(RelationDelta::Added {
-                    new: relation.clone(),
-                });
+                push_relation_addition(
+                    graph,
+                    &mut held_relations,
+                    &mut delta,
+                    &mut spoken_for,
+                    relation.clone(),
+                )?;
             }
         }
 

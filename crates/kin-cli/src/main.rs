@@ -2556,7 +2556,34 @@ fn parse_cli_or_report_retired_command() -> Cli {
     }
 }
 
+/// Restore the default SIGPIPE disposition for this process.
+///
+/// The Rust runtime sets SIGPIPE to `SIG_IGN` before `main`, so a write to a
+/// pipe whose reader has gone returns `EPIPE`, and `println!` turns that into a
+/// panic: exit status 101, plus a `library/std/src/io/stdio.rs` panic message
+/// that reads like a crash inside the product. `kin commit ... | head -3` hit
+/// exactly that on a commit that had already landed, so the run that worked
+/// reported a failure (FIR-2838). Every other Unix tool dies quietly by SIGPIPE
+/// there, and `kin` should too: the reader leaving is not this program
+/// crashing.
+///
+/// Restoring the default costs nothing when stdout is a file or a terminal, and
+/// it is the whole of the change: a command whose output nobody truncated is
+/// untouched and still exits on its own status.
+#[cfg(unix)]
+fn restore_default_sigpipe() {
+    // SAFETY: called as the first statement of `main`, before any thread is
+    // spawned and before any handler is installed, and `SIG_DFL` is a valid
+    // disposition for SIGPIPE on every supported unix.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 fn main() -> Result<()> {
+    // Before anything can write: see `restore_default_sigpipe`.
+    #[cfg(unix)]
+    restore_default_sigpipe();
     // Select this process's resource profile before anything reads it: the GPU
     // kernel plan and the Metal submission depth are each resolved once per
     // process, and mutating the environment is only safe while the process is
