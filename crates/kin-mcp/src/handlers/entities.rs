@@ -198,7 +198,7 @@ into one deduped result. The fan-out is echoed once under `queries` and each hit
 that surfaced it (diverse variants, meaning identifiers, behavior and subsystem, recover \
 more than any single phrasing); multi-query fusion always uses the fused pipeline. Both \
 pipelines report semantic_coverage as one counter object (indexed, total, pending, \
-complete), the same shape `_kin.semantic_coverage` carries; the fused arm additionally reports a `degradations` array \
+complete), the same shape `_kin.semantic_coverage` carries, and both report a `degradations` array \
 naming any retrieval capability that could not fully run (empty vector index, reranker \
 model not cached, …), so a thin result set is attributable instead of silent. Ranking \
 demotes test-role entities, and at several stages excludes them, unless the query text \
@@ -211,7 +211,7 @@ error in offline/no-daemon mode. On an empty result the additive `negative` obje
 `safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \"not \
 yet embedded\". A NON-empty result needs the opposite check, because retrieval always \
 returns its best candidates: each hit carries `match_kind` (`name` when a query token is \
-that entity's name, else `semantic` or `text_fallback`), and the response carries \
+that entity's name, else `semantic` or `text_fallback`), and an entity-granularity response carries \
 `all_fallback: true` when NOT ONE returned entity was named by the query. Asking for a \
 symbol that does not exist yields a full, confident-looking page with `all_fallback` set \
 — treat that as \"this symbol was not found\" rather than as the answer. Every hit also \
@@ -221,13 +221,17 @@ the graph, so get_entity_source, get_context_pack, graph_neighborhood, and find_
 all take it. `id_space: \"artifact\"` means the hit is an artifact-level embedding — a \
 tracked file the parsers produced no entities for — so it carries `artifact_path` and NO \
 `entity_id`, and those tools will refuse it; read it with kin_artifact_read instead. Do \
-not synthesize an entity id from an artifact hit's path. The response bounds its own size \
-(max_chars, default 45000 serialized characters, ceiling 60000) so it is never refused by a \
-client for being too large: it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
-ask with explain=true or compact=false, and under pressure it sheds the per-file symbol roll-up, \
-then inline snippets, and only then withholds hits from the end of the page. Any cut is reported \
+not synthesize an entity id from an artifact hit's path. The response attempts to bound its own size \
+(max_chars, default 45000 serialized characters, ceiling 60000): it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
+ask with explain=true or compact=false, and under pressure an entity-granularity response first \
+sheds its secondary per-file symbol roll-up. File granularity preserves those symbols because they \
+are primary answer detail. It then sheds inline snippets, and only then withholds hits from the end \
+of the page. Any cut is reported \
 in `degradations` and in `_kin.response`, which carries the budget applied and what the response \
-measured before it, and the rest of the ranking stays reachable through `next_cursor`.";
+measured before it. Primary rows are withheld only when `next_cursor` can be rebased so every row \
+stays reachable. A cursorless final page keeps its primary rows instead; if those rows alone exceed \
+the ceiling, the response ships over budget with `response_over_budget` disclosure rather than \
+silently losing unrecoverable answers, and a size-limited client may still refuse it.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///

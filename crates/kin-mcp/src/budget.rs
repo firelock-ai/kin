@@ -26,6 +26,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
+use kin_core::LocateCursor;
 use serde_json::{json, Map, Value};
 
 /// Serialized characters one retrieval response may occupy by default.
@@ -208,8 +209,9 @@ pub struct BudgetAccounting {
     /// Publishing the size the response actually shipped at is what separates
     /// them, and it is the number a caller compares against `max_chars`.
     ///
-    /// Measured before the envelope's own accounting stanza is rewritten, so it
-    /// is accurate to within the length of that stanza rather than to the byte.
+    /// Reconciled after the envelope, budget downgrade, residual disclosure and
+    /// self-check have reached their final shape, so it is the exact serialized
+    /// size of the JSON response that carries this field.
     #[serde(rename = "chars_after_budget", default)]
     pub chars_after: usize,
     /// True when the budget removed hits, bodies or breakdowns under pressure.
@@ -675,8 +677,10 @@ struct ResponseShape {
     explain_keys: &'static [&'static str],
     /// Top-level keys holding explanation blocks.
     top_explain_keys: &'static [&'static str],
-    /// Per-hit keys holding a nested repeat of hits another collection already
-    /// reports in full.
+    /// Per-hit keys holding a secondary nested roll-up. These normally repeat
+    /// primary hits, but can carry detail when entity projection is empty; they
+    /// are still lower authority than the declared primary and are never shed
+    /// when their parent collection itself is primary.
     duplicate_keys: &'static [&'static str],
     /// Per-hit keys holding bulk identity or retrieval-internal state that no
     /// reader of this tool's answer consumes.
@@ -703,7 +707,10 @@ struct ResponseShape {
 fn shape_for(tool: &str) -> Option<ResponseShape> {
     let shape = match tool {
         "semantic_locate" => ResponseShape {
-            collections: &["entities", "files"],
+            // Fused publishes its primary ranking as `entities`; cosine uses
+            // `results`. Both precede the secondary `files` rollup so the first
+            // present array is the page whose cursor advances.
+            collections: &["entities", "results", "files"],
             body_keys: &["body", "snippet"],
             explain_keys: &[
                 "match_evidence",
@@ -712,8 +719,9 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
                 "score_breakdown",
             ],
             top_explain_keys: &["debug"],
-            // Every symbol in `files[].symbols[]` is a hit `entities[]` already
-            // reports with more fields, so the roll-up is the redundant copy.
+            // Every symbol in `files[].symbols[]` is a hit the primary ranking
+            // already reports with more fields (`entities[]` when fused,
+            // `results[]` when cosine), so the roll-up is the redundant copy.
             duplicate_keys: &["symbols"],
             bulk_keys: &[],
             narrow_param: "limit",
@@ -865,6 +873,31 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
     Some(shape)
 }
 
+/// The collection a semantic-locate cursor advances.
+///
+/// Presence is not enough to identify it. Empty `LocateResult.entities` is
+/// omitted from JSON while the secondary `files` roll-up is always serialized,
+/// so choosing the first present array relabels an empty entity answer as file
+/// granularity. Prefer the response's declared arm and granularity; retain the
+/// presence fallback for older/test payloads that predate those fields.
+fn primary_collection(payload: &Value, tool: &str, shape: &ResponseShape) -> Option<&'static str> {
+    if tool == "semantic_locate" {
+        if payload.get("granularity").and_then(Value::as_str) == Some("file") {
+            return Some("files");
+        }
+        match payload.get("routing").and_then(Value::as_str) {
+            Some("cosine-v0") => return Some("results"),
+            Some("fused-v1") => return Some("entities"),
+            _ => {}
+        }
+    }
+    shape
+        .collections
+        .iter()
+        .copied()
+        .find(|key| payload.get(*key).is_some_and(Value::is_array))
+}
+
 /// Whether this tool's response is governed by the budget.
 /// The file-enumeration tool, named from the handler that defines it so this
 /// table cannot come to describe a tool under a name the registry stopped using.
@@ -882,8 +915,8 @@ pub fn is_budgeted(tool: &str) -> bool {
 ///
 /// The ladder is ordered by what a caller loses. Explanation and per-signal
 /// breakdowns go first: they are diagnostics about a hit, not the hit. A nested
-/// repeat of hits another array already carries goes next, because dropping it
-/// costs nothing at all. Source bodies go next, recoverable one call at a time
+/// secondary roll-up goes next while the declared primary remains unchanged.
+/// Source bodies go next, recoverable one call at a time
 /// through `get_entity_source`. Only then are hits themselves withheld, from the
 /// tail of the least important array first, which is the only cut that removes
 /// an answer rather than a description of one.
@@ -915,7 +948,7 @@ pub fn enforce(
         bounded: prior.is_some(),
         compact: budget.compact,
     };
-    run_ladder(payload, &shape, budget, &mut accounting);
+    run_ladder(payload, tool, &shape, budget, &mut accounting);
     accounting.chars_after = measure(payload);
 
     // A response the ladder could not bring under its ceiling is the case
@@ -923,17 +956,7 @@ pub fn enforce(
     // the accounting reported a whole answer. The ceiling is not always
     // reachable, because a bound is not a refusal and every list keeps an entry,
     // but the caller has to be told which of the two it is holding.
-    if accounting.chars_after > budget.max_chars {
-        disclose_residual(payload, budget);
-    } else {
-        // The other direction, and it is reachable: the first arm cuts under
-        // the budget less the envelope reserve, so it can miss a ceiling this
-        // arm clears once the reserve it was holding back turns out to be
-        // larger than the envelope that landed. A note saying the response did
-        // not fit, on a response that does, is the same false report in
-        // reverse.
-        clear_residual(payload);
-    }
+    reconcile_residual(payload, budget);
     accounting.chars_after = measure(payload);
     Some(accounting)
 }
@@ -945,6 +968,7 @@ pub fn enforce(
 /// rung return early without anything measuring the result.
 fn run_ladder(
     payload: &mut Value,
+    tool: &str,
     shape: &ResponseShape,
     budget: &ResponseBudget,
     accounting: &mut BudgetAccounting,
@@ -952,6 +976,12 @@ fn run_ladder(
     let started_at = measure(payload);
     let mut cuts: Vec<String> = Vec::new();
     let mut remediations: Vec<String> = Vec::new();
+    // `semantic_locate` declares its primary through routing and granularity:
+    // `entities` for fused entity pages, `results` for cosine entity pages, and
+    // `files` for either file arm. Other tools retain the first-present rule.
+    // Presence alone is not authoritative here because an empty fused entity
+    // array is omitted while its secondary file roll-up remains serialized.
+    let primary = primary_collection(payload, tool, shape);
 
     // Compact by default, whether or not the payload is over budget: the
     // breakdowns are diagnostics a caller did not ask for, and shipping them
@@ -1004,14 +1034,19 @@ fn run_ladder(
         }
     }
 
-    if !shape.duplicate_keys.is_empty() {
+    // `files[].symbols` is a duplicate roll-up only when entities/results are
+    // the primary answer. Under `granularity: "file"`, `files[]` is the only
+    // primary collection and those symbols are its unique detail. Stripping
+    // them there would erase answer content while falsely claiming it remained
+    // under the same collection.
+    if !shape.duplicate_keys.is_empty() && primary != Some("files") {
         let stripped = strip_keys(payload, shape, shape.duplicate_keys, &[]);
         if stripped > 0 {
             accounting.bounded = true;
             cuts.push(format!(
-                "the per-file symbol roll-up dropped from {stripped} entries, every symbol of \
-                 which is still reported in full under `{}`",
-                shape.collections.first().copied().unwrap_or("entities")
+                "the secondary per-file symbol roll-up dropped from {stripped} entries; the \
+                 primary `{}` ranking remains unchanged",
+                primary.unwrap_or("the primary result collection")
             ));
         }
         if measure(payload) <= target {
@@ -1053,14 +1088,44 @@ fn run_ladder(
     // used to be the primary alone, so the last bucket of an `impact_analysis`
     // emptied first and `"affected_tests": []` shipped beside a
     // `covering_tests: 16` that said sixteen tests cover it.
-    let primary = shape.collections.first().copied();
+    let primary_found = primary
+        .and_then(|key| payload.get(key))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let mut locate_cursor = (tool == "semantic_locate")
+        .then(|| {
+            payload
+                .get("next_cursor")
+                .and_then(Value::as_str)
+                .filter(|cursor| !cursor.is_empty())
+                .and_then(LocateCursor::decode)
+        })
+        .flatten()
+        .filter(|cursor| {
+            cursor
+                .next_offset
+                .is_some_and(|offset| offset >= primary_found)
+        });
     let mut withheld_any = false;
+    let mut primary_withheld = 0usize;
+    let mut cursor_rebased = false;
     for key in shape.collections.iter().rev() {
         let found = payload
             .get(*key)
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
-        let (withheld, shape) = trim_collection(payload, key, target, 1);
+        // Every collection is cut, including a final page's primary one.
+        // `max_chars` is the caller's context budget rather than a preference,
+        // so nothing licenses exceeding it, and a page with no cursor is not an
+        // exception: it is the case where the caller cannot page to the rest and
+        // therefore most needs to be told what was withheld and how to reach it.
+        // The floor of one entry per list is what keeps this from producing the
+        // empty array FIR-2600 exists to prevent, and the remediation below says
+        // `max_chars` rather than `next_cursor` when there is no cursor to
+        // follow. Retaining rows here instead shipped a response over the
+        // ceiling and published no elision at all, which is what took
+        // `response_budget:3` to UNREADABLE on main.
+        let (withheld, cut_shape) = trim_collection(payload, key, target, 1);
         if withheld > 0 {
             accounting.bounded = true;
             withheld_any = true;
@@ -1070,12 +1135,22 @@ fn run_ladder(
             // far end of the answer is missing. A cut that held the named target
             // says so too, because "the branch you asked for is still here" is
             // the one thing a caller who named a target needs to read.
-            let how = shape.phrase();
+            let how = cut_shape.phrase();
             cuts.push(format!(
                 "{withheld} of {found} entries withheld from `{key}`, {how}"
             ));
             record_elision(payload, key, found.saturating_sub(withheld), withheld);
             payload["truncated"] = Value::Bool(true);
+            if Some(*key) == primary {
+                primary_withheld = withheld;
+                let kept = found.saturating_sub(withheld);
+                if let Some(cursor) = locate_cursor.as_mut() {
+                    if cursor.rebase_after_withheld(withheld, kept) {
+                        payload["next_cursor"] = Value::String(cursor.encode());
+                        cursor_rebased = true;
+                    }
+                }
+            }
         }
         if measure(payload) <= target {
             break;
@@ -1086,9 +1161,18 @@ fn run_ladder(
             .and_then(|key| payload.get(key))
             .and_then(Value::as_array)
             .map_or(0, Vec::len);
-        if payload.get("next_cursor").is_some() && kept > 0 {
+        if primary_withheld > 0 && cursor_rebased && kept > 0 {
             remediations.push(format!(
                 "re-issue with `page_size: {kept}` and follow `next_cursor`"
+            ));
+        } else if tool == "semantic_locate" && primary_withheld > 0 && locate_cursor.is_none() {
+            // Naming a cursor here would be a recovery the response cannot
+            // provide. The two things that do reach the withheld rows are a
+            // larger ceiling and a narrower question, and the caller owns both.
+            remediations.push(format!(
+                "raise `max_chars`, or narrow the request with `{}`; this page has no \
+                 `next_cursor`, so the withheld entries cannot be reached by paging",
+                shape.narrow_param
             ));
         } else {
             remediations.push(format!("narrow the request with `{}`", shape.narrow_param));
@@ -1183,6 +1267,28 @@ fn clear_residual(payload: &mut Value) {
         if let Some(map) = payload.as_object_mut() {
             map.remove("degradations");
         }
+    }
+}
+
+/// Make the residual-over-budget disclosure agree with the bytes currently in
+/// the response.
+///
+/// The envelope finalizer calls this again after its epistemic downgrade,
+/// accounting stanza and optional self-check have landed. Those fields are not
+/// answer rows and must never be trimmed, but they still count against the
+/// caller's ceiling. A final response that cannot fit therefore says so, while
+/// one that now fits must not retain a stale warning from an earlier pass.
+pub(crate) fn reconcile_residual(payload: &mut Value, budget: &ResponseBudget) {
+    if measure(payload) > budget.max_chars {
+        disclose_residual(payload, budget);
+    } else {
+        // The other direction, and it is reachable: the first arm cuts under
+        // the budget less the envelope reserve, so it can miss a ceiling this
+        // arm clears once the reserve it was holding back turns out to be
+        // larger than the envelope that landed. A note saying the response did
+        // not fit, on a response that does, is the same false report in
+        // reverse.
+        clear_residual(payload);
     }
 }
 
@@ -1977,12 +2083,19 @@ mod tests {
                 })
             })
             .collect();
+        let next_cursor = LocateCursor {
+            key: "deadbeefdeadbeef".to_string(),
+            page: 1,
+            next_offset: Some(hits),
+            page_size: Some(hits.max(1)),
+        }
+        .encode();
         json!({
             "query": "where redirects are resolved",
             "entities": entities,
             "files": files,
             "total_ranked": hits,
-            "next_cursor": "deadbeefdeadbeef.1",
+            "next_cursor": next_cursor,
         })
     }
 
@@ -2234,11 +2347,342 @@ mod tests {
                 40
             );
             assert_eq!(payload["truncated"], json!(true));
+            let cursor = LocateCursor::decode(payload["next_cursor"].as_str().unwrap())
+                .expect("a fused locate cut keeps a followable cursor");
+            assert_eq!(cursor.next_offset, Some(kept));
+            assert_eq!(cursor.page_size, Some(kept));
         }
         assert_eq!(
             payload["total_ranked"],
             json!(40),
             "the full ranking size is still reported"
+        );
+    }
+
+    fn cosine_locate_payload(hits: usize) -> Value {
+        let cursor = LocateCursor {
+            key: "cosine-ranking".to_string(),
+            page: 1,
+            next_offset: Some(hits),
+            page_size: Some(hits.max(1)),
+        }
+        .encode();
+        json!({
+            "query": "where redirects are resolved",
+            "routing": "cosine-v0",
+            "results": (0..hits).map(|index| json!({
+                "entity_id": format!("00000000-0000-0000-0000-{index:012}"),
+                "name": format!("handler_{index}_{}", "x".repeat(500)),
+                "kind": "function",
+                "score": 0.5,
+                "provenance": { "file": format!("src/f{index}.rs") },
+            })).collect::<Vec<_>>(),
+            "files": [],
+            "total_ranked": hits,
+            "next_cursor": cursor,
+        })
+    }
+
+    fn file_locate_payload(files: usize, symbols_per_file: usize) -> Value {
+        let cursor = LocateCursor {
+            key: "file-ranking".to_string(),
+            page: 1,
+            next_offset: Some(files),
+            page_size: Some(files.max(1)),
+        }
+        .encode();
+        json!({
+            "query": "where redirects are resolved",
+            "granularity": "file",
+            "routing": "fused-v1",
+            "files": (0..files).map(|index| json!({
+                "path": format!("src/f{index}.rs"),
+                "score": 0.5,
+                "signals": ["vector", "lexical"],
+                "symbols": (0..symbols_per_file).map(|symbol| json!({
+                    "name": format!("symbol_{index}_{symbol}_{}", "x".repeat(80)),
+                    "kind": "function",
+                    "score": 0.4,
+                    "span": [1, 40],
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+            "total_ranked": files,
+            "next_cursor": cursor,
+        })
+    }
+
+    #[test]
+    fn file_primary_budget_keeps_unique_symbol_detail_and_rebases_files() {
+        let found = 12usize;
+        let mut payload = file_locate_payload(found, 8);
+        let budget = ResponseBudget {
+            max_chars: 7_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+
+        let kept = payload["files"].as_array().unwrap().len();
+        assert!(
+            kept > 0 && kept < found,
+            "fixture must trim file rows: {payload}"
+        );
+        assert!(
+            payload["files"].as_array().unwrap().iter().all(|file| file
+                .get("symbols")
+                .and_then(Value::as_array)
+                .is_some_and(|symbols| !symbols.is_empty())),
+            "file-primary symbols are answer detail, not a duplicate roll-up: {payload}"
+        );
+        let cursor = LocateCursor::decode(payload["next_cursor"].as_str().unwrap())
+            .expect("file cursor remains followable");
+        assert_eq!(cursor.next_offset, Some(kept));
+        assert_eq!(cursor.page_size, Some(kept));
+        assert!(payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| !entry["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("per-file symbol roll-up dropped")));
+    }
+
+    #[test]
+    fn empty_fused_entity_primary_does_not_relabel_secondary_files_as_primary() {
+        let mut payload = json!({
+            "query": "where redirects are resolved",
+            "routing": "fused-v1",
+            "granularity": "entity",
+            // LocateResult omits its empty entities array, while this secondary
+            // roll-up remains present.
+            "files": [{
+                "path": "src/lib.rs",
+                "score": 0.9,
+                "symbols": (0..120).map(|index| json!({
+                    "name": format!("secondary_symbol_{index}_{}", "x".repeat(80)),
+                    "kind": "function",
+                    "score": 0.8,
+                    "span": [1, 20],
+                })).collect::<Vec<_>>(),
+            }],
+            "total_ranked": 0,
+            "next_cursor": Value::Null,
+        });
+        let without_symbols = {
+            let mut candidate = payload.clone();
+            candidate["files"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("symbols");
+            measure(&candidate)
+        };
+        let budget = ResponseBudget {
+            max_chars: without_symbols + RESPONSE_DISCLOSURE_RESERVE_CHARS,
+            ..ResponseBudget::default()
+        };
+        assert!(measure(&payload) > budget.max_chars);
+
+        enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+
+        assert!(
+            payload["files"][0].get("symbols").is_none(),
+            "entity granularity may shed its secondary roll-up: {payload}"
+        );
+        let disclosure = payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["reason"] == BOUNDED_REASON)
+            .and_then(|entry| entry["detail"].as_str())
+            .expect("secondary cut is disclosed");
+        assert!(
+            disclosure.contains("primary `entities` ranking remains unchanged"),
+            "{disclosure}"
+        );
+    }
+
+    #[test]
+    fn cosine_rows_are_budgeted_and_rebase_the_followable_cursor() {
+        let found = 30usize;
+        let mut payload = cosine_locate_payload(found);
+        let budget = ResponseBudget {
+            max_chars: 4_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        let kept = payload["results"].as_array().unwrap().len();
+        assert!(
+            kept > 0 && kept < found,
+            "fixture must force a row cut: {payload}"
+        );
+        let cursor = LocateCursor::decode(payload["next_cursor"].as_str().unwrap())
+            .expect("budget leaves a valid cursor");
+        assert_eq!(cursor.next_offset, Some(kept));
+        assert_eq!(cursor.page_size, Some(kept));
+        let emitted = payload["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["entity_id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
+        let resumed = (kept..(kept + kept).min(found))
+            .map(|index| format!("00000000-0000-0000-0000-{index:012}"))
+            .collect::<Vec<_>>();
+        assert!(
+            emitted.iter().all(|id| !resumed.contains(id)),
+            "the rebased continuation must not repeat a row already emitted"
+        );
+        assert_eq!(
+            emitted
+                .iter()
+                .chain(resumed.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            (0..(kept + kept).min(found))
+                .map(|index| format!("00000000-0000-0000-0000-{index:012}"))
+                .collect::<Vec<_>>(),
+            "budget trimming and continuation must cover one contiguous prefix without gaps"
+        );
+        assert_eq!(payload["elisions"]["results"]["kept"], json!(kept));
+        assert!(payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["remediation"]
+                .as_str()
+                .is_some_and(|text| text.contains("follow `next_cursor`"))));
+    }
+
+    #[test]
+    fn a_second_budget_pass_rebases_from_the_first_pass_offset() {
+        let mut payload = cosine_locate_payload(40);
+        let first_budget = ResponseBudget {
+            max_chars: 8_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "semantic_locate", &first_budget).expect("first pass");
+        let first_kept = payload["results"].as_array().unwrap().len();
+        let first_cursor = LocateCursor::decode(payload["next_cursor"].as_str().unwrap()).unwrap();
+        assert_eq!(first_cursor.next_offset, Some(first_kept));
+
+        let second_budget = ResponseBudget {
+            max_chars: 3_000,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "semantic_locate", &second_budget).expect("second pass");
+        let second_kept = payload["results"].as_array().unwrap().len();
+        assert!(
+            second_kept < first_kept,
+            "second pass must cut again: {payload}"
+        );
+        let second_cursor = LocateCursor::decode(payload["next_cursor"].as_str().unwrap()).unwrap();
+        assert_eq!(second_cursor.next_offset, Some(second_kept));
+        assert_eq!(second_cursor.page_size, Some(second_kept));
+    }
+
+    #[test]
+    fn cosine_duplicate_rollup_disclosure_names_results_not_absent_entities() {
+        let mut payload = cosine_locate_payload(2);
+        payload["files"] = json!([{
+            "path": "src/lib.rs",
+            "score": 0.9,
+            "symbols": (0..120).map(|index| json!({
+                "name": format!("duplicate_symbol_{index}_{}", "x".repeat(80)),
+                "kind": "function",
+                "score": 0.8,
+                "span": [1, 20],
+            })).collect::<Vec<_>>(),
+        }]);
+        let without_symbols = {
+            let mut candidate = payload.clone();
+            candidate["files"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("symbols");
+            measure(&candidate)
+        };
+        let budget = ResponseBudget {
+            max_chars: without_symbols + RESPONSE_DISCLOSURE_RESERVE_CHARS,
+            ..ResponseBudget::default()
+        };
+        assert!(measure(&payload) > budget.max_chars);
+        enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        let disclosure = payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["reason"] == BOUNDED_REASON)
+            .and_then(|entry| entry["detail"].as_str())
+            .expect("duplicate rollup cut is disclosed");
+        assert!(
+            disclosure.contains("primary `results` ranking remains unchanged"),
+            "{disclosure}"
+        );
+        assert!(!disclosure.contains("primary `entities`"), "{disclosure}");
+    }
+
+    /// A final page is still bound by the ceiling, and says what it withheld.
+    ///
+    /// `max_chars` is the caller's context budget, so a page with no cursor does
+    /// not get to exceed it. What a final page owes instead is honesty about the
+    /// cut: at least one entry survives per list, the elision is published, and
+    /// the remedy names the ceiling rather than a `next_cursor` it does not
+    /// have. The earlier contract kept the rows and shipped over budget, which
+    /// took `response_budget:3` to UNREADABLE on main because nothing was cut.
+    #[test]
+    fn a_final_page_is_cut_to_its_ceiling_and_names_no_cursor_recovery() {
+        let mut payload = cosine_locate_payload(20);
+        payload["next_cursor"] = Value::Null;
+        let before = payload["results"].as_array().unwrap().len();
+        let budget = ResponseBudget {
+            max_chars: RESPONSE_MIN_MAX_CHARS,
+            ..ResponseBudget::default()
+        };
+        let accounting = enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        let kept = payload["results"].as_array().unwrap().len();
+        assert!(
+            kept < before,
+            "a final page over its ceiling must still be cut: kept {kept} of {before}"
+        );
+        assert!(
+            kept >= 1,
+            "the cut must leave an entry rather than an empty array"
+        );
+        assert!(
+            accounting.chars_after <= budget.max_chars,
+            "a final page must not ship over its ceiling: {} against {}",
+            accounting.chars_after,
+            budget.max_chars
+        );
+        let elisions = payload["elisions"]["results"]
+            .as_object()
+            .expect("the cut list publishes its elision");
+        assert_eq!(elisions["kept"].as_u64().unwrap() as usize, kept);
+        assert_eq!(elisions["elided"].as_u64().unwrap() as usize, before - kept);
+        let remediations = payload["degradations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["remediation"].as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            remediations
+                .iter()
+                .all(|remedy| !remedy.contains("follow `next_cursor`")),
+            "a final page cannot offer cursor recovery: {remediations:?}"
+        );
+        // `max_chars` alone is not evidence this branch ran. The residual
+        // disclosure names it too, so a bare substring test is satisfied by a
+        // producer this assertion is not about, and the mutation that deletes
+        // the branch survived exactly that test. Key on the clause only the cut
+        // disclosure writes.
+        assert!(
+            remediations.iter().any(|remedy| {
+                remedy.contains("raise `max_chars`")
+                    && remedy.contains("cannot be reached by paging")
+            }),
+            "the cut disclosure itself must name the ceiling and say why paging cannot reach \
+             the withheld rows: {remediations:?}"
         );
     }
 
