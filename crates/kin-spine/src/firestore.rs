@@ -3535,6 +3535,58 @@ mod tests {
 
     /// In-memory [`SpineStore`] fake. Mirrors staged rows and a revision-checked
     /// repository head without any network.
+    /// Two-party rendezvous with a deadline, used by the race fixtures below.
+    ///
+    /// `std::sync::Barrier` has no timed wait, and the fake reaches its
+    /// rendezvous only on the paths that actually select a stage or a head:
+    /// every other path returns earlier. So a change in what production selects
+    /// turns a race test from a failure into a permanent hang. Measured, not
+    /// hypothesised: two of these ran 13305 seconds before a signal stopped
+    /// them, and 112 of the suite's 145 tests never ran as a result, which is
+    /// strictly worse than a red test because it reports nothing at all. A
+    /// bounded wait turns the same mismatch into a named failure in seconds and
+    /// says which side never arrived.
+    struct BoundedRendezvous {
+        /// (parties arrived in the current phase, phase number)
+        inner: Mutex<(usize, u64)>,
+        signal: std::sync::Condvar,
+    }
+
+    impl BoundedRendezvous {
+        const DEADLINE: Duration = Duration::from_secs(30);
+
+        fn new() -> Self {
+            Self {
+                inner: Mutex::new((0, 0)),
+                signal: std::sync::Condvar::new(),
+            }
+        }
+
+        /// Arrive and wait for the other party, or panic naming this side.
+        fn wait(&self, who: &str) {
+            let mut state = self.inner.lock().unwrap();
+            let phase = state.1;
+            state.0 += 1;
+            if state.0 == 2 {
+                state.0 = 0;
+                state.1 += 1;
+                self.signal.notify_all();
+                return;
+            }
+            let (_state, timeout) = self
+                .signal
+                .wait_timeout_while(state, Self::DEADLINE, |state| state.1 == phase)
+                .unwrap();
+            assert!(
+                !timeout.timed_out(),
+                "{who} waited {:?} at a two-party rendezvous the other side never reached; \
+                 the fake reaches its rendezvous only after it selects a stage or head, so \
+                 this means production selected nothing on the path under test",
+                Self::DEADLINE
+            );
+        }
+    }
+
     struct FakeSpineStore {
         // (root_hash, entries) keyed by repo_id.
         repos: Mutex<HashMap<String, (String, Vec<EntityEntry>)>>,
@@ -3567,10 +3619,10 @@ mod tests {
         disable_stage_head_precondition: AtomicBool,
         /// Optional deterministic pause after cleanup snapshots a stage but
         /// before its exact-revision atomic delete commit.
-        cleanup_snapshot_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+        cleanup_snapshot_barrier: Mutex<Option<Arc<BoundedRendezvous>>>,
         /// Optional deterministic pause after hydration snapshots heads but
         /// before it reads the corresponding immutable rows.
-        load_snapshot_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
+        load_snapshot_barrier: Mutex<Option<Arc<BoundedRendezvous>>>,
         /// Keep staged rows in place while a race or cleanup assertion inspects
         /// them. Production cleanup remains enabled and bounded.
         disable_cleanup: AtomicBool,
@@ -4367,8 +4419,8 @@ mod tests {
             for _ in 0..3 {
                 let selected_heads = self.publication_state.lock().unwrap().heads.clone();
                 if let Some(barrier) = self.load_snapshot_barrier.lock().unwrap().take() {
-                    barrier.wait();
-                    barrier.wait();
+                    barrier.wait("fake store hydration snapshot");
+                    barrier.wait("fake store hydration snapshot");
                 }
                 let loaded = {
                     let state = self.publication_state.lock().unwrap();
@@ -4497,8 +4549,8 @@ mod tests {
             };
 
             if let Some(barrier) = self.cleanup_snapshot_barrier.lock().unwrap().take() {
-                barrier.wait();
-                barrier.wait();
+                barrier.wait("fake store cleanup snapshot");
+                barrier.wait("fake store cleanup snapshot");
             }
 
             let mut state = self.publication_state.lock().unwrap();
@@ -5430,13 +5482,13 @@ mod tests {
         commit_store_success(store.as_ref(), &first);
         seal_fake_for_current_heads(&store);
 
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(BoundedRendezvous::new());
         *store.load_snapshot_barrier.lock().unwrap() = Some(barrier.clone());
         let reopened = Arc::new(FirestoreSpineBackend::with_store(store.clone()));
         let hydrating = reopened.clone();
         let load = std::thread::spawn(move || hydrating.hydrate());
 
-        barrier.wait();
+        barrier.wait("hydration snapshot race, test main");
         let second = store
             .prepare_repo_publication(metadata_publication(
                 "repo",
@@ -5454,7 +5506,7 @@ mod tests {
             3,
             "the old row, manifest, and marker are reclaimed"
         );
-        barrier.wait();
+        barrier.wait("hydration snapshot race, test main");
 
         load.join()
             .expect("hydration thread")
@@ -5564,7 +5616,7 @@ mod tests {
         store
             .disable_distinct_stage_heartbeat
             .store(disable_distinct_stage_heartbeat, Ordering::SeqCst);
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(BoundedRendezvous::new());
         *store.cleanup_snapshot_barrier.lock().unwrap() = Some(barrier.clone());
         let cleanup_store = store.clone();
         let winner_head = winner.candidate_head().clone();
@@ -5575,7 +5627,7 @@ mod tests {
                 .deleted
         });
 
-        barrier.wait();
+        barrier.wait("late-row cleanup race, test main");
         {
             let mut state = store.publication_state.lock().unwrap();
             state
@@ -5602,7 +5654,7 @@ mod tests {
             };
             apply_fake_stage_marker(&mut state, &stale_id, late_marker);
         }
-        barrier.wait();
+        barrier.wait("late-row cleanup race, test main");
         let deleted = cleanup.join().unwrap();
         let state = store.publication_state.lock().unwrap();
         (
@@ -5769,7 +5821,7 @@ mod tests {
         store
             .disable_stage_head_precondition
             .store(disable_stage_head_precondition, Ordering::SeqCst);
-        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(BoundedRendezvous::new());
         *store.cleanup_snapshot_barrier.lock().unwrap() = Some(barrier.clone());
         let cleanup_store = store.clone();
         let cleanup = std::thread::spawn(move || {
@@ -5779,14 +5831,14 @@ mod tests {
                 .deleted
         });
 
-        barrier.wait();
+        barrier.wait("cleanup-snapshot-before-head-commit race, test main");
         let outcome = backend.commit_repo_publication(prepared).unwrap();
         assert!(matches!(outcome, RepoPublicationCommit::Committed { .. }));
         assert_eq!(
             committed_head(&store, "source").publication_id,
             candidate_id
         );
-        barrier.wait();
+        barrier.wait("cleanup-snapshot-before-head-commit race, test main");
         let deleted = cleanup.join().unwrap();
         seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
