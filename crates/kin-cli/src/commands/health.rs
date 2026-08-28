@@ -10612,23 +10612,22 @@ mod tests {
         assert!(current.manual_fix.is_none());
         assert!(!blocks_readiness(&current));
 
-        for standing in [HydrationStanding::Behind {
+        let standing = HydrationStanding::Behind {
             created_under: 9,
             derives: 10,
-        }] {
-            let row = hydration_semantics_check_for(&standing);
-            assert!(matches!(row.status, HealthStatus::Stale), "{row:?}");
-            assert!(
-                row.manual_fix
-                    .as_deref()
-                    .is_some_and(|fix| fix.contains("re-ingest")),
-                "a store this build can repair needs the re-ingest remedy: {row:?}"
-            );
-            assert!(
-                !blocks_readiness(&row),
-                "phase-one disclosure must not turn a legacy store into a broken install"
-            );
-        }
+        };
+        let row = hydration_semantics_check_for(&standing);
+        assert!(matches!(row.status, HealthStatus::Stale), "{row:?}");
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("re-ingest")),
+            "a store this build can repair needs the re-ingest remedy: {row:?}"
+        );
+        assert!(
+            !blocks_readiness(&row),
+            "phase-one disclosure must not turn a legacy store into a broken install"
+        );
 
         for standing in [
             HydrationStanding::Unstamped { derives: 10 },
