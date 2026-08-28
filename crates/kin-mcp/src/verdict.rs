@@ -1764,9 +1764,14 @@ mod tests {
     /// stands. That happens through `degradations`, and the fragile part is not
     /// the array being non-empty, it is the label surviving
     /// `describes_the_store_not_the_run`. The corpus-scale arm below is what
-    /// separates those two: it is a degradation that must NOT move the verdict,
-    /// so if the producer arm refused merely because the array was populated,
-    /// that arm would refuse too.
+    /// separates those two: it is a real degradation entry that must NOT move
+    /// the verdict, so if the producer arm refused merely because the array was
+    /// populated, that arm would refuse too.
+    ///
+    /// An authoritative absence object is supplied because
+    /// `safe_to_conclude_absent` is `false` on any answer that claims no
+    /// absence, whatever its quality. Without it the assertion below would read
+    /// false in every arm and prove nothing about the mismatch.
     #[test]
     fn a_query_producer_mismatch_leaves_the_answer_uncertified() {
         let clean = || {
@@ -1782,10 +1787,16 @@ mod tests {
                 },
             })
         };
+        let absence = json!({"trust": "authoritative"});
         let compute = |payload: &Value| {
-            Verdict::compute("find_references", payload, &Envelope::daemon(), None)
-                .expect("a retrieval payload carries a verdict")
-                .to_value()
+            Verdict::compute(
+                "find_references",
+                payload,
+                &Envelope::daemon(),
+                Some(&absence),
+            )
+            .expect("a retrieval payload carries a verdict")
+            .to_value()
         };
 
         // Control that must certify: nothing degraded.
@@ -1794,7 +1805,8 @@ mod tests {
         assert_eq!(
             baseline["safe_to_conclude_absent"],
             json!(true),
-            "{baseline}"
+            "the baseline must certify its absence, or the mismatch arm below \
+             cannot show that the mismatch is what withdrew it: {baseline}"
         );
 
         // The reason string comes from the policy that produces it, so a rename
@@ -1844,6 +1856,7 @@ mod tests {
         }]);
         let scaled = compute(&corpus);
         assert_eq!(scaled["state"], json!(CERTIFIED), "{scaled}");
+        assert_eq!(scaled["safe_to_conclude_absent"], json!(true), "{scaled}");
     }
 
     /// FIR-2496. The `edge_coverage` input used to answer `certified` for an
