@@ -1457,9 +1457,15 @@ fn contains_call_node(node: &tree_sitter::Node) -> bool {
     if node.kind() == "call" {
         return true;
     }
+    // Bound rather than returned as the tail expression: the iterator borrows
+    // `cursor`, and a temporary at the end of a block outlives the block's own
+    // locals. `has_unobserved_call` carried the same binding for the same
+    // reason before this change replaced it.
     let mut cursor = node.walk();
-    node.children(&mut cursor)
-        .any(|child| contains_call_node(&child))
+    let found = node
+        .children(&mut cursor)
+        .any(|child| contains_call_node(&child));
+    found
 }
 
 struct PythonNamedCallee {
