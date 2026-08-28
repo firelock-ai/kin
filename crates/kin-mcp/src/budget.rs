@@ -1062,7 +1062,10 @@ pub fn enforce(
 
 /// Rows one collection carries in a payload. A key that is absent or is not an
 /// array carries none, which is the same reading a caller gets from the JSON.
-fn collection_rows(payload: &Value, key: &str) -> usize {
+///
+/// Public to the crate so the envelope's placeholder accounting counts rows
+/// through this function rather than through a third inline copy of it.
+pub(crate) fn collection_rows(payload: &Value, key: &str) -> usize {
     payload
         .get(key)
         .and_then(Value::as_array)

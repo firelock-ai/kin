@@ -2319,6 +2319,25 @@ def self_test():
     return 1 if problems else 0
 
 
+def tree_sha():
+    """The sha of the tree this suite was read from, measured rather than typed.
+
+    A `--label` is a string the caller writes; this is a value the run reads. When
+    the two disagree the report shows it, which is the whole defect a hand-typed
+    sha has: the numbers are right and nothing downstream reads as broken.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else None
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         add_help=True,
@@ -2382,7 +2401,11 @@ def main(argv):
             os.makedirs(directory)
         with open(opts.json, "w") as handle:
             json.dump(
-                {"label": opts.label, "results": [r.row() for r in results]},
+                {
+                    "label": opts.label,
+                    "tree_sha": tree_sha(),
+                    "results": [r.row() for r in results],
+                },
                 handle,
                 indent=2,
                 sort_keys=True,
