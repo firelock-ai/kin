@@ -826,7 +826,7 @@ mod tests {
         // over the PATH `kin_core::tool_prefix` composes.
         let path = kin_core::tool_prefix::path_with_managed_tools(
             Some(&std::ffi::OsString::from("/nonexistent-for-this-test")),
-            &[bin_dir.clone()],
+            std::slice::from_ref(&bin_dir),
         )
         .expect("the tool dir must be added to a PATH that lacks it");
         let found = which::which_in("rust-analyzer", Some(&path), home.path())
