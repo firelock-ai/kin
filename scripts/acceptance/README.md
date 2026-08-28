@@ -119,7 +119,27 @@ which is the shape of a `compact` call and of source the graph never had, so it
 now keeps a null `body` beside a marker naming what went. Check 7 drives
 `kin context`, whose rendered lines are the whole of what a reader of that
 surface sees, and asserts the lines and `--json` report the same cut and name the
-lever that recovers it.
+lever that recovers it. Check 8 covers the page a cursor cannot rescue: a final
+page has no continuation, so the rows it withheld are reachable only by raising
+`max_chars` or narrowing the question, and it has to name those rather than a
+cursor it does not have.
+
+Checks 9 to 11 are FIR-2814, and they are the same reading defect one field over.
+A `LocateResult` skips its `entities` array when empty while the secondary
+`files` roll-up serializes whatever it holds, so a fused entity page that ranked
+nothing shipped no primary key at all beside a populated roll-up, and a reader
+taking the first present array read an empty answer as a file answer. Every
+reader had to re-derive which array was the answer from `granularity` and
+`routing`, and two of them did, in two places, under rules that were not the
+same. Check 9 asks each granularity to name the literal collection it answers
+with and to publish a row count that matches the array it ships, and it grades
+both granularities in one check because a server answering `files` to everything
+would satisfy the file half on its own. Check 10 asks a file page to be a window
+over the file ranking rather than the whole roll-up re-emitted under an advancing
+cursor, which reads as paging and is not. Check 11 asks an entity page that
+ranked nothing to still ship its primary as an empty array and count it zero,
+with a populated page as the control, since a server reporting every page empty
+would satisfy the empty arm on every call.
 
 `memory_pressure_refusal.py` covers the back-off Kin owes a machine it is
 running on, and the disclosure it owes the person running it. A daemon that
