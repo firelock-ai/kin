@@ -283,8 +283,7 @@ fn materialize_hosted_vector_binding(
     Option<SemanticChangeId>,
     kin_db::VectorArtifactBinding,
 )> {
-    let (query_snapshot, materialized_head) =
-        materialize_hosted_repository_snapshot(snapshot)?;
+    let (query_snapshot, materialized_head) = materialize_hosted_repository_snapshot(snapshot)?;
     let binding = kin_db::VectorArtifactBinding::for_repository(
         repo_id,
         snapshot_cursor,
@@ -406,10 +405,7 @@ impl DurableVectorTestBackend {
             .next_save_fault = Some(fault);
     }
 
-    fn current_vector_artifact(
-        &self,
-        repo_id: &str,
-    ) -> Option<kin_db::PersistedVectorArtifact> {
+    fn current_vector_artifact(&self, repo_id: &str) -> Option<kin_db::PersistedVectorArtifact> {
         let binding = self.current_binding(repo_id).ok()?;
         self.vectors
             .lock()
@@ -574,7 +570,10 @@ impl StorageBackend for DurableVectorTestBackend {
                 observed_cursor: None,
             };
         }
-        if matches!(fault, Some(DurableVectorSaveFault::IndeterminateNotInstalled)) {
+        if matches!(
+            fault,
+            Some(DurableVectorSaveFault::IndeterminateNotInstalled)
+        ) {
             return kin_db::VectorArtifactSaveOutcome::Indeterminate {
                 error: kin_db::KinDbError::StorageError(format!(
                     "repo {repo_id}: injected ambiguous pre-install vector failure"
@@ -3248,8 +3247,7 @@ impl DaemonState {
             );
         };
 
-        if let Err(reason) =
-            Self::require_current_hosted_snapshot_cursor(backend, repo_id, binding)
+        if let Err(reason) = Self::require_current_hosted_snapshot_cursor(backend, repo_id, binding)
         {
             let _ = Self::clear_hosted_vector_projection(layout);
             let detail = format!(
@@ -3291,8 +3289,7 @@ impl DaemonState {
             }
         };
 
-        if let Err(reason) =
-            Self::require_current_hosted_snapshot_cursor(backend, repo_id, binding)
+        if let Err(reason) = Self::require_current_hosted_snapshot_cursor(backend, repo_id, binding)
         {
             let _ = Self::clear_hosted_vector_projection(layout);
             let detail = format!(
@@ -3401,7 +3398,8 @@ impl DaemonState {
         };
         if computed_sha256 != persisted.artifact_sha256 {
             let _ = Self::clear_hosted_vector_projection(layout);
-            let reason = "durable vector artifact digest did not match its loaded identity".to_string();
+            let reason =
+                "durable vector artifact digest did not match its loaded identity".to_string();
             return (
                 VectorSidecarOpen {
                     discarded: Some(reason.clone()),
@@ -3418,7 +3416,10 @@ impl DaemonState {
         }
 
         if let Err(reason) = Self::materialize_hosted_vector_artifact(layout, &persisted.artifact) {
-            warn!(repo_id, reason, "durable vector artifact materialization failed");
+            warn!(
+                repo_id,
+                reason, "durable vector artifact materialization failed"
+            );
             return (
                 VectorSidecarOpen {
                     discarded: Some(reason.clone()),
@@ -3440,7 +3441,10 @@ impl DaemonState {
             Ok(indexed_count) => indexed_count,
             Err(reason) => {
                 let _ = Self::clear_hosted_vector_projection(layout);
-                warn!(repo_id, reason, "durable vector artifact inner validation failed");
+                warn!(
+                    repo_id,
+                    reason, "durable vector artifact inner validation failed"
+                );
                 return (
                     VectorSidecarOpen {
                         discarded: Some(reason.clone()),
@@ -3472,8 +3476,9 @@ impl DaemonState {
             );
         }
         if sidecar_open.salvage.is_some() {
-            let reason = "hosted exact vector artifact unexpectedly entered local stamp-drift salvage"
-                .to_string();
+            let reason =
+                "hosted exact vector artifact unexpectedly entered local stamp-drift salvage"
+                    .to_string();
             graph.reset_vector_index();
             let _ = Self::clear_hosted_vector_projection(layout);
             return (
@@ -3511,7 +3516,11 @@ impl DaemonState {
             .hosted_vector_persistence
             .lock()
             .ok()
-            .and_then(|state| state.writable_authority().map(|authority| authority.binding));
+            .and_then(|state| {
+                state
+                    .writable_authority()
+                    .map(|authority| authority.binding)
+            });
         if let Ok(mut state) = self.hosted_vector_persistence.lock() {
             *state = HostedVectorPersistenceState::Indeterminate {
                 binding: prior_binding,
@@ -3525,7 +3534,9 @@ impl DaemonState {
         let rebound = (|| -> std::result::Result<HostedVectorPersistenceState, String> {
             let recovered = kin_db::load_recovered_snapshot(backend, &self.cached_repo_id)
                 .map_err(|error| error.to_string())?
-                .ok_or_else(|| "committed graph authority disappeared during vector rebind".to_string())?;
+                .ok_or_else(|| {
+                    "committed graph authority disappeared during vector rebind".to_string()
+                })?;
             if recovered.generation != committed_generation {
                 return Err(format!(
                     "vector rebind expected snapshot cursor {committed_generation}, but coherent recovery returned {}",
@@ -3536,9 +3547,8 @@ impl DaemonState {
                 .map_err(|error| error.to_string())?;
             let retrieval_authority_hash =
                 kin_db::storage::compute_retrieval_authority_hash(&query_snapshot);
-            let live_retrieval_authority_hash = kin_db::storage::compute_retrieval_authority_hash(
-                &self.graph.to_snapshot(),
-            );
+            let live_retrieval_authority_hash =
+                kin_db::storage::compute_retrieval_authority_hash(&self.graph.to_snapshot());
             if retrieval_authority_hash != live_retrieval_authority_hash {
                 return Err(format!(
                     "committed retrieval authority {} is not the live served authority {}; vector persistence stays closed until the next coherent graph checkpoint",
@@ -4424,63 +4434,59 @@ impl DaemonState {
         allowed_repo_ids: Option<HashSet<String>>,
     ) -> Result<Self> {
         let text_index_path = layout.text_index_dir();
-        let (
-            graph,
-            generation,
-            loaded_snapshot,
-            hosted_authority_envelope,
-            hosted_vector_binding,
-        ) = match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
-            .map_err(DaemonError::from)?
-        {
-            Some(recovered) => {
-                // Read before the move: `from_snapshot_with_text_index`
-                // discards this field by design, because the envelope is
-                // owned by the publication manager and never by the
-                // in-place mutable graph. This is the last point at which
-                // the daemon can see whether the object it opened is one
-                // an envelope-free write would erase.
-                let hosted_authority_envelope = recovered.snapshot.repository_authority.is_some();
-                // Bind vectors to the graph Kin actually serves, not to the
-                // raw repository-v6 envelope whose top-level query domains are
-                // intentionally empty. The recovered generation is the exact
-                // backend publication cursor retained from that same coherent
-                // recovery view.
-                let (query_snapshot, materialized_head, hosted_vector_binding) =
-                    materialize_hosted_vector_binding(
-                    repo_id,
-                    kin_db::SnapshotCursor::from_backend_generation(recovered.generation),
-                    recovered.snapshot,
-                )?;
-                let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
-                    query_snapshot,
-                    text_index_path.clone(),
-                )
-                .map_err(DaemonError::from)?;
-                info!(
-                    repo_id,
-                    generation = recovered.generation,
-                    deltas_replayed = recovered.deltas_applied,
-                    hosted_authority_envelope,
-                    materialized_head = ?materialized_head,
-                    "loaded graph from storage backend"
-                );
-                (
-                    Arc::new(g),
-                    recovered.generation,
-                    true,
-                    hosted_authority_envelope,
-                    Some(hosted_vector_binding),
-                )
-            }
-            None => {
-                info!(repo_id, "no snapshot found, starting with empty graph");
-                // In cloud mode, an empty graph IS the valid initial state.
-                // Mark as initialized so the readiness probe passes.
-                let graph = kin_db::InMemoryGraph::with_text_index(text_index_path.clone());
-                (Arc::new(graph), 0, true, false, None)
-            }
-        };
+        let (graph, generation, loaded_snapshot, hosted_authority_envelope, hosted_vector_binding) =
+            match kin_db::load_recovered_snapshot(backend.as_ref(), repo_id)
+                .map_err(DaemonError::from)?
+            {
+                Some(recovered) => {
+                    // Read before the move: `from_snapshot_with_text_index`
+                    // discards this field by design, because the envelope is
+                    // owned by the publication manager and never by the
+                    // in-place mutable graph. This is the last point at which
+                    // the daemon can see whether the object it opened is one
+                    // an envelope-free write would erase.
+                    let hosted_authority_envelope =
+                        recovered.snapshot.repository_authority.is_some();
+                    // Bind vectors to the graph Kin actually serves, not to the
+                    // raw repository-v6 envelope whose top-level query domains are
+                    // intentionally empty. The recovered generation is the exact
+                    // backend publication cursor retained from that same coherent
+                    // recovery view.
+                    let (query_snapshot, materialized_head, hosted_vector_binding) =
+                        materialize_hosted_vector_binding(
+                            repo_id,
+                            kin_db::SnapshotCursor::from_backend_generation(recovered.generation),
+                            recovered.snapshot,
+                        )?;
+                    let g = kin_db::InMemoryGraph::from_snapshot_with_text_index(
+                        query_snapshot,
+                        text_index_path.clone(),
+                    )
+                    .map_err(DaemonError::from)?;
+                    info!(
+                        repo_id,
+                        generation = recovered.generation,
+                        deltas_replayed = recovered.deltas_applied,
+                        hosted_authority_envelope,
+                        materialized_head = ?materialized_head,
+                        "loaded graph from storage backend"
+                    );
+                    (
+                        Arc::new(g),
+                        recovered.generation,
+                        true,
+                        hosted_authority_envelope,
+                        Some(hosted_vector_binding),
+                    )
+                }
+                None => {
+                    info!(repo_id, "no snapshot found, starting with empty graph");
+                    // In cloud mode, an empty graph IS the valid initial state.
+                    // Mark as initialized so the readiness probe passes.
+                    let graph = kin_db::InMemoryGraph::with_text_index(text_index_path.clone());
+                    (Arc::new(graph), 0, true, false, None)
+                }
+            };
 
         let blobs = BlobStore::new(layout.ingest_cas_dir()).map_err(DaemonError::from)?;
         let backend: Arc<dyn StorageBackend> = Arc::from(backend);
@@ -6164,16 +6170,13 @@ impl DaemonState {
                 detail: Some("hosted vector persistence state was not initialized".to_string()),
                 ..HostedVectorPersistenceHealth::default()
             },
-            HostedVectorPersistenceState::Unsupported { detail } => {
-                HostedVectorPersistenceHealth {
-                    status: "unsupported".to_string(),
-                    detail: Some(detail.clone()),
-                    ..HostedVectorPersistenceHealth::default()
-                }
-            }
+            HostedVectorPersistenceState::Unsupported { detail } => HostedVectorPersistenceHealth {
+                status: "unsupported".to_string(),
+                detail: Some(detail.clone()),
+                ..HostedVectorPersistenceHealth::default()
+            },
             HostedVectorPersistenceState::Empty { authority } => {
-                let (snapshot_cursor, retrieval_hash_prefix) =
-                    binding_fields(authority.binding);
+                let (snapshot_cursor, retrieval_hash_prefix) = binding_fields(authority.binding);
                 HostedVectorPersistenceHealth {
                     status: "empty".to_string(),
                     producer_profile,
@@ -6188,8 +6191,7 @@ impl DaemonState {
                 artifact_sha256,
                 indexed_count,
             } => {
-                let (snapshot_cursor, retrieval_hash_prefix) =
-                    binding_fields(authority.binding);
+                let (snapshot_cursor, retrieval_hash_prefix) = binding_fields(authority.binding);
                 let runtime = self.graph.embedding_status();
                 HostedVectorPersistenceHealth {
                     status: if *indexed_count < runtime.total {
@@ -6207,8 +6209,7 @@ impl DaemonState {
                 }
             }
             HostedVectorPersistenceState::RepairableCorrupt { authority, detail } => {
-                let (snapshot_cursor, retrieval_hash_prefix) =
-                    binding_fields(authority.binding);
+                let (snapshot_cursor, retrieval_hash_prefix) = binding_fields(authority.binding);
                 HostedVectorPersistenceHealth {
                     status: "repairable_corrupt".to_string(),
                     producer_profile,
@@ -6240,9 +6241,8 @@ impl DaemonState {
                 observed_cursor,
                 detail,
             } => {
-                let (snapshot_cursor, retrieval_hash_prefix) = binding
-                    .map(binding_fields)
-                    .unwrap_or((None, None));
+                let (snapshot_cursor, retrieval_hash_prefix) =
+                    binding.map(binding_fields).unwrap_or((None, None));
                 HostedVectorPersistenceHealth {
                     status: "indeterminate".to_string(),
                     producer_profile,
@@ -6806,7 +6806,8 @@ impl DaemonState {
         );
         let recovered_authority = recovered.writable_authority();
         let recovered_cursor = recovered_authority.map(|authority| authority.cursor);
-        let cursor_matches = observed_cursor.is_none_or(|observed| recovered_cursor == Some(observed));
+        let cursor_matches =
+            observed_cursor.is_none_or(|observed| recovered_cursor == Some(observed));
         let mut installed = self
             .hosted_vector_persistence
             .lock()
@@ -6864,9 +6865,8 @@ impl DaemonState {
                 ),
             )));
         }
-        let live_retrieval_hash = kin_db::storage::compute_retrieval_authority_hash(
-            &self.graph.to_snapshot(),
-        );
+        let live_retrieval_hash =
+            kin_db::storage::compute_retrieval_authority_hash(&self.graph.to_snapshot());
         if live_retrieval_hash != hosted.binding.retrieval_authority_hash {
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
                 format!(
@@ -7351,9 +7351,7 @@ impl DaemonState {
             .as_ref()
             .map(|_| hosted_vector_producer_profile())
             .transpose()
-            .map_err(|reason| {
-                DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
-            })?;
+            .map_err(|reason| DaemonError::Graph(kin_db::KinDbError::StorageError(reason)))?;
         let checkpointed = kin_db::SnapshotManager::checkpoint_vector_index_for_graph(
             self.layout.kindb_snapshot_path(),
             self.graph.as_ref(),
@@ -7483,9 +7481,7 @@ impl DaemonState {
             .as_ref()
             .map(|_| hosted_vector_producer_profile())
             .transpose()
-            .map_err(|reason| {
-                DaemonError::Graph(kin_db::KinDbError::StorageError(reason))
-            })?;
+            .map_err(|reason| DaemonError::Graph(kin_db::KinDbError::StorageError(reason)))?;
         kin_db::SnapshotManager::save_vector_index_for_graph(
             self.layout.kindb_snapshot_path(),
             self.graph.as_ref(),
@@ -8495,10 +8491,9 @@ mod tests {
             .save(&state.layout.kindb_vector_index_path())
             .unwrap();
         assert!(matches!(
-            state.graph.load_vector_index_compatible(
-                &state.layout.kindb_vector_index_path(),
-                &descriptor
-            ),
+            state
+                .graph
+                .load_vector_index_compatible(&state.layout.kindb_vector_index_path(), &descriptor),
             kin_db::vector::VectorIndexLoad::Loaded(1)
         ));
         std::fs::remove_file(state.layout.kindb_vector_index_path()).unwrap();
@@ -8535,13 +8530,8 @@ mod tests {
         let backend = DurableVectorTestBackend::new(storage.path());
         let repo_id = "durable-hosted-vector-graph-successor";
         let first_cursor = backend.publish_graph(repo_id, &kin_db::InMemoryGraph::new(), 0);
-        let state = DaemonState::open_with_backend(
-            layout,
-            Box::new(backend),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend), repo_id, None).unwrap();
         assert_eq!(
             state
                 .hosted_vector_persistence_health()
@@ -8782,13 +8772,9 @@ mod tests {
         let entity = test_entity("conflict_vector", "src/conflict.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state = DaemonState::open_with_backend(
-            layout,
-            Box::new(backend.clone()),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
+                .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::ConflictInstallWinner);
 
@@ -8838,13 +8824,9 @@ mod tests {
         let entity = test_entity("conflict_no_cursor", "src/conflict_none.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state = DaemonState::open_with_backend(
-            layout,
-            Box::new(backend.clone()),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
+                .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::ConflictWithoutCursor);
 
@@ -8880,13 +8862,9 @@ mod tests {
         let entity = test_entity("lost_ack_vector", "src/lost_ack.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state = DaemonState::open_with_backend(
-            layout,
-            Box::new(backend.clone()),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
+                .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::IndeterminateInstalled);
 
@@ -8934,13 +8912,9 @@ mod tests {
         let entity = test_entity("indeterminate_missing", "src/indeterminate_missing.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state = DaemonState::open_with_backend(
-            layout,
-            Box::new(backend.clone()),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
+                .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::IndeterminateNotInstalled);
 
@@ -8953,13 +8927,9 @@ mod tests {
 
         let reopened_working = tempfile::tempdir().unwrap();
         let reopened_layout = kin_core::init(reopened_working.path()).unwrap().layout;
-        let reopened = DaemonState::open_with_backend(
-            reopened_layout,
-            Box::new(backend),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let reopened =
+            DaemonState::open_with_backend(reopened_layout, Box::new(backend), repo_id, None)
+                .unwrap();
         assert!(reopened.can_persist_embed_progress_locally());
         assert_eq!(
             reopened
@@ -8981,13 +8951,9 @@ mod tests {
         let entity = test_entity("wrong_ack_digest", "src/wrong_ack.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state = DaemonState::open_with_backend(
-            layout,
-            Box::new(backend.clone()),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
+                .unwrap();
         install_checkpoint_vector(&state, entity.id);
         backend.inject_next_save_fault(DurableVectorSaveFault::CommittedWrongDigest);
 
@@ -9012,13 +8978,9 @@ mod tests {
         let entity = test_entity("inner_count_vector", "src/inner_count.rs");
         graph.upsert_entity(&entity).unwrap();
         backend.publish_graph(repo_id, &graph, 0);
-        let state = DaemonState::open_with_backend(
-            layout,
-            Box::new(backend.clone()),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let state =
+            DaemonState::open_with_backend(layout, Box::new(backend.clone()), repo_id, None)
+                .unwrap();
         install_checkpoint_vector(&state, entity.id);
         state.flush_embed_progress().unwrap();
         drop(state);
@@ -9026,13 +8988,9 @@ mod tests {
 
         let reopened_working = tempfile::tempdir().unwrap();
         let reopened_layout = kin_core::init(reopened_working.path()).unwrap().layout;
-        let reopened = DaemonState::open_with_backend(
-            reopened_layout,
-            Box::new(backend),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let reopened =
+            DaemonState::open_with_backend(reopened_layout, Box::new(backend), repo_id, None)
+                .unwrap();
         assert_eq!(reopened.graph.embedding_status().indexed, 0);
         assert!(
             reopened
@@ -9193,13 +9151,9 @@ mod tests {
 
         let repaired_working = tempfile::tempdir().unwrap();
         let repaired_layout = kin_core::init(repaired_working.path()).unwrap().layout;
-        let repaired = DaemonState::open_with_backend(
-            repaired_layout,
-            Box::new(backend),
-            repo_id,
-            None,
-        )
-        .unwrap();
+        let repaired =
+            DaemonState::open_with_backend(repaired_layout, Box::new(backend), repo_id, None)
+                .unwrap();
         assert_eq!(repaired.graph.embedding_status().indexed, 1);
         assert_eq!(
             repaired
@@ -9333,8 +9287,7 @@ mod tests {
         let snapshot_cursor = kin_db::SnapshotCursor::from_backend_generation(41);
         let (materialized, head, binding) =
             materialize_hosted_vector_binding(&repo_id, snapshot_cursor, raw).unwrap();
-        let materialized_hash =
-            kin_db::storage::compute_retrieval_authority_hash(&materialized);
+        let materialized_hash = kin_db::storage::compute_retrieval_authority_hash(&materialized);
 
         assert_eq!(head, materialized.changes.keys().next().copied());
         assert!(materialized.entities.contains_key(&entity.id));
@@ -9346,7 +9299,9 @@ mod tests {
         assert_eq!(binding.retrieval_authority_hash, materialized_hash);
         binding.validate_for_repository(&repo_id).unwrap();
         assert!(
-            binding.validate_for_repository("different-repository").is_err(),
+            binding
+                .validate_for_repository("different-repository")
+                .is_err(),
             "the binding must carry stable repository identity, not only a path namespace"
         );
     }
@@ -13821,8 +13776,7 @@ mod tests {
         );
         as_reopened_by_the_daemon(graph.as_ref());
 
-        let discarded =
-            DaemonState::load_validated_vector_index(&layout, graph.as_ref(), None);
+        let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref(), None);
 
         assert_eq!(
             discarded.discarded, None,
@@ -13856,8 +13810,7 @@ mod tests {
         metadata["version"] = json!(u32::MAX);
         std::fs::write(&metadata_path, serde_json::to_vec(&metadata).unwrap()).unwrap();
 
-        let discarded =
-            DaemonState::load_validated_vector_index(&layout, graph.as_ref(), None);
+        let discarded = DaemonState::load_validated_vector_index(&layout, graph.as_ref(), None);
 
         let reason = discarded
             .discarded
@@ -14563,10 +14516,9 @@ mod tests {
     #[test]
     fn hybrid_embedding_has_no_single_producer_and_is_refused() {
         for hybrid in ["on", "1", "true", "auto"] {
-            let error = hosted_vector_producer_policy_for(
-                hybrid, "local", "metal", "auto", false, false,
-            )
-            .expect_err("hybrid must not resolve a single-producer fence");
+            let error =
+                hosted_vector_producer_policy_for(hybrid, "local", "metal", "auto", false, false)
+                    .expect_err("hybrid must not resolve a single-producer fence");
             assert!(
                 error.contains("one numerical producer"),
                 "the refusal must say why: {error}"
@@ -14585,10 +14537,9 @@ mod tests {
     /// stamps a shorter identity would silently widen sidecar reuse.
     #[test]
     fn the_profile_identity_keeps_its_epoch_and_every_field() {
-        let policy = hosted_vector_producer_policy_for(
-            "off", "local", "cpu", "pure-rust", true, true,
-        )
-        .expect("must resolve");
+        let policy =
+            hosted_vector_producer_policy_for("off", "local", "cpu", "pure-rust", true, true)
+                .expect("must resolve");
         for field in [
             HOSTED_VECTOR_PRODUCER_PROFILE_EPOCH,
             "backend=cpu",

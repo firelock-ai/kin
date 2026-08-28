@@ -341,11 +341,12 @@ mod tests {
         let detail = verdict.detail().expect("must explain itself");
         assert!(detail.contains("unspecified"), "{detail}");
 
-        let both_unattributed = evaluate_query_producers(
-            Some(&index),
-            &set(&[EmbeddingProducer::Unspecified]),
+        let both_unattributed =
+            evaluate_query_producers(Some(&index), &set(&[EmbeddingProducer::Unspecified]));
+        assert_eq!(
+            both_unattributed.reason(),
+            Some("vector_index_unattributed")
         );
-        assert_eq!(both_unattributed.reason(), Some("vector_index_unattributed"));
     }
 
     /// An attributed index queried by an unattributed vector blames the query.
