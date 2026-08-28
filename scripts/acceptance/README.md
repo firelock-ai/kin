@@ -96,14 +96,22 @@ binaries expose (`kin init` on a bare directory, `kin init` over a Git checkout,
 the published record back through the product's own path. One door proved
 nothing about the others.
 
-`native_transfer` creates a receiver with `kin init --adopt-repository-id`,
-moves real history into it with `kin pull --url`, and requires the receiver's
-creation record to be gone afterwards, with all three surfaces disclosing the
-gap. The transfer protocol carries no authoring version, so a receiver that kept
-its own creation stamp would certify replay semantics for deltas authored on
-another host by another build. Its control is a second pull that admits nothing,
-which must leave the record alone, and it also asserts the source's own record
-was never touched.
+`native_transfer` is present in the script and deliberately NOT wired into its
+check list. No path through the shipped CLI builds its fixture: a Git-admitted
+source into an adopting receiver is refused at export for Git-authority
+divergence, a native source holding real content is refused at pack validation
+because a native change that introduces artifacts needs a bound workspace
+admission context that a transfer's receive transaction does not carry, and
+`kin clone` is Git transport only and fail-closes on a native remote. Its
+docstring records each refusal verbatim. Wiring an arm whose fixture the product
+refuses to build would put a permanent UNREADABLE into the acceptance verdict,
+which fails the gate for a reason that is not about the code under test.
+
+That behaviour is covered by `api::tests::hydration_semantics_on_native_transfer`
+in kin-daemon instead, five arms driving the real production routes: the HTTP
+receive route through `router()`, `pull_into_replica` through
+`clone_native_replica`, a hosted control and a refused-pack control. What is not
+covered anywhere is the same proof against the shipped binaries.
 
 `brownfield_repro.py` covers reference enrichment on two pinned upstream trees,
 `psf/requests` and `expressjs/express`, replayed as single-commit repositories

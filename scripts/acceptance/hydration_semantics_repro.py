@@ -1231,11 +1231,38 @@ def check_creation_doors(suite):
 def check_native_transfer(suite):
     """Transported history must not inherit the receiver's creation record.
 
-    The defect: a receiver created by this build stamps itself with this build's
-    version, then admits history authored somewhere else by some other build,
-    and every surface reads current over it. The transfer protocol carries no
-    authoring version, so the only honest outcome is that the receiver stops
-    claiming one.
+    NOT WIRED. Left in the file because the graders and the fixture are correct
+    and the arm becomes runnable the moment one of the blockers below lifts, and
+    because deleting it would lose what nine runs established.
+
+    No path through the shipped CLI builds this fixture today. Every reachable
+    combination is refused by the product, for reasons that are properties of
+    transfer v1 rather than of this suite:
+
+    - A Git-admitted source into an adopting receiver: refused at export,
+      "repository-v6 transfer requires identical imported-Git authority on both
+      replicas, or a destination that has admitted nothing; Git-authority
+      divergence is not adapted". An adopting receiver on a bare directory holds
+      no Git authority at all.
+    - A native source holding real content: refused at pack validation, "native
+      change ... introduces artifacts without a bound workspace admission
+      context". crates/kin-remote/src/repository_transfer.rs states the rule
+      outright at its seed_native_line helper: a native change that introduces
+      an artifact needs a bound workspace admission context and a transfer's
+      receive transaction carries none. Every kin commit of a real file
+      introduces artifacts, and the CLI exposes no way to author an
+      artifact-free change.
+    - A native clone: kin clone is Git transport only, and reject_native_remote
+      in crates/kin-cli/src/commands/clone.rs fail-closes on a native remote.
+
+    The behaviour this arm exists to prove is covered instead by
+    api::tests::hydration_semantics_on_native_transfer in kin-daemon, five arms
+    driving the real production routes: the HTTP receive route through router(),
+    pull_into_replica through clone_native_replica, a hosted control and a
+    refused-pack control. Four mutants falsify them, including one that makes the
+    unlink a no-op and turns both admitting arms red, which is what proves they
+    exercise the real removal rather than a proxy. What is missing here, and only
+    here, is the same proof against the shipped binaries.
     """
     result = Result(
         "native_transfer",
@@ -1331,13 +1358,17 @@ def check_native_transfer(suite):
     return result
 
 
+# `check_native_transfer` is deliberately absent; its docstring says why, and
+# the five kin-daemon arms it names carry that coverage. Wiring an arm whose
+# fixture the product refuses to build would put a permanent UNREADABLE into the
+# hosted acceptance verdict, which fails the gate for a reason that is not about
+# the code under test.
 CHECKS = (
     check_status,
     check_doctor,
     check_envelope,
     check_verdict,
     check_creation_doors,
-    check_native_transfer,
 )
 DECLARED = (
     "status",
@@ -1345,7 +1376,6 @@ DECLARED = (
     "envelope",
     "verdict",
     "creation_doors",
-    "native_transfer",
 )
 
 
