@@ -23,6 +23,12 @@ use kin_model::{
 use kin_projection::ProjectionState;
 use kin_reconcile::Reconciler;
 #[cfg(feature = "firestore")]
+// Needed for method-call syntax in some feature shapes and not others: the
+// default-feature build of this crate uses it and the gcs+firestore build does
+// not, both measured. Allowed rather than gated, because a gate has to name
+// every shape and a wrong guess is a red required leg on a shape this lane
+// cannot build locally.
+#[allow(unused_imports)]
 use kin_spine::SpineBackend as _;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
 use tracing::{debug, error, info, warn};

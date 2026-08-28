@@ -2184,25 +2184,6 @@ impl FirestoreStore {
         Ok(true)
     }
 
-    fn ensure_immutable_document(
-        &self,
-        write: serde_json::Value,
-        operation: &str,
-    ) -> Result<(), SpineError> {
-        match self.commit_write_batches(vec![write.clone()], operation) {
-            Ok(()) => Ok(()),
-            Err(commit_error) => {
-                if self.validate_existing_immutable_write(&write, operation)? {
-                    Ok(())
-                } else {
-                    Err(SpineError::Backend(format!(
-                        "{commit_error}; {operation} was not durably created"
-                    )))
-                }
-            }
-        }
-    }
-
     /// Commit immutable rows in bounded atomic batches. Every batch also
     /// updates the stage marker with an `exists` precondition. Cleanup uses the
     /// marker's exact updateTime, so a racing writer and cleaner cannot both

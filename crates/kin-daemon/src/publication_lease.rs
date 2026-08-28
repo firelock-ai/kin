@@ -6283,9 +6283,13 @@ mod tests {
             .put(&path, PutPayload::from(vec![b'x'; 33]))
             .await
             .unwrap();
-        let control =
+        // Named `bounded_reader` rather than `control`: the module helper that
+        // builds a control is also called `control`, and a local binding of
+        // that name shadows it for the rest of the block, so the logical
+        // control built below would try to call an object-store record store.
+        let bounded_reader =
             ObjectStorePublicationControlStore::with_control_record_limit(raw_store, "fixture", 32);
-        let refused = control.load().unwrap_err();
+        let refused = bounded_reader.load().unwrap_err();
         assert!(
             refused
                 .to_string()

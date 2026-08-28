@@ -12166,6 +12166,17 @@ async fn spine_health(
     let capture = state.sibling_capture_report();
     Ok(Json(json!({
         "status": "ok",
+        // A FOURTH reading, and the one that says what the three above are
+        // about. This route is side-effect-free on purpose: it must never warm,
+        // hydrate or publish, so it does not re-read durable heads. The counts
+        // below are therefore the last proven head set under the current
+        // rollout fence, not a fresh read of Firestore. Another pod committing
+        // an ordinary head under an unchanged fence is not visible here until a
+        // semantic route takes the full refresh and proof path. Saying so is
+        // the difference between a diagnostic and a false green: a reader who
+        // takes these counts as current authority is reading a cache, and
+        // nothing else on this response tells them that.
+        "durable_heads_reread": false,
         "repos": spine.repo_count(),
         "entities": spine.entity_count(),
         "cross_repo_edges": spine.edge_count(),
@@ -32859,6 +32870,15 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
+        // The route is side-effect-free, so its counts are the last proven head
+        // set rather than a fresh durable read. A response that says `ok` and
+        // nothing else invites a reader to treat a cache as current authority,
+        // so the reading has to be on the wire, not only in a comment.
+        assert_eq!(
+            json["durable_heads_reread"],
+            serde_json::Value::Bool(false),
+            "health must state that it did not re-read durable heads: {json}"
+        );
     }
 
     /// A zero edge count says nothing on its own, so the health route reports

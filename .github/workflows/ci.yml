@@ -908,6 +908,20 @@ jobs:
       - name: Check the flake quarantine
         run: python3 scripts/check-quarantine.py
 
+      # Here rather than in `check`, for the reason the step above records: a
+      # script step in `check` is a gate `bin/kin-precheck` enumerates and must
+      # classify by name, and one wired there without the matching umbrella
+      # entry makes precheck refuse with no tally. Both were in `check` and
+      # precheck reported them UNCLASSIFIED, which costs every lane its local
+      # verdict. This job carries the required "Fast gate lint and policy"
+      # context, so the guard is no weaker here; promoting it back is one job
+      # move and one name joining precheck's LOCAL list.
+      - name: Check Docker daemon production features
+        run: bash scripts/check-docker-daemon-features.sh
+
+      - name: Falsify Docker daemon production feature guard
+        run: bash scripts/check-docker-daemon-features.test.sh
+
       # Byte-identical to the `check` job's clippy step, deliberately. The two
       # run on different events now and there is no event on which neither runs,
       # so the workspace is linted exactly once per event rather than twice.
@@ -1426,14 +1440,6 @@ jobs:
       - name: Check formatting
         if: matrix.shard == 1
         run: cargo fmt -- --check
-
-      - name: Check Docker daemon production features
-        if: matrix.shard == 1
-        run: bash scripts/check-docker-daemon-features.sh
-
-      - name: Falsify Docker daemon production feature guard
-        if: matrix.shard == 1
-        run: bash scripts/check-docker-daemon-features.test.sh
 
       # Two guards, two jobs. The Python checker walks every crate and carries
       # the owned, dated, existence-validated allowlist. The shell guard is a
