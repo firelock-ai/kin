@@ -20043,9 +20043,17 @@ mod tests {
         let fallback = row_with_symbols("axum/src/json.rs", &[("Json", "")]);
 
         assert_eq!(
-            file_row_match_kind(&named, "where is the path_router built"),
+            file_row_match_kind(&named, "where is PathRouter built"),
             LocateMatchKind::Name,
             "a query naming a symbol in the file is a named match"
+        );
+        assert_eq!(
+            file_row_match_kind(&named, "where is the path_router built"),
+            LocateMatchKind::TextFallback,
+            "and `path_router` does not name `PathRouter`: the query tokenizer splits on \
+             every character that is not alphanumeric or an underscore, so the underscore \
+             stays inside the token and the two are different words. Asserting otherwise \
+             would pin a claim `query_names_entity` does not make."
         );
         assert_eq!(
             file_row_match_kind(&vectored, "how does routing dispatch"),
@@ -20081,7 +20089,7 @@ mod tests {
         let mut strong = LocateResult::default();
         strong.files = vec![named.clone(), fallback.clone()];
         assert!(
-            answer_floor_note(&strong, "where is the path_router built").is_none(),
+            answer_floor_note(&strong, "where is PathRouter built").is_none(),
             "one row over the floor is enough; the rest are its neighbours"
         );
 
@@ -20104,7 +20112,7 @@ mod tests {
             "every row carries its label, so an absent one is a bug rather than good news: {:?}",
             lines[0]
         );
-        let named_lines = locate_text_lines(&strong, false, "where is the path_router built");
+        let named_lines = locate_text_lines(&strong, false, "where is PathRouter built");
         assert!(
             named_lines[0].ends_with("[named match]"),
             "and a row the query named says so: {:?}",

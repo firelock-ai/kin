@@ -10898,11 +10898,27 @@ mod tests {
                 "a busy machine is not a broken install, and this row must never fail the proof"
             );
         }
-        assert_eq!(live_embed.detail, embed.reason);
-        assert_eq!(queue_empty_but_short.detail, embed.reason);
-        assert_eq!(unobserved_embed.detail, embed.reason);
-        assert_eq!(live_lsp.detail, lsp.reason);
-        assert_eq!(live_unknown.detail, unknown.reason);
+        // The row now stamps the refusal with the moment it was taken, so it
+        // opens with the reason rather than equalling it. Which refusal is
+        // being reported is still what these arms are asking.
+        for (reported, expected) in [
+            (&live_embed, &embed.reason),
+            (&queue_empty_but_short, &embed.reason),
+            (&unobserved_embed, &embed.reason),
+            (&live_lsp, &lsp.reason),
+            (&live_unknown, &unknown.reason),
+        ] {
+            assert!(
+                reported.detail.starts_with(expected.as_str()),
+                "the row reports this refusal: {} against {expected}",
+                reported.detail
+            );
+            assert!(
+                reported.detail.contains("when the work was declined"),
+                "stamped with the moment it was taken: {}",
+                reported.detail
+            );
+        }
 
         for independent in [&lsp, &unknown] {
             for refusals in [
@@ -10912,10 +10928,11 @@ mod tests {
                 let reported =
                     host_memory_pressure_check_for(&refusals, None, Some(coverage(0, 9, 9)));
                 assert!(matches!(reported.status, HealthStatus::Degraded));
-                assert_eq!(
-                    reported.detail, independent.reason,
-                    "a completed embed entry cannot mask {} in either publication order",
-                    independent.work
+                assert!(
+                    reported.detail.starts_with(independent.reason.as_str()),
+                    "a completed embed entry cannot mask {} in either publication order: {}",
+                    independent.work,
+                    reported.detail
                 );
                 assert!(!blocks_readiness(&reported));
             }
