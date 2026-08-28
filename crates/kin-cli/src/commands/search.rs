@@ -521,6 +521,7 @@ async fn run_daemon_search(
 fn search_absence_qualifier(
     graph: &kin_db::InMemoryGraph,
     envelope: &kin_mcp::Envelope,
+    degradations: &[crate::commands::locate::RetrievalDegradation],
 ) -> Vec<String> {
     let scoped = match graph.query_entities(&kin_model::graph::EntityFilter::default()) {
         Ok(scoped) => scoped,
@@ -530,9 +531,14 @@ fn search_absence_qualifier(
         // change exists to stop.
         Err(_) => return Vec::new(),
     };
+    // The degradations this run reported travel with the payload. The absence
+    // gate and the single verdict both read `degradations`, and a synthetic
+    // payload that omitted them let a query-producer mismatch certify an
+    // absence the mismatch had already made unproven.
     let payload = serde_json::json!({
         "results": [],
         "total_matches": 0,
+        "degradations": degradations,
         kin_mcp::EDGE_COVERAGE_KEY: kin_mcp::edge_coverage::observe_absence_scope(
             &kin_mcp::edge_coverage::languages_of(&scoped),
             Some(scoped.len()),
@@ -549,7 +555,8 @@ pub fn collect_daemon_search_response(
     if request.semantic {
         let mut response = collect_daemon_semantic_search_response(graph, request, envelope)?;
         if response.records.is_empty() {
-            response.absence_qualifier = search_absence_qualifier(graph, envelope);
+            let reported = response.degradations.clone();
+            response.absence_qualifier = search_absence_qualifier(graph, envelope, &reported);
         }
         return Ok(response);
     }
@@ -572,7 +579,7 @@ pub fn collect_daemon_search_response(
         .map(|matched| record_to_daemon_record(&matched.record, matched.match_kind, matched.score))
         .collect::<Vec<_>>();
     let absence_qualifier = if records.is_empty() {
-        search_absence_qualifier(graph, envelope)
+        search_absence_qualifier(graph, envelope, &[])
     } else {
         Vec::new()
     };
@@ -739,7 +746,7 @@ fn collect_daemon_semantic_search_response(
     }
 
     let absence_qualifier = if records.is_empty() {
-        search_absence_qualifier(graph, envelope)
+        search_absence_qualifier(graph, envelope, &degradations)
     } else {
         Vec::new()
     };
