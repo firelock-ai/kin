@@ -1648,13 +1648,37 @@ async fn await_revived_daemon(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "MCP revival: daemon did not become healthy within 15s (port {port}); it was left \
-                 running rather than killed"
-            ));
+            return Err(still_starting_message(port, patience));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// What a revival reports when the daemon it started is alive, has published a
+/// port, and has not finished opening its store inside this caller's patience.
+///
+/// The number is derived from the patience actually waited rather than written
+/// into the sentence. It was written before: the wait beside it was raised to
+/// [`kin_daemon_spawn::daemon_startup_patience`], which floors at 300 s and
+/// shares its override with the CLI, while this message went on saying `15s`.
+/// A stranger run read the sentence, believed the bound, and reported the wait
+/// as the defect that made MCP recovery impossible; the wait had already been
+/// fixed and only the sentence still said fifteen. A number that comes from the
+/// deadline it describes cannot drift from it again, and the test beside this
+/// asserts two different patiences to prove the number is derived rather than
+/// merely correct once.
+///
+/// Worded as a still-starting state rather than a failure, matching
+/// [`kin_daemon_spawn::PortWaitError::StillStarting`] on the port half of the
+/// same revival: the child is alive and was left running, so retrying is the
+/// remedy and killing it is not.
+fn still_starting_message(port: u16, patience: Duration) -> String {
+    format!(
+        "MCP revival: daemon on port {port} is still starting after {}s and was left running \
+         rather than killed. Retry this call, or raise {} to wait longer",
+        patience.as_secs(),
+        kin_daemon_spawn::DAEMON_STARTUP_PATIENCE_ENV
+    )
 }
 
 // ── Seam-based MCP tool dispatch ────────────────────────────────────────
@@ -2557,6 +2581,58 @@ pub async fn forward_check_traffic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two patiences, because one reading cannot tell a derived number from a
+    /// literal that happens to match it.
+    ///
+    /// The stale sentence said `15s` while the wait resolved to 300 or more, so
+    /// asserting only the real bound would pass a message that had simply been
+    /// re-typed with a different constant. Each patience must name its own
+    /// seconds and must not name the other's.
+    #[test]
+    fn the_still_starting_report_names_the_bound_it_actually_waited() {
+        let short = still_starting_message(40713, Duration::from_secs(15));
+        let real = still_starting_message(40713, Duration::from_secs(300));
+        assert!(
+            short.contains("after 15s"),
+            "a 15 s wait must report 15 s: {short}"
+        );
+        assert!(
+            real.contains("after 300s"),
+            "a 300 s wait must report 300 s, not the literal the sentence used to carry: {real}"
+        );
+        assert!(
+            !real.contains("after 15s"),
+            "the 300 s report still carries the stale 15 s literal: {real}"
+        );
+        assert!(
+            !short.contains("after 300s"),
+            "the 15 s report names a bound it did not wait: {short}"
+        );
+    }
+
+    /// A live daemon that has not finished opening is a retry, not a failure.
+    ///
+    /// The port half of this same revival already reports it that way
+    /// (`PortWaitError::StillStarting`), and the stranger who hit the health
+    /// half was told to restart instead. The message has to say the child was
+    /// left running, offer the retry, and name the lever that widens the wait,
+    /// or the caller has no move but the one that loses the daemon.
+    #[test]
+    fn the_still_starting_report_offers_a_retry_and_the_lever_that_widens_the_wait() {
+        let message = still_starting_message(40713, Duration::from_secs(300));
+        assert!(message.contains("still starting"), "{message}");
+        assert!(message.contains("left running"), "{message}");
+        assert!(message.contains("Retry this call"), "{message}");
+        assert!(
+            message.contains(kin_daemon_spawn::DAEMON_STARTUP_PATIENCE_ENV),
+            "the report names no way to wait longer: {message}"
+        );
+        assert!(
+            message.contains("40713"),
+            "the report names no port: {message}"
+        );
+    }
 
     fn pressure_refusal(work: &str) -> kin_core::memory_pressure::PressureRefusal {
         kin_core::memory_pressure::PressureRefusal {

@@ -21,7 +21,7 @@ every projection open after that refused. The only exit the stranger found was
 `.git/hooks/docs.url`, a 34-byte URL gitoxide's init template writes and Git
 never runs, which `kin eject` itself had put there.
 
-Five checks, each with its own control:
+Six checks, each with its own control:
 
   archive   a finished eject leaves no journal in the archived `kin/`, while
             the same directory still carries the authority key
@@ -34,6 +34,9 @@ Five checks, each with its own control:
             store commits once the file is gone
   hook      `kin init` re-admits the ejected repository with gitoxide's
             `docs.url` in place, and still refuses an executable `pre-commit`
+  author    a native commit is stamped with the repository's own Git identity,
+            read back out of Git rather than written here, and a repository
+            where no identity resolves refuses instead of inventing one
 
     CHECK <id> <ticket> PASS|FAIL|UNREADABLE <detail>
 
@@ -191,10 +194,41 @@ def init_refused_over(out, name):
     return "admission blocker" in out and "Git hook" in out and name in out
 
 
+def native_change_author(out):
+    """The `Author:` of the newest native change in `kin log`, or None.
+
+    Scoped to `Origin: native` on purpose. Imported changes carry the author Git
+    recorded, so a grader that took the first `Author:` line it saw would read an
+    imported one and pass while a native commit was stamped by anybody.
+    """
+    for block in re.split(r"^change ", out, flags=re.M)[1:]:
+        if not re.search(r"^Origin: native", block, re.M):
+            continue
+        match = re.search(r"^Author: (.+)$", block, re.M)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def identity_refusal_is_worded(out):
+    """Whether a commit with no resolvable identity refused, and said how to fix it.
+
+    Both remedies are required. Kin resolves a Git identity or a Kin-specific
+    `default_author`, so a refusal naming only one leaves a reader who set the
+    other with nothing to do.
+    """
+    return ("no author identity" in out
+            and "git config --global user.name" in out
+            and "git config --global user.email" in out
+            and "default_author" in out)
+
+
 GRADERS = {
     "commit_landed": commit_landed,
     "refusal_is_worded": refusal_is_worded,
     "init_refused_over": init_refused_over,
+    "native_change_author": native_change_author,
+    "identity_refusal_is_worded": identity_refusal_is_worded,
 }
 
 
@@ -523,8 +557,82 @@ def check_hook(suite):
     return result
 
 
-CHECKS = [check_archive, check_copyback, check_carried, check_refusal, check_hook]
-DECLARED = ("archive", "copyback", "carried", "refusal", "hook")
+def check_author(suite):
+    """A native commit carries the repository's own Git identity, and nothing else.
+
+    The rc061a brown stranger read `Author: Kin Isolation Probe
+    <iso-probe@firelock.io>` out of `kin log`, concluded Kin had a built-in
+    identity it substitutes for the repository's own, and filed it as a
+    provenance leak that would stop a tag. It was the container's own global Git
+    identity, set by the stranger image, and Kin had resolved it correctly. The
+    resolution has unit tests; what nothing exercised was the whole path, binary
+    to `kin log`, which is the only surface the report was ever going to read.
+    So this asserts it end to end, and it asserts the identity read back out of
+    Git rather than a constant written here, because a constant this file and the
+    fixture both spell would agree with itself while the product stamped anybody.
+
+    The second arm is the half that makes the first mean something: with no
+    identity resolvable anywhere, the commit must refuse. A product that stamps
+    the configured identity when there is one and invents one when there is not
+    passes the first arm and is exactly the defect the report alleged.
+    """
+    result = Result("author", "a native commit carries the repository's configured Git "
+                              "identity, and an unresolvable identity refuses")
+    repo = suite.fresh_repo("author")
+
+    configured = []
+    for field in ("user.name", "user.email"):
+        rc, out = suite.git(["config", "--get", field], repo)
+        if rc != 0 or not out.strip():
+            result.unknown("the fixture repository has no %s, so this run cannot compare what "
+                           "kin stamped against what Git holds" % field)
+            return result
+        configured.append(out.strip())
+    want = "%s <%s>" % (configured[0], configured[1])
+
+    rc, out = suite.kin_run(["log"], repo)
+    if rc != 0:
+        result.unknown("kin log failed (rc=%d): %s" % (rc, error_lines(out)))
+        return result
+    stamped = native_change_author(out)
+    if stamped is None:
+        result.unknown("kin log printed no native change with an Author line: %s" % tail(out))
+        return result
+    if stamped != want:
+        result.bad("the native change is stamped %r, but this repository's Git identity is %r; "
+                   "kin substituted an identity nobody configured" % (stamped, want))
+        return result
+
+    # Nothing resolvable anywhere: the repository's own scope is unset and both
+    # wider scopes are cut off, which is the only way to prove the refusal is
+    # about the absence rather than about the host that happened to run this.
+    empty_global = os.path.join(suite.workdir, "empty-global.gitconfig")
+    with open(empty_global, "w") as handle:
+        handle.write("")
+    for field in ("user.name", "user.email"):
+        suite.git(["config", "--unset", field], repo)
+    stripped_env = dict(suite.env)
+    stripped_env["GIT_CONFIG_NOSYSTEM"] = "1"
+    stripped_env["GIT_CONFIG_GLOBAL"] = empty_global
+    with open(os.path.join(repo, "unattributed.py"), "w") as handle:
+        handle.write("def unattributed():\n    return 0\n")
+    rc, out = run([suite.kin, "commit", "-m", "a change nobody can be named for"],
+                  cwd=repo, env=stripped_env)
+    suite.log("kin commit with no identity -> %d" % rc)
+    if rc == 0:
+        result.bad("kin committed with no resolvable identity anywhere (rc=0), so some value "
+                   "stood in for a person: %s" % tail(out))
+    elif not identity_refusal_is_worded(out):
+        result.bad("kin refused the unattributable commit but did not name both remedies: %s"
+                   % error_lines(out))
+    else:
+        result.ok("stamped %r, matching this repository's Git identity, and refused when "
+                  "nothing was resolvable" % stamped)
+    return result
+
+
+CHECKS = [check_archive, check_copyback, check_carried, check_refusal, check_hook, check_author]
+DECLARED = ("archive", "copyback", "carried", "refusal", "hook", "author")
 
 
 # ------------------------------------------------------------------ self-test
@@ -578,6 +686,43 @@ def self_test():
            init_refused_over(refused, "docs.url"), False)
     expect("an admission is not a refusal",
            init_refused_over("admitted exact Git repository in 0.1s", "pre-commit"), False)
+
+    # `kin log` in the shape rc061a read it: one native change above an imported
+    # one. The imported line is the trap, because it carries an Author too, and a
+    # grader that took the first one it saw would grade the wrong change.
+    log = ("change aaa\n"
+           "Author: Kin Isolation Probe <iso-probe@firelock.io>\n"
+           "Date:   2026-08-28T12:10:43Z\n"
+           "Origin: native\n"
+           "\n"
+           "change bbb\n"
+           "Author: Nate Prewitt <nate.prewitt@gmail.com> 1787618757 -0600\n"
+           "Date:   2026-08-25T00:45:57Z\n"
+           "Origin: git commit 5460f467\n")
+    expect("the native change's author is the one read",
+           native_change_author(log), "Kin Isolation Probe <iso-probe@firelock.io>")
+    expect("an imported change alone yields no native author",
+           native_change_author("change bbb\n"
+                                "Author: Nate Prewitt <nate.prewitt@gmail.com> 1 -0600\n"
+                                "Origin: git commit 5460f467\n"), None)
+    expect("a log with no Author line yields none",
+           native_change_author("change aaa\nOrigin: native\n"), None)
+
+    remedy = ("Error: kin has no author identity to record for this change.\n\n"
+              "Authorship is provenance. A change attributed to nobody cannot support review "
+              "attribution, blame, or audit, and it cannot be corrected later without rewriting "
+              "history, so kin refuses to invent one.\n\n"
+              "Set your Git identity:\n"
+              "  git config --global user.name \"Your Name\"\n"
+              "  git config --global user.email \"you@example.com\"\n"
+              "Or set a Kin-specific author in .kin/config.toml:\n"
+              "  default_author = \"Your Name <you@example.com>\"")
+    expect("the identity refusal names both remedies",
+           identity_refusal_is_worded(remedy), True)
+    expect("a refusal naming only the Git remedy fails",
+           identity_refusal_is_worded(remedy.split("Or set a Kin-specific")[0]), False)
+    expect("a landed commit is not a refusal",
+           identity_refusal_is_worded("Created semantic change abc on branch main"), False)
 
     # The crafted journal encodes in kin-core's field order and authenticates
     # under the key it was given, and a changed byte changes the tag.
