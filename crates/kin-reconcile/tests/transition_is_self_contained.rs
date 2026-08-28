@@ -62,7 +62,7 @@ const INGEST_PY: &str = r#"# Ingest notes.
 from notes import forget_notes_outside
 
 
-def ingest(store, roots):
+def run_ingest(store, roots):
     return forget_notes_outside(store, roots)
 "#;
 
@@ -159,13 +159,19 @@ impl LiveRepo {
         delta
     }
 
+    /// The one FUNCTION with this name.
+    ///
+    /// A Python file also declares a module entity carrying the file's stem, so
+    /// a lookup by name alone is ambiguous for any function named after its own
+    /// module. Naming the kind is what keeps the assertion about the
+    /// declaration the test means.
     fn entity(&self, name: &str) -> Entity {
         let mut matches: Vec<Entity> = self
             .graph
             .list_all_entities()
             .expect("list entities")
             .into_iter()
-            .filter(|entity| entity.name == name)
+            .filter(|entity| entity.name == name && entity.kind == kin_model::EntityKind::Function)
             .collect();
         assert_eq!(
             matches.len(),
@@ -303,7 +309,7 @@ fn a_rederived_edge_keeps_the_identity_the_store_already_holds() {
     repo.commit("notes.py", NOTES_PY);
     repo.commit("ingest.py", INGEST_PY);
 
-    let caller = repo.entity("ingest");
+    let caller = repo.entity("run_ingest");
     let callee = repo.entity("forget_notes_outside");
     let held = repo
         .relations_at(GraphNodeId::Entity(caller.id))
@@ -327,7 +333,10 @@ fn a_rederived_edge_keeps_the_identity_the_store_already_holds() {
 
     // Touch the caller. Pre-fix its delta adds an identity the store holds and
     // kin-db refuses the whole transition, so `commit` panics here.
-    let delta = repo.commit("ingest.py", &format!("{INGEST_PY}\n\n# a trailing comment\n"));
+    let delta = repo.commit(
+        "ingest.py",
+        &format!("{INGEST_PY}\n\n# a trailing comment\n"),
+    );
 
     assert!(
         !delta.relation_deltas.iter().any(|relation_delta| matches!(
@@ -356,7 +365,9 @@ fn a_rederived_edge_keeps_the_identity_the_store_already_holds() {
     assert_eq!(before, 0, "the control symbol must not exist yet");
     let delta = repo.commit(
         "ingest.py",
-        &format!("{INGEST_PY}\n\ndef second_hop(store, roots):\n    return ingest(store, roots)\n"),
+        &format!(
+            "{INGEST_PY}\n\ndef second_hop(store, roots):\n    return run_ingest(store, roots)\n"
+        ),
     );
     assert!(
         delta

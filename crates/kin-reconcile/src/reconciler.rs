@@ -137,7 +137,9 @@ fn push_relation_addition<G: GraphStore>(
                 kind = ?new.kind,
                 "the graph already holds this relation identity; carrying it as a modification"
             );
-            delta.relation_deltas.push(RelationDelta::Modified { old, new });
+            delta
+                .relation_deltas
+                .push(RelationDelta::Modified { old, new });
         }
         None => delta.relation_deltas.push(RelationDelta::Added { new }),
     }
