@@ -3,6 +3,10 @@
 
 #[cfg(feature = "embeddings")]
 pub mod cache_admin;
+mod producer;
+pub use producer::{
+    EmbeddingProducer, EmbeddingProducerSet, ProducedEmbeddingBatch, VectorProducerProvenance,
+};
 #[cfg(feature = "embeddings")]
 mod inference;
 #[cfg(feature = "embeddings")]
@@ -24,6 +28,8 @@ use sha2::{Digest, Sha256};
 use std::borrow::Cow;
 #[cfg(feature = "embeddings")]
 use std::collections::HashMap;
+#[cfg(feature = "embeddings")]
+use std::io::Write;
 #[cfg(feature = "embeddings")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "embeddings")]
@@ -627,7 +633,7 @@ const METAL_MAX_BATCH_TOKENS: usize = 16_384;
 #[cfg(feature = "embeddings")]
 const METAL_MAX_ATTENTION_AREA: usize = 8_388_608;
 #[cfg(feature = "embeddings")]
-const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v2";
+const EMBEDDING_CACHE_SCHEMA_VERSION: &str = "v4";
 #[cfg(feature = "embeddings")]
 const EMBEDDING_CACHE_PIPELINE_EPOCH: &str = "embed-pipeline-2026-05-31-swerank";
 pub const EMBEDDING_BODY_PREVIEW_KEY: &str = "embedding_body_preview";
@@ -685,6 +691,56 @@ pub struct CodeEmbedder {
 enum CodeEmbedderBackend {
     Bert(BertEmbedder),
     OpenAiCompat(OpenAiCompatEmbedder),
+    #[cfg(test)]
+    TestLocalRuntime(TestLocalRuntime),
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+enum TestLocalForward {
+    Success(Vec<f32>),
+    ModelError(String),
+    OutOfMemory(String),
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+struct TestLocalModel {
+    backend: GpuBackend,
+    forward: TestLocalForward,
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+#[derive(Default)]
+pub(crate) struct TestLocalRuntimeStats {
+    cpu_model_calls: std::sync::atomic::AtomicUsize,
+    primary_forward_calls: std::sync::atomic::AtomicUsize,
+    cpu_forward_calls: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+impl TestLocalRuntimeStats {
+    pub(crate) fn cpu_model_calls(&self) -> usize {
+        self.cpu_model_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn primary_forward_calls(&self) -> usize {
+        self.primary_forward_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) fn cpu_forward_calls(&self) -> usize {
+        self.cpu_forward_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+struct TestLocalRuntime {
+    primary: TestLocalModel,
+    cpu: Option<TestLocalModel>,
+    cpu_model_error: Option<String>,
+    backend_choice: EmbedBackendChoice,
+    stats: std::sync::Arc<TestLocalRuntimeStats>,
 }
 
 #[cfg(feature = "embeddings")]
@@ -719,6 +775,74 @@ struct OpenAiCompatEmbedder {
 }
 
 #[cfg(feature = "embeddings")]
+#[derive(Debug, Clone, PartialEq)]
+struct AttributedEmbedding {
+    vector: Vec<f32>,
+    producers: EmbeddingProducerSet,
+}
+
+#[cfg(feature = "embeddings")]
+impl AttributedEmbedding {
+    fn remote(vector: Vec<f32>) -> Self {
+        Self {
+            vector,
+            producers: EmbeddingProducerSet::singleton(EmbeddingProducer::Remote),
+        }
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl From<GpuBackend> for EmbeddingProducer {
+    fn from(value: GpuBackend) -> Self {
+        match value {
+            GpuBackend::Cpu => Self::Cpu,
+            GpuBackend::Metal => Self::Metal,
+            GpuBackend::Cuda => Self::Cuda,
+        }
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn actual_producer_from_returning_backend(backend: GpuBackend) -> EmbeddingProducer {
+    EmbeddingProducer::from(backend)
+}
+
+#[cfg(feature = "embeddings")]
+fn metal_oom_reason(error: kin_infer::InferError) -> Result<String, KinDbError> {
+    match error {
+        kin_infer::InferError::OutOfMemory(message) => Ok(message),
+        other => Err(KinDbError::IndexError(format!("inference failed: {other}"))),
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn run_cpu_route_forward<'a, Model, TwinError, Forward, Backend>(
+    primary: &'a Model,
+    cpu_model: Result<&'a Model, TwinError>,
+    forward: Forward,
+    backend: Backend,
+) -> Result<(Vec<Vec<f32>>, &'a Model, EmbeddingProducer), KinDbError>
+where
+    TwinError: std::fmt::Display,
+    Forward: FnOnce(&'a Model) -> Result<Vec<Vec<f32>>, KinDbError>,
+    Backend: FnOnce(&Model) -> GpuBackend,
+{
+    let returning_model = match cpu_model {
+        Ok(model) => model,
+        Err(error) => {
+            tracing::warn!(
+                error = %error,
+                "cpu_model unavailable; falling back to primary model for this chunk"
+            );
+            primary
+        }
+    };
+    let vectors = forward(returning_model)?;
+    let actual_producer = actual_producer_from_returning_backend(backend(returning_model));
+    Ok((vectors, returning_model, actual_producer))
+}
+
+#[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum EmbeddingInputRole {
     Query,
@@ -733,6 +857,78 @@ enum EmbeddingInputRole {
 struct CpuModelSource {
     weights_path: PathBuf,
     config_json: String,
+}
+
+/// Initialize one value from retained source material with one in-flight
+/// builder. The source lock deliberately remains held while `build` runs: a
+/// second first-use caller blocks, then rechecks the `OnceLock` and returns the
+/// winner instead of mistaking an in-progress initialization for consumed
+/// source. A failed build leaves the source in place so a later caller can
+/// retry.
+#[cfg(feature = "embeddings")]
+fn get_or_try_init_single_flight<'a, T, S, F>(
+    cell: &'a std::sync::OnceLock<T>,
+    source: &std::sync::Mutex<Option<S>>,
+    build: F,
+) -> Result<&'a T, KinDbError>
+where
+    F: FnOnce(&S) -> Result<T, KinDbError>,
+{
+    get_or_try_init_single_flight_with_wait_hook(cell, source, build, || {})
+}
+
+#[cfg(feature = "embeddings")]
+fn get_or_try_init_single_flight_with_wait_hook<'a, T, S, F, W>(
+    cell: &'a std::sync::OnceLock<T>,
+    source: &std::sync::Mutex<Option<S>>,
+    build: F,
+    on_wait: W,
+) -> Result<&'a T, KinDbError>
+where
+    F: FnOnce(&S) -> Result<T, KinDbError>,
+    W: FnOnce(),
+{
+    if let Some(value) = cell.get() {
+        return Ok(value);
+    }
+
+    let mut guard = match source.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            on_wait();
+            source
+                .lock()
+                .map_err(|_| KinDbError::IndexError("single-flight source mutex poisoned".into()))?
+        }
+        Err(std::sync::TryLockError::Poisoned(_)) => {
+            return Err(KinDbError::IndexError(
+                "single-flight source mutex poisoned".into(),
+            ));
+        }
+    };
+    if let Some(value) = cell.get() {
+        return Ok(value);
+    }
+
+    let retained = guard.as_ref().ok_or_else(|| {
+        KinDbError::IndexError(
+            "single-flight source was consumed without a successful initialization".into(),
+        )
+    })?;
+    let built = build(retained)?;
+    match cell.set(built) {
+        Ok(()) => {
+            guard.take();
+        }
+        Err(_loser) => {
+            // The source mutex serializes every caller of this helper, so this
+            // branch is only defensive against a direct external `set`.
+            guard.take();
+        }
+    }
+    cell.get().ok_or_else(|| {
+        KinDbError::IndexError("single-flight initialization completed without a value".into())
+    })
 }
 
 impl std::fmt::Debug for CodeEmbedder {
@@ -779,6 +975,141 @@ impl CodeEmbedder {
         {
             Err(disabled_error())
         }
+    }
+
+    #[cfg(all(test, feature = "embeddings"))]
+    fn test_local_runtime(
+        dimensions: usize,
+        cache_root: PathBuf,
+        namespace: &str,
+        primary: TestLocalModel,
+        cpu: Option<TestLocalModel>,
+        cpu_model_error: Option<String>,
+        backend_choice: EmbedBackendChoice,
+    ) -> (Self, std::sync::Arc<TestLocalRuntimeStats>) {
+        let stats = std::sync::Arc::new(TestLocalRuntimeStats::default());
+        let runtime = TestLocalRuntime {
+            primary,
+            cpu,
+            cpu_model_error,
+            backend_choice,
+            stats: std::sync::Arc::clone(&stats),
+        };
+        let embedder = Self {
+            backend: CodeEmbedderBackend::TestLocalRuntime(runtime),
+            dimensions,
+            cache: Some(
+                EmbeddingCache::new_in(cache_root, namespace.to_string(), dimensions)
+                    .expect("test embedding cache should initialize"),
+            ),
+        };
+        (embedder, stats)
+    }
+
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn test_local_forward_error(
+        dimensions: usize,
+        cache_root: PathBuf,
+        message: &str,
+    ) -> (Self, std::sync::Arc<TestLocalRuntimeStats>) {
+        Self::test_local_runtime(
+            dimensions,
+            cache_root,
+            "test-local-forward-error",
+            TestLocalModel {
+                backend: GpuBackend::Metal,
+                forward: TestLocalForward::ModelError(message.to_string()),
+            },
+            Some(TestLocalModel {
+                backend: GpuBackend::Cpu,
+                forward: TestLocalForward::Success(vec![1.0; dimensions]),
+            }),
+            None,
+            EmbedBackendChoice::Metal {
+                reason: "test_non_oom_primary_error",
+            },
+        )
+    }
+
+    #[cfg(all(test, feature = "embeddings"))]
+    fn test_local_oom_fallback(
+        dimensions: usize,
+        cache_root: PathBuf,
+        cpu_vector: Vec<f32>,
+    ) -> (Self, std::sync::Arc<TestLocalRuntimeStats>) {
+        Self::test_local_runtime(
+            dimensions,
+            cache_root,
+            "test-local-oom-fallback",
+            TestLocalModel {
+                backend: GpuBackend::Metal,
+                forward: TestLocalForward::OutOfMemory(
+                    "synthetic model-free Metal OOM".to_string(),
+                ),
+            },
+            Some(TestLocalModel {
+                backend: GpuBackend::Cpu,
+                forward: TestLocalForward::Success(cpu_vector),
+            }),
+            None,
+            EmbedBackendChoice::Metal {
+                reason: "test_oom_primary_error",
+            },
+        )
+    }
+
+    #[cfg(all(test, feature = "embeddings", feature = "vector"))]
+    pub(crate) fn test_local_success(
+        dimensions: usize,
+        cache_root: PathBuf,
+        backend: GpuBackend,
+        vector: Vec<f32>,
+    ) -> Self {
+        Self::test_local_runtime(
+            dimensions,
+            cache_root,
+            "test-local-success",
+            TestLocalModel {
+                backend,
+                forward: TestLocalForward::Success(vector),
+            },
+            None,
+            Some("synthetic CPU twin unavailable".to_string()),
+            EmbedBackendChoice::Metal {
+                reason: "test_local_success",
+            },
+        )
+        .0
+    }
+
+    #[cfg(all(test, feature = "embeddings"))]
+    fn test_cpu_route_with_unavailable_twin(
+        dimensions: usize,
+        cache_root: PathBuf,
+        primary_backend: GpuBackend,
+        vector: Vec<f32>,
+    ) -> (Self, std::sync::Arc<TestLocalRuntimeStats>) {
+        Self::test_local_runtime(
+            dimensions,
+            cache_root,
+            "test-cpu-route-primary-fallback",
+            TestLocalModel {
+                backend: primary_backend,
+                forward: TestLocalForward::Success(vector),
+            },
+            None,
+            Some("synthetic CPU twin construction failure".to_string()),
+            EmbedBackendChoice::Cpu {
+                reason: "test_cpu_twin_failure",
+            },
+        )
+    }
+
+    #[cfg(all(test, feature = "embeddings"))]
+    pub(crate) fn test_cache_is_empty(&self) -> bool {
+        self.cache
+            .as_ref()
+            .is_none_or(EmbeddingCache::test_is_empty)
     }
 
     /// Create with a specific HuggingFace model.
@@ -938,8 +1269,11 @@ impl CodeEmbedder {
     pub fn embed_text(&self, text: &str) -> Result<Vec<f32>, KinDbError> {
         let _span =
             tracing::info_span!("kindb.embedder.embed_text", text_len = text.len()).entered();
-        let mut vecs = self.embed_batch_for_role(&[text.to_string()], EmbeddingInputRole::Query)?;
-        vecs.pop()
+        let mut batch =
+            self.embed_batch_for_role(&[text.to_string()], EmbeddingInputRole::Query)?;
+        batch
+            .vectors
+            .pop()
             .ok_or_else(|| KinDbError::IndexError("embedding returned empty result".into()))
     }
 
@@ -954,6 +1288,20 @@ impl CodeEmbedder {
     pub fn embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
         let _span =
             tracing::info_span!("kindb.embedder.embed_batch", texts = texts.len()).entered();
+        Ok(self.embed_batch_with_producers(texts)?.vectors)
+    }
+
+    /// Batch-embed document text and report the runtime producers that actually
+    /// returned the vectors.
+    ///
+    /// This is the authoritative API for building a persistent vector index.
+    /// [`Self::embed_batch`] remains a compatibility wrapper for query-only or
+    /// transient callers that do not persist the returned bytes.
+    #[cfg(feature = "embeddings")]
+    pub fn embed_batch_with_producers(
+        &self,
+        texts: &[String],
+    ) -> Result<ProducedEmbeddingBatch, KinDbError> {
         self.embed_batch_for_role(texts, EmbeddingInputRole::Document)
     }
 
@@ -963,6 +1311,25 @@ impl CodeEmbedder {
         let _span =
             tracing::info_span!("kindb.embedder.embed_query_batch", queries = queries.len())
                 .entered();
+        Ok(self.embed_query_batch_with_producers(queries)?.vectors)
+    }
+
+    /// Batch-embed query text and report the runtime producers that actually
+    /// returned the query vectors.
+    ///
+    /// Ranking compatibility policy needs both sides of the comparison. A
+    /// stored CPU-produced index does not make a fresh Metal or remote query
+    /// vector numerically compatible by implication.
+    #[cfg(feature = "embeddings")]
+    pub fn embed_query_batch_with_producers(
+        &self,
+        queries: &[String],
+    ) -> Result<ProducedEmbeddingBatch, KinDbError> {
+        let _span = tracing::info_span!(
+            "kindb.embedder.embed_query_batch_with_producers",
+            queries = queries.len()
+        )
+        .entered();
         self.embed_batch_for_role(queries, EmbeddingInputRole::Query)
     }
 
@@ -971,13 +1338,13 @@ impl CodeEmbedder {
         &self,
         texts: &[String],
         role: EmbeddingInputRole,
-    ) -> Result<Vec<Vec<f32>>, KinDbError> {
+    ) -> Result<ProducedEmbeddingBatch, KinDbError> {
         if texts.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ProducedEmbeddingBatch::empty());
         }
 
         let prepared_texts = self.prepare_inputs(texts, role);
-        let mut cached_results: Vec<Option<Vec<f32>>> = vec![None; texts.len()];
+        let mut cached_results: Vec<Option<AttributedEmbedding>> = vec![None; texts.len()];
         // Cache-missing inputs are borrowed from `prepared_texts`, never copied —
         // the inference backend only needs to read them.
         let mut missing_texts: Vec<&str> = Vec::new();
@@ -1011,14 +1378,15 @@ impl CodeEmbedder {
         }
 
         if missing_texts.is_empty() {
-            return cached_results
+            let attributed = cached_results
                 .into_iter()
-                .map(|vector| {
-                    vector.ok_or_else(|| {
+                .map(|embedding| {
+                    embedding.ok_or_else(|| {
                         KinDbError::IndexError("embedding cache returned incomplete batch".into())
                     })
                 })
-                .collect();
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(produced_batch_from_attributed(attributed));
         }
 
         let missing_results = self.embed_uncached_batch(&missing_texts)?;
@@ -1030,29 +1398,28 @@ impl CodeEmbedder {
             )));
         }
 
-        for (miss_idx, vector) in missing_results.into_iter().enumerate() {
-            let vector = sanitize_embedding(vector, self.dimensions, || {
+        for (miss_idx, attributed) in missing_results.into_iter().enumerate() {
+            let embedding = sanitize_attributed_embedding(attributed, self.dimensions, || {
                 missing_texts.get(miss_idx).copied().unwrap_or("")
             });
             if let Some(cache) = self.cache.as_ref() {
                 if let Some(key) = missing_keys.get(miss_idx) {
-                    cache.put_by_key(key, &vector);
+                    cache.put_by_key(key, &embedding.vector, &embedding.producers);
                 }
             }
 
-            for original_idx in &missing_slots[miss_idx] {
-                cached_results[*original_idx] = Some(vector.clone());
-            }
+            fanout_attributed_embedding(&mut cached_results, &missing_slots[miss_idx], &embedding)?;
         }
 
-        cached_results
+        let attributed = cached_results
             .into_iter()
-            .map(|vector| {
-                vector.ok_or_else(|| {
+            .map(|embedding| {
+                embedding.ok_or_else(|| {
                     KinDbError::IndexError("embedding batch result order mismatch".into())
                 })
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(produced_batch_from_attributed(attributed))
     }
 
     #[cfg(feature = "embeddings")]
@@ -1064,16 +1431,38 @@ impl CodeEmbedder {
         match &self.backend {
             CodeEmbedderBackend::Bert(embedder) => embedder.prepare_inputs(texts, role),
             CodeEmbedderBackend::OpenAiCompat(embedder) => embedder.prepare_inputs(texts, role),
+            #[cfg(test)]
+            CodeEmbedderBackend::TestLocalRuntime(_) => Cow::Borrowed(texts),
         }
     }
 
     #[cfg(feature = "embeddings")]
-    fn embed_uncached_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>, KinDbError> {
+    fn embed_uncached_batch(&self, texts: &[&str]) -> Result<Vec<AttributedEmbedding>, KinDbError> {
         match &self.backend {
             CodeEmbedderBackend::Bert(embedder) => {
                 embedder.embed_uncached_batch(texts, self.dimensions)
             }
-            CodeEmbedderBackend::OpenAiCompat(embedder) => embedder.embed_batch(texts),
+            CodeEmbedderBackend::OpenAiCompat(embedder) => Ok(embedder
+                .embed_batch(texts)?
+                .into_iter()
+                .map(AttributedEmbedding::remote)
+                .collect()),
+            #[cfg(test)]
+            CodeEmbedderBackend::TestLocalRuntime(runtime) => {
+                let token_ids = vec![vec![1u32]; texts.len()];
+                let attention_masks = vec![vec![1u32]; texts.len()];
+                let indices: Vec<usize> = (0..texts.len()).collect();
+                let placed = process_chunk_with_runtime(
+                    runtime,
+                    runtime.backend_choice,
+                    &token_ids,
+                    &attention_masks,
+                    &indices,
+                    1,
+                    self.dimensions,
+                )?;
+                scatter_attributed(placed, texts.len())
+            }
         }
     }
 
@@ -1083,9 +1472,25 @@ impl CodeEmbedder {
         Err(disabled_error())
     }
 
+    #[cfg(not(feature = "embeddings"))]
+    pub fn embed_batch_with_producers(
+        &self,
+        _texts: &[String],
+    ) -> Result<ProducedEmbeddingBatch, KinDbError> {
+        Err(disabled_error())
+    }
+
     /// Batch-embed multiple raw queries as query roles.
     #[cfg(not(feature = "embeddings"))]
     pub fn embed_query_batch(&self, _queries: &[String]) -> Result<Vec<Vec<f32>>, KinDbError> {
+        Err(disabled_error())
+    }
+
+    #[cfg(not(feature = "embeddings"))]
+    pub fn embed_query_batch_with_producers(
+        &self,
+        _queries: &[String],
+    ) -> Result<ProducedEmbeddingBatch, KinDbError> {
         Err(disabled_error())
     }
 
@@ -1101,6 +1506,8 @@ impl CodeEmbedder {
         match &self.backend {
             CodeEmbedderBackend::Bert(embedder) => Some(embedder.model.backend()),
             CodeEmbedderBackend::OpenAiCompat(_) => None,
+            #[cfg(test)]
+            CodeEmbedderBackend::TestLocalRuntime(runtime) => Some(runtime.primary.backend),
         }
     }
 
@@ -1134,7 +1541,7 @@ impl BertEmbedder {
         &self,
         texts: &[&str],
         dimensions: usize,
-    ) -> Result<Vec<Vec<f32>>, KinDbError> {
+    ) -> Result<Vec<AttributedEmbedding>, KinDbError> {
         let encodings = {
             let _span =
                 tracing::info_span!("kindb.embedder.tokenize_batch", texts = texts.len()).entered();
@@ -1169,7 +1576,7 @@ impl BertEmbedder {
         }
 
         let placed = self.process_encoded_subset(batch.as_slice(), dimensions, budget, None)?;
-        scatter_placed(placed, texts.len())
+        scatter_attributed(placed, texts.len())
     }
 
     fn embed_hybrid(
@@ -1179,7 +1586,7 @@ impl BertEmbedder {
         budget: BatchBudget,
         total: usize,
         mode: HybridMode,
-    ) -> Result<Vec<Vec<f32>>, KinDbError> {
+    ) -> Result<Vec<AttributedEmbedding>, KinDbError> {
         let placed = match mode {
             HybridMode::Off => unreachable!("embed_hybrid is only called for enabled modes"),
             HybridMode::SeqFloor => match plan_seqfloor_route(&batch.ids) {
@@ -1210,7 +1617,7 @@ impl BertEmbedder {
             )?,
         };
 
-        scatter_placed(placed, total)
+        scatter_attributed(placed, total)
     }
 
     /// Dispatch a batch through the adaptive throughput split.
@@ -1227,7 +1634,7 @@ impl BertEmbedder {
         dimensions: usize,
         budget: BatchBudget,
         gpu_tput_ratio: Option<f64>,
-    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+    ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
         let (plan, adaptive) = match gpu_tput_ratio {
             Some(fixed) => (
                 adaptive_split::SplitPlan::Balanced {
@@ -1292,7 +1699,7 @@ impl BertEmbedder {
         dimensions: usize,
         budget: BatchBudget,
         backend_override: Option<EmbedBackendChoice>,
-    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+    ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
         // Pack the length-sorted run into sub-batch ranges up front.
         let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
         let mut start = 0usize;
@@ -1343,14 +1750,15 @@ impl BertEmbedder {
                     )
                 })
                 .collect::<Result<Vec<_>, KinDbError>>()?;
-            let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(batch.len());
+            let mut placed: Vec<(usize, Vec<f32>, EmbeddingProducer)> =
+                Vec::with_capacity(batch.len());
             for chunk in chunks {
                 placed.extend(chunk);
             }
             return Ok(placed);
         }
 
-        let mut placed: Vec<(usize, Vec<f32>)> = Vec::with_capacity(batch.len());
+        let mut placed: Vec<(usize, Vec<f32>, EmbeddingProducer)> = Vec::with_capacity(batch.len());
         for &(s, e, longest) in &ranges {
             let backend_choice = backend_override.unwrap_or_else(|| resolve_embed_backend(longest));
             placed.extend(self.process_chunk(
@@ -1379,178 +1787,16 @@ impl BertEmbedder {
         indices: &[usize],
         longest: usize,
         dimensions: usize,
-    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
-        let count = token_ids.len();
-        let trace_start = batch_trace::enabled().then(std::time::Instant::now);
-        let (vectors, forward_model): (Vec<Vec<f32>>, &BertModel) = match backend_choice {
-            EmbedBackendChoice::Metal { reason } => {
-                if let Some((attention_area, attention_area_cap)) =
-                    metal_hard_guard_rejection(count, longest)
-                {
-                    let guard_reason = match reason {
-                        "env_forced" => "env_forced_memory_guard",
-                        "hybrid_metal" => "hybrid_metal_memory_guard",
-                        "hybrid_serial_primary" => "hybrid_serial_memory_guard",
-                        _ => "metal_memory_guard_cpu",
-                    };
-                    tracing::warn!(
-                        target: "kindb.embed.dispatch",
-                        batch_size = count,
-                        max_seq = longest,
-                        attention_area = attention_area,
-                        attention_area_cap = attention_area_cap,
-                        backend = "cpu",
-                        reason = guard_reason,
-                        "embed_metal_memory_guard"
-                    );
-                    let model = self.cpu_model().map_err(|e| {
-                        KinDbError::IndexError(format!(
-                            "Metal memory guard declined unsafe batch \
-                             (batch_size={count}, max_seq={longest}, \
-                             attention_area={attention_area}, cap={attention_area_cap}) \
-                             but CPU twin is unavailable: {e}"
-                        ))
-                    })?;
-                    let vectors =
-                        model
-                            .forward_batched(token_ids, attention_masks)
-                            .map_err(|e| {
-                                KinDbError::IndexError(format!(
-                                    "inference failed (CPU retry after Metal memory guard): {e}"
-                                ))
-                            })?;
-                    (vectors, model)
-                } else {
-                    tracing::info!(
-                        target: "kindb.embed.dispatch",
-                        batch_size = count,
-                        max_seq = longest,
-                        backend = "metal",
-                        reason = reason,
-                        "embed_dispatch"
-                    );
-                    let _span = tracing::info_span!(
-                        "kindb.embedder.forward_batch",
-                        batch = count,
-                        longest = longest
-                    )
-                    .entered();
-                    let metal_forward = if metal_oom_injection_armed() {
-                        Err(kin_infer::InferError::OutOfMemory(
-                            "synthetic Metal OOM (KIN_EMBED_TEST_FORCE_METAL_OOM)".to_string(),
-                        ))
-                    } else {
-                        self.model.forward_batched(token_ids, attention_masks)
-                    };
-                    let vectors = match metal_forward {
-                        Ok(v) => v,
-                        Err(kin_infer::InferError::OutOfMemory(msg)) => {
-                            // Metal ran out of device memory mid-forward. Rather
-                            // than failing the index, degrade this batch to the CPU
-                            // twin and retry once. If the twin is unavailable, fail
-                            // loud instead of submitting the same unsafe batch back
-                            // to the primary Metal model.
-                            tracing::warn!(
-                                target: "kindb.embed.dispatch",
-                                error = %msg,
-                                batch_size = count,
-                                max_seq = longest,
-                                "metal embed out-of-memory; retrying batch on CPU"
-                            );
-                            let model = self.cpu_model().map_err(|e| {
-                                KinDbError::IndexError(format!(
-                                    "Metal OOM for batch \
-                                     (batch_size={count}, max_seq={longest}) \
-                                     and CPU twin is unavailable: {e}"
-                                ))
-                            })?;
-                            model
-                                .forward_batched(token_ids, attention_masks)
-                                .map_err(|e| {
-                                    KinDbError::IndexError(format!(
-                                        "inference failed (CPU retry after Metal OOM): {e}"
-                                    ))
-                                })?
-                        }
-                        Err(e) => {
-                            return Err(KinDbError::IndexError(format!("inference failed: {e}")));
-                        }
-                    };
-                    (vectors, &self.model)
-                }
-            }
-            EmbedBackendChoice::Cpu { reason } => {
-                tracing::info!(
-                    target: "kindb.embed.dispatch",
-                    batch_size = count,
-                    max_seq = longest,
-                    backend = "cpu",
-                    reason = reason,
-                    "embed_dispatch"
-                );
-                let _span = tracing::info_span!(
-                    "kindb.embedder.forward_cpu_path",
-                    batch = count,
-                    longest = longest
-                )
-                .entered();
-                let cpu_model = match self.cpu_model() {
-                    Ok(m) => Some(m),
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "cpu_model unavailable; falling back to primary model for this chunk"
-                        );
-                        None
-                    }
-                };
-                let model = cpu_model.unwrap_or(&self.model);
-                let vectors = model
-                    .forward_batched(token_ids, attention_masks)
-                    .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
-                (vectors, model)
-            }
-        };
-
-        if let Some(start) = trace_start {
-            batch_trace::record_batch(count, longest, token_ids, start.elapsed());
-        }
-
-        // Defense in depth: if the dispatched path still returned any non-finite
-        // vectors, retry per-sample through the single-input forward path of the
-        // SAME model before the outer sanitizer handles any remaining bad vectors.
-        let vectors = if vectors.iter().any(|v| !v.iter().all(|x| x.is_finite())) {
-            tracing::warn!(
-                batch = count,
-                longest = longest,
-                "dispatched path produced non-finite vectors; retrying via single-input forward path"
-            );
-            let mut retried = Vec::with_capacity(count);
-            for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
-                let out = forward_model
-                    .forward(std::slice::from_ref(ids), std::slice::from_ref(mask))
-                    .map_err(|e| KinDbError::IndexError(format!("inference failed: {e}")))?;
-                retried.push(out.into_iter().next().ok_or_else(|| {
-                    KinDbError::IndexError("forward returned empty batch".into())
-                })?);
-            }
-            retried
-        } else {
-            vectors
-        };
-
-        let mut chunk: Vec<(usize, Vec<f32>)> = Vec::with_capacity(count);
-        for (original_idx, vector) in indices.iter().zip(vectors) {
-            if vector.len() != dimensions {
-                return Err(KinDbError::IndexError(format!(
-                    "embedding returned {} dimensions, expected {}",
-                    vector.len(),
-                    dimensions
-                )));
-            }
-            chunk.push((*original_idx, vector));
-        }
-        Ok(chunk)
+    ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
+        process_chunk_with_runtime(
+            &BertChunkRuntime(self),
+            backend_choice,
+            token_ids,
+            attention_masks,
+            indices,
+            longest,
+            dimensions,
+        )
     }
 
     fn dispatch_concurrent(
@@ -1560,7 +1806,7 @@ impl BertEmbedder {
         dimensions: usize,
         budget: BatchBudget,
         record_adaptive: bool,
-    ) -> Result<Vec<(usize, Vec<f32>)>, KinDbError> {
+    ) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
         let tokens =
             |side: EncodedSlice<'_>| -> u64 { side.ids.iter().map(|ids| ids.len() as u64).sum() };
         let metal_entities = metal_side.len() as u64;
@@ -1731,22 +1977,7 @@ impl BertEmbedder {
     /// split.
     #[cfg(feature = "embeddings")]
     fn cpu_model(&self) -> Result<&BertModel, KinDbError> {
-        if let Some(model) = self.cpu_model.get() {
-            return Ok(model);
-        }
-
-        // Take the source out of the Mutex; we only need it once. After
-        // successful init, the OnceLock holds the model and the source is
-        // dropped.
-        let source = {
-            let mut guard = self
-                .cpu_model_source
-                .lock()
-                .map_err(|_| KinDbError::IndexError("cpu_model_source mutex poisoned".into()))?;
-            guard.take()
-        };
-
-        let built = if let Some(source) = source {
+        get_or_try_init_single_flight(&self.cpu_model, &self.cpu_model_source, |source| {
             let config: BertConfig = parse_model_config(&source.config_json).map_err(|e| {
                 KinDbError::IndexError(format!("cpu twin config parse failed: {e}"))
             })?;
@@ -1761,20 +1992,8 @@ impl BertEmbedder {
                 backend = %cpu_model.backend(),
                 "kindb.embed: CPU BertModel twin loaded for long-sequence fallback"
             );
-            cpu_model
-        } else {
-            return Err(KinDbError::IndexError(
-                "cpu_model_source already consumed without a successful init".into(),
-            ));
-        };
-
-        // Race: another thread may have beaten us; `set` will return Err on
-        // that second attempt. Either way, `get` afterward yields the
-        // winning instance.
-        let _ = self.cpu_model.set(built);
-        self.cpu_model
-            .get()
-            .ok_or_else(|| KinDbError::IndexError("cpu_model init failed".into()))
+            Ok(cpu_model)
+        })
     }
 }
 
@@ -2713,6 +2932,314 @@ enum EmbedBackendChoice {
 }
 
 #[cfg(feature = "embeddings")]
+trait LocalChunkRuntime {
+    type Model;
+
+    fn primary_model(&self) -> &Self::Model;
+    fn cpu_model(&self) -> Result<&Self::Model, KinDbError>;
+    fn backend(&self, model: &Self::Model) -> GpuBackend;
+    fn forward_batched(
+        &self,
+        model: &Self::Model,
+        token_ids: &[Vec<u32>],
+        attention_masks: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>, kin_infer::InferError>;
+    fn forward_single(
+        &self,
+        model: &Self::Model,
+        token_ids: &[u32],
+        attention_mask: &[u32],
+    ) -> Result<Vec<Vec<f32>>, kin_infer::InferError>;
+}
+
+#[cfg(feature = "embeddings")]
+struct BertChunkRuntime<'a>(&'a BertEmbedder);
+
+#[cfg(feature = "embeddings")]
+impl LocalChunkRuntime for BertChunkRuntime<'_> {
+    type Model = BertModel;
+
+    fn primary_model(&self) -> &Self::Model {
+        &self.0.model
+    }
+
+    fn cpu_model(&self) -> Result<&Self::Model, KinDbError> {
+        self.0.cpu_model()
+    }
+
+    fn backend(&self, model: &Self::Model) -> GpuBackend {
+        model.backend()
+    }
+
+    fn forward_batched(
+        &self,
+        model: &Self::Model,
+        token_ids: &[Vec<u32>],
+        attention_masks: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>, kin_infer::InferError> {
+        model.forward_batched(token_ids, attention_masks)
+    }
+
+    fn forward_single(
+        &self,
+        model: &Self::Model,
+        token_ids: &[u32],
+        attention_mask: &[u32],
+    ) -> Result<Vec<Vec<f32>>, kin_infer::InferError> {
+        let token_ids = [token_ids.to_vec()];
+        let attention_mask = [attention_mask.to_vec()];
+        model.forward(&token_ids, &attention_mask)
+    }
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+impl LocalChunkRuntime for TestLocalRuntime {
+    type Model = TestLocalModel;
+
+    fn primary_model(&self) -> &Self::Model {
+        &self.primary
+    }
+
+    fn cpu_model(&self) -> Result<&Self::Model, KinDbError> {
+        self.stats
+            .cpu_model_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.cpu.as_ref().ok_or_else(|| {
+            KinDbError::IndexError(
+                self.cpu_model_error
+                    .clone()
+                    .unwrap_or_else(|| "synthetic CPU twin unavailable".to_string()),
+            )
+        })
+    }
+
+    fn backend(&self, model: &Self::Model) -> GpuBackend {
+        model.backend
+    }
+
+    fn forward_batched(
+        &self,
+        model: &Self::Model,
+        token_ids: &[Vec<u32>],
+        _attention_masks: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>, kin_infer::InferError> {
+        let counter = if std::ptr::eq(model, &self.primary) {
+            &self.stats.primary_forward_calls
+        } else {
+            &self.stats.cpu_forward_calls
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match &model.forward {
+            TestLocalForward::Success(vector) => Ok(vec![vector.clone(); token_ids.len()]),
+            TestLocalForward::ModelError(message) => {
+                Err(kin_infer::InferError::ModelError(message.clone()))
+            }
+            TestLocalForward::OutOfMemory(message) => {
+                Err(kin_infer::InferError::OutOfMemory(message.clone()))
+            }
+        }
+    }
+
+    fn forward_single(
+        &self,
+        model: &Self::Model,
+        _token_ids: &[u32],
+        _attention_mask: &[u32],
+    ) -> Result<Vec<Vec<f32>>, kin_infer::InferError> {
+        let counter = if std::ptr::eq(model, &self.primary) {
+            &self.stats.primary_forward_calls
+        } else {
+            &self.stats.cpu_forward_calls
+        };
+        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match &model.forward {
+            TestLocalForward::Success(vector) => Ok(vec![vector.clone()]),
+            TestLocalForward::ModelError(message) => {
+                Err(kin_infer::InferError::ModelError(message.clone()))
+            }
+            TestLocalForward::OutOfMemory(message) => {
+                Err(kin_infer::InferError::OutOfMemory(message.clone()))
+            }
+        }
+    }
+}
+
+#[cfg(feature = "embeddings")]
+fn process_chunk_with_runtime<R: LocalChunkRuntime>(
+    runtime: &R,
+    backend_choice: EmbedBackendChoice,
+    token_ids: &[Vec<u32>],
+    attention_masks: &[Vec<u32>],
+    indices: &[usize],
+    longest: usize,
+    dimensions: usize,
+) -> Result<Vec<(usize, Vec<f32>, EmbeddingProducer)>, KinDbError> {
+    let count = token_ids.len();
+    let trace_start = batch_trace::enabled().then(std::time::Instant::now);
+    let (vectors, forward_model, actual_producer) = match backend_choice {
+        EmbedBackendChoice::Metal { reason } => {
+            let (vectors, forward_model) = if let Some((attention_area, attention_area_cap)) =
+                metal_hard_guard_rejection(count, longest)
+            {
+                let guard_reason = match reason {
+                    "env_forced" => "env_forced_memory_guard",
+                    "hybrid_metal" => "hybrid_metal_memory_guard",
+                    "hybrid_serial_primary" => "hybrid_serial_memory_guard",
+                    _ => "metal_memory_guard_cpu",
+                };
+                tracing::warn!(
+                    target: "kindb.embed.dispatch",
+                    batch_size = count,
+                    max_seq = longest,
+                    attention_area = attention_area,
+                    attention_area_cap = attention_area_cap,
+                    backend = "cpu",
+                    reason = guard_reason,
+                    "embed_metal_memory_guard"
+                );
+                let model = runtime.cpu_model().map_err(|error| {
+                    KinDbError::IndexError(format!(
+                        "Metal memory guard declined unsafe batch \
+                         (batch_size={count}, max_seq={longest}, \
+                         attention_area={attention_area}, cap={attention_area_cap}) \
+                         but CPU twin is unavailable: {error}"
+                    ))
+                })?;
+                let vectors = runtime
+                    .forward_batched(model, token_ids, attention_masks)
+                    .map_err(|error| {
+                        KinDbError::IndexError(format!(
+                            "inference failed (CPU retry after Metal memory guard): {error}"
+                        ))
+                    })?;
+                (vectors, model)
+            } else {
+                tracing::info!(
+                    target: "kindb.embed.dispatch",
+                    batch_size = count,
+                    max_seq = longest,
+                    backend = "metal",
+                    reason = reason,
+                    "embed_dispatch"
+                );
+                let _span = tracing::info_span!(
+                    "kindb.embedder.forward_batch",
+                    batch = count,
+                    longest = longest
+                )
+                .entered();
+                let primary = runtime.primary_model();
+                let primary_forward = if metal_oom_injection_armed() {
+                    Err(kin_infer::InferError::OutOfMemory(
+                        "synthetic Metal OOM (KIN_EMBED_TEST_FORCE_METAL_OOM)".to_string(),
+                    ))
+                } else {
+                    runtime.forward_batched(primary, token_ids, attention_masks)
+                };
+                match primary_forward {
+                    Ok(vectors) => (vectors, primary),
+                    Err(error) => {
+                        let message = metal_oom_reason(error)?;
+                        tracing::warn!(
+                            target: "kindb.embed.dispatch",
+                            error = %message,
+                            batch_size = count,
+                            max_seq = longest,
+                            "metal embed out-of-memory; retrying batch on CPU"
+                        );
+                        let model = runtime.cpu_model().map_err(|error| {
+                            KinDbError::IndexError(format!(
+                                "Metal OOM for batch \
+                                 (batch_size={count}, max_seq={longest}) \
+                                 and CPU twin is unavailable: {error}"
+                            ))
+                        })?;
+                        let vectors = runtime
+                            .forward_batched(model, token_ids, attention_masks)
+                            .map_err(|error| {
+                                KinDbError::IndexError(format!(
+                                    "inference failed (CPU retry after Metal OOM): {error}"
+                                ))
+                            })?;
+                        (vectors, model)
+                    }
+                }
+            };
+            let producer = actual_producer_from_returning_backend(runtime.backend(forward_model));
+            (vectors, forward_model, producer)
+        }
+        EmbedBackendChoice::Cpu { reason } => {
+            tracing::info!(
+                target: "kindb.embed.dispatch",
+                batch_size = count,
+                max_seq = longest,
+                backend = "cpu",
+                reason = reason,
+                "embed_dispatch"
+            );
+            let _span = tracing::info_span!(
+                "kindb.embedder.forward_cpu_path",
+                batch = count,
+                longest = longest
+            )
+            .entered();
+            run_cpu_route_forward(
+                runtime.primary_model(),
+                runtime.cpu_model(),
+                |model| {
+                    runtime
+                        .forward_batched(model, token_ids, attention_masks)
+                        .map_err(|error| {
+                            KinDbError::IndexError(format!("inference failed: {error}"))
+                        })
+                },
+                |model| runtime.backend(model),
+            )?
+        }
+    };
+
+    if let Some(start) = trace_start {
+        batch_trace::record_batch(count, longest, token_ids, start.elapsed());
+    }
+
+    let vectors = if vectors
+        .iter()
+        .any(|vector| !vector.iter().all(|value| value.is_finite()))
+    {
+        tracing::warn!(
+            batch = count,
+            longest = longest,
+            "dispatched path produced non-finite vectors; retrying via single-input forward path"
+        );
+        let mut retried = Vec::with_capacity(count);
+        for (ids, mask) in token_ids.iter().zip(attention_masks.iter()) {
+            let out = runtime
+                .forward_single(forward_model, ids, mask)
+                .map_err(|error| KinDbError::IndexError(format!("inference failed: {error}")))?;
+            retried.push(out.into_iter().next().ok_or_else(|| {
+                KinDbError::IndexError("forward returned empty batch".to_string())
+            })?);
+        }
+        retried
+    } else {
+        vectors
+    };
+
+    let mut chunk = Vec::with_capacity(count);
+    for (original_idx, vector) in indices.iter().zip(vectors) {
+        if vector.len() != dimensions {
+            return Err(KinDbError::IndexError(format!(
+                "embedding returned {} dimensions, expected {}",
+                vector.len(),
+                dimensions
+            )));
+        }
+        chunk.push((*original_idx, vector, actual_producer));
+    }
+    Ok(chunk)
+}
+
+#[cfg(feature = "embeddings")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum HybridMode {
     Off,
@@ -3016,16 +3543,64 @@ fn balanced_partition_with_cpu_max_seq_len(
     (metal, cpu)
 }
 
-/// Scatter `(original_idx, vector)` placements back into input order, failing if
-/// any slot is missing.
 #[cfg(feature = "embeddings")]
-fn scatter_placed(
-    placed: Vec<(usize, Vec<f32>)>,
+fn produced_batch_from_attributed(attributed: Vec<AttributedEmbedding>) -> ProducedEmbeddingBatch {
+    let mut producers = EmbeddingProducerSet::new();
+    let mut vectors = Vec::with_capacity(attributed.len());
+    for embedding in attributed {
+        producers.extend(&embedding.producers);
+        vectors.push(embedding.vector);
+    }
+    ProducedEmbeddingBatch { vectors, producers }
+}
+
+#[cfg(feature = "embeddings")]
+fn fanout_attributed_embedding(
+    results: &mut [Option<AttributedEmbedding>],
+    slots: &[usize],
+    embedding: &AttributedEmbedding,
+) -> Result<(), KinDbError> {
+    let total = results.len();
+    for &original_idx in slots {
+        let slot = results.get_mut(original_idx).ok_or_else(|| {
+            KinDbError::IndexError(format!(
+                "embedding duplicate fanout position {original_idx} is out of range for {} inputs",
+                total
+            ))
+        })?;
+        if slot.is_some() {
+            return Err(KinDbError::IndexError(format!(
+                "embedding duplicate fanout attempted to overwrite position {original_idx}"
+            )));
+        }
+        *slot = Some(embedding.clone());
+    }
+    Ok(())
+}
+
+/// Scatter `(original_idx, vector, producer)` placements back into input order,
+/// failing if any slot is missing.
+#[cfg(feature = "embeddings")]
+fn scatter_attributed(
+    placed: Vec<(usize, Vec<f32>, EmbeddingProducer)>,
     total: usize,
-) -> Result<Vec<Vec<f32>>, KinDbError> {
-    let mut results: Vec<Option<Vec<f32>>> = vec![None; total];
-    for (original_idx, vector) in placed {
-        results[original_idx] = Some(vector);
+) -> Result<Vec<AttributedEmbedding>, KinDbError> {
+    let mut results: Vec<Option<AttributedEmbedding>> = vec![None; total];
+    for (original_idx, vector, producer) in placed {
+        let slot = results.get_mut(original_idx).ok_or_else(|| {
+            KinDbError::IndexError(format!(
+                "embedding batch returned out-of-range position {original_idx} for {total} inputs"
+            ))
+        })?;
+        if slot.is_some() {
+            return Err(KinDbError::IndexError(format!(
+                "embedding batch returned duplicate position {original_idx}"
+            )));
+        }
+        *slot = Some(AttributedEmbedding {
+            vector,
+            producers: EmbeddingProducerSet::singleton(producer),
+        });
     }
     results
         .into_iter()
@@ -3397,7 +3972,7 @@ struct VectorLruCache {
 #[cfg(feature = "embeddings")]
 #[derive(Debug)]
 struct LruEntry {
-    vector: Vec<f32>,
+    embedding: AttributedEmbedding,
     last_used: u64,
 }
 
@@ -3418,19 +3993,19 @@ impl VectorLruCache {
     }
 
     /// Return a clone of the cached vector and mark it most-recently-used.
-    fn get(&mut self, key: &str) -> Option<Vec<f32>> {
+    fn get(&mut self, key: &str) -> Option<AttributedEmbedding> {
         let tick = self.next_tick();
         let entry = self.entries.get_mut(key)?;
         entry.last_used = tick;
-        Some(entry.vector.clone())
+        Some(entry.embedding.clone())
     }
 
     /// Insert or refresh `key`, evicting the least-recently-used entry first
     /// when a new key would exceed capacity.
-    fn put(&mut self, key: &str, vector: Vec<f32>) {
+    fn put(&mut self, key: &str, embedding: AttributedEmbedding) {
         let tick = self.next_tick();
         if let Some(entry) = self.entries.get_mut(key) {
-            entry.vector = vector;
+            entry.embedding = embedding;
             entry.last_used = tick;
             return;
         }
@@ -3440,7 +4015,7 @@ impl VectorLruCache {
         self.entries.insert(
             key.to_string(),
             LruEntry {
-                vector,
+                embedding,
                 last_used: tick,
             },
         );
@@ -3510,21 +4085,27 @@ impl EmbeddingCache {
         hex::encode(hasher.finalize())
     }
 
-    fn get_by_key(&self, key: &str) -> Option<Vec<f32>> {
+    fn get_by_key(&self, key: &str) -> Option<AttributedEmbedding> {
         if let Some(cached) = self.memory_cache.lock().unwrap().get(key) {
             return Some(cached);
         }
 
-        if let Some(vector) = read_cached_vector(&self.path_for_key(key), self.dimensions) {
-            self.memory_cache.lock().unwrap().put(key, vector.clone());
-            Some(vector)
+        if let Some(embedding) = read_cached_embedding(&self.path_for_key(key), self.dimensions) {
+            self.memory_cache
+                .lock()
+                .unwrap()
+                .put(key, embedding.clone());
+            Some(embedding)
         } else {
             None
         }
     }
 
-    fn put_by_key(&self, key: &str, vector: &[f32]) {
+    fn put_by_key(&self, key: &str, vector: &[f32], producers: &EmbeddingProducerSet) {
         if vector.len() != self.dimensions {
+            return;
+        }
+        if producers.is_empty() || !producers.is_fully_attributed() {
             return;
         }
         if !vector.iter().all(|v| v.is_finite()) {
@@ -3540,15 +4121,29 @@ impl EmbeddingCache {
 
         {
             let mut cache = self.memory_cache.lock().unwrap();
-            cache.put(key, vector.to_vec());
+            cache.put(
+                key,
+                AttributedEmbedding {
+                    vector: vector.to_vec(),
+                    producers: producers.clone(),
+                },
+            );
         }
 
-        let _ = write_cached_vector(&self.path_for_key(key), vector);
+        let _ = write_cached_embedding(&self.path_for_key(key), vector, producers);
     }
 
     fn path_for_key(&self, key: &str) -> PathBuf {
         let prefix = &key[..2];
         self.root.join(prefix).join(format!("{key}.bin"))
+    }
+
+    #[cfg(test)]
+    fn test_is_empty(&self) -> bool {
+        self.memory_cache.lock().unwrap().len() == 0
+            && std::fs::read_dir(&self.root)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false)
     }
 }
 
@@ -3590,14 +4185,69 @@ fn sanitize_component(value: &str) -> String {
 }
 
 #[cfg(feature = "embeddings")]
-fn read_cached_vector(path: &Path, dimensions: usize) -> Option<Vec<f32>> {
-    let bytes = std::fs::read(path).ok()?;
-    if bytes.len() != dimensions * std::mem::size_of::<f32>() {
+const EMBEDDING_CACHE_ENTRY_MAGIC: [u8; 4] = *b"KEC4";
+#[cfg(feature = "embeddings")]
+const EMBEDDING_CACHE_ENTRY_DOMAIN: &[u8] = b"kindb-embedding-cache-entry-v4\0";
+#[cfg(feature = "embeddings")]
+const MAX_EMBEDDING_CACHE_PRODUCERS: usize = 5;
+
+#[cfg(feature = "embeddings")]
+fn read_cached_embedding(path: &Path, dimensions: usize) -> Option<AttributedEmbedding> {
+    let vector_bytes = dimensions.checked_mul(std::mem::size_of::<f32>())?;
+    let max_entry_bytes = EMBEDDING_CACHE_ENTRY_MAGIC
+        .len()
+        .checked_add(1)?
+        .checked_add(MAX_EMBEDDING_CACHE_PRODUCERS)?
+        .checked_add(vector_bytes)?
+        .checked_add(32)?;
+    let bytes = crate::storage::read_regular_bounded(
+        path,
+        "embedding cache entry",
+        u64::try_from(max_entry_bytes).ok()?,
+    )
+    .ok()?;
+    if bytes.len() < EMBEDDING_CACHE_ENTRY_MAGIC.len() + 1 + 32
+        || bytes[..4] != EMBEDDING_CACHE_ENTRY_MAGIC
+    {
+        return None;
+    }
+
+    let producer_count = bytes[4] as usize;
+    if producer_count == 0 || producer_count > MAX_EMBEDDING_CACHE_PRODUCERS {
+        return None;
+    }
+    let vector_offset = 5usize.checked_add(producer_count)?;
+    let digest_offset = vector_offset.checked_add(vector_bytes)?;
+    if bytes.len() != digest_offset.checked_add(32)? {
+        return None;
+    }
+    let mut producers = EmbeddingProducerSet::new();
+    let mut previous_tag = None;
+    for tag in &bytes[5..vector_offset] {
+        if previous_tag.is_some_and(|previous| previous >= *tag) {
+            return None;
+        }
+        let producer = EmbeddingProducer::from_cache_tag(*tag)?;
+        if !producers.insert(producer) {
+            return None;
+        }
+        previous_tag = Some(*tag);
+    }
+    if !producers.is_fully_attributed() {
+        return None;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(EMBEDDING_CACHE_ENTRY_DOMAIN);
+    hasher.update(&bytes[..digest_offset]);
+    let digest: [u8; 32] = hasher.finalize().into();
+    if bytes[digest_offset..] != digest[..] {
+        let _ = std::fs::remove_file(path);
         return None;
     }
 
     let mut values = Vec::with_capacity(dimensions);
-    for chunk in bytes.chunks_exact(std::mem::size_of::<f32>()) {
+    for chunk in bytes[vector_offset..digest_offset].chunks_exact(std::mem::size_of::<f32>()) {
         values.push(f32::from_le_bytes(chunk.try_into().ok()?));
     }
     // Poisoned cache entries from prior builds must not be returned: treat them
@@ -3614,49 +4264,100 @@ fn read_cached_vector(path: &Path, dimensions: usize) -> Option<Vec<f32>> {
         let _ = std::fs::remove_file(path);
         return None;
     }
-    Some(values)
+    Some(AttributedEmbedding {
+        vector: values,
+        producers,
+    })
 }
 
-/// Replace non-finite embeddings with a zero vector of the correct dimension.
-/// Cosine distance's zero-norm guard then produces a sentinel distance of 1.0
-/// rather than propagating NaN through the search index.
+/// Replace a malformed backend result with KinDB's local zero sentinel and
+/// discard the backend attribution. The returned bytes were created by KinDB,
+/// not by the runtime that failed, so preserving CPU/Metal/CUDA/Remote here
+/// would manufacture producer evidence. `Unspecified` keeps local sentinel
+/// behavior while making hosted persistence fail closed and preventing caching.
 #[cfg(feature = "embeddings")]
-fn sanitize_embedding<'a, F>(vector: Vec<f32>, dimensions: usize, describe: F) -> Vec<f32>
+fn sanitize_attributed_embedding<'a, F>(
+    mut embedding: AttributedEmbedding,
+    dimensions: usize,
+    describe: F,
+) -> AttributedEmbedding
 where
     F: FnOnce() -> &'a str,
 {
-    let needs_fix = vector.len() != dimensions || !vector.iter().all(|v| v.is_finite());
+    let needs_fix = embedding.vector.len() != dimensions
+        || !embedding.vector.iter().all(|value| value.is_finite());
     if !needs_fix {
-        return vector;
+        return embedding;
     }
     let text = describe();
     let preview: String = text.chars().take(64).collect();
     tracing::error!(
-        dims = vector.len(),
+        dims = embedding.vector.len(),
         expected_dims = dimensions,
-        nan_count = vector.iter().filter(|v| v.is_nan()).count(),
-        inf_count = vector.iter().filter(|v| v.is_infinite()).count(),
+        nan_count = embedding.vector.iter().filter(|v| v.is_nan()).count(),
+        inf_count = embedding.vector.iter().filter(|v| v.is_infinite()).count(),
         text_len = text.len(),
         text_preview = %preview,
-        "embedder produced non-finite vector; substituting zero vector"
+        "embedder produced malformed vector; substituting unattributed zero vector"
     );
-    vec![0.0f32; dimensions]
+    embedding.vector = vec![0.0f32; dimensions];
+    embedding.producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Unspecified);
+    embedding
 }
 
 #[cfg(feature = "embeddings")]
-fn write_cached_vector(path: &Path, vector: &[f32]) -> std::io::Result<()> {
+fn write_cached_embedding(
+    path: &Path,
+    vector: &[f32],
+    producers: &EmbeddingProducerSet,
+) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    let mut bytes = Vec::with_capacity(std::mem::size_of_val(vector));
+    let producer_count = u8::try_from(producers.len()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedding cache producer set is too large",
+        )
+    })?;
+    if producer_count == 0 || !producers.is_fully_attributed() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "embedding cache producer set is empty or unattributed",
+        ));
+    }
+    let mut bytes = Vec::with_capacity(5 + producers.len() + std::mem::size_of_val(vector) + 32);
+    bytes.extend_from_slice(&EMBEDDING_CACHE_ENTRY_MAGIC);
+    bytes.push(producer_count);
+    bytes.extend(producers.iter().map(EmbeddingProducer::cache_tag));
     for value in vector {
         bytes.extend_from_slice(&value.to_le_bytes());
     }
+    let mut hasher = Sha256::new();
+    hasher.update(EMBEDDING_CACHE_ENTRY_DOMAIN);
+    hasher.update(&bytes);
+    bytes.extend_from_slice(&hasher.finalize());
 
-    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
-    std::fs::write(&tmp, bytes)?;
-    std::fs::rename(&tmp, path)?;
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)?;
+    let write_result = file.write_all(&bytes).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -4875,17 +5576,463 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
+    fn single_flight_initialization_waits_for_one_builder_and_returns_its_value() {
+        let cell = std::sync::Arc::new(std::sync::OnceLock::<u32>::new());
+        let source = std::sync::Arc::new(std::sync::Mutex::new(Some(7u32)));
+        let builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+
+        let first = {
+            let cell = std::sync::Arc::clone(&cell);
+            let source = std::sync::Arc::clone(&source);
+            let builds = std::sync::Arc::clone(&builds);
+            std::thread::spawn(move || {
+                *get_or_try_init_single_flight_with_wait_hook(
+                    &cell,
+                    &source,
+                    |value| {
+                        builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        started_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(*value * 2)
+                    },
+                    || panic!("the first builder must acquire the source lock"),
+                )
+                .unwrap()
+            })
+        };
+        started_rx.recv().unwrap();
+
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::sync_channel(0);
+        let second = {
+            let cell = std::sync::Arc::clone(&cell);
+            let source = std::sync::Arc::clone(&source);
+            let builds = std::sync::Arc::clone(&builds);
+            std::thread::spawn(move || {
+                *get_or_try_init_single_flight_with_wait_hook(
+                    &cell,
+                    &source,
+                    |value| {
+                        builds.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Ok(*value * 99)
+                    },
+                    || waiting_tx.send(()).unwrap(),
+                )
+                .unwrap()
+            })
+        };
+        waiting_rx.recv().unwrap();
+        assert_eq!(
+            builds.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a waiting caller must not run a second builder"
+        );
+        release_tx.send(()).unwrap();
+
+        assert_eq!(first.join().unwrap(), 14);
+        assert_eq!(second.join().unwrap(), 14);
+        assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(source.lock().unwrap().is_none());
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn single_flight_failed_build_retains_source_for_retry() {
+        let cell = std::sync::OnceLock::<u32>::new();
+        let source = std::sync::Mutex::new(Some(11u32));
+        let error = get_or_try_init_single_flight(&cell, &source, |_| {
+            Err(KinDbError::IndexError("synthetic init failure".into()))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("synthetic init failure"));
+        assert_eq!(*source.lock().unwrap(), Some(11));
+
+        assert_eq!(
+            *get_or_try_init_single_flight(&cell, &source, |value| Ok(*value + 1)).unwrap(),
+            12
+        );
+        assert!(source.lock().unwrap().is_none());
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
     fn embedding_cache_round_trips_vectors() {
         let dir = tempfile::tempdir().unwrap();
-        let cache =
+        let writer =
             EmbeddingCache::new_in(dir.path().to_path_buf(), "test_model-namespace".into(), 4)
                 .expect("cache should initialize");
-        let key = cache.key_for_text("hello");
+        let key = writer.key_for_text("hello");
 
-        assert!(cache.get_by_key(&key).is_none());
+        assert!(writer.get_by_key(&key).is_none());
 
-        cache.put_by_key(&key, &[1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(cache.get_by_key(&key).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        writer.put_by_key(&key, &[1.0, 2.0, 3.0, 4.0], &producers);
+        let path = writer.path_for_key(&key);
+        assert!(path.is_file(), "put must persist a cache entry to disk");
+
+        let reader =
+            EmbeddingCache::new_in(dir.path().to_path_buf(), "test_model-namespace".into(), 4)
+                .expect("fresh cache should reopen the same namespace");
+        let expected = AttributedEmbedding {
+            vector: vec![1.0, 2.0, 3.0, 4.0],
+            producers,
+        };
+        assert_eq!(
+            reader.get_by_key(&key).unwrap(),
+            expected,
+            "a fresh instance must recover the entry from disk"
+        );
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            reader.get_by_key(&key).unwrap(),
+            expected,
+            "the reopened instance must retain its verified disk hit in the LRU"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn embedding_cache_digest_rejects_producer_and_vector_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = EmbeddingCache::new_in(dir.path().to_path_buf(), "tamper".into(), 4)
+            .expect("cache should initialize");
+        let key = cache.key_for_text("tamper-me");
+        let path = cache.path_for_key(&key);
+        let vector = [1.0, 2.0, 3.0, 4.0];
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+
+        write_cached_embedding(&path, &vector, &producers).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[5] = EmbeddingProducer::Metal.cache_tag();
+        std::fs::write(&path, bytes).unwrap();
+        assert!(read_cached_embedding(&path, 4).is_none());
+
+        write_cached_embedding(&path, &vector, &producers).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[6] ^= 0x01;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(read_cached_embedding(&path, 4).is_none());
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn embedding_cache_reader_rejects_oversized_truncated_and_symlink_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let dimensions = 4;
+        let vector = [1.0, 2.0, 3.0, 4.0];
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+
+        let oversized_path = dir.path().join("oversized.bin");
+        let max_entry_bytes =
+            5 + MAX_EMBEDDING_CACHE_PRODUCERS + dimensions * std::mem::size_of::<f32>() + 32;
+        std::fs::write(&oversized_path, vec![0u8; max_entry_bytes + 1]).unwrap();
+        assert!(
+            read_cached_embedding(&oversized_path, dimensions).is_none(),
+            "an entry above the fixed dimensional bound must miss before allocation"
+        );
+
+        let truncated_path = dir.path().join("truncated.bin");
+        write_cached_embedding(&truncated_path, &vector, &producers).unwrap();
+        let mut truncated = std::fs::read(&truncated_path).unwrap();
+        truncated.pop();
+        std::fs::write(&truncated_path, truncated).unwrap();
+        assert!(
+            read_cached_embedding(&truncated_path, dimensions).is_none(),
+            "a truncated entry must not be accepted"
+        );
+
+        let target_path = dir.path().join("target.bin");
+        write_cached_embedding(&target_path, &vector, &producers).unwrap();
+        let symlink_path = dir.path().join("symlink.bin");
+        std::os::unix::fs::symlink(&target_path, &symlink_path).unwrap();
+        assert!(
+            read_cached_embedding(&symlink_path, dimensions).is_none(),
+            "cache reads must not follow an ambient symlink"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn legacy_vector_only_cache_entry_is_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-kec3.bin");
+        let mut legacy = b"KEC3".to_vec();
+        legacy.extend_from_slice(&1.0f32.to_le_bytes());
+        legacy.extend_from_slice(&2.0f32.to_le_bytes());
+        std::fs::write(&path, legacy).unwrap();
+        assert!(
+            read_cached_embedding(&path, 2).is_none(),
+            "a vector-only cache entry cannot be relabeled from current configuration"
+        );
+        std::fs::write(
+            &path,
+            [1.0f32, 2.0f32]
+                .into_iter()
+                .flat_map(f32::to_le_bytes)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(
+            read_cached_embedding(&path, 2).is_none(),
+            "a pre-header raw-float cache entry must also miss"
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn actual_backend_mapping_ignores_the_configured_route() {
+        let configured = GpuBackend::Metal;
+        let returning = GpuBackend::Cpu;
+        let actual = actual_producer_from_returning_backend(returning);
+        assert_eq!(actual, EmbeddingProducer::Cpu);
+        assert_ne!(actual, actual_producer_from_returning_backend(configured));
+        assert_eq!(
+            actual_producer_from_returning_backend(GpuBackend::Metal),
+            EmbeddingProducer::Metal
+        );
+        assert_eq!(
+            actual_producer_from_returning_backend(GpuBackend::Cuda),
+            EmbeddingProducer::Cuda
+        );
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn cpu_route_cpu_twin_construction_failure_uses_primary_actual_backend_through_process_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let (embedder, stats) = CodeEmbedder::test_cpu_route_with_unavailable_twin(
+            2,
+            dir.path().to_path_buf(),
+            GpuBackend::Metal,
+            vec![1.0, 0.0],
+        );
+        let produced = embedder
+            .embed_batch_with_producers(&["cpu-route-primary".to_string()])
+            .unwrap();
+
+        assert_eq!(produced.vectors, vec![vec![1.0, 0.0]]);
+        assert_eq!(
+            produced.producers,
+            EmbeddingProducerSet::singleton(EmbeddingProducer::Metal)
+        );
+        assert_eq!(stats.cpu_model_calls(), 1);
+        assert_eq!(stats.primary_forward_calls(), 1);
+        assert_eq!(stats.cpu_forward_calls(), 0);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn metal_oom_fallback_records_the_cpu_model_that_returned_the_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let (embedder, stats) =
+            CodeEmbedder::test_local_oom_fallback(2, dir.path().to_path_buf(), vec![0.25, 0.75]);
+        let produced = embedder
+            .embed_batch_with_producers(&["model-free-oom".to_string()])
+            .unwrap();
+
+        assert_eq!(produced.vectors, vec![vec![0.25, 0.75]]);
+        assert_eq!(
+            produced.producers,
+            EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu)
+        );
+        assert_eq!(stats.primary_forward_calls(), 1);
+        assert_eq!(stats.cpu_model_calls(), 1);
+        assert_eq!(stats.cpu_forward_calls(), 1);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn non_oom_local_forward_error_is_not_classified_as_cpu_fallback() {
+        let classifier_error = metal_oom_reason(kin_infer::InferError::ModelError(
+            "synthetic non-OOM failure".to_string(),
+        ))
+        .expect_err("generic local failures must return Err without producer evidence");
+        assert!(classifier_error
+            .to_string()
+            .contains("synthetic non-OOM failure"));
+        assert_eq!(
+            metal_oom_reason(kin_infer::InferError::OutOfMemory("oom".to_string())).unwrap(),
+            "oom"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let (embedder, stats) = CodeEmbedder::test_local_forward_error(
+            2,
+            dir.path().to_path_buf(),
+            "synthetic non-OOM primary failure",
+        );
+        assert!(embedder.test_cache_is_empty());
+        let error = embedder
+            .embed_batch_with_producers(&["local-error".to_string()])
+            .expect_err("a non-OOM local forward failure must return no batch or producers");
+        assert!(error
+            .to_string()
+            .contains("synthetic non-OOM primary failure"));
+        assert!(
+            embedder.test_cache_is_empty(),
+            "a failed local forward must not populate disk or memory cache"
+        );
+        assert_eq!(stats.primary_forward_calls(), 1);
+        assert_eq!(stats.cpu_model_calls(), 0);
+        assert_eq!(stats.cpu_forward_calls(), 0);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn sanitizer_does_not_attribute_kindb_generated_zero_vectors_to_the_backend() {
+        let sanitized = sanitize_attributed_embedding(
+            AttributedEmbedding::remote(vec![f32::NAN, 1.0]),
+            2,
+            || "synthetic malformed remote vector",
+        );
+        assert_eq!(sanitized.vector, vec![0.0, 0.0]);
+        assert_eq!(
+            sanitized.producers,
+            EmbeddingProducerSet::singleton(EmbeddingProducer::Unspecified)
+        );
+        assert_eq!(
+            produced_batch_from_attributed(vec![sanitized.clone()]).producers,
+            EmbeddingProducerSet::singleton(EmbeddingProducer::Unspecified)
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = EmbeddingCache::new_in(dir.path().to_path_buf(), "sanitized".into(), 2)
+            .expect("cache should initialize");
+        let key = cache.key_for_text("malformed");
+        cache.put_by_key(&key, &sanitized.vector, &sanitized.producers);
+        assert!(cache.test_is_empty());
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn out_of_order_scatter_preserves_vectors_and_mixed_actual_producers() {
+        let attributed = scatter_attributed(
+            vec![
+                (2, vec![2.0], EmbeddingProducer::Metal),
+                (0, vec![0.0], EmbeddingProducer::Cpu),
+                (3, vec![3.0], EmbeddingProducer::Cuda),
+                (1, vec![1.0], EmbeddingProducer::Metal),
+            ],
+            4,
+        )
+        .unwrap();
+        let batch = produced_batch_from_attributed(attributed);
+        assert_eq!(
+            batch.vectors,
+            vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0]]
+        );
+        let mut expected = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        expected.insert(EmbeddingProducer::Metal);
+        expected.insert(EmbeddingProducer::Cuda);
+        assert_eq!(batch.producers, expected);
+
+        assert!(scatter_attributed(
+            vec![
+                (0, vec![0.0], EmbeddingProducer::Cpu),
+                (0, vec![1.0], EmbeddingProducer::Metal),
+            ],
+            2,
+        )
+        .is_err());
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn scripted_hybrid_arms_record_both_actual_models_and_restore_input_order() {
+        let stats = std::sync::Arc::new(TestLocalRuntimeStats::default());
+        let runtime = TestLocalRuntime {
+            primary: TestLocalModel {
+                backend: GpuBackend::Metal,
+                forward: TestLocalForward::Success(vec![0.0, 1.0]),
+            },
+            cpu: Some(TestLocalModel {
+                backend: GpuBackend::Cpu,
+                forward: TestLocalForward::Success(vec![1.0, 0.0]),
+            }),
+            cpu_model_error: None,
+            backend_choice: EmbedBackendChoice::Metal {
+                reason: "scripted_hybrid_primary",
+            },
+            stats: std::sync::Arc::clone(&stats),
+        };
+        let token_ids = vec![vec![1u32]];
+        let masks = vec![vec![1u32]];
+        let mut scattered = process_chunk_with_runtime(
+            &runtime,
+            EmbedBackendChoice::Metal {
+                reason: "hybrid_metal",
+            },
+            &token_ids,
+            &masks,
+            &[1],
+            1,
+            2,
+        )
+        .unwrap();
+        scattered.extend(
+            process_chunk_with_runtime(
+                &runtime,
+                EmbedBackendChoice::Cpu {
+                    reason: "hybrid_cpu",
+                },
+                &token_ids,
+                &masks,
+                &[0],
+                1,
+                2,
+            )
+            .unwrap(),
+        );
+        let produced = produced_batch_from_attributed(
+            scatter_attributed(scattered, 2).expect("hybrid indices are complete"),
+        );
+
+        assert_eq!(produced.vectors, vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        let mut expected = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        expected.insert(EmbeddingProducer::Metal);
+        assert_eq!(produced.producers, expected);
+        assert_eq!(stats.primary_forward_calls(), 1);
+        assert_eq!(stats.cpu_model_calls(), 1);
+        assert_eq!(stats.cpu_forward_calls(), 1);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn cached_cpu_and_fresh_metal_fanout_union_actual_producers() {
+        let mut slots = vec![
+            Some(AttributedEmbedding {
+                vector: vec![0.0],
+                producers: EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
+            }),
+            None,
+            None,
+        ];
+        let fresh = AttributedEmbedding {
+            vector: vec![1.0],
+            producers: EmbeddingProducerSet::singleton(EmbeddingProducer::Metal),
+        };
+        fanout_attributed_embedding(&mut slots, &[1, 2], &fresh).unwrap();
+        let batch = produced_batch_from_attributed(
+            slots
+                .into_iter()
+                .map(|slot| slot.expect("cached and fresh fanout must fill every slot"))
+                .collect(),
+        );
+        let mut expected = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        expected.insert(EmbeddingProducer::Metal);
+        assert_eq!(batch.producers, expected);
+        assert_eq!(batch.vectors.len(), 3);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn remote_result_and_cache_hit_remain_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("remote.bin");
+        let attributed = AttributedEmbedding::remote(vec![1.0, 2.0]);
+        write_cached_embedding(&path, &attributed.vector, &attributed.producers).unwrap();
+        assert_eq!(read_cached_embedding(&path, 2).unwrap(), attributed);
     }
 
     #[cfg(feature = "embeddings")]
@@ -4965,9 +6112,22 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     fn test_openai_embedder(query_prefix: &str, document_prefix: &str) -> OpenAiCompatEmbedder {
+        test_openai_embedder_at(
+            "http://localhost:1234/v1/embeddings".to_string(),
+            query_prefix,
+            document_prefix,
+        )
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn test_openai_embedder_at(
+        endpoint: String,
+        query_prefix: &str,
+        document_prefix: &str,
+    ) -> OpenAiCompatEmbedder {
         OpenAiCompatEmbedder {
             client: BlockingHttpClient::new(),
-            endpoint: "http://localhost:1234/v1/embeddings".into(),
+            endpoint,
             model_id: "test-embed".into(),
             api_key: None,
             dimensions: 2,
@@ -4975,6 +6135,89 @@ mod tests {
             query_prefix: query_prefix.into(),
             document_prefix: document_prefix.into(),
         }
+    }
+
+    #[cfg(feature = "embeddings")]
+    fn serve_one_embedding_response(
+        status: &str,
+        body: &str,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let status = status.to_string();
+        let body = body.to_string();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}/v1/embeddings"), server)
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn openai_remote_result_and_cached_hit_preserve_actual_producer() {
+        let (endpoint, server) = serve_one_embedding_response(
+            "200 OK",
+            r#"{"data":[{"index":0,"embedding":[1.0,0.0]}]}"#,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            EmbeddingCache::new_in(dir.path().to_path_buf(), "remote-mock".into(), 2).unwrap();
+        let embedder = CodeEmbedder {
+            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder_at(endpoint, "", "")),
+            dimensions: 2,
+            cache: Some(cache),
+        };
+        let texts = vec!["remote-result".to_string()];
+
+        let fresh = embedder.embed_batch_with_producers(&texts).unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            fresh.producers,
+            EmbeddingProducerSet::singleton(EmbeddingProducer::Remote)
+        );
+        assert_eq!(fresh.vectors, vec![vec![1.0, 0.0]]);
+
+        // The one-shot server is gone. Success now proves the cache preserved
+        // the remote producer alongside the vector rather than relabeling it.
+        let cached = embedder.embed_batch_with_producers(&texts).unwrap();
+        assert_eq!(cached, fresh);
+    }
+
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn openai_error_returns_no_provenance_and_does_not_cache() {
+        let (endpoint, server) =
+            serve_one_embedding_response("500 Internal Server Error", r#"{"error":"boom"}"#);
+        let dir = tempfile::tempdir().unwrap();
+        let cache =
+            EmbeddingCache::new_in(dir.path().to_path_buf(), "remote-error".into(), 2).unwrap();
+        let key = cache.key_for_text("remote-error");
+        let cache_path = cache.path_for_key(&key);
+        let embedder = CodeEmbedder {
+            backend: CodeEmbedderBackend::OpenAiCompat(test_openai_embedder_at(endpoint, "", "")),
+            dimensions: 2,
+            cache: Some(cache),
+        };
+
+        let error = embedder
+            .embed_batch_with_producers(&["remote-error".to_string()])
+            .expect_err("an endpoint error must not manufacture producer evidence");
+        server.join().unwrap();
+        assert!(error.to_string().contains("HTTP 500"));
+        assert!(
+            !cache_path.exists(),
+            "a failed forward must not leave a vector or producer cache entry"
+        );
     }
 
     #[cfg(feature = "embeddings")]
@@ -5073,8 +6316,12 @@ mod tests {
     fn vector_lru_hit_and_miss() {
         let mut lru = VectorLruCache::with_capacity(4);
         assert_eq!(lru.get("absent"), None);
-        lru.put("k", vec![0.5, 0.25]);
-        assert_eq!(lru.get("k"), Some(vec![0.5, 0.25]));
+        let embedding = AttributedEmbedding {
+            vector: vec![0.5, 0.25],
+            producers: EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
+        };
+        lru.put("k", embedding.clone());
+        assert_eq!(lru.get("k"), Some(embedding));
         assert_eq!(lru.len(), 1);
     }
 
@@ -5082,12 +6329,16 @@ mod tests {
     #[cfg(feature = "embeddings")]
     fn vector_lru_evicts_least_recently_used() {
         let mut lru = VectorLruCache::with_capacity(2);
-        lru.put("a", vec![1.0]);
-        lru.put("b", vec![2.0]);
+        let attributed = |value| AttributedEmbedding {
+            vector: vec![value],
+            producers: EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
+        };
+        lru.put("a", attributed(1.0));
+        lru.put("b", attributed(2.0));
         // Touch "a" so "b" becomes the least-recently-used entry.
-        assert_eq!(lru.get("a"), Some(vec![1.0]));
+        assert_eq!(lru.get("a"), Some(attributed(1.0)));
         // Inserting a third key over capacity must evict "b" only.
-        lru.put("c", vec![3.0]);
+        lru.put("c", attributed(3.0));
         assert_eq!(lru.len(), 2);
         assert!(lru.contains_key("a"));
         assert!(lru.contains_key("c"));
@@ -5099,12 +6350,16 @@ mod tests {
     #[cfg(feature = "embeddings")]
     fn vector_lru_refresh_existing_does_not_evict() {
         let mut lru = VectorLruCache::with_capacity(2);
-        lru.put("a", vec![1.0]);
-        lru.put("b", vec![2.0]);
+        let attributed = |value| AttributedEmbedding {
+            vector: vec![value],
+            producers: EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
+        };
+        lru.put("a", attributed(1.0));
+        lru.put("b", attributed(2.0));
         // Updating an existing key is not a new insertion — nothing is evicted.
-        lru.put("a", vec![9.0]);
+        lru.put("a", attributed(9.0));
         assert_eq!(lru.len(), 2);
-        assert_eq!(lru.get("a"), Some(vec![9.0]));
+        assert_eq!(lru.get("a"), Some(attributed(9.0)));
         assert!(lru.contains_key("b"));
     }
 
@@ -5114,33 +6369,34 @@ mod tests {
     #[test]
     #[cfg(feature = "embeddings")]
     fn lru_served_vector_equals_disk_read() {
-        let tmp =
-            std::env::temp_dir().join(format!("kin-db-embed-lru-test-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&tmp);
+        let tmp = tempfile::tempdir().unwrap();
         let dims = 4;
 
-        let writer = EmbeddingCache::new_in(tmp.clone(), "lru-equality".to_string(), dims)
-            .expect("cache root");
+        let writer =
+            EmbeddingCache::new_in(tmp.path().to_path_buf(), "lru-equality".to_string(), dims)
+                .expect("cache root");
         let key = writer.key_for_text("function\nsrc/lib.rs\nload_registry");
         let vector = vec![0.5_f32, -0.25, 0.125, 0.0625];
-        writer.put_by_key(&key, &vector);
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        writer.put_by_key(&key, &vector, &producers);
 
         // Direct disk read of the persisted vector.
-        let from_disk = read_cached_vector(&writer.path_for_key(&key), dims).expect("on-disk hit");
+        let from_disk =
+            read_cached_embedding(&writer.path_for_key(&key), dims).expect("on-disk hit");
 
         // A fresh cache over the same root starts with an empty LRU, so the
         // first read is served from disk (and populates the LRU); the second is
         // served from the LRU. Both must equal the disk bytes.
-        let reader = EmbeddingCache::new_in(tmp.clone(), "lru-equality".to_string(), dims)
-            .expect("cache root");
+        let reader =
+            EmbeddingCache::new_in(tmp.path().to_path_buf(), "lru-equality".to_string(), dims)
+                .expect("cache root");
         let served_from_disk = reader.get_by_key(&key).expect("disk-backed hit");
         let served_from_lru = reader.get_by_key(&key).expect("memory hit");
 
-        assert_eq!(from_disk, vector);
-        assert_eq!(served_from_disk, vector);
-        assert_eq!(served_from_lru, vector);
+        let expected = AttributedEmbedding { vector, producers };
+        assert_eq!(from_disk, expected);
+        assert_eq!(served_from_disk, expected);
+        assert_eq!(served_from_lru, expected);
         assert_eq!(served_from_lru, from_disk);
-
-        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

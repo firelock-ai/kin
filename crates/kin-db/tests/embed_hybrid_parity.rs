@@ -19,7 +19,8 @@
 //! fp parity is measured separately on real Metal hardware; this test pins the
 //! dispatch/scatter machinery that the GPU path also relies on.)
 
-use kin_db::CodeEmbedder;
+use kin_db::{CodeEmbedder, EmbeddingProducer};
+use kin_infer::gpu::GpuBackend;
 
 /// A batch of distinct short entities. The Balanced split routes a `ratio /
 /// (ratio + 1)` majority to the GPU arm and the remainder to the CPU twin, so
@@ -83,8 +84,8 @@ fn throughput_hybrid_split_matches_single_arm_and_preserves_order() {
     // Reset the dispatch counters first so the snapshot reflects only this embed.
     kin_db::embed::hybrid_metrics::reset();
     std::env::set_var("KIN_RESOURCE_PROFILE", "throughput");
-    let hybrid = embedder
-        .embed_batch(&texts)
+    let hybrid_batch = embedder
+        .embed_batch_with_producers(&texts)
         .expect("throughput-hybrid embed must succeed");
     std::env::remove_var("KIN_RESOURCE_PROFILE");
     std::env::remove_var("KIN_EMBED_MAX_BATCH_TOKENS");
@@ -114,6 +115,27 @@ fn throughput_hybrid_split_matches_single_arm_and_preserves_order() {
         stats.single_side_batches,
         stats.twin_unavailable_batches
     );
+
+    assert!(
+        hybrid_batch.producers.is_fully_attributed(),
+        "a real hybrid batch must never be labeled from configuration or as unspecified"
+    );
+    let primary = embedder
+        .local_backend()
+        .expect("hybrid parity uses a local inference backend");
+    let mut expected_producers = kin_db::EmbeddingProducerSet::singleton(match primary {
+        GpuBackend::Cpu => EmbeddingProducer::Cpu,
+        GpuBackend::Metal => EmbeddingProducer::Metal,
+        GpuBackend::Cuda => EmbeddingProducer::Cuda,
+    });
+    if primary != GpuBackend::Cpu {
+        expected_producers.insert(EmbeddingProducer::Cpu);
+    }
+    assert_eq!(
+        hybrid_batch.producers, expected_producers,
+        "hybrid evidence must name the actual primary and CPU-twin runtimes, not logical arm labels"
+    );
+    let hybrid = hybrid_batch.vectors;
 
     assert_eq!(
         hybrid.len(),

@@ -13,10 +13,16 @@ pub mod types;
 #[cfg(feature = "vector")]
 pub mod vector;
 
-pub use embed::CodeEmbedder;
+pub use embed::{
+    CodeEmbedder, EmbeddingProducer, EmbeddingProducerSet, ProducedEmbeddingBatch,
+    VectorProducerProvenance,
+};
 #[cfg(feature = "vector")]
 pub use engine::VectorSalvageStats;
-pub use engine::{EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ResolvedRetrievalItem};
+pub use engine::{
+    EmbeddingStatus, InMemoryGraph, PersistenceEpoch, ProducedSemanticSearch,
+    ProducedSemanticSearchBatch, ResolvedRetrievalItem,
+};
 pub use error::{KinDbError, Result};
 pub use kin_search::TEXT_INDEX_FORMAT_VERSION;
 pub use retrieval::{unified_retrieve, RetrievalCandidate, RetrievalQuery};
@@ -36,17 +42,22 @@ pub use storage::{
     VerificationReport, REPO_TRUTH_HASH_VERSION, ZERO_HASH,
 };
 pub use storage::{
-    load_recovered_snapshot, AuthorityPayloadStats, Generation, LocalFileBackend,
-    LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta, PersistedVectorArtifact,
-    RecoveredSnapshot, SnapshotAuthority, SnapshotCursor, SnapshotRecoveryState,
-    SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch, StorageBackend,
-    VectorArtifact, VectorArtifactBinding, VectorArtifactCursor, VectorArtifactLoadOutcome,
-    VectorArtifactSaveOutcome, VectorRepositoryIdentity, VerifiedSourceBlob,
-    VerifiedSourceBlobBatch, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES,
+    load_recovered_snapshot, AuthorityPayloadStats, GcsFullAuthorityEnvelopeCompatibility,
+    Generation, LocalFileBackend, LocalNamespaceIdentityFault, LocalNamespaceProbe, PersistedDelta,
+    PersistedVectorArtifact, RecoveredSnapshot, SnapshotAuthority, SnapshotCursor,
+    SnapshotRecoveryState, SnapshotSaveOutcome, SourceBlobValidationRequest, SourceBlobWriteBatch,
+    StorageBackend, VectorArtifact, VectorArtifactBinding, VectorArtifactCursor,
+    VectorArtifactLoadOutcome, VectorArtifactSaveOutcome, VectorRepositoryIdentity,
+    VerifiedSourceBlob, VerifiedSourceBlobBatch, GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY,
+    GENERATION_INIT, MAX_SOURCE_BLOB_BYTES, MAX_VECTOR_ARTIFACT_BYTES,
     MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
 #[cfg(feature = "vector")]
-pub use storage::{validate_hosted_vector_artifact_inner, VECTOR_INDEX_METADATA_VERSION};
+pub use storage::{
+    read_hosted_vector_artifact_actual_producers, validate_hosted_vector_artifact_inner,
+    validate_hosted_vector_artifact_inner_for_producers,
+    validate_hosted_vector_artifact_inner_with_producers, VECTOR_INDEX_METADATA_VERSION,
+};
 pub use storage::{
     AuthorityCommitDecision, AuthorityPublication, AuthorityReadLease, DurableAuthorityPersistence,
     PersistOutcome, VersionedAuthorityState,

@@ -36,8 +36,11 @@ use crate::storage::backend::{
     VectorArtifactSaveOutcome, VectorRepositoryIdentity, GENERATION_INIT, MAX_SOURCE_BLOB_BYTES,
     MAX_VECTOR_ARTIFACT_BYTES, MAX_VECTOR_ARTIFACT_METADATA_BYTES,
 };
+use crate::storage::gcs_compatibility::{
+    full_authority_envelope_magic, full_authority_envelope_version,
+};
+use crate::storage::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY;
 
-const GCS_FULL_AUTHORITY_MAGIC: [u8; 8] = *b"KNGCSF02";
 const GCS_FULL_AUTHORITY_HEADER_LEN: usize = 8 + 8 + 32;
 const GCS_VECTOR_ARTIFACT_MAGIC: [u8; 8] = *b"KNGCSV02";
 const GCS_VECTOR_ARTIFACT_HEADER_LEN: usize = 8 + 32 + 8 + 4 + 32 + 8 + 8 + 32;
@@ -178,7 +181,9 @@ impl GcsBackend {
             KinDbError::StorageError("GCS snapshot payload length exceeds u64".to_string())
         })?;
         let mut encoded = Vec::with_capacity(GCS_FULL_AUTHORITY_HEADER_LEN + snapshot_bytes.len());
-        encoded.extend_from_slice(&GCS_FULL_AUTHORITY_MAGIC);
+        encoded.extend_from_slice(&full_authority_envelope_magic(
+            GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
+        )?);
         encoded.extend_from_slice(&payload_len.to_le_bytes());
         encoded.extend_from_slice(&Sha256::digest(snapshot_bytes));
         encoded.extend_from_slice(snapshot_bytes);
@@ -186,10 +191,19 @@ impl GcsBackend {
     }
 
     fn decode_full_snapshot_authority(bytes: &[u8]) -> Result<Vec<u8>, KinDbError> {
-        if !bytes.starts_with(&GCS_FULL_AUTHORITY_MAGIC) {
-            return Err(KinDbError::StorageError(
-                "GCS snapshot object is not a current full-authority envelope".to_string(),
-            ));
+        let version = full_authority_envelope_version(bytes)?;
+        if !GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.supports(version) {
+            let direction =
+                if version < GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version {
+                    "older than"
+                } else {
+                    "newer than"
+                };
+            return Err(KinDbError::StorageError(format!(
+                "GCS full-authority envelope version {version} is {direction} the range this binary supports (versions {} through {})",
+                GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version,
+                GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
+            )));
         }
         if bytes.len() < GCS_FULL_AUTHORITY_HEADER_LEN {
             return Err(KinDbError::StorageError(
@@ -2763,6 +2777,11 @@ pub(crate) mod tests {
     fn gcs_full_snapshot_authority_envelope_roundtrips_and_detects_corruption() {
         let bytes = GraphSnapshot::empty().to_bytes().unwrap();
         let encoded = GcsBackend::encode_full_snapshot_authority(&bytes).unwrap();
+        assert_eq!(
+            full_authority_envelope_version(&encoded).unwrap(),
+            GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
+            "the writer must emit the version it publicly advertises"
+        );
         let decoded = GcsBackend::decode_full_snapshot_authority(&encoded).unwrap();
         assert_eq!(decoded, bytes);
 
@@ -2770,11 +2789,37 @@ pub(crate) mod tests {
             .expect_err("raw snapshot bytes are not current GCS authority");
         assert!(error.to_string().contains("not a current"));
 
-        let mut corrupt = encoded;
+        let mut corrupt = encoded.clone();
         *corrupt.last_mut().unwrap() ^= 0xff;
         let error = GcsBackend::decode_full_snapshot_authority(&corrupt)
             .expect_err("corrupt authoritative envelope must fail closed");
         assert!(error.to_string().contains("digest mismatch"));
+
+        for (version, direction) in [
+            (
+                GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version - 1,
+                "older than",
+            ),
+            (
+                GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version + 1,
+                "newer than",
+            ),
+        ] {
+            let mut incompatible = encoded.clone();
+            incompatible[..8].copy_from_slice(&full_authority_envelope_magic(version).unwrap());
+            let error = GcsBackend::decode_full_snapshot_authority(&incompatible)
+                .expect_err("an envelope outside the advertised reader range must fail closed");
+            let message = error.to_string();
+            assert!(message.contains(direction), "unexpected error: {message}");
+            assert!(
+                message.contains(&format!(
+                    "versions {} through {}",
+                    GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version,
+                    GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
+                )),
+                "the refusal must name the advertised reader range: {message}"
+            );
+        }
     }
 
     #[test]

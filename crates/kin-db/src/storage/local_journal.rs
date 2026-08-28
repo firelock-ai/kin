@@ -41,7 +41,7 @@ pub(super) fn quarantine_delta_path(
     ))
 }
 
-pub(super) fn sync_parent_directory(path: &Path) -> Result<(), KinDbError> {
+pub(crate) fn sync_parent_directory(path: &Path) -> Result<(), KinDbError> {
     let Some(parent) = path.parent().map(|parent| {
         if parent.as_os_str().is_empty() {
             Path::new(".")

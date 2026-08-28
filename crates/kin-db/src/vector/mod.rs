@@ -3,6 +3,7 @@
 
 mod hnsw;
 
+pub(crate) use hnsw::VectorIndexPersistenceInfo;
 pub use hnsw::{IndexLoadOutcome, VectorIndex};
 pub use kin_vector::IndexDescriptor;
 

@@ -11,11 +11,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+#[cfg(feature = "vector")]
+use crate::embed::EmbeddingProducerSet;
 use crate::engine::{InMemoryGraph, PersistenceEpoch};
 use crate::error::KinDbError;
-#[cfg(feature = "vector")]
-use crate::storage::backend::VectorArtifact;
 use crate::storage::backend::{Generation, GENERATION_INIT};
+#[cfg(feature = "vector")]
+use crate::storage::backend::{VectorArtifact, MAX_VECTOR_ARTIFACT_METADATA_BYTES};
 use crate::storage::delta::{apply_graph_delta, GraphSnapshotDelta};
 use crate::storage::format::CompactionStats;
 use crate::storage::local_journal::{
@@ -1213,12 +1215,12 @@ fn vector_index_metadata_path_for(snapshot_path: &Path) -> PathBuf {
 
 /// Exact current vector-index sidecar metadata version.
 #[cfg(feature = "vector")]
-pub const VECTOR_INDEX_METADATA_VERSION: u32 = 3;
+pub const VECTOR_INDEX_METADATA_VERSION: u32 = 4;
 
 const LOCATE_CACHE_VERSION: u32 = 3;
 
 #[cfg(feature = "vector")]
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VectorIndexMetadata {
     version: u32,
     /// Exact graph/tree/artifact authority digest, despite the historical
@@ -1233,6 +1235,15 @@ struct VectorIndexMetadata {
     /// Caller-supplied artifact/binary identity of the embedder that produced
     /// these vectors (for example a build SHA or model-pipeline identity).
     embedder_identity: String,
+    /// Conservative union of the runtimes that actually returned vectors in
+    /// this index. Required in v4; no serde default may manufacture evidence
+    /// for an older artifact.
+    actual_producers: EmbeddingProducerSet,
+    /// Digest jointly covering the exact kin-vector bytes and their canonical
+    /// actual-producer trailer. Shape, descriptor, and lineage can all remain
+    /// equal across a re-embed, so this binding is what rejects a crash-torn
+    /// old-index/new-metadata pair.
+    index_binding_sha256: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1305,12 +1316,91 @@ fn decode_vector_index_metadata(
         || metadata.embedding_model_revision.is_empty()
         || metadata.embedding_pipeline_epoch.is_empty()
         || metadata.embedder_identity.is_empty()
+        || metadata.index_binding_sha256.len() != 64
+        || hex::decode(&metadata.index_binding_sha256).is_err()
+        || (metadata.indexed > 0 && metadata.actual_producers.is_empty())
     {
         return Err(KinDbError::StorageError(format!(
             "vector index metadata {label} is missing required current identity fields"
         )));
     }
     Ok(metadata)
+}
+
+#[cfg(feature = "vector")]
+fn vector_index_metadata_version(bytes: &[u8]) -> Result<u32, KinDbError> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        KinDbError::StorageError(format!(
+            "failed to decode vector index metadata version: {error}"
+        ))
+    })?;
+    let raw = value
+        .get("version")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| {
+            KinDbError::StorageError(
+                "vector index metadata version is missing or is not an unsigned integer"
+                    .to_string(),
+            )
+        })?;
+    u32::try_from(raw).map_err(|_| {
+        KinDbError::StorageError(format!(
+            "vector index metadata version {raw} does not fit the supported version field"
+        ))
+    })
+}
+
+#[cfg(feature = "vector")]
+#[derive(Debug)]
+enum VectorIndexMetadataRead {
+    Missing,
+    Current(VectorIndexMetadata),
+    UnknownLegacy { version: u32 },
+    Unsupported { version: u32 },
+}
+
+#[cfg(all(feature = "vector", test))]
+std::thread_local! {
+    static VECTOR_SIDECAR_BEFORE_ATTACH_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(feature = "vector", test))]
+fn set_vector_sidecar_before_attach_hook(hook: Option<Box<dyn Fn()>>) {
+    VECTOR_SIDECAR_BEFORE_ATTACH_HOOK.with(|slot| *slot.borrow_mut() = hook);
+}
+
+#[cfg(feature = "vector")]
+fn run_vector_sidecar_before_attach_hook() {
+    #[cfg(test)]
+    VECTOR_SIDECAR_BEFORE_ATTACH_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(feature = "vector")]
+fn read_vector_index_metadata_for_load(path: &Path) -> Result<VectorIndexMetadataRead, KinDbError> {
+    if !path.exists() {
+        return Ok(VectorIndexMetadataRead::Missing);
+    }
+    let bytes = mmap::read_regular_bounded(
+        path,
+        "vector index metadata",
+        MAX_VECTOR_ARTIFACT_METADATA_BYTES,
+    )?;
+    let version = vector_index_metadata_version(&bytes)?;
+    if version < VectorIndexMetadata::VERSION {
+        return Ok(VectorIndexMetadataRead::UnknownLegacy { version });
+    }
+    if version > VectorIndexMetadata::VERSION {
+        return Ok(VectorIndexMetadataRead::Unsupported { version });
+    }
+    let label = path.display().to_string();
+    Ok(VectorIndexMetadataRead::Current(
+        decode_vector_index_metadata(&bytes, &label)?,
+    ))
 }
 
 #[cfg(feature = "vector")]
@@ -1335,36 +1425,40 @@ fn validate_vector_index_metadata_shape(
     Ok(())
 }
 
-#[cfg(feature = "vector")]
+#[cfg(all(test, feature = "vector"))]
 fn read_vector_index_metadata(path: &Path) -> Result<Option<VectorIndexMetadata>, KinDbError> {
     if !path.exists() {
         return Ok(None);
     }
 
-    let bytes = std::fs::read(path).map_err(|err| {
-        KinDbError::StorageError(format!(
-            "failed to read vector index metadata {}: {err}",
-            path.display()
-        ))
-    })?;
+    let bytes = mmap::read_regular_bounded(
+        path,
+        "vector index metadata",
+        MAX_VECTOR_ARTIFACT_METADATA_BYTES,
+    )?;
     let label = path.display().to_string();
     Ok(Some(decode_vector_index_metadata(&bytes, &label)?))
 }
 
-/// Validate validator-owned metadata inside one hosted vector artifact.
-///
-/// The outer storage envelope must already have been decoded against the exact
-/// [`crate::storage::backend::VectorArtifactBinding`], and the opaque index
-/// bytes must already have passed their format and self-description loader.
-/// This final hook proves that the inner metadata names the same retrieval
-/// authority as the outer binding, and that its declared dimensions and
-/// coverage equal the shape actually decoded from the index.
 #[cfg(feature = "vector")]
-pub fn validate_hosted_vector_artifact_inner(
-    artifact: &VectorArtifact,
-    decoded_dimensions: usize,
-    decoded_indexed_count: usize,
+fn validate_hosted_vector_producer_set(
+    indexed: usize,
+    producers: &EmbeddingProducerSet,
 ) -> Result<(), KinDbError> {
+    if producers.contains(crate::EmbeddingProducer::Unspecified)
+        || (indexed > 0 && !producers.is_fully_attributed())
+    {
+        return Err(KinDbError::StorageError(
+            "hosted vector artifact contains non-attributable actual-producer evidence".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "vector")]
+fn decode_hosted_vector_artifact_producers(
+    artifact: &VectorArtifact,
+) -> Result<(VectorIndexMetadata, EmbeddingProducerSet), KinDbError> {
     let metadata = decode_vector_index_metadata(&artifact.metadata, "hosted vector artifact")?;
     let expected_authority = hex::encode(artifact.binding.retrieval_authority_hash);
     if metadata.graph_root_hash != expected_authority {
@@ -1373,12 +1467,131 @@ pub fn validate_hosted_vector_artifact_inner(
             metadata.graph_root_hash, expected_authority
         )));
     }
+    let (producers, index_binding_sha256) =
+        match crate::vector::VectorIndex::current_producer_binding_from_bytes(&artifact.index)? {
+            Some(binding) => binding,
+            None => {
+                return Err(KinDbError::StorageError(
+                    "hosted vector artifact index has no current actual-producer binding"
+                        .to_string(),
+                ))
+            }
+        };
+    if metadata.actual_producers != producers {
+        return Err(KinDbError::StorageError(format!(
+            "hosted vector artifact metadata producers {:?} do not match index-bound producers {:?}",
+            metadata.actual_producers, producers
+        )));
+    }
+    let actual_index_binding = hex::encode(index_binding_sha256);
+    if metadata.index_binding_sha256 != actual_index_binding {
+        return Err(KinDbError::StorageError(format!(
+            "hosted vector artifact metadata index binding {} does not match exact index binding {}",
+            metadata.index_binding_sha256, actual_index_binding
+        )));
+    }
+    validate_hosted_vector_producer_set(metadata.indexed, &producers)?;
+    Ok((metadata, producers))
+}
+
+/// Read the exact conservative actual-producer lineage jointly bound by hosted
+/// metadata, index bytes, and the outer retrieval authority. This is not the
+/// configured backend and does not report the producer of a later query.
+/// Missing legacy evidence, tampering, mismatch, and current raw `Unspecified`
+/// vectors are rejected rather than inferred from configuration.
+#[cfg(feature = "vector")]
+pub fn read_hosted_vector_artifact_actual_producers(
+    artifact: &VectorArtifact,
+) -> Result<EmbeddingProducerSet, KinDbError> {
+    decode_hosted_vector_artifact_producers(artifact).map(|(_, producers)| producers)
+}
+
+/// Validate validator-owned metadata and producer evidence inside one hosted
+/// vector artifact, returning the exact canonical actual-producer set.
+///
+/// The outer storage envelope must already have been decoded against the exact
+/// [`crate::storage::backend::VectorArtifactBinding`], and the opaque index
+/// bytes must already have passed their format and self-description loader.
+/// This hook proves inner/outer authority, decoded shape, and exact equality
+/// between metadata producer evidence and the digest-bound `.kvec` trailer.
+#[cfg(feature = "vector")]
+pub fn validate_hosted_vector_artifact_inner_with_producers(
+    artifact: &VectorArtifact,
+    decoded_dimensions: usize,
+    decoded_indexed_count: usize,
+) -> Result<EmbeddingProducerSet, KinDbError> {
+    let (metadata, producers) = decode_hosted_vector_artifact_producers(artifact)?;
     validate_vector_index_metadata_shape(
         &metadata,
         decoded_dimensions,
         decoded_indexed_count,
         "inside hosted vector artifact",
+    )?;
+    Ok(producers)
+}
+
+/// Validate one hosted artifact and enforce an explicit set of permitted
+/// numerical producers before any caller attaches it.
+#[cfg(feature = "vector")]
+pub fn validate_hosted_vector_artifact_inner_for_producers(
+    artifact: &VectorArtifact,
+    decoded_dimensions: usize,
+    decoded_indexed_count: usize,
+    allowed_producers: &EmbeddingProducerSet,
+) -> Result<EmbeddingProducerSet, KinDbError> {
+    let producers = validate_hosted_vector_artifact_inner_with_producers(
+        artifact,
+        decoded_dimensions,
+        decoded_indexed_count,
+    )?;
+    if !producers.is_subset(allowed_producers) {
+        return Err(KinDbError::StorageError(format!(
+            "hosted vector artifact producers {:?} are outside the permitted set {:?}",
+            producers, allowed_producers
+        )));
+    }
+    Ok(producers)
+}
+
+/// Source-compatible hosted inner validator. New callers should consume the
+/// typed producer-returning sibling and apply an explicit allowlist.
+#[cfg(feature = "vector")]
+pub fn validate_hosted_vector_artifact_inner(
+    artifact: &VectorArtifact,
+    decoded_dimensions: usize,
+    decoded_indexed_count: usize,
+) -> Result<(), KinDbError> {
+    validate_hosted_vector_artifact_inner_with_producers(
+        artifact,
+        decoded_dimensions,
+        decoded_indexed_count,
     )
+    .map(drop)
+}
+
+#[cfg(feature = "vector")]
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_VECTOR_METADATA_PARENT_SYNC: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(all(feature = "vector", test))]
+fn fail_next_vector_metadata_parent_sync() {
+    FAIL_VECTOR_METADATA_PARENT_SYNC.with(|armed| armed.set(true));
+}
+
+#[cfg(feature = "vector")]
+fn sync_vector_metadata_parent(path: &Path) -> Result<(), KinDbError> {
+    #[cfg(test)]
+    if FAIL_VECTOR_METADATA_PARENT_SYNC.with(|armed| armed.replace(false)) {
+        return Err(KinDbError::StorageError(format!(
+            "injected vector metadata parent-directory fsync failure for {}",
+            path.display()
+        )));
+    }
+    sync_parent_directory(path)
 }
 
 #[cfg(feature = "vector")]
@@ -1405,15 +1618,19 @@ fn write_vector_index_metadata(
     // the kvec loads on reopen, so it must be at least as durable as the index it
     // describes: an incremental kvec flush that survives a crash must never be
     // paired with a metadata write that silently evaporated.
-    let tmp_path = path.with_extension("tmp");
-    {
+    let tmp_path = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+    let write_result = (|| -> Result<(), KinDbError> {
         use std::io::Write as _;
-        let mut tmp = File::create(&tmp_path).map_err(|err| {
-            KinDbError::StorageError(format!(
-                "failed to create vector index metadata temp {}: {err}",
-                tmp_path.display()
-            ))
-        })?;
+        let mut tmp = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|err| {
+                KinDbError::StorageError(format!(
+                    "failed to create vector index metadata temp {}: {err}",
+                    tmp_path.display()
+                ))
+            })?;
         tmp.write_all(&encoded).map_err(|err| {
             KinDbError::StorageError(format!(
                 "failed to write vector index metadata {}: {err}",
@@ -1426,20 +1643,21 @@ fn write_vector_index_metadata(
                 tmp_path.display()
             ))
         })?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(error);
     }
-    std::fs::rename(&tmp_path, path).map_err(|err| {
-        KinDbError::StorageError(format!(
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(KinDbError::StorageError(format!(
             "failed to promote vector index metadata {} -> {}: {err}",
             tmp_path.display(),
             path.display()
-        ))
-    })?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            let _ = dir.sync_all();
-        }
+        )));
     }
-    Ok(())
+    sync_vector_metadata_parent(path)
 }
 
 #[cfg(feature = "vector")]
@@ -1974,7 +2192,7 @@ impl SnapshotManager {
         embedder_identity: Option<&str>,
     ) -> Result<(), KinDbError> {
         let vector_path = vector_index_path_for(path);
-        let Some((dimensions, indexed)) = graph.vector_index_stats() else {
+        if graph.vector_index_stats().is_none() {
             // No index is loaded for this graph. A graph-only save must not
             // manufacture an unbound empty vector artifact. If an older
             // sidecar exists, leave its exact bytes and metadata untouched;
@@ -2007,28 +2225,43 @@ impl SnapshotManager {
             None => format!("{provider}:{model_id}:{revision}:{pipeline_epoch}"),
         };
 
-        // Stamp the index's self-description (model identity + graph provenance)
-        // BEFORE saving, so the persisted `.kvec` proves its own compatibility on
-        // load — defense-in-depth alongside the sidecar metadata below.
-        graph.stamp_vector_index_descriptor(crate::vector::IndexDescriptor {
+        let descriptor = crate::vector::IndexDescriptor {
             model_id: Some(model_id.clone()),
             graph_root: Some(hex::encode(retrieval_authority_hash)),
-        });
-        graph.save_vector_index(&vector_path)?;
+        };
 
         let metadata_path = vector_index_metadata_path_for(path);
-        let metadata = VectorIndexMetadata {
-            version: VectorIndexMetadata::VERSION,
-            graph_root_hash: hex::encode(retrieval_authority_hash),
-            dimensions: runtime_dimensions.unwrap_or(dimensions),
-            indexed,
-            embedding_provider: provider,
-            embedding_model_id: model_id,
-            embedding_model_revision: revision,
-            embedding_pipeline_epoch: pipeline_epoch,
-            embedder_identity,
-        };
-        write_vector_index_metadata(&metadata_path, &metadata)?;
+        graph.save_vector_index_with_provenance(
+            &vector_path,
+            Some(descriptor),
+            |receipt| {
+                if let Some(configured) = runtime_dimensions {
+                    if configured != receipt.dimensions {
+                        return Err(KinDbError::StorageError(format!(
+                            "embedding runtime declares {configured} dimensions, but the exact saved vector index contains {}",
+                            receipt.dimensions
+                        )));
+                    }
+                }
+                let metadata = VectorIndexMetadata {
+                    version: VectorIndexMetadata::VERSION,
+                    graph_root_hash: hex::encode(retrieval_authority_hash),
+                    dimensions: receipt.dimensions,
+                    indexed: receipt.indexed,
+                    embedding_provider: provider,
+                    embedding_model_id: model_id,
+                    embedding_model_revision: revision,
+                    embedding_pipeline_epoch: pipeline_epoch,
+                    embedder_identity,
+                    actual_producers: receipt.actual_producers.clone(),
+                    index_binding_sha256: hex::encode(receipt.index_binding_sha256),
+                };
+                // Promote metadata first. A crash before the complete trailed
+                // index promotion leaves a mixed pair that every v4 reader
+                // refuses, while older readers reject the new metadata version.
+                write_vector_index_metadata(&metadata_path, &metadata)
+            },
+        )?;
 
         Ok(())
     }
@@ -2036,8 +2269,16 @@ impl SnapshotManager {
     #[cfg(feature = "vector")]
     fn invalidate_vector_index_metadata(path: &Path) -> Result<(), KinDbError> {
         let metadata_path = vector_index_metadata_path_for(path);
-        let Some(mut metadata) = read_vector_index_metadata(&metadata_path)? else {
-            return Ok(());
+        let mut metadata = match read_vector_index_metadata_for_load(&metadata_path)? {
+            VectorIndexMetadataRead::Current(metadata) => metadata,
+            VectorIndexMetadataRead::Missing
+            | VectorIndexMetadataRead::UnknownLegacy { .. } => return Ok(()),
+            VectorIndexMetadataRead::Unsupported { version } => {
+                return Err(KinDbError::StorageError(format!(
+                    "refusing to rewrite future vector index metadata version {version} as version {}",
+                    VectorIndexMetadata::VERSION
+                )))
+            }
         };
         metadata.graph_root_hash = hex::encode([0u8; 32]);
         write_vector_index_metadata(&metadata_path, &metadata)
@@ -2140,7 +2381,46 @@ impl SnapshotManager {
         }
 
         let metadata_path = vector_index_metadata_path_for(path);
-        let metadata = read_vector_index_metadata(&metadata_path)?;
+        let metadata = match read_vector_index_metadata_for_load(&metadata_path)? {
+            VectorIndexMetadataRead::Current(metadata) => Some(metadata),
+            VectorIndexMetadataRead::Missing => None,
+            VectorIndexMetadataRead::UnknownLegacy { version } => {
+                tracing::warn!(
+                    path = %vector_path.display(),
+                    metadata = %metadata_path.display(),
+                    metadata_version = ?version,
+                    check = "actual_producers",
+                    "refusing legacy vector index without actual-producer evidence; rebuilding"
+                );
+                if write_missing_metadata {
+                    graph.queue_missing_for_embedding();
+                    graph.queue_missing_artifacts_for_embedding();
+                }
+                return Ok(VectorSidecarLoadOutcome {
+                    disposition: VectorSidecarDisposition::RefusedSidecar {
+                        check: "actual_producers_unknown_legacy".to_string(),
+                    },
+                    durable_coverage_before_load,
+                    ..Default::default()
+                });
+            }
+            VectorIndexMetadataRead::Unsupported { version } => {
+                tracing::warn!(
+                    path = %vector_path.display(),
+                    metadata = %metadata_path.display(),
+                    metadata_version = version,
+                    check = "metadata_version_future",
+                    "refusing future vector index metadata without downgrading or rebuilding it"
+                );
+                return Ok(VectorSidecarLoadOutcome {
+                    disposition: VectorSidecarDisposition::RefusedSidecar {
+                        check: "metadata_version_future".to_string(),
+                    },
+                    durable_coverage_before_load,
+                    ..Default::default()
+                });
+            }
+        };
         let verdict = metadata.as_ref().map(|metadata| {
             classify_vector_sidecar(
                 metadata,
@@ -2231,9 +2511,26 @@ impl SnapshotManager {
             graph_root: Some(metadata.graph_root_hash.clone()),
         };
 
-        let count = match graph.load_vector_index_compatible(&vector_path, &expected) {
-            crate::vector::VectorIndexLoad::Loaded(count) => count,
-            crate::vector::VectorIndexLoad::Incompatible(reason) => {
+        let expected_index_binding = match hex::decode(&metadata.index_binding_sha256)
+            .ok()
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        {
+            Some(binding) => binding,
+            None => {
+                return Err(KinDbError::StorageError(format!(
+                    "vector index metadata {} has an invalid index binding digest",
+                    metadata_path.display()
+                )))
+            }
+        };
+        let detached = match crate::vector::VectorIndex::load_compatible_with_producer_binding(
+            &vector_path,
+            &expected,
+            &metadata.actual_producers,
+            expected_index_binding,
+        ) {
+            crate::vector::IndexLoadOutcome::Loaded(index) => index,
+            crate::vector::IndexLoadOutcome::Incompatible(reason) => {
                 tracing::warn!(
                     path = %vector_path.display(),
                     check = "index_self_description",
@@ -2252,22 +2549,13 @@ impl SnapshotManager {
                 });
             }
         };
-        let shape_validation = match graph.vector_index_stats() {
-            Some((decoded_dimensions, decoded_count)) if decoded_count == count => {
-                validate_vector_index_metadata_shape(
-                    &metadata,
-                    decoded_dimensions,
-                    decoded_count,
-                    "beside persisted sidecar",
-                )
-            }
-            Some((_, decoded_count)) => Err(KinDbError::StorageError(format!(
-                "vector index loader reported {count} vectors, but the installed index reports {decoded_count}"
-            ))),
-            None => Err(KinDbError::StorageError(
-                "vector index loader reported success without installing an index".to_string(),
-            )),
-        };
+        let count = detached.len();
+        let shape_validation = validate_vector_index_metadata_shape(
+            &metadata,
+            detached.dimensions(),
+            count,
+            "beside persisted sidecar",
+        );
         if let Err(error) = shape_validation {
             let reason = error.to_string();
             tracing::warn!(
@@ -2276,7 +2564,6 @@ impl SnapshotManager {
                 reason = %reason,
                 "LOUD WARNING: archiving incompatible vector index because its declared shape does not match its decoded contents"
             );
-            graph.reset_vector_index();
             archive_incompatible_index(&vector_path, &metadata_path);
             if write_missing_metadata {
                 graph.queue_missing_for_embedding();
@@ -2288,6 +2575,44 @@ impl SnapshotManager {
                 ..Default::default()
             });
         }
+
+        // The detached loader pinned and verified one open file, but an
+        // ambient path can still be atomically replaced while shape checks run.
+        // Re-read both public paths immediately before attachment and require
+        // the same strict metadata plus the same exact index binding. A
+        // byte-identical replacement is harmless; any different generation is
+        // refused without touching the index already serving this graph.
+        run_vector_sidecar_before_attach_hook();
+        let metadata_still_matches = matches!(
+            read_vector_index_metadata_for_load(&metadata_path),
+            Ok(VectorIndexMetadataRead::Current(current)) if current == metadata
+        );
+        let index_still_matches = matches!(
+            crate::vector::VectorIndex::current_producer_binding_from_path(&vector_path),
+            Ok(Some((ref producers, binding)))
+                if producers == &metadata.actual_producers && binding == expected_index_binding
+        );
+        if !metadata_still_matches || !index_still_matches {
+            tracing::warn!(
+                path = %vector_path.display(),
+                metadata_unchanged = metadata_still_matches,
+                index_unchanged = index_still_matches,
+                "refusing vector sidecar replaced during detached validation"
+            );
+            if write_missing_metadata {
+                graph.queue_missing_for_embedding();
+                graph.queue_missing_artifacts_for_embedding();
+            }
+            return Ok(VectorSidecarLoadOutcome {
+                disposition: VectorSidecarDisposition::RefusedSidecar {
+                    check: "sidecar_changed_before_attach".to_string(),
+                },
+                durable_coverage_before_load,
+                ..Default::default()
+            });
+        }
+        let installed_count = graph.install_vector_index(detached);
+        debug_assert_eq!(installed_count, count);
 
         let (disposition, vectors_dropped) = match verdict {
             SidecarVerdict::StampDrift => {
@@ -3491,6 +3816,12 @@ mod tests {
             embedding_model_revision: revision.unwrap_or_else(|| "test-revision".to_string()),
             embedding_pipeline_epoch: pipeline_epoch.unwrap_or_else(|| "test-pipeline".to_string()),
             embedder_identity: embedder_identity.to_string(),
+            actual_producers: if indexed == 0 {
+                EmbeddingProducerSet::new()
+            } else {
+                EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Unspecified)
+            },
+            index_binding_sha256: hex::encode([9u8; 32]),
         }
     }
 
@@ -6686,6 +7017,197 @@ mod tests {
 
     #[test]
     #[cfg(feature = "vector")]
+    fn decoded_shape_failure_preserves_the_preexisting_installed_index() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("shape_preserves_sentinel");
+        graph.upsert_entity(&entity).unwrap();
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &vectors, &vector_path);
+        mgr.save().unwrap();
+
+        let before = graph.vector_actual_producers();
+        assert_eq!(graph.embedding_status().indexed, 1);
+        let mut metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+        metadata.indexed = 2;
+        write_vector_index_metadata(&metadata_path, &metadata).unwrap();
+
+        let outcome = SnapshotManager::load_vector_index_into_graph_if_valid(
+            graph.as_ref(),
+            &snapshot_path,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome.disposition,
+            VectorSidecarDisposition::ArchivedIncompatibleIndex { .. }
+        ));
+        assert_eq!(
+            graph.embedding_status().indexed,
+            1,
+            "detached validation failure must not reset the index already serving this graph"
+        );
+        assert_eq!(graph.vector_actual_producers(), before);
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn sidecar_replacement_before_attach_refuses_and_preserves_served_index() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+        let sentinel_path = dir.path().join("sentinel.kvec");
+        let replacement_path = dir.path().join("replacement.kvec");
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let first = test_entity("replacement_guard_first");
+        let second = test_entity("replacement_guard_second");
+        graph.upsert_entity(&first).unwrap();
+        graph.upsert_entity(&second).unwrap();
+
+        // Persist a valid candidate whose exact binding matches its v4
+        // metadata. This is the detached index the loader will inspect.
+        let candidate = VectorIndex::new(4).unwrap();
+        candidate.upsert(first.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        candidate.upsert(second.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &candidate, &vector_path);
+        mgr.save().unwrap();
+        let metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+
+        // Keep a different sentinel index serving the live graph. A refusal
+        // after detached validation must not replace this handle.
+        let sentinel = VectorIndex::new(4).unwrap();
+        sentinel.upsert(first.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        sentinel.upsert(second.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &sentinel, &sentinel_path);
+        let before = graph
+            .search_loaded_vector_index_for_test(&[1.0, 0.0, 0.0, 0.0], 1)
+            .unwrap();
+        assert_eq!(before[0].0, RetrievalKey::from(first.id));
+
+        // Prepare a third valid generation with the same descriptor, shape,
+        // count, and producer set but different vector bytes. Replacing the
+        // ambient path after detached validation must be caught by the exact
+        // binding recheck rather than attached or archived.
+        let replacement = VectorIndex::new(4).unwrap();
+        replacement.upsert(first.id, &[0.0, 0.0, 1.0, 0.0]).unwrap();
+        replacement
+            .upsert(second.id, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        replacement.set_descriptor(crate::vector::IndexDescriptor {
+            model_id: Some(metadata.embedding_model_id.clone()),
+            graph_root: Some(metadata.graph_root_hash.clone()),
+        });
+        replacement.save(&replacement_path).unwrap();
+        let replacement_binding =
+            VectorIndex::current_producer_binding_from_path(&replacement_path)
+                .unwrap()
+                .unwrap()
+                .1;
+        assert_ne!(
+            hex::encode(replacement_binding),
+            metadata.index_binding_sha256
+        );
+
+        let vector_path_for_hook = vector_path.clone();
+        let replacement_path_for_hook = replacement_path.clone();
+        set_vector_sidecar_before_attach_hook(Some(Box::new(move || {
+            std::fs::rename(&replacement_path_for_hook, &vector_path_for_hook).unwrap();
+        })));
+        let outcome = SnapshotManager::load_vector_index_into_graph_if_valid(
+            graph.as_ref(),
+            &snapshot_path,
+            None,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            outcome.disposition,
+            VectorSidecarDisposition::RefusedSidecar { ref check }
+                if check == "sidecar_changed_before_attach"
+        ));
+        let after = graph
+            .search_loaded_vector_index_for_test(&[1.0, 0.0, 0.0, 0.0], 1)
+            .unwrap();
+        assert_eq!(after[0].0, RetrievalKey::from(first.id));
+        assert_eq!(graph.embedding_status().indexed, 2);
+        assert!(
+            vector_path.exists(),
+            "the replacement is preserved for the next open to refuse or rebuild"
+        );
+        assert!(metadata_path.exists());
+        assert!(!archived_sidecar_path(&vector_path).exists());
+        assert!(!archived_sidecar_path(&metadata_path).exists());
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn exact_index_binding_rejects_old_index_with_new_metadata() {
+        let dir = TempDir::new().unwrap();
+        let snapshot_path = dir.path().join("graph.kndb");
+        let vector_path = vector_index_path_for(&snapshot_path);
+        let metadata_path = vector_index_metadata_path_for(&snapshot_path);
+
+        let mgr = SnapshotManager::new(&snapshot_path);
+        let graph = mgr.graph();
+        let entity = test_entity("mixed_generation_owner");
+        graph.upsert_entity(&entity).unwrap();
+
+        let old_index = VectorIndex::new(4).unwrap();
+        old_index.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &old_index, &vector_path);
+        mgr.save().unwrap();
+        let old_bytes = std::fs::read(&vector_path).unwrap();
+        let old_metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+
+        let new_index = VectorIndex::new(4).unwrap();
+        new_index.upsert(entity.id, &[0.0, 1.0, 0.0, 0.0]).unwrap();
+        install_current_test_vector_index(graph.as_ref(), &new_index, &vector_path);
+        mgr.save().unwrap();
+        let new_metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+
+        assert_eq!(old_metadata.dimensions, new_metadata.dimensions);
+        assert_eq!(old_metadata.indexed, new_metadata.indexed);
+        assert_eq!(old_metadata.actual_producers, new_metadata.actual_producers);
+        assert_eq!(
+            old_metadata.embedding_model_id,
+            new_metadata.embedding_model_id
+        );
+        assert_eq!(old_metadata.graph_root_hash, new_metadata.graph_root_hash);
+        assert_ne!(
+            old_metadata.index_binding_sha256, new_metadata.index_binding_sha256,
+            "different index bytes must mint a different exact binding"
+        );
+
+        // Model a crash after new metadata promotion but before the new index
+        // rename: the old valid trailed index remains beside the new metadata.
+        std::fs::write(&vector_path, old_bytes).unwrap();
+        drop(graph);
+        drop(mgr);
+
+        let reopened = SnapshotManager::open(&snapshot_path).unwrap();
+        assert_eq!(
+            reopened.graph().embedding_status().indexed,
+            0,
+            "same-shape, same-producer stale bytes must not attach under new metadata"
+        );
+        assert_eq!(reopened.graph().pending_embeddings(), 1);
+        assert!(!vector_path.exists());
+        assert!(!metadata_path.exists());
+        assert!(archived_sidecar_path(&vector_path).exists());
+        assert!(archived_sidecar_path(&metadata_path).exists());
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
     fn hosted_vector_shape_mismatched_dimensions_refuses_loudly_and_archives() {
         let dir = TempDir::new().unwrap();
         let snapshot_path = dir.path().join("graph.kndb");
@@ -7662,6 +8184,15 @@ mod tests {
         let mut value = serde_json::to_value(&metadata).unwrap();
         value.as_object_mut().unwrap().remove("embedder_identity");
         assert!(serde_json::from_value::<VectorIndexMetadata>(value).is_err());
+        let mut value = serde_json::to_value(&metadata).unwrap();
+        value.as_object_mut().unwrap().remove("actual_producers");
+        assert!(serde_json::from_value::<VectorIndexMetadata>(value).is_err());
+        let mut value = serde_json::to_value(&metadata).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("index_binding_sha256");
+        assert!(serde_json::from_value::<VectorIndexMetadata>(value).is_err());
         assert!(
             matches!(
                 classify_vector_sidecar(&metadata, root, None),
@@ -7673,9 +8204,240 @@ mod tests {
 
     #[test]
     #[cfg(feature = "vector")]
+    fn vector_metadata_load_distinguishes_legacy_future_and_malformed_versions() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("graph.kvec.meta.json");
+        let metadata = current_vector_metadata([1u8; 32], 4, 1, "sha256-aabbcc");
+
+        let mut legacy = serde_json::to_value(&metadata).unwrap();
+        legacy["version"] = serde_json::json!(3);
+        legacy.as_object_mut().unwrap().remove("actual_producers");
+        std::fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert!(matches!(
+            read_vector_index_metadata_for_load(&path).unwrap(),
+            VectorIndexMetadataRead::UnknownLegacy { version: 3 }
+        ));
+
+        let mut future = serde_json::to_value(&metadata).unwrap();
+        future["version"] = serde_json::json!(5);
+        std::fs::write(&path, serde_json::to_vec(&future).unwrap()).unwrap();
+        assert!(matches!(
+            read_vector_index_metadata_for_load(&path).unwrap(),
+            VectorIndexMetadataRead::Unsupported { version: 5 }
+        ));
+
+        let mut malformed = serde_json::to_value(&metadata).unwrap();
+        malformed["version"] = serde_json::json!("4");
+        std::fs::write(&path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        let error = read_vector_index_metadata_for_load(&path)
+            .expect_err("a malformed current version is corrupt, not legacy");
+        assert!(error
+            .to_string()
+            .contains("missing or is not an unsigned integer"));
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn vector_metadata_rejects_duplicate_and_descending_producer_sequences() {
+        let metadata = current_vector_metadata([1u8; 32], 4, 1, "sha256-aabbcc");
+        let mut duplicate = serde_json::to_value(&metadata).unwrap();
+        duplicate["actual_producers"] = serde_json::json!(["cpu", "cpu"]);
+        let duplicate_error = decode_vector_index_metadata(
+            &serde_json::to_vec(&duplicate).unwrap(),
+            "duplicate producer fixture",
+        )
+        .expect_err("duplicate producer evidence is not canonical");
+        assert!(duplicate_error.to_string().contains("strictly canonical"));
+
+        let mut descending = serde_json::to_value(&metadata).unwrap();
+        descending["actual_producers"] = serde_json::json!(["metal", "cpu"]);
+        let descending_error = decode_vector_index_metadata(
+            &serde_json::to_vec(&descending).unwrap(),
+            "descending producer fixture",
+        )
+        .expect_err("descending producer evidence is not canonical");
+        assert!(descending_error.to_string().contains("strictly canonical"));
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn vector_metadata_v4_round_trips_supported_sets_and_rejects_unknown_or_empty_current_evidence()
+    {
+        let mut mixed = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu);
+        mixed.insert(crate::EmbeddingProducer::Metal);
+        let cases = [
+            (0usize, EmbeddingProducerSet::new()),
+            (
+                1,
+                EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu),
+            ),
+            (1, mixed),
+            (
+                1,
+                EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Unspecified),
+            ),
+        ];
+        for (indexed, producers) in cases {
+            let mut metadata = current_vector_metadata([1u8; 32], 4, indexed, "sha256-aabbcc");
+            metadata.actual_producers = producers.clone();
+            let decoded = decode_vector_index_metadata(
+                &serde_json::to_vec(&metadata).unwrap(),
+                "supported producer fixture",
+            )
+            .unwrap();
+            assert_eq!(decoded.actual_producers, producers);
+            assert_eq!(decoded.indexed, indexed);
+        }
+
+        let mut empty_nonempty = current_vector_metadata([1u8; 32], 4, 1, "sha256-aabbcc");
+        empty_nonempty.actual_producers = EmbeddingProducerSet::new();
+        assert!(decode_vector_index_metadata(
+            &serde_json::to_vec(&empty_nonempty).unwrap(),
+            "empty current producer fixture",
+        )
+        .is_err());
+
+        let mut unknown =
+            serde_json::to_value(current_vector_metadata([1u8; 32], 4, 1, "sha256-aabbcc"))
+                .unwrap();
+        unknown["actual_producers"] = serde_json::json!(["future_accelerator"]);
+        assert!(decode_vector_index_metadata(
+            &serde_json::to_vec(&unknown).unwrap(),
+            "unknown producer fixture",
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn hosted_policy_rejects_unspecified_even_for_an_empty_index() {
+        let unspecified = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Unspecified);
+        assert!(validate_hosted_vector_producer_set(0, &unspecified).is_err());
+        assert!(validate_hosted_vector_producer_set(1, &unspecified).is_err());
+        assert!(validate_hosted_vector_producer_set(0, &EmbeddingProducerSet::new()).is_ok());
+
+        // Attested controls that MUST pass. Without a non-empty attributed case,
+        // a policy mutated to refuse everything would still satisfy the refusals
+        // above, and only the empty-index case would notice.
+        let cpu = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu);
+        assert!(validate_hosted_vector_producer_set(1, &cpu).is_ok());
+        let mixed = {
+            let mut set = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu);
+            set.insert(crate::EmbeddingProducer::Metal);
+            set
+        };
+        assert!(validate_hosted_vector_producer_set(2, &mixed).is_ok());
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn vector_metadata_reader_rejects_oversized_files_before_decoding() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("oversized.kvec.meta.json");
+        let oversized = vec![b' '; (MAX_VECTOR_ARTIFACT_METADATA_BYTES + 1) as usize];
+        std::fs::write(&path, oversized).unwrap();
+        let error = read_vector_index_metadata_for_load(&path)
+            .expect_err("metadata above the public bound must not be allocated and decoded");
+        let message = error.to_string();
+        assert!(
+            message.contains("vector index metadata")
+                && message.contains(&format!(
+                    "above the {MAX_VECTOR_ARTIFACT_METADATA_BYTES}-byte safety limit"
+                )),
+            "the refusal must name the role and the exact public bound: {message}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn metadata_parent_sync_failure_prevents_exact_index_promotion() {
+        let dir = TempDir::new().unwrap();
+        let vector_path = dir.path().join("durability.kvec");
+        let metadata_path = dir.path().join("durability.kvec.meta.json");
+        let root = [3u8; 32];
+        let descriptor = crate::vector::IndexDescriptor {
+            model_id: Some("durability-model".to_string()),
+            graph_root: Some(hex::encode(root)),
+        };
+        let key = kin_model::RetrievalKey::from(EntityId::new());
+
+        let old_index = VectorIndex::new(4).unwrap();
+        old_index
+            .upsert_retrievable(key, &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        old_index.set_descriptor(descriptor.clone());
+        old_index.save(&vector_path).unwrap();
+        let old_bytes = std::fs::read(&vector_path).unwrap();
+        let (_, old_binding) = VectorIndex::current_producer_binding_from_bytes(&old_bytes)
+            .unwrap()
+            .unwrap();
+
+        let new_index = VectorIndex::new(4).unwrap();
+        new_index
+            .upsert_retrievable(key, &[0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        let mut metadata = current_vector_metadata(root, 4, 1, "durability-test");
+        metadata.embedding_model_id = "durability-model".to_string();
+
+        fail_next_vector_metadata_parent_sync();
+        let error = new_index
+            .save_with_provenance(&vector_path, Some(descriptor), |receipt| {
+                metadata.index_binding_sha256 = hex::encode(receipt.index_binding_sha256);
+                write_vector_index_metadata(&metadata_path, &metadata)
+            })
+            .expect_err("metadata durability failure must abort final index promotion");
+        assert!(error
+            .to_string()
+            .contains("injected vector metadata parent-directory fsync failure"));
+        assert_eq!(
+            std::fs::read(&vector_path).unwrap(),
+            old_bytes,
+            "the old final index must remain when metadata durability is unproven"
+        );
+        let written_metadata = read_vector_index_metadata(&metadata_path).unwrap().unwrap();
+        assert_ne!(
+            written_metadata.index_binding_sha256,
+            hex::encode(old_binding)
+        );
+        let stranded: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("producer-base"))
+            .collect();
+        assert!(stranded.is_empty(), "stranded vector stages: {stranded:?}");
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
     fn hosted_vector_shape_metadata_authority_dimensions_and_count_must_match() {
         let root = [1u8; 32];
-        let metadata = current_vector_metadata(root, 4, 2, "sha256-aabbcc");
+        let producers = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu);
+        let mut metadata = current_vector_metadata(root, 4, 2, "sha256-aabbcc");
+        metadata.actual_producers = producers.clone();
+        let index_dir = TempDir::new().unwrap();
+        let index_path = index_dir.path().join("hosted.kvec");
+        let vectors = VectorIndex::new(4).unwrap();
+        vectors
+            .upsert_retrievable_with_producers(
+                kin_model::RetrievalKey::from(EntityId::new()),
+                &[1.0, 0.0, 0.0, 0.0],
+                &producers,
+            )
+            .unwrap();
+        vectors
+            .upsert_retrievable_with_producers(
+                kin_model::RetrievalKey::from(EntityId::new()),
+                &[0.0, 1.0, 0.0, 0.0],
+                &producers,
+            )
+            .unwrap();
+        vectors.save(&index_path).unwrap();
+        let (_, index_binding_sha256) =
+            VectorIndex::current_producer_binding_from_bytes(&std::fs::read(&index_path).unwrap())
+                .unwrap()
+                .unwrap();
+        metadata.index_binding_sha256 = hex::encode(index_binding_sha256);
         let artifact = VectorArtifact {
             binding: crate::storage::VectorArtifactBinding::for_repository(
                 "hosted-inner-contract",
@@ -7684,10 +8446,32 @@ mod tests {
             )
             .unwrap(),
             metadata: serde_json::to_vec(&metadata).unwrap(),
-            index: b"opaque validated index bytes".to_vec(),
+            index: std::fs::read(index_path).unwrap(),
         };
 
         validate_hosted_vector_artifact_inner(&artifact, 4, 2).unwrap();
+        assert_eq!(
+            validate_hosted_vector_artifact_inner_with_producers(&artifact, 4, 2).unwrap(),
+            producers
+        );
+        assert_eq!(
+            validate_hosted_vector_artifact_inner_for_producers(
+                &artifact,
+                4,
+                2,
+                &EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu),
+            )
+            .unwrap(),
+            producers
+        );
+        let disallowed = validate_hosted_vector_artifact_inner_for_producers(
+            &artifact,
+            4,
+            2,
+            &EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Metal),
+        )
+        .expect_err("hosted producer policy must reject an out-of-policy runtime");
+        assert!(disallowed.to_string().contains("outside the permitted set"));
 
         let count_error = validate_hosted_vector_artifact_inner(&artifact, 4, 1)
             .expect_err("declared and decoded indexed counts must match exactly");
@@ -7697,13 +8481,137 @@ mod tests {
             .expect_err("declared and decoded dimensions must match exactly");
         assert!(dimension_error.to_string().contains("4 dimensions"));
 
+        let mut mismatched_metadata = metadata.clone();
+        mismatched_metadata.actual_producers =
+            EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Metal);
+        let mut mismatched = artifact.clone();
+        mismatched.metadata = serde_json::to_vec(&mismatched_metadata).unwrap();
+        let mismatch_error = validate_hosted_vector_artifact_inner(&mismatched, 4, 2)
+            .expect_err("metadata producer evidence must equal the index trailer exactly");
+        assert!(mismatch_error
+            .to_string()
+            .contains("do not match index-bound"));
+
+        let mut wrong_binding_metadata = metadata.clone();
+        wrong_binding_metadata.index_binding_sha256 = hex::encode([7u8; 32]);
+        let mut wrong_binding = artifact.clone();
+        wrong_binding.metadata = serde_json::to_vec(&wrong_binding_metadata).unwrap();
+        let binding_error = read_hosted_vector_artifact_actual_producers(&wrong_binding)
+            .expect_err("producer readback must bind the exact staged index generation");
+        assert!(binding_error
+            .to_string()
+            .contains("does not match exact index binding"));
+
         let mut wrong_outer = artifact;
         wrong_outer.binding.retrieval_authority_hash = [2u8; 32];
+        let readback_error = read_hosted_vector_artifact_actual_producers(&wrong_outer)
+            .expect_err("producer readback must not trust a relabeled outer authority");
+        assert!(readback_error
+            .to_string()
+            .contains("does not match outer binding"));
         let authority_error = validate_hosted_vector_artifact_inner(&wrong_outer, 4, 2)
             .expect_err("inner metadata must not be attached to a different outer authority");
         assert!(authority_error
             .to_string()
             .contains("does not match outer binding"));
+    }
+
+    #[test]
+    #[cfg(feature = "vector")]
+    fn hosted_cpu_policy_rejects_mixed_unspecified_legacy_and_incompatible_evidence() {
+        let root = [4u8; 32];
+        let cpu = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Cpu);
+        let metal = EmbeddingProducerSet::singleton(crate::EmbeddingProducer::Metal);
+        let mut mixed = cpu.clone();
+        mixed.extend(&metal);
+        let dir = TempDir::new().unwrap();
+
+        let mixed_path = dir.path().join("mixed.kvec");
+        let mixed_index = VectorIndex::new(4).unwrap();
+        mixed_index
+            .upsert_retrievable_with_producers(
+                kin_model::RetrievalKey::from(EntityId::new()),
+                &[1.0, 0.0, 0.0, 0.0],
+                &cpu,
+            )
+            .unwrap();
+        mixed_index
+            .upsert_retrievable_with_producers(
+                kin_model::RetrievalKey::from(EntityId::new()),
+                &[0.0, 1.0, 0.0, 0.0],
+                &metal,
+            )
+            .unwrap();
+        mixed_index.save(&mixed_path).unwrap();
+        let mixed_bytes = std::fs::read(&mixed_path).unwrap();
+        let (_, mixed_binding) = VectorIndex::current_producer_binding_from_bytes(&mixed_bytes)
+            .unwrap()
+            .unwrap();
+        let mut mixed_metadata = current_vector_metadata(root, 4, 2, "mixed-hosted");
+        mixed_metadata.actual_producers = mixed.clone();
+        mixed_metadata.index_binding_sha256 = hex::encode(mixed_binding);
+        let mixed_artifact = VectorArtifact {
+            binding: crate::storage::VectorArtifactBinding::for_repository(
+                "hosted-policy",
+                crate::storage::SnapshotCursor::from_backend_generation(11),
+                root,
+            )
+            .unwrap(),
+            metadata: serde_json::to_vec(&mixed_metadata).unwrap(),
+            index: mixed_bytes,
+        };
+        let mixed_error =
+            validate_hosted_vector_artifact_inner_for_producers(&mixed_artifact, 4, 2, &cpu)
+                .expect_err("CPU-only policy must reject a mixed CPU/Metal index");
+        assert!(mixed_error
+            .to_string()
+            .contains("outside the permitted set"));
+
+        let mut cpu_metadata = mixed_metadata.clone();
+        cpu_metadata.actual_producers = cpu.clone();
+        let mut mismatched = mixed_artifact.clone();
+        mismatched.metadata = serde_json::to_vec(&cpu_metadata).unwrap();
+        assert!(read_hosted_vector_artifact_actual_producers(&mismatched).is_err());
+
+        let unspecified_path = dir.path().join("unspecified.kvec");
+        let unspecified_index = VectorIndex::new(4).unwrap();
+        unspecified_index
+            .upsert(EntityId::new(), &[1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        unspecified_index.save(&unspecified_path).unwrap();
+        let unspecified_bytes = std::fs::read(&unspecified_path).unwrap();
+        let (_, unspecified_binding) =
+            VectorIndex::current_producer_binding_from_bytes(&unspecified_bytes)
+                .unwrap()
+                .unwrap();
+        let mut unspecified_metadata = current_vector_metadata(root, 4, 1, "unspecified-hosted");
+        unspecified_metadata.index_binding_sha256 = hex::encode(unspecified_binding);
+        let unspecified_artifact = VectorArtifact {
+            binding: mixed_artifact.binding,
+            metadata: serde_json::to_vec(&unspecified_metadata).unwrap(),
+            index: unspecified_bytes.clone(),
+        };
+        let unspecified_error = read_hosted_vector_artifact_actual_producers(&unspecified_artifact)
+            .expect_err("current raw insertion is explicit but not hosted-attributable");
+        assert!(unspecified_error.to_string().contains("non-attributable"));
+
+        let trailer_start = unspecified_bytes
+            .windows(8)
+            .position(|window| window == b"KINPRD01")
+            .expect("saved wrapper appends the current producer trailer");
+        let raw_base = unspecified_bytes[..trailer_start].to_vec();
+        let mut legacy = unspecified_artifact.clone();
+        legacy.index = raw_base.clone();
+        let legacy_error = read_hosted_vector_artifact_actual_producers(&legacy)
+            .expect_err("exact raw v2 bytes carry only unknown legacy evidence");
+        assert!(legacy_error
+            .to_string()
+            .contains("no current actual-producer binding"));
+
+        let mut incompatible = legacy;
+        incompatible.index = raw_base;
+        incompatible.index.push(0x7f);
+        assert!(read_hosted_vector_artifact_actual_producers(&incompatible).is_err());
     }
 
     /// `classify_vector_sidecar`: matching identities on both sides loads.

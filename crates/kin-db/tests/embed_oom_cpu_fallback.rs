@@ -35,7 +35,7 @@
 //! proving the OOM retry was served by the CPU twin's compute, not some other
 //! path.
 
-use kin_db::CodeEmbedder;
+use kin_db::{CodeEmbedder, EmbeddingProducer, EmbeddingProducerSet};
 
 /// The exact text embedded twice — once via the OOM-degraded Metal arm, once
 /// directly via the CPU arm — so the two vectors must match.
@@ -77,11 +77,20 @@ fn metal_oom_degrades_to_cpu_twin_and_returns_correct_vectors() {
     // The single Metal forward for this batch is forcibly OOM'd, so a
     // successful result can only have come from the CPU-twin retry. If that
     // retry path were broken, embed_batch would return Err and fail the index.
-    let degraded = embedder
-        .embed_batch(&[SAMPLE.to_string()])
+    let degraded_batch = embedder
+        .embed_batch_with_producers(&[SAMPLE.to_string()])
         .expect("embed_batch must succeed by degrading to the CPU twin after Metal OOM");
-    assert_eq!(degraded.len(), 1, "expected exactly one vector");
-    let degraded = &degraded[0];
+    assert_eq!(
+        degraded_batch.producers,
+        EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
+        "the OOM retry must attest the CPU model that actually returned the vector"
+    );
+    assert_eq!(
+        degraded_batch.vectors.len(),
+        1,
+        "expected exactly one vector"
+    );
+    let degraded = &degraded_batch.vectors[0];
 
     assert_eq!(
         degraded.len(),
@@ -103,11 +112,15 @@ fn metal_oom_degrades_to_cpu_twin_and_returns_correct_vectors() {
     // reproduce the degraded vector, proving the OOM retry was served by the CPU
     // twin's compute.
     std::env::set_var("KIN_EMBED_BACKEND", "cpu");
-    let reference = embedder
-        .embed_batch(&[SAMPLE.to_string()])
+    let reference_batch = embedder
+        .embed_batch_with_producers(&[SAMPLE.to_string()])
         .expect("direct CPU reference embed must succeed");
-    assert_eq!(reference.len(), 1);
-    let reference = &reference[0];
+    assert_eq!(
+        reference_batch.producers,
+        EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu)
+    );
+    assert_eq!(reference_batch.vectors.len(), 1);
+    let reference = &reference_batch.vectors[0];
     assert_eq!(reference.len(), dim);
 
     let cos = cosine(degraded, reference);

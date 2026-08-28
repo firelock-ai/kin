@@ -6827,9 +6827,10 @@ fn ref_log_root(authority: &PersistedRepositoryAuthority) -> Result<Hash256, Kin
     Ok(root.finish())
 }
 
-/// Replicated ref-log entry. Repository transactions may also carry local
-/// workspace and overlay mutations, but those must not perturb a replicated
-/// root. The full operation identity remains bound under `local_state`.
+/// Receiver-local ref receipt entry. Its destination operation identity,
+/// actor, and commit time are local to the authority that accepted it, so this
+/// is not portable ref history and must not override replicated `ref_state`.
+/// The full operation identity remains bound under `local_state`.
 #[derive(Serialize)]
 struct RefLogProjection {
     operation_id: OperationId,
@@ -7912,6 +7913,34 @@ mod tests {
             merge_transaction_delta: None,
             sealed_observation: None,
         }
+    }
+
+    fn receiver_ref_transaction<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        operation: u128,
+        actor: &str,
+    ) -> RepositoryTransaction {
+        let main = RefName::branch(b"main").unwrap();
+        let mut transaction = transaction_shell(manager, operation);
+        transaction.actor = AuthorId::new(actor);
+        transaction.reason = "apply equivalent transferred ref authority".to_string();
+        transaction.ref_mutations.push(RefMutation {
+            name: main.clone(),
+            expected: RefExpectation::MustNotExist,
+            new_target: Some(RefTarget::symbolic(RefName::branch(b"upstream").unwrap())),
+            policy: RefUpdatePolicy::FastForwardOnly,
+        });
+        transaction.default_ref_mutation = Some(DefaultRefMutation {
+            expected: DefaultRefExpectation::MustBeUnset,
+            new_default: Some(main),
+        });
+        transaction
+    }
+
+    fn perturb_root(root: &mut AuthorityRoot) {
+        let mut bytes = *root.hash.as_bytes();
+        bytes[0] ^= 1;
+        root.hash = Hash256::from_bytes(bytes);
     }
 
     fn semantic_workspace_transaction<B: StorageBackend + ?Sized + 'static>(
@@ -13127,6 +13156,148 @@ mod tests {
             .expect_err("non-commit object must not imply ancestry");
         assert!(error.to_string().contains("requires force-with-lease"));
         assert_eq!(manager.read_authority().generation(), stable_generation);
+    }
+
+    #[test]
+    fn replicated_truth_classifies_every_root_bundle_field() {
+        let manager = initial_manager(Arc::new(MemoryBackend::default()));
+        let expected = manager.read_authority().roots().clone();
+
+        type Case = (&'static str, bool, fn(&mut RootBundle));
+        let cases: [Case; 8] = [
+            ("version", false, |bundle| bundle.version += 1),
+            ("generation", true, |bundle| bundle.generation += 1),
+            ("history", false, |bundle| perturb_root(&mut bundle.history)),
+            ("ref_state", false, |bundle| {
+                perturb_root(&mut bundle.ref_state)
+            }),
+            ("ref_log", true, |bundle| perturb_root(&mut bundle.ref_log)),
+            ("collaboration", false, |bundle| {
+                perturb_root(&mut bundle.collaboration)
+            }),
+            ("replication", false, |bundle| {
+                perturb_root(&mut bundle.replication)
+            }),
+            ("local_state", true, |bundle| {
+                perturb_root(&mut bundle.local_state)
+            }),
+        ];
+
+        expected.validate().unwrap();
+        let expected_wire = rmp_serde::to_vec(&expected).unwrap();
+        assert_eq!(
+            expected_wire.first(),
+            Some(&0x98),
+            "RootBundle gained or lost a field; classify every field explicitly"
+        );
+
+        for (field, expects_same_replicated_truth, mutate) in cases {
+            let mut changed = expected.clone();
+            mutate(&mut changed);
+            assert_ne!(changed, expected, "{field} must remain in full equality");
+            assert_ne!(
+                rmp_serde::to_vec(&changed).unwrap(),
+                expected_wire,
+                "{field} must remain in the complete serialized bundle"
+            );
+            assert_eq!(
+                expected.has_same_replicated_truth(&changed),
+                expects_same_replicated_truth,
+                "{field} has the wrong replicated-truth classification"
+            );
+        }
+
+        let mut invalid_local_root = expected;
+        invalid_local_root.ref_log.version += 1;
+        assert!(
+            invalid_local_root.validate().is_err(),
+            "receiver-local roots remain version-validated"
+        );
+    }
+
+    #[test]
+    fn equivalent_receivers_reopen_with_the_same_replicated_truth() {
+        let source_backend = Arc::new(MemoryBackend::default());
+        let receiver_backend = Arc::new(MemoryBackend::default());
+        let source = initial_manager(Arc::clone(&source_backend));
+        let receiver = initial_manager(Arc::clone(&receiver_backend));
+
+        let source_receipt = source
+            .commit_repository_transaction(receiver_ref_transaction(
+                &source,
+                0xfa01,
+                "transfer-source-receiver",
+            ))
+            .unwrap();
+        let receiver_receipt = receiver
+            .commit_repository_transaction(receiver_ref_transaction(
+                &receiver,
+                0xfa02,
+                "transfer-destination-receiver",
+            ))
+            .unwrap();
+
+        assert_ne!(
+            source_receipt.operation.operation_id,
+            receiver_receipt.operation.operation_id
+        );
+        assert_ne!(
+            source_receipt.operation.actor,
+            receiver_receipt.operation.actor
+        );
+        assert_ne!(
+            source_receipt, receiver_receipt,
+            "each receiver must preserve its own exact durable receipt"
+        );
+
+        let source_roots = source.read_authority().roots().clone();
+        let receiver_roots = receiver.read_authority().roots().clone();
+        source_roots.validate().unwrap();
+        receiver_roots.validate().unwrap();
+        assert_eq!(source_roots.history, receiver_roots.history);
+        assert_eq!(source_roots.ref_state, receiver_roots.ref_state);
+        assert_eq!(source_roots.collaboration, receiver_roots.collaboration);
+        assert_eq!(source_roots.replication, receiver_roots.replication);
+        assert_ne!(source_roots.ref_log, receiver_roots.ref_log);
+        assert_ne!(source_roots.local_state, receiver_roots.local_state);
+        assert_ne!(source_roots, receiver_roots);
+        assert!(source_roots.has_same_replicated_truth(&receiver_roots));
+
+        let source_snapshot = source_backend
+            .snapshot
+            .lock()
+            .as_ref()
+            .expect("source commit persisted a snapshot")
+            .0
+            .clone();
+        let receiver_snapshot = receiver_backend
+            .snapshot
+            .lock()
+            .as_ref()
+            .expect("receiver commit persisted a snapshot")
+            .0
+            .clone();
+        assert_ne!(
+            source_snapshot, receiver_snapshot,
+            "receiver-local receipts remain in exact persisted snapshot identity"
+        );
+
+        drop(source);
+        drop(receiver);
+        let reopened_source = initial_manager(source_backend);
+        let reopened_receiver = initial_manager(receiver_backend);
+        let reopened_source_roots = reopened_source.read_authority().roots().clone();
+        let reopened_receiver_roots = reopened_receiver.read_authority().roots().clone();
+        assert_eq!(reopened_source_roots, source_roots);
+        assert_eq!(reopened_receiver_roots, receiver_roots);
+        assert!(reopened_source_roots.has_same_replicated_truth(&reopened_receiver_roots));
+
+        let mut moved_ref = reopened_receiver_roots;
+        perturb_root(&mut moved_ref.ref_state);
+        assert!(
+            !reopened_source_roots.has_same_replicated_truth(&moved_ref),
+            "receiver-local receipt differences must not hide a replicated ref-state move"
+        );
     }
 
     #[test]

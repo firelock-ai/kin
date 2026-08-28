@@ -10,11 +10,18 @@ pub mod delta;
 pub mod format;
 #[cfg(feature = "gcs")]
 pub mod gcs;
+mod gcs_compatibility;
 pub(crate) mod history_replay;
 pub mod index;
 mod local_journal;
 pub mod merkle;
 mod mmap;
+#[cfg(feature = "vector")]
+pub(crate) use local_journal::sync_parent_directory;
+#[cfg(feature = "vector")]
+pub(crate) use mmap::open_regular_nofollow;
+#[cfg(feature = "embeddings")]
+pub(crate) use mmap::read_regular_bounded;
 pub mod repository;
 mod snapshot;
 #[cfg(feature = "sql")]
@@ -42,6 +49,9 @@ pub use delta::{
 pub use format::{CompactionStats, GraphSnapshot, WorkspaceGraphFacts};
 #[cfg(feature = "gcs")]
 pub use gcs::GcsBackend;
+pub use gcs_compatibility::{
+    GcsFullAuthorityEnvelopeCompatibility, GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY,
+};
 pub use index::ReadIndex;
 pub use merkle::{
     build_entity_hash_map, compute_entity_hash, compute_graph_root_hash, compute_relation_hash,
@@ -56,7 +66,11 @@ pub use repository::{
     WorkspaceAdmissionSnapshot, PREPARED_WORKSPACE_GRAPH_VERSION,
 };
 #[cfg(feature = "vector")]
-pub use snapshot::{validate_hosted_vector_artifact_inner, VECTOR_INDEX_METADATA_VERSION};
+pub use snapshot::{
+    read_hosted_vector_artifact_actual_producers, validate_hosted_vector_artifact_inner,
+    validate_hosted_vector_artifact_inner_for_producers,
+    validate_hosted_vector_artifact_inner_with_producers, VECTOR_INDEX_METADATA_VERSION,
+};
 pub use snapshot::{SnapshotManager, VectorSidecarDisposition, VectorSidecarLoadOutcome};
 #[cfg(feature = "sql")]
 pub use sql::SqliteBackend;

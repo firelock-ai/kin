@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 #[cfg(feature = "embeddings")]
 use crate::embed::CodeEmbedder;
+#[cfg(feature = "vector")]
+use crate::embed::EmbeddingProducer;
+use crate::embed::EmbeddingProducerSet;
 use crate::error::KinDbError;
 use crate::search::{
     opaque_artifact_fields, shallow_file_fields, structured_artifact_fields, TextIndex,
@@ -113,11 +116,9 @@ fn drive_embed_pipeline<P, F, G, H>(
 ) -> Result<usize, KinDbError>
 where
     P: FnMut() -> Result<Option<PreparedEmbedBatch>, KinDbError> + Send,
-    F: Fn(
-            PreparedEmbedBatch,
-        ) -> Result<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>), KinDbError>
+    F: Fn(PreparedEmbedBatch) -> Result<(PreparedEmbedBatch, ProducedRetrievalBatch), KinDbError>
         + Send,
-    G: FnMut(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>) -> Result<usize, KinDbError>,
+    G: FnMut(PreparedEmbedBatch, ProducedRetrievalBatch) -> Result<usize, KinDbError>,
     H: Fn(PreparedEmbedBatch) + Send + Sync,
 {
     use std::sync::{
@@ -128,7 +129,7 @@ where
 
     let (prep_tx, prep_rx) = sync_channel::<PreparedEmbedBatch>(prep_capacity);
     let (result_tx, result_rx) =
-        sync_channel::<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>)>(result_capacity);
+        sync_channel::<(PreparedEmbedBatch, ProducedRetrievalBatch)>(result_capacity);
     let first_error: parking_lot::Mutex<Option<KinDbError>> = parking_lot::Mutex::new(None);
     let error_ref = &first_error;
     let abandon_ref = &abandon;
@@ -2046,6 +2047,51 @@ pub struct PreparedEmbedBatch {
     /// Recency for every drained key (including any whose entity was missing),
     /// so an error-requeue cannot demote changed-this-sync work to backfill.
     recency: hashbrown::HashMap<RetrievalKey, EmbedRecency>,
+}
+
+/// Retrieval vectors paired with the conservative union of runtimes that
+/// actually returned them.
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+pub struct ProducedRetrievalBatch {
+    items: Vec<(RetrievalKey, Vec<f32>)>,
+    producers: EmbeddingProducerSet,
+}
+
+#[cfg(all(feature = "embeddings", feature = "vector"))]
+impl ProducedRetrievalBatch {
+    fn empty() -> Self {
+        Self {
+            items: Vec::new(),
+            producers: EmbeddingProducerSet::new(),
+        }
+    }
+
+    fn from_unattributed(items: Vec<(RetrievalKey, Vec<f32>)>) -> Self {
+        let producers = if items.is_empty() {
+            EmbeddingProducerSet::new()
+        } else {
+            EmbeddingProducerSet::singleton(EmbeddingProducer::Unspecified)
+        };
+        Self { items, producers }
+    }
+}
+
+/// One semantic-search result plus the exact producer set for the query vector
+/// used to rank it. This is distinct from configured routing and from the
+/// conservative producer lineage of the persisted document index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProducedSemanticSearch {
+    pub matches: Vec<(RetrievalKey, f32)>,
+    pub query_producers: EmbeddingProducerSet,
+}
+
+/// Batched semantic-search results plus the union of runtimes that actually
+/// returned the query vectors. An empty set means query embedding did not run,
+/// for example because the document index was empty.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProducedSemanticSearchBatch {
+    pub matches: Vec<Vec<(RetrievalKey, f32)>>,
+    pub query_producers: EmbeddingProducerSet,
 }
 
 #[cfg(all(feature = "embeddings", feature = "vector"))]
@@ -4672,11 +4718,14 @@ impl InMemoryGraph {
         let mut count = 0;
         for chunk in entity_data.chunks(batch_size) {
             let texts: Vec<String> = chunk.iter().map(|(_, t)| t.clone()).collect();
-            let vectors = embedder.embed_batch(&texts)?;
-            for ((id, _), vec) in chunk.iter().zip(vectors.iter()) {
-                vi.upsert(*id, vec)?;
-                count += 1;
-            }
+            let produced = embedder.embed_batch_with_producers(&texts)?;
+            let items: Vec<(RetrievalKey, Vec<f32>)> = chunk
+                .iter()
+                .zip(produced.vectors)
+                .map(|((id, _), vector)| (RetrievalKey::Entity(*id), vector))
+                .collect();
+            count += items.len();
+            vi.upsert_retrievable_batch_with_producers(items, &produced.producers)?;
         }
 
         Ok(count)
@@ -4733,11 +4782,14 @@ impl InMemoryGraph {
 
         for chunk in docs.chunks(batch_size) {
             let texts: Vec<String> = chunk.iter().map(|(_, text)| text.clone()).collect();
-            let vectors = embedder.embed_batch(&texts)?;
-            for ((key, _), vector) in chunk.iter().zip(vectors.iter()) {
-                vi.upsert_retrievable(*key, vector)?;
-                count += 1;
-            }
+            let produced = embedder.embed_batch_with_producers(&texts)?;
+            let items: Vec<(RetrievalKey, Vec<f32>)> = chunk
+                .iter()
+                .zip(produced.vectors)
+                .map(|((key, _), vector)| (*key, vector))
+                .collect();
+            count += items.len();
+            vi.upsert_retrievable_batch_with_producers(items, &produced.producers)?;
         }
 
         Ok(count)
@@ -4791,20 +4843,60 @@ impl InMemoryGraph {
         path: &std::path::Path,
         expected: &crate::vector::IndexDescriptor,
     ) -> crate::vector::VectorIndexLoad {
+        self.load_vector_index_compatible_with_producers(path, expected, None)
+    }
+
+    /// Load a persisted index only when its self-description and the actual
+    /// producer set bound inside the same bytes equal the caller's metadata.
+    #[cfg(feature = "vector")]
+    pub fn load_vector_index_compatible_with_producers(
+        &self,
+        path: &std::path::Path,
+        expected: &crate::vector::IndexDescriptor,
+        expected_producers: Option<&EmbeddingProducerSet>,
+    ) -> crate::vector::VectorIndexLoad {
         use crate::vector::{IndexLoadOutcome, VectorIndexLoad};
-        match VectorIndex::load_compatible(path, expected) {
+        match VectorIndex::load_compatible_with_producers(path, expected, expected_producers) {
             IndexLoadOutcome::Loaded(index) => {
-                let count = index.len();
-                *self.vector_index.lock() = Some(Arc::new(index));
-                self.mark_vector_full_reconcile();
+                let count = self.install_vector_index(index);
                 VectorIndexLoad::Loaded(count)
             }
             IndexLoadOutcome::Incompatible(reason) => VectorIndexLoad::Incompatible(reason),
         }
     }
 
+    /// Install a fully detached and validated vector index in one slot swap.
+    /// Callers must complete descriptor, producer, and shape validation before
+    /// invoking this method; failures before this point leave the served index
+    /// untouched.
+    #[cfg(feature = "vector")]
+    pub(crate) fn install_vector_index(&self, index: VectorIndex) -> usize {
+        let count = index.len();
+        *self.vector_index.lock() = Some(Arc::new(index));
+        self.mark_vector_full_reconcile();
+        count
+    }
+
     #[cfg(feature = "vector")]
     pub fn save_vector_index(&self, path: &std::path::Path) -> Result<(), KinDbError> {
+        self.save_vector_index_with_provenance(path, None, |_| Ok(()))?;
+        Ok(())
+    }
+
+    /// Serialize one detached producer-bound vector candidate, let the caller
+    /// promote matching metadata from its exact receipt, then atomically expose
+    /// the complete index. The vector mutation/provenance frontier stays held
+    /// across the callback and both promotions.
+    #[cfg(feature = "vector")]
+    pub(crate) fn save_vector_index_with_provenance<F>(
+        &self,
+        path: &std::path::Path,
+        descriptor: Option<crate::vector::IndexDescriptor>,
+        before_index_promote: F,
+    ) -> Result<Option<crate::vector::VectorIndexPersistenceInfo>, KinDbError>
+    where
+        F: FnOnce(&crate::vector::VectorIndexPersistenceInfo) -> Result<(), KinDbError>,
+    {
         let _span = tracing::info_span!(
             "kindb.save_vector_index",
             path = %path.display()
@@ -4844,10 +4936,12 @@ impl InMemoryGraph {
         let index = self.vector_index.lock().clone();
         run_save_vector_index_after_detach_hook(self);
         if let Some(index) = index {
-            index.save(path)?;
+            return index
+                .save_with_provenance(path, descriptor, before_index_promote)
+                .map(Some);
         }
 
-        Ok(())
+        Ok(None)
     }
 
     /// Stamp the in-memory vector index's self-description (embedding model
@@ -4890,6 +4984,29 @@ impl InMemoryGraph {
             .map(|index| (index.dimensions(), index.len()))
     }
 
+    /// Conservative actual-producer lineage for the currently installed vector
+    /// index. `None` means no index handle is installed; `Some(empty)` means an
+    /// installed empty index has not yet accepted any vectors.
+    #[cfg(feature = "vector")]
+    pub fn vector_actual_producers(&self) -> Option<EmbeddingProducerSet> {
+        self.vector_index
+            .lock()
+            .as_ref()
+            .map(|index| index.actual_producers())
+    }
+
+    #[cfg(all(test, feature = "vector"))]
+    pub(crate) fn search_loaded_vector_index_for_test(
+        &self,
+        embedding: &[f32],
+        limit: usize,
+    ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
+        let index = self.vector_index.lock().clone().ok_or_else(|| {
+            KinDbError::IndexError("no vector index is installed for test search".to_string())
+        })?;
+        index.search_similar(embedding, limit)
+    }
+
     /// Semantic similarity search across all embedded entities.
     ///
     /// Embeds the query text using the code embedding model, then searches
@@ -4904,8 +5021,21 @@ impl InMemoryGraph {
         query: &str,
         limit: usize,
     ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
+        Ok(self.semantic_search_with_producers(query, limit)?.matches)
+    }
+
+    /// Semantic search with exact query-vector producer evidence. Callers that
+    /// enforce a hosted numerical-compatibility policy must inspect
+    /// `query_producers`; the persisted index's lineage alone does not attest
+    /// which runtime produced this query.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn semantic_search_with_producers(
+        &self,
+        query: &str,
+        limit: usize,
+    ) -> Result<ProducedSemanticSearch, KinDbError> {
         let _span = tracing::info_span!(
-            "kindb.semantic_search",
+            "kindb.semantic_search_with_producers",
             query = %query,
             limit = limit
         )
@@ -4919,12 +5049,23 @@ impl InMemoryGraph {
         // to embed/search the query still surfaces the error via `?`.
         let vi = match &*self.vector_index.lock() {
             Some(vi) if !vi.is_empty() => Arc::clone(vi),
-            _ => return Ok(Vec::new()),
+            _ => {
+                return Ok(ProducedSemanticSearch {
+                    matches: Vec::new(),
+                    query_producers: EmbeddingProducerSet::new(),
+                })
+            }
         };
 
         let embedder = self.get_embedder()?;
-        let vector = embedder.embed_text(query)?;
-        vi.search_similar(&vector, limit)
+        let mut produced = embedder.embed_query_batch_with_producers(&[query.to_string()])?;
+        let vector = produced.vectors.pop().ok_or_else(|| {
+            KinDbError::IndexError("query embedding returned empty result".to_string())
+        })?;
+        Ok(ProducedSemanticSearch {
+            matches: vi.search_similar(&vector, limit)?,
+            query_producers: produced.producers,
+        })
     }
 
     /// Semantic similarity search (stub when features are disabled).
@@ -4935,6 +5076,18 @@ impl InMemoryGraph {
         _limit: usize,
     ) -> Result<Vec<(RetrievalKey, f32)>, KinDbError> {
         Ok(Vec::new())
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn semantic_search_with_producers(
+        &self,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<ProducedSemanticSearch, KinDbError> {
+        Ok(ProducedSemanticSearch {
+            matches: Vec::new(),
+            query_producers: EmbeddingProducerSet::new(),
+        })
     }
 
     /// Batched semantic similarity search across all embedded entities.
@@ -4950,34 +5103,57 @@ impl InMemoryGraph {
         queries: &[&str],
         limit: usize,
     ) -> Result<Vec<Vec<(RetrievalKey, f32)>>, KinDbError> {
+        Ok(self
+            .semantic_search_batch_with_producers(queries, limit)?
+            .matches)
+    }
+
+    /// Batched semantic search with exact query-vector producer evidence.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn semantic_search_batch_with_producers(
+        &self,
+        queries: &[&str],
+        limit: usize,
+    ) -> Result<ProducedSemanticSearchBatch, KinDbError> {
         let _span = tracing::info_span!(
-            "kindb.semantic_search_batch",
+            "kindb.semantic_search_batch_with_producers",
             num_queries = queries.len(),
             limit = limit
         )
         .entered();
 
         if queries.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ProducedSemanticSearchBatch {
+                matches: Vec::new(),
+                query_producers: EmbeddingProducerSet::new(),
+            });
         }
 
         // Mirror `semantic_search`: an empty/unpopulated index degrades to one
         // empty result per query rather than loading the embedder and failing.
         let vi = match &*self.vector_index.lock() {
             Some(vi) if !vi.is_empty() => Arc::clone(vi),
-            _ => return Ok(vec![Vec::new(); queries.len()]),
+            _ => {
+                return Ok(ProducedSemanticSearchBatch {
+                    matches: vec![Vec::new(); queries.len()],
+                    query_producers: EmbeddingProducerSet::new(),
+                })
+            }
         };
 
         let embedder = self.get_embedder()?;
 
         let texts: Vec<String> = queries.iter().map(|q| q.to_string()).collect();
-        let vectors = embedder.embed_query_batch(&texts)?;
+        let produced = embedder.embed_query_batch_with_producers(&texts)?;
 
-        let mut results = Vec::with_capacity(vectors.len());
-        for vector in &vectors {
+        let mut results = Vec::with_capacity(produced.vectors.len());
+        for vector in &produced.vectors {
             results.push(vi.search_similar(vector, limit)?);
         }
-        Ok(results)
+        Ok(ProducedSemanticSearchBatch {
+            matches: results,
+            query_producers: produced.producers,
+        })
     }
 
     /// Batched semantic similarity search with a predicate filter.
@@ -4991,32 +5167,60 @@ impl InMemoryGraph {
     where
         P: Fn(&RetrievalKey) -> bool,
     {
+        Ok(self
+            .semantic_search_batch_filtered_with_producers(queries, limit, predicate)?
+            .matches)
+    }
+
+    /// Filtered batched semantic search with exact query-vector producer
+    /// evidence for hosted ranking policy.
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    pub fn semantic_search_batch_filtered_with_producers<P>(
+        &self,
+        queries: &[&str],
+        limit: usize,
+        predicate: P,
+    ) -> Result<ProducedSemanticSearchBatch, KinDbError>
+    where
+        P: Fn(&RetrievalKey) -> bool,
+    {
         let _span = tracing::info_span!(
-            "kindb.semantic_search_batch_filtered",
+            "kindb.semantic_search_batch_filtered_with_producers",
             num_queries = queries.len(),
             limit = limit
         )
         .entered();
 
         if queries.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ProducedSemanticSearchBatch {
+                matches: Vec::new(),
+                query_producers: EmbeddingProducerSet::new(),
+            });
         }
 
         let vi = match &*self.vector_index.lock() {
             Some(vi) if !vi.is_empty() => Arc::clone(vi),
-            _ => return Ok(vec![Vec::new(); queries.len()]),
+            _ => {
+                return Ok(ProducedSemanticSearchBatch {
+                    matches: vec![Vec::new(); queries.len()],
+                    query_producers: EmbeddingProducerSet::new(),
+                })
+            }
         };
 
         let embedder = self.get_embedder()?;
 
         let texts: Vec<String> = queries.iter().map(|q| q.to_string()).collect();
-        let vectors = embedder.embed_query_batch(&texts)?;
+        let produced = embedder.embed_query_batch_with_producers(&texts)?;
 
-        let mut results = Vec::with_capacity(vectors.len());
-        for vector in &vectors {
+        let mut results = Vec::with_capacity(produced.vectors.len());
+        for vector in &produced.vectors {
             results.push(vi.search_similar_filtered(vector, limit, &predicate)?);
         }
-        Ok(results)
+        Ok(ProducedSemanticSearchBatch {
+            matches: results,
+            query_producers: produced.producers,
+        })
     }
 
     /// Batched semantic similarity search (stub when features are disabled).
@@ -5027,6 +5231,18 @@ impl InMemoryGraph {
         _limit: usize,
     ) -> Result<Vec<Vec<(RetrievalKey, f32)>>, KinDbError> {
         Ok(vec![Vec::new(); queries.len()])
+    }
+
+    #[cfg(not(all(feature = "embeddings", feature = "vector")))]
+    pub fn semantic_search_batch_with_producers(
+        &self,
+        queries: &[&str],
+        _limit: usize,
+    ) -> Result<ProducedSemanticSearchBatch, KinDbError> {
+        Ok(ProducedSemanticSearchBatch {
+            matches: vec![Vec::new(); queries.len()],
+            query_producers: EmbeddingProducerSet::new(),
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -5255,6 +5471,7 @@ impl InMemoryGraph {
             Some(vi) => vi,
             None => return 0,
         };
+        let carried_producers = vi.actual_producers();
 
         let ent = self.entities.read();
 
@@ -5308,7 +5525,11 @@ impl InMemoryGraph {
                         {
                             let source_key = RetrievalKey::EntityRevision(*prev_id);
                             if let Some(vector) = vi.get_retrievable(&source_key) {
-                                let _ = vi.upsert_retrievable(key, &vector);
+                                let _ = vi.upsert_retrievable_with_producers(
+                                    key,
+                                    &vector,
+                                    &carried_producers,
+                                );
                                 propagated += 1;
                                 last_vectored = Some(rev.revision_id);
                                 continue;
@@ -5330,7 +5551,11 @@ impl InMemoryGraph {
                         {
                             let source_key = RetrievalKey::EntityRevision(source_id);
                             if let Some(vector) = vi.get_retrievable(&source_key) {
-                                let _ = vi.upsert_retrievable(key, &vector);
+                                let _ = vi.upsert_retrievable_with_producers(
+                                    key,
+                                    &vector,
+                                    &carried_producers,
+                                );
                                 propagated += 1;
                                 last_vectored = Some(rev.revision_id);
                                 continue;
@@ -5711,7 +5936,7 @@ impl InMemoryGraph {
             return Ok(0);
         }
         let embedded = self.embed_prepared_batch(&prepared)?;
-        self.persist_embedded_batch(embedded, &prepared)
+        self.persist_produced_embedding_batch(embedded, &prepared)
     }
 
     /// Stage 1 of the embed pipeline: drain a deterministic, priority-ordered
@@ -5835,9 +6060,9 @@ impl InMemoryGraph {
     pub fn embed_prepared_batch(
         &self,
         prepared: &PreparedEmbedBatch,
-    ) -> Result<Vec<(RetrievalKey, Vec<f32>)>, KinDbError> {
+    ) -> Result<ProducedRetrievalBatch, KinDbError> {
         if prepared.keys.is_empty() {
-            return Ok(Vec::new());
+            return Ok(ProducedRetrievalBatch::empty());
         }
 
         let embedder = match self.get_embedder() {
@@ -5857,21 +6082,24 @@ impl InMemoryGraph {
         let forward_result = self
             .embed_stage_timings
             .time(crate::embed::EmbedStage::Forward, || {
-                embedder.embed_batch(&prepared.texts)
+                embedder.embed_batch_with_producers(&prepared.texts)
             });
-        let vectors = match forward_result {
-            Ok(vectors) => vectors,
+        let produced = match forward_result {
+            Ok(produced) => produced,
             Err(err) => {
                 self.requeue_embedding_keys(prepared.keys.iter().copied(), &prepared.recency);
                 return Err(err);
             }
         };
-        Ok(prepared
-            .keys
-            .iter()
-            .copied()
-            .zip(vectors.into_iter())
-            .collect())
+        Ok(ProducedRetrievalBatch {
+            items: prepared
+                .keys
+                .iter()
+                .copied()
+                .zip(produced.vectors)
+                .collect(),
+            producers: produced.producers,
+        })
     }
 
     /// Stage 3 of the embed pipeline: persist embedded vectors into the index and
@@ -5882,6 +6110,19 @@ impl InMemoryGraph {
     pub fn persist_embedded_batch(
         &self,
         embedded: Vec<(RetrievalKey, Vec<f32>)>,
+        prepared: &PreparedEmbedBatch,
+    ) -> Result<usize, KinDbError> {
+        self.persist_embedded_batch_inner(
+            ProducedRetrievalBatch::from_unattributed(embedded),
+            prepared,
+            true,
+        )
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    fn persist_produced_embedding_batch(
+        &self,
+        embedded: ProducedRetrievalBatch,
         prepared: &PreparedEmbedBatch,
     ) -> Result<usize, KinDbError> {
         self.persist_embedded_batch_inner(embedded, prepared, true)
@@ -5898,14 +6139,14 @@ impl InMemoryGraph {
     #[cfg(all(feature = "embeddings", feature = "vector"))]
     fn persist_embedded_batch_inner(
         &self,
-        embedded: Vec<(RetrievalKey, Vec<f32>)>,
+        embedded: ProducedRetrievalBatch,
         prepared: &PreparedEmbedBatch,
         prune_on_empty: bool,
     ) -> Result<usize, KinDbError> {
-        if embedded.is_empty() {
+        if embedded.items.is_empty() {
             return Ok(0);
         }
-        let keys: Vec<RetrievalKey> = embedded.iter().map(|(key, _)| *key).collect();
+        let keys: Vec<RetrievalKey> = embedded.items.iter().map(|(key, _)| *key).collect();
 
         let vi = match self.get_vector_index() {
             Ok(index) => index,
@@ -5915,11 +6156,11 @@ impl InMemoryGraph {
             }
         };
 
-        let count = embedded.len();
+        let count = embedded.items.len();
         let persist_result = self
             .embed_stage_timings
             .time(crate::embed::EmbedStage::Persist, || {
-                vi.upsert_retrievable_batch(embedded)
+                vi.upsert_retrievable_batch_with_producers(embedded.items, &embedded.producers)
             });
         if let Err(err) = persist_result {
             self.requeue_embedding_keys(keys.iter().copied(), &prepared.recency);
@@ -6049,8 +6290,8 @@ impl InMemoryGraph {
         let mut count = 0usize;
         for (chunk_idx, chunk) in docs.chunks(embed_batch_size).enumerate() {
             let texts: Vec<String> = chunk.iter().map(|(_, _, text)| text.clone()).collect();
-            let vectors = match embedder.embed_batch(&texts) {
-                Ok(vectors) => vectors,
+            let produced = match embedder.embed_batch_with_producers(&texts) {
+                Ok(produced) => produced,
                 Err(err) => {
                     let remaining_ids: Vec<ArtifactId> = docs[chunk_idx * embed_batch_size..]
                         .iter()
@@ -6061,8 +6302,12 @@ impl InMemoryGraph {
                 }
             };
 
-            for (item_idx, ((_, key, _), vector)) in chunk.iter().zip(vectors.iter()).enumerate() {
-                if let Err(err) = vi.upsert_retrievable(*key, vector) {
+            for (item_idx, ((_, key, _), vector)) in
+                chunk.iter().zip(produced.vectors.iter()).enumerate()
+            {
+                if let Err(err) =
+                    vi.upsert_retrievable_with_producers(*key, vector, &produced.producers)
+                {
                     let mut remaining_ids: Vec<ArtifactId> = chunk[item_idx..]
                         .iter()
                         .map(|(artifact_id, _, _)| *artifact_id)
@@ -6381,6 +6626,7 @@ impl InMemoryGraph {
             return;
         }
         let vector_index = self.vector_index.lock().clone();
+        let carried_producers = vector_index.as_ref().map(|index| index.actual_producers());
         let mut carried = 0usize;
         // Decide against the index first and take the queue lock once at the
         // end. Holding the queue across index calls would be the only place in
@@ -6394,7 +6640,16 @@ impl InMemoryGraph {
                 }
                 if let Some(source) = entry.carry_from {
                     if let Some(vector) = vi.get_retrievable(&source) {
-                        if vi.upsert_retrievable(entry.key, &vector).is_ok() {
+                        if vi
+                            .upsert_retrievable_with_producers(
+                                entry.key,
+                                &vector,
+                                carried_producers
+                                    .as_ref()
+                                    .expect("producer set exists beside vector index"),
+                            )
+                            .is_ok()
+                        {
                             carried += 1;
                             continue;
                         }
@@ -18135,6 +18390,30 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "vector")]
+    #[test]
+    fn vector_actual_producers_distinguishes_missing_empty_and_attributed_indexes() {
+        let graph = InMemoryGraph::new();
+        assert_eq!(graph.vector_actual_producers(), None);
+
+        let index = Arc::new(VectorIndex::new(2).unwrap());
+        *graph.vector_index.lock() = Some(Arc::clone(&index));
+        assert_eq!(
+            graph.vector_actual_producers(),
+            Some(EmbeddingProducerSet::new())
+        );
+
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        index
+            .upsert_retrievable_with_producers(
+                RetrievalKey::Entity(EntityId::new()),
+                &[1.0, 0.0],
+                &producers,
+            )
+            .unwrap();
+        assert_eq!(graph.vector_actual_producers(), Some(producers));
+    }
+
     /// admitted every generation) kept BOTH vectors and `semantic_locate`
     /// returned the entity twice with two distinct cosine scores. Discriminating:
     /// FAILS on the old all-revisions truth (evicts 0), PASSES on head-only truth.
@@ -18681,6 +18960,105 @@ mod tests {
         // This should be Ok(0) regardless of feature flags
         let result = graph.process_embedding_queue(64);
         assert!(result.is_ok());
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn non_oom_local_forward_error_preserves_cache_queue_and_vector_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("local_forward_error", "src/error.rs");
+        graph.upsert_entity(&entity).unwrap();
+
+        let index = VectorIndex::new(2).unwrap();
+        index.upsert(entity.id, &[1.0, 0.0]).unwrap();
+        graph.install_vector_index(index);
+        let before_producers = graph.vector_actual_producers();
+        let before_search = graph
+            .search_loaded_vector_index_for_test(&[1.0, 0.0], 1)
+            .unwrap();
+        assert_eq!(before_search[0].0, RetrievalKey::from(entity.id));
+
+        let (embedder, stats) = CodeEmbedder::test_local_forward_error(
+            2,
+            dir.path().to_path_buf(),
+            "synthetic non-OOM graph forward failure",
+        );
+        let embedder = Arc::new(embedder);
+        assert!(embedder.test_cache_is_empty());
+        *graph.embedder.lock() = Some(Arc::clone(&embedder));
+
+        let error = graph
+            .process_embedding_queue(1)
+            .expect_err("a local non-OOM forward error must stop before persistence");
+        assert!(error
+            .to_string()
+            .contains("synthetic non-OOM graph forward failure"));
+        assert!(embedder.test_cache_is_empty());
+        assert_eq!(
+            graph.pending_embeddings(),
+            1,
+            "the failed key must be requeued instead of acknowledged"
+        );
+        assert_eq!(graph.embedding_status().indexed, 1);
+        assert_eq!(graph.vector_actual_producers(), before_producers);
+        assert_eq!(stats.primary_forward_calls(), 1);
+        assert_eq!(stats.cpu_model_calls(), 0);
+        assert_eq!(stats.cpu_forward_calls(), 0);
+        let after_search = graph
+            .search_loaded_vector_index_for_test(&[1.0, 0.0], 1)
+            .unwrap();
+        assert_eq!(after_search, before_search);
+    }
+
+    #[cfg(all(feature = "embeddings", feature = "vector"))]
+    #[test]
+    fn semantic_search_surfaces_query_producers_separately_from_index_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::new();
+        let entity = test_entity("query_provenance", "src/query.rs");
+        graph.upsert_entity(&entity).unwrap();
+
+        let index_producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
+        let index = VectorIndex::new(2).unwrap();
+        index
+            .upsert_retrievable_with_producers(
+                RetrievalKey::from(entity.id),
+                &[1.0, 0.0],
+                &index_producers,
+            )
+            .unwrap();
+        graph.install_vector_index(index);
+
+        let embedder = Arc::new(CodeEmbedder::test_local_success(
+            2,
+            dir.path().to_path_buf(),
+            kin_infer::gpu::GpuBackend::Metal,
+            vec![1.0, 0.0],
+        ));
+        *graph.embedder.lock() = Some(embedder);
+
+        let single = graph.semantic_search_with_producers("query", 1).unwrap();
+        assert_eq!(single.matches[0].0, RetrievalKey::from(entity.id));
+        assert_eq!(
+            single.query_producers,
+            EmbeddingProducerSet::singleton(EmbeddingProducer::Metal)
+        );
+        assert_eq!(graph.vector_actual_producers(), Some(index_producers));
+
+        let batch = graph
+            .semantic_search_batch_with_producers(&["first", "second"], 1)
+            .unwrap();
+        assert_eq!(batch.matches.len(), 2);
+        assert_eq!(
+            batch.query_producers,
+            EmbeddingProducerSet::singleton(EmbeddingProducer::Metal)
+        );
+        assert_eq!(
+            graph.semantic_search("query", 1).unwrap(),
+            single.matches,
+            "the compatibility wrapper must preserve ranking results"
+        );
     }
 
     #[test]
@@ -20254,7 +20632,7 @@ mod tests {
             texts: Vec::new(),
             recency: hashbrown::HashMap::new(),
         };
-        assert!(g.embed_prepared_batch(&empty).unwrap().is_empty());
+        assert!(g.embed_prepared_batch(&empty).unwrap().items.is_empty());
         assert_eq!(g.persist_embedded_batch(Vec::new(), &empty).unwrap(), 0);
 
         let changed = RetrievalKey::Entity(EntityId(uuid::Uuid::from_u128(0xbeef)));
@@ -20344,14 +20722,20 @@ mod tests {
         // reference loop and the pipelined driver, which consumes it by value.
         fn forward(
             prepared: PreparedEmbedBatch,
-        ) -> Result<(PreparedEmbedBatch, Vec<(RetrievalKey, Vec<f32>)>), KinDbError> {
+        ) -> Result<(PreparedEmbedBatch, ProducedRetrievalBatch), KinDbError> {
             let embedded: Vec<(RetrievalKey, Vec<f32>)> = prepared
                 .keys
                 .iter()
                 .zip(prepared.texts.iter())
                 .map(|(key, text)| (*key, stub_vector(text)))
                 .collect();
-            Ok((prepared, embedded))
+            Ok((
+                prepared,
+                ProducedRetrievalBatch {
+                    items: embedded,
+                    producers: EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
+                },
+            ))
         }
 
         // Many batches of varying size so the bounded channels fill and the three
@@ -20367,7 +20751,7 @@ mod tests {
         let mut serial_order: Vec<(RetrievalKey, Vec<f32>)> = Vec::new();
         for ids in &batch_id_lists {
             let (_prepared, embedded) = forward(make_batch(ids)).unwrap();
-            serial_order.extend(embedded);
+            serial_order.extend(embedded.items);
         }
 
         // Pipelined: the real driver under test, same stub stages.
@@ -20379,9 +20763,9 @@ mod tests {
             EMBED_PIPELINE_RESULT_CAPACITY,
             move || Ok(remaining.next().map(|ids| make_batch(&ids))),
             forward,
-            |_prepared, embedded: Vec<(RetrievalKey, Vec<f32>)>| {
-                let count = embedded.len();
-                pipelined_order.lock().unwrap().extend(embedded);
+            |_prepared, embedded: ProducedRetrievalBatch| {
+                let count = embedded.items.len();
+                pipelined_order.lock().unwrap().extend(embedded.items);
                 Ok(count)
             },
             |_prepared| {},
@@ -20436,7 +20820,13 @@ mod tests {
                     .iter()
                     .map(|key| (*key, vec![1.0, 2.0, 3.0, 4.0]))
                     .collect();
-                Ok((prepared, embedded))
+                Ok((
+                    prepared,
+                    ProducedRetrievalBatch {
+                        items: embedded,
+                        producers: EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu),
+                    },
+                ))
             },
             |prepared, _embedded| {
                 abandoned
