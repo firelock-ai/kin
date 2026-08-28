@@ -10157,6 +10157,7 @@ mod tests {
             pid: Some(std::process::id()),
             behavior_env: Default::default(),
             build: None,
+            reconcile: Default::default(),
         }
     }
 
@@ -10896,6 +10897,7 @@ mod tests {
             pid: Some(std::process::id()),
             behavior_env: Default::default(),
             build: None,
+            reconcile: Default::default(),
         };
 
         let error = validate_health_repo(&health, dir.path()).unwrap_err();
@@ -10916,6 +10918,7 @@ mod tests {
             pid: Some(std::process::id()),
             behavior_env: Default::default(),
             build: None,
+            reconcile: Default::default(),
         }
     }
 

@@ -1637,7 +1637,7 @@ mod tests {
         std::fs::write(root.join("brand_new/module.py"), "NEW = 3\n").unwrap();
 
         let ignore = RepositoryIgnore::load(root).unwrap();
-        let tracked = vec![path("known/tracked.py")];
+        let tracked = [path("known/tracked.py")];
         let untracked = scan_repository_untracked_paths(
             root,
             &ignore,
@@ -1657,7 +1657,7 @@ mod tests {
         // The control that keeps this from naming everything: a working copy
         // whose every leaf is tracked measures nothing, which is what makes a
         // count of zero worth reporting rather than noise.
-        let all_tracked = vec![
+        let all_tracked = [
             path("brand_new/module.py"),
             path("known/fresh.py"),
             path("known/tracked.py"),
