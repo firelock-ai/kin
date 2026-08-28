@@ -50,6 +50,7 @@ pub mod sync_state;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
 pub mod tree;
+pub mod vector_producer_policy;
 pub mod workspace_carry;
 pub mod workspace_semantics;
 
