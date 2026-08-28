@@ -463,9 +463,18 @@ mod tests {
         assert!(standing.is_gap());
         assert_eq!(standing.label(), "unreadable");
         assert!(
-            standing.sentence().contains("unknown"),
+            standing.sentence().contains("cannot be shown to match"),
             "an unreadable record must not read as current: {}",
             standing.sentence()
+        );
+        let advice = standing.remedy().expect("an unreadable record has advice");
+        assert!(
+            advice.starts_with("upgrade Kin before changing this store"),
+            "unknown provenance must preserve a potentially newer store: {advice}"
+        );
+        assert!(
+            !advice.starts_with("re-ingest the repository"),
+            "unknown provenance must not begin with destructive re-ingest advice: {advice}"
         );
     }
 
