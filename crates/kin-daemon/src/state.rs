@@ -6751,7 +6751,12 @@ impl DaemonState {
         max_bytes: u64,
         label: &str,
     ) -> Result<Vec<u8>> {
-        let file = std::fs::File::open(path).map_err(DaemonError::from)?;
+        let file = std::fs::File::open(path).map_err(|error| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "{label} at {} could not be opened: {error}",
+                path.display()
+            )))
+        })?;
         let length = file.metadata().map_err(DaemonError::from)?.len();
         if length > max_bytes {
             return Err(DaemonError::Graph(kin_db::KinDbError::StorageError(
@@ -7355,12 +7360,24 @@ impl DaemonState {
             hosted_producer_profile.as_deref(),
         )
         .map_err(DaemonError::from)?;
-        if checkpointed {
+        // `checkpointed` reports that the throttle ALLOWED a write, not that
+        // one happened: kin-db's bundle writer returns Ok without writing when
+        // no index is loaded for this graph, which is exactly the state a
+        // hosted reload leaves behind after it retires a losing process's
+        // index. Publishing on that answer opened an artifact file that was
+        // never written. There is nothing to publish when there is no index,
+        // and the deferral still clears, because the vectors it was protecting
+        // are gone rather than merely unwritten.
+        let sidecar_written = checkpointed && self.graph.vector_index_stats().is_some();
+        if sidecar_written {
             self.persist_hosted_vector_artifact(generation)?;
-            // Cleared only after both the local sidecar projection and, for a
-            // hosted daemon, the backend compare-and-swap return committed.
-            // Clearing earlier would retire the record while its vectors were
-            // still process-local.
+        }
+        if checkpointed {
+            // Cleared once this call is no longer holding vectors the sidecar
+            // does not: either the write and, for a hosted daemon, the backend
+            // compare-and-swap both returned committed, or there was no index
+            // left to write. Clearing on a throttled tick would retire the
+            // record while its vectors were still process-local.
             self.clear_deferred_vector_checkpoint();
         }
         if self.post_commit_finalization_pending.load(Ordering::SeqCst) {
@@ -8681,7 +8698,7 @@ mod tests {
              {refusal}"
         );
         assert!(
-            refusal.contains(kin_core::vector_producer_policy::producer_label(foreign)),
+            refusal.contains(&format!("{foreign:?}")),
             "the refusal must name the runtime it refused ({foreign:?}): {refusal}"
         );
         assert_eq!(
