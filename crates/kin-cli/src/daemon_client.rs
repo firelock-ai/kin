@@ -404,9 +404,14 @@ pub struct LocateRequest {
     /// daemon retrieves `text` plus each variant independently and RRF-fuses the
     /// rankings into one deduped result, with per-hit variant attribution. Empty
     /// (the default) is a single-query locate, serialized identically to before.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub queries: Vec<String>,
-    pub explain: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queries: Option<Vec<String>>,
+    /// Whether this request explicitly asks for the retrieval explanation.
+    /// Omitted on a bare cursor continuation so it can inherit the held
+    /// ranking's presentation. Explicit false may shed held debug for one page;
+    /// explicit true requires that the cached ranking built it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explain: Option<bool>,
     pub max_files: usize,
     pub max_files_explicit: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -434,17 +439,24 @@ pub struct LocateRequest {
     /// coordinates-only.
     #[serde(default)]
     pub entity_surface: bool,
-    /// Opaque paging cursor (`<key>.<page>`) from a prior locate's `next_cursor`.
+    /// Opaque paging cursor from a prior locate's `next_cursor`. Current cursors
+    /// carry an absolute next-row offset and the prior page width; released
+    /// `<key>.<page>` cursors remain accepted while their ranking is cached.
     /// When set and the daemon still holds the matching ranking, the next page of
-    /// ENTITIES is sliced from cache with NO retrieval re-run; on a cache miss or
-    /// a graph-version change the daemon transparently re-runs retrieval and
-    /// returns page 0. Absent for a first/fresh query.
+    /// its primary collection is sliced from cache with NO retrieval re-run. POST
+    /// serves entity cursors; semantic_locate also supports file-primary cursors.
+    /// A cursor-only cache miss or graph-version change fails loud; repeating the
+    /// original query lets the owning surface run it fresh and return page 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
-    /// Entities per page for the graph-native `entities` surface
-    /// (`KIN_LOCATE_ENTITY_CAP` otherwise). Only affects entity paging.
+    /// Primary rows per page (`KIN_LOCATE_ENTITY_CAP` otherwise). This means
+    /// entities on POST and entity granularity, files on semantic file mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub page_size: Option<usize>,
+    /// Explicit body-projection change on a cursor continuation. Omitted on a
+    /// bare `--next`, which inherits the projection the cursor was minted from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet_override: Option<bool>,
     /// Rank test-role entities alongside source for this query.
     ///
     /// Defaults to false, which is the ranking every caller has today: test-role
@@ -452,8 +464,8 @@ pub struct LocateRequest {
     /// text itself reads as being about tests. That heuristic is the only thing
     /// that lifted the demotion, and a caller who knows exactly what it is
     /// asking for had no way to say so.
-    #[serde(default)]
-    pub include_tests: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_tests: Option<bool>,
 }
 
 /// Resolve the bearer token the daemon expects on non-public routes.
