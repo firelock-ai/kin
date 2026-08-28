@@ -428,7 +428,7 @@ struct CleanupSweepGate {
 // Reconciliation and cleanup-safety are decided only by the Firestore REST
 // paths and by the fake the tests drive, so a default-feature library build
 // compiles neither caller and every item below is dead code there.
-#[cfg(any(feature = "firestore", test))]
+#[cfg(any(feature = "firestore", feature = "test-support", test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RolloutFenceReconciliation {
     CandidateCurrent(SpineRolloutFenceEvidence),
@@ -436,7 +436,7 @@ pub(crate) enum RolloutFenceReconciliation {
     Retry,
 }
 
-#[cfg(any(feature = "firestore", test))]
+#[cfg(any(feature = "firestore", feature = "test-support", test))]
 pub(crate) fn classify_rollout_fence_reconciliation(
     candidate: &SpineRolloutFence,
     observed: Option<&LoadedSpineRolloutFence>,
@@ -469,7 +469,7 @@ pub(crate) fn classify_rollout_fence_reconciliation(
 /// the safe direction is one stage's storage for an hour; the cost of being
 /// wrong in the other direction is a committed head naming deleted rows, which
 /// is why the margin is generous rather than tight.
-#[cfg(any(feature = "firestore", test))]
+#[cfg(any(feature = "firestore", feature = "test-support", test))]
 pub(crate) const STAGE_TTL: Duration = Duration::from_secs(3600);
 
 /// Whether cleanup may reclaim `staged`, given the active head and how old the
@@ -484,7 +484,7 @@ pub(crate) const STAGE_TTL: Duration = Duration::from_secs(3600);
 /// An absent or unreadable age counts as young. Reclaiming on a missing
 /// timestamp would be reclaiming on no evidence, and the direction to fail in
 /// is the one that keeps a live writer's rows.
-#[cfg(any(feature = "firestore", test))]
+#[cfg(any(feature = "firestore", feature = "test-support", test))]
 pub(crate) fn publication_stage_is_cleanup_safe(
     staged: &RepoPublicationHead,
     active: &RepoPublicationHead,

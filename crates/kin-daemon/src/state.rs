@@ -1956,6 +1956,18 @@ pub struct DaemonState {
     /// until the durable backend owns cursor-bound publication CAS.
     #[cfg(test)]
     hosted_in_memory_spine_allowed: AtomicBool,
+    /// A durable spine backend injected by a test, used instead of building a
+    /// Firestore one.
+    ///
+    /// Distinct from `hosted_in_memory_spine_allowed`, and the difference is
+    /// the whole point: that flag also turns OFF hosted readiness, so every
+    /// control-plane route refuses with "hosted durable spine backend requested
+    /// for a local daemon" and the composed rollout path cannot run at all.
+    /// This one leaves hosted readiness exactly as production has it and swaps
+    /// only what the backend is built over, so the rollout sequence under test
+    /// is the real one.
+    #[cfg(test)]
+    hosted_durable_spine_for_test: Mutex<Option<Arc<dyn kin_spine::SpineBackend>>>,
     /// Serializes the complete lazy initialization pass. `OnceLock` serializes
     /// publication only; without this gate, multiple callers can concurrently
     /// perform the full O(graph) capture/load/build pass and one warm guard can
@@ -3388,6 +3400,8 @@ impl DaemonState {
             spine_backend_hydrations: AtomicUsize::new(0),
             #[cfg(test)]
             hosted_in_memory_spine_allowed: AtomicBool::new(false),
+            #[cfg(test)]
+            hosted_durable_spine_for_test: Mutex::new(None),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
             background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
@@ -3723,6 +3737,8 @@ impl DaemonState {
             spine_backend_hydrations: AtomicUsize::new(0),
             #[cfg(test)]
             hosted_in_memory_spine_allowed: AtomicBool::new(false),
+            #[cfg(test)]
+            hosted_durable_spine_for_test: Mutex::new(None),
             spine_initialization: Mutex::new(()),
             spine_warming: AtomicBool::new(false),
             background_work: Arc::new(crate::background_work::BackgroundWorkSupervisor::default()),
@@ -4670,6 +4686,25 @@ impl DaemonState {
 
     /// Enable process-local hosted spine behavior in tests that exercise the
     /// in-memory algorithm itself. This method does not exist in production.
+    /// Install a durable spine backend for a test, leaving hosted readiness
+    /// and every configuration gate exactly as production has them.
+    ///
+    /// The point is to vary ONE thing: what the backend is built over. A test
+    /// that also relaxes readiness is no longer exercising the composed rollout
+    /// path, because the control-plane routes reach the backend through
+    /// `ensure_hosted_spine_backend_constructed`, which refuses outright when
+    /// hosted readiness is off.
+    #[cfg(test)]
+    pub(crate) fn install_hosted_durable_spine_for_test(
+        &self,
+        backend: Arc<dyn kin_spine::SpineBackend>,
+    ) {
+        *self
+            .hosted_durable_spine_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(backend);
+    }
+
     #[cfg(test)]
     pub(crate) fn allow_hosted_in_memory_spine_for_test(&self) {
         self.hosted_in_memory_spine_allowed
@@ -5506,6 +5541,15 @@ impl DaemonState {
         #[cfg(test)]
         self.spine_backend_constructions
             .fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(injected) = self
+            .hosted_durable_spine_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+        {
+            return Ok(Arc::clone(injected));
+        }
         #[cfg(test)]
         if self.storage_backend.is_some()
             && self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst)

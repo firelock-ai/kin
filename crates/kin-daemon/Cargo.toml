@@ -99,6 +99,10 @@ futures-util = "0.3"
 kin-core = { workspace = true, features = ["test-support"] }
 kin-git = { workspace = true, features = ["test-support"] }
 kin-migrate = { workspace = true }
+# The durable spine fake, so the composed rollout path can be driven against the
+# real FirestoreSpineBackend over a fake transport rather than a second
+# implementation of the CAS semantics.
+kin-spine = { workspace = true, features = ["test-support"] }
 http-body = "1"
 tempfile = { workspace = true }
 pretty_assertions = { workspace = true }
