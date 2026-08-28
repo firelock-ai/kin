@@ -808,6 +808,16 @@ pub fn prepare_repository_layout_with_origin(
         crate::tree::initialize_projection_control_directory(layout.root())?;
         std::fs::write(layout.version_path(), KIN_LAYOUT_VERSION.to_string())
             .map_err(|error| KinError::io(layout.version_path(), error))?;
+        // Which replay-semantics version was in force when this store was
+        // created, recorded here because this is the one staging boundary every
+        // store-creation path crosses: `kin init` on a bare directory, `kin
+        // init` over a Git checkout, a replica staged by `kin clone`, and
+        // `kin-migrate`'s Git-admission path. Writing it into the stage rather
+        // than after publication makes a visible unstamped store distinguishable
+        // from an in-flight creation. Absence stays unverified because the store
+        // may predate the record or the file may have been removed.
+        crate::hydration_semantics::stamp_staged(&layout)
+            .map_err(|error| KinError::io(layout.kindb_hydration_semantics_path(), error))?;
         config.save_initialization_stage(layout.root())?;
         manifest.save(&layout.manifest_path())?;
         let metadata_seal = capture_metadata_seal(&layout)?;
@@ -2326,19 +2336,106 @@ fn filesystem_entry_exists(path: &Path) -> Result<bool> {
     }
 }
 
-/// Reap only stages whose exact owner record is private, destination-bound,
-/// inode-bound, and no longer locked by a live initializer.
+/// How many times the recovery scan attempts one candidate's owner lock before
+/// it gives up on that candidate.
 ///
-/// Invalid, ambiguous, replaced, or active candidates are retained. Automatic
-/// orphan recovery is disabled when the platform cannot expose a stable file
-/// identity and current-user ownership.
+/// Deliberately far shorter than `OWN_STAGE_OWNER_LOCK_ATTEMPTS`. There the
+/// contention is transient by construction: the file is one nobody else can
+/// name, and the only thing that can be holding it is a scan reading a single
+/// record. Here the holder is a live initializer that may keep its own stage
+/// for the length of an init, so no budget worth paying would outlast a real
+/// one, and waiting longer would only make every init that meets a live sibling
+/// slower before it gave the same answer. This retry exists to cross the far
+/// side of that same create-then-lock window, which is microseconds.
+#[cfg(unix)]
+const RECOVERY_SCAN_LOCK_ATTEMPTS: u32 = 3;
+#[cfg(unix)]
+const RECOVERY_SCAN_LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// What one attempt on a recovery candidate's owner lock established.
+#[cfg(unix)]
+enum RecoveryLock {
+    /// The lock is held, so this pass may read the record and decide.
+    Taken,
+    /// Someone else holds it, and still held it at the end of the retry budget.
+    /// A live initializer looks exactly like this.
+    Contended,
+    /// The lock could not be attempted at all, for a reason that is not
+    /// contention.
+    Refused(std::io::Error),
+}
+
+// Gated on unix as well as test because the recovery scan is unix-only, so the
+// tests that drive this injection are too. Leaving it on every test build would
+// make it dead code on Windows, which CI rejects under `-D warnings`.
+#[cfg(all(unix, test))]
+std::thread_local! {
+    /// Fails the next recovery-scan lock attempt with this raw errno.
+    static RECOVERY_LOCK_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fail the next recovery-scan lock attempt with `errno`, so a test can drive an
+/// arm no filesystem produces on demand rather than assume it.
+///
+/// One-shot, and taken rather than read, so the attempt after it meets the real
+/// lock; that is what lets one test assert the retry crosses a contention which
+/// has already cleared. Thread-local because `cargo test` runs a binary's tests
+/// as threads in one process, where a process-global fault would reach every
+/// pass running beside this one.
+#[cfg(all(unix, test))]
+fn fail_next_recovery_lock(errno: i32) {
+    RECOVERY_LOCK_FAULT.set(Some(errno));
+}
+
+#[cfg(all(unix, test))]
+fn try_lock_recovery_candidate(owner_file: &File) -> std::io::Result<()> {
+    match RECOVERY_LOCK_FAULT.take() {
+        Some(errno) => Err(std::io::Error::from_raw_os_error(errno)),
+        None => owner_file.try_lock_exclusive(),
+    }
+}
+
+#[cfg(all(unix, not(test)))]
+fn try_lock_recovery_candidate(owner_file: &File) -> std::io::Result<()> {
+    owner_file.try_lock_exclusive()
+}
+
+/// Take a recovery candidate's owner lock, retrying contention on a bounded
+/// budget and keeping a failure that is not contention apart from it.
+///
+/// The two are separated because they mean opposite things. A contended lock is
+/// the healthy case: a live init owns that stage and this pass must leave it
+/// alone. A refusal is a fault on this machine, and the pass has learned nothing
+/// at all about the stage behind it. Collapsing them is what let `EINTR`,
+/// `ENOLCK` and a real `EWOULDBLOCK` leave through one `continue` that counted
+/// nothing, so a pass which walked past its only candidate returned the
+/// `ReclaimedStages` a clean parent returns. FIR-2857.
+#[cfg(unix)]
+fn lock_recovery_candidate(owner_file: &File) -> RecoveryLock {
+    let mut attempts_left = RECOVERY_SCAN_LOCK_ATTEMPTS;
+    loop {
+        match try_lock_recovery_candidate(owner_file) {
+            Ok(()) => return RecoveryLock::Taken,
+            Err(error) if !is_lock_contention(&error) => return RecoveryLock::Refused(error),
+            Err(_) => {
+                if attempts_left <= 1 {
+                    return RecoveryLock::Contended;
+                }
+                attempts_left -= 1;
+                std::thread::sleep(RECOVERY_SCAN_LOCK_RETRY);
+            }
+        }
+    }
+}
+
 /// What one reclaim pass over abandoned repository stages did.
 ///
-/// Two numbers rather than one, because an operator's question after a killed
+/// More than one number, because an operator's question after a killed
 /// conversion is not only what came back but what is still sitting on their
-/// disk. Both tallies existed already and neither left this function: the
-/// return value was dropped at both call sites and the retained count reached
-/// an `info!` and nothing a person running `kin init` would ever see. FIR-2792.
+/// disk. Both original tallies existed already and neither left this function:
+/// the return value was dropped at both call sites and the retained count
+/// reached an `info!` and nothing a person running `kin init` would ever see.
+/// FIR-2792.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ReclaimedStages {
     /// Stages whose owner was proven gone, whose disk this pass took back.
@@ -2346,8 +2443,33 @@ pub(crate) struct ReclaimedStages {
     /// Stages this pass declined to touch, because it could not prove them
     /// unused.
     pub retained: usize,
+    /// Candidate owner records this pass walked past without reaching any
+    /// verdict on the stage behind them.
+    ///
+    /// Distinct from `retained`, which is a stage this pass examined and
+    /// declined. A skip is one it never examined: a live initializer holds the
+    /// owner lock, or the record does not describe a stage this destination
+    /// could reclaim. It exists because every skip route used to leave through a
+    /// bare `continue`, so a pass that walked past the only stranded stage on
+    /// the disk returned exactly what a pass over an empty directory returns,
+    /// and neither a caller nor a test could tell the two apart. With all three
+    /// counted, an all-zero return means a clean parent and nothing else.
+    /// FIR-2857.
+    ///
+    /// Deliberately absent from the operator's printed report. A contended owner
+    /// lock is the healthy concurrent case and has nothing to tell a person
+    /// running `kin init`, while a lock that fails for any other reason is
+    /// counted into `retained` instead, where the existing sentence already says
+    /// a directory was kept.
+    pub skipped: usize,
 }
 
+/// Reap only stages whose exact owner record is private, destination-bound,
+/// inode-bound, and no longer locked by a live initializer.
+///
+/// Invalid, ambiguous, replaced, or active candidates are retained. Automatic
+/// orphan recovery is disabled when the platform cannot expose a stable file
+/// identity and current-user ownership.
 pub(crate) fn recover_orphaned_repository_stages(
     staging_parent: &Path,
     final_kin_dir: &Path,
@@ -2368,6 +2490,7 @@ pub(crate) fn recover_orphaned_repository_stages(
         entries.sort_by_key(std::fs::DirEntry::file_name);
         let mut recovered = 0;
         let mut retained = 0;
+        let mut skipped = 0;
         for entry in entries {
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                 continue;
@@ -2388,8 +2511,25 @@ pub(crate) fn recover_orphaned_repository_stages(
                     continue;
                 }
             };
-            if owner_file.try_lock_exclusive().is_err() {
-                continue;
+            match lock_recovery_candidate(&owner_file) {
+                RecoveryLock::Taken => {}
+                RecoveryLock::Contended => {
+                    debug!(
+                        path = %owner_path.display(),
+                        "skipping repository stage whose owner a live initializer holds"
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                RecoveryLock::Refused(error) => {
+                    tracing::warn!(
+                        path = %owner_path.display(),
+                        %error,
+                        "retaining repository stage whose owner lock could not be attempted"
+                    );
+                    retained += 1;
+                    continue;
+                }
             }
             let record = match read_stage_owner_record(&owner_file, &owner_path) {
                 Ok(record) => record,
@@ -2408,6 +2548,11 @@ pub(crate) fn recover_orphaned_repository_stages(
                 || record.stage_path != exact_path_identity(&stage_root)?
                 || record.destination_path != expected_destination
             {
+                debug!(
+                    path = %owner_path.display(),
+                    "skipping owner record that names a different stage or destination"
+                );
+                skipped += 1;
                 continue;
             }
             let repository_uuid = uuid::Uuid::parse_str(&record.repository_id).ok();
@@ -2430,6 +2575,11 @@ pub(crate) fn recover_orphaned_repository_stages(
                 })
                 || repository_uuid == workspace_uuid
             {
+                debug!(
+                    path = %owner_path.display(),
+                    "skipping owner record carrying identities this build does not write"
+                );
+                skipped += 1;
                 continue;
             }
             let reap_root = staging_parent.join(format!(".kin.reap-{stage_id}"));
@@ -2549,9 +2699,17 @@ pub(crate) fn recover_orphaned_repository_stages(
                 staging_parent.display()
             );
         }
+        if skipped > 0 {
+            debug!(
+                count = skipped,
+                parent = %staging_parent.display(),
+                "kin init walked past repository stage owners it reached no verdict on"
+            );
+        }
         Ok(ReclaimedStages {
             recovered,
             retained,
+            skipped,
         })
     }
 }
@@ -2729,6 +2887,30 @@ mod tests {
         assert!(is_lock_contention(
             &lock_own_stage_owner(&owner_file).unwrap_err()
         ));
+    }
+
+    /// The discriminator's other half, which nothing asserted.
+    ///
+    /// Both tests above prove a real holder reads as contention. Neither can
+    /// fail if the answer were simply always yes, and always yes is what the
+    /// recovery scan used to assume: it would then retry a fault it can never
+    /// clear and count the result as a live owner. These are the errnos a lock
+    /// call returns when the machine, rather than another process, is the
+    /// reason.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_failure_that_is_not_contention_does_not_read_as_contention() {
+        for errno in [libc::ENOLCK, libc::EINTR, libc::EBADF] {
+            let error = std::io::Error::from_raw_os_error(errno);
+            assert!(
+                !is_lock_contention(&error),
+                "errno {errno} is a fault on this machine, not a live owner: {error}"
+            );
+        }
+        assert!(
+            is_lock_contention(&fs2::lock_contended_error()),
+            "and the lock crate's own contention error still reads as contention"
+        );
     }
 
     fn prepare_unborn(
@@ -3447,7 +3629,17 @@ mod tests {
         drop(prepared);
         assert!(stage_root.is_dir(), "the stage must exist to be reclaimed");
 
-        let reclaimed = recover_orphaned_repository_stages(&parent, &final_kin).unwrap();
+        let reclaimed = reclaim_until_no_skip(&parent, &final_kin);
+        // Asserted before `recovered`, because a pass that walked past this
+        // stage and a pass that found nothing to walk past both return zero
+        // recovered. Only this number separates them, so the assertion below
+        // used to be able to fail without naming which of the two happened.
+        // FIR-2857.
+        assert_eq!(
+            reclaimed.skipped, 0,
+            "the pass reached a verdict on the one candidate rather than walking past it: \
+             {reclaimed:?}"
+        );
         assert!(
             reclaimed.recovered > 0,
             "the pass took a stage back: {reclaimed:?}"
@@ -3464,6 +3656,199 @@ mod tests {
             lines[0].contains(&format!("reclaimed {}", reclaimed.recovered)),
             "the sentence carries the count the pass actually returned, not a literal: {lines:?}"
         );
+    }
+
+    /// One stranded stage of the exact shape this pass reclaims, plus the path
+    /// of its owner record. Built the way `orphan_recovery_is_bound_to_the_exact_destination`
+    /// builds the stage it proves recoverable, so a test using this and getting
+    /// zero back has learned something about the pass rather than about its own
+    /// fixture.
+    #[cfg(unix)]
+    fn strand_one_reclaimable_stage(parent: &Path, final_kin: &Path) -> (PathBuf, PathBuf) {
+        let staging_root = parent.join(format!(".kin.init-{}", uuid::Uuid::new_v4()));
+        let mut prepared = prepare_repository_layout_at(
+            &staging_root,
+            final_kin,
+            KinConfig::default(),
+            KinManifest::new(),
+        )
+        .unwrap();
+        let owner_path = prepared.stage_lease.as_ref().unwrap().owner_path.clone();
+        prepared.cleanup_armed = false;
+        drop(prepared);
+        assert!(
+            staging_root.is_dir(),
+            "the stage must exist to be reclaimed"
+        );
+        assert!(owner_path.is_file(), "and its owner record with it");
+        (staging_root, owner_path)
+    }
+
+    /// Run the reclaim pass until it reaches a verdict on every candidate.
+    ///
+    /// A sibling test's descendant can still hold an inherited descriptor on an
+    /// owner file for a window after this process dropped its own, which is
+    /// real flock contention on a path nobody can name. That is a skip rather
+    /// than a verdict, so a test asserting on the first pass is asserting
+    /// against a premise it has not established. Measured on this host, the
+    /// kin-core lib suite went red 2 runs in 10 that way, and 3 in 13 before
+    /// this change, when the same skip was invisible.
+    ///
+    /// The wait is bounded, so a skip that is real still fails the caller's own
+    /// assertion, carrying the count. And it is only possible because the pass
+    /// reports skips now: before FIR-2857 it returned the same value for
+    /// "nothing here" and "walked past it", so there was nothing to wait on.
+    #[cfg(unix)]
+    fn reclaim_until_no_skip(parent: &Path, final_kin: &Path) -> ReclaimedStages {
+        let mut reclaimed = recover_orphaned_repository_stages(parent, final_kin).unwrap();
+        for _ in 0..40 {
+            if reclaimed.skipped == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            reclaimed = recover_orphaned_repository_stages(parent, final_kin).unwrap();
+        }
+        reclaimed
+    }
+
+    /// A live initializer's lock is counted, not walked past in silence.
+    ///
+    /// The owner lock is the one route through this pass that can fail
+    /// intermittently, and until FIR-2857 it left through a bare `continue`. So
+    /// a pass that walked past the only stranded stage on the disk returned
+    /// `recovered: 0, retained: 0`, which is exactly what a pass over a clean
+    /// parent returns: the pass condition of one arm of
+    /// `a_reclaimed_stage_reaches_the_operator_and_a_clean_parent_stays_silent`
+    /// and the fail condition of the other.
+    ///
+    /// The holder is released and the same parent scanned again, so the skip is
+    /// a fact about the lock rather than about anything else on this disk.
+    #[cfg(unix)]
+    #[test]
+    fn a_locked_owner_is_counted_as_a_skip_rather_than_left_as_silence() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let final_kin = parent.join(".kin");
+        let (staging_root, owner_path) = strand_one_reclaimable_stage(&parent, &final_kin);
+
+        // A live initializer, standing in as the only thing that holds this.
+        // Taking the lock is itself subject to the contention this test is
+        // about, so it goes through the repository's own bounded retry rather
+        // than a bare `unwrap`, which failed here 2 runs in 10.
+        let holder = open_stage_owner_for_recovery(&owner_path).unwrap();
+        lock_own_stage_owner(&holder).expect("this test has to be the one holding the lock");
+
+        let contended = recover_orphaned_repository_stages(&parent, &final_kin).unwrap();
+        assert_eq!(
+            contended.skipped, 1,
+            "the held lock is counted where a caller can see it: {contended:?}"
+        );
+        assert_ne!(
+            contended,
+            ReclaimedStages::default(),
+            "and a skipped pass no longer returns what a clean parent returns"
+        );
+        assert_eq!(contended.recovered, 0, "nothing was taken: {contended:?}");
+        assert!(staging_root.is_dir(), "and the live stage is untouched");
+
+        // The control. With the holder gone the same parent reclaims, so the
+        // skip above measured the lock and not this stage.
+        fs2::FileExt::unlock(&holder).unwrap();
+        drop(holder);
+        let reclaimed = reclaim_until_no_skip(&parent, &final_kin);
+        assert_eq!(
+            (reclaimed.recovered, reclaimed.skipped, reclaimed.retained),
+            (1, 0, 0),
+            "the same stage comes back once nobody holds it: {reclaimed:?}"
+        );
+        assert!(!staging_root.exists());
+    }
+
+    /// Contention that has already cleared is crossed rather than counted.
+    ///
+    /// The init side of this same lock retries for the reason `lock_own_stage_owner`
+    /// gives: a recovery scan can hold a sibling owner for as long as it takes
+    /// to read one record. This is the far side of that window. The injected
+    /// error is one-shot, so the attempt after it meets the real lock, which
+    /// nobody holds; with no retry the pass gives up on the first refusal and
+    /// this stage's disk is never taken back.
+    #[cfg(unix)]
+    #[test]
+    fn a_contention_that_has_cleared_is_retried_rather_than_counted_as_a_skip() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let final_kin = parent.join(".kin");
+        let (staging_root, owner_path) = strand_one_reclaimable_stage(&parent, &final_kin);
+
+        // Establish that nobody else holds this owner lock before injecting
+        // one, so what the retry crosses is the injected contention and not a
+        // descendant's inherited descriptor. Deliberately NOT
+        // `reclaim_until_no_skip` below: the injected error is one-shot, so a
+        // second pass would meet a free lock and reclaim whether or not the
+        // retry works, and the mutation that deletes the retry would survive.
+        {
+            let probe = open_stage_owner_for_recovery(&owner_path).unwrap();
+            lock_own_stage_owner(&probe)
+                .expect("the owner lock has to be free before this measures a retry");
+            fs2::FileExt::unlock(&probe).unwrap();
+        }
+        fail_next_recovery_lock(
+            fs2::lock_contended_error()
+                .raw_os_error()
+                .expect("the lock crate's contention error carries an errno"),
+        );
+        let reclaimed = recover_orphaned_repository_stages(&parent, &final_kin).unwrap();
+        assert_eq!(
+            (reclaimed.recovered, reclaimed.skipped, reclaimed.retained),
+            (1, 0, 0),
+            "the retry crossed a contention that had already cleared: {reclaimed:?}"
+        );
+        assert!(!staging_root.exists());
+    }
+
+    /// A lock failure that is not contention is retained and said out loud,
+    /// rather than counted as a live owner or dropped on the floor.
+    ///
+    /// `ENOLCK` is the shape of the fault this pass used to swallow, and no
+    /// filesystem produces it on demand, so it is injected. It must not reach
+    /// `skipped`, because that is where a live owner goes and a fault is not a
+    /// live owner. It lands in `retained`, whose operator sentence already says
+    /// a directory was kept, beside a `warn!` carrying the errno.
+    ///
+    /// The pass must also not fail outright: one unreadable owner file wedging
+    /// every later init in that directory would be worse than the silence this
+    /// replaces.
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_error_that_is_not_contention_is_retained_rather_than_swallowed() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().canonicalize().unwrap();
+        let final_kin = parent.join(".kin");
+        let (staging_root, _owner_path) = strand_one_reclaimable_stage(&parent, &final_kin);
+
+        fail_next_recovery_lock(libc::ENOLCK);
+        let faulted = recover_orphaned_repository_stages(&parent, &final_kin).unwrap();
+        assert_eq!(
+            (faulted.retained, faulted.skipped, faulted.recovered),
+            (1, 0, 0),
+            "a fault on this machine is counted apart from a live owner: {faulted:?}"
+        );
+        assert!(staging_root.is_dir(), "and it left the stage alone");
+        assert!(
+            !crate::init_attempt::reclaimed_stage_lines(faulted.recovered, faulted.retained)
+                .is_empty(),
+            "a retained stage reaches the sentence an operator reads: {faulted:?}"
+        );
+
+        // The control. The fault is one-shot, so nothing about this stage was
+        // wrong but the injected errno, and the next pass proves it.
+        let reclaimed = reclaim_until_no_skip(&parent, &final_kin);
+        assert_eq!(
+            (reclaimed.recovered, reclaimed.retained, reclaimed.skipped),
+            (1, 0, 0),
+            "the same stage comes back on the next pass: {reclaimed:?}"
+        );
+        assert!(!staging_root.exists());
     }
 
     #[test]
@@ -3567,19 +3952,14 @@ mod tests {
         prepared.cleanup_armed = false;
         drop(prepared);
 
-        assert_eq!(
-            recover_orphaned_repository_stages(&parent, &other_final_kin)
-                .unwrap()
-                .recovered,
-            0
-        );
+        let elsewhere = recover_orphaned_repository_stages(&parent, &other_final_kin).unwrap();
+        assert_eq!(elsewhere.recovered, 0);
+        // A stage bound to another destination is walked past, and the count now
+        // says so, so this pass is not a silence that happens to look right.
+        // FIR-2857.
+        assert_eq!(elsewhere.skipped, 1, "{elsewhere:?}");
         assert!(staging_root.is_dir());
-        assert_eq!(
-            recover_orphaned_repository_stages(&parent, &final_kin)
-                .unwrap()
-                .recovered,
-            1
-        );
+        assert_eq!(reclaim_until_no_skip(&parent, &final_kin).recovered, 1);
         assert!(!staging_root.exists());
     }
 

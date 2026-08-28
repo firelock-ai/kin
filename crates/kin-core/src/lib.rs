@@ -23,6 +23,7 @@ pub mod error;
 pub mod exact_tree;
 pub mod git_init;
 pub mod hooks;
+pub mod hydration_semantics;
 pub mod identity;
 pub mod init;
 pub mod init_attempt;

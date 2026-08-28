@@ -884,9 +884,14 @@ pub fn execute_work_request(
             out
         }
         WorkRequest::TodoImport { path } => {
-            let scan_root = path
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|| _layout.working_dir().to_path_buf());
+            // `path` is caller supplied: this arm serves the daemon's POST
+            // /work and POST /note routes, so the value arrives in a request
+            // body rather than from an operator's shell. The `kin_todo_import`
+            // MCP tool does NOT reach this arm; it has its own handler, which
+            // calls the same resolver. Containment lives in kin-parser beside
+            // the walk so both callers share one implementation.
+            let scan_root = kin_parser::resolve_scan_root(_layout.working_dir(), path.as_deref())
+                .context("resolve todo import scan root")?;
             let todos = kin_parser::extract_todos(&scan_root)?;
             let existing = graph.list_work_items(&WorkFilter::default())?;
             let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
@@ -1141,76 +1146,6 @@ mod tests {
         Ok(vec![])
     }
 
-    async fn todo_import_in_layout_direct(
-        layout: &kin_core::KinLayout,
-        path: Option<String>,
-    ) -> Result<(usize, usize)> {
-        let snap = crate::backend::open_kindb_snapshot(layout)?;
-        let graph = snap.graph();
-        let scan_root = path
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| layout.working_dir().to_path_buf());
-        let todos = kin_parser::extract_todos(&scan_root)?;
-        let existing = graph.list_work_items(&WorkFilter::default())?;
-        let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
-            .into_iter()
-            .flat_map(|item| {
-                item.scopes
-                    .into_iter()
-                    .filter_map(move |scope| match scope {
-                        WorkScope::Artifact(file_id) => {
-                            Some((item.kind, item.title.clone(), file_id.0))
-                        }
-                        _ => None,
-                    })
-            })
-            .collect();
-        let mut imported = 0usize;
-        let mut skipped = 0usize;
-        for todo in &todos {
-            let work_kind = match todo.kind.as_str() {
-                "FIXME" => WorkKind::Issue,
-                "HACK" => WorkKind::Debt,
-                _ => WorkKind::Todo,
-            };
-            let key = (work_kind, todo.body.clone(), todo.file_path.clone());
-            if existing_keys.contains(&key) {
-                skipped += 1;
-                continue;
-            }
-            let scope = WorkScope::Artifact(FilePathId::new(&todo.file_path));
-            let item = WorkItem {
-                work_id: WorkId::new(),
-                kind: work_kind,
-                title: todo.body.clone(),
-                description: format!(
-                    "Imported from {} (line {})",
-                    todo.file_path, todo.line_number
-                ),
-                status: WorkStatus::Proposed,
-                priority: if todo.kind == "FIXME" {
-                    Priority::High
-                } else {
-                    Priority::Medium
-                },
-                scopes: vec![scope.clone()],
-                acceptance_criteria: vec![],
-                external_refs: vec![],
-                created_by: IdentityRef::human("kin-todo-import"),
-                created_at: Timestamp::now(),
-            };
-            graph.create_work_item(&item)?;
-            graph.create_work_link(&WorkLink::Affects {
-                work_id: item.work_id,
-                scope,
-            })?;
-            existing_keys.insert(key);
-            imported += 1;
-        }
-        snap.save()?;
-        Ok((imported, skipped))
-    }
-
     #[tokio::test]
     async fn create_and_link_work_persist_to_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -1367,13 +1302,30 @@ mod tests {
         .unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
 
-        let first = todo_import_in_layout_direct(&layout, None).await.unwrap();
-        let second = todo_import_in_layout_direct(&layout, None).await.unwrap();
-        assert_eq!(first, (2, 0));
-        assert_eq!(second, (0, 2));
-
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
+        let import = || {
+            execute_work_request(
+                &layout,
+                graph.as_ref(),
+                WorkRequest::TodoImport { path: None },
+            )
+            .unwrap()
+            .response
+            .text
+        };
+
+        let first = import();
+        let second = import();
+        assert!(
+            first.contains("Imported 2 TODO(s)") && !first.contains("Skipped"),
+            "the first import takes both markers: {first:?}"
+        );
+        assert!(
+            second.contains("Imported 0 TODO(s)") && second.contains("Skipped 2 TODO(s)"),
+            "the second import skips both as duplicates: {second:?}"
+        );
+
         let items = graph.list_work_items(&WorkFilter::default()).unwrap();
         assert_eq!(items.len(), 2);
     }
@@ -1462,5 +1414,92 @@ mod tests {
         assert!(report.missing_scope_proof.is_empty());
         assert_eq!(report.direct_work_runs.len(), 1);
         assert_eq!(report.direct_work_runs[0].run_id, run.run_id);
+    }
+
+    // Every test here drives `execute_work_request`. A `todo_import_in_layout_direct`
+    // helper used to stand in for it, reproducing this arm's body verbatim, so no
+    // test could observe a change to the product path and the arm shipped
+    // unguarded. It is gone rather than fixed: a second copy of the code under
+    // test only ever fails in the shape of a passing run.
+
+    #[tokio::test]
+    async fn todo_import_refuses_a_scan_root_outside_the_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        kin_core::init(repo.path()).unwrap();
+        std::fs::write(repo.path().join("inside.rs"), "// TODO: inside the repo\n").unwrap();
+        let layout = kin_core::KinLayout::discover(repo.path()).unwrap();
+
+        // A tree this request has no business reading. The marker text is what
+        // says whether the walk actually reached it.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("secret.rs"),
+            "// TODO: outside the repo\n",
+        )
+        .unwrap();
+
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let graph = snap.graph();
+        let refused = execute_work_request(
+            &layout,
+            graph.as_ref(),
+            WorkRequest::TodoImport {
+                path: Some(outside.path().to_string_lossy().into_owned()),
+            },
+        );
+        assert!(
+            refused.is_err(),
+            "a scan root outside the repository must be refused"
+        );
+
+        let titles: Vec<String> = graph
+            .list_work_items(&WorkFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert!(
+            !titles
+                .iter()
+                .any(|title| title.contains("outside the repo")),
+            "nothing outside the repository may be imported: {titles:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn todo_import_accepts_a_scan_root_inside_the_repository() {
+        let repo = tempfile::tempdir().unwrap();
+        kin_core::init(repo.path()).unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src").join("lib.rs"),
+            "// TODO: inside a subdirectory\n",
+        )
+        .unwrap();
+        let layout = kin_core::KinLayout::discover(repo.path()).unwrap();
+
+        let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
+        let graph = snap.graph();
+        execute_work_request(
+            &layout,
+            graph.as_ref(),
+            WorkRequest::TodoImport {
+                path: Some("src".to_string()),
+            },
+        )
+        .expect("a subdirectory of the repository is a legitimate scan root");
+
+        let titles: Vec<String> = graph
+            .list_work_items(&WorkFilter::default())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.title)
+            .collect();
+        assert!(
+            titles
+                .iter()
+                .any(|title| title.contains("inside a subdirectory")),
+            "a legitimate subdirectory scan must still import: {titles:?}"
+        );
     }
 }
