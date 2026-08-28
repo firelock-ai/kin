@@ -2337,11 +2337,29 @@ impl DaemonState {
                 };
             }
             Ok(_) if !had_persisted_index => return VectorSidecarOpen::default(),
-            Ok(_) => format!(
-                "the persisted vector index at {} no longer matches this repository's graph or \
-                 embedding model, so it was not loaded",
-                vector_path.display()
-            ),
+            // kin-db carries WHY it refused, and collapsing every non-attach
+            // into one sentence about the graph and the embedding model
+            // misdiagnoses the ones that are about neither. A metadata version
+            // this build cannot read is not a stamp that drifted, and telling
+            // an operator to expect a rebuild for a mismatch they do not have
+            // sends them looking in the wrong place.
+            Ok(outcome) => match &outcome.disposition {
+                kin_db::VectorSidecarDisposition::RefusedSidecar { check } => format!(
+                    "the persisted vector index at {} was refused by the {check} check, so it \
+                     was not loaded",
+                    vector_path.display()
+                ),
+                kin_db::VectorSidecarDisposition::ArchivedIncompatibleIndex { reason } => format!(
+                    "the persisted vector index at {} contradicted the metadata beside it \
+                     ({reason}), so it was archived aside and not loaded",
+                    vector_path.display()
+                ),
+                _ => format!(
+                    "the persisted vector index at {} no longer matches this repository's graph \
+                     or embedding model, so it was not loaded",
+                    vector_path.display()
+                ),
+            },
             Err(error) => format!(
                 "the persisted vector index at {} could not be read ({error}), so it was not loaded",
                 vector_path.display()
@@ -11323,8 +11341,13 @@ mod tests {
             .discarded
             .expect("a refused sidecar must be announced, not dropped silently");
         assert!(
-            reason.contains("graph.kvec") && reason.contains("could not be read"),
-            "the announcement must name what was discarded and why: {reason}"
+            reason.contains("graph.kvec"),
+            "the announcement must name what was discarded: {reason}"
+        );
+        assert!(
+            reason.contains("metadata_version_future"),
+            "and WHY, by the check kin-db refused on, not by a generic sentence about a graph \
+             or model mismatch this sidecar does not have: {reason}"
         );
         assert_eq!(
             graph.embedding_status().indexed,
