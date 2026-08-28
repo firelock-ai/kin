@@ -1851,7 +1851,7 @@ mod tests {
             assert!(out.contains("upgrade this Kin build"), "{out}");
             assert!(
                 !out.contains("re-ingest the repository"),
-                "an older binary must not replace a newer graph: {out}"
+                "an older binary must not replace a store recorded under newer replay semantics: {out}"
             );
         }
     }

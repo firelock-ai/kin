@@ -150,16 +150,17 @@ impl KinLayout {
     /// store was created under.
     ///
     /// Durable rather than in-process because the fact it records is about the
-    /// store and not about any daemon's life: the historical entity and relation
-    /// deltas a conversion persisted were authored by one revision of the replay
-    /// algorithm and no path re-derives them in place, so the only honest place
-    /// to keep that version is beside the graph it authored.
+    /// store's creation and not about any daemon's life. A local conversion's
+    /// initial historical deltas use one revision of the replay algorithm and no
+    /// path re-derives them in place. Native transport can later add history
+    /// authored elsewhere, so this records only the creation-time version and
+    /// does not claim provenance for everything the store later receives.
     ///
     /// Written into the STAGED layout, before the rename that publishes `.kin`,
-    /// so a store and its own provenance become visible in the same instant and
-    /// an absent record can only mean the store predates the record. See
-    /// [`crate::hydration_semantics`] for the full enumeration of what an absence
-    /// can mean.
+    /// so a store and its own creation-time record become visible in the same
+    /// instant. An absent record does not establish agreement: the store may
+    /// predate this record or the file may have been removed. See
+    /// [`crate::hydration_semantics`] for the full producer enumeration.
     pub fn kindb_hydration_semantics_path(&self) -> PathBuf {
         self.kindb_dir().join("hydration-semantics")
     }
