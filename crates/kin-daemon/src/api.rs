@@ -23176,6 +23176,177 @@ mod tests {
     /// A hosted daemon built without a usable durable spine must leave the GCS
     /// rollout active and refuse both admission and direct ingest. A test-only
     /// local backend must never make the production control route look green.
+    /// The composed rollout path, driven end to end against a durable fake.
+    ///
+    /// This is the positive half the suite did not have. Every other test of
+    /// this surface asserts a refusal, and a refusal passes on a daemon that
+    /// refuses everything, so without this the routes could stop working
+    /// entirely and nothing would say so.
+    ///
+    /// It drives the real sequence: acquire derives the Firestore fleet fence
+    /// from server-owned lease state, advances it, checkpoints the returned
+    /// evidence back into the GCS lease and completes the acquisition; admit
+    /// publishes the exact five heads and binds the reader; release clears the
+    /// rollout. The spine underneath is kin-spine's own durable fake behind
+    /// `FirestoreSpineBackend`, so the CAS semantics exercised here are the
+    /// same ones that crate's suite exercises, not a second implementation.
+    ///
+    /// Hosted readiness is left exactly as production has it. The older
+    /// in-memory seam also switches readiness off, and every control-plane
+    /// route then refuses before it starts, which is why this test could not
+    /// have been written on that seam.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn publication_control_api_drives_the_rollout_to_release() {
+        const READER_A: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fleet = vec![
+            "kin".to_string(),
+            "kin-db".to_string(),
+            "kin-editor".to_string(),
+            "kin-vfs".to_string(),
+            "kinlab".to_string(),
+        ];
+
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&fleet.join(",")));
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+        let scope = "gcs://fixture-bucket/fixture-prefix";
+
+        // Every repository in the exact fleet needs a graph, because admit
+        // publishes all five heads and then proves the exact set.
+        let backend_root = tempfile::tempdir().unwrap();
+        for repo_id in &fleet {
+            let graph = kin_db::InMemoryGraph::new();
+            graph
+                .upsert_entity(&test_entity(
+                    &format!("{}_entity", repo_id.replace('-', "_")),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+            kin_db::StorageBackend::save_snapshot(
+                &kin_db::LocalFileBackend::new(backend_root.path()),
+                repo_id,
+                &graph.to_snapshot().to_bytes().unwrap(),
+                kin_db::GENERATION_INIT,
+            )
+            .unwrap();
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(
+                scope,
+                READER_A,
+                fleet.clone(),
+                store,
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                "kin",
+                Some(fleet.iter().cloned().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        state.install_hosted_durable_spine_for_test(Arc::new(
+            kin_spine::FirestoreSpineBackend::with_store(Arc::new(
+                kin_spine::test_support::FakeSpineStore::default(),
+            )),
+        ));
+        assert!(
+            state.hosted_spine_readiness_required(),
+            "this test is only about the composed path if hosted readiness is on, which the \
+             older in-memory seam turns off"
+        );
+
+        let app = router_with_publication_control_auth(
+            Arc::clone(&state),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        );
+
+        let (status, lease) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/acquire",
+            serde_json::json!({
+                "scope": scope,
+                "repositories": fleet,
+                "holder": "positive-regression",
+                "request_id": "run-positive-1",
+                "ttl_seconds": 300,
+                "bootstrap_reader": {
+                    "identity": READER_A,
+                    "min_snapshot_schema": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                    "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                    "valid_for_seconds": 3600
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "acquire must succeed: {lease}");
+        let token = lease["token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("acquire must return a lease token: {lease}"))
+            .to_string();
+        let fence = lease["fence"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("acquire must return a lease fence: {lease}"));
+
+        let proof = serde_json::json!({ "scope": scope, "token": token, "fence": fence });
+        let (status, admitted) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/admit-reader",
+            serde_json::json!({
+                "lease": proof,
+                "repositories": fleet,
+                "reader": {
+                    "identity": READER_A,
+                    "min_snapshot_schema": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                    "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                    "valid_for_seconds": 3600
+                }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admit must publish the exact fleet and bind the reader: {admitted}"
+        );
+
+        let (status, released) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/release",
+            serde_json::json!({ "lease": proof }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "release must succeed: {released}");
+
+        // The point of the whole sequence: a reader is admitted afterwards and
+        // semantic readiness is open. Asserting only the three 200s would pass
+        // on routes that returned 200 and changed nothing.
+        let readiness = app
+            .clone()
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            readiness.status(),
+            StatusCode::OK,
+            "the daemon must be reader-ready once the rollout has released"
+        );
+    }
+
     ///
     /// The absence this asserts has to be established, not assumed. Other tests
     /// in this library set `GOOGLE_CLOUD_PROJECT` and its companions, and the
