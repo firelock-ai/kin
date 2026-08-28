@@ -427,10 +427,13 @@ fn resolve_commit_after_lost_reply(
     ) {
         LostReply::Landed(result) => {
             if !quiet {
-                eprintln!(
+                // Same rule as the summary above: the commit is in repository
+                // authority, so a departed reader must not turn it into a
+                // failure.
+                crate::progress::note(format_args!(
                     "The daemon's reply was lost, and repository authority holds this commit \
-                     (operation {operation_id}). Reporting the change it recorded."
-                );
+                     (operation {operation_id}). Reporting the change it recorded.\n"
+                ));
             }
             Ok(*result)
         }

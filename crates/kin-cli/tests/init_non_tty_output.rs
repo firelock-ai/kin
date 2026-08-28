@@ -204,10 +204,15 @@ fn commit_reports_its_own_status_when_the_reader_closes_the_pipe() {
     // The arm: the same commit with a reader that leaves after one line.
     fs::write(repo.join("piped.py"), "def piped():\n    return 2\n").expect("write the piped edit");
     let status_file = root.path().join("commit-status");
+    // The one line the reader took is kept rather than discarded: when this
+    // fails, the child's own output has gone into the closed pipe with it, and
+    // that line is the only thing left to name.
+    let taken_file = root.path().join("commit-taken");
     let script = format!(
-        "{{ {kin} commit -m 'Add a piped module' 2>&1; echo $? > {status}; }} | head -1 > /dev/null",
+        "{{ {kin} commit -m 'Add a piped module' 2>&1; echo $? > {status}; }} | head -1 > {taken}",
         kin = shell_quote(env!("CARGO_BIN_EXE_kin")),
         status = shell_quote(&status_file.display().to_string()),
+        taken = shell_quote(&taken_file.display().to_string()),
     );
     let output = runtime
         .process_command_for_test("sh")
@@ -222,10 +227,11 @@ fn commit_reports_its_own_status_when_the_reader_closes_the_pipe() {
         String::from_utf8_lossy(&output.stderr)
     );
     let recorded = fs::read_to_string(&status_file).expect("commit recorded its own exit status");
+    let taken = fs::read_to_string(&taken_file).unwrap_or_default();
     assert_eq!(
         recorded.trim(),
         "0",
-        "the exit status must report the change, not the pipe"
+        "the exit status must report the change, not the pipe; the reader took {taken:?}"
     );
     assert!(
         !String::from_utf8_lossy(&output.stderr).contains("panicked"),
