@@ -19950,6 +19950,178 @@ mod tests {
         );
     }
 
+    /// A ranked row carrying named symbols, so the file surface can be asked
+    /// what evidence it rests on.
+    fn row_with_symbols(path: &str, symbols: &[(&str, &str)]) -> LocateFileEntry {
+        serde_json::from_value(serde_json::json!({
+            "path": path,
+            "score": 10.0,
+            "signals": ["lexical", "graph"],
+            "symbols": symbols
+                .iter()
+                .map(|(name, origin)| serde_json::json!({
+                    "name": name,
+                    "score": 1.0,
+                    "kind": "function",
+                    "definition": true,
+                    "origin": origin,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .expect("file entry with symbols deserializes")
+    }
+
+    /// A stranger's first `kin locate` on axum printed 1,400 characters of
+    /// coverage warnings ahead of 432 characters of answer. Collapsed, the
+    /// answer is first; nothing is dropped, because `--explain` still prints
+    /// every note in full.
+    #[test]
+    fn coverage_notes_collapse_to_one_line_that_names_them() {
+        let mut result = LocateResult::default();
+        result.degradations = vec![
+            RetrievalDegradation {
+                component: "capability_tier".to_string(),
+                reason: "standard".to_string(),
+                detail: "graph multihop budget narrowed".to_string(),
+                remediation: "set KIN_LOCATE_PROFILE=performance".to_string(),
+            },
+            RetrievalDegradation {
+                component: "graph_role_filter".to_string(),
+                reason: "tests_withheld".to_string(),
+                detail: "134 test-role source path(s) were kept out of ranking".to_string(),
+                remediation: "pass include_tests".to_string(),
+            },
+        ];
+        let notes = coverage_notes(&result);
+        assert_eq!(notes.len(), 2, "both notes survive collapsing");
+
+        let summary = collapsed_notes_line(&notes).expect("two notes collapse to a line");
+        assert!(
+            summary.contains("2 notes"),
+            "the count is the point of the line: {summary}"
+        );
+        assert!(
+            summary.contains("capability_tier") && summary.contains("graph_role_filter"),
+            "and the components are named, so a reader can tell whether theirs is in \
+             there without re-running: {summary}"
+        );
+        assert!(
+            summary.contains("--explain"),
+            "the full text has to be reachable and the line has to say how: {summary}"
+        );
+        assert!(
+            !summary.contains("134 test-role"),
+            "the detail is what was collapsed; leaving it in collapses nothing: {summary}"
+        );
+        // The full text is what --explain prints, unchanged.
+        assert!(
+            notes[1].full.contains("134 test-role source path(s)")
+                && notes[1].full.contains("pass include_tests"),
+            "detail and remediation both survive into the explain form: {}",
+            notes[1].full
+        );
+
+        assert!(
+            collapsed_notes_line(&[]).is_none(),
+            "a clean answer prints no summary at all"
+        );
+        let one = collapsed_notes_line(&notes[..1]).expect("one note still collapses");
+        assert!(
+            one.contains("1 note on") && one.contains("read it."),
+            "the singular reads as a sentence: {one}"
+        );
+    }
+
+    /// `kin locate "Router path_router"` inside a Flask store returned six
+    /// confident-looking Flask paths, and the reverse control did the same.
+    /// Scoping was right in both directions. Nothing on the rows said that
+    /// nothing had matched.
+    #[test]
+    fn rows_say_what_evidence_they_rest_on_and_a_weak_answer_says_so() {
+        let named = row_with_symbols("axum/src/routing/path_router.rs", &[("PathRouter", "")]);
+        let vectored = row_with_symbols("axum/src/routing/mod.rs", &[("Endpoint", "vector")]);
+        let fallback = row_with_symbols("axum/src/json.rs", &[("Json", "")]);
+
+        assert_eq!(
+            file_row_match_kind(&named, "where is the path_router built"),
+            LocateMatchKind::Name,
+            "a query naming a symbol in the file is a named match"
+        );
+        assert_eq!(
+            file_row_match_kind(&vectored, "how does routing dispatch"),
+            LocateMatchKind::Semantic,
+            "vector provenance is a weaker claim than a name and a stronger one than none"
+        );
+        assert_eq!(
+            file_row_match_kind(&fallback, "Blueprint werkzeug wsgi_app"),
+            LocateMatchKind::TextFallback,
+            "nothing named and nothing from the vector pool is a text fallback"
+        );
+        assert_eq!(
+            file_row_match_kind(
+                &serde_json::from_value::<LocateFileEntry>(serde_json::json!({
+                    "path": "a.rs", "score": 1.0, "signals": []
+                }))
+                .expect("bare entry deserializes"),
+                "PathRouter"
+            ),
+            LocateMatchKind::TextFallback,
+            "a row with no attributed symbols reads as the weaker claim, not the flattering one"
+        );
+
+        // A file holding the named symbol keeps the named verdict whatever else
+        // it holds, so the strongest symbol decides the row.
+        let mixed = row_with_symbols("axum/src/lib.rs", &[("Unrelated", ""), ("Router", "")]);
+        assert_eq!(
+            file_row_match_kind(&mixed, "Router"),
+            LocateMatchKind::Name,
+            "the strongest symbol decides the row"
+        );
+
+        let mut strong = LocateResult::default();
+        strong.files = vec![named.clone(), fallback.clone()];
+        assert!(
+            answer_floor_note(&strong, "where is the path_router built").is_none(),
+            "one row over the floor is enough; the rest are its neighbours"
+        );
+
+        let mut weak = LocateResult::default();
+        weak.files = vec![fallback.clone(), named.clone()];
+        let note = answer_floor_note(&weak, "Blueprint werkzeug wsgi_app")
+            .expect("an answer where nothing matched says so");
+        assert!(
+            note.contains("answer floor") && note.contains("symbol this query named"),
+            "the floor is named rather than left as a number: {note}"
+        );
+        assert!(
+            note.contains("2 rank on lexical and graph signals alone"),
+            "and the reader is told how many rows it covers: {note}"
+        );
+
+        let lines = locate_text_lines(&weak, false, "Blueprint werkzeug wsgi_app");
+        assert!(
+            lines[0].ends_with("[lexical and graph only]"),
+            "every row carries its label, so an absent one is a bug rather than good news: {:?}",
+            lines[0]
+        );
+        let named_lines = locate_text_lines(&strong, false, "where is the path_router built");
+        assert!(
+            named_lines[0].ends_with("[named match]"),
+            "and a row the query named says so: {:?}",
+            named_lines[0]
+        );
+        assert!(
+            named_lines[0].contains("(signals: lexical, graph)"),
+            "the label is appended, so the row shape other surfaces pin is unchanged: {:?}",
+            named_lines[0]
+        );
+
+        assert!(
+            answer_floor_note(&LocateResult::default(), "anything").is_none(),
+            "an empty result has its own empty state and needs no floor note"
+        );
+    }
+
     #[test]
     fn locate_text_order_matches_json_order() {
         let result = non_monotonic_ranking();

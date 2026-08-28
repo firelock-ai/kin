@@ -742,4 +742,69 @@ mod tests {
         assert!(rendered.contains("no registered repository records this one as a provider"));
         assert!(rendered.contains("kin init") && rendered.contains("registers a repository"));
     }
+
+    /// The caveat is about stores that predate dependency recording. With axum
+    /// and flask both registered minutes earlier by the same 0.6.0 binary,
+    /// `kin deps --all` named them both, because the only thing it could key on
+    /// was the empty listing, and a correct zero and an unrecorded one look
+    /// identical there.
+    #[test]
+    fn the_unrecorded_caveat_keys_on_the_recorded_build_not_on_an_empty_listing() {
+        let recorded = |id: &str| RegisteredRepo {
+            id: id.to_string(),
+            path: std::path::PathBuf::from(format!("/registered/{id}")),
+            entities: 0,
+            last_commit: "2026-01-01T00:00:00Z".to_string(),
+            dependencies: Vec::new(),
+            dependencies_recorded_by: Some("0.6.1".to_string()),
+        };
+
+        // Registered by a build that records dependencies. The zero is measured.
+        let mut registry = KinRegistry::default();
+        registry.repos = vec![recorded("axum")];
+        let view = repo_dependency_view(&registry, "axum").unwrap();
+        assert!(
+            !view.depends_on_predates_recording,
+            "an entry written by a recording build does not predate recording"
+        );
+        let rendered = render_repo_view_lines(&view).join("\n");
+        assert!(
+            rendered.contains("no cross-repo dependencies recorded"),
+            "the empty direction is still reported: {rendered}"
+        );
+        assert!(
+            !rendered.contains("may mean unrecorded"),
+            "but a measured zero is not called possibly-unrecorded: {rendered}"
+        );
+
+        // The same shape, written before any build recorded dependencies.
+        let mut old = KinRegistry::default();
+        old.repos = vec![named_repo("legacy", Vec::new())];
+        let old_view = repo_dependency_view(&old, "legacy").unwrap();
+        assert!(
+            old_view.depends_on_predates_recording,
+            "an entry with no recorded build is exactly what the caveat is for"
+        );
+        assert!(
+            render_repo_view_lines(&old_view)
+                .join("\n")
+                .contains("may mean unrecorded"),
+            "and it still gets the caveat"
+        );
+
+        // The two directions are answered by different entries' records: this
+        // repository recorded its own, a sibling did not, so only the consumers
+        // direction is in doubt.
+        let mut mixed = KinRegistry::default();
+        mixed.repos = vec![recorded("axum"), named_repo("legacy", Vec::new())];
+        let mixed_view = repo_dependency_view(&mixed, "axum").unwrap();
+        assert!(
+            !mixed_view.depends_on_predates_recording,
+            "this repository's own records are current"
+        );
+        assert!(
+            mixed_view.consumers_predate_recording,
+            "a sibling that predates recording leaves the inverse direction in doubt"
+        );
+    }
 }

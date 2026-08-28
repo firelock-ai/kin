@@ -10671,6 +10671,110 @@ mod tests {
         );
     }
 
+    /// One row, one measurement, one moment.
+    ///
+    /// `kin doctor` used to join a refusal's captured standing and the daemon's
+    /// live one into a single row behind "Also:", and a cold-user walk quoted
+    /// the pair back: the same row said the daemon held 3.7 GiB and 7.0 GiB of
+    /// the same 4.0 GiB allowance, with eleven child processes and ten. Both
+    /// readings were true. The row never said they were minutes apart, and the
+    /// second one, being larger than the allowance, read as arithmetically
+    /// impossible.
+    #[test]
+    fn memory_pressure_rows_carry_one_measurement_each_with_its_moment() {
+        let gib = 1024 * 1024 * 1024;
+        let over = kin_core::memory_pressure::DaemonFootprint {
+            footprint: kin_core::memory_pressure::TreeFootprint {
+                own_bytes: 4 * gib,
+                children_bytes: 3 * gib,
+                child_count: 10,
+                kernel_capped: false,
+            },
+            budget_bytes: 4 * gib,
+            budget_is_derived: true,
+            level: "critical".to_string(),
+            pid: 4103,
+            at_unix: 76_440, // 21:14Z
+        };
+        let refusal = kin_core::memory_pressure::PressureRefusal {
+            work: kin_core::memory_pressure::HeavyWork::LspSweep.id().to_string(),
+            level: "critical".to_string(),
+            reason: "this repository's daemon and the 11 process(es) it started hold 3.7 GiB \
+                     of the 4.0 GiB it is allowed"
+                .to_string(),
+            at_unix: 76_440, // 21:14Z
+        };
+
+        let row = host_memory_pressure_check_for(std::slice::from_ref(&refusal), Some(&over), None);
+        assert!(
+            !row.detail.contains("Also:"),
+            "the two readings are no longer joined into one row: {}",
+            row.detail
+        );
+        assert!(
+            row.detail.contains("21:14Z") && row.detail.contains("when the work was declined"),
+            "the refusal row says when its reading was taken: {}",
+            row.detail
+        );
+        assert!(
+            !row.detail.contains("7.0 GiB"),
+            "and carries only its own measurement: {}",
+            row.detail
+        );
+
+        let standing = daemon_memory_standing_check_for(&over, 76_440 + 42);
+        assert!(
+            standing.detail.contains("7.0 GiB") && standing.detail.contains("10 process(es)"),
+            "the live standing is a row of its own: {}",
+            standing.detail
+        );
+        assert!(
+            standing.detail.contains("measured at 21:14Z")
+                && standing.detail.contains("42s ago")
+                && standing.detail.contains("pid 4103"),
+            "stamped unconditionally, not only once it has gone stale: {}",
+            standing.detail
+        );
+        assert!(
+            matches!(standing.status, HealthStatus::Degraded),
+            "a tree past its allowance is not a healthy row"
+        );
+        assert!(
+            !blocks_readiness(&standing),
+            "and it still must not fail a correct install on a small machine"
+        );
+
+        // The impossible-looking figure now says what it means. Without this
+        // clause "hold 7.0 GiB of the 4.0 GiB it is allowed" is a sentence a
+        // reader cannot resolve, and an unresolvable row stops being read.
+        assert!(
+            standing.detail.contains("3.0 GiB past the allowance")
+                && standing.detail.contains("rather than one the kernel imposes"),
+            "the overrun is named and explained: {}",
+            standing.detail
+        );
+
+        let under = kin_core::memory_pressure::DaemonFootprint {
+            footprint: kin_core::memory_pressure::TreeFootprint {
+                own_bytes: gib,
+                children_bytes: gib,
+                child_count: 2,
+                kernel_capped: false,
+            },
+            ..over.clone()
+        };
+        let inside = daemon_memory_standing_check_for(&under, 76_440);
+        assert!(
+            matches!(inside.status, HealthStatus::Healthy),
+            "a tree inside its allowance is healthy"
+        );
+        assert!(
+            !inside.detail.contains("past the allowance"),
+            "and says nothing about an overrun it does not have: {}",
+            inside.detail
+        );
+    }
+
     /// A refusal remains visible exactly while its own work is outstanding or
     /// the count is unknown, and it never changes the verdict of the page.
     ///
@@ -10707,10 +10811,22 @@ mod tests {
         let gauge = host_memory_pressure_check_for(&[], Some(&published), None);
         assert!(matches!(gauge.status, HealthStatus::Healthy));
         assert!(!blocks_readiness(&gauge));
+        // The gauge moved to its own row, so this one points at it rather than
+        // carrying a second measurement of its own. See
+        // `memory_pressure_rows_carry_one_measurement_each_with_its_moment`.
         assert!(
-            gauge.detail.contains("it is allowed") && gauge.detail.contains("child processes"),
-            "the healthy row reports the standing and names the children: {}",
+            gauge.detail.contains("Daemon memory standing"),
+            "the refusal row points at the row that holds the standing: {}",
             gauge.detail
+        );
+        let standing_row = daemon_memory_standing_check_for(&published, published.at_unix + 3);
+        assert!(matches!(standing_row.status, HealthStatus::Healthy));
+        assert!(!blocks_readiness(&standing_row));
+        assert!(
+            standing_row.detail.contains("it is allowed")
+                && standing_row.detail.contains("child processes"),
+            "the standing row reports the standing and names the children: {}",
+            standing_row.detail
         );
 
         let refusal = |work: &str| kin_core::memory_pressure::PressureRefusal {
@@ -10735,9 +10851,8 @@ mod tests {
         assert!(completed.manual_fix.is_none());
         assert!(!completed.detail.contains(&embed.reason));
         assert!(
-            completed.detail.contains("it is allowed")
-                && completed.detail.contains("child processes"),
-            "retiring an old embed refusal must preserve the footprint gauge: {}",
+            completed.detail.contains("Daemon memory standing"),
+            "retiring an old embed refusal still points at the footprint gauge: {}",
             completed.detail
         );
 

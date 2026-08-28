@@ -1511,4 +1511,53 @@ mod tests {
         assert_eq!(human_seconds(90), "1 min 30 s");
         assert_eq!(human_seconds(707), "11 min 47 s");
     }
+
+    /// `kin init .` in `/root/shallow` opened with "a previous kin init of
+    /// /root/repo did not finish". The cleanup is right and worth announcing.
+    /// The header just never said the two paths were different repositories,
+    /// and a reader with one repository in mind reads it as the one they are
+    /// standing in.
+    #[test]
+    fn the_post_mortem_names_the_repository_it_is_about_and_the_one_being_initialized() {
+        let elsewhere = post_mortem_lines(
+            &attempt(Some(record())),
+            None,
+            Path::new("/work/shallow"),
+        )
+        .join("\n");
+        assert!(
+            elsewhere.contains("a previous kin init of /work/requests did not finish"),
+            "the corpse is still named: {elsewhere}"
+        );
+        assert!(
+            elsewhere.contains("a different repository from the /work/shallow this run is \
+                                initializing"),
+            "and so is the repository this run is converting: {elsewhere}"
+        );
+
+        let ours =
+            post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/requests"))
+                .join("\n");
+        assert!(
+            ours.contains("a previous kin init of /work/requests did not finish"),
+            "the same-repository case still opens the same way: {ours}"
+        );
+        assert!(
+            !ours.contains("a different repository"),
+            "and does not print one path twice in one sentence: {ours}"
+        );
+
+        // A capture with no readable record cannot name a source, so the
+        // clause is what carries the current repository there.
+        let orphan = AbandonedInit {
+            record: None,
+            ..attempt(None)
+        };
+        let orphan_lines =
+            post_mortem_lines(&orphan, None, Path::new("/work/shallow")).join("\n");
+        assert!(
+            orphan_lines.contains("/work/shallow this run is initializing"),
+            "an unreadable record still says which repository this run is about: {orphan_lines}"
+        );
+    }
 }
