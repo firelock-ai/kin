@@ -18077,6 +18077,7 @@ mod tests {
                     base_tree_hash: workspace.base_tree_hash,
                     tree_hash: workspace.tree_hash,
                     semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
                 },
             },
             new_generation: existing_workspace
