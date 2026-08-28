@@ -246,6 +246,8 @@ def _existing_attestation(
         body = comment.get("body")
         if not isinstance(body, str) or not body.startswith(guard.ATTESTATION_MARKER):
             continue
+        if not guard._has_exact_attestation_app_identity(comment):
+            continue
         evidence = guard._parse_comment_body(body)
         if evidence["head"] == head:
             current.append((comment, evidence))
@@ -615,6 +617,37 @@ def _workflow_run_pages(value: Any) -> list[dict[str, Any]]:
     return runs
 
 
+def _is_recheck_run_candidate(
+    run: dict[str, Any],
+    *,
+    repository: str,
+    admission: dict[str, Any],
+) -> bool:
+    if run.get("head_sha") != admission["head"]:
+        return False
+    pulls = run.get("pull_requests")
+    bound_to_admitted_pull = isinstance(pulls, list) and any(
+        isinstance(pull, dict) and pull.get("number") == admission["pull"]
+        for pull in pulls
+    )
+    if bound_to_admitted_pull:
+        return True
+    if isinstance(pulls, list) and pulls and all(
+        isinstance(pull, dict)
+        and isinstance(pull.get("number"), int)
+        and not isinstance(pull.get("number"), bool)
+        for pull in pulls
+    ):
+        return False
+    head_repository = run.get("head_repository")
+    first_party_wave = (
+        run.get("head_branch") == guard.WAVE_BRANCH
+        and isinstance(head_repository, dict)
+        and head_repository.get("full_name") == repository
+    )
+    return first_party_wave
+
+
 def _validate_recheck_pull(
     run: dict[str, Any],
     *,
@@ -715,6 +748,8 @@ def _post_attestation_recheck(
             "-f",
             f"head_sha={admission['head']}",
             "-f",
+            f"branch={guard.WAVE_BRANCH}",
+            "-f",
             "per_page=100",
         ]
     )
@@ -724,6 +759,12 @@ def _post_attestation_recheck(
     )
     candidates: list[dict[str, Any]] = []
     for run in _workflow_run_pages(response):
+        if not _is_recheck_run_candidate(
+            run,
+            repository=repository,
+            admission=admission,
+        ):
+            continue
         created_at = _timestamp(run.get("created_at"), "CI run creation")
         if created_at < cutoff:
             continue

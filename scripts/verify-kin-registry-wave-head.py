@@ -567,6 +567,24 @@ def _parse_comment_body(body: Any) -> dict[str, str | int]:
     }
 
 
+def _has_exact_attestation_app_identity(comment: dict[str, Any]) -> bool:
+    app = comment.get("performed_via_github_app")
+    owner = app.get("owner") if isinstance(app, dict) else None
+    user = comment.get("user")
+    return (
+        isinstance(app, dict)
+        and app.get("id") == ATTESTATION_APP_ID
+        and app.get("slug") == ATTESTATION_APP_SLUG
+        and isinstance(owner, dict)
+        and owner.get("id") == ATTESTATION_APP_OWNER_ID
+        and owner.get("login") == ATTESTATION_APP_OWNER
+        and isinstance(user, dict)
+        and user.get("id") == ATTESTATION_CREATOR_ID
+        and user.get("login") == ATTESTATION_CREATOR
+        and user.get("type") == "Bot"
+    )
+
+
 def validate_workflow_run(
     repository: str,
     evidence: dict[str, str | int],
@@ -654,28 +672,15 @@ def validate_attestation(
         body = comment.get("body")
         if not isinstance(body, str) or not body.startswith(ATTESTATION_MARKER):
             continue
+        if not _has_exact_attestation_app_identity(comment):
+            continue
         evidence = _parse_comment_body(body)
-        app = comment.get("performed_via_github_app")
-        owner = app.get("owner") if isinstance(app, dict) else None
-        user = comment.get("user")
         comment_id = comment.get("id")
         if (
             not isinstance(comment_id, int)
             or isinstance(comment_id, bool)
-            or not isinstance(app, dict)
-            or app.get("id") != ATTESTATION_APP_ID
-            or app.get("slug") != ATTESTATION_APP_SLUG
-            or not isinstance(owner, dict)
-            or owner.get("id") != ATTESTATION_APP_OWNER_ID
-            or owner.get("login") != ATTESTATION_APP_OWNER
-            or not isinstance(user, dict)
-            or user.get("id") != ATTESTATION_CREATOR_ID
-            or user.get("login") != ATTESTATION_CREATOR
-            or user.get("type") != "Bot"
         ):
-            raise AdmissionError(
-                "reserved dependency admission comment is not from the exact release App"
-            )
+            raise AdmissionError("exact App admission comment has an invalid id")
         if comment.get("created_at") != comment.get("updated_at"):
             raise AdmissionError("dependency admission comment was edited")
         if comment.get("issue_url") != (

@@ -264,6 +264,25 @@ def attestation_documents(
     return [review], [comment]
 
 
+def outsider_attestation_comment(
+    template: dict[str, object],
+    *,
+    comment_id: int = 52,
+    malformed: bool = False,
+) -> dict[str, object]:
+    comment = copy.deepcopy(template)
+    comment["id"] = comment_id
+    comment["html_url"] = (
+        f"https://github.com/{head_guard.EXPECTED_REPOSITORY}/pull/77"
+        f"#issuecomment-{comment_id}"
+    )
+    comment["performed_via_github_app"] = None
+    comment["user"] = {"id": 123, "login": "outsider", "type": "User"}
+    if malformed:
+        comment["body"] = head_guard.ATTESTATION_MARKER + "\nspoof"
+    return comment
+
+
 def workflow_run_document(
     policy_sha: str,
     *,
@@ -683,6 +702,24 @@ class HeadAdmissionTests(unittest.TestCase):
                 workflow_run=workflow_run_document(base),
             )
             self.assertEqual(evidence.head, head)
+            wrong_bot = outsider_attestation_comment(comments[0], comment_id=55)
+            wrong_bot["performed_via_github_app"] = copy.deepcopy(
+                comments[0]["performed_via_github_app"]
+            )
+            wrong_bot["user"] = {
+                "id": 1,
+                "login": head_guard.ATTESTATION_CREATOR,
+                "type": "Bot",
+            }
+            evidence = head_guard.validate_attestation(
+                repo,
+                head_guard.EXPECTED_REPOSITORY,
+                77,
+                head,
+                reviews,
+                comments + [wrong_bot],
+            )
+            self.assertEqual(evidence.head, head)
             failed = workflow_run_document(base, conclusion="failure")
             with self.assertRaisesRegex(head_guard.AdmissionError, "successful"):
                 head_guard.validate_attestation(
@@ -722,32 +759,111 @@ class HeadAdmissionTests(unittest.TestCase):
             with self.assertRaisesRegex(head_guard.AdmissionError, "workspace version"):
                 head_guard.validate_delta(repo, base, head, require_marker=True)
 
-    def test_rejects_body_spoof_without_exact_app_identity(self) -> None:
+    def test_ignores_body_spoof_without_exact_app_identity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             base = initialize_repo(repo)
             head = commit_dependency_head(repo)
             reviews, comments = attestation_documents(repo, base, head)
-            comments[0]["performed_via_github_app"]["id"] = 15368
-            with self.assertRaisesRegex(head_guard.AdmissionError, "exact release App"):
+            wrong_app = outsider_attestation_comment(comments[0])
+            evidence = head_guard.validate_attestation(
+                repo,
+                head_guard.EXPECTED_REPOSITORY,
+                77,
+                head,
+                reviews,
+                comments + [wrong_app],
+            )
+            self.assertEqual(evidence.head, head)
+            with self.assertRaises(head_guard.PendingAttestation):
                 head_guard.validate_attestation(
                     repo,
                     head_guard.EXPECTED_REPOSITORY,
                     77,
                     head,
                     reviews,
-                    comments,
+                    [wrong_app],
                 )
-            _, same_login_comments = attestation_documents(repo, base, head)
-            same_login_comments[0]["user"]["id"] = 1
-            with self.assertRaisesRegex(head_guard.AdmissionError, "exact release App"):
+            same_login = outsider_attestation_comment(comments[0], comment_id=53)
+            same_login["user"] = {
+                "id": 1,
+                "login": head_guard.ATTESTATION_CREATOR,
+                "type": "Bot",
+            }
+            evidence = head_guard.validate_attestation(
+                repo,
+                head_guard.EXPECTED_REPOSITORY,
+                77,
+                head,
+                reviews,
+                comments + [same_login],
+            )
+            self.assertEqual(evidence.head, head)
+            different_app = outsider_attestation_comment(
+                comments[0], comment_id=54, malformed=True
+            )
+            different_app["performed_via_github_app"] = copy.deepcopy(
+                comments[0]["performed_via_github_app"]
+            )
+            different_app["performed_via_github_app"]["id"] = 15368
+            evidence = head_guard.validate_attestation(
+                repo,
+                head_guard.EXPECTED_REPOSITORY,
+                77,
+                head,
+                reviews,
+                comments + [different_app],
+            )
+            self.assertEqual(evidence.head, head)
+
+    def test_rejects_malformed_exact_app_comment_but_ignores_outsider_marker(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            base = initialize_repo(repo)
+            head = commit_dependency_head(repo)
+            reviews, comments = attestation_documents(repo, base, head)
+            outsider = outsider_attestation_comment(comments[0], malformed=True)
+            evidence = head_guard.validate_attestation(
+                repo,
+                head_guard.EXPECTED_REPOSITORY,
+                77,
+                head,
+                reviews,
+                comments + [outsider],
+            )
+            self.assertEqual(evidence.head, head)
+            exact_app_malformed = copy.deepcopy(comments[0])
+            exact_app_malformed["body"] = head_guard.ATTESTATION_MARKER + "\nspoof"
+            with self.assertRaisesRegex(head_guard.AdmissionError, "malformed"):
                 head_guard.validate_attestation(
                     repo,
                     head_guard.EXPECTED_REPOSITORY,
                     77,
                     head,
                     reviews,
-                    same_login_comments,
+                    [exact_app_malformed],
+                )
+            wrong_exact_app_identity = copy.deepcopy(comments[0])
+            wrong_exact_app_identity["performed_via_github_app"]["slug"] = "wrong"
+            evidence = head_guard.validate_attestation(
+                repo,
+                head_guard.EXPECTED_REPOSITORY,
+                77,
+                head,
+                reviews,
+                comments + [wrong_exact_app_identity],
+            )
+            self.assertEqual(evidence.head, head)
+            with self.assertRaises(head_guard.PendingAttestation):
+                head_guard.validate_attestation(
+                    repo,
+                    head_guard.EXPECTED_REPOSITORY,
+                    77,
+                    head,
+                    reviews,
+                    [wrong_exact_app_identity],
                 )
 
     def test_rejects_edited_comment_deleted_review_and_dismissed_review(self) -> None:
@@ -1259,6 +1375,9 @@ class PostCompletionAttesterTests(unittest.TestCase):
             repo, _, result_file, base, head = self._changed(directory)
             pull = pull_document(head, base)
             reviews, comments = attestation_documents(repo, base, head)
+            comments.append(
+                outsider_attestation_comment(comments[0], malformed=True)
+            )
             posted = False
             writes: list[str] = []
 
@@ -1376,6 +1495,138 @@ class PostCompletionAttesterTests(unittest.TestCase):
                 workflow_run=workflow_run_document(base),
             )
             self.assertEqual(evidence.head, head)
+
+    def test_recheck_filters_irrelevant_same_sha_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _, result_file, base, head = self._changed(directory)
+            pull = pull_document(head, base)
+            reviews, comments = attestation_documents(repo, base, head)
+            exact = ci_run_document(head, base, run_id=901)
+            irrelevant = copy.deepcopy(exact)
+            irrelevant["id"] = 900
+            irrelevant["head_repository"] = {"full_name": "outsider/kin"}
+            irrelevant["created_at"] = "not-a-timestamp"
+            irrelevant["pull_requests"][0]["number"] = 123
+            other_pull_same_branch = copy.deepcopy(irrelevant)
+            other_pull_same_branch["id"] = 899
+            other_pull_same_branch["head_repository"] = {
+                "full_name": head_guard.EXPECTED_REPOSITORY
+            }
+
+            def fake_for_runs(runs: list[dict[str, object]]):
+                def fake(arguments: list[str]) -> object:
+                    endpoint = next(
+                        (item for item in arguments if item.startswith("repos/")), ""
+                    )
+                    if endpoint.endswith("/git/ref/heads/main"):
+                        return {"object": {"sha": base}}
+                    if endpoint == f"repos/{head_guard.EXPECTED_REPOSITORY}/pulls/77":
+                        return pull
+                    if endpoint.endswith("/reviews?per_page=100"):
+                        return [reviews]
+                    if endpoint.endswith("/comments?per_page=100"):
+                        return [comments]
+                    if endpoint.endswith("/actions/workflows/ci.yml/runs"):
+                        return [{"total_count": len(runs), "workflow_runs": runs}]
+                    if endpoint.endswith("/actions/runs/901/attempts/1/jobs"):
+                        return ci_jobs_document(run_id=901)
+                    if endpoint.endswith("/actions/runs/902/attempts/1/jobs"):
+                        return ci_jobs_document(run_id=902)
+                    raise AssertionError(
+                        f"unexpected mocked GitHub request: {arguments}"
+                    )
+
+                return fake
+
+            for runs in (
+                [irrelevant, other_pull_same_branch, exact],
+                [exact, other_pull_same_branch, irrelevant],
+            ):
+                with (
+                    self.subTest(order=[int(run["id"]) for run in runs]),
+                    mock.patch.object(
+                        attester,
+                        "gh_json",
+                        side_effect=fake_for_runs(runs),
+                    ),
+                    mock.patch.object(
+                        attester.guard,
+                        "gh_json",
+                        return_value=workflow_run_document(base),
+                    ),
+                    self._live_graphql(head),
+                ):
+                    recheck = attester.recheck_status(
+                        admission_file=result_file,
+                        workspace=repo,
+                        repository=attester.EXPECTED_REPOSITORY,
+                        wait_seconds=0,
+                        require_recheck=True,
+                    )
+                    self.assertEqual(recheck["run_id"], 901)
+
+            newest = ci_run_document(
+                head,
+                base,
+                run_id=902,
+                created_at="2026-08-27T22:00:03Z",
+            )
+            with mock.patch.object(
+                attester,
+                "gh_json",
+                side_effect=fake_for_runs([newest, exact]),
+            ), mock.patch.object(
+                attester.guard,
+                "gh_json",
+                return_value=workflow_run_document(base),
+            ), self._live_graphql(head):
+                selected = attester.recheck_status(
+                    admission_file=result_file,
+                    workspace=repo,
+                    repository=attester.EXPECTED_REPOSITORY,
+                    wait_seconds=0,
+                    require_recheck=True,
+                )
+            self.assertEqual(selected["run_id"], 902)
+
+            with mock.patch.object(
+                attester,
+                "gh_json",
+                side_effect=fake_for_runs([irrelevant, other_pull_same_branch]),
+            ), mock.patch.object(
+                attester.guard,
+                "gh_json",
+                return_value=workflow_run_document(base),
+            ), self._live_graphql(head):
+                missing = attester.recheck_status(
+                    admission_file=result_file,
+                    workspace=repo,
+                    repository=attester.EXPECTED_REPOSITORY,
+                    wait_seconds=0,
+                    require_recheck=False,
+                )
+            self.assertIs(missing["needs_retrigger"], True)
+
+            associated_but_wrong = copy.deepcopy(irrelevant)
+            associated_but_wrong["created_at"] = "2026-08-27T22:00:03Z"
+            associated_but_wrong["pull_requests"][0]["number"] = 77
+            with mock.patch.object(
+                attester,
+                "gh_json",
+                side_effect=fake_for_runs([associated_but_wrong]),
+            ), mock.patch.object(
+                attester.guard,
+                "gh_json",
+                return_value=workflow_run_document(base),
+            ), self._live_graphql(head):
+                with self.assertRaisesRegex(attester.AttesterError, "wrong authority"):
+                    attester.recheck_status(
+                        admission_file=result_file,
+                        workspace=repo,
+                        repository=attester.EXPECTED_REPOSITORY,
+                        wait_seconds=0,
+                        require_recheck=False,
+                    )
 
     def test_late_attestation_retriggers_and_materializes_required_recheck(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1640,7 +1891,8 @@ class EventHandlerTests(unittest.TestCase):
                         self.pull_event(head, base),
                         wait_seconds=0,
                     )
-            malformed = [{"body": head_guard.ATTESTATION_MARKER + "\nspoof"}]
+            _, malformed = attestation_documents(repo, base, head)
+            malformed[0]["body"] = head_guard.ATTESTATION_MARKER + "\nspoof"
             with mock.patch.object(head_guard, "_fresh_pull", return_value=pull), mock.patch.object(
                 head_guard, "_attestation_documents", return_value=([], malformed)
             ):
