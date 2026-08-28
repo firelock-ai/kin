@@ -885,26 +885,13 @@ pub fn execute_work_request(
         }
         WorkRequest::TodoImport { path } => {
             // `path` is caller supplied: this arm serves the daemon's POST
-            // /work and POST /note routes and the `kin_todo_import` MCP tool,
-            // so the value arrives in a request body rather than from an
-            // operator's shell. Resolve it against the repository working
-            // directory and refuse anything that lands outside. Joining an
-            // absolute path discards the base, so containment is the test that
-            // rejects it, and `is_within` canonicalizes both sides, which also
-            // resolves `..` before the comparison.
-            let working_dir = _layout.working_dir();
-            let scan_root = match path {
-                Some(requested) => {
-                    let candidate = working_dir.join(requested);
-                    if !crate::commands::managed_config_scope::is_within(working_dir, &candidate) {
-                        anyhow::bail!(
-                            "todo import scan root must stay inside the repository working directory"
-                        );
-                    }
-                    candidate
-                }
-                None => working_dir.to_path_buf(),
-            };
+            // /work and POST /note routes, so the value arrives in a request
+            // body rather than from an operator's shell. The `kin_todo_import`
+            // MCP tool does NOT reach this arm; it has its own handler, which
+            // calls the same resolver. Containment lives in kin-parser beside
+            // the walk so both callers share one implementation.
+            let scan_root = kin_parser::resolve_scan_root(_layout.working_dir(), path.as_deref())
+                .context("resolve todo import scan root")?;
             let todos = kin_parser::extract_todos(&scan_root)?;
             let existing = graph.list_work_items(&WorkFilter::default())?;
             let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
@@ -1159,76 +1146,6 @@ mod tests {
         Ok(vec![])
     }
 
-    async fn todo_import_in_layout_direct(
-        layout: &kin_core::KinLayout,
-        path: Option<String>,
-    ) -> Result<(usize, usize)> {
-        let snap = crate::backend::open_kindb_snapshot(layout)?;
-        let graph = snap.graph();
-        let scan_root = path
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| layout.working_dir().to_path_buf());
-        let todos = kin_parser::extract_todos(&scan_root)?;
-        let existing = graph.list_work_items(&WorkFilter::default())?;
-        let mut existing_keys: HashSet<(WorkKind, String, String)> = existing
-            .into_iter()
-            .flat_map(|item| {
-                item.scopes
-                    .into_iter()
-                    .filter_map(move |scope| match scope {
-                        WorkScope::Artifact(file_id) => {
-                            Some((item.kind, item.title.clone(), file_id.0))
-                        }
-                        _ => None,
-                    })
-            })
-            .collect();
-        let mut imported = 0usize;
-        let mut skipped = 0usize;
-        for todo in &todos {
-            let work_kind = match todo.kind.as_str() {
-                "FIXME" => WorkKind::Issue,
-                "HACK" => WorkKind::Debt,
-                _ => WorkKind::Todo,
-            };
-            let key = (work_kind, todo.body.clone(), todo.file_path.clone());
-            if existing_keys.contains(&key) {
-                skipped += 1;
-                continue;
-            }
-            let scope = WorkScope::Artifact(FilePathId::new(&todo.file_path));
-            let item = WorkItem {
-                work_id: WorkId::new(),
-                kind: work_kind,
-                title: todo.body.clone(),
-                description: format!(
-                    "Imported from {} (line {})",
-                    todo.file_path, todo.line_number
-                ),
-                status: WorkStatus::Proposed,
-                priority: if todo.kind == "FIXME" {
-                    Priority::High
-                } else {
-                    Priority::Medium
-                },
-                scopes: vec![scope.clone()],
-                acceptance_criteria: vec![],
-                external_refs: vec![],
-                created_by: IdentityRef::human("kin-todo-import"),
-                created_at: Timestamp::now(),
-            };
-            graph.create_work_item(&item)?;
-            graph.create_work_link(&WorkLink::Affects {
-                work_id: item.work_id,
-                scope,
-            })?;
-            existing_keys.insert(key);
-            imported += 1;
-        }
-        snap.save()?;
-        Ok((imported, skipped))
-    }
-
     #[tokio::test]
     async fn create_and_link_work_persist_to_snapshot() {
         let dir = tempfile::tempdir().unwrap();
@@ -1385,13 +1302,30 @@ mod tests {
         .unwrap();
         let layout = kin_core::KinLayout::discover(dir.path()).unwrap();
 
-        let first = todo_import_in_layout_direct(&layout, None).await.unwrap();
-        let second = todo_import_in_layout_direct(&layout, None).await.unwrap();
-        assert_eq!(first, (2, 0));
-        assert_eq!(second, (0, 2));
-
         let snap = crate::backend::open_kindb_snapshot(&layout).unwrap();
         let graph = snap.graph();
+        let import = || {
+            execute_work_request(
+                &layout,
+                graph.as_ref(),
+                WorkRequest::TodoImport { path: None },
+            )
+            .unwrap()
+            .response
+            .text
+        };
+
+        let first = import();
+        let second = import();
+        assert!(
+            first.contains("Imported 2 TODO(s)") && !first.contains("Skipped"),
+            "the first import takes both markers: {first:?}"
+        );
+        assert!(
+            second.contains("Imported 0 TODO(s)") && second.contains("Skipped 2 TODO(s)"),
+            "the second import skips both as duplicates: {second:?}"
+        );
+
         let items = graph.list_work_items(&WorkFilter::default()).unwrap();
         assert_eq!(items.len(), 2);
     }
@@ -1482,9 +1416,11 @@ mod tests {
         assert_eq!(report.direct_work_runs[0].run_id, run.run_id);
     }
 
-    // The two tests below drive `execute_work_request` rather than
-    // `todo_import_in_layout_direct`, which is a second copy of this arm's
-    // body and cannot observe a change to the product path.
+    // Every test here drives `execute_work_request`. A `todo_import_in_layout_direct`
+    // helper used to stand in for it, reproducing this arm's body verbatim, so no
+    // test could observe a change to the product path and the arm shipped
+    // unguarded. It is gone rather than fixed: a second copy of the code under
+    // test only ever fails in the shape of a passing run.
 
     #[tokio::test]
     async fn todo_import_refuses_a_scan_root_outside_the_repository() {

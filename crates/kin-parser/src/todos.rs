@@ -37,6 +37,46 @@ const TODO_MARKERS: &[&str] = &["TODO", "FIXME", "HACK", "NOTE"];
 /// ends the walk instead. No real source tree approaches this depth.
 const MAX_SCAN_DEPTH: usize = 64;
 
+/// Resolve a caller-supplied scan root against `boundary`, refusing anything
+/// outside it.
+///
+/// Containment lives here rather than at each call site because every caller of
+/// `extract_todos` takes its root from a request: the daemon's POST /work and
+/// POST /note routes, and the `kin_todo_import` MCP tool. Guarding them one at a
+/// time is what left the MCP handler reading any directory the process could
+/// reach while the daemon routes were already bounded, so the check belongs next
+/// to the walk it protects and a fourth caller inherits it.
+///
+/// Fails closed in both directions. The boundary and the resolved candidate must
+/// each canonicalize, so a path that cannot be resolved is refused rather than
+/// compared unresolved, and a scan root that does not exist is an error rather
+/// than a silently empty import. Joining an absolute path discards the base, so
+/// the containment test is the single check that rejects an absolute path and a
+/// `..` traversal alike.
+pub fn resolve_scan_root(boundary: &Path, requested: Option<&str>) -> Result<PathBuf> {
+    let base = boundary.canonicalize().map_err(|e| {
+        crate::error::ParseError::Extraction(format!(
+            "scan boundary {} cannot be resolved: {e}",
+            boundary.display()
+        ))
+    })?;
+    let Some(requested) = requested else {
+        return Ok(base);
+    };
+    let candidate = base.join(requested).canonicalize().map_err(|e| {
+        crate::error::ParseError::Extraction(format!(
+            "scan root {requested:?} cannot be resolved: {e}"
+        ))
+    })?;
+    if !candidate.starts_with(&base) {
+        return Err(crate::error::ParseError::Extraction(format!(
+            "scan root {requested:?} resolves outside {}",
+            base.display()
+        )));
+    }
+    Ok(candidate)
+}
+
 /// Scan a directory tree for inline TODO/FIXME/HACK/NOTE markers.
 pub fn extract_todos(root: &Path) -> Result<Vec<ExtractedTodo>> {
     let mut todos = Vec::new();
@@ -234,6 +274,46 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let todos = extract_todos(dir.path()).unwrap();
         assert!(todos.is_empty());
+    }
+
+    #[test]
+    fn resolve_scan_root_accepts_a_subdirectory_and_defaults_to_the_boundary() {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        let base = dir.path().canonicalize().unwrap();
+
+        assert_eq!(resolve_scan_root(dir.path(), None).unwrap(), base);
+        assert_eq!(
+            resolve_scan_root(dir.path(), Some("src")).unwrap(),
+            base.join("src")
+        );
+    }
+
+    #[test]
+    fn resolve_scan_root_refuses_a_path_outside_the_boundary() {
+        let dir = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+
+        let refused = resolve_scan_root(dir.path(), Some(&outside.path().to_string_lossy()));
+        assert!(
+            refused.is_err(),
+            "an absolute path outside the boundary must be refused, got {refused:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_scan_root_refuses_a_traversal_that_cannot_be_resolved() {
+        // The one that fails open if canonicalization is treated as optional.
+        // `<base>/../escape` starts with `<base>` as plain text, so a resolver
+        // that falls back to the unresolved join admits it while the directory
+        // it names sits outside. Refusing an unresolvable path is what closes
+        // that, so this asserts the refusal rather than the comparison.
+        let dir = TempDir::new().unwrap();
+        let refused = resolve_scan_root(dir.path(), Some("../escape-does-not-exist"));
+        assert!(
+            refused.is_err(),
+            "an unresolvable traversal must be refused, got {refused:?}"
+        );
     }
 
     #[test]
