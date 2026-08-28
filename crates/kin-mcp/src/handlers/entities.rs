@@ -228,10 +228,12 @@ sheds its secondary per-file symbol roll-up. File granularity preserves those sy
 are primary answer detail. It then sheds inline snippets, and only then withholds hits from the end \
 of the page. Any cut is reported \
 in `degradations` and in `_kin.response`, which carries the budget applied and what the response \
-measured before it. Primary rows are withheld only when `next_cursor` can be rebased so every row \
-stays reachable. A cursorless final page keeps its primary rows instead; if those rows alone exceed \
-the ceiling, the response ships over budget with `response_over_budget` disclosure rather than \
-silently losing unrecoverable answers, and a size-limited client may still refuse it.";
+measured before it. When primary rows are withheld and `next_cursor` can be rebased, every row \
+stays reachable and the remedy says so. A cursorless final page is cut to its ceiling too, keeping \
+at least one entry, and the cut is published in `elisions` and `degradations`; its remedy names \
+a narrower request, because with no `next_cursor` the withheld entries cannot be \
+reached by paging. Only when one surviving entry per list still exceeds the ceiling does the \
+response ship over budget, and it discloses that as `response_over_budget`.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///
