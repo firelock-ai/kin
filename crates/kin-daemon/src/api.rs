@@ -18608,12 +18608,23 @@ mod tests {
             None,
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{wrong_repository_entity}");
+        // An entity this repository does not carry is the caller naming
+        // something absent, so it leaves as a typed request refusal rather than
+        // as a 200 whose payload says it failed. Both prove the isolation; only
+        // one of them is the envelope this endpoint publishes, and a caller
+        // that has to parse a success to learn it was refused is the shape the
+        // typed error schema exists to replace.
         assert_eq!(
-            wrong_repository_entity["result"]["isError"],
-            true,
+            status,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{wrong_repository_entity}"
+        );
+        assert_eq!(
+            wrong_repository_entity["error"]["code"], "invalid_semantic_tool_call",
             "an entity from repository A must not resolve through repository B: {wrong_repository_entity}"
         );
+        // The load-bearing half, unchanged: whatever shape the refusal takes,
+        // no byte of repository A's source may travel in it.
         assert!(
             !wrong_repository_entity
                 .to_string()
@@ -19451,12 +19462,17 @@ mod tests {
         assert_eq!(status, StatusCode::GONE, "{gone}");
         assert_eq!(gone["error"]["code"], "cursor_unavailable");
 
+        // Named exactly, not described. The advanced publication is proved by
+        // the symbol it introduced actually resolving, and a generic query
+        // cannot carry that weight: it ranks by text over a four-entity corpus
+        // and the newest symbol does not have to make the cut, so the check
+        // would fail on ranking rather than on staleness.
         let (status, _, fresh) = call_repo_mcp_tool(
             restarted_app,
             &repo_a,
             "semantic_locate",
             json!({
-                "query": "shared cursor",
+                "query": "shared_cursor_four",
                 "limit": 10,
                 "include_snippet": true
             }),
@@ -19476,6 +19492,10 @@ mod tests {
             "the restarted pod must answer from the advanced publication: {fresh}"
         );
         let fresh = successful_repo_mcp_payload(fresh);
+        // The identity assertion above proves the CURSOR moved, which a stale
+        // graph served at a new backend generation would also satisfy. This is
+        // the half that proves the GRAPH moved: the body of the artifact the
+        // second publication introduced, which no predecessor could have held.
         assert!(
             fresh.to_string().contains("restart_generation_marker"),
             "the restarted pod must not replay its predecessor's cached success: {fresh}"
