@@ -1974,6 +1974,18 @@ fn new_repo_semantic_cursor_secret() -> [u8; 32] {
 /// `graph_version` is checked on lookup so a stale page is rejected rather than
 /// served after the graph moves.
 pub struct CachedLocateRanking {
+    /// The repository this ranking belongs to, or `None` for the daemon's own
+    /// local cache.
+    ///
+    /// The hosted map is shared by every repository the daemon serves, so a cap
+    /// enforced across the whole map is a shared resource: repository A filling
+    /// it evicts repository B's held ranking, and B's next continuation answers
+    /// 410 for something B did nothing to cause. Both the count and the
+    /// eviction filter on this, because filtering only the eviction is worse
+    /// than filtering neither: the cap would fire on the global length, the
+    /// filtered search for an entry to evict would find none of its own, and
+    /// the map would grow unbounded while still reading as capped.
+    pub repo_id: Option<String>,
     /// The primary query this ranking answered. Cursor-only continuations carry
     /// no query text of their own, and response evidence must still be derived
     /// against the same query that produced page zero.
@@ -2078,6 +2090,19 @@ pub struct CachedSemanticPage {
 /// this bound. Paging is a short-lived read-after-read, so a small cache covers
 /// the realistic concurrent-cursor count without unbounded growth.
 pub const LOCATE_RANKING_CACHE_CAP: usize = 64;
+
+/// The ceiling on the whole ranking map, across every repository.
+///
+/// [`LOCATE_RANKING_CACHE_CAP`] is now per repository, which is what stops one
+/// tenant evicting another's continuations, and on its own that makes the map
+/// sixty-four rankings times the repository count. A `CachedLocateRanking`
+/// clones its entities, files, debug payload and queries, so it is orders of
+/// magnitude larger than the half-kilobyte cursor row the same fix was modelled
+/// on, and unbounded growth is not a trade worth taking for tenant fairness.
+/// So the global ceiling stays, above the per-repo cap rather than in place of
+/// it: a repository can always hold its own sixty-four, and the map as a whole
+/// stops at four repositories' worth before the globally oldest entry goes.
+pub const LOCATE_RANKING_CACHE_GLOBAL_CAP: usize = 256;
 
 /// Minimum baseline count before an anti-wipe guard can fire. Below this, the
 /// set is small enough that a collapse is not catastrophic (and fresh-init /

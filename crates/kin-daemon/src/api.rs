@@ -7097,7 +7097,7 @@ fn cache_locate_ranking(
     result: &kin_cli::commands::locate::LocateResult,
     shape: CachedLocateShape,
 ) {
-    cache_locate_ranking_in(&state.locate_rankings, key, query, result, shape);
+    cache_locate_ranking_in(&state.locate_rankings, None, key, query, result, shape);
 }
 
 /// Retain one full ranking in a NAMED cache.
@@ -7108,24 +7108,57 @@ fn cache_locate_ranking(
 /// cursor could reach a ranking the caller's repository never produced.
 fn cache_locate_ranking_in(
     rankings: &std::sync::Mutex<HashMap<String, CachedLocateRanking>>,
+    repo_id: Option<&str>,
     key: &str,
     query: &str,
     result: &kin_cli::commands::locate::LocateResult,
     shape: CachedLocateShape,
 ) {
     let mut cache = rankings.lock().unwrap();
-    if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(key) {
-        if let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, entry)| entry.created)
-            .map(|(k, _)| k.clone())
-        {
+    if !cache.contains_key(key) {
+        // Both halves filter, and that is the whole fix. Counting globally and
+        // evicting per repository is worse than doing neither: the cap fires on
+        // the global length, the filtered search finds none of this
+        // repository's own entries to evict, nothing is removed, and the map
+        // grows without bound while still reading as capped.
+        let held_for_repo = cache
+            .values()
+            .filter(|entry| entry.repo_id.as_deref() == repo_id)
+            .count();
+        if held_for_repo >= LOCATE_RANKING_CACHE_CAP {
+            if let Some(oldest) = cache
+                .iter()
+                .filter(|(_, entry)| entry.repo_id.as_deref() == repo_id)
+                .min_by_key(|(_, entry)| entry.created)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest);
+            }
+            // The `None` arm is unreachable while the cap is positive, because
+            // reaching it requires this repository to hold at least the cap and
+            // therefore at least one entry. If a future cap of zero made it
+            // reachable, skipping the eviction is the safe reading: the insert
+            // below still lands and the global ceiling still bounds the map.
+        }
+        // The global ceiling, above the per-repo cap rather than instead of it.
+        // Without it, per-repo fairness costs sixty-four full rankings per
+        // repository with no bound on the repository count, and a ranking
+        // clones its entities, files, debug payload and queries.
+        while cache.len() >= LOCATE_RANKING_CACHE_GLOBAL_CAP {
+            let Some(oldest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.created)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
             cache.remove(&oldest);
         }
     }
     cache.insert(
         key.to_string(),
         CachedLocateRanking {
+            repo_id: repo_id.map(ToOwned::to_owned),
             query: query.to_string(),
             entities: result.entities.clone(),
             files: result.files.clone(),
@@ -9765,7 +9798,7 @@ async fn build_fused_semantic_locate_result(
     graph: &kin_db::InMemoryGraph,
     arguments: &HashMap<String, serde_json::Value>,
     hosted: Option<&HostedSemanticRequest>,
-) -> kin_mcp::ToolCallResult {
+) -> std::result::Result<kin_mcp::ToolCallResult, RepoScopedMcpFailure> {
     let hosted_view = hosted.map(HostedSemanticRequest::view);
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.to_string(),
@@ -9779,7 +9812,9 @@ async fn build_fused_semantic_locate_result(
             String::new()
         }
         _ => {
-            return kin_mcp::ToolCallResult::error("missing required parameter: query".to_string());
+            return Ok(kin_mcp::ToolCallResult::error(
+                "missing required parameter: query".to_string(),
+            ));
         }
     };
     let limit = arguments
@@ -9924,7 +9959,7 @@ async fn build_fused_semantic_locate_result(
                     cached_mode,
                     Some(cached_snippet_alias),
                 ) {
-                    return kin_mcp::ToolCallResult::error(error);
+                    return Ok(kin_mcp::ToolCallResult::error(error));
                 }
                 if let Err(error) = validate_fused_cursor_shape(
                     arguments,
@@ -9932,7 +9967,7 @@ async fn build_fused_semantic_locate_result(
                     cached_include_tests,
                     cached_explain,
                 ) {
-                    return kin_mcp::ToolCallResult::error(error);
+                    return Ok(kin_mcp::ToolCallResult::error(error));
                 }
                 // The variant echo travels with the ranking, so a paged response
                 // carries the list its hits' `matched_variant_indexes` point into.
@@ -9963,7 +9998,7 @@ async fn build_fused_semantic_locate_result(
                     result.entities.len()
                 };
                 if let Err(error) = validate_held_locate_offset(start, total) {
-                    return kin_mcp::ToolCallResult::error(error);
+                    return Ok(kin_mcp::ToolCallResult::error(error));
                 }
                 if cached_file_granularity {
                     kin_cli::commands::locate::apply_file_page_at_offset(
@@ -10016,20 +10051,20 @@ async fn build_fused_semantic_locate_result(
                     .await
                     {
                         Ok(Ok(hydrated)) => result = hydrated,
-                        Ok(Err(error)) => {
-                            return kin_mcp::ToolCallResult::error(error.to_string());
-                        }
-                        Err(failure) => {
-                            return kin_mcp::ToolCallResult::error(failure.message);
-                        }
+                        // A projection failure is the authority failing, not the
+                        // caller asking for something absent, so it leaves typed
+                        // rather than flattened into a message a text predicate
+                        // would then have to guess at.
+                        Ok(Err(error)) => return Err(repo_scoped_handler_failure(error)),
+                        Err(failure) => return Err(failure),
                     }
                 }
-                return fused_semantic_locate_payload(
+                return Ok(fused_semantic_locate_payload(
                     result,
                     &cached_query,
                     cached_file_granularity,
                     cached_snippet_alias,
-                );
+                ));
             }
         }
         // Two refusals, both wanted, narrowest first. A hosted continuation
@@ -10038,15 +10073,18 @@ async fn build_fused_semantic_locate_result(
         // zero would serve a different question under the same token while the
         // authority binding the cursor carries goes unchecked.
         if hosted_view.is_some() {
-            return kin_mcp::ToolCallResult::error(
-                "repo-scoped semantic cursor ranking is unavailable".to_string(),
-            );
+            return Err(RepoScopedMcpFailure::new(
+                StatusCode::GONE,
+                "cursor_unavailable",
+                "repo-scoped semantic cursor ranking is unavailable",
+                true,
+            ));
         }
         if query.trim().is_empty() {
-            return kin_mcp::ToolCallResult::error(
+            return Ok(kin_mcp::ToolCallResult::error(
                 "semantic_locate cursor expired or is unavailable; re-run the original query"
                     .to_string(),
-            );
+            ));
         }
     }
 
@@ -10102,7 +10140,7 @@ async fn build_fused_semantic_locate_result(
         .await
         {
             Ok(run_result) => run_result,
-            Err(failure) => return kin_mcp::ToolCallResult::error(failure.message),
+            Err(failure) => return Err(failure),
         }
     } else if multi_query {
         run_multiquery_fused_locate(
@@ -10135,7 +10173,15 @@ async fn build_fused_semantic_locate_result(
     let mut locate_result = match run_result {
         Ok(result) => result,
         Err(error) => {
-            return kin_mcp::ToolCallResult::error(format!("fused locate failed: {error}"));
+            // Retrieval itself could not answer. That is the repository being
+            // unready rather than the caller being wrong, and it is typed here
+            // so nothing downstream has to recognize it by its prefix.
+            return Err(RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_semantic_unready",
+                format!("fused locate failed: {error}"),
+                true,
+            ));
         }
     };
 
@@ -10158,8 +10204,10 @@ async fn build_fused_semantic_locate_result(
     let rankings = hosted_view
         .map(|_| &state.repo_semantic_locate_rankings)
         .unwrap_or(&state.locate_rankings);
+    let ranking_repo_id = hosted_view.map(|view| view.repository_id.to_string());
     cache_locate_ranking_in(
         rankings,
+        ranking_repo_id.as_deref(),
         &key,
         &query,
         &locate_result,
@@ -10192,12 +10240,17 @@ async fn build_fused_semantic_locate_result(
         .await
         {
             Ok(Ok(hydrated)) => locate_result = hydrated,
-            Ok(Err(error)) => return kin_mcp::ToolCallResult::error(error.to_string()),
-            Err(failure) => return kin_mcp::ToolCallResult::error(failure.message),
+            Ok(Err(error)) => return Err(repo_scoped_handler_failure(error)),
+            Err(failure) => return Err(failure),
         }
     }
 
-    fused_semantic_locate_payload(locate_result, &query, file_granularity, snippet_alias)
+    Ok(fused_semantic_locate_payload(
+        locate_result,
+        &query,
+        file_granularity,
+        snippet_alias,
+    ))
 }
 
 /// Map a resolved [`kin_cli::commands::graph::EntitySourceOutcome`] to an MCP
@@ -11570,7 +11623,7 @@ async fn repo_mcp_tools_call(
 
     let result = match request.name.as_str() {
         "semantic_locate" => {
-            build_fused_semantic_locate_result(
+            match build_fused_semantic_locate_result(
                 &state,
                 None,
                 view.graph.as_ref(),
@@ -11578,6 +11631,10 @@ async fn repo_mcp_tools_call(
                 Some(&hosted),
             )
             .await
+            {
+                Ok(result) => result,
+                Err(failure) => return repo_scoped_mcp_error(&repo_id, failure),
+            }
         }
         "get_context_pack" => {
             let packed = hosted.clone();
@@ -11617,39 +11674,16 @@ async fn repo_mcp_tools_call(
         _ => unreachable!("repo-scoped semantic tool allowlist checked above"),
     };
 
-    if let Some(message) = mcp_tool_result_error(&result) {
-        // What the failure IS decides the status, never which tool reported it.
-        // This block once carried `|| request.name == "semantic_locate"`, which
-        // made every locate tool error a retryable 503 including a permanent
-        // caller mistake, so a well-behaved client would retry it forever. That
-        // is the closed "failures must not ship as 200" finding inverted: an
-        // outage wearing a success became a caller error wearing an outage.
-        let authority_gap = kin_mcp::error::is_graph_authority_gap_message(&message);
-        let cursor_unavailable =
-            message.contains("repo-scoped semantic cursor ranking is unavailable");
-        let retrieval_unready = message.starts_with("fused locate failed");
-        if cursor_unavailable || authority_gap || retrieval_unready {
-            return repo_scoped_mcp_error(
-                &repo_id,
-                RepoScopedMcpFailure::new(
-                    if cursor_unavailable {
-                        StatusCode::GONE
-                    } else {
-                        StatusCode::SERVICE_UNAVAILABLE
-                    },
-                    if cursor_unavailable {
-                        "cursor_unavailable"
-                    } else if authority_gap {
-                        "repo_authority_unavailable"
-                    } else {
-                        "repo_semantic_unready"
-                    },
-                    message,
-                    true,
-                ),
-            );
-        }
-    }
+    // Nothing here classifies a tool result by its TEXT any more, and that is
+    // the fix rather than a tidy-up. `handle_trace_data_flow` echoes the
+    // caller's `focal` into its message, so a caller who sends
+    // `{"focal": "graph authority gap"}` used to make a perfectly healthy
+    // repository answer 503 retryable: the reader matched the caller's own
+    // words. Every genuine failure this route can raise now arrives typed, from
+    // the handler through `repo_scoped_handler_failure` or from the seam as a
+    // `RepoScopedMcpFailure`, so a tool result that still reports `isError` is
+    // the tool answering about the request, and 200 with `isError` is what the
+    // response schema declares for that.
     if let Some(failure) = repo_scoped_authority_degradation(&result) {
         return repo_scoped_mcp_error(&repo_id, failure);
     }
@@ -12413,7 +12447,8 @@ async fn mcp_tools_call_inner(
                     &request.arguments,
                     None,
                 )
-                .await,
+                .await
+                .unwrap_or_else(|failure| kin_mcp::ToolCallResult::error(failure.message)),
             ));
         }
         return Ok(Json(build_semantic_locate_result(
@@ -21187,6 +21222,230 @@ mod tests {
         );
     }
 
+    /// P2: the hosted ranking cache is per repository, so one tenant filling it
+    /// cannot take another tenant's continuation down with it.
+    ///
+    /// Both halves of the cap filter, and the test proves both. Repository B's
+    /// cursor surviving is the property; repository A's own oldest entry being
+    /// evicted is the positive control, without which the assertion passes
+    /// trivially against a cap that never evicts anything at all.
+    #[tokio::test]
+    async fn a_hosted_ranking_cache_is_capped_per_repository() {
+        let repo_a = format!("repo-rank-a-{}", Uuid::new_v4());
+        let repo_b = format!("repo-rank-b-{}", Uuid::new_v4());
+        let state = test_state();
+        let rankings = &state.repo_semantic_locate_rankings;
+
+        let ranking = |repo: &str, key: &str, created: std::time::Instant| CachedLocateRanking {
+            repo_id: Some(repo.to_string()),
+            query: key.to_string(),
+            entities: Vec::new(),
+            files: Vec::new(),
+            debug: None,
+            queries: Vec::new(),
+            requested_queries: Vec::new(),
+            include_tests: false,
+            reference: None,
+            max_files: 10,
+            explain: false,
+            semantic_coverage: None,
+            degradations: Vec::new(),
+            file_granularity: false,
+            snippet_alias: false,
+            page_size: 1,
+            graph_version: 1,
+            mode: "bodies",
+            created,
+        };
+
+        // B holds one ranking, minted first so it is the globally oldest and
+        // would be the first casualty of an unfiltered eviction.
+        let base = std::time::Instant::now();
+        {
+            let mut cache = lock_recover(rankings);
+            cache.insert(format!("{repo_b}:held"), ranking(&repo_b, "b-held", base));
+            for index in 0..LOCATE_RANKING_CACHE_CAP {
+                cache.insert(
+                    format!("{repo_a}:{index}"),
+                    ranking(
+                        &repo_a,
+                        "a",
+                        base + Duration::from_millis(u64::try_from(index + 1).unwrap()),
+                    ),
+                );
+            }
+        }
+        let a_oldest = format!("{repo_a}:0");
+
+        // A's next distinct query, the one over its own cap.
+        cache_locate_ranking_in(
+            rankings,
+            Some(&repo_a),
+            &format!("{repo_a}:overflow"),
+            "a-overflow",
+            &kin_cli::commands::locate::LocateResult::default(),
+            CachedLocateShape {
+                file_granularity: false,
+                snippet_alias: false,
+                requested_queries: Vec::new(),
+                include_tests: false,
+                reference: None,
+                max_files: 10,
+                explain: false,
+                page_size: 1,
+                graph_version: 1,
+                mode: "bodies",
+            },
+        );
+
+        let cache = lock_recover(rankings);
+        // The property.
+        assert!(
+            cache.contains_key(&format!("{repo_b}:held")),
+            "repository A reaching its own cap must not evict repository B's held ranking"
+        );
+        // The positive control. Without it the assertion above passes against a
+        // cap that never evicts at all, and the test cannot fail for the right
+        // reason.
+        assert!(
+            !cache.contains_key(&a_oldest),
+            "repository A's own oldest ranking must be the one evicted"
+        );
+        assert!(
+            cache.contains_key(&format!("{repo_a}:overflow")),
+            "the ranking that triggered the eviction must be the one retained"
+        );
+        assert_eq!(
+            cache
+                .values()
+                .filter(|entry| entry.repo_id.as_deref() == Some(repo_a.as_str()))
+                .count(),
+            LOCATE_RANKING_CACHE_CAP,
+            "repository A must hold exactly its own cap, never the global length"
+        );
+    }
+
+    /// P2: the caller's own words must not decide the status code.
+    ///
+    /// `handle_trace_data_flow` echoes the caller's `focal` into its message,
+    /// and the route used to classify that message by substring, so a caller
+    /// who sent this exact focal made a perfectly healthy repository answer 503
+    /// retryable. The fix is to classify on the typed error rather than on
+    /// text, which is why this drives the real route: the defect lived in the
+    /// join between the echo and the reader, not in either end.
+    #[tokio::test]
+    async fn a_focal_quoting_an_authority_gap_is_not_an_outage() {
+        let repo_id = format!("repo-scoped-echo-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0xa101,
+            "publish echo fixture",
+            &[("echo_symbol", "src/echo.rs", "fn echo_symbol() {}\n")],
+        );
+        let app = router(Arc::clone(&state));
+
+        let (status, _, echoed) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_id,
+            "trace_data_flow",
+            json!({ "focal": kin_mcp::error::GRAPH_AUTHORITY_GAP_PREFIX }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a focal that merely quotes the authority-gap phrase is a caller asking for something \
+             absent, not this repository failing: {echoed}"
+        );
+        assert!(
+            !echoed.to_string().contains("repo_authority_unavailable"),
+            "the caller's own words must not be classified as an authority failure: {echoed}"
+        );
+
+        // The control that must stay silent in the other direction: an ordinary
+        // absent focal answers the same way, so the assertion above is about the
+        // phrase rather than about trace refusing everything.
+        let (status, _, ordinary) = call_repo_mcp_tool(
+            app,
+            &repo_id,
+            "trace_data_flow",
+            json!({ "focal": "a_symbol_this_repository_does_not_have" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ordinary}");
+    }
+
+    /// P2: a join failure answers what the seam's own doc promises.
+    ///
+    /// The three seam sites inside the locate builder flattened the typed
+    /// failure to a message, and no predicate downstream matched it, so a
+    /// worker that died answered 200. The armed backend PANICS rather than
+    /// returning an error, because `spawn_blocking` yields `Err(JoinError)`
+    /// only when the closure panics: a closure returning `Err` takes the
+    /// `Ok(Err(..))` arm and would test a different path entirely.
+    #[tokio::test]
+    async fn a_hosted_join_failure_answers_the_documented_service_error() {
+        let repo_id = format!("repo-scoped-join-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, faults, backend_dir) =
+            hosted_state_with_backend_dir("repo-mcp-join", &repo_id, &[]);
+        publish_hosted_semantic_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0xa201,
+            "publish join fixture",
+            &[("join_symbol", "src/join.rs", "fn join_symbol() {}\n")],
+        );
+        let app = router(Arc::clone(&state));
+
+        // The control first: healthy, the same call succeeds and reads source,
+        // so the failure below is the armed panic and not the fixture.
+        let (status, _, healthy) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_id,
+            "semantic_locate",
+            json!({ "query": "join_symbol", "include_snippet": true }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{healthy}");
+        assert!(
+            !faults.blob_read_ceilings().is_empty(),
+            "the control must prove this call reads source at all"
+        );
+
+        faults.start_blob_panicking(&repo_id);
+        let (status, _, joined) = call_repo_mcp_tool(
+            app,
+            &repo_id,
+            "semantic_locate",
+            json!({ "query": "join_symbol", "include_snippet": true }),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a worker that died is the service failing, which is what the seam's doc promises: \
+             {joined}"
+        );
+        assert_eq!(joined["error"]["code"], "repo_semantic_unready", "{joined}");
+        assert_eq!(joined["error"]["retryable"], true, "{joined}");
+        assert!(
+            joined["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("hosted semantic worker failed")),
+            "the refusal must name the seam that failed: {joined}"
+        );
+    }
+
     #[tokio::test]
     async fn repo_scoped_route_never_falls_back_to_a_local_daemon() {
         let state = test_state();
@@ -28091,6 +28350,13 @@ mod tests {
         /// one, and zero here is only evidence beside a nonzero bounded count.
         unbounded_blob_reads: usize,
         blob_faults: std::collections::HashSet<String>,
+        /// Panic inside the source read rather than returning an error.
+        ///
+        /// `spawn_blocking` yields `Err(JoinError)` only when the closure panics
+        /// or the runtime shuts down. A closure that returns `Err` takes the
+        /// `Ok(Err(..))` arm, which is a different path, so a test that returns
+        /// an error asserts on a proxy and cannot see a join failure at all.
+        blob_panics: std::collections::HashSet<String>,
         /// Wall-clock delay a source read holds for, used to prove the read is
         /// not running on the thread driving the request future.
         blob_read_delay: Option<Duration>,
@@ -28178,6 +28444,18 @@ mod tests {
                 .get(repo_id)
                 .copied()
                 .unwrap_or_default()
+        }
+
+        fn start_blob_panicking(&self, repo_id: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .blob_panics
+                .insert(repo_id.to_string());
+        }
+
+        fn blob_panics_for(&self, repo_id: &str) -> bool {
+            self.0.lock().unwrap().blob_panics.contains(repo_id)
         }
 
         fn start_blob_faulting(&self, repo_id: &str) {
@@ -28331,6 +28609,9 @@ mod tests {
         ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
             if let Some(delay) = self.faulting.record_bounded_blob_read(max_bytes) {
                 std::thread::sleep(delay);
+            }
+            if self.faulting.blob_panics_for(repo_id) {
+                panic!("{BACKEND_FAULT_TEXT}: source read panicked for {repo_id}");
             }
             if let Some(error) = self.faulting.blob_fault_for(repo_id) {
                 return Err(error);
