@@ -231,8 +231,8 @@ in `degradations` and in `_kin.response`, which carries the budget applied and w
 measured before it. When primary rows are withheld and `next_cursor` can be rebased, every row \
 stays reachable and the remedy says so. A cursorless final page is cut to its ceiling too, keeping \
 at least one entry, and the cut is published in `elisions` and `degradations`; its remedy names \
-`max_chars` and a narrower request, because with no `next_cursor` the withheld entries cannot be \
-reached by paging. Only when one surviving entry per list still exceeds the ceiling does the \
+`max_chars` and a narrower request, because with no `next_cursor` the withheld entries stay \
+withheld. Only when one surviving entry per list still exceeds the ceiling does the \
 response ship over budget, and it discloses that as `response_over_budget`.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
