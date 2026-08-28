@@ -297,6 +297,16 @@ absent. Without it the other three are satisfied by a product that qualifies
 every answer it gives, which is the failure mode that would make this fix
 worthless without ever failing a test.
 
+`--self-test` carries one fixture per assertion, not one per grader, and the
+distinction was bought. The first version's two durability fixtures both read
+`recorded` AND `live_only_entities: 0`, so deleting either field check left the
+other one catching the same input a step later and the self-test stayed green:
+three of four grader mutations survived, and the claim above that this suite
+asserts the fields rather than the note was unfalsifiable for either field
+alone. Every assertion now has an input only it can catch, so deleting a
+defence turns the suite red and nothing else does. Adding inputs is the fix for
+that class; deleting the second assertion never is.
+
 `eject_journal_repro.py` covers the eject archive round trip the rc0552n green
 stranger lost on 0.5.52 (FIR-2664). A finished `kin eject` left its journal in
 the archived `kin/` at the detach phase, `cp -r` of that archive back to `.kin`

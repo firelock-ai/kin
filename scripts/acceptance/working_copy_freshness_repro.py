@@ -171,6 +171,16 @@ def grade_durability_withholds_the_all_clear(payload):
     note = block.get("note") or ""
     if "host path(s) on disk that no admission has taken" not in note:
         return FAIL, "the note does not name the host paths it cannot see: %r" % (note,)
+    # FIR-2499 withdrew the prose and left the fields. The first cut of the
+    # FIR-2820 fix withdrew the fields and left the prose, composing the note's
+    # own lead out of live_only_entities one statement before setting it to
+    # None, so a reader grepping the payload for "0 uncommitted" over an
+    # unadmitted module still found it. The two halves move together or neither
+    # of them has moved.
+    if "uncommitted" in note:
+        return FAIL, (
+            "the note still states an uncommitted count the field withdrew: %r" % (note,)
+        )
     return PASS, "state %r, live_only_entities %r, note names the host paths" % (
         state, block.get("live_only_entities"),
     )
@@ -487,12 +497,14 @@ CHECKS = [
 ]
 
 
+QUALIFIED_NOTE = (
+    "6 entities answered here, and 1 host path(s) on disk that no admission has taken, so how "
+    "much of this working copy is recorded is unknown; this reading covers admitted content "
+    "only. `kin admit` takes those paths now, and a commit takes them anyway.")
+
 BEHIND = {"_kin": {"durability": {
     "state": "unknown", "live_entities": 6, "durable_entities": 6,
-    "note": "6 entities, 0 uncommitted, and 1 host path(s) on disk that no admission has taken, "
-            "so how much of this working copy is recorded is unknown; this reading covers "
-            "admitted content only. `kin admit` takes those paths now, and a commit takes them "
-            "anyway."}}}
+    "note": QUALIFIED_NOTE}}}
 SHIPPED_0_6_1 = {"_kin": {"durability": {
     "state": "recorded", "live_entities": 38, "durable_entities": 38,
     "live_only_entities": 0,
@@ -506,6 +518,29 @@ PROSE_ONLY = {"_kin": {"durability": {
             "admitted content only. `kin admit` takes those paths now, and a commit takes them "
             "anyway."}}}
 
+# ── one fixture per assertion, because two assertions that can both catch one
+# input hide each other's absence ─────────────────────────────────────────────
+#
+# Every durability fixture above carries `recorded` AND `live_only_entities: 0`,
+# so mutating away either field check left the other one catching the same input
+# one step later and the self-test stayed green. Each dict below is caught by
+# exactly one assertion, so deleting that assertion turns this suite red and
+# nothing else does. Written as inputs, never by deleting a defence.
+STATE_ONLY = {"_kin": {"durability": {
+    "state": "recorded", "live_entities": 6, "durable_entities": 6,
+    "note": QUALIFIED_NOTE}}}
+FIELD_ONLY = {"_kin": {"durability": {
+    "state": "unknown", "live_entities": 6, "durable_entities": 6,
+    "live_only_entities": 0,
+    "note": QUALIFIED_NOTE}}}
+NOTE_STATES_A_COUNT = {"_kin": {"durability": {
+    "state": "unknown", "live_entities": 6, "durable_entities": 6,
+    "note": "6 entities, 0 uncommitted, and 1 host path(s) on disk that no admission has taken, "
+            "so how much of this working copy is recorded is unknown."}}}
+NOTE_NAMES_NOTHING = {"_kin": {"durability": {
+    "state": "unknown", "live_entities": 6, "durable_entities": 6,
+    "note": "This daemon has not levelled its query graph with durable repository authority."}}}
+
 STATUS_HEAD = "Kin repository-v6 status\nTree: abc (3 artifacts, matching its base change)\n"
 STATUS_NAMING = STATUS_HEAD + (
     "Untracked host content: 1 host path(s) on disk that graph truth does not carry "
@@ -515,6 +550,17 @@ STATUS_UNMEASURED = STATUS_HEAD + (
     "of it\n")
 STATUS_SILENT = STATUS_HEAD
 STATUS_CLEAN = STATUS_HEAD + "Untracked host content: none, measured 0s ago\n"
+# Names the file AND says nothing measured it, which is the only input the
+# "not measured" arm can catch on its own: the unmeasured line above is caught
+# one step later for not naming the file.
+STATUS_UNMEASURED_NAMING = STATUS_HEAD + (
+    "Untracked host content: not measured; this repository's daemon reports no measurement of "
+    "1 host path(s) including linkgraph/predicates.py\n")
+# Names the file and never says when, which is the only input the "does not say
+# when it was measured" arm can catch on its own.
+STATUS_NAMING_UNDATED = STATUS_HEAD + (
+    "Untracked host content: 1 host path(s) on disk that graph truth does not carry "
+    "(linkgraph/predicates.py); nothing above describes them\n")
 
 CERTIFIED = {"negative": {
     "safe_to_conclude_absent": True, "trust": "authoritative",
@@ -548,6 +594,15 @@ def self_test():
            grade_durability_withholds_the_all_clear(PROSE_ONLY), FAIL)
     expect("durability cannot read a response with no envelope",
            grade_durability_withholds_the_all_clear({"entity_count": 6}), UNREADABLE)
+    # One arm per assertion in that grader, each caught by exactly one of them.
+    expect("durability fails a recorded state on its own",
+           grade_durability_withholds_the_all_clear(STATE_ONLY), FAIL)
+    expect("durability fails a zero live_only_entities on its own",
+           grade_durability_withholds_the_all_clear(FIELD_ONLY), FAIL)
+    expect("durability fails a note that still states an uncommitted count",
+           grade_durability_withholds_the_all_clear(NOTE_STATES_A_COUNT), FAIL)
+    expect("durability fails a note that names no host paths",
+           grade_durability_withholds_the_all_clear(NOTE_NAMES_NOTHING), FAIL)
 
     expect("durability control passes a committed tree",
            grade_durability_reads_clean_over_a_committed_tree(SHIPPED_0_6_1), PASS)
@@ -567,6 +622,12 @@ def self_test():
            grade_status_names_the_unadmitted_file(STATUS_NAMING, "other/module.py"), FAIL)
     expect("status cannot read something that is not a status",
            grade_status_names_the_unadmitted_file("nope", "linkgraph/predicates.py"), UNREADABLE)
+    expect("status fails an unmeasured line that does name the file",
+           grade_status_names_the_unadmitted_file(STATUS_UNMEASURED_NAMING,
+                                                  "linkgraph/predicates.py"), FAIL)
+    expect("status fails a line that names the file and never says when",
+           grade_status_names_the_unadmitted_file(STATUS_NAMING_UNDATED,
+                                                  "linkgraph/predicates.py"), FAIL)
 
     expect("status control passes a clean measured tree",
            grade_status_reports_nothing_untracked(STATUS_CLEAN), PASS)

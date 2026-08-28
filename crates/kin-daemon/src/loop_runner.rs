@@ -553,10 +553,18 @@ pub(crate) fn refresh_untracked_reading(state: &DaemonState) -> Result<bool> {
     // A graph-authority daemon does not scan a projected checkout in the first
     // place, so host paths there are not content anything failed to admit and
     // counting them would manufacture a disclosure out of the projection.
+    //
+    // Recorded rather than merely returned, because every consumer downstream
+    // gates on whether a reading was taken, and "no reading" here has to be
+    // told apart from "a reading that should exist and does not". Silence on
+    // its own reads as the second, which would leave every daemon with
+    // ingestion off refusing to certify any absence for the life of the
+    // process.
+    let probes = state.background_work.reconcile();
     if state.filesystem_reconcile_disabled() {
+        probes.record_untracked_not_applicable();
         return Ok(false);
     }
-    let probes = state.background_work.reconcile();
     if !probes.untracked_refresh_due(Instant::now()) {
         return Ok(false);
     }

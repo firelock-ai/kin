@@ -317,6 +317,11 @@ pub const BACKLOG_STALE_SECONDS: u64 = 900;
 /// Counters are cumulative for this daemon process and reset on restart. Ages
 /// are monotonic and therefore unaffected by a wall-clock adjustment; the
 /// paired timestamps are wall clock, for lining an incident up against a log.
+/// A false flag is the ordinary case and stays off the wire.
+fn untracked_observation_applies(not_applicable: &bool) -> bool {
+    !*not_applicable
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReconcileHealth {
     /// Reconcile events dropped after erroring. Each one leaves exactly one
@@ -384,6 +389,18 @@ pub struct ReconcileHealth {
     /// Wall-clock time of the measurement above, RFC 3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub untracked_observed_at: Option<String>,
+    /// Whether a walk of the working copy can mean anything for this daemon.
+    ///
+    /// An absent measurement has three producers and only one of them is a
+    /// disclosure: a reading was taken, a reading cannot apply here, and a
+    /// reading should exist and does not. This field separates the second from
+    /// the third, which the clock above cannot do on its own. It is true when
+    /// filesystem-to-graph ingestion is off, so nothing on disk is ever
+    /// admitted and host content is not a gap the graph failed to close;
+    /// counting a projected checkout there would manufacture a disclosure out
+    /// of the projection (FIR-2820).
+    #[serde(default, skip_serializing_if = "untracked_observation_applies")]
+    pub untracked_observation_not_applicable: bool,
     /// Untracked host entries the effective ignore rules excluded from the most
     /// recent walk.
     ///

@@ -3938,6 +3938,7 @@ mod tests {
             "reconcile": {
                 "untracked_path_count": unadmitted_paths,
                 "untracked_paths_sample": ["notekeeper/search.py"],
+                "untracked_observed_age_seconds": 0,
                 "last_admission_success_at": "2026-08-20T13:00:00Z",
             },
         }))
@@ -6335,7 +6336,12 @@ mod tests {
             "initialized": true,
             "graph_loaded": true,
             "graph_entity_count": 38,
-            "reconcile": { "untracked_path_count": 0 },
+            // Stamped. An unstamped zero is a different fact and the two tests
+            // below this one are what separate them.
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+            },
         }));
         let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
             .expect("a miss is still qualified");
@@ -6345,6 +6351,60 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("graph_behind_working_tree"));
+    }
+
+    /// FIR-2820, the review's second finding, on the surface a caller acts on.
+    ///
+    /// A walk that errored is logged at debug and swallowed, and a daemon that
+    /// has not walked yet has taken no reading at all. Both leave the count at
+    /// its `u64` default with no stamp, and `kin status` on the same daemon at
+    /// the same instant says "not measured" while this builder certified.
+    #[test]
+    fn resolution_miss_over_an_unmeasured_working_copy_is_inconclusive() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            "reconcile": { "untracked_path_count": 0 },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a zero nobody measured is not a zero, and certifying on it is the whole ticket"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("working_copy_unmeasured"),
+            "the reason has to name the lever, and it is not `kin admit` here: {reason}"
+        );
+    }
+
+    /// The control for the case above. A daemon that admits nothing from the
+    /// filesystem has no walk to miss, so a gate keyed on the stamp alone would
+    /// refuse every absence it ever answers.
+    #[test]
+    fn resolution_miss_over_a_daemon_that_admits_nothing_from_disk_certifies() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observation_not_applicable": true,
+            },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("working_copy_unmeasured"),
+            "there is no working copy to measure here: {reason}"
+        );
     }
 
     #[test]

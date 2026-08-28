@@ -793,6 +793,16 @@ struct ReconcileProbesInner {
     /// never take more than a bounded share of the daemon's own time on a
     /// working copy large enough for it to matter.
     untracked_measurement_cost: Option<Duration>,
+    /// Whether measuring the working copy can mean anything on this daemon.
+    ///
+    /// Set once, by the refresh itself, on a daemon whose filesystem-to-graph
+    /// ingestion is off. Nothing on disk is ever admitted there, so host
+    /// content is not a gap the graph failed to close and the projected
+    /// checkout is not evidence about one. Without this the stamp above cannot
+    /// tell that case from a walk that should have run and did not, and a
+    /// consumer gating on the stamp alone would turn every graph-authority
+    /// daemon into a permanent disclosure (FIR-2820).
+    untracked_observation_not_applicable: bool,
     /// What the most recent complete walk deliberately did not observe.
     excluded: ExcludedHostContent,
     /// The publication error that left a commit's deferred tree unpublished.
@@ -1023,6 +1033,17 @@ impl ReconcileProbes {
         inner.untracked_observed = Some(RecordedFault::new(String::new(), Instant::now()));
     }
 
+    /// Record that measuring the working copy cannot mean anything here.
+    ///
+    /// The third producer of an absent reading, and the one that is not a
+    /// disclosure. A consumer that gates on the stamp alone reads a daemon with
+    /// ingestion off as one whose walk failed, and refuses to certify any
+    /// absence for the life of the process. Enumerating this producer is what
+    /// keeps the gate honest in both directions.
+    pub fn record_untracked_not_applicable(&self) {
+        self.lock().untracked_observation_not_applicable = true;
+    }
+
     /// The disclosure surfaces' view of all of it.
     pub fn report(&self, now: Instant) -> ReconcileHealth {
         let inner = self.lock();
@@ -1056,6 +1077,7 @@ impl ReconcileProbes {
                 .untracked_observed
                 .as_ref()
                 .map(|observed| observed.wall_clock.to_rfc3339()),
+            untracked_observation_not_applicable: inner.untracked_observation_not_applicable,
             ignored_path_count: inner.excluded.ignored,
             unsupported_path_count: inner.excluded.unsupported,
             policy_excluded_path_count: inner.excluded.policy_excluded,
@@ -1736,6 +1758,36 @@ mod tests {
         assert!(
             probes.untracked_refresh_due(now),
             "a reading nothing has ever taken is due the first time anyone asks"
+        );
+    }
+
+    /// FIR-2820, the review's second finding. The third producer of an absent
+    /// reading, which is the one that is not a disclosure.
+    ///
+    /// A daemon with filesystem ingestion off never walks, so the stamp above
+    /// stays absent forever. Without this record every consumer gating on the
+    /// stamp would read that daemon as one whose walk went missing and refuse to
+    /// certify any absence for the life of the process, which is a disclosure
+    /// manufactured out of a projection.
+    #[test]
+    fn a_daemon_that_admits_nothing_from_disk_says_so_rather_than_going_quiet() {
+        let probes = ReconcileProbes::default();
+        let now = Instant::now();
+        assert!(
+            !probes.report(now).untracked_observation_not_applicable,
+            "the ordinary case is a daemon that does walk"
+        );
+
+        probes.record_untracked_not_applicable();
+        let report = probes.report(now);
+        assert!(report.untracked_observation_not_applicable);
+        assert_eq!(
+            report.untracked_observed_age_seconds, None,
+            "nothing measured, and nothing should have: the flag is what says which"
+        );
+        assert_eq!(
+            report.untracked_path_count, 0,
+            "a projected checkout holds no content anything failed to admit"
         );
     }
 

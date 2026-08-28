@@ -1045,6 +1045,15 @@ async fn untracked_host_content_line(layout: &kin_core::KinLayout) -> String {
         return format!("{LEAD} not measured; this repository's daemon did not answer");
     };
     let reconcile = health.reconcile;
+    // Fifth arm, and the one that is not a gap. A daemon that admits nothing
+    // from the filesystem has no host content waiting to be taken, so counting
+    // its projected checkout would report a shortfall the graph is not in.
+    if reconcile.untracked_observation_not_applicable {
+        return format!(
+            "{LEAD} not applicable; filesystem ingestion is off for this repository's daemon, so \
+             nothing on disk is waiting to be admitted"
+        );
+    }
     let Some(age) = reconcile.untracked_observed_age_seconds else {
         return format!(
             "{LEAD} not measured; this repository's daemon reports no measurement of it, so the \
