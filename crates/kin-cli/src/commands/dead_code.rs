@@ -2530,9 +2530,10 @@ mod tests {
             "a fully measured test-only row remains a supported classification: {joined}"
         );
         assert!(
-            response.lines.iter().any(
-                |line| line == "  format_row (Function, rust) - src/report.rs"
-            ),
+            response
+                .lines
+                .iter()
+                .any(|line| line == "  format_row (Function, rust) - src/report.rs"),
             "the clean test-only row carries no blanket unverified label: {joined}"
         );
         assert!(
@@ -2563,11 +2564,7 @@ mod tests {
         }
         // The same-file test call keeps `format_row` in the test-only bucket.
         graph
-            .upsert_relation(&make_relation(
-                suite.id,
-                format_row.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_relation(suite.id, format_row.id, RelationKind::Calls))
             .unwrap();
         // The production entry point can reach report.rs, but its two parsed
         // calls produced no Calls edge. Either missing call could target
