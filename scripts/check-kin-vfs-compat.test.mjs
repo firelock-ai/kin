@@ -22,6 +22,12 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const PIN_A = 'a'.repeat(40);
 const PIN_B = 'b'.repeat(40);
 
+// Escapes every RegExp metacharacter, backslash included. A class of only `.`
+// and `/` leaves a backslash in the input free to open an escape sequence in
+// the compiled pattern, so the match quietly stops meaning what the literal
+// says instead of failing.
+const escapeRegExp = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
 const releaseYamlWith = (checkoutRef, expectedCommit) => `
 jobs:
   build:
@@ -133,7 +139,7 @@ test('refuses a pin that release.yml moved and rc-build.yml did not', () => {
     ]),
     (error) => {
       assert.match(error.message, /disagreeing/);
-      assert.match(error.message, new RegExp(RC_BUILD.replace(/[./]/g, '\\$&')));
+      assert.match(error.message, new RegExp(escapeRegExp(RC_BUILD)));
       return true;
     },
     'the failure must name rc-build.yml, or an operator cannot tell which home lagged',
@@ -146,7 +152,7 @@ test('refuses a pin the authority script alone did not follow', () => {
       { path: RELEASE, text: releaseYamlWith(PIN_A, PIN_A) },
       { path: AUTHORITY, text: authorityPyWith(PIN_B) },
     ]),
-    new RegExp(AUTHORITY.replace(/[./]/g, '\\$&')),
+    new RegExp(escapeRegExp(AUTHORITY)),
   );
 });
 
