@@ -66,9 +66,18 @@ use crate::publication::{
 use crate::publication::RepoPublicationPhase;
 #[cfg(test)]
 use crate::publication::SpineRolloutRepositoryFence;
-#[cfg(any(feature = "firestore", test))]
+// Firestore-only, not firestore-or-test. The fake that used these under a plain
+// `test` build now lives in `test_support` and imports them itself, so keeping
+// the `test` arm here made them unused on the default shape, where warnings are
+// denied.
+#[cfg(all(test, not(feature = "firestore")))]
 use crate::store::PreparedStorePublication;
 use crate::store::{LoadedRepoPublication, LoadedSpineRolloutFence, SpineStore};
+#[cfg(feature = "firestore")]
+use crate::store::{
+    PreparedStorePublication, RepoPublicationCleanupProgress, StoreHeadPrecondition,
+    StorePublicationStageGuard, StoreRepoHeadGuard,
+};
 
 const CLEANUP_DOCUMENTS_PER_COMMIT: usize = 100;
 const CLEANUP_PASSES_PER_TERMINAL_OUTCOME: usize = 4;
