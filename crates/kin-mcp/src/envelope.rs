@@ -3046,6 +3046,51 @@ mod tests {
         );
     }
 
+    /// The predicate reads both halves, and this asserts the predicate rather
+    /// than the producer's invariant.
+    ///
+    /// `from_health` never emits a stamped zero, so within that one producer the
+    /// count would be discriminator enough and the `measured` half of the
+    /// conjunct would be a clause no mutation could kill. The clause is there
+    /// for a caller that builds one of these itself, and a check that cannot
+    /// fail is worth nothing, so the object is built here by hand.
+    #[test]
+    fn a_stamped_zero_is_not_the_unmeasured_shape() {
+        let stamped = GraphBehind {
+            unadmitted_paths: 0,
+            since: None,
+            sample: Vec::new(),
+            measured_age_seconds: Some(9),
+            measured: true,
+            note: String::new(),
+        };
+        assert!(
+            !stamped.unmeasured(),
+            "a walk ran and found nothing, which is an all-clear and not an absence of one"
+        );
+
+        let unstamped = GraphBehind {
+            measured_age_seconds: None,
+            measured: false,
+            ..stamped.clone()
+        };
+        assert!(
+            unstamped.unmeasured(),
+            "the same zero with nothing behind it is the disclosure"
+        );
+
+        let counted = GraphBehind {
+            unadmitted_paths: 3,
+            measured_age_seconds: None,
+            measured: false,
+            ..stamped
+        };
+        assert!(
+            !counted.unmeasured(),
+            "a count with no stamp is still a count, and `kin admit` is still the remedy"
+        );
+    }
+
     /// FIR-2820, the delta review's finding 12. The disclosure has to be honest
     /// on the wire, not only in Rust.
     ///
