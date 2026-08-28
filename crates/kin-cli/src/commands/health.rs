@@ -10612,12 +10612,10 @@ mod tests {
         assert!(current.manual_fix.is_none());
         assert!(!blocks_readiness(&current));
 
-        for standing in [
-            HydrationStanding::Behind {
-                created_under: 9,
-                derives: 10,
-            },
-        ] {
+        for standing in [HydrationStanding::Behind {
+            created_under: 9,
+            derives: 10,
+        }] {
             let row = hydration_semantics_check_for(&standing);
             assert!(matches!(row.status, HealthStatus::Stale), "{row:?}");
             assert!(

@@ -608,7 +608,10 @@ mod tests {
         assert!(!behind.contains("was authored under"), "{behind}");
 
         let unstamped = HydrationStanding::Unstamped { derives: 10 }.sentence();
-        assert!(unstamped.contains("cannot be shown to match"), "{unstamped}");
+        assert!(
+            unstamped.contains("cannot be shown to match"),
+            "{unstamped}"
+        );
         assert!(!unstamped.contains("older than"), "{unstamped}");
         assert!(!unstamped.contains("was authored"), "{unstamped}");
     }
