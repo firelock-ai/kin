@@ -37154,8 +37154,10 @@ mod tests {
 
         // A `LocateRequest` in one of the three projections. `page_size: 1` keeps a
         // cursor live across the interleaving below.
-        let post_locate =
-            |app: Router, snippets: bool, entity_surface: bool, cursor: Option<String>| async move {
+        let post_locate = |app: Router,
+                           snippets: bool,
+                           entity_surface: bool,
+                           cursor: Option<String>| async move {
             let continuation = cursor.is_some();
             let response = app
                 .oneshot(
@@ -37584,12 +37586,7 @@ mod tests {
 
         let page0 = call_semantic_locate(
             app.clone(),
-            json!({
-                "query": "parse",
-                "page_size": 2,
-                "pipeline": "fused",
-                "compact": false
-            }),
+            json!({ "query": "parse", "page_size": 2, "pipeline": "fused" }),
         )
         .await;
         let total = page0["total_ranked"].as_u64().unwrap();
@@ -37606,10 +37603,6 @@ mod tests {
         assert!(
             carries_guidance(&page0),
             "the fresh full ranking carries description guidance: {page0}"
-        );
-        assert!(
-            page0.get("debug").is_some(),
-            "compact:false must build and preserve the fresh explanation: {page0}"
         );
         let first_page: Vec<String> = page0["entities"]
             .as_array()
@@ -37628,38 +37621,15 @@ mod tests {
             .to_string();
 
         // Page the cursor (empty query is allowed on a paging continuation).
-        let page1 = call_semantic_locate(
-            app.clone(),
-            json!({ "cursor": cursor.clone(), "compact": false }),
-        )
-        .await;
+        let page1 = call_semantic_locate(app.clone(), json!({ "cursor": cursor.clone() })).await;
         assert_eq!(page1["routing"], "fused-v1");
         assert_eq!(page1["query"], "parse");
         assert_eq!(page1["granularity"], "entity");
         assert_eq!(page1["page"].as_u64().unwrap(), 1);
         assert_eq!(page1["all_fallback"], json!(true));
         assert!(
-            page1.get("debug").is_some(),
-            "compact:false continuation must reuse the held explanation: {page1}"
-        );
-        assert!(
             carries_guidance(&page1),
             "a cached page must rehydrate the whole-ranking guidance: {page1}"
-        );
-        let contracted = call_semantic_locate(
-            app.clone(),
-            json!({
-                "cursor": cursor.clone(),
-                "explain": true,
-                "compact": true
-            }),
-        )
-        .await;
-        assert_eq!(contracted["routing"], "fused-v1");
-        assert_eq!(contracted["page"], 1);
-        assert!(
-            contracted.get("debug").is_none(),
-            "a compact continuation must not leak held explanation data: {contracted}"
         );
         let second_page: Vec<String> = page1["entities"]
             .as_array()
@@ -37678,10 +37648,6 @@ mod tests {
 
         // Cursor stability: the same cursor yields the same page from cache.
         let page1_again = call_semantic_locate(app, json!({ "cursor": cursor })).await;
-        assert!(
-            page1_again.get("debug").is_none(),
-            "a bare cursor uses compact presentation even when the cache holds debug: {page1_again}"
-        );
         let second_again: Vec<String> = page1_again["entities"]
             .as_array()
             .unwrap()
@@ -37691,6 +37657,88 @@ mod tests {
         assert_eq!(
             second_page, second_again,
             "a stable cursor must return the identical page on re-issue"
+        );
+    }
+
+    /// Presentation is decided per page, so a held explanation is reused,
+    /// contracted or withheld by what THIS call asked for.
+    ///
+    /// The cache has to hold real explanation data for any of that to be
+    /// observable, which is why this seeds one rather than ranking fresh. The
+    /// fresh-ranking fixture above upserts entities at paths the graph never
+    /// admitted as artifacts, and building an explanation resolves provenance
+    /// through the graph, so asking that fixture for `compact: false` fails the
+    /// whole locate on an honest graph gap rather than returning a page.
+    #[tokio::test]
+    async fn a_held_explanation_is_reused_contracted_or_withheld_by_the_current_page() {
+        let state = test_state();
+        let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
+        let result = kin_cli::commands::locate::LocateResult {
+            entities: vec![
+                fused_locate_entity("first"),
+                fused_locate_entity("second"),
+                fused_locate_entity("third"),
+            ],
+            debug: Some(kin_cli::commands::locate::LocateDebugInfo::default()),
+            ..Default::default()
+        };
+        let key = "held-explanation-ranking";
+        cache_locate_ranking(
+            &state,
+            key,
+            "parse",
+            &result,
+            CachedLocateShape {
+                file_granularity: false,
+                snippet_alias: false,
+                requested_queries: Vec::new(),
+                include_tests: false,
+                reference: None,
+                max_files: 10,
+                explain: true,
+                page_size: 1,
+                graph_version,
+                mode: kin_cli::commands::locate::projection_mode(true, false),
+            },
+        );
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let app = router(state);
+        let cursor = kin_core::LocateCursor {
+            key: key.to_string(),
+            page: 1,
+            next_offset: Some(1),
+            page_size: Some(1),
+        }
+        .encode();
+
+        let reused = call_semantic_locate(
+            app.clone(),
+            json!({ "cursor": cursor.clone(), "compact": false }),
+        )
+        .await;
+        assert_eq!(reused["page"].as_u64().unwrap(), 1);
+        assert!(
+            reused.get("debug").is_some(),
+            "compact:false must reuse the held explanation: {reused}"
+        );
+
+        let contracted = call_semantic_locate(
+            app.clone(),
+            json!({ "cursor": cursor.clone(), "explain": true, "compact": true }),
+        )
+        .await;
+        assert_eq!(contracted["page"].as_u64().unwrap(), 1);
+        assert!(
+            contracted.get("debug").is_none(),
+            "a compact continuation must not leak held explanation data: {contracted}"
+        );
+
+        let bare = call_semantic_locate(app, json!({ "cursor": cursor })).await;
+        assert!(
+            bare.get("debug").is_none(),
+            "a bare cursor uses compact presentation even when the cache holds debug: {bare}"
         );
     }
 

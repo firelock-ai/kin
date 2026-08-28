@@ -919,11 +919,11 @@ pub fn build_embed_response(
 mod tests {
     use super::{
         constrained_memory_notice, effective_batch_size, embed_completion_line,
-        embed_pass_should_continue, embed_resource_exhaustion, eta_suffix, format_duration_secs,
-        lost_the_daemon_mid_request, resolve_total_budget, should_queue_missing_embedding_pass,
-        throughput_per_sec, EmbedResult, PassCoverage, DEFAULT_BATCH_SIZE,
-        DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD, EMBED_MODEL_ID,
-        RECOMMENDED_EMBED_MEMORY_BYTES,
+        embed_pass_should_continue, embed_resource_exhaustion, embed_resource_exhaustion_for,
+        eta_suffix, format_duration_secs, lost_the_daemon_mid_request, resolve_total_budget,
+        should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult, PassCoverage,
+        DEFAULT_BATCH_SIZE, DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD,
+        EMBED_MODEL_ID, RECOMMENDED_EMBED_MEMORY_BYTES,
     };
 
     fn result_with(pending_entities: usize, pending_artifacts: usize) -> EmbedResult {

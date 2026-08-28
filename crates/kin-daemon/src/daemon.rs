@@ -7795,8 +7795,7 @@ mod memory_pressure_tests {
     use super::{
         clear_pressure_refusal_for_work, decide_sweep_on_start, embed_batch_under_pressure,
         embedding_coverage_is_complete, pressure_announcement_after_retirement,
-        pressure_refusal_matches_work,
-        pressure_refusal_needs_disclosure, pressure_verdict,
+        pressure_refusal_matches_work, pressure_refusal_needs_disclosure, pressure_verdict,
         queue_embedding_backfill_under_pressure, retire_embed_pressure_for_unavailable_persistence,
         sample_tree_footprint, start_or_defer_background_embed, tree_footprint_from, ProcessRow,
         SweepStartDecision,
