@@ -44,6 +44,7 @@ HELPER_PREFIXES = ("assert_", "test_")
 
 COVERED_SUITES = (
     "scripts/test-release-workflow-authority.py",
+    "scripts/test-daemon-compat-contract.py",
     "scripts/test-homebrew-release-gate.py",
     "scripts/test-assertion-reachability.py",
 )

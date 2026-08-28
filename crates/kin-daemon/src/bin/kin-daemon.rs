@@ -501,6 +501,14 @@ async fn async_main() -> i32 {
                 "schema": "kin.daemon.compat.v2",
                 "version": env!("CARGO_PKG_VERSION"),
                 "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "graph_snapshot_min_supported_version":
+                    kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                "graph_snapshot_max_supported_version":
+                    kin_db::GraphSnapshot::CURRENT_VERSION,
+                "gcs_full_authority_envelope_min_supported_version":
+                    kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version,
+                "gcs_full_authority_envelope_max_supported_version":
+                    kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
                 "supervisor_startup_protocol": 2,
                 "supervisor_startup_capabilities": [
                     "generation-adoption-ack-v2",

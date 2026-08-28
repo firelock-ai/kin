@@ -51,6 +51,43 @@ async fn compat_json_stdout_is_pure_json_under_env_overrides() {
         parsed["graph_snapshot_version"].is_number(),
         "compat payload must carry a numeric graph_snapshot_version"
     );
+    assert_eq!(
+        parsed["graph_snapshot_min_supported_version"],
+        kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION
+    );
+    assert_eq!(
+        parsed["graph_snapshot_max_supported_version"],
+        kin_db::GraphSnapshot::CURRENT_VERSION
+    );
+    assert_eq!(
+        parsed["graph_snapshot_version"],
+        kin_db::GraphSnapshot::CURRENT_VERSION
+    );
+    assert_eq!(
+        parsed["gcs_full_authority_envelope_min_supported_version"],
+        kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version
+    );
+    assert_eq!(
+        parsed["gcs_full_authority_envelope_max_supported_version"],
+        kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version
+    );
+    let graph_min = parsed["graph_snapshot_min_supported_version"]
+        .as_u64()
+        .expect("graph minimum must be an unsigned integer");
+    let graph_writer = parsed["graph_snapshot_version"]
+        .as_u64()
+        .expect("graph writer must be an unsigned integer");
+    let graph_max = parsed["graph_snapshot_max_supported_version"]
+        .as_u64()
+        .expect("graph maximum must be an unsigned integer");
+    assert!(graph_min <= graph_writer && graph_writer <= graph_max);
+    let envelope_min = parsed["gcs_full_authority_envelope_min_supported_version"]
+        .as_u64()
+        .expect("envelope minimum must be an unsigned integer");
+    let envelope_max = parsed["gcs_full_authority_envelope_max_supported_version"]
+        .as_u64()
+        .expect("envelope maximum must be an unsigned integer");
+    assert!(envelope_min <= envelope_max);
     assert_eq!(parsed["supervisor_startup_protocol"], 2);
     let capabilities = parsed["supervisor_startup_capabilities"]
         .as_array()

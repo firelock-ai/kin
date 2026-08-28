@@ -148,6 +148,10 @@ struct DaemonCompatResponse {
     #[serde(default)]
     schema: String,
     graph_snapshot_version: u32,
+    graph_snapshot_min_supported_version: u32,
+    graph_snapshot_max_supported_version: u32,
+    gcs_full_authority_envelope_min_supported_version: u32,
+    gcs_full_authority_envelope_max_supported_version: u32,
     #[serde(default)]
     supervisor_startup_protocol: Option<u32>,
     #[serde(default)]
@@ -4040,11 +4044,34 @@ pub fn validate_daemon_compat_json(payload: &[u8]) -> Result<(), String> {
 }
 
 fn validate_daemon_compat_response(compat: &DaemonCompatResponse) -> Result<(), String> {
-    let expected = kin_db::GraphSnapshot::CURRENT_VERSION;
-    if compat.graph_snapshot_version != expected {
+    let expected_graph_min = kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION;
+    let expected_graph_max = kin_db::GraphSnapshot::CURRENT_VERSION;
+    if compat.graph_snapshot_min_supported_version != expected_graph_min
+        || compat.graph_snapshot_max_supported_version != expected_graph_max
+        || compat.graph_snapshot_version != expected_graph_max
+    {
         return Err(format!(
-            "graph snapshot version {} does not match CLI expected version {expected}",
-            compat.graph_snapshot_version
+            "graph snapshot compatibility {}..={} with writer {} does not match CLI expected {}..={} with writer {}",
+            compat.graph_snapshot_min_supported_version,
+            compat.graph_snapshot_max_supported_version,
+            compat.graph_snapshot_version,
+            expected_graph_min,
+            expected_graph_max,
+            expected_graph_max,
+        ));
+    }
+    let expected_envelope = kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY;
+    if compat.gcs_full_authority_envelope_min_supported_version
+        != expected_envelope.min_supported_version
+        || compat.gcs_full_authority_envelope_max_supported_version
+            != expected_envelope.current_version
+    {
+        return Err(format!(
+            "GCS full-authority envelope compatibility {}..={} does not match CLI expected {}..={}",
+            compat.gcs_full_authority_envelope_min_supported_version,
+            compat.gcs_full_authority_envelope_max_supported_version,
+            expected_envelope.min_supported_version,
+            expected_envelope.current_version,
         ));
     }
     if compat.schema != "kin.daemon.compat.v2"
@@ -5513,6 +5540,36 @@ pub enum InstalledStartupProtocol {
     Undetermined(String),
 }
 
+#[derive(Debug, Deserialize)]
+struct InstalledStartupCompatResponse {
+    #[serde(default)]
+    schema: String,
+    #[serde(default)]
+    supervisor_startup_protocol: Option<u32>,
+}
+
+fn classify_installed_startup_protocol_payload(
+    payload: &[u8],
+) -> Result<InstalledStartupProtocol, String> {
+    let compat: InstalledStartupCompatResponse = serde_json::from_slice(payload)
+        .map_err(|error| format!("compat probe returned invalid JSON: {error}"))?;
+    Ok(match compat.supervisor_startup_protocol {
+        Some(SUPERVISOR_STARTUP_PROTOCOL) => InstalledStartupProtocol::Current,
+        Some(protocol) => InstalledStartupProtocol::Predates(format!(
+            "it reports supervisor startup protocol v{protocol}, not \
+             v{SUPERVISOR_STARTUP_PROTOCOL}"
+        )),
+        None => InstalledStartupProtocol::Predates(format!(
+            "it reports compat schema {} and no supervisor startup protocol at all",
+            if compat.schema.is_empty() {
+                "<none>"
+            } else {
+                &compat.schema
+            }
+        )),
+    })
+}
+
 /// Installed kin binaries on this host that are not the running one.
 ///
 /// Candidates are whatever `PATH` resolves for `kin`, plus the Kin home's
@@ -5602,28 +5659,11 @@ pub fn probe_installed_startup_protocol(kin_binary: &Path) -> InstalledStartupPr
                 ))
             }
         };
-    let compat: DaemonCompatResponse = match serde_json::from_slice(&output.stdout) {
-        Ok(compat) => compat,
+    match classify_installed_startup_protocol_payload(&output.stdout) {
+        Ok(protocol) => protocol,
         Err(error) => {
-            return InstalledStartupProtocol::Undetermined(format!(
-                "compat probe returned invalid JSON: {error}"
-            ))
+            InstalledStartupProtocol::Undetermined(error)
         }
-    };
-    match compat.supervisor_startup_protocol {
-        Some(SUPERVISOR_STARTUP_PROTOCOL) => InstalledStartupProtocol::Current,
-        Some(protocol) => InstalledStartupProtocol::Predates(format!(
-            "it reports supervisor startup protocol v{protocol}, not \
-             v{SUPERVISOR_STARTUP_PROTOCOL}"
-        )),
-        None => InstalledStartupProtocol::Predates(format!(
-            "it reports compat schema {} and no supervisor startup protocol at all",
-            if compat.schema.is_empty() {
-                "<none>"
-            } else {
-                &compat.schema
-            }
-        )),
     }
 }
 
@@ -9062,6 +9102,12 @@ mod tests {
         let base: DaemonCompatResponse = serde_json::from_value(serde_json::json!({
             "schema": "kin.daemon.compat.v1",
             "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "graph_snapshot_min_supported_version": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+            "graph_snapshot_max_supported_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "gcs_full_authority_envelope_min_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version,
+            "gcs_full_authority_envelope_max_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
         }))
         .unwrap();
         let error = validate_daemon_compat_response(&base).unwrap_err();
@@ -9073,6 +9119,12 @@ mod tests {
         let current: DaemonCompatResponse = serde_json::from_value(serde_json::json!({
             "schema": "kin.daemon.compat.v2",
             "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "graph_snapshot_min_supported_version": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+            "graph_snapshot_max_supported_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "gcs_full_authority_envelope_min_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version,
+            "gcs_full_authority_envelope_max_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
             "supervisor_startup_protocol": SUPERVISOR_STARTUP_PROTOCOL,
             "supervisor_startup_capabilities": [
                 SUPERVISOR_STARTUP_CAPABILITY,
@@ -9082,6 +9134,173 @@ mod tests {
         }))
         .unwrap();
         validate_daemon_compat_response(&current).unwrap();
+    }
+
+    fn current_daemon_compat_response() -> DaemonCompatResponse {
+        serde_json::from_value(serde_json::json!({
+            "schema": "kin.daemon.compat.v2",
+            "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "graph_snapshot_min_supported_version": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+            "graph_snapshot_max_supported_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "gcs_full_authority_envelope_min_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version,
+            "gcs_full_authority_envelope_max_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
+            "supervisor_startup_protocol": SUPERVISOR_STARTUP_PROTOCOL,
+            "supervisor_startup_capabilities": [
+                SUPERVISOR_STARTUP_CAPABILITY,
+                SUPERVISOR_LEGACY_SENTINEL_CAPABILITY,
+                SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY,
+            ],
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn compat_handshake_rejects_legacy_v2_without_reader_ranges() {
+        let legacy_payload = serde_json::json!({
+            "schema": "kin.daemon.compat.v2",
+            "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "supervisor_startup_protocol": SUPERVISOR_STARTUP_PROTOCOL,
+            "supervisor_startup_capabilities": [
+                SUPERVISOR_STARTUP_CAPABILITY,
+                SUPERVISOR_LEGACY_SENTINEL_CAPABILITY,
+                SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY,
+            ],
+        });
+        let error = validate_daemon_compat_json(&serde_json::to_vec(&legacy_payload).unwrap())
+            .unwrap_err();
+        assert!(
+            error.contains("graph_snapshot_min_supported_version"),
+            "candidate admission must require explicit reader ranges: {error}"
+        );
+    }
+
+    #[test]
+    fn compat_handshake_rejects_partial_reader_ranges() {
+        let partial_graph = serde_json::json!({
+            "schema": "kin.daemon.compat.v2",
+            "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "graph_snapshot_min_supported_version": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+            "gcs_full_authority_envelope_min_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version,
+            "gcs_full_authority_envelope_max_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.current_version,
+            "supervisor_startup_protocol": SUPERVISOR_STARTUP_PROTOCOL,
+            "supervisor_startup_capabilities": [
+                SUPERVISOR_STARTUP_CAPABILITY,
+                SUPERVISOR_LEGACY_SENTINEL_CAPABILITY,
+                SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY,
+            ],
+        });
+        let error = validate_daemon_compat_json(&serde_json::to_vec(&partial_graph).unwrap())
+            .unwrap_err();
+        assert!(
+            error.contains("graph_snapshot_max_supported_version"),
+            "partial graph range must fail closed: {error}"
+        );
+
+        let partial_envelope = serde_json::json!({
+            "schema": "kin.daemon.compat.v2",
+            "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "graph_snapshot_min_supported_version": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+            "graph_snapshot_max_supported_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "gcs_full_authority_envelope_min_supported_version":
+                kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY.min_supported_version,
+            "supervisor_startup_protocol": SUPERVISOR_STARTUP_PROTOCOL,
+            "supervisor_startup_capabilities": [
+                SUPERVISOR_STARTUP_CAPABILITY,
+                SUPERVISOR_LEGACY_SENTINEL_CAPABILITY,
+                SUPERVISOR_BOUNDED_ROLLBACK_CAPABILITY,
+            ],
+        });
+        let error = validate_daemon_compat_json(&serde_json::to_vec(&partial_envelope).unwrap())
+            .unwrap_err();
+        assert!(
+            error.contains("gcs_full_authority_envelope_max_supported_version"),
+            "partial envelope range must fail closed: {error}"
+        );
+    }
+
+    #[test]
+    fn installed_startup_protocol_parser_tolerates_legacy_compat_shapes() {
+        let legacy_v2 = serde_json::json!({
+            "schema": "kin.daemon.compat.v2",
+            "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+            "supervisor_startup_protocol": SUPERVISOR_STARTUP_PROTOCOL,
+        });
+        assert_eq!(
+            classify_installed_startup_protocol_payload(
+                &serde_json::to_vec(&legacy_v2).unwrap()
+            )
+            .unwrap(),
+            InstalledStartupProtocol::Current
+        );
+
+        let legacy_v1 = serde_json::json!({
+            "schema": "kin.daemon.compat.v1",
+            "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+        });
+        let verdict = classify_installed_startup_protocol_payload(
+            &serde_json::to_vec(&legacy_v1).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(
+                &verdict,
+                InstalledStartupProtocol::Predates(reason)
+                    if reason.contains("kin.daemon.compat.v1")
+            ),
+            "legacy diagnostic must retain the old schema evidence: {verdict:?}"
+        );
+    }
+
+    #[test]
+    fn compat_handshake_rejects_graph_snapshot_range_and_writer_drift() {
+        let expected_min = kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION;
+        assert!(expected_min > 0, "snapshot schema versions must be positive");
+
+        let mut copied_minimum = current_daemon_compat_response();
+        copied_minimum.graph_snapshot_min_supported_version = 1;
+        assert_ne!(
+            copied_minimum.graph_snapshot_min_supported_version,
+            expected_min,
+            "the copied-constant falsifier must differ from KinDB's reader minimum"
+        );
+        let error = validate_daemon_compat_response(&copied_minimum).unwrap_err();
+        assert!(error.contains("graph snapshot compatibility"));
+
+        let mut future_maximum = current_daemon_compat_response();
+        future_maximum.graph_snapshot_max_supported_version =
+            kin_db::GraphSnapshot::CURRENT_VERSION + 1;
+        let error = validate_daemon_compat_response(&future_maximum).unwrap_err();
+        assert!(error.contains("graph snapshot compatibility"));
+
+        let mut future_writer = current_daemon_compat_response();
+        future_writer.graph_snapshot_version = kin_db::GraphSnapshot::CURRENT_VERSION + 1;
+        let error = validate_daemon_compat_response(&future_writer).unwrap_err();
+        assert!(error.contains("graph snapshot compatibility"));
+    }
+
+    #[test]
+    fn compat_handshake_rejects_gcs_envelope_range_drift() {
+        let expected = kin_db::GCS_FULL_AUTHORITY_ENVELOPE_COMPATIBILITY;
+        assert!(
+            expected.min_supported_version > 0,
+            "authority-envelope versions must be positive"
+        );
+
+        let mut below_minimum = current_daemon_compat_response();
+        below_minimum.gcs_full_authority_envelope_min_supported_version =
+            expected.min_supported_version - 1;
+        let error = validate_daemon_compat_response(&below_minimum).unwrap_err();
+        assert!(error.contains("GCS full-authority envelope compatibility"));
+
+        let mut future_maximum = current_daemon_compat_response();
+        future_maximum.gcs_full_authority_envelope_max_supported_version =
+            expected.current_version + 1;
+        let error = validate_daemon_compat_response(&future_maximum).unwrap_err();
+        assert!(error.contains("GCS full-authority envelope compatibility"));
     }
 
     #[test]

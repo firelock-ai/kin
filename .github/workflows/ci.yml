@@ -123,6 +123,7 @@ jobs:
       - name: Test release ordering and npm provenance policy
         run: |
           python3 ./scripts/test-release-workflow-authority.py
+          python3 ./scripts/test-daemon-compat-contract.py
           python3 ./scripts/test_install_optional_vfs.py
           python3 ./scripts/test_installer_parity.py
           # Every install surface builds a release asset name; the release
@@ -945,6 +946,7 @@ jobs:
         run: |
           bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
+          python3 scripts/test-daemon-compat-contract.py
           node --test \
             scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \
@@ -1362,6 +1364,7 @@ jobs:
         run: |
           bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
+          python3 scripts/test-daemon-compat-contract.py
           node --test \
             scripts/check-glibc-floor.test.mjs \
             scripts/check-kin-vfs-compat.test.mjs \

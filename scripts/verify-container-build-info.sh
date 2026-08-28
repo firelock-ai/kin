@@ -23,6 +23,9 @@ payload="$(docker run --rm --entrypoint /usr/local/bin/kin-daemon \
   "$image" --compat-json)"
 printf '%s\n' "$payload"
 
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+printf '%s\n' "$payload" | python3 "$script_dir/verify-daemon-compat-json.py"
+
 if [ ! -f Cargo.lock ]; then
   echo "error: Cargo.lock is required to verify container dependency provenance" >&2
   exit 2
