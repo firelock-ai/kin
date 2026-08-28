@@ -1988,6 +1988,19 @@ def check_12(suite):
     res.ok("the one function nothing calls is listed (%d row(s): %s)"
            % (len(listed), ", ".join(sorted(listed))))
 
+    # A disclosure rather than a graded arm, so the run says which branch of the
+    # spanless rule answered for this fixture instead of leaving a reader to
+    # infer it from the absence of a label. The rule certifies when a file parses
+    # at most one call site, discloses a floor when it parses more sites than it
+    # holds edges of any kind, and declines only when the fan-out decides.
+    try:
+        arrival = (suite.references(repo, REEXPORT_DEAD_FUNCTION).get("caller_arrival")
+                   or {})
+    except McpError as exc:
+        arrival = {"state": "unreadable: %s" % exc}
+    res.ok("arrival state for this fixture reads %r, which is the branch of the spanless "
+           "rule that answered here" % arrival.get("state", "absent"))
+
     # The fourth arm, and the one that carries this ticket's claim now. A label
     # is allowed, because this fixture's language emits no call-site span and the
     # arrival reading declines over that for every row in every such store. What
