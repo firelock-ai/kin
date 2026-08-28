@@ -11083,20 +11083,6 @@ fn bind_repo_semantic_cursor(
     Ok(())
 }
 
-fn mcp_tool_result_error(result: &kin_mcp::ToolCallResult) -> Option<String> {
-    result.is_error.filter(|is_error| *is_error).map(|_| {
-        result
-            .content
-            .iter()
-            .map(|block| {
-                let kin_mcp::ContentBlock::Text { text } = block;
-                text.as_str()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    })
-}
-
 fn repo_scoped_handler_failure(error: kin_mcp::McpError) -> RepoScopedMcpFailure {
     let (status, code, retryable) = match &error {
         kin_mcp::McpError::InvalidParams(_)
@@ -21299,11 +21285,50 @@ mod tests {
             },
         );
 
+        {
+            let cache = lock_recover(rankings);
+            assert!(
+                cache.contains_key(&format!("{repo_b}:held")),
+                "repository A reaching its own cap must not evict repository B's held ranking"
+            );
+        }
+
+        // The arm that separates a per-repo COUNT from a global one, and the
+        // only input that can. A fix which counts globally and evicts per
+        // repository passes every assertion above: A's overflow still evicts A's
+        // own oldest. What it gets wrong is B's next query. The global length is
+        // already over the cap through no fault of B's, so B's insert fires the
+        // eviction and the only entry the filter can find is B's own held
+        // ranking, which B then loses on its own second call.
+        cache_locate_ranking_in(
+            rankings,
+            Some(&repo_b),
+            &format!("{repo_b}:second"),
+            "b-second",
+            &kin_cli::commands::locate::LocateResult::default(),
+            CachedLocateShape {
+                file_granularity: false,
+                snippet_alias: false,
+                requested_queries: Vec::new(),
+                include_tests: false,
+                reference: None,
+                max_files: 10,
+                explain: false,
+                page_size: 1,
+                graph_version: 1,
+                mode: "bodies",
+            },
+        );
+
         let cache = lock_recover(rankings);
         // The property.
         assert!(
             cache.contains_key(&format!("{repo_b}:held")),
-            "repository A reaching its own cap must not evict repository B's held ranking"
+            "repository B's own second query must not evict its first while B is far under its cap"
+        );
+        assert!(
+            cache.contains_key(&format!("{repo_b}:second")),
+            "repository B's second ranking must land"
         );
         // The positive control. Without it the assertion above passes against a
         // cap that never evicts at all, and the test cannot fail for the right
