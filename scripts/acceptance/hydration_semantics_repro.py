@@ -350,7 +350,12 @@ def verdict_problems(payload, gap):
     references = payload.get("references")
     if not isinstance(references, list) or not references:
         return ["find_references returned no rows, so this arm graded nothing"]
-    negative = envelope.get("negative")
+    # `negative` is a sibling of `_kin` at the payload's top level while
+    # `verdict` and `completeness` live inside it. Reading `negative` off `_kin`
+    # returns nothing and reads exactly like a tool that published no negative
+    # block at all, which is the envelope-piercing mistake in the trap
+    # catalogue. `verdict_limits_repro.py` is the proven reader this follows.
+    negative = (payload or {}).get("negative")
     verdict = envelope.get("verdict")
     completeness = envelope.get("completeness")
     if not isinstance(negative, dict):
@@ -909,7 +914,7 @@ class Suite(object):
         }
         return self._transfer
 
-    def find_references(self, attempts=6, pause=5):
+    def find_references(self, attempts=8, pause=4):
         """One negative-capable retrieval call, retried while enrichment settles.
 
         `calls` only, because that is the class this fixture defines directly and
@@ -917,15 +922,24 @@ class Suite(object):
         it proves the real finalizer ran, and `find_references` still emits a
         `negative` block over a qualified answer, so a current store certifies
         and a hydration gap has to withdraw that.
+
+        The wait is on the `calls` class reading `present`, not on the row count.
+        `references` reads short until the language server has run, which is a
+        fact about timing rather than about the verdict, and a retry keyed on
+        rows alone stops as soon as one arrives with the class still settling.
         """
         payload = None
         for attempt in range(attempts):
+            self.kin_run(["graph", "status"], timeout=900)
             payload = self.mcp(
                 "find_references",
                 {"query": "blank_code", "relation_kinds": ["calls"]},
             )
             rows = payload.get("references")
-            if isinstance(rows, list) and rows:
+            classes = ((payload.get("_kin") or {}).get("completeness") or {}).get(
+                "classes"
+            ) or {}
+            if isinstance(rows, list) and rows and classes.get("calls") == "present":
                 return payload
             if attempt + 1 < attempts:
                 time.sleep(pause)
@@ -1567,20 +1581,22 @@ def self_test():
     )
 
     def retrieval_payload(gap):
+        # `negative` beside `_kin`, not inside it, exactly as a real
+        # `find_references` response carries it.
         return {
             "references": [{"id": "pkg/search.py::index_note"}],
+            "negative": {
+                "interpretation": "qualified_answer",
+                "trust": "inconclusive" if gap else "authoritative",
+                "safe_to_conclude_absent": False,
+                "degraded_signals": [FLAG] if gap else [],
+            },
             "_kin": {
                 "degraded": {FLAG: True} if gap else {},
                 OBSERVATION: {
                     "standing": "behind" if gap else "current",
                     "derives": 10,
                     "created_under": 9 if gap else 10,
-                },
-                "negative": {
-                    "interpretation": "qualified_answer",
-                    "trust": "inconclusive" if gap else "authoritative",
-                    "safe_to_conclude_absent": False,
-                    "degraded_signals": [FLAG] if gap else [],
                 },
                 "verdict": {
                     "state": "inconclusive" if gap else "certified",
@@ -1606,7 +1622,7 @@ def self_test():
     expect("verdict gap arm", verdict_problems(retrieval_payload(True), gap=True), [])
 
     still_trusted = retrieval_payload(True)
-    still_trusted["_kin"]["negative"]["trust"] = "authoritative"
+    still_trusted["negative"]["trust"] = "authoritative"
     rejects("verdict gap answering authoritative", verdict_problems(still_trusted, gap=True))
 
     still_certified = retrieval_payload(True)
@@ -1622,41 +1638,41 @@ def self_test():
     # it is the only input its own assertion can catch alone.
     def one_field(mutate):
         payload = retrieval_payload(True)
-        mutate(payload["_kin"])
+        mutate(payload)
         return payload
 
-    def set_state(envelope):
-        envelope["verdict"]["state"] = "certified"
+    def set_state(payload):
+        payload["_kin"]["verdict"]["state"] = "certified"
 
-    def set_safe(envelope):
-        envelope["verdict"]["safe_to_conclude_absent"] = True
+    def set_safe(payload):
+        payload["_kin"]["verdict"]["safe_to_conclude_absent"] = True
 
-    def set_gate(envelope):
-        envelope["verdict"]["inputs"]["absence_gate"] = "certified"
+    def set_gate(payload):
+        payload["_kin"]["verdict"]["inputs"]["absence_gate"] = "certified"
 
-    def set_negative_safe(envelope):
-        envelope["negative"]["safe_to_conclude_absent"] = True
+    def set_negative_safe(payload):
+        payload["negative"]["safe_to_conclude_absent"] = True
 
-    def set_interpretation(envelope):
-        envelope["negative"]["interpretation"] = "absent_as_indexed"
+    def set_interpretation(payload):
+        payload["negative"]["interpretation"] = "absent_as_indexed"
 
-    def set_bound(envelope):
-        envelope["completeness"]["bound"] = "exact"
+    def set_bound(payload):
+        payload["_kin"]["completeness"]["bound"] = "exact"
 
-    def set_counted(envelope):
-        envelope["completeness"]["counted"]["exact"] = True
+    def set_counted(payload):
+        payload["_kin"]["completeness"]["counted"]["exact"] = True
 
-    def drop_degraded_limit(envelope):
-        envelope["completeness"]["limits"] = ["verdict_inconclusive"]
+    def drop_degraded_limit(payload):
+        payload["_kin"]["completeness"]["limits"] = ["verdict_inconclusive"]
 
-    def drop_verdict_limit(envelope):
-        envelope["completeness"]["limits"] = ["degraded:%s" % FLAG]
+    def drop_verdict_limit(payload):
+        payload["_kin"]["completeness"]["limits"] = ["degraded:%s" % FLAG]
 
-    def drop_flag(envelope):
-        envelope["degraded"] = {}
+    def drop_flag(payload):
+        payload["_kin"]["degraded"] = {}
 
-    def drop_signal(envelope):
-        envelope["negative"]["degraded_signals"] = []
+    def drop_signal(payload):
+        payload["negative"]["degraded_signals"] = []
 
     for label, mutate in (
         ("verdict.state alone", set_state),
@@ -1682,7 +1698,7 @@ def self_test():
     rejects("verdict gap naming no limiting factor", verdict_problems(unblamed, gap=True))
 
     untrusted_current = retrieval_payload(False)
-    untrusted_current["_kin"]["negative"]["trust"] = "inconclusive"
+    untrusted_current["negative"]["trust"] = "inconclusive"
     rejects(
         "verdict current answering inconclusive trust",
         verdict_problems(untrusted_current, gap=False),
@@ -1712,7 +1728,7 @@ def self_test():
     rejects("verdict current flagged as degraded", verdict_problems(flagged_current, gap=False))
 
     signalled_current = retrieval_payload(False)
-    signalled_current["_kin"]["negative"]["degraded_signals"] = [FLAG]
+    signalled_current["negative"]["degraded_signals"] = [FLAG]
     rejects(
         "verdict current naming itself a degraded signal",
         verdict_problems(signalled_current, gap=False),
