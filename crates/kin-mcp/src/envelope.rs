@@ -607,9 +607,7 @@ impl GraphBehind {
             .get("untracked_observation_not_applicable")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if unadmitted_paths == 0
-            && (measured_age_seconds.is_some() || observation_not_applicable)
-        {
+        if unadmitted_paths == 0 && (measured_age_seconds.is_some() || observation_not_applicable) {
             return None;
         }
         let since = reconcile
@@ -3027,7 +3025,9 @@ mod tests {
         );
         assert_eq!(durability.live_only_entities, None);
         assert!(
-            durability.note.contains("nothing has measured this working copy"),
+            durability
+                .note
+                .contains("nothing has measured this working copy"),
             "{}",
             durability.note
         );
