@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (500 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (502 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -106,6 +106,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests |
+| `KIN_DAEMON_AUTH_TOKEN_PREVIOUS` | secret | *(unset)* | secret | a superseded daemon bearer token this process still accepts, so a credential rotation across several containers does not have to be atomic. Set it during a rotation window and unset it once /auth/rotation reports the superseded token is no longer carrying traffic. Setting it with KIN_DAEMON_AUTH_TOKEN unset, or to the same value, is refused at startup: neither is an overlap window and both would read as one |
 | `KIN_DAEMON_AUTO_EMBED` | bool | true | operational | let the daemon start background embedding on its own; set falsy to defer until an explicit embed request. Read by the daemon at process start, so it takes effect on the command that starts one; a command reaching an already-running daemon cannot change it and is warned that it diverged |
 | `KIN_DAEMON_BIN` | path | *(unset)* | operational | override path to the kin-daemon binary |
 | `KIN_DAEMON_BIND_HOST` | string | *(unset)* | operational | host/interface the daemon binds its HTTP endpoint to |
@@ -139,6 +140,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | --- | --- | --- | --- | --- |
 | `KIN_SUPERVISOR_ADOPT_DISABLE` | bool | false | operational | disable supervisor adoption of an existing daemon |
 | `KIN_SUPERVISOR_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated supervisor requests |
+| `KIN_SUPERVISOR_AUTH_TOKEN_PREVIOUS` | secret | *(unset)* | secret | a superseded supervisor bearer token this process still accepts, the supervisor counterpart of KIN_DAEMON_AUTH_TOKEN_PREVIOUS and subject to the same startup refusals |
 | `KIN_SUPERVISOR_BIND_HOST` | string | *(unset)* | operational | host/interface the supervisor binds to |
 | `KIN_SUPERVISOR_IDLE_TIMEOUT_SECS` | seconds>=0 | 3600 | operational | supervisor auto-shutdown idle period; 0 disables idle shutdown |
 | `KIN_SUPERVISOR_REAP_CPU` | bool | true | operational | enable the CPU-heuristic zombie reaper; set falsey to disable |

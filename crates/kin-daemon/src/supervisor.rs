@@ -956,7 +956,7 @@ fn auth_error(status: StatusCode, message: &str) -> Response {
 
 #[derive(Clone)]
 struct SupervisorAuthState {
-    auth_token: Option<String>,
+    tokens: crate::auth_rotation::RotationTokens,
 }
 
 #[derive(Clone)]
@@ -1008,11 +1008,10 @@ async fn supervisor_auth(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    if auth_state.auth_token.is_none() || is_public_route(request.uri().path()) {
+    if !auth_state.tokens.is_enforced() || is_public_route(request.uri().path()) {
         return next.run(request).await;
     }
 
-    let expected_token = auth_state.auth_token.as_deref().unwrap_or_default();
     let provided = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -1020,11 +1019,34 @@ async fn supervisor_auth(
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim);
 
-    if provided != Some(expected_token) {
-        return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    match auth_state.tokens.classify(provided) {
+        crate::auth_rotation::TokenVerdict::Rejected => {
+            return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
+        }
+        crate::auth_rotation::TokenVerdict::Previous => {
+            tracing::debug!(
+                path = %request.uri().path(),
+                "request authenticated on the superseded supervisor token"
+            );
+        }
+        crate::auth_rotation::TokenVerdict::Primary
+        | crate::auth_rotation::TokenVerdict::NotEnforced => {}
     }
 
     next.run(request).await
+}
+
+/// Whether a supervisor token rotation overlap window is open, and whether it
+/// is still carrying traffic. Mirrors `api::auth_rotation_status`.
+async fn auth_rotation_status(
+    Extension(tokens): Extension<crate::auth_rotation::RotationTokens>,
+) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "enforced": tokens.is_enforced(),
+        "overlap_open": tokens.overlap_open(),
+        "previous_accepted": tokens.previous_accepted_count(),
+        "previous_last_accepted_unix": tokens.previous_last_accepted_unix(),
+    }))
 }
 
 fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
@@ -1033,8 +1055,32 @@ fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// The variable carrying the token this supervisor primarily expects.
+pub(crate) const SUPERVISOR_AUTH_TOKEN_ENV: &str = "KIN_SUPERVISOR_AUTH_TOKEN";
+/// The variable carrying a superseded token still accepted during a rotation.
+pub(crate) const SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV: &str = "KIN_SUPERVISOR_AUTH_TOKEN_PREVIOUS";
+
 fn auth_token_from_env() -> Option<String> {
-    resolve_auth_token(std::env::var("KIN_SUPERVISOR_AUTH_TOKEN").ok())
+    resolve_auth_token(std::env::var(SUPERVISOR_AUTH_TOKEN_ENV).ok())
+}
+
+fn previous_auth_token_from_env() -> Option<String> {
+    resolve_auth_token(std::env::var(SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV).ok())
+}
+
+/// The token set this supervisor serves with, primary plus any superseded token.
+///
+/// Mirrors `api::resolve_serve_rotation_tokens`, including that the superseded
+/// token is environment-only with no on-disk fallback.
+fn resolve_serve_rotation_tokens(
+    dir: &Path,
+) -> Result<crate::auth_rotation::RotationTokens, crate::auth_rotation::RotationConfigError> {
+    crate::auth_rotation::RotationTokens::new(
+        resolve_serve_auth_token(dir),
+        previous_auth_token_from_env(),
+        SUPERVISOR_AUTH_TOKEN_ENV,
+        SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
+    )
 }
 
 /// Load the per-install supervisor loopback token, generating and persisting one
@@ -1110,6 +1156,23 @@ fn router_with_auth_and_shutdown(
     auth_token: Option<String>,
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Router {
+    // A single token is a closed rotation window. Every existing caller keeps
+    // this signature; only the serve path resolves a superseded token too.
+    let tokens = crate::auth_rotation::RotationTokens::new(
+        auth_token,
+        None,
+        SUPERVISOR_AUTH_TOKEN_ENV,
+        SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
+    )
+    .expect("a primary-only token set cannot be an invalid rotation configuration");
+    router_with_rotation_tokens(state, tokens, shutdown)
+}
+
+fn router_with_rotation_tokens(
+    state: Arc<SupervisorState>,
+    tokens: crate::auth_rotation::RotationTokens,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+) -> Router {
     let app = Router::new()
         .route("/health", get(health))
         .route("/readiness", get(readiness))
@@ -1120,10 +1183,14 @@ fn router_with_auth_and_shutdown(
         .route("/daemons/register", post(register_daemon))
         .route("/daemons/{repo_id}/heartbeat", post(heartbeat_daemon))
         .route("/daemons/{repo_id}", delete(deregister_daemon))
+        .route("/auth/rotation", get(auth_rotation_status))
         .with_state(state)
         .layer(Extension(SupervisorShutdownControl(shutdown)))
+        // The same set the guard holds, so the status route reports the counter
+        // the guard increments rather than a second copy that reads zero.
+        .layer(Extension(tokens.clone()))
         .layer(middleware::from_fn_with_state(
-            SupervisorAuthState { auth_token },
+            SupervisorAuthState { tokens },
             supervisor_auth,
         ))
         .layer(middleware::from_fn(validate_host_and_origin));
@@ -1347,8 +1414,10 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     // which rejects a non-loopback daemon bind that has no auth token. The
     // Host/Origin guard is always active; the token is the second layer for
     // non-browser local/LAN callers.
-    let auth_token = resolve_serve_auth_token(&supervisor_dir());
-    if !addr.ip().is_loopback() && auth_token.is_none() {
+    let tokens = resolve_serve_rotation_tokens(&supervisor_dir()).map_err(|error| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+    })?;
+    if !addr.ip().is_loopback() && !tokens.is_enforced() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "KIN_SUPERVISOR_AUTH_TOKEN (or KIN_SUPERVISOR_REQUIRE_TOKEN) is required when binding the supervisor to a non-loopback host",
@@ -1433,7 +1502,7 @@ pub async fn run_supervisor(port: u16, idle_timeout: Option<Duration>) -> std::i
     info!(port = bound_port, "kin supervisor listening");
     let result = axum::serve(
         listener,
-        router_with_auth_and_shutdown(state, auth_token, Some(shutdown_tx.clone())),
+        router_with_rotation_tokens(state, tokens, Some(shutdown_tx.clone())),
     )
     .with_graceful_shutdown(async move {
         while !*shutdown_rx.borrow() {
@@ -3679,6 +3748,87 @@ mod tests {
             *accepted_rx.borrow(),
             "matching identity did not request shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn an_open_supervisor_rotation_window_accepts_both_tokens_over_http() {
+        // The supervisor guard is a second copy of the daemon guard, and a
+        // second copy is only ever wrong in a way that looks like a passing
+        // run. Both are wired to one `auth_rotation` implementation now, and
+        // this proves the supervisor's wiring rather than assuming the shared
+        // type covers it.
+        let tokens = crate::auth_rotation::RotationTokens::new(
+            Some("current-token".to_string()),
+            Some("retired-token".to_string()),
+            SUPERVISOR_AUTH_TOKEN_ENV,
+            SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
+        )
+        .unwrap();
+        let app = router_with_rotation_tokens(
+            Arc::new(SupervisorState::new()),
+            tokens.clone(),
+            None,
+        );
+
+        for token in ["current-token", "retired-token"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::get("/repos")
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{token} should be accepted");
+        }
+        assert_eq!(tokens.previous_accepted_count(), 1);
+
+        let rejected = app
+            .clone()
+            .oneshot(
+                Request::get("/repos")
+                    .header("authorization", "Bearer neither-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(tokens.previous_accepted_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_supervisor_rotation_window_rejects_the_retired_token() {
+        let app = router_with_auth(
+            Arc::new(SupervisorState::new()),
+            Some("current-token".to_string()),
+        );
+        let retired = app
+            .oneshot(
+                Request::get("/repos")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(retired.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn the_supervisor_rotation_status_route_requires_a_token() {
+        let app = router_with_auth(
+            Arc::new(SupervisorState::new()),
+            Some("current-token".to_string()),
+        );
+        let anonymous = app
+            .oneshot(Request::get("/auth/rotation").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert!(!is_public_route("/auth/rotation"));
     }
 
     #[tokio::test]

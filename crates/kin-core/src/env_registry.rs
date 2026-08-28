@@ -192,7 +192,9 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
 
     // ---- secrets --------------------------------------------------------------
     EnvVarSpec { name: "KIN_DAEMON_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated daemon requests" },
+    EnvVarSpec { name: "KIN_DAEMON_AUTH_TOKEN_PREVIOUS", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "a superseded daemon bearer token this process still accepts, so a credential rotation across several containers does not have to be atomic. Set it during a rotation window and unset it once /auth/rotation reports the superseded token is no longer carrying traffic. Setting it with KIN_DAEMON_AUTH_TOKEN unset, or to the same value, is refused at startup: neither is an overlap window and both would read as one" },
     EnvVarSpec { name: "KIN_SUPERVISOR_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated supervisor requests" },
+    EnvVarSpec { name: "KIN_SUPERVISOR_AUTH_TOKEN_PREVIOUS", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "a superseded supervisor bearer token this process still accepts, the supervisor counterpart of KIN_DAEMON_AUTH_TOKEN_PREVIOUS and subject to the same startup refusals" },
     EnvVarSpec { name: "KIN_REGISTRY_CARGO_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "cargo registry auth token for publish" },
     EnvVarSpec { name: "KIN_REGISTRY_OCI_WRITE_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "OCI registry auth token for mutations" },
     EnvVarSpec { name: "KIN_REGISTRY_STARTUP_REPAIR", kind: Kind::Str, default: "1", sensitivity: Sensitivity::Operational, summary: "set 0/false to disable the cargo registry migrate-on-boot repair" },
