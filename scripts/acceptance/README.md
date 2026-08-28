@@ -38,7 +38,7 @@ reference line a caller reports must still carry the call when read against the
 file on disk, and an answer taken over a graph short of its own census must
 disclose that rather than presenting as clean. Each of the three runs its own
 control, and they share one experiment because the experiment is destructive.
-Check 22 covers FIR-2821. A function reached only through `from . import store`
+Check 23 covers FIR-2821. A function reached only through `from . import store`
 must first resolve as a graph entity with the expected incoming `main` call,
 then must not be listed, and the one function nothing calls must be listed. The
 v0.6.1 stranger's scan listed eleven live functions with no caveat at all while
