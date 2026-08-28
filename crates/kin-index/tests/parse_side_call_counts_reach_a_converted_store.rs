@@ -37,7 +37,11 @@ use kin_model::{
 
 /// The focal's file. Nothing here reaches outward, so it never joins its own
 /// family.
-const STORE_PY: &str = r#"def open_db():
+const STORE_PY: &str = r#"def audited(fn):
+    return fn
+
+
+def open_db():
     return {}
 
 
@@ -45,13 +49,19 @@ def note_body(db, note_id):
     return ""
 "#;
 
-/// A family file with no shortfall: two call sites, and the linker records an
-/// edge for both. The receiver call is what made the extractor withhold this
-/// file's count, and it is also an edge the graph holds.
+/// A family file with no shortfall: three call sites, and the linker records an
+/// edge for all three. The receiver call is what made the extractor withhold
+/// this file's count, and it is also an edge the graph holds.
+///
+/// The bare decorator is the third site and it is the sharp one. It produces a
+/// `Calls` relation and no `call` node, so a census counting only `call` nodes
+/// reports two against three edges, which is the shape that puts the stamped
+/// count BELOW the resolved edge count.
 const CLEAN_PY: &str = r#"from notepkg import store
-from notepkg.store import note_body
+from notepkg.store import audited, note_body
 
 
+@audited
 def summarize(note_id):
     db = store.open_db()
     return note_body(db, note_id)
@@ -68,6 +78,22 @@ def summarize_messy(note_id, handlers):
     db = store.open_db()
     body = note_body(db, note_id)
     return handlers["render"](body)
+"#;
+
+/// A file whose extraction is COMPLETE, so the old code measured it and stamped
+/// the relations it emitted. Every call site here became a relation, the callee
+/// of the one call is a bare imported name, and the decorator is bare, so
+/// nothing is unrepresentable and nothing sits where the walker cannot reach it.
+///
+/// This is the fixture the no-regression invariant needs and `CLEAN_PY` is not:
+/// `store.open_db()` leaves that file incomplete, so its count was withheld and
+/// the number it "always did" report is a number it never had.
+const MEASURED_PY: &str = r#"from notepkg.store import audited, note_body
+
+
+@audited
+def summarize_measured(db, note_id):
+    return note_body(db, note_id)
 "#;
 
 fn blob_hash() -> kin_blobs::Hash256 {
@@ -111,6 +137,15 @@ fn stamped_call_sites(entities: &[Entity], path: &str) -> Option<u64> {
     counts.into_iter().next().expect("one count")
 }
 
+/// Whether the parser recorded that it could not represent every call in the
+/// file, which is the state that made the old code withhold the count.
+fn extraction_was_incomplete(indexed: &kin_index::IndexedFile) -> bool {
+    indexed
+        .extracted_relations
+        .iter()
+        .any(kin_parser::is_call_extraction_incomplete_marker)
+}
+
 fn emitted_call_relations(indexed: &kin_index::IndexedFile) -> usize {
     indexed
         .extracted_relations
@@ -144,23 +179,72 @@ fn a_file_whose_callee_cannot_be_named_still_reports_every_call_site() {
     );
 }
 
-/// The control, and it is what keeps the change from being a blanket inflation.
-/// A file whose every call site became a relation reports exactly the number it
-/// always reported, so no reading that was already right moves.
+/// The two sides must agree about what a Python call site is, and the bare
+/// decorator is where they disagreed.
+///
+/// `@audited` produces a `Calls` relation and no `call` node. A census counting
+/// only `call` nodes reports two here against three emitted relations, so the
+/// stamped count lands BELOW the resolved edge count, the arrival gate floors
+/// that difference at zero, and it certifies an absence over a file holding a
+/// call site the graph never saw. That is a correct refusal turning into a
+/// wrong certification, so the equality below is the assertion rather than the
+/// tally beside it.
+///
+/// This file is NOT a measured-file control despite what its name suggests, and
+/// the parse-state assertion says so out loud: `store.open_db()` leaves
+/// extraction incomplete, so the old code withheld this file's count entirely
+/// and the number it "always did" report is a number it never had. The
+/// invariant about readings that were already right lives on `MEASURED_PY` in
+/// the test below.
 #[test]
 fn a_file_whose_calls_all_became_relations_reports_the_number_it_always_did() {
     let indexed = index("notepkg/clean.py", CLEAN_PY);
 
     let emitted = emitted_call_relations(&indexed);
     assert_eq!(
-        emitted, 2,
-        "the control fixture must emit both of its calls"
+        emitted, 3,
+        "the fixture must emit two calls and one decorator edge, or it is not testing the \
+         direction where the parsed count falls below the resolved one"
+    );
+    assert!(
+        extraction_was_incomplete(&indexed),
+        "this fixture is deliberately an INCOMPLETE file, so nothing reads it as evidence about \
+         the files the old code measured"
     );
     assert_eq!(
         stamped_call_sites(&indexed.entities, "notepkg/clean.py"),
         Some(emitted as u64),
-        "a file with nothing unrepresentable must report the relation count, or the census and \
-         the relations disagree where they must not"
+        "every call site the extractor emitted an edge for must be in the count, or the stamped \
+         number sits below the resolved edge count and the gate certifies over the difference"
+    );
+}
+
+/// The no-regression invariant, on a file that really was measured before.
+///
+/// The change rests on the claim that no reading which was already right moves,
+/// and that claim is only testable on a file whose extraction was COMPLETE,
+/// because those are the only files the old code stamped at all. Every call
+/// site here became a relation and nothing sits where the walker cannot reach
+/// it, so the old code stamped the relation count and the new code must stamp
+/// the same number.
+#[test]
+fn a_file_that_was_already_measured_reports_the_number_it_always_did() {
+    let indexed = index("notepkg/measured.py", MEASURED_PY);
+
+    assert!(
+        !extraction_was_incomplete(&indexed),
+        "the fixture must parse to a COMPLETE extraction, or it is not a file the old code \
+         measured and the invariant has no guard again"
+    );
+    let emitted = emitted_call_relations(&indexed);
+    assert_eq!(
+        emitted, 2,
+        "one call and one decorator edge, so a census missing either one is visible here"
+    );
+    assert_eq!(
+        stamped_call_sites(&indexed.entities, "notepkg/measured.py"),
+        Some(emitted as u64),
+        "a file the old code measured must report the same number it always did"
     );
 }
 
@@ -186,6 +270,35 @@ fn a_call_outside_every_function_body_is_still_a_call_site() {
     );
 }
 
+/// The other stamp site, which nothing else here reaches.
+///
+/// `IndexPipeline` stamps in two places: the content path every other test in
+/// this file drives, and the incremental edit-hint path `kin_reconcile` drives
+/// on every save. The two edits are byte-identical, so the code is right by
+/// inspection, but inspection is not a check: a regression at the hint site
+/// alone would survive this whole suite, and the mutation that removes the
+/// stamp cannot separate them because it edits the one function they share.
+#[test]
+fn the_incremental_edit_hint_path_stamps_the_same_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let file = root.join("notepkg").join("clean.py");
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, CLEAN_PY).unwrap();
+    let blob_store = BlobStore::new(root.join(".hint-cas")).unwrap();
+
+    let (indexed, _tree) = IndexPipeline::new()
+        .index_file_relative_with_hint(&file, &blob_store, root, None, None)
+        .expect("the hint path indexes the fixture");
+
+    assert_eq!(
+        stamped_call_sites(&indexed.entities, "notepkg/clean.py"),
+        Some(3),
+        "the incremental path must stamp the same count the content path does, or a file saved \
+         through reconcile carries a different parse side than the same file converted"
+    );
+}
+
 /// The join, over the path a brownfield repository actually takes. Every claim
 /// above is about one parse; this is about what a converted store holds, which
 /// is the surface `kin graph status` and `caller_arrival` read.
@@ -199,6 +312,7 @@ fn every_file_of_a_converted_history_carries_its_call_count() {
             ("notepkg/__init__.py", ""),
             ("notepkg/store.py", STORE_PY),
             ("notepkg/clean.py", CLEAN_PY),
+            ("notepkg/measured.py", MEASURED_PY),
             ("notepkg/messy.py", MESSY_PY),
         ],
     );
@@ -220,6 +334,7 @@ fn every_file_of_a_converted_history_carries_its_call_count() {
         vec![
             "notepkg/__init__.py".to_string(),
             "notepkg/clean.py".to_string(),
+            "notepkg/measured.py".to_string(),
             "notepkg/messy.py".to_string(),
             "notepkg/store.py".to_string(),
         ],
@@ -246,8 +361,14 @@ fn every_file_of_a_converted_history_carries_its_call_count() {
     );
     assert_eq!(
         stamped_call_sites(&repo.entities, "notepkg/clean.py"),
+        Some(3),
+        "and the file whose bare decorator produces an edge counts that site too, so the count \
+         never lands below the edges the graph holds for it"
+    );
+    assert_eq!(
+        stamped_call_sites(&repo.entities, "notepkg/measured.py"),
         Some(2),
-        "while the file with nothing unrepresentable is unchanged"
+        "while a file the old code already measured survives conversion with the same number"
     );
 }
 

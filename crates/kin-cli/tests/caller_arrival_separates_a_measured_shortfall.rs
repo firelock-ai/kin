@@ -31,7 +31,11 @@ use kin_model::{
     TransactionDelta, TreeDelta, TreeEntry,
 };
 
-const STORE_PY: &str = r#"def open_db():
+const STORE_PY: &str = r#"def audited(fn):
+    return fn
+
+
+def open_db():
     return {}
 
 
@@ -39,12 +43,19 @@ def note_body(db, note_id):
     return ""
 "#;
 
-/// Two call sites, and the linker records an edge for both. The receiver call
-/// is what made the extractor withhold this file's count.
+/// Three call sites, and the linker records an edge for all three. The receiver
+/// call is what made the extractor withhold this file's count.
+///
+/// The bare decorator is the third site and it is the one that decides this
+/// test. It produces a `Calls` relation and no `call` node, so a census counting
+/// only `call` nodes reports two against three edges here, the gate's shortfall
+/// floors at zero, and this file drops out of `unaccounted` while holding a site
+/// the graph never saw.
 const CLEAN_PY: &str = r#"from notepkg import store
-from notepkg.store import note_body
+from notepkg.store import audited, note_body
 
 
+@audited
 def summarize(note_id):
     db = store.open_db()
     return note_body(db, note_id)
@@ -65,9 +76,10 @@ def summarize_messy(note_id, handlers):
 /// The same family shape as `messy.py` with the unnameable call removed, so the
 /// control differs from the subject in exactly one call site.
 const SECOND_CLEAN_PY: &str = r#"from notepkg import store
-from notepkg.store import note_body
+from notepkg.store import audited, note_body
 
 
+@audited
 def summarize_again(note_id):
     db = store.open_db()
     return note_body(db, note_id)
@@ -156,6 +168,21 @@ fn focal(entities: &[Entity], name: &str, file: &str) -> Entity {
         .clone()
 }
 
+/// The parse-side count stamped on a file's entities, read the way every
+/// consumer reads it.
+fn stamped_call_sites(entities: &[Entity], file: &str) -> Option<u64> {
+    entities
+        .iter()
+        .filter(|entity| entity.file_origin.as_ref().is_some_and(|f| f.0 == file))
+        .find_map(|entity| {
+            entity
+                .metadata
+                .extra
+                .get(kin_parser::FILE_PARSED_CALL_SITES_KEY)
+                .and_then(serde_json::Value::as_u64)
+        })
+}
+
 /// Resolved `Calls` edges leaving one file, counted the way the gate counts
 /// them, so the fixture cannot drift into proving something else.
 fn resolved_call_edges(graph: &InMemoryGraph, entities: &[Entity], file: &str) -> u64 {
@@ -202,14 +229,28 @@ fn the_gate_names_only_the_family_file_holding_an_unresolved_call() {
     );
     assert_eq!(
         resolved_call_edges(&graph, &entities, "notepkg/clean.py"),
-        2,
-        "the control file's two calls must both become edges, or it is not a clean control"
+        3,
+        "the control file's two calls and its decorator must all become edges, or it is not a \
+         clean control"
     );
     assert_eq!(
         resolved_call_edges(&graph, &entities, "notepkg/messy.py"),
         2,
-        "and the subject file must resolve the same two, so the only difference between them \
-         is the call site that produced no relation"
+        "and the subject file must resolve its two, so the only difference between the two \
+         files is the call site that produced no relation"
+    );
+    // The shape the reviewer of this lane found, asserted where it bites, and
+    // deliberately NOT off `arrival.unaccounted`. A file whose parsed count
+    // falls below its resolved count is exactly the file the gate drops from
+    // that list, because `saturating_sub` floors the shortfall at zero, so an
+    // assertion ranging over the list cannot see the defect it is written for.
+    // The store is where it is visible.
+    assert_eq!(
+        stamped_call_sites(&entities, "notepkg/clean.py"),
+        Some(resolved_call_edges(&graph, &entities, "notepkg/clean.py")),
+        "a file whose every call site became an edge must report exactly as many sites as the \
+         graph holds edges for it; fewer means the gate floors the difference at zero and \
+         certifies over a call site the graph never saw"
     );
 
     assert_eq!(

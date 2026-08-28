@@ -994,8 +994,17 @@ fn classify(
         // `[resolved]` under a no-issues banner.
         None | Some(0) => ReferenceResolution::Unmeasured,
         Some(_) if resolved_call_edges == 0 => ReferenceResolution::NoneResolved,
-        Some(parsed) if resolved_call_edges < parsed => ReferenceResolution::PartiallyResolved,
-        Some(_) => ReferenceResolution::FullyResolved,
+        // Fully resolved is the claim that every parsed call site became an
+        // edge, and only an exact match says that. MORE edges than sites is not
+        // a stronger result, it is fan-out: one ambiguous call site binds
+        // several same-named targets under the linker's fanout cap, so the
+        // numerator counts edges the denominator never counted sites for and
+        // the ratio stops being coverage. Reading that as `[resolved]` is the
+        // same wrong word the zero-denominator case above produced, arrived at
+        // from the other side, and it became reachable for Python the moment
+        // the parse side started being measured at all.
+        Some(parsed) if resolved_call_edges == parsed => ReferenceResolution::FullyResolved,
+        Some(_) => ReferenceResolution::PartiallyResolved,
     }
 }
 
@@ -2028,6 +2037,49 @@ mod tests {
             resolution: ReferenceResolution::FullyResolved,
             reference_enrichment: enrichment,
         }
+    }
+
+    /// Fan-out can put more edges on the numerator than the denominator ever
+    /// counted sites for, and the word `resolved` must not follow it there.
+    ///
+    /// One ambiguous call site binds several same-named targets under the
+    /// linker's fanout cap, so `resolved > parsed` is a real state on a real
+    /// repository rather than a hypothetical. It became reachable for Python
+    /// the moment the parse side started being measured at all: before that,
+    /// the zero denominator held every Python row at `Unmeasured`. Reading it
+    /// as `FullyResolved` prints `[resolved]` and `100%` off a ratio that is no
+    /// longer coverage, which is the same wrong word the zero-denominator case
+    /// produced, arrived at from the other side.
+    #[test]
+    fn more_edges_than_sites_is_not_fully_resolved() {
+        assert_eq!(
+            classify(1, Some(4), 4),
+            ReferenceResolution::FullyResolved,
+            "an exact match is the only thing that says every parsed site became an edge"
+        );
+        assert_eq!(
+            classify(1, Some(4), 5),
+            ReferenceResolution::PartiallyResolved,
+            "more edges than sites is fan-out, not a stronger result, so the row must not claim \
+             the call side is fully resolved"
+        );
+        // The controls on either side of the new arm, so a fix that floors
+        // everything to partial is visible here rather than in a later ticket.
+        assert_eq!(
+            classify(1, Some(4), 3),
+            ReferenceResolution::PartiallyResolved,
+            "fewer edges than sites is still partial"
+        );
+        assert_eq!(
+            classify(1, Some(4), 0),
+            ReferenceResolution::NoneResolved,
+            "and no edges at all is still the state an absence cannot be concluded from"
+        );
+        assert_eq!(
+            classify(1, None, 5),
+            ReferenceResolution::Unmeasured,
+            "and an absent parse side is still unmeasured rather than resolved"
+        );
     }
 
     #[test]
