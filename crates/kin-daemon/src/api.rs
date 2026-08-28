@@ -23260,7 +23260,7 @@ mod tests {
         );
         state.install_hosted_durable_spine_for_test(Arc::new(
             kin_spine::FirestoreSpineBackend::with_store(Arc::new(
-                kin_spine::test_support::FakeSpineStore::default(),
+                kin_spine::test_support::FakeSpineStore::cold(),
             )),
         ));
         assert!(
