@@ -4418,7 +4418,9 @@ mod tests {
             }
             for _ in 0..3 {
                 let selected_heads = self.publication_state.lock().unwrap().heads.clone();
-                if let Some(barrier) = self.load_snapshot_barrier.lock().unwrap().take() {
+                // Same guard-lifetime rule as the cleanup rendezvous below.
+                let rendezvous = self.load_snapshot_barrier.lock().unwrap().take();
+                if let Some(barrier) = rendezvous {
                     barrier.wait("fake store hydration snapshot");
                     barrier.wait("fake store hydration snapshot");
                 }
@@ -4548,7 +4550,13 @@ mod tests {
                 )
             };
 
-            if let Some(barrier) = self.cleanup_snapshot_barrier.lock().unwrap().take() {
+            // Take the rendezvous out of the mutex BEFORE waiting. As an
+            // `if let` scrutinee the guard lives to the end of the block, so it
+            // was held across both waits, and the committing thread re-enters
+            // cleanup and blocks on this same mutex: a deadlock that an untimed
+            // Barrier turns into a permanent hang.
+            let rendezvous = self.cleanup_snapshot_barrier.lock().unwrap().take();
+            if let Some(barrier) = rendezvous {
                 barrier.wait("fake store cleanup snapshot");
                 barrier.wait("fake store cleanup snapshot");
             }
