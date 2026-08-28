@@ -1001,9 +1001,29 @@ impl SpineBackend for FirestoreSpineBackend {
             winner.entries,
             winner.outgoing_edges,
         )?;
-        if winner.head.publication_id != prepared.candidate_head().publication_id
-            && !matches!(&outcome, RepoPublicationCommit::Conflict(_))
-        {
+        // Reconcile in BOTH directions against the stable durable winner.
+        //
+        // The winner was just loaded under the head/rows/head fence, so its
+        // identity is the authority on what happened, not the CAS response. A
+        // winner that is not the candidate turns a reported success into a
+        // conflict. A winner that IS the candidate turns a reported conflict
+        // into an idempotent already-committed: the durable head holds exactly
+        // this publication, which is what already-committed means, and a
+        // publication id is a digest over the canonicalized publication alone,
+        // so equality here is content equality and nothing weaker.
+        //
+        // Only the first direction existed, so two writers racing identical
+        // content both did the right thing durably and the loser was told it
+        // had lost. The caller's contract is that a conflict names a different
+        // winner it must reconcile to; reporting one whose winner is the
+        // caller's own publication asks it to reconcile to itself.
+        if winner.head.publication_id == prepared.candidate_head().publication_id {
+            if matches!(&outcome, RepoPublicationCommit::Conflict(_)) {
+                outcome = RepoPublicationCommit::AlreadyCommitted {
+                    source_cursor: winner.head.source_cursor,
+                };
+            }
+        } else if !matches!(&outcome, RepoPublicationCommit::Conflict(_)) {
             outcome = RepoPublicationCommit::Conflict(
                 crate::publication::RepoPublicationConflict::against(
                     prepared.candidate_head().source_cursor,
