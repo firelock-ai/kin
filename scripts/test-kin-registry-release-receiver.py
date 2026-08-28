@@ -2119,7 +2119,7 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("base_sha=", resolve)
         self.assertIn('!= "$GITHUB_SHA"', early_resolve)
         self.assertIn('!= "$GITHUB_SHA"', resolve)
-        self.assertIn("ref: ${{ steps.base.outputs.base_sha }}", checkout)
+        self.assertIn("ref: ${{ github.sha }}", checkout)
         self.assertIn('!= "$GITHUB_SHA"', mutation_fence)
         self.assertIn("kin-registry-wave-artifact.py apply", admission)
         self.assertIn("branch: ${{ env.WAVE_BRANCH }}", writer)

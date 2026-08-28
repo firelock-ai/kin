@@ -73,10 +73,17 @@ jobs:
           fi
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
 
+      # github.sha, not steps.base.outputs.base_sha: the step above already
+      # refuses unless that computed value equals github.sha, so the checkout
+      # ref and the assertion target are the same commit either way. A
+      # step-output expression reads as attacker-influenceable to a static
+      # checker with no view of the shell assertion that pins it, so this
+      # checkout uses the literal trusted context value instead. CodeQL rule
+      # actions/cache-poisoning/poisonable-step named this exact expression.
       - name: Checkout exact policy for early disarm
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ steps.base.outputs.base_sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Refuse protected-main movement before early-disarm token mint
@@ -161,10 +168,14 @@ jobs:
           fi
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
 
+      # github.sha, not steps.base.outputs.base_sha: see the comment on the
+      # same substitution in disarm-wave above. The step directly above this
+      # one already refuses the job unless the computed value equals
+      # github.sha, so this checks out the same commit either way.
       - name: Checkout exact queued protected main
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ steps.base.outputs.base_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -360,10 +371,15 @@ jobs:
           fi
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
 
+      # github.sha, not steps.base.outputs.base_sha: see the comment on the
+      # same substitution in disarm-wave above. The step directly above this
+      # one already refuses the job unless the computed value equals both
+      # github.sha and prepare-wave's admitted base, so this checks out the
+      # same commit either way.
       - name: Checkout exact protected main for trusted mutation code
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ steps.base.outputs.base_sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
 
