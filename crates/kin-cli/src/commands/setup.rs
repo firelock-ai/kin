@@ -12903,6 +12903,23 @@ fn print_next_steps(
     println!("  kin setup doctor     -- run health checks (use --fix to repair)");
     println!("  kin setup ledger     -- show what setup wrote + verify it on disk");
     println!("  kin setup uninstall  -- remove exactly what setup wrote (ledger-verified)");
+    // Named here because this is the list a first run reads to the end. Cross-file
+    // reference edges are the answer Kin is sold on and they need a server per
+    // language, so a host missing one is owed the command rather than the
+    // discovery that `find_references` returns nothing.
+    let missing_servers = language_servers::missing_enrichable_languages();
+    if !missing_servers.is_empty() {
+        println!(
+            "  kin doctor --fix --install-language-servers  -- install the {} language \
+             server{} this host is missing, which is what cross-file reference edges need",
+            missing_servers
+                .iter()
+                .map(|language| language.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            if missing_servers.len() == 1 { "" } else { "s" }
+        );
+    }
 
     let configured_any = configured_assistants.iter().any(|(_, p)| p.is_some());
     if matches!(intent, SetupIntent::AgentOnly | SetupIntent::Advanced) && configured_any {
@@ -13230,11 +13247,18 @@ async fn apply_language_server_provisioning(
                 .join(", "),
             if missing.len() == 1 { "it" } else { "them" }
         );
-        for command in language_servers::install_commands_for(missing) {
+        // The ROUTE's command, not the recipe's. On a host with no rustup the
+        // recipe's line is `rustup component add rust-analyzer`, which is the
+        // exact sentence that ended a cold walkthrough on 2026-08-28: a reader
+        // who is not a Rust developer sees an instruction to install a
+        // toolchain and stops. What Kin would actually do here is fetch a
+        // pinned, checksummed release binary, and that is what has to be on the
+        // line.
+        for command in language_servers::route_commands_for(missing) {
             println!("      {command}");
         }
         println!(
-            "      or re-run with --install-language-servers to have Kin run {}",
+            "      or re-run with --install-language-servers to have Kin do {}",
             if missing.len() == 1 { "it" } else { "them" }
         );
         return ProvisioningOutcome::default();
@@ -13244,16 +13268,19 @@ async fn apply_language_server_provisioning(
         missing,
         consent,
         |recipe| recipe.installed(),
-        |recipe| recipe.installer_available(),
-        |recipe| {
+        language_servers::resolve_route,
+        |recipe, route| {
             println!();
             println!(
                 "  Kin can enrich {} with cross-file reference edges, but its language server is \
                  not installed.",
                 recipe.language
             );
-            println!("    Command:    {}", recipe.command_line());
-            println!("    This will:  {}", recipe.disclosure);
+            println!("    Command:    {}", recipe.route_command_line(route));
+            println!(
+                "    This will:  {}",
+                language_servers::route_disclosure(recipe, route)
+            );
             prompt_yn("  Install it now?", false, true)
         },
         language_servers::run_install,
@@ -13266,12 +13293,50 @@ async fn apply_language_server_provisioning(
         let recipe = language_servers::recipe_for(report.language);
         match report.outcome {
             InstallOutcome::AlreadyPresent => {}
-            InstallOutcome::Installed { command } => {
+            InstallOutcome::Installed { command, evidence } => {
                 installed_any = true;
                 applied.push(format!(
                     "installed the {} language server (`{command}`)",
                     report.language
                 ));
+                // What a run downloaded itself is shown, not summarised. A tick
+                // beside "installed" says nothing a reader can check; the URL,
+                // the digest Kin verified before writing anything, and the
+                // directory it landed in are all checkable in one command each.
+                for line in evidence {
+                    applied.push(format!("    {line}"));
+                }
+            }
+            // Its own arm, above `Failed`, because the two need different
+            // words. A network error is worth retrying and a digest that did
+            // not match never is: something served bytes that are not the ones
+            // Kin pins, and the only safe reading is that the install must not
+            // happen on this path today.
+            InstallOutcome::ChecksumRefused { command, reason } => {
+                println!(
+                    "  {} refused to install the {} language server: {reason}",
+                    style("✗").red(),
+                    report.language
+                );
+                unfinished.push(UnfinishedRepair {
+                    what: format!("install the {} language server", report.language),
+                    reason,
+                    remediation: vec![
+                        "Kin installed nothing. The bytes served are not the ones this build \
+                         pins, so either the download was corrupted in transit or something \
+                         between this host and the release is rewriting it."
+                            .to_string(),
+                        format!(
+                            "retry once; if it repeats, install the server yourself with `{}` \
+                             and run `kin daemon stop`",
+                            recipe
+                                .map(|recipe| recipe.command_line())
+                                .unwrap_or_else(|| command.clone())
+                        ),
+                        language_servers::WORKS_WITHOUT_LANGUAGE_SERVERS.to_string(),
+                    ],
+                    requested: true,
+                });
             }
             // A zero exit that left the binary unreachable is reported as the
             // gap it still is. Counting it as applied is how a closed-looking
@@ -13319,17 +13384,31 @@ async fn apply_language_server_provisioning(
                 style("-").dim(),
                 report.language
             ),
+            // Reached only when this host leaves NO route open: the recipe's
+            // installer is absent AND Kin's own fallback cannot serve it. For
+            // the npm recipes that means no Node at all, and Kin does not
+            // install a language runtime behind a user's back. For Rust it
+            // means a host Kin pins no release binary for.
             InstallOutcome::NoInstaller { program, command } => {
                 println!(
-                    "  {} `{program}` is not installed, so Kin cannot run `{command}` to \
-                     provision the {} language server",
+                    "  {} `{program}` is not installed and Kin has no other route to the {} \
+                     language server on this host, so it cannot run `{command}`",
                     style("✗").red(),
                     report.language
                 );
                 unfinished.push(UnfinishedRepair {
                     what: format!("install the {} language server", report.language),
-                    reason: format!("`{program}` is not installed on this host"),
-                    remediation: vec![format!("install `{program}`, then run `{command}`")],
+                    reason: format!(
+                        "`{program}` is not installed on this host, and Kin pins no {} release \
+                         binary for {}-{}",
+                        report.language,
+                        std::env::consts::OS,
+                        std::env::consts::ARCH
+                    ),
+                    remediation: vec![
+                        format!("install `{program}`, then run `{command}`"),
+                        language_servers::WORKS_WITHOUT_LANGUAGE_SERVERS.to_string(),
+                    ],
                     // Consent was never asked for here, so only the flag makes
                     // this a repair the operator requested.
                     requested: consent == InstallConsent::Granted,

@@ -29,6 +29,89 @@ use std::process::{Command, Stdio};
 
 use kin_model::LanguageId;
 
+use super::language_server_release::{self, PinnedRelease, RUST_ANALYZER_RELEASE};
+
+/// What Kin can do for a language whose named installer this host does not
+/// have, or cannot use.
+///
+/// The recipes name a package manager or a toolchain: `rustup` for Rust, `npm`
+/// for the rest. Both assumptions break on an ordinary machine, and they break
+/// differently. A developer who is not a Rust developer has no rustup at all,
+/// so the Rust row's only advice was to install a toolchain in order to read
+/// somebody else's code. A user running as themselves in a Node base image has
+/// npm, and its global prefix is owned by root, so the install cannot write
+/// where it would put the binary.
+///
+/// Neither of those is a reason to leave a repository with no reference edges,
+/// so each recipe carries the route Kin takes instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Fallback {
+    /// Kin fetches the project's own release binary, pinned to one tag and
+    /// verified against a digest recorded in Kin's source.
+    PinnedRelease(&'static PinnedRelease),
+    /// Kin re-runs the same installer against a prefix Kin owns, under
+    /// `KIN_HOME`, which needs no privilege and no shared directory.
+    ManagedPrefix,
+}
+
+/// Which of a recipe's routes one run takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InstallRoute {
+    /// The recipe's own installer, against its own default target. Preferred
+    /// wherever it works: a rustup component tracks the toolchain that compiles
+    /// the repository, and Kin's pinned copy does not.
+    Installer,
+    /// The pinned release binary Kin downloads and verifies itself.
+    PinnedRelease,
+    /// The recipe's installer, redirected at a prefix Kin owns.
+    ManagedPrefix,
+}
+
+/// What this host can offer one recipe, measured before a route is chosen.
+///
+/// Taken as data rather than probed inside [`choose_route`] so the rule is
+/// decidable with no host, no network and no subprocess. Every field is a fact
+/// somebody measured; none of them is a preference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HostRoutes {
+    /// The recipe's named program is on `PATH`.
+    pub(crate) installer_on_path: bool,
+    /// The installer's default target refuses this user, so running it would
+    /// spend the download and end in the installer's own permission trace.
+    pub(crate) default_target_blocked: bool,
+    /// Kin pins a release binary for this host's os and architecture.
+    pub(crate) pinned_release_for_this_host: bool,
+}
+
+/// Which route this host leaves open for a recipe, or `None` when it leaves
+/// none.
+///
+/// Ordered by what serves the operator best, not by what is easiest. The
+/// installer wins whenever it can actually run, because a server the operator's
+/// own toolchain manages is the one their toolchain expects. Kin's own routes
+/// are what a host without that toolchain gets instead of a refusal.
+pub(crate) fn choose_route(
+    recipe: &LanguageServerRecipe,
+    host: HostRoutes,
+) -> Option<InstallRoute> {
+    if host.installer_on_path && !host.default_target_blocked {
+        return Some(InstallRoute::Installer);
+    }
+    match recipe.fallback {
+        // A pinned release needs nothing from this host but a network, so it
+        // serves both the no-installer case and the blocked-target one.
+        Fallback::PinnedRelease(_) if host.pinned_release_for_this_host => {
+            Some(InstallRoute::PinnedRelease)
+        }
+        // A managed prefix is the same installer pointed somewhere else, so it
+        // answers a blocked target and cannot answer a missing installer. npm
+        // absent means Node absent, and Kin does not install a language
+        // runtime behind a user's back.
+        Fallback::ManagedPrefix if host.installer_on_path => Some(InstallRoute::ManagedPrefix),
+        _ => None,
+    }
+}
+
 /// How to install the language server for one language.
 ///
 /// `binaries` mirrors `kin_lsp::discovery::KNOWN_SERVERS` for the same
@@ -41,6 +124,8 @@ pub(crate) struct LanguageServerRecipe {
     pub(crate) binaries: &'static [&'static str],
     pub(crate) program: &'static str,
     pub(crate) args: &'static [&'static str],
+    /// What Kin does when [`Self::program`] cannot serve this host.
+    pub(crate) fallback: Fallback,
     /// What the operator is spending by saying yes. Named per recipe rather
     /// than as one sentence, because "this downloads a package" is exactly the
     /// disclosure that reads as boilerplate and gets clicked through.
@@ -72,6 +157,76 @@ impl LanguageServerRecipe {
     pub(crate) fn installer_available(&self) -> bool {
         which::which(self.program).is_ok()
     }
+
+    /// The arguments for the same installer pointed at a prefix Kin owns.
+    ///
+    /// `-g` is dropped and `--prefix` inserted, which turns a global install
+    /// into a local one rooted where Kin can always write. The package
+    /// arguments are untouched, pin included, because the whole hazard the
+    /// TypeScript pin exists for is a copy that quietly drops it.
+    pub(crate) fn managed_prefix_args(&self, prefix: &Path) -> Vec<String> {
+        let mut args: Vec<String> = vec!["install".to_string()];
+        args.push("--prefix".to_string());
+        args.push(prefix.display().to_string());
+        for arg in self.args {
+            if matches!(*arg, "install" | "-g" | "--global") {
+                continue;
+            }
+            args.push((*arg).to_string());
+        }
+        args
+    }
+
+    /// What one route does, as a line an operator reads back.
+    ///
+    /// This is the string every report row quotes, and the key `provision`
+    /// deduplicates on, so two languages served by one route still ask once and
+    /// run once.
+    pub(crate) fn route_command_line(&self, route: InstallRoute) -> String {
+        match route {
+            InstallRoute::Installer => self.command_line(),
+            InstallRoute::ManagedPrefix => format!(
+                "{} {}",
+                self.program,
+                self.managed_prefix_args(&kin_core::tool_prefix::managed_node_prefix())
+                    .join(" ")
+            ),
+            InstallRoute::PinnedRelease => match self.fallback {
+                Fallback::PinnedRelease(release) => format!(
+                    "download {} {} from the {} release binaries",
+                    release.binary, release.tag, release.project
+                ),
+                // Unreachable through `choose_route`, which only returns this
+                // route for a recipe whose fallback is a pinned release. Stated
+                // rather than panicked, because a report row is not worth an
+                // abort.
+                Fallback::ManagedPrefix => self.command_line(),
+            },
+        }
+    }
+}
+
+/// What this host leaves open for a recipe, measured against the live machine.
+///
+/// The probe half of [`choose_route`], kept apart from the rule so the rule
+/// stays decidable without a host. `default_target_blocked` costs an `npm
+/// config get prefix` subprocess for the npm recipes and nothing for the rest.
+pub(crate) fn resolve_host_routes(recipe: &LanguageServerRecipe) -> HostRoutes {
+    let installer_on_path = recipe.installer_available();
+    HostRoutes {
+        installer_on_path,
+        default_target_blocked: installer_on_path && install_blocker(recipe).is_some(),
+        pinned_release_for_this_host: match recipe.fallback {
+            Fallback::PinnedRelease(release) => language_server_release::host_target()
+                .is_some_and(|target| release.asset_for(target).is_some()),
+            Fallback::ManagedPrefix => false,
+        },
+    }
+}
+
+/// The route this host leaves open for a recipe, probing the machine.
+pub(crate) fn resolve_route(recipe: &LanguageServerRecipe) -> Option<InstallRoute> {
+    choose_route(recipe, resolve_host_routes(recipe))
 }
 
 /// The typescript package `typescript-language-server` is installed beside.
@@ -101,6 +256,7 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
         binaries: &["rust-analyzer"],
         program: "rustup",
         args: &["component", "add", "rust-analyzer"],
+        fallback: Fallback::PinnedRelease(&RUST_ANALYZER_RELEASE),
         disclosure: "adds a rustup component to the active toolchain",
     },
     LanguageServerRecipe {
@@ -108,6 +264,7 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
         binaries: &["pyright-langserver", "pylsp"],
         program: "npm",
         args: &["install", "-g", "pyright"],
+        fallback: Fallback::ManagedPrefix,
         disclosure: "downloads the pyright npm package into your global npm prefix",
     },
     LanguageServerRecipe {
@@ -120,6 +277,7 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
             "typescript-language-server",
             TYPESCRIPT_PACKAGE,
         ],
+        fallback: Fallback::ManagedPrefix,
         disclosure: "downloads the typescript-language-server and typescript npm packages into \
                      your global npm prefix",
     },
@@ -133,6 +291,7 @@ pub(crate) const LANGUAGE_SERVERS: &[LanguageServerRecipe] = &[
             "typescript-language-server",
             TYPESCRIPT_PACKAGE,
         ],
+        fallback: Fallback::ManagedPrefix,
         disclosure: "downloads the typescript-language-server and typescript npm packages into \
                      your global npm prefix",
     },
@@ -229,6 +388,35 @@ pub(crate) fn install_commands_for_names(names: &[&str]) -> Vec<String> {
     seen
 }
 
+/// What Kin would actually do for each missing language on THIS host,
+/// deduplicated.
+///
+/// The sibling of [`install_commands_for`], and the one to print at a person.
+/// That function answers "what does this recipe say", which is the right answer
+/// for a doc and the wrong one at a terminal: on a host with no rustup it prints
+/// `rustup component add rust-analyzer`, an instruction to install a toolchain
+/// in order to read somebody else's code. This one probes the host and prints
+/// the route Kin has, which on that host is a pinned download.
+pub(crate) fn route_commands_for(missing: &[LanguageId]) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for language in missing {
+        let Some(recipe) = recipe_for(*language) else {
+            continue;
+        };
+        let command = match resolve_route(recipe) {
+            Some(route) => recipe.route_command_line(route),
+            // No route at all. The recipe's own command is still the honest
+            // thing to print, because installing what it names is exactly what
+            // would open one.
+            None => recipe.command_line(),
+        };
+        if !seen.contains(&command) {
+            seen.push(command);
+        }
+    }
+    seen
+}
+
 /// The fix line for a set of languages whose servers are missing.
 ///
 /// Names the command rather than describing it. A row that says "install a
@@ -251,6 +439,38 @@ pub(crate) fn install_fix_line(missing_names: &[&str]) -> String {
             .collect::<Vec<_>>()
             .join(" and "),
     )
+}
+
+/// What the operator is spending by saying yes to one ROUTE.
+///
+/// The recipe's own `disclosure` describes its installer, and it is the wrong
+/// sentence for two of the three routes. "Adds a rustup component to the active
+/// toolchain" is not what a pinned download does, and a person consenting to a
+/// network fetch of a binary from a project's releases is owed the tag, the
+/// digest and the directory rather than a sentence about a toolchain they do
+/// not have.
+pub(crate) fn route_disclosure(recipe: &LanguageServerRecipe, route: InstallRoute) -> String {
+    match route {
+        InstallRoute::Installer => recipe.disclosure.to_string(),
+        InstallRoute::ManagedPrefix => format!(
+            "runs the same install against {}, a prefix Kin owns under KIN_HOME, because this \
+             host's global npm prefix refuses this user",
+            kin_core::tool_prefix::managed_node_prefix().display()
+        ),
+        InstallRoute::PinnedRelease => match recipe.fallback {
+            Fallback::PinnedRelease(release) => format!(
+                "downloads {} {} from the {} release binaries, checks it against a sha256 \
+                 recorded in Kin's own source, and installs it into {}. Your toolchain is not \
+                 touched, and this route is taken because `{}` is not on this host.",
+                release.binary,
+                release.tag,
+                release.project,
+                kin_core::tool_prefix::managed_tool_bin_dir().display(),
+                recipe.program,
+            ),
+            Fallback::ManagedPrefix => recipe.disclosure.to_string(),
+        },
+    }
 }
 
 /// Whether Kin may install a language server, and on whose say-so.
@@ -281,13 +501,35 @@ impl InstallConsent {
     }
 }
 
+/// Why one install could not be completed, separated by what a reader has to
+/// do about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstallProblem {
+    /// The installer ran, or the download was attempted, and it did not work.
+    Failed { reason: String },
+    /// Bytes arrived and are not the bytes Kin pins. Its own variant because it
+    /// is the one failure that is never worth retrying and never the network's
+    /// fault, and because a reader must not read it as a flaky download.
+    ChecksumMismatch { reason: String },
+}
+
 /// What happened to one language's server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum InstallOutcome {
     /// A binary for this language was already on `PATH`.
     AlreadyPresent,
     /// The install command ran and the binary is now on `PATH`.
-    Installed { command: String },
+    ///
+    /// `evidence` is what the run can show for it: for a download Kin performed
+    /// itself, the URL the bytes came from and the digest verified before they
+    /// were written. Empty for a route where the disclosure belongs to the
+    /// installer, which printed its own output live.
+    Installed {
+        command: String,
+        evidence: Vec<String>,
+    },
+    /// Bytes were served and refused. Nothing was installed.
+    ChecksumRefused { command: String, reason: String },
     /// The install command ran and the binary is still not on `PATH`. Reported
     /// rather than assumed installed: a zero exit from a package manager that
     /// wrote to a prefix outside `PATH` is the failure that reads as success.
@@ -316,28 +558,33 @@ pub(crate) struct InstallReport {
 /// which is a green test that has stopped checking its own subject. As written,
 /// a test states the whole environment it is asserting against.
 ///
+/// `route` reports which of a recipe's routes this host leaves open, and `None`
+/// is the state that used to be the only answer for a host with no installer.
+/// `ask` and `run` both take the route, because the disclosure and the work
+/// differ by it: consenting to a rustup component and consenting to a download
+/// from a release Kin pins are not the same consent.
+///
 /// `ask` is called at most once per distinct command, so consenting to
 /// TypeScript does not produce a second prompt for JavaScript.
 pub(crate) fn provision(
     missing: &[LanguageId],
     consent: InstallConsent,
     mut installed: impl FnMut(&LanguageServerRecipe) -> bool,
-    mut installer_available: impl FnMut(&LanguageServerRecipe) -> bool,
-    mut ask: impl FnMut(&LanguageServerRecipe) -> bool,
-    mut run: impl FnMut(&LanguageServerRecipe) -> Result<(), String>,
+    mut route: impl FnMut(&LanguageServerRecipe) -> Option<InstallRoute>,
+    mut ask: impl FnMut(&LanguageServerRecipe, InstallRoute) -> bool,
+    mut run: impl FnMut(&LanguageServerRecipe, InstallRoute) -> Result<Vec<String>, InstallProblem>,
 ) -> Vec<InstallReport> {
     let mut reports = Vec::new();
     // Keyed on the command rather than the language: one npm install serves
     // both JavaScript and TypeScript, and running it twice would download the
     // same package again and ask twice for one decision.
     let mut decided: Vec<(String, bool)> = Vec::new();
-    let mut ran: Vec<(String, Result<(), String>)> = Vec::new();
+    let mut ran: Vec<(String, Result<Vec<String>, InstallProblem>)> = Vec::new();
 
     for language in missing {
         let Some(recipe) = recipe_for(*language) else {
             continue;
         };
-        let command = recipe.command_line();
 
         if installed(recipe) {
             reports.push(InstallReport {
@@ -347,16 +594,17 @@ pub(crate) fn provision(
             continue;
         }
 
-        if !installer_available(recipe) {
+        let Some(chosen) = route(recipe) else {
             reports.push(InstallReport {
                 language: *language,
                 outcome: InstallOutcome::NoInstaller {
                     program: recipe.program.to_string(),
-                    command,
+                    command: recipe.command_line(),
                 },
             });
             continue;
-        }
+        };
+        let command = recipe.route_command_line(chosen);
 
         let approved = match consent {
             InstallConsent::Granted => true,
@@ -364,7 +612,7 @@ pub(crate) fn provision(
             InstallConsent::Ask => match decided.iter().find(|(cmd, _)| cmd == &command) {
                 Some((_, answer)) => *answer,
                 None => {
-                    let answer = ask(recipe);
+                    let answer = ask(recipe, chosen);
                     decided.push((command.clone(), answer));
                     answer
                 }
@@ -382,20 +630,23 @@ pub(crate) fn provision(
         let result = match ran.iter().find(|(cmd, _)| cmd == &command) {
             Some((_, result)) => result.clone(),
             None => {
-                let result = run(recipe);
+                let result = run(recipe, chosen);
                 ran.push((command.clone(), result.clone()));
                 result
             }
         };
 
         let outcome = match result {
-            Err(reason) => InstallOutcome::Failed { command, reason },
+            Err(InstallProblem::ChecksumMismatch { reason }) => {
+                InstallOutcome::ChecksumRefused { command, reason }
+            }
+            Err(InstallProblem::Failed { reason }) => InstallOutcome::Failed { command, reason },
             // Re-probe `PATH` rather than trusting the exit code. A global npm
             // prefix outside `PATH` installs successfully and leaves the binary
             // unreachable, which is the shape of success that would let doctor
             // report a closed gap that is still open.
-            Ok(()) if installed(recipe) => InstallOutcome::Installed { command },
-            Ok(()) => InstallOutcome::RanButStillMissing { command },
+            Ok(evidence) if installed(recipe) => InstallOutcome::Installed { command, evidence },
+            Ok(_) => InstallOutcome::RanButStillMissing { command },
         };
         reports.push(InstallReport {
             language: *language,
@@ -787,25 +1038,112 @@ pub(crate) fn unreachable_after_install_remediation(recipe: &LanguageServerRecip
     )]
 }
 
-/// Run a recipe's install command, streaming the installer's own output.
+/// Perform one recipe's install along the route this host left open.
 ///
-/// Two things happen here that a bare `status()` cannot do. The prefix is
-/// checked before the command runs, because `npm install -g` against a prefix
-/// this user cannot write ends in an EACCES trace that is npm's diagnostic
-/// rather than Kin's, and Kin can know the answer without spending the attempt.
-/// And stderr is teed rather than inherited, so the operator still reads the
-/// installer live while a failure keeps the installer's own words for the
-/// report at the end: a reason that says only "exited with 243" sends someone
-/// back to scroll a terminal for the cause (FIR-2547).
-pub(crate) fn run_install(recipe: &LanguageServerRecipe) -> Result<(), String> {
-    if let Some(blocker) = install_blocker(recipe) {
-        return Err(blocker);
+/// Three routes, one contract: the returned lines are what the run can SHOW for
+/// what it did, and an error is either an ordinary failure or a digest that did
+/// not match. Nothing here reports success it did not verify; `provision`
+/// re-probes `PATH` afterwards either way, because a package manager that
+/// wrote to a prefix nothing reads exits zero.
+pub(crate) fn run_install(
+    recipe: &LanguageServerRecipe,
+    route: InstallRoute,
+) -> Result<Vec<String>, InstallProblem> {
+    match route {
+        InstallRoute::Installer => {
+            if let Some(blocker) = install_blocker(recipe) {
+                return Err(InstallProblem::Failed { reason: blocker });
+            }
+            run_program(
+                recipe,
+                recipe.program,
+                &recipe
+                    .args
+                    .iter()
+                    .map(|a| (*a).to_string())
+                    .collect::<Vec<_>>(),
+                &recipe.command_line(),
+            )
+            .map(|()| Vec::new())
+        }
+        InstallRoute::ManagedPrefix => {
+            let prefix = kin_core::tool_prefix::managed_node_prefix();
+            std::fs::create_dir_all(&prefix).map_err(|error| InstallProblem::Failed {
+                reason: format!("could not create {}: {error}", prefix.display()),
+            })?;
+            let args = recipe.managed_prefix_args(&prefix);
+            let command = recipe.route_command_line(route);
+            run_program(recipe, recipe.program, &args, &command).map(|()| {
+                vec![
+                    format!("source:   {}, integrity checked by npm", recipe.program),
+                    format!(
+                        "installed to: {}",
+                        kin_core::tool_prefix::managed_node_bin_dir().display()
+                    ),
+                ]
+            })
+        }
+        InstallRoute::PinnedRelease => {
+            let Fallback::PinnedRelease(release) = recipe.fallback else {
+                return Err(InstallProblem::Failed {
+                    reason: format!(
+                        "{}: no pinned release binary is recorded for this language",
+                        recipe.language
+                    ),
+                });
+            };
+            let bin_dir = kin_core::tool_prefix::managed_tool_bin_dir();
+            let target = language_server_release::host_target();
+            let Some(asset) = target.and_then(|target| release.asset_for(target)) else {
+                return Err(InstallProblem::Failed {
+                    reason: language_server_release::InstallFailure::UnsupportedHost {
+                        target: format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                    }
+                    .reason(),
+                });
+            };
+            let (base, expected) = language_server_release::resolve_source_from_env(release, asset);
+            match language_server_release::install_pinned_release(
+                release, target, &bin_dir, &base, &expected,
+            ) {
+                Ok(install) => Ok(install.evidence_lines()),
+                Err(failure @ language_server_release::InstallFailure::ChecksumMismatch { .. }) => {
+                    Err(InstallProblem::ChecksumMismatch {
+                        reason: failure.reason(),
+                    })
+                }
+                Err(failure) => Err(InstallProblem::Failed {
+                    reason: failure.reason(),
+                }),
+            }
+        }
     }
-    let mut child = Command::new(recipe.program)
-        .args(recipe.args)
+}
+
+/// Run one installer, streaming its own output and keeping its words on a
+/// failure.
+///
+/// Two things happen here that a bare `status()` cannot do. Stderr is teed
+/// rather than inherited, so the operator still reads the installer live while
+/// a failure keeps the installer's own words for the report at the end: a
+/// reason that says only "exited with 243" sends someone back to scroll a
+/// terminal for the cause (FIR-2547). And the command as an operator would type
+/// it is passed in rather than recomposed, so a redirected install reports the
+/// command that actually ran.
+fn run_program(
+    recipe: &LanguageServerRecipe,
+    program: &str,
+    args: &[String],
+    command_line: &str,
+) -> Result<(), InstallProblem> {
+    let _ = recipe;
+    let mut child = Command::new(program)
+        .args(args)
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("could not run `{}`: {error}", recipe.command_line()))?;
+        .map_err(|error| InstallProblem::Failed {
+            reason: format!("could not run `{command_line}`: {error}"),
+        })?;
     let mut stderr_lines: Vec<String> = Vec::new();
     if let Some(stderr) = child.stderr.take() {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
@@ -822,17 +1160,15 @@ pub(crate) fn run_install(recipe: &LanguageServerRecipe) -> Result<(), String> {
             }
         }
     }
-    let status = child
-        .wait()
-        .map_err(|error| format!("could not wait for `{}`: {error}", recipe.command_line()))?;
+    let status = child.wait().map_err(|error| InstallProblem::Failed {
+        reason: format!("could not wait for `{command_line}`: {error}"),
+    })?;
     if status.success() {
         Ok(())
     } else {
-        Err(installer_failure_reason(
-            &recipe.command_line(),
-            status.code(),
-            &stderr_lines,
-        ))
+        Err(InstallProblem::Failed {
+            reason: installer_failure_reason(command_line, status.code(), &stderr_lines),
+        })
     }
 }
 
@@ -1292,8 +1628,11 @@ mod tests {
     fn nothing_installed(_: &LanguageServerRecipe) -> bool {
         false
     }
-    fn installer_present(_: &LanguageServerRecipe) -> bool {
-        true
+    fn installer_present(_: &LanguageServerRecipe) -> Option<InstallRoute> {
+        Some(InstallRoute::Installer)
+    }
+    fn no_route(_: &LanguageServerRecipe) -> Option<InstallRoute> {
+        None
     }
 
     /// The whole point of the consent model: nothing runs unless someone said so.
@@ -1305,10 +1644,10 @@ mod tests {
             InstallConsent::Withheld,
             nothing_installed,
             installer_present,
-            |_| panic!("must not prompt when consent is withheld"),
-            |_| {
+            |_, _| panic!("must not prompt when consent is withheld"),
+            |_, _| {
                 runs += 1;
-                Ok(())
+                Ok(Vec::new())
             },
         );
         assert_eq!(runs, 0, "an install ran without consent");
@@ -1328,10 +1667,10 @@ mod tests {
             InstallConsent::Ask,
             nothing_installed,
             installer_present,
-            |_| false,
-            |_| {
+            |_, _| false,
+            |_, _| {
                 runs += 1;
-                Ok(())
+                Ok(Vec::new())
             },
         );
         assert_eq!(runs, 0);
@@ -1353,13 +1692,13 @@ mod tests {
             InstallConsent::Ask,
             nothing_installed,
             installer_present,
-            |_| {
+            |_, _| {
                 prompts += 1;
                 true
             },
-            |_| {
+            |_, _| {
                 runs += 1;
-                Ok(())
+                Ok(Vec::new())
             },
         );
         assert_eq!(prompts, 1, "one install command must ask exactly once");
@@ -1383,10 +1722,10 @@ mod tests {
             InstallConsent::Granted,
             |_| ran.get(),
             installer_present,
-            |_| panic!("granted consent must not prompt"),
-            |_| {
+            |_, _| panic!("granted consent must not prompt"),
+            |_, _| {
                 ran.set(true);
-                Ok(())
+                Ok(Vec::new())
             },
         );
         assert!(ran.get(), "the install command never ran");
@@ -1416,8 +1755,8 @@ mod tests {
             InstallConsent::Granted,
             nothing_installed,
             installer_present,
-            |_| true,
-            |_| Ok(()),
+            |_, _| true,
+            |_, _| Ok(Vec::new()),
         );
         assert!(
             matches!(
@@ -1435,8 +1774,12 @@ mod tests {
             InstallConsent::Granted,
             nothing_installed,
             installer_present,
-            |_| true,
-            |_| Err("network unreachable".to_string()),
+            |_, _| true,
+            |_, _| {
+                Err(InstallProblem::Failed {
+                    reason: "network unreachable".to_string(),
+                })
+            },
         );
         match reports.first().map(|r| &r.outcome) {
             Some(InstallOutcome::Failed { reason, command }) => {
@@ -1456,11 +1799,11 @@ mod tests {
             &[LanguageId::Python],
             InstallConsent::Granted,
             nothing_installed,
-            |_| false,
-            |_| panic!("must not prompt when the installer is absent"),
-            |_| {
+            no_route,
+            |_, _| panic!("must not prompt when no route is open"),
+            |_, _| {
                 runs += 1;
-                Ok(())
+                Ok(Vec::new())
             },
         );
         assert_eq!(runs, 0);
@@ -1483,10 +1826,10 @@ mod tests {
             InstallConsent::Granted,
             |_| true,
             installer_present,
-            |_| panic!("must not prompt for something already installed"),
-            |_| {
+            |_, _| panic!("must not prompt for something already installed"),
+            |_, _| {
                 runs += 1;
-                Ok(())
+                Ok(Vec::new())
             },
         );
         assert_eq!(runs, 0);
@@ -1495,6 +1838,275 @@ mod tests {
                 .iter()
                 .all(|r| r.outcome == InstallOutcome::AlreadyPresent),
             "{reports:?}"
+        );
+    }
+
+    // ---- route selection --------------------------------------------------
+
+    fn host(installer: bool, blocked: bool, pinned: bool) -> HostRoutes {
+        HostRoutes {
+            installer_on_path: installer,
+            default_target_blocked: blocked,
+            pinned_release_for_this_host: pinned,
+        }
+    }
+
+    /// The host the cold walkthrough measured: node and npm present, no rustup.
+    ///
+    /// This is the finding, stated as a test. On 2026-08-28 a stranger followed
+    /// the documented install on exactly this host and `kin doctor --fix
+    /// --install-language-servers` exited 1 with "'rustup' is not installed on
+    /// this host", leaving a Rust repository at `imports 0/1085 (0%)`. Rust must
+    /// now route to the pinned release, and the npm-served languages must keep
+    /// the installer they already had, because changing those would be a
+    /// regression dressed as a fix.
+    #[test]
+    fn a_host_with_npm_and_no_rustup_gets_every_language_a_route() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        assert_eq!(
+            choose_route(rust, host(false, false, true)),
+            Some(InstallRoute::PinnedRelease),
+            "a host with no rustup must still get a Rust language server"
+        );
+        for language in [
+            LanguageId::Python,
+            LanguageId::TypeScript,
+            LanguageId::JavaScript,
+        ] {
+            let recipe = recipe_for(language).expect("recipe must exist");
+            assert_eq!(
+                choose_route(recipe, host(true, false, false)),
+                Some(InstallRoute::Installer),
+                "{language}: a working npm must keep its own route"
+            );
+        }
+    }
+
+    /// rustup wins wherever it exists.
+    ///
+    /// The direction matters as much as the fallback. A rustup component tracks
+    /// the toolchain that compiles the repository and Kin's pinned copy does
+    /// not, so a host that has rustup must never be quietly moved onto Kin's
+    /// download.
+    #[test]
+    fn the_recipes_own_installer_outranks_kins_fallback() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        assert_eq!(
+            choose_route(rust, host(true, false, true)),
+            Some(InstallRoute::Installer),
+            "a host with rustup must get the rustup component"
+        );
+    }
+
+    /// An npm whose global prefix refuses this user is redirected, not refused.
+    ///
+    /// The container case: a Node base image sets the global prefix to
+    /// `/usr/local`, whose `lib/node_modules` is owned by root. Before this
+    /// route the install was correctly refused before it spent the download,
+    /// and correctly refused is still no language server.
+    #[test]
+    fn a_blocked_npm_prefix_routes_to_a_prefix_kin_owns() {
+        for language in [
+            LanguageId::Python,
+            LanguageId::TypeScript,
+            LanguageId::JavaScript,
+        ] {
+            let recipe = recipe_for(language).expect("recipe must exist");
+            assert_eq!(
+                choose_route(recipe, host(true, true, false)),
+                Some(InstallRoute::ManagedPrefix),
+                "{language}: a prefix this user cannot write must not end the attempt"
+            );
+        }
+    }
+
+    /// A blocked rustup falls to the pinned release rather than to nothing.
+    #[test]
+    fn a_blocked_rust_installer_still_reaches_the_pinned_release() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        assert_eq!(
+            choose_route(rust, host(true, true, true)),
+            Some(InstallRoute::PinnedRelease)
+        );
+    }
+
+    /// The cases that genuinely leave no route, so the refusal is still real.
+    ///
+    /// A rule that always answers `Some` is a rule that has stopped deciding.
+    /// Two hosts must still come back with nothing: a Rust host Kin pins no
+    /// binary for, and a machine with no Node at all, where the only honest
+    /// move is to say so rather than install a language runtime unasked.
+    #[test]
+    fn a_host_that_leaves_no_route_open_is_still_refused() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        assert_eq!(
+            choose_route(rust, host(false, false, false)),
+            None,
+            "no rustup and no pinned binary for this host is a real refusal"
+        );
+        let python = recipe_for(LanguageId::Python).expect("python must have a recipe");
+        assert_eq!(
+            choose_route(python, host(false, false, false)),
+            None,
+            "no npm means no Node, and Kin does not install a runtime unasked"
+        );
+        assert_eq!(
+            choose_route(python, host(false, false, true)),
+            None,
+            "a pinned-release flag must not rescue a recipe with no pinned release"
+        );
+    }
+
+    /// The managed-prefix command is the same install, redirected, pin intact.
+    ///
+    /// The TypeScript 5.x pin is the reason this is asserted rather than
+    /// assumed. Every copy of the install command that drops it walks the
+    /// operator into a TypeScript 7 that ships no `lib/tsserver.js`, and this
+    /// route rewrites the argument list, which is exactly where a pin gets
+    /// lost.
+    #[test]
+    fn the_managed_prefix_command_keeps_the_packages_and_their_pin() {
+        let recipe = recipe_for(LanguageId::TypeScript).expect("typescript must have a recipe");
+        let args = recipe.managed_prefix_args(Path::new("/home/u/.kin/tools/node"));
+        assert_eq!(
+            args,
+            vec![
+                "install".to_string(),
+                "--prefix".to_string(),
+                "/home/u/.kin/tools/node".to_string(),
+                "typescript-language-server".to_string(),
+                "typescript@^5".to_string(),
+            ],
+            "the global flag is dropped, the prefix inserted, and the packages untouched"
+        );
+        assert!(
+            !args.contains(&"-g".to_string()),
+            "a redirected install must not also be global"
+        );
+    }
+
+    /// Two languages behind one redirected install still ask and run once.
+    ///
+    /// The deduplication key moved from the recipe's command to the route's
+    /// command, and a key that no longer collides would download the same npm
+    /// package twice and prompt twice for one decision.
+    #[test]
+    fn one_redirected_install_serves_both_javascript_and_typescript() {
+        let mut prompts = 0;
+        let mut runs = 0;
+        let reports = provision(
+            &[LanguageId::TypeScript, LanguageId::JavaScript],
+            InstallConsent::Ask,
+            nothing_installed,
+            |_| Some(InstallRoute::ManagedPrefix),
+            |_, route| {
+                assert_eq!(route, InstallRoute::ManagedPrefix);
+                prompts += 1;
+                true
+            },
+            |_, _| {
+                runs += 1;
+                Ok(Vec::new())
+            },
+        );
+        assert_eq!(prompts, 1, "one route command must ask exactly once");
+        assert_eq!(runs, 1, "one route command must run exactly once");
+        assert_eq!(reports.len(), 2);
+    }
+
+    /// A digest that did not match is its own outcome, never a plain failure.
+    ///
+    /// The two need different words and different advice, and a reader must not
+    /// take "the bytes were wrong" for "the network was flaky" and retry into
+    /// the same wall.
+    #[test]
+    fn a_checksum_mismatch_reports_its_own_outcome() {
+        let ran = std::cell::Cell::new(false);
+        let reports = provision(
+            &[LanguageId::Rust],
+            InstallConsent::Granted,
+            |_| ran.get(),
+            |_| Some(InstallRoute::PinnedRelease),
+            |_, _| panic!("granted consent must not prompt"),
+            |_, _| {
+                ran.set(true);
+                Err(InstallProblem::ChecksumMismatch {
+                    reason: "served bytes hash to abc, Kin pins def".to_string(),
+                })
+            },
+        );
+        match reports.first().map(|r| &r.outcome) {
+            Some(InstallOutcome::ChecksumRefused { reason, command }) => {
+                assert!(reason.contains("Kin pins def"), "{reason}");
+                assert!(
+                    command.contains("download rust-analyzer"),
+                    "the row must name the route that was refused: {command}"
+                );
+            }
+            other => panic!("a mismatch must not read as an ordinary failure: {other:?}"),
+        }
+    }
+
+    /// A successful pinned install carries its evidence into the report.
+    ///
+    /// A tick beside "installed" is not a disclosure. The URL and the digest
+    /// have to reach the row an operator reads, or the verification happened
+    /// somewhere nobody can check it.
+    #[test]
+    fn a_pinned_install_carries_its_source_and_digest_into_the_report() {
+        let ran = std::cell::Cell::new(false);
+        let reports = provision(
+            &[LanguageId::Rust],
+            InstallConsent::Granted,
+            |_| ran.get(),
+            |_| Some(InstallRoute::PinnedRelease),
+            |_, _| panic!("granted consent must not prompt"),
+            |_, _| {
+                ran.set(true);
+                Ok(vec![
+                    "source:   https://example.invalid/rust-analyzer.gz".to_string(),
+                    "sha256:   abc (verified before install)".to_string(),
+                ])
+            },
+        );
+        match reports.first().map(|r| &r.outcome) {
+            Some(InstallOutcome::Installed { evidence, .. }) => {
+                let joined = evidence.join("\n");
+                assert!(joined.contains("https://example.invalid"), "{joined}");
+                assert!(joined.contains("sha256"), "{joined}");
+            }
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    /// The pinned-download disclosure describes the download, not rustup.
+    ///
+    /// A person consenting to a network fetch of somebody's release binary is
+    /// owed the tag, the digest promise and the directory. "Adds a rustup
+    /// component to the active toolchain" is a true sentence about a route this
+    /// host is not taking, and it is the sentence the recipe carries.
+    #[test]
+    fn the_download_disclosure_describes_the_download() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        let disclosure = route_disclosure(rust, InstallRoute::PinnedRelease);
+        assert!(
+            disclosure.contains(RUST_ANALYZER_RELEASE.tag),
+            "{disclosure}"
+        );
+        assert!(disclosure.contains("sha256"), "{disclosure}");
+        assert!(
+            disclosure.contains("rust-lang/rust-analyzer"),
+            "the project the bytes come from must be named: {disclosure}"
+        );
+        assert!(
+            !disclosure.contains("rustup component"),
+            "the download must not be described as a toolchain change: {disclosure}"
+        );
+
+        // Control: the installer route keeps the recipe's own sentence.
+        assert_eq!(
+            route_disclosure(rust, InstallRoute::Installer),
+            rust.disclosure
         );
     }
 
