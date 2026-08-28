@@ -18053,7 +18053,7 @@ mod tests {
         let workspace_id = existing_workspace
             .as_ref()
             .map(|workspace| workspace.workspace_id)
-            .unwrap_or_else(kin_model::WorkspaceId::new);
+            .unwrap_or_default();
         let base_tree = existing_workspace
             .as_ref()
             .map(|workspace| workspace.tree.clone())
