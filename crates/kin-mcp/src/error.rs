@@ -135,9 +135,12 @@ mod tests {
     /// authority-gap message they build to be one the reader accepts.
     ///
     /// It is a source read rather than a call because the producers are
-    /// scattered across six modules behind conditions a unit test cannot
-    /// reach. The needle is the message construction, and the control is a
-    /// spelling that must appear nowhere.
+    /// scattered across many modules behind conditions a unit test cannot
+    /// reach. The control is a spelling that must appear nowhere.
+    ///
+    /// Scope: this sweeps the producers in THIS crate. `kin-daemon` has its own
+    /// and cannot be read from here, so a daemon-side drift is not covered by
+    /// this test.
     #[test]
     fn every_producer_spells_the_prefix_the_reader_matches() {
         let modules = [
@@ -154,6 +157,13 @@ mod tests {
             let source = std::fs::read_to_string(&path)
                 .unwrap_or_else(|error| panic!("{} is a producer module: {error}", path.display()));
             for line in source.lines() {
+                // Prose is not a producer. A doc comment explaining why an
+                // oversized object is an authority gap names the phrase without
+                // building a message, and counting it graded the wrong thing:
+                // the first run of this test failed on exactly that line.
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
                 // Anything that names an authority gap at all, however it
                 // spells it, so a drifted spelling is found rather than missed.
                 let names_a_gap = line.contains("authority gap") || line.contains("authority hole");
@@ -172,8 +182,12 @@ mod tests {
         // Without this the loop passing means nothing: a module list that
         // stopped resolving, or a needle that stopped matching, would report
         // every producer conforming while grading none.
+        // Counted on this tree: 29 non-comment producer lines across the five
+        // modules. The floor is what makes the loop mean something, because a
+        // module list that stopped resolving or a needle that stopped matching
+        // would otherwise report every producer conforming while grading none.
         assert!(
-            producers >= 20,
+            producers >= 25,
             "expected the producer sweep to find the known population, found {producers}"
         );
         // The control that must find nothing. A spelling no producer uses has
