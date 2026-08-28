@@ -1870,7 +1870,24 @@ const HOSTED_VECTOR_PRODUCER_PROFILE_EPOCH: &str = "kin-hosted-vector-producer-v
 /// proof admits a wider numeric profile. Local sidecars retain their existing
 /// model/pipeline-only compatibility contract; this stricter fence is for
 /// storage-backed artifacts that can move between hosts.
+/// The one numerical producer this process admits for a hosted vector
+/// artifact, together with the profile identity that names it.
+///
+/// Both halves are derived from a single resolved [`kin_db::EmbeddingProducer`]
+/// rather than from two readings of the environment, so the producer written
+/// into the persisted sidecar identity and the producer set the hosted
+/// validator enforces cannot drift apart.
+#[derive(Debug, Clone)]
+struct HostedVectorProducerPolicy {
+    profile: String,
+    allowed: kin_db::EmbeddingProducerSet,
+}
+
 fn hosted_vector_producer_profile() -> std::result::Result<String, String> {
+    hosted_vector_producer_policy().map(|policy| policy.profile)
+}
+
+fn hosted_vector_producer_policy() -> std::result::Result<HostedVectorProducerPolicy, String> {
     let normalized = |name: &str, default: &str| {
         std::env::var(name)
             .ok()
@@ -1885,15 +1902,30 @@ fn hosted_vector_producer_profile() -> std::result::Result<String, String> {
         ));
     }
 
-    let requested_backend = normalized("KIN_EMBED_BACKEND", "auto");
-    let resolved_backend = match requested_backend.as_str() {
-        "cpu" => "cpu",
-        "metal" | "gpu" => "metal",
-        // KinDB's product default is Metal on macOS and CPU on targets where
-        // the Metal implementation cannot be compiled.
-        _ if cfg!(target_os = "macos") => "metal",
-        _ => "cpu",
+    // KinDB's remote provider returns vectors attested as `Remote` whatever
+    // the local accelerator is, so the provider decides the producer before
+    // the backend does. Reading only KIN_EMBED_BACKEND here would fence a
+    // remote deployment behind a local label and then refuse every artifact
+    // that deployment ever writes. An unrecognized provider falls back to the
+    // local route, which is what KinDB itself does with it.
+    let provider = normalized("KIN_EMBED_PROVIDER", "local");
+    let producer = match provider.as_str() {
+        "openai" | "lmstudio" | "lm-studio" | "openai-compat" | "openai-compatible"
+        | "compatible" => kin_db::EmbeddingProducer::Remote,
+        _ => {
+            let requested_backend = normalized("KIN_EMBED_BACKEND", "auto");
+            match requested_backend.as_str() {
+                "cpu" => kin_db::EmbeddingProducer::Cpu,
+                "metal" | "gpu" => kin_db::EmbeddingProducer::Metal,
+                // KinDB's product default is Metal on macOS and CPU on targets
+                // where the Metal implementation cannot be compiled.
+                _ if cfg!(target_os = "macos") => kin_db::EmbeddingProducer::Metal,
+                _ => kin_db::EmbeddingProducer::Cpu,
+            }
+        }
     };
+    let allowed = kin_core::vector_producer_policy::hosted_allowed_producers(producer)?;
+    let resolved_backend = kin_core::vector_producer_policy::producer_label(producer);
     let requested_cpu = normalized("KIN_INFER_CPU_BACKEND", "auto");
     let resolved_cpu = match requested_cpu.as_str() {
         "pure-rust" | "pure_rust" => "pure-rust",
@@ -1904,11 +1936,14 @@ fn hosted_vector_producer_profile() -> std::result::Result<String, String> {
     let no_fold = std::env::var_os("KIN_INFER_NO_FOLD").is_some();
     let rope_per_element = std::env::var_os("KIN_ROPE_PERELEM").is_some();
 
-    Ok(format!(
-        "{HOSTED_VECTOR_PRODUCER_PROFILE_EPOCH};backend={resolved_backend};cpu={resolved_cpu};target={}-{};no_fold={no_fold};rope_per_element={rope_per_element}",
-        std::env::consts::OS,
-        std::env::consts::ARCH,
-    ))
+    Ok(HostedVectorProducerPolicy {
+        profile: format!(
+            "{HOSTED_VECTOR_PRODUCER_PROFILE_EPOCH};backend={resolved_backend};cpu={resolved_cpu};target={}-{};no_fold={no_fold};rope_per_element={rope_per_element}",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ),
+        allowed,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3055,6 +3090,7 @@ impl DaemonState {
     fn validate_hosted_vector_artifact_before_attach(
         layout: &KinLayout,
         artifact: &kin_db::VectorArtifact,
+        allowed_producers: &kin_db::EmbeddingProducerSet,
     ) -> std::result::Result<usize, String> {
         #[derive(serde::Deserialize)]
         struct DescriptorIdentity {
@@ -3080,12 +3116,24 @@ impl DaemonState {
             }
         };
         let indexed_count = decoded.len();
-        kin_db::validate_hosted_vector_artifact_inner(
+        // The strict entry point, not the compatibility wrapper. The wrapper
+        // proves the artifact is internally coherent and then discards the
+        // producer evidence, so a Metal-configured process would accept a
+        // CPU-produced or mixed artifact, including one a memory guard or an
+        // out-of-memory retry produced on the writing host. Passing the
+        // allowlist makes the artifact's own attested producers part of the
+        // admission decision.
+        let admitted = kin_db::validate_hosted_vector_artifact_inner_for_producers(
             artifact,
             decoded.dimensions(),
             indexed_count,
+            allowed_producers,
         )
         .map_err(|error| error.to_string())?;
+        debug_assert!(
+            admitted.is_subset(allowed_producers),
+            "the strict validator returned producers outside the allowlist it enforced"
+        );
         Ok(indexed_count)
     }
 
@@ -3093,6 +3141,7 @@ impl DaemonState {
     fn validate_hosted_vector_artifact_before_attach(
         _layout: &KinLayout,
         _artifact: &kin_db::VectorArtifact,
+        _allowed_producers: &kin_db::EmbeddingProducerSet,
     ) -> std::result::Result<usize, String> {
         Err("this daemon was built without vector artifact validation".to_string())
     }
@@ -3156,8 +3205,8 @@ impl DaemonState {
             );
         }
 
-        let producer_profile = match hosted_vector_producer_profile() {
-            Ok(profile) => profile,
+        let producer_policy = match hosted_vector_producer_policy() {
+            Ok(policy) => policy,
             Err(detail) => {
                 let _ = Self::clear_hosted_vector_projection(layout);
                 return (
@@ -3370,6 +3419,7 @@ impl DaemonState {
         let indexed_count = match Self::validate_hosted_vector_artifact_before_attach(
             layout,
             &persisted.artifact,
+            &producer_policy.allowed,
         ) {
             Ok(indexed_count) => indexed_count,
             Err(reason) => {
@@ -3392,7 +3442,7 @@ impl DaemonState {
         };
 
         let sidecar_open =
-            Self::load_validated_vector_index(layout, graph, Some(&producer_profile));
+            Self::load_validated_vector_index(layout, graph, Some(&producer_policy.profile));
         if let Some(reason) = sidecar_open.discarded.clone() {
             return (
                 sidecar_open,
@@ -6824,9 +6874,15 @@ impl DaemonState {
                 "vector artifact index",
             )?,
         };
+        let producer_policy = hosted_vector_producer_policy().map_err(|reason| {
+            DaemonError::Graph(kin_db::KinDbError::StorageError(format!(
+                "refusing durable vector artifact save without a single numerical producer: {reason}"
+            )))
+        })?;
         let indexed_count = Self::validate_hosted_vector_artifact_before_attach(
             &self.layout,
             &artifact,
+            &producer_policy.allowed,
         )
         .map_err(|reason| {
             DaemonError::Graph(kin_db::KinDbError::StorageError(format!(

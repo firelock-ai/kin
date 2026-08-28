@@ -1930,6 +1930,60 @@ pub fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: Retrieval
     sink.push(event);
 }
 
+/// The producer lineage of the vector index this graph currently serves.
+///
+/// `None` in a build without the vector feature, where no index exists to have
+/// a lineage; the producer-aware search stubs return an empty query producer
+/// set in that shape, so the verdict below is `NotRanked` either way.
+#[cfg(feature = "vector")]
+fn installed_vector_index_lineage(
+    graph: &kin_db::InMemoryGraph,
+) -> Option<kin_db::EmbeddingProducerSet> {
+    graph.vector_actual_producers()
+}
+
+#[cfg(not(feature = "vector"))]
+fn installed_vector_index_lineage(
+    _graph: &kin_db::InMemoryGraph,
+) -> Option<kin_db::EmbeddingProducerSet> {
+    None
+}
+
+/// Compare the runtimes that produced this query's vectors with the lineage of
+/// the index they were ranked against, and record the disagreement.
+///
+/// KinDB attests which runtime actually returned each vector, and the whole
+/// point of carrying that attestation to a query caller is that it can be
+/// checked here rather than discarded. A clean verdict records nothing, so an
+/// empty degradation list keeps meaning the healthy path ran.
+pub fn record_query_producer_verdict(
+    sink: &mut Vec<RetrievalDegradation>,
+    graph: &kin_db::InMemoryGraph,
+    query_producers: &kin_db::EmbeddingProducerSet,
+) -> kin_core::vector_producer_policy::QueryProducerVerdict {
+    let verdict = kin_core::vector_producer_policy::evaluate_query_producers(
+        installed_vector_index_lineage(graph).as_ref(),
+        query_producers,
+    );
+    if let (Some(reason), Some(detail)) = (verdict.reason(), verdict.detail()) {
+        tracing::warn!(
+            reason,
+            detail,
+            "vector ranking is not backed by matching producer evidence"
+        );
+        record_degradation(
+            sink,
+            RetrievalDegradation {
+                component: "vector_index".to_string(),
+                reason: reason.to_string(),
+                detail,
+                remediation: verdict.remediation().unwrap_or_default().to_string(),
+            },
+        );
+    }
+    verdict
+}
+
 /// Record the vector-index state for this query as a structured degradation
 /// when it is absent, empty or partial. The `SemanticCoverage` object already
 /// carries the numbers; this adds the machine-readable
@@ -11204,10 +11258,14 @@ fn extract_embedding_signals(
     }
     .max(locate_env_usize("KIN_LOCATE_SEMANTIC_FETCH_LIMIT", 250));
     let query_strings: Vec<&str> = queries.iter().map(|(q, _)| q.as_str()).collect();
-    let all_results = if needs_scope_filter {
+    // The producer-aware variants, not the discarding wrappers. A ranking is
+    // only as trustworthy as the agreement between the runtime that produced
+    // the query vector and the runtimes that produced the index it was ranked
+    // against, and that agreement is unknowable from the configured route.
+    let produced = if needs_scope_filter {
         // We know we are querying the HEAD graph (vector_source).
         // Only return hits that have a matching topological entity in the scoped graph.
-        match search_graph.semantic_search_batch_filtered(
+        match search_graph.semantic_search_batch_filtered_with_producers(
             &query_strings,
             fetch_limit,
             |retrieval_key| {
@@ -11217,7 +11275,7 @@ fn extract_embedding_signals(
         ) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("semantic_search_batch_filtered failed: {:?}", e);
+                tracing::error!("semantic_search_batch_filtered_with_producers failed: {:?}", e);
                 record_degradation(
                     degradations,
                     RetrievalDegradation {
@@ -11232,10 +11290,10 @@ fn extract_embedding_signals(
             }
         }
     } else {
-        match search_graph.semantic_search_batch(&query_strings, fetch_limit) {
+        match search_graph.semantic_search_batch_with_producers(&query_strings, fetch_limit) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("semantic_search_batch failed: {:?}", e);
+                tracing::error!("semantic_search_batch_with_producers failed: {:?}", e);
                 record_degradation(
                     degradations,
                     RetrievalDegradation {
@@ -11250,6 +11308,9 @@ fn extract_embedding_signals(
             }
         }
     };
+
+    record_query_producer_verdict(degradations, search_graph, &produced.query_producers);
+    let all_results = produced.matches;
 
     // Drop weak semantic matches before they enter the signal column. The
     // floor is expressed in RELEVANCE units ((1 + cos) / 2), not raw cosine;
