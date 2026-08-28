@@ -366,6 +366,7 @@ impl LanguageAdapter for PythonAdapter {
             imports,
             tests,
             parse_state,
+            parsed_call_sites: Some(count_python_call_sites(&root)),
         })
     }
 }
@@ -1342,6 +1343,29 @@ fn extract_module_docstring(root: &tree_sitter::Node, source: &[u8]) -> Option<S
 struct PythonCallExtractionAudit {
     seen_calls: std::collections::HashSet<(usize, usize)>,
     incomplete: bool,
+}
+
+/// Every call site this file holds, counted off the tree rather than off the
+/// relations extraction produced.
+///
+/// The two numbers are not the same one, and the gap between them is the whole
+/// reason this exists. A call whose callee the adapter cannot name
+/// (`handlers["render"](body)`), and a call written where no callable entity
+/// owns the edge, produce no [`kin_model::RelationKind::Calls`] relation at
+/// all. A denominator taken off the relations therefore reports such a file as
+/// holding fewer call sites than it does, and a consumer subtracting the
+/// graph's resolved edges from that number finds no shortfall on a file whose
+/// calls the graph never saw.
+///
+/// The traversal is every child rather than every named child, matching
+/// [`has_unobserved_call`], so the two agree about which nodes are call sites.
+fn count_python_call_sites(node: &tree_sitter::Node) -> u64 {
+    let mut total = u64::from(node.kind() == "call");
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        total += count_python_call_sites(&child);
+    }
+    total
 }
 
 fn has_unobserved_call(
