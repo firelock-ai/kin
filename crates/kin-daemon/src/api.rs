@@ -26163,9 +26163,28 @@ mod tests {
         );
     }
 
+    /// Durable authority that advances after the daemon froze its startup graph
+    /// must never be answered out of that frozen graph.
+    ///
+    /// A primary capture is bound to the publication cursor its cache entry was
+    /// loaded at. Once durable authority moves past that cursor the capture can
+    /// no longer be proved current, so the spine is left unpublished rather than
+    /// published over rows the store has already superseded. That is the safe
+    /// direction, and the refusal has to say which one it took: a spine that is
+    /// merely absent and a spine that refused a stale capture are the same
+    /// observation from outside, and only the recorded cause separates them.
+    ///
+    /// The narrower claim this replaced, that a later `ensure_spine` cannot
+    /// re-register the startup graph over hosted rows, is not reachable from
+    /// this fixture. A storage-backed daemon requires hosted spine readiness, so
+    /// production builds its backend through
+    /// `ensure_hosted_spine_backend_constructed` and never reaches the startup
+    /// capture path at all; only the in-memory test seam routes a backed state
+    /// through it. `hosted_spine_refuses_persistence_without_cursor_cas` carries
+    /// the hosted fail-closed half.
     #[tokio::test]
     #[serial_test::serial]
-    async fn hosted_spine_does_not_roll_current_rows_back_to_the_startup_graph() {
+    async fn hosted_spine_refuses_a_startup_capture_once_durable_authority_advanced() {
         let registry_dir = tempfile::tempdir().unwrap();
         let registry_path = registry_dir.path().join("registry.toml");
         kin_core::registry::KinRegistry { repos: Vec::new() }
@@ -26186,23 +26205,28 @@ mod tests {
             "publish authority after the daemon startup graph was frozen",
         );
 
-        let ingested = state
+        let refusal = state
             .ingest_repo_into_spine(&repo_id, false)
             .await
-            .expect("cursor-bound hosted authority must ingest");
-        let spine = state.spine().expect("ingest initializes the hosted spine");
-        assert_eq!(
-            spine.root_hash(&repo_id).as_deref(),
-            Some(ingested.root_hash.as_str())
+            .expect_err("a startup capture bound to a superseded cursor must not publish");
+        let message = refusal.to_string();
+        // Two separate facts, so a mutation that keeps one and loses the other
+        // is still caught, and the assertion that fires says which half went.
+        // A `!contains(generic fallback)` arm was tried here and removed: the
+        // two strings are mutually exclusive, so it could never fire while the
+        // assertion above it passed, and an assertion that cannot fire reads as
+        // coverage without being any.
+        assert!(
+            message.contains("could not capture stable spine authority"),
+            "the refusal must name the capture that could not be proved current: {message}"
         );
-
-        let ensured = state
-            .ensure_spine()
-            .expect("the hosted spine remains available");
-        assert_eq!(
-            ensured.root_hash(&repo_id).as_deref(),
-            Some(ingested.root_hash.as_str()),
-            "ensure_spine must not re-register the immutable startup graph over current hosted authority"
+        assert!(
+            message.contains("graph changed while its detached spine domain was captured"),
+            "the refusal must carry why the capture could not be proved, not just that it could not: {message}"
+        );
+        assert!(
+            state.spine().is_none(),
+            "a refused capture must leave no spine published"
         );
     }
 

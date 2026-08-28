@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (500 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (503 total, 342 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -106,7 +106,6 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests; required for hosted GCS publication control |
-| `KIN_PUBLICATION_CONTROL_AUTH_TOKEN` | secret | *(unset)* | secret | distinct operator bearer token for hosted rollout and publication-control administration |
 | `KIN_DAEMON_AUTO_EMBED` | bool | true | operational | let the daemon start background embedding on its own; set falsy to defer until an explicit embed request. Read by the daemon at process start, so it takes effect on the command that starts one; a command reaching an already-running daemon cannot change it and is warned that it diverged |
 | `KIN_DAEMON_BIN` | path | *(unset)* | operational | override path to the kin-daemon binary |
 | `KIN_DAEMON_BIND_HOST` | string | *(unset)* | operational | host/interface the daemon binds its HTTP endpoint to |
@@ -133,6 +132,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_TEST_STARTUP_HOLD_SECS` | seconds>=0 | *(unset)* | diagnostic | kin-daemon fault injection: hold the endpoint unpublished for N seconds at startup, so a client's startup binding stays PENDING past the tools/call grace and the still-starting disclosure is reachable; unset or zero disarms it |
 | `KIN_DAEMON_URL` | url | *(unset)* | operational | explicit daemon endpoint URL (skip local discovery) |
 | `KIN_DAEMON_WATCH_PID` | usize | *(unset)* | operational | pid the daemon watches; it exits when that process dies |
+| `KIN_PUBLICATION_CONTROL_AUTH_TOKEN` | secret | *(unset)* | secret | distinct operator bearer token for hosted rollout and publication-control administration |
 
 ## Supervisor
 

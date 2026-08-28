@@ -2027,6 +2027,21 @@ jobs:
   # documentation-only diff would otherwise wait forever for two contexts that
   # were never going to be created. Both legs run here on one ubuntu runner
   # because the point is the name, not the work.
+  #
+  # Read this before trusting a green `Feature permutation tests` on a pull
+  # request. On a pull request this job runs NO tests: it exists only to publish
+  # the two context names, and every step below it in `feature-tests` is skipped.
+  # The permutations execute on push to `main` and nowhere earlier, because this
+  # repository lands through direct merges rather than a merge queue, so there is
+  # no pre-merge event that runs them. The trade is deliberate: the permutations
+  # carry a 60 minute timeout and a per-pull-request gate is held to minutes, so
+  # they are kept off the pull-request path on purpose.
+  #
+  # The consequence is real and is the reason this is written down. A break that
+  # appears only under a non-default feature permutation reaches `main` first and
+  # is caught by the push run afterwards, not by the pull request that introduced
+  # it. Anything that must refuse a change BEFORE it lands belongs in the fast
+  # gate instead, where the required contexts are.
   feature-tests-pr-fast-path:
     name: Feature permutation tests
     if: ${{ !cancelled() && github.event_name == 'pull_request' }}
@@ -2037,8 +2052,9 @@ jobs:
     steps:
       - name: Report the pull-request fast path
         run: |
-          echo "The feature permutations run in the merge queue and on every"
-          echo "main commit. Admission is the fast gate."
+          echo "This job runs no tests. The feature permutations run on push to"
+          echo "main, after the merge, and not on this pull request."
+          echo "Admission before the merge is the fast gate."
 
   feature-tests:
     name: Feature permutation tests

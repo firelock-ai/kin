@@ -3246,13 +3246,20 @@ impl PublicationControlStore for InMemoryPublicationControlStore {
     ) -> Result<RepositoryAuthorityFence, PublicationControlError> {
         let repo_id = capture.repo_id.as_str();
 
+        // Take the rendezvous out of the guard before entering the block. Under
+        // edition 2021 an `if let` scrutinee temporary lives to the end of the
+        // block, so locking inline holds `fence_gate` across the condvar wait
+        // below, and the paired thread blocks forever trying to take the same
+        // gate. Binding the `take()` result first drops the guard at the end of
+        // this statement.
         #[cfg(test)]
-        if let Some(gate) = self
+        let fence_gate = self
             .fence_gate
             .lock()
             .map_err(|_| PublicationControlError::Store("memory fence gate poisoned".to_string()))?
-            .take()
-        {
+            .take();
+        #[cfg(test)]
+        if let Some(gate) = fence_gate {
             let (state, changed) = gate.as_ref();
             let mut state = state.lock().map_err(|_| {
                 PublicationControlError::Store("memory fence gate state poisoned".to_string())

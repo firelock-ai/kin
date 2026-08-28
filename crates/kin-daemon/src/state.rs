@@ -5337,6 +5337,16 @@ impl DaemonState {
         let primary = match self.capture_spine_repo(primary_repo_id, Arc::clone(&self.graph)) {
             Ok(capture) => capture,
             Err(capture_error) => {
+                // Record the cause. Leaving this slot empty makes every caller
+                // fall through to the generic "could not capture stable graph
+                // authority" string, which says a spine was not captured and
+                // never says why. `ensure_spine` clears the slot on its next
+                // successful pass, so a transient deferral does not stick.
+                *self
+                    .spine_initialization_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(capture_error.clone());
                 warn!(
                     repo_id = primary_repo_id,
                     error = %capture_error,
@@ -5412,11 +5422,19 @@ impl DaemonState {
         // A captured graph may advance while a later sibling is loading. Never
         // publish a backend containing a stale capture; leave OnceLock empty so
         // the next request can retry the whole authority set.
-        if captures
+        if let Some(advanced) = captures
             .iter()
-            .any(|capture| !self.spine_capture_is_current(capture))
+            .find(|capture| !self.spine_capture_is_current(capture))
         {
-            warn!("spine initialization deferred because a captured graph advanced");
+            let reason = format!(
+                "spine initialization deferred because repo {} advanced while the authority set was captured",
+                advanced.repo_id
+            );
+            *self
+                .spine_initialization_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.clone());
+            warn!(%reason, "spine initialization deferred because a captured graph advanced");
             return Ok(());
         }
         if self.spine.get().is_some() {
