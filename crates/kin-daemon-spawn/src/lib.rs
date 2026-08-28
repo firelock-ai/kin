@@ -1392,7 +1392,12 @@ fn unix_now() -> u64 {
 /// Rendered by arithmetic rather than by a calendar crate because only the time
 /// of day is wanted and the seconds themselves stay in the record for anything
 /// that needs the date.
-fn hhmm_utc(unix: u64) -> String {
+///
+/// Public because a surface that prints two measurements has to stamp each one
+/// with the moment it was taken, and the two moments come from different
+/// crates. A second copy of this formatter would be one rule stated twice and
+/// free to drift, so callers outside this crate use this one.
+pub fn hhmm_utc(unix: u64) -> String {
     let seconds_of_day = unix % 86_400;
     format!(
         "{:02}:{:02}Z",

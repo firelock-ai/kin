@@ -208,7 +208,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_daemon_kill_record());
     checks.push(check_interrupted_init());
     checks.push(check_suspended_sweep());
-    checks.push(check_host_memory_pressure(embedding_coverage));
+    checks.extend(check_memory_pressure_rows(embedding_coverage));
     checks.push(check_retrieval_profile());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
@@ -4443,6 +4443,55 @@ fn check_host_memory_pressure(
     )
 }
 
+/// Every row the memory-pressure reading is worth, one measurement each.
+///
+/// Split from [`check_host_memory_pressure`] so the row set is one function
+/// rather than a branch at the call site.
+fn check_memory_pressure_rows(
+    embedding_coverage: Option<kin_core::memory_pressure::EmbeddingCoverage>,
+) -> Vec<HealthCheck> {
+    let cwd = env::current_dir().unwrap_or_default();
+    let refusal_row = check_host_memory_pressure(embedding_coverage);
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return vec![refusal_row];
+    };
+    let mut rows = vec![refusal_row];
+    if let Some(footprint) = kin_core::memory_pressure::DaemonFootprint::read(layout.root()) {
+        rows.push(daemon_memory_standing_check_for(&footprint, unix_now()));
+    }
+    rows
+}
+
+/// Unix seconds now, or zero when the clock is before the epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// What this store's daemon last published about what it is holding.
+///
+/// Its own row rather than a clause appended to the refusal row. A refusal is a
+/// reading taken at the moment work was declined; this is the reading taken
+/// when the daemon last published one. Joined into one row with "Also:" they
+/// read as one self-contradicting claim, and the walkthrough that found it
+/// quoted both halves back: 3.7 GiB and 7.0 GiB of the same 4.0 GiB allowance,
+/// eleven child processes and ten. Two moments, two rows, each stamped.
+fn daemon_memory_standing_check_for(
+    footprint: &kin_core::memory_pressure::DaemonFootprint,
+    now_unix: u64,
+) -> HealthCheck {
+    const ID: &str = "daemon_memory_standing";
+    const LABEL: &str = "Daemon memory standing";
+    let status = if footprint.standing().is_over_allowance() {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Healthy
+    };
+    HealthCheck::new(ID, LABEL, status, footprint.row_sentence(now_unix))
+}
+
 /// Whether this store's creation-time replay version matches the one this
 /// binary carries.
 ///
@@ -4508,25 +4557,27 @@ fn host_memory_pressure_check_for(
             .map(|coverage| refusal.describes_outstanding_work(coverage))
             .unwrap_or(true)
     });
-    let standing = footprint.map(|footprint| {
-        footprint.line(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or_default(),
-        )
-    });
     let Some(refusal) = refusal else {
-        let detail = match standing {
-            Some(standing) => format!("no work has been held back on this store; {standing}"),
+        // The gauge is not appended here. It is a live reading with its own
+        // moment and it gets its own row, so this one carries exactly what the
+        // refusal ledger says and nothing else.
+        let detail = match footprint {
+            Some(_) => "no work has been held back on this store for want of memory; the \
+                        Daemon memory standing row reports how close it is"
+                .to_string(),
             None => "no work has been held back on this store for want of memory".to_string(),
         };
         return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, detail);
     };
-    let detail = match standing {
-        Some(standing) => format!("{} Also: {standing}", refusal.cause_sentence()),
-        None => refusal.cause_sentence(),
-    };
+    // One measurement, stamped. The live standing used to be appended here
+    // behind "Also:", which put a reading from the moment work was declined
+    // beside a reading from minutes later and let the row disagree with itself.
+    // It has its own row now; see [`daemon_memory_standing_check_for`].
+    let detail = format!(
+        "{}; that reading was taken at {}, when the work was declined",
+        refusal.cause_sentence(),
+        kin_daemon_spawn::hhmm_utc(refusal.at_unix)
+    );
     HealthCheck::new(ID, LABEL, HealthStatus::Degraded, detail)
         .with_manual_fix(refusal.remediation())
 }
