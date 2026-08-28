@@ -1220,10 +1220,16 @@ def check_native_transfer(suite):
         else:
             result.ok("a pull that admitted nothing left the record alone")
 
-    if transfer["source_stamp"] is None:
+    source_stamp = transfer["source_stamp"]
+    if source_stamp is None:
         result.bad("the transfer removed the SOURCE's creation record, which it must never do")
+    elif source_stamp.get("created_under") != suite.derives - 1:
+        result.bad(
+            "the transfer rewrote the SOURCE's creation record to %r, wanted the %r it was set to"
+            % (source_stamp.get("created_under"), suite.derives - 1)
+        )
     else:
-        result.ok("the source's own record is untouched")
+        result.ok("the source's own record still reads %d" % (suite.derives - 1))
     return result
 
 
