@@ -1873,18 +1873,25 @@ mod tests {
     /// The floor branch, end to end. A file parsing more sites than it holds
     /// edges of any kind reports a real shortfall even when nothing joined, and
     /// says on the row that the number is a floor.
+    ///
+    /// The five and the two are load bearing. They put the interval at `[3, 4]`,
+    /// where the floor and the ceiling differ, so the number below witnesses
+    /// which end of the range the row reports. A pair that makes the two ends
+    /// coincide, three parsed sites against one spanless edge, scores the same
+    /// shortfall whichever end is read, and a reading taken off the top would
+    /// pass this test unchanged.
     #[test]
     fn a_spanless_file_short_of_edges_reports_a_floor_rather_than_declining() {
-        let (store, focal) = store_with_spanless_calls(3, 1);
+        let (store, focal) = store_with_spanless_calls(5, 2);
         let arrival = observe_caller_arrival(&store, &focal);
         assert_eq!(
             arrival.state,
             ArrivalState::Unaccounted,
-            "three parsed sites against one edge is short whichever way it fans: {:?}",
+            "five parsed sites against two edges is short whichever way they fan: {:?}",
             arrival.unaccounted
         );
         let row = &arrival.unaccounted[0];
-        assert_eq!(row.unaccounted_call_sites, Some(2), "{row:?}");
+        assert_eq!(row.unaccounted_call_sites, Some(3), "{row:?}");
         assert!(
             row.shortfall_is_floor,
             "the row says the number is a floor, because a spanless edge leaves the resolved \
