@@ -11447,13 +11447,33 @@ mod tests {
         assert!(spine.cross_repo_edges_snapshot().complete);
     }
 
+    /// The gcs-only fail-closed hold, kept beside the combined production leg.
+    ///
+    /// Gated off the Firestore build on purpose: with both features the durable
+    /// backend is exactly what a complete configuration is supposed to select,
+    /// and `hosted_production_feature_pair_selects_durable_backend` proves that
+    /// half. Here the point is narrower and only observable without the
+    /// feature: bytes built without the durable dependency must refuse even
+    /// when every hosted configuration value is present and canonical, rather
+    /// than recovering an in-memory fallback. The configuration is provisioned
+    /// for that reason. Leaving it absent would let the configuration
+    /// diagnostic satisfy the assertion and the fallback hold would go
+    /// untested.
+    #[cfg(not(feature = "firestore"))]
     #[tokio::test]
     #[serial_test::serial]
     async fn hosted_spine_refuses_persistence_without_cursor_cas() {
         use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
 
-        let _spine_env = kin_core::test_env::EnvVarGuard::unset("KIN_DISABLE_SPINE");
-        let repo_id = format!("hosted-spine-hold-{}", uuid::Uuid::new_v4());
+        let repositories = ["kin", "kin-db", "kin-lsp", "kin-model", "kin-search"];
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&repositories.join(",")));
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+
+        let repo_id = "kin";
         let storage = tempfile::tempdir().unwrap();
         let graph = InMemoryGraph::new();
         graph
@@ -11461,7 +11481,7 @@ mod tests {
             .unwrap();
         LocalFileBackend::new(storage.path())
             .save_snapshot(
-                &repo_id,
+                repo_id,
                 &graph.to_snapshot().to_bytes().unwrap(),
                 GENERATION_INIT,
             )
@@ -11472,10 +11492,15 @@ mod tests {
         let state = DaemonState::open_with_backend(
             layout,
             Box::new(LocalFileBackend::new(storage.path())),
-            &repo_id,
-            None,
+            repo_id,
+            Some(repositories.into_iter().map(str::to_string).collect()),
         )
         .unwrap();
+        assert!(
+            state.hosted_spine_contract().is_ok(),
+            "this test must provision a complete hosted contract, or it proves only that \
+             configuration was missing"
+        );
         let constructions_before = state.spine_backend_constructions.load(Ordering::SeqCst);
         let hydrations_before = state.spine_backend_hydrations.load(Ordering::SeqCst);
 
@@ -11499,7 +11524,7 @@ mod tests {
             HOSTED_SPINE_CURSOR_CAS_REQUIRED
         );
         let error = state
-            .ingest_repo_into_spine(&repo_id, false)
+            .ingest_repo_into_spine(repo_id, false)
             .await
             .expect_err("cursorless durable persistence must fail closed");
         assert!(
@@ -11534,7 +11559,7 @@ mod tests {
         environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
         environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
         environment.apply("KIN_REPO_IDS", Some(&repositories.join(",")));
-        environment.apply("KIN_DISABLE_SPINE", None);
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
 
         let storage = tempfile::tempdir().unwrap();
         let graph = InMemoryGraph::new();
@@ -11565,6 +11590,106 @@ mod tests {
             .ensure_hosted_spine_backend_constructed()
             .expect("gcs+firestore production bytes must construct the durable backend");
         assert_eq!(state.spine_backend_constructions.load(Ordering::SeqCst), 1);
+    }
+
+    /// A process that opened its primary graph before the GCS generation fence
+    /// completed must never become reader-ready, however much durable state it
+    /// later repairs: a writer that advanced in between leaves `self.graph` and
+    /// every manager derived from it stale, and a cache reload replaces neither.
+    ///
+    /// Both arms are built by one closure, so the only difference between the
+    /// ready control and the refused recovery process is the recovery marking.
+    /// Without that control the refusal below would also pass on a fixture that
+    /// could never reach a ready spine for unrelated reasons.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_recovery_only_process_never_serves_reads_while_a_restart_does() {
+        use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
+
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let repo_id = format!("recovery-only-{}", uuid::Uuid::new_v4());
+        let storage = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("fenced_winner", "src/winner.rs"))
+            .unwrap();
+        LocalFileBackend::new(storage.path())
+            .save_snapshot(
+                &repo_id,
+                &graph.to_snapshot().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+
+        let open = || {
+            let repo_dir = tempfile::tempdir().unwrap();
+            let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+            let state = DaemonState::open_with_backend(
+                layout,
+                Box::new(LocalFileBackend::new(storage.path())),
+                &repo_id,
+                Some([repo_id.clone()].into_iter().collect()),
+            )
+            .unwrap();
+            state.allow_hosted_in_memory_spine_for_test();
+            (repo_dir, state)
+        };
+
+        // The restarted process: the same durable bytes, opened after the fence.
+        let (_restarted_dir, restarted) = open();
+        assert!(
+            restarted.ensure_spine().is_some(),
+            "the control arm must reach a ready spine, or the recovery refusals below \
+             prove nothing about the recovery marking"
+        );
+        restarted
+            .acquire_initialized_spine_read_authority()
+            .await
+            .expect("a restarted process must answer health from its fenced view");
+
+        // The recovery-only process: opened before the fence could complete.
+        let (_recovery_dir, recovery) = open();
+        recovery.require_hosted_restart_after_recovery(
+            "bootstrap hosted publication control before Firestore spine recovery: injected",
+        );
+        assert!(recovery.hosted_restart_required());
+        assert!(
+            recovery.ensure_spine().is_none(),
+            "a recovery-only process must not initialize a reader spine"
+        );
+        assert!(
+            recovery.acquire_spine_read_authority().await.is_none(),
+            "a recovery-only process must not hand out semantic read authority"
+        );
+        // Matched rather than `expect_err`, because the guard is deliberately
+        // not `Debug`: it holds a live read lock.
+        let health = match recovery.acquire_initialized_spine_read_authority().await {
+            Ok(_) => panic!("a recovery-only process must not certify health authority"),
+            Err(error) => error,
+        };
+        assert!(
+            health.contains("restart is required"),
+            "the health refusal must name the restart requirement rather than refusing \
+             for the unrelated reason that no spine was constructed: {health}"
+        );
+        let reason = recovery.spine_unavailable_reason();
+        assert!(
+            reason.contains("restart is required"),
+            "the unavailable reason must name the restart requirement: {reason}"
+        );
+
+        // Permanence. Repeated initialization is all a process does between
+        // repairing durable state and otherwise flipping ready, and none of it
+        // clears the marking.
+        assert!(recovery.ensure_spine().is_none());
+        assert!(recovery.hosted_restart_required());
     }
 
     #[test]

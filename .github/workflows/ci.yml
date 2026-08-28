@@ -2089,6 +2089,16 @@ jobs:
           state::tests::hosted_spine_refuses_persistence_without_cursor_cas
           -- --exact --nocapture --test-threads=1
 
+      # kin-spine gates its Firestore REST write-shape, envelope and migration
+      # seal tests behind its own `firestore` feature. The workspace test legs
+      # build kin-daemon with default features, so nothing enables it there, and
+      # the `-p kin-daemon --features gcs,firestore` leg below compiles kin-spine
+      # with the feature on but runs only kin-daemon's test binaries. Without
+      # this step those tests are written, compiled on no leg that runs them,
+      # and can never fail.
+      - name: Test kin-spine durable publication paths
+        run: cargo nextest run -p kin-spine --features firestore --locked
+
       # The actual daemon container enables both non-default hosted features.
       # Default and all-features checks do not execute this exact deployed
       # configuration, so keep a complete package pass for the production bytes.

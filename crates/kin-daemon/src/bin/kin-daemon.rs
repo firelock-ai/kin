@@ -1027,7 +1027,7 @@ mod tests {
             "KIN_PUBLICATION_CONTROL_AUTH_TOKEN",
             Some("publication-admin-token"),
         );
-        environment.apply("KIN_DAEMON_AUTH_TOKEN", None);
+        environment.apply::<_, &str>("KIN_DAEMON_AUTH_TOKEN", None);
         let repo = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(repo.path().join(".kin"));
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1065,7 +1065,7 @@ mod tests {
         );
         environment.apply("KIN_REPO_IDS", Some("kin,kin-db"));
         environment.apply("KIN_DAEMON_AUTH_TOKEN", Some("ordinary-daemon-token"));
-        environment.apply("KIN_PUBLICATION_CONTROL_AUTH_TOKEN", None);
+        environment.apply::<_, &str>("KIN_PUBLICATION_CONTROL_AUTH_TOKEN", None);
         let repo = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(repo.path().join(".kin"));
         let runtime = tokio::runtime::Runtime::new().unwrap();

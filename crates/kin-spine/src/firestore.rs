@@ -2816,6 +2816,48 @@ fn firestore_rollout_fence_fields(
     }))
 }
 
+/// Assemble every write the one-way legacy migration seal commits together.
+///
+/// The seal is correct only if the fleet fence, each exact repository head, the
+/// historical marker guard and the new canonical seal all land in a single
+/// Firestore Commit: any split leaves a durable head naming content another
+/// writer may still reclaim. Assembly is separated from the reads that produce
+/// the preconditions so the operation set itself can be asserted without a
+/// network, which is the only way a test can prove the count rather than
+/// rebuild it. For the hosted five-repository contract this is eight writes:
+/// one fence, five heads, the marker guard and the seal.
+#[cfg(feature = "firestore")]
+fn legacy_migration_seal_write_set(
+    rollout_fence_document_name: String,
+    rollout_fence: &LoadedSpineRolloutFence,
+    guarded_heads: &[(String, RepoPublicationHead, StoreHeadPrecondition)],
+    marker_document_name: String,
+    marker: &LegacyMigrationMarker,
+    seal_document_name: String,
+    seal: &LegacyMigrationSeal,
+) -> Result<Vec<serde_json::Value>, SpineError> {
+    let mut writes = Vec::with_capacity(guarded_heads.len() + 3);
+    writes.push(firestore_rollout_fence_write(
+        rollout_fence_document_name,
+        &rollout_fence.fence,
+        &StoreHeadPrecondition::Revision(rollout_fence.update_time.clone()),
+    )?);
+    for (document_name, head, precondition) in guarded_heads {
+        writes.push(firestore_head_write(
+            document_name.clone(),
+            head,
+            precondition,
+        )?);
+    }
+    writes.extend(firestore_legacy_migration_finalize_writes(
+        marker_document_name,
+        marker,
+        seal_document_name,
+        seal,
+    )?);
+    Ok(writes)
+}
+
 #[cfg(feature = "firestore")]
 fn validate_single_commit_envelope(
     writes: &[serde_json::Value],
@@ -3106,11 +3148,7 @@ impl SpineStore for FirestoreStore {
             return require_exact_legacy_migration_seal(&seal, observed);
         }
 
-        let mut writes = vec![firestore_rollout_fence_write(
-            self.document_name("spine_control_v2", "rollout_fence"),
-            &rollout_fence.fence,
-            &StoreHeadPrecondition::Revision(rollout_fence.update_time.clone()),
-        )?];
+        let mut guarded_heads = Vec::with_capacity(heads.len());
         for head in &heads {
             let (observed, precondition) = self.read_repo_head(&head.repo_id)?;
             if observed.as_ref() != Some(head) {
@@ -3119,18 +3157,21 @@ impl SpineStore for FirestoreStore {
                     head.repo_id
                 )));
             }
-            writes.push(firestore_head_write(
+            guarded_heads.push((
                 self.document_name("spine_repo_heads_v2", &sha256_hex(head.repo_id.as_bytes())),
-                head,
-                &precondition,
-            )?);
+                head.clone(),
+                precondition,
+            ));
         }
-        writes.extend(firestore_legacy_migration_finalize_writes(
+        let writes = legacy_migration_seal_write_set(
+            self.document_name("spine_control_v2", "rollout_fence"),
+            rollout_fence,
+            &guarded_heads,
             marker_document_name,
             &marker,
             seal_document_name.clone(),
             &seal,
-        )?);
+        )?;
         match self.commit_atomic_write_set(writes, "complete legacy spine migration") {
             Ok(()) => Ok(()),
             Err(commit_error) => {
@@ -6661,6 +6702,196 @@ mod tests {
                 .pointer("/currentDocument/exists")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
+        );
+    }
+
+    /// Build a five-repository seal fixture matching the hosted fleet contract.
+    #[cfg(feature = "firestore")]
+    fn five_repository_seal_fixture() -> (
+        [&'static str; 5],
+        LoadedSpineRolloutFence,
+        Vec<RepoPublicationHead>,
+        LegacyMigrationSeal,
+    ) {
+        let fleet = ["kin", "kin-db", "kin-lsp", "kin-model", "kin-search"];
+        let loaded = LoadedSpineRolloutFence {
+            fence: test_rollout_fence(7, "five-repo-rollout", &fleet),
+            update_time: "2026-08-27T12:00:00.000000Z".to_string(),
+        };
+        let writer_drain = LegacySpineWriterDrainAttestation {
+            schema: crate::publication::LEGACY_SPINE_WRITER_DRAIN_SCHEMA.to_string(),
+            rollout_fence_evidence: loaded.evidence(),
+            daemon_image_sha256: format!("sha256:{}", "a".repeat(64)),
+            drain_proof_sha256: format!("sha256:{}", "b".repeat(64)),
+        };
+        let heads = fleet
+            .iter()
+            .map(|repo_id| {
+                metadata_publication(repo_id, 41, &format!("{repo_id}-root"), Vec::new())
+                    .canonicalize()
+                    .unwrap()
+                    .head
+            })
+            .collect::<Vec<_>>();
+        let seal = LegacyMigrationSeal::build(&loaded, writer_drain, heads.clone()).unwrap();
+        (fleet, loaded, heads, seal)
+    }
+
+    /// The seal is a single-Commit authority transition, so the operation set it
+    /// assembles is itself the contract: one fleet fence, one head per exact
+    /// repository, the historical marker guard and the new canonical seal. The
+    /// focused tests beside this one inspect the two migration-specific writes
+    /// and cannot see a fence or head write going missing from the whole.
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn legacy_migration_seal_assembles_exactly_eight_unique_guarded_writes() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let (fleet, loaded, heads, seal) = five_repository_seal_fixture();
+        assert_eq!(
+            fleet.len(),
+            5,
+            "the hosted contract is a five-repository fleet"
+        );
+
+        let guarded_heads = heads
+            .iter()
+            .enumerate()
+            .map(|(index, head)| {
+                (
+                    store
+                        .document_name("spine_repo_heads_v2", &sha256_hex(head.repo_id.as_bytes())),
+                    head.clone(),
+                    StoreHeadPrecondition::Revision(format!("2026-08-27T12:00:0{index}.000000Z")),
+                )
+            })
+            .collect::<Vec<_>>();
+        let fence_document_name = store.document_name("spine_control_v2", "rollout_fence");
+        let marker_document_name =
+            store.document_name("spine_metadata_v2", LEGACY_MIGRATION_MARKER_DOCUMENT_ID);
+        let seal_document_name =
+            store.document_name("spine_metadata_v2", LEGACY_MIGRATION_SEAL_DOCUMENT_ID);
+
+        let writes = legacy_migration_seal_write_set(
+            fence_document_name.clone(),
+            &loaded,
+            &guarded_heads,
+            marker_document_name.clone(),
+            &LegacyMigrationMarker::Absent,
+            seal_document_name.clone(),
+            &seal,
+        )
+        .unwrap();
+
+        assert_eq!(
+            writes.len(),
+            3 + fleet.len(),
+            "the seal commits one fence, one head per repository, the marker guard and the seal"
+        );
+        assert_eq!(
+            writes.len(),
+            8,
+            "the five-repository contract is eight writes"
+        );
+
+        let mut expected = std::collections::BTreeSet::new();
+        expected.insert(fence_document_name);
+        expected.insert(marker_document_name);
+        expected.insert(seal_document_name);
+        for head in &heads {
+            expected.insert(
+                store.document_name("spine_repo_heads_v2", &sha256_hex(head.repo_id.as_bytes())),
+            );
+        }
+        let observed = writes
+            .iter()
+            .map(|write| {
+                write
+                    .pointer("/update/name")
+                    .and_then(serde_json::Value::as_str)
+                    .expect("every seal write targets a named document")
+                    .to_string()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            observed.len(),
+            writes.len(),
+            "two seal writes addressed the same document, so one operation was lost"
+        );
+        assert_eq!(
+            observed, expected,
+            "the assembled document set is not the exact fence, five heads, marker and seal"
+        );
+
+        for write in &writes {
+            let name = write
+                .pointer("/update/name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            assert!(
+                write.get("currentDocument").is_some(),
+                "seal write for {name} carries no precondition, so it would overwrite blind"
+            );
+        }
+
+        validate_single_commit_envelope(&writes, "complete legacy spine migration")
+            .expect("the exact five-repository seal must fit one Firestore Commit");
+    }
+
+    /// The atomic helper refuses rather than chunking, and it must refuse before
+    /// it reaches the network. With no ambient credentials the very next step
+    /// after validation is a metadata-server token fetch, so an `Auth` error
+    /// here would prove validation ran too late.
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn atomic_write_set_refuses_an_over_count_write_set_before_any_request() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let write = serde_json::json!({
+            "update": { "name": "projects/p/databases/d/documents/c/d", "fields": {} },
+            "currentDocument": { "exists": false }
+        });
+        let writes = vec![write; FIRESTORE_MAX_WRITES_PER_COMMIT + 1];
+
+        let error = store
+            .commit_atomic_write_set(writes, "test atomic operation")
+            .expect_err("a write set above the one-Commit count limit must be refused");
+        assert!(
+            matches!(error, SpineError::Serialization(_)),
+            "the refusal must come from envelope validation, not from a network step: {error:?}"
+        );
+        assert!(
+            error.to_string().contains("above the one-Commit limit"),
+            "the refusal must name the count envelope: {error}"
+        );
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn atomic_write_set_refuses_an_over_size_write_set_before_any_request() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        // Four writes, each a quarter of the request envelope, so no single
+        // document is oversized and only the sum can trip the limit.
+        let payload = "x".repeat(FIRESTORE_MAX_COMMIT_JSON_BYTES / 4);
+        let write = serde_json::json!({
+            "update": {
+                "name": "projects/p/databases/d/documents/c/d",
+                "fields": { "payload": { "stringValue": payload } }
+            },
+            "currentDocument": { "exists": false }
+        });
+        let writes = vec![write; 5];
+
+        let error = store
+            .commit_atomic_write_set(writes, "test atomic operation")
+            .expect_err("a write set above the one-Commit size limit must be refused");
+        assert!(
+            matches!(error, SpineError::Serialization(_)),
+            "the refusal must come from envelope validation, not from a network step: {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("encoded bytes, above the one-Commit limit"),
+            "the refusal must name the encoded-size envelope: {error}"
         );
     }
 

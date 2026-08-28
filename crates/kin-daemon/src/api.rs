@@ -23165,11 +23165,36 @@ mod tests {
     /// A hosted daemon built without a usable durable spine must leave the GCS
     /// rollout active and refuse both admission and direct ingest. A test-only
     /// local backend must never make the production control route look green.
+    ///
+    /// The absence this asserts has to be established, not assumed. Other tests
+    /// in this library set `GOOGLE_CLOUD_PROJECT` and its companions, and the
+    /// process environment is shared, so under a plain parallel `cargo test`
+    /// this fixture could otherwise enter a different or real Firestore path
+    /// and still read green. The guard clears them and `serial` keeps a
+    /// concurrent test from setting them back mid-run.
     #[tokio::test]
+    #[serial_test::serial]
     async fn publication_control_api_fails_closed_without_durable_spine() {
         const READER_A: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         const SCOPE: &str = "gcs://fixture/v2";
+
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        for name in [
+            "GOOGLE_CLOUD_PROJECT",
+            "FIRESTORE_DATABASE_ID",
+            "KIN_GCS_BUCKET",
+            "KIN_GCS_PREFIX",
+            "KIN_REPO_IDS",
+        ] {
+            environment.apply::<_, &str>(name, None);
+        }
+        assert!(
+            std::env::var("GOOGLE_CLOUD_PROJECT").is_err(),
+            "this fixture proves a refusal that only holds while the hosted Firestore \
+             environment is absent"
+        );
+
         let fleet = vec![
             "kin".to_string(),
             "kin-db".to_string(),
