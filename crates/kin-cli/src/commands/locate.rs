@@ -1191,6 +1191,14 @@ const LOCATE_PHASE_BUDGETS: [(&str, &str, f64); 6] = [
 impl LocateBudget {
     /// The budget a real query runs under, resolved from the environment.
     fn from_env() -> Self {
+        Self::from_env_capped(f64::INFINITY)
+    }
+
+    /// The production budget, additionally capped by a caller-owned request
+    /// deadline. Hosted multi-query routing uses this so every variant spends
+    /// from one wall-clock allowance instead of receiving a fresh 90-second
+    /// budget of its own.
+    fn from_env_capped(total_cap_secs: f64) -> Self {
         // Timeout/budget knobs: `0` means unbounded (disable the budget) rather
         // than a real 0 s deadline that would skip every phase and gut retrieval.
         // The unbounded sentinel (`f64::INFINITY`) flows harmlessly through the
@@ -1198,7 +1206,8 @@ impl LocateBudget {
         use kin_core::env_registry::env_secs_bound_f64 as secs_budget;
         Self {
             start: std::time::Instant::now(),
-            total_secs: secs_budget("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0),
+            total_secs: secs_budget("KIN_LOCATE_TOTAL_TIMEOUT_SECS", 90.0)
+                .min(total_cap_secs.max(0.0)),
             phase_budgets: LOCATE_PHASE_BUDGETS
                 .iter()
                 .map(|(phase, knob, default)| (*phase, secs_budget(knob, *default)))
@@ -2648,6 +2657,43 @@ pub fn run_with_graph_capture_with_priority_files_and_vector_source(
         source_scope,
         scope,
         LocateBudget::from_env(),
+    )
+}
+
+/// Hosted form of
+/// [`run_with_graph_capture_with_priority_files_and_vector_source`] whose
+/// caller owns the remaining request-wide wall-clock budget. The cap composes
+/// with every existing per-phase/environment limit and never widens one.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_graph_capture_with_priority_files_and_vector_source_capped(
+    graph: &kin_db::InMemoryGraph,
+    workspace_root: Option<&std::path::Path>,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    extra_priority_files: Vec<(String, f32)>,
+    vector_source: Option<&kin_db::InMemoryGraph>,
+    snippet_opts: SnippetOptions,
+    repository_authority: Option<&kin_mcp::handlers::RequestRepositoryAuthority>,
+    source_scope: kin_mcp::handlers::common::EntitySourceScope,
+    scope: LocateScope,
+    total_budget: std::time::Duration,
+) -> Result<LocateResult> {
+    run_with_graph_capture_budgeted(
+        graph,
+        workspace_root,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        extra_priority_files,
+        vector_source,
+        snippet_opts,
+        repository_authority,
+        source_scope,
+        scope,
+        LocateBudget::from_env_capped(total_budget.as_secs_f64()),
     )
 }
 

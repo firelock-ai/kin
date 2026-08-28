@@ -222,7 +222,7 @@ pub(crate) fn resolve_repository_target(
 /// requires its top-level entity, relation, tree, and revision caches to be
 /// empty. Every hosted authority-to-query conversion must pass through this
 /// helper, or a valid transfer presents as a zero-entity repository.
-fn materialize_hosted_repository_snapshot(
+pub(crate) fn materialize_hosted_repository_snapshot(
     mut snapshot: kin_db::GraphSnapshot,
 ) -> Result<(kin_db::GraphSnapshot, Option<SemanticChangeId>)> {
     let Some(metadata) = snapshot.repository_authority.as_ref() else {
@@ -1932,6 +1932,48 @@ pub struct DaemonState {
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
+    /// Coherent hosted graph and source authority views, keyed by repository.
+    /// Each request probes the backend cursor before reusing an entry.
+    pub(crate) repo_semantic_views:
+        RwLock<HashMap<String, Arc<crate::api::HostedRepositoryMcpView>>>,
+    /// Hosted-only locate rankings. The legacy unscoped route never reads this
+    /// cache, so it cannot address a hosted ranking even with a forged inner
+    /// locate cursor.
+    pub repo_semantic_locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
+    /// Process-incarnation identity authenticated into every hosted semantic
+    /// cursor. A restarted daemon rejects a prior token before touching caches.
+    pub repo_semantic_instance_id: uuid::Uuid,
+    /// Per-incarnation HMAC key for hosted semantic cursor payloads.
+    pub(crate) repo_semantic_cursor_secret: [u8; 32],
+    /// Opaque hosted MCP paging cursors retained by this daemon incarnation.
+    /// Each token is bound to one repository and one exact backend authority
+    /// cursor plus graph root. A restart intentionally drops this map so an
+    /// old token fails closed instead of silently replaying page zero.
+    pub repo_semantic_cursors: Mutex<HashMap<String, HostedSemanticCursor>>,
+}
+
+/// Server-side authority carried by one opaque hosted semantic cursor.
+///
+/// The wire token names this record and nothing else, so the repository and the
+/// publication a cursor is bound to are held here rather than handed to the
+/// caller. `snapshot_identity` is the opaque digest of that publication: an
+/// equality is the only question a paging cursor asks of it, and the backend
+/// generation it replaced answered that question while also disclosing an
+/// order.
+pub struct HostedSemanticCursor {
+    pub repo_id: String,
+    pub snapshot_identity: String,
+    pub inner_cursor: String,
+    pub created: Instant,
+}
+
+fn new_repo_semantic_cursor_secret() -> [u8; 32] {
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    let mut secret = [0u8; 32];
+    secret[..16].copy_from_slice(first.as_bytes());
+    secret[16..].copy_from_slice(second.as_bytes());
+    secret
 }
 
 /// Cached full locate ranking for cursor paging. The daemon holds both entity
@@ -1940,6 +1982,18 @@ pub struct DaemonState {
 /// `graph_version` is checked on lookup so a stale page is rejected rather than
 /// served after the graph moves.
 pub struct CachedLocateRanking {
+    /// The repository this ranking belongs to, or `None` for the daemon's own
+    /// local cache.
+    ///
+    /// The hosted map is shared by every repository the daemon serves, so a cap
+    /// enforced across the whole map is a shared resource: repository A filling
+    /// it evicts repository B's held ranking, and B's next continuation answers
+    /// 410 for something B did nothing to cause. Both the count and the
+    /// eviction filter on this, because filtering only the eviction is worse
+    /// than filtering neither: the cap would fire on the global length, the
+    /// filtered search for an entry to evict would find none of its own, and
+    /// the map would grow unbounded while still reading as capped.
+    pub repo_id: Option<String>,
     /// The primary query this ranking answered. Cursor-only continuations carry
     /// no query text of their own, and response evidence must still be derived
     /// against the same query that produced page zero.
@@ -2044,6 +2098,19 @@ pub struct CachedSemanticPage {
 /// this bound. Paging is a short-lived read-after-read, so a small cache covers
 /// the realistic concurrent-cursor count without unbounded growth.
 pub const LOCATE_RANKING_CACHE_CAP: usize = 64;
+
+/// The ceiling on the whole ranking map, across every repository.
+///
+/// [`LOCATE_RANKING_CACHE_CAP`] is now per repository, which is what stops one
+/// tenant evicting another's continuations, and on its own that makes the map
+/// sixty-four rankings times the repository count. A `CachedLocateRanking`
+/// clones its entities, files, debug payload and queries, so it is orders of
+/// magnitude larger than the half-kilobyte cursor row the same fix was modelled
+/// on, and unbounded growth is not a trade worth taking for tenant fairness.
+/// So the global ceiling stays, above the per-repo cap rather than in place of
+/// it: a repository can always hold its own sixty-four, and the map as a whole
+/// stops at four repositories' worth before the globally oldest entry goes.
+pub const LOCATE_RANKING_CACHE_GLOBAL_CAP: usize = 256;
 
 /// Minimum baseline count before an anti-wipe guard can fire. Below this, the
 /// set is small enough that a collapse is not catastrophic (and fresh-init /
@@ -3198,6 +3265,11 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
+            repo_semantic_views: RwLock::new(HashMap::new()),
+            repo_semantic_locate_rankings: Mutex::new(HashMap::new()),
+            repo_semantic_instance_id: uuid::Uuid::new_v4(),
+            repo_semantic_cursor_secret: new_repo_semantic_cursor_secret(),
+            repo_semantic_cursors: Mutex::new(HashMap::new()),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -3460,6 +3532,11 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
+            repo_semantic_views: RwLock::new(HashMap::new()),
+            repo_semantic_locate_rankings: Mutex::new(HashMap::new()),
+            repo_semantic_instance_id: uuid::Uuid::new_v4(),
+            repo_semantic_cursor_secret: new_repo_semantic_cursor_secret(),
+            repo_semantic_cursors: Mutex::new(HashMap::new()),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.

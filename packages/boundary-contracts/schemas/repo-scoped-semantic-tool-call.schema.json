@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/repo-scoped-semantic-tool-call",
+  "description": "A hosted semantic tool call whose repository authority is selected only by the HTTP path.",
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["schema_version", "name", "arguments"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "name": { "const": "semantic_locate" },
+        "arguments": {
+          "type": "object",
+          "description": "A bounded graph-native locate call. A fresh call requires query; a page call may carry only its opaque cursor.",
+          "anyOf": [
+            { "required": ["query"] },
+            { "required": ["cursor"] }
+          ],
+          "not": { "required": ["max_chars", "max_response_chars"] },
+          "properties": {
+            "query": { "type": "string", "pattern": "\\S", "maxLength": 4096 },
+            "queries": {
+              "type": "array",
+              "maxItems": 8,
+              "items": { "type": "string", "pattern": "\\S", "maxLength": 4096 }
+            },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 200 },
+            "page_size": { "type": "integer", "minimum": 1, "maximum": 200 },
+            "cursor": { "type": "string", "pattern": "\\S" },
+            "granularity": { "type": "string", "enum": ["file", "entity"] },
+            "include_snippet": { "type": "boolean" },
+            "snippet_alias": { "type": "boolean" },
+            "pipeline": { "const": "fused" },
+            "include_tests": { "type": "boolean" },
+            "explain": { "type": "boolean" },
+            "compact": { "type": "boolean" },
+            "max_chars": { "type": "integer", "minimum": 2000, "maximum": 60000 },
+            "max_response_chars": { "type": "integer", "minimum": 2000, "maximum": 60000 },
+            "repo_id": false,
+            "repository": false,
+            "repo_path": false,
+            "cwd": false,
+            "workspace": false,
+            "session_id": false
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["schema_version", "name", "arguments"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "name": { "const": "get_context_pack" },
+        "arguments": {
+          "type": "object",
+          "required": ["entity_id"],
+          "not": { "required": ["max_chars", "max_response_chars"] },
+          "properties": {
+            "entity_id": {
+              "type": "string",
+              "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+            },
+            "token_budget": { "type": "integer", "minimum": 1, "maximum": 32000 },
+            "depth": { "type": "integer", "minimum": 1, "maximum": 8 },
+            "include_traffic": { "const": false },
+            "compact": { "type": "boolean" },
+            "max_chars": { "type": "integer", "minimum": 2000, "maximum": 60000 },
+            "max_response_chars": { "type": "integer", "minimum": 2000, "maximum": 60000 },
+            "repo_id": false,
+            "repository": false,
+            "repo_path": false,
+            "cwd": false,
+            "workspace": false,
+            "session_id": false
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    {
+      "type": "object",
+      "required": ["schema_version", "name", "arguments"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "name": { "const": "trace_data_flow" },
+        "arguments": {
+          "type": "object",
+          "required": ["focal"],
+          "not": { "required": ["max_chars", "max_response_chars"] },
+          "properties": {
+            "focal": { "type": "string", "pattern": "\\S", "maxLength": 4096 },
+            "depth": { "type": "integer", "minimum": 1, "maximum": 8 },
+            "direction": { "type": "string", "enum": ["calls", "callers", "both"] },
+            "limit_per_step": { "type": "integer", "minimum": 1, "maximum": 25 },
+            "target": { "type": "string", "pattern": "\\S", "maxLength": 4096 },
+            "include_body": { "type": "boolean" },
+            "compact": { "type": "boolean" },
+            "include_type_edges": { "type": "boolean" },
+            "max_chars": { "type": "integer", "minimum": 2000, "maximum": 60000 },
+            "max_response_chars": { "type": "integer", "minimum": 2000, "maximum": 60000 },
+            "repo_id": false,
+            "repository": false,
+            "repo_path": false,
+            "cwd": false,
+            "workspace": false,
+            "session_id": false
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  ]
+}

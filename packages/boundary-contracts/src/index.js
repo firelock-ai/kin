@@ -24,6 +24,9 @@ const schemaFiles = {
   intentConflict: 'intent-conflict.schema.json',
   trafficReport: 'traffic-report.schema.json',
   mcpArtifactReadInput: 'mcp-artifact-read-input.schema.json',
+  repoScopedSemanticToolCall: 'repo-scoped-semantic-tool-call.schema.json',
+  repoScopedSemanticToolResponse: 'repo-scoped-semantic-tool-response.schema.json',
+  repoScopedSemanticToolError: 'repo-scoped-semantic-tool-error.schema.json',
   shadowGateReport: 'shadow-gate-report.schema.json'
 };
 
@@ -73,6 +76,14 @@ export async function assertContract(name, payload) {
 }
 
 function validateAgainstSchema(schema, value, schemas, pointer, errors, rootSchema) {
+  if (schema === false) {
+    errors.push(`${pointer}: value is forbidden`);
+    return;
+  }
+  if (schema === true) {
+    return;
+  }
+
   if (schema.$ref) {
     if (schema.$ref.startsWith('#/')) {
       const resolved = resolveLocalRef(rootSchema, schema.$ref);
@@ -97,6 +108,21 @@ function validateAgainstSchema(schema, value, schemas, pointer, errors, rootSche
       schemas[schemaName]
     );
     return;
+  }
+
+  if (schema.not) {
+    const candidateErrors = [];
+    validateAgainstSchema(
+      schema.not,
+      value,
+      schemas,
+      pointer,
+      candidateErrors,
+      rootSchema
+    );
+    if (candidateErrors.length === 0) {
+      errors.push(`${pointer}: matched a forbidden schema`);
+    }
   }
 
   if (schema.oneOf) {
@@ -154,6 +180,16 @@ function validateAgainstSchema(schema, value, schemas, pointer, errors, rootSche
     errors.push(`${pointer}: did not match ${schema.pattern}`);
   }
 
+  if (typeof value === 'string') {
+    const length = Array.from(value).length;
+    if (schema.minLength !== undefined && length < schema.minLength) {
+      errors.push(`${pointer}: expected at least ${schema.minLength} character(s)`);
+    }
+    if (schema.maxLength !== undefined && length > schema.maxLength) {
+      errors.push(`${pointer}: expected at most ${schema.maxLength} character(s)`);
+    }
+  }
+
   if (typeof value === 'number') {
     if (schema.minimum !== undefined && value < schema.minimum) {
       errors.push(`${pointer}: expected value >= ${schema.minimum}`);
@@ -187,7 +223,7 @@ function validateAgainstSchema(schema, value, schemas, pointer, errors, rootSche
 
     if (schema.additionalProperties === false) {
       for (const key of Object.keys(value)) {
-        if (!schema.properties[key]) {
+        if (!Object.prototype.hasOwnProperty.call(schema.properties, key)) {
           errors.push(`${pointer}: unexpected property ${key}`);
         }
       }
