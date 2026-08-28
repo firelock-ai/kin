@@ -1295,6 +1295,13 @@ def check_4(suite):
     # and cannot be read by the same pattern. A verdict claiming candidates over
     # a parse that found none is a blind parser, and it refuses here rather than
     # passing two arms over nothing.
+    #
+    # Measured on 2026-08-28, this arm is a guard rather than a live assertion:
+    # this fixture's store lists no dead code at all, so the run reads "0 claimed,
+    # 0 row(s) read" and the two arms below have always graded an empty list here.
+    # The consumer that can catch a blind parser today is check 12, whose store
+    # does list labelled rows. Said out loud so nobody reads this arm's green as
+    # evidence the parse was exercised.
     claimed = re.search(r"^(?:Found (\d+) unreferenced entit|UNVERIFIED: (\d+) candidate)",
                         dead["raw"], re.M)
     claimed_rows = int(claimed.group(1) or claimed.group(2)) if claimed else 0
@@ -1914,13 +1921,13 @@ def check_12(suite):
     res = Result("12", "FIR-2605", "dead-code answers over a benign re-export file")
     repo = suite.fixture("reexport")
 
+    # Read through Suite.dead_code's own parse rather than a second copy of it.
+    # A duplicated parser is only ever wrong in a way that looks like a passing
+    # run, and this fixture lists labelled rows, which makes it the consumer that
+    # can actually catch the shared parser going blind to a label. Check 4 cannot:
+    # its store lists nothing at all, so its arms grade an empty list either way.
     def listed_rows(scan):
-        found = {}
-        for line in scan["raw"].splitlines():
-            match = DEAD_CODE_ROW.match(line)
-            if match:
-                found[match.group(2)] = (match.group(1) or "").strip()
-        return found
+        return {row["name"]: row["label"] for row in scan["rows"]}
 
     dead = suite.dead_code(repo)
     listed = listed_rows(dead)
@@ -3075,12 +3082,10 @@ def check_22(suite):
                  "dead-code over a relative module import, and its arrival gate")
 
     def listed_rows(repo):
+        # Suite.dead_code's own parse, for the reason check 12 states: a second
+        # copy of a row parser cannot fail in a way anyone notices.
         scan = suite.dead_code(repo)
-        found = {}
-        for line in scan["raw"].splitlines():
-            match = DEAD_CODE_ROW.match(line)
-            if match:
-                found[match.group(2)] = (match.group(1) or "").strip()
+        found = {row["name"]: row["label"] for row in scan["rows"]}
         if not found:
             # A conversion's enrichment lands asynchronously, so a scan fired
             # straight after `kin init` can read a graph that has not resolved
@@ -3088,10 +3093,7 @@ def check_22(suite):
             # withholds its answer keeps withholding it across the retry.
             time.sleep(3)
             scan = suite.dead_code(repo)
-            for line in scan["raw"].splitlines():
-                match = DEAD_CODE_ROW.match(line)
-                if match:
-                    found[match.group(2)] = (match.group(1) or "").strip()
+            found = {row["name"]: row["label"] for row in scan["rows"]}
         return scan, found
 
     repo = suite.fixture("relimport")
