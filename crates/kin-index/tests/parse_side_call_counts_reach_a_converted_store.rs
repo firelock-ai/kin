@@ -270,6 +270,36 @@ fn a_call_outside_every_function_body_is_still_a_call_site() {
     );
 }
 
+/// The call-form decorator must be counted exactly once, not twice.
+///
+/// `@app.route("/")` holds a real `call` node AND yields a decorator name, so
+/// the two producers overlap on it and the emitter pushes exactly one relation.
+/// Counting every decorator site regardless would count this one twice, which
+/// inflates the parsed side and makes the arrival gate refuse a file whose
+/// calls all resolved. That is the opposite error from the one this fix is
+/// about, and it is the reason the census excludes a decorator holding a `call`
+/// node rather than counting decorators outright.
+#[test]
+fn a_decorator_written_as_a_call_is_counted_once() {
+    let indexed = index(
+        "notepkg/routed.py",
+        "@app.route(\"/\")\ndef handler():\n    return \"\"\n",
+    );
+
+    let emitted = emitted_call_relations(&indexed);
+    assert_eq!(
+        emitted, 1,
+        "the emitter pushes one relation for a call-form decorator, or this fixture is not the \
+         overlapping shape"
+    );
+    assert_eq!(
+        stamped_call_sites(&indexed.entities, "notepkg/routed.py"),
+        Some(1),
+        "a decorator written as a call is one call site, counted through its own `call` node; \
+         counting the decorator too would report two and refuse a file whose calls all resolved"
+    );
+}
+
 /// The other stamp site, which nothing else here reaches.
 ///
 /// `IndexPipeline` stamps in two places: the content path every other test in
