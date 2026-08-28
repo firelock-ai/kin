@@ -8994,6 +8994,10 @@ fn build_semantic_locate_result(
     // suffix to be treated as absent. The search fetch bound remains explicit
     // below when it saturates.
     let mut degradations: Vec<kin_cli::commands::locate::RetrievalDegradation> = Vec::new();
+    // Filled by the search closure below with the runtimes that actually
+    // returned this query's vectors, and compared against the persisted index's
+    // lineage once the ranking is back.
+    let mut query_producers = kin_db::EmbeddingProducerSet::new();
     let mut seen_files: HashSet<String> = HashSet::new();
     let mut seen_entities: HashSet<String> = HashSet::new();
     // Constant across the page and reported per hit in `match_evidence`: whether
@@ -9009,7 +9013,15 @@ fn build_semantic_locate_result(
     let projected = search_and_project_all_cosine_candidates(
         &query,
         fetch_limit,
-        |query, fetch_limit| graph.semantic_search(query, fetch_limit),
+        // The producer-aware variant, not the discarding wrapper. The runtime
+        // that actually returned this query vector is the only thing that can
+        // be compared against the lineage of the index it ranks over, and the
+        // configured route is not that runtime.
+        |query, fetch_limit| {
+            let produced = graph.semantic_search_with_producers(query, fetch_limit)?;
+            query_producers = produced.query_producers;
+            Ok(produced.matches)
+        },
         |raw| {
             // Opt-in (KIN_SEMLOC_RERANK=1): role-aware demotion + exact-name
             // boost over the cosine hit set only. Resolve once for scoring,
@@ -9225,6 +9237,12 @@ fn build_semantic_locate_result(
             return kin_mcp::ToolCallResult::error(format!("semantic search failed: {error}"));
         }
     };
+
+    kin_cli::commands::locate::record_query_producer_verdict(
+        &mut degradations,
+        graph,
+        &query_producers,
+    );
 
     record_cosine_candidate_cap(fetch_limit, fetched, &mut degradations);
 

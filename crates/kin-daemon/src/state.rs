@@ -1895,8 +1895,30 @@ fn hosted_vector_producer_policy() -> std::result::Result<HostedVectorProducerPo
             .filter(|value| !value.is_empty())
             .unwrap_or_else(|| default.to_string())
     };
-    let hybrid = normalized("KIN_EMBED_HYBRID", "off");
-    if !matches!(hybrid.as_str(), "off" | "0" | "false" | "no") {
+    hosted_vector_producer_policy_for(
+        &normalized("KIN_EMBED_HYBRID", "off"),
+        &normalized("KIN_EMBED_PROVIDER", "local"),
+        &normalized("KIN_EMBED_BACKEND", "auto"),
+        &normalized("KIN_INFER_CPU_BACKEND", "auto"),
+        std::env::var_os("KIN_INFER_NO_FOLD").is_some(),
+        std::env::var_os("KIN_ROPE_PERELEM").is_some(),
+    )
+}
+
+/// Resolve the hosted producer policy from already-normalized settings.
+///
+/// Pure on purpose. The environment is read exactly once, by the caller above,
+/// so every case below is reachable from a test without mutating process-wide
+/// state that other tests are reading at the same time.
+fn hosted_vector_producer_policy_for(
+    hybrid: &str,
+    provider: &str,
+    requested_backend: &str,
+    requested_cpu: &str,
+    no_fold: bool,
+    rope_per_element: bool,
+) -> std::result::Result<HostedVectorProducerPolicy, String> {
+    if !matches!(hybrid, "off" | "0" | "false" | "no") {
         return Err(format!(
             "hosted vector persistence requires one numerical producer, but KIN_EMBED_HYBRID={hybrid} admits both CPU and accelerator vectors"
         ));
@@ -1908,13 +1930,11 @@ fn hosted_vector_producer_policy() -> std::result::Result<HostedVectorProducerPo
     // remote deployment behind a local label and then refuse every artifact
     // that deployment ever writes. An unrecognized provider falls back to the
     // local route, which is what KinDB itself does with it.
-    let provider = normalized("KIN_EMBED_PROVIDER", "local");
-    let producer = match provider.as_str() {
+    let producer = match provider {
         "openai" | "lmstudio" | "lm-studio" | "openai-compat" | "openai-compatible"
         | "compatible" => kin_db::EmbeddingProducer::Remote,
         _ => {
-            let requested_backend = normalized("KIN_EMBED_BACKEND", "auto");
-            match requested_backend.as_str() {
+            match requested_backend {
                 "cpu" => kin_db::EmbeddingProducer::Cpu,
                 "metal" | "gpu" => kin_db::EmbeddingProducer::Metal,
                 // KinDB's product default is Metal on macOS and CPU on targets
@@ -1926,16 +1946,12 @@ fn hosted_vector_producer_policy() -> std::result::Result<HostedVectorProducerPo
     };
     let allowed = kin_core::vector_producer_policy::hosted_allowed_producers(producer)?;
     let resolved_backend = kin_core::vector_producer_policy::producer_label(producer);
-    let requested_cpu = normalized("KIN_INFER_CPU_BACKEND", "auto");
-    let resolved_cpu = match requested_cpu.as_str() {
+    let resolved_cpu = match requested_cpu {
         "pure-rust" | "pure_rust" => "pure-rust",
         "accelerate" if cfg!(target_os = "macos") => "accelerate",
         _ if cfg!(target_os = "macos") => "accelerate",
         _ => "pure-rust",
     };
-    let no_fold = std::env::var_os("KIN_INFER_NO_FOLD").is_some();
-    let rope_per_element = std::env::var_os("KIN_ROPE_PERELEM").is_some();
-
     Ok(HostedVectorProducerPolicy {
         profile: format!(
             "{HOSTED_VECTOR_PRODUCER_PROFILE_EPOCH};backend={resolved_backend};cpu={resolved_cpu};target={}-{};no_fold={no_fold};rope_per_element={rope_per_element}",
@@ -14218,6 +14234,172 @@ mod tests {
             state.graph.full_snapshot_required(),
             "a refused flush must retire its batch, which is what makes the next attempt \
              serialize the live graph instead of trusting an acknowledgement nothing earned"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Hosted vector producer policy (external P1-1).
+    //
+    // These grade the resolver directly rather than the environment, because
+    // the env reader is one line and the interesting behaviour is all in the
+    // resolution. Every case asserts BOTH halves of the policy, since the
+    // whole point of deriving them from one producer is that the label an
+    // operator reads and the set the validator enforces cannot disagree.
+    // ---------------------------------------------------------------------
+
+    fn policy_for(provider: &str, backend: &str) -> HostedVectorProducerPolicy {
+        hosted_vector_producer_policy_for("off", provider, backend, "auto", false, false)
+            .unwrap_or_else(|error| panic!("provider={provider} backend={backend}: {error}"))
+    }
+
+    fn only(policy: &HostedVectorProducerPolicy) -> kin_db::EmbeddingProducer {
+        assert_eq!(
+            policy.allowed.len(),
+            1,
+            "the hosted fence must stay one producer wide, got {:?}",
+            policy.allowed
+        );
+        policy.allowed.iter().next().expect("one producer")
+    }
+
+    /// The label in the profile identity and the producer in the allowlist are
+    /// two readings of one decision. Asserting them separately would let a
+    /// future edit rename one and leave the other, so this asserts the JOIN:
+    /// the label must be the label OF the producer the fence admits, read back
+    /// out of the profile string the daemon actually persists.
+    #[test]
+    fn the_profile_label_always_names_the_producer_the_fence_admits() {
+        let cases = [
+            ("local", "cpu"),
+            ("local", "metal"),
+            ("local", "gpu"),
+            ("local", "auto"),
+            ("local", "not-a-backend"),
+            ("openai", "cpu"),
+            ("lmstudio", "metal"),
+            ("openai-compat", "auto"),
+            ("something-unknown", "cpu"),
+        ];
+        for (provider, backend) in cases {
+            let policy = policy_for(provider, backend);
+            let producer = only(&policy);
+            let expected = format!(
+                "backend={}",
+                kin_core::vector_producer_policy::producer_label(producer)
+            );
+            assert!(
+                policy.profile.contains(&expected),
+                "provider={provider} backend={backend}: profile {} does not name {expected}",
+                policy.profile
+            );
+        }
+    }
+
+    /// An explicit backend resolves to exactly that producer, and the two
+    /// spellings of the accelerator agree.
+    #[test]
+    fn an_explicit_local_backend_resolves_to_that_producer() {
+        assert_eq!(
+            only(&policy_for("local", "cpu")),
+            kin_db::EmbeddingProducer::Cpu
+        );
+        assert_eq!(
+            only(&policy_for("local", "metal")),
+            kin_db::EmbeddingProducer::Metal
+        );
+        assert_eq!(
+            only(&policy_for("local", "gpu")),
+            kin_db::EmbeddingProducer::Metal
+        );
+    }
+
+    /// The remote provider decides the producer before the backend does. This
+    /// is the case a backend-only reading gets wrong: an OpenAI-compatible
+    /// deployment on a Metal host writes artifacts attested `Remote`, and a
+    /// `{Metal}` fence would refuse every one of them.
+    #[test]
+    fn a_remote_provider_outranks_the_local_backend() {
+        for provider in [
+            "openai",
+            "lmstudio",
+            "lm-studio",
+            "openai-compat",
+            "openai-compatible",
+            "compatible",
+        ] {
+            for backend in ["cpu", "metal", "auto"] {
+                assert_eq!(
+                    only(&policy_for(provider, backend)),
+                    kin_db::EmbeddingProducer::Remote,
+                    "provider={provider} backend={backend} must fence on the remote producer"
+                );
+            }
+        }
+    }
+
+    /// An unrecognized provider falls back to the local route, which is what
+    /// KinDB itself does with it. A provider typo must not silently open the
+    /// fence to a producer nothing will ever write.
+    #[test]
+    fn an_unknown_provider_falls_back_to_the_local_route() {
+        let policy = policy_for("not-a-provider", "cpu");
+        assert_eq!(only(&policy), kin_db::EmbeddingProducer::Cpu);
+    }
+
+    /// Hybrid admits CPU and accelerator vectors in one index, so there is no
+    /// single numerical producer to fence on and the policy refuses outright.
+    #[test]
+    fn hybrid_embedding_has_no_single_producer_and_is_refused() {
+        for hybrid in ["on", "1", "true", "auto"] {
+            let error = hosted_vector_producer_policy_for(
+                hybrid, "local", "metal", "auto", false, false,
+            )
+            .expect_err("hybrid must not resolve a single-producer fence");
+            assert!(
+                error.contains("one numerical producer"),
+                "the refusal must say why: {error}"
+            );
+        }
+        // And the off spellings must all still resolve, or the guard above is
+        // refusing the healthy path rather than the hybrid one.
+        for hybrid in ["off", "0", "false", "no"] {
+            hosted_vector_producer_policy_for(hybrid, "local", "cpu", "auto", false, false)
+                .unwrap_or_else(|error| panic!("hybrid={hybrid} must resolve: {error}"));
+        }
+    }
+
+    /// The profile identity still carries every field it carried before the
+    /// allowlist was derived from it. A policy that fences correctly but
+    /// stamps a shorter identity would silently widen sidecar reuse.
+    #[test]
+    fn the_profile_identity_keeps_its_epoch_and_every_field() {
+        let policy = hosted_vector_producer_policy_for(
+            "off", "local", "cpu", "pure-rust", true, true,
+        )
+        .expect("must resolve");
+        for field in [
+            HOSTED_VECTOR_PRODUCER_PROFILE_EPOCH,
+            "backend=cpu",
+            "cpu=pure-rust",
+            "no_fold=true",
+            "rope_per_element=true",
+            "target=",
+        ] {
+            assert!(
+                policy.profile.contains(field),
+                "profile {} is missing {field}",
+                policy.profile
+            );
+        }
+        // The flags are not constants: the false case must render false.
+        let plain =
+            hosted_vector_producer_policy_for("off", "local", "cpu", "pure-rust", false, false)
+                .expect("must resolve");
+        assert!(plain.profile.contains("no_fold=false"), "{}", plain.profile);
+        assert!(
+            plain.profile.contains("rope_per_element=false"),
+            "{}",
+            plain.profile
         );
     }
 }
