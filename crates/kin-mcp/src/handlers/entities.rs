@@ -5501,10 +5501,22 @@ mod tests {
         let store = InMemoryGraph::new();
         // `cli.rs` names `store.rs` in its own source, so it can reach the
         // focal, and the store holds no count of the call sites parsed there.
-        let dead_target = make_entity("probe_dead_target", "src/store.rs");
+        let mut dead_target = make_entity("probe_dead_target", "src/store.rs");
+        dead_target.metadata.extra.insert(
+            kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+            serde_json::json!(0),
+        );
         let mut store_module = make_entity("store", "src/store.rs");
         store_module.kind = EntityKind::Module;
-        let caller = make_entity("probe_caller", "src/cli.rs");
+        // Two call sites read in cli.rs against the one edge the linker bound,
+        // which is a MEASURED shortfall. Measured on purpose: this arm is about
+        // two surfaces agreeing, so it must not also move when the shared rule's
+        // uncounted branch does.
+        let mut caller = make_entity("probe_caller", "src/cli.rs");
+        caller.metadata.extra.insert(
+            kin_parser::FILE_PARSED_CALL_SITES_KEY.to_string(),
+            serde_json::json!(2),
+        );
         for entity in [&dead_target, &store_module, &caller] {
             store.upsert_entity(entity).unwrap();
         }
@@ -5513,6 +5525,13 @@ mod tests {
                 caller.id,
                 store_module.id,
                 RelationKind::References,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(
+                caller.id,
+                store_module.id,
+                RelationKind::Calls,
             ))
             .unwrap();
 
@@ -5578,6 +5597,11 @@ mod tests {
             crate::caller_arrival::absence_gap(&store, &dead_target),
             None,
             "this control is only a control while the shared rule certifies here"
+        );
+        assert!(
+            row.get("absence_limiting_factor").is_some(),
+            "the key is written even when there is no caveat, or a tool that stopped \
+             publishing it reads identical to one that accounted for everything: {row}"
         );
         assert_eq!(
             row["absence_limiting_factor"],
