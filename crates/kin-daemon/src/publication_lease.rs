@@ -3325,11 +3325,22 @@ impl PublicationControlStore for InMemoryPublicationControlStore {
                 .and_then(|(record, _)| record.active_lease.as_ref())
                 .map(|active| active.authority_fence.len() + 1)
                 .unwrap_or(1);
-            let mut hook = self.crash_after_fenced_repositories.lock().map_err(|_| {
-                PublicationControlError::Store("memory crash hook poisoned".to_string())
-            })?;
-            if hook.is_some_and(|count| count == completed) {
-                *hook = None;
+            let inject_death = {
+                let mut hook = self.crash_after_fenced_repositories.lock().map_err(|_| {
+                    PublicationControlError::Store("memory crash hook poisoned".to_string())
+                })?;
+                if hook.is_some_and(|count| count == completed) {
+                    *hook = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            // Panic outside the guard. A real process death poisons no lock,
+            // so a simulated one must not either: panicking while the hook
+            // guard is alive leaves that mutex poisoned, and every later read
+            // of it fails as a store error the simulated crash never caused.
+            if inject_death {
                 panic!("injected abrupt death after a strict fleet prefix");
             }
         }
@@ -4433,11 +4444,20 @@ mod tests {
             if reader_spine_rollout_fence_evidence(&record).unwrap()
                 != record_spine_rollout_fence_evidence(&record).unwrap()
             {
+                // Carry the record's own reader lifetime rather than a constant.
+                // This helper exists to advance a fixture past release, not to
+                // re-decide how long its reader lives, and a hardcoded value
+                // silently replaces a deliberately short reader with a long one,
+                // so a test that then advances the clock to prove expiry proves
+                // nothing.
+                let ttl_seconds = (record.reader.expires_at - record.reader.admitted_at)
+                    .num_seconds()
+                    .max(1) as u64;
                 control
                     .admit_reader(AdmitReaderRequest {
                         lease: proof(&completed),
                         repositories: completed.target_repositories.clone(),
-                        reader: reader(control.runtime_reader_identity(), 300),
+                        reader: reader(control.runtime_reader_identity(), ttl_seconds),
                         legacy_writer_drain_proof_sha256: None,
                     })
                     .unwrap();
@@ -4567,7 +4587,14 @@ mod tests {
             assert!(stranded_lease.authority_fencing_token.is_some());
             assert_eq!(stranded_lease.authority_fence.len(), crash_after - 1);
             assert!(stranded.last_authority_fence.is_empty());
-            for (position, repo_id) in repositories.iter().enumerate() {
+            // The control canonicalizes its fleet, and canonical means sorted,
+            // so rows are fenced in sorted order. The prefix that moved is a
+            // prefix of the SORTED fleet, not of the order this fixture happens
+            // to declare, and iterating the declared order compares the right
+            // count of repositories against the wrong names.
+            let mut fenced_order = repositories.clone();
+            fenced_order.sort();
+            for (position, repo_id) in fenced_order.iter().enumerate() {
                 assert_eq!(
                     store.authority_state(repo_id).unwrap().0,
                     if position < crash_after { 2 } else { 1 },
@@ -4589,7 +4616,10 @@ mod tests {
             assert_eq!(recovered.fence, stranded_lease.fence);
             assert_eq!(recovered.token, stranded_lease.token);
             assert_eq!(recovered.authority_fence.len(), repositories.len());
-            for (position, repo_id) in repositories.iter().enumerate() {
+            // Sorted for the same reason as the prefix check above: the fence
+            // walks the canonical fleet, so the recaptured prefix is a prefix
+            // of the sorted order.
+            for (position, repo_id) in fenced_order.iter().enumerate() {
                 assert_eq!(
                     store.authority_state(repo_id).unwrap().0,
                     if position < crash_after { 3 } else { 2 },
@@ -4833,6 +4863,11 @@ mod tests {
             "a refused validated save must never reach the inner backend"
         );
 
+        // Acquisition is two-phase on this contract: `acquire_rollout` returns a
+        // GCS-fenced but spine-uncheckpointed lease, and admission needs the
+        // completed one. Everything above deliberately runs against the
+        // uncompleted lease, because that is the state that must block writers.
+        let lease = checkpoint_rollout_for_test(&old, &lease);
         old.admit_reader(AdmitReaderRequest {
             lease: proof(&lease),
             repositories: fleet(),
@@ -5330,6 +5365,18 @@ mod tests {
         assert_eq!(lease.fence_repositories, expected_union);
         assert_eq!(lease.authority_fence.len(), 6);
 
+        // Membership installs on the SECOND phase, and the code says so and
+        // enforces it on every record load: before `authority_fenced_at` is set
+        // the record must still carry the PREVIOUS fleet. Assert both sides
+        // rather than the target alone, so a regression that installs early is
+        // caught as well as one that never installs.
+        let before_checkpoint = candidate.status().unwrap();
+        assert_eq!(
+            before_checkpoint.repositories, old_repositories,
+            "an uncompleted transition must still carry the previous fleet"
+        );
+
+        let lease = checkpoint_rollout_for_test(&candidate, &lease);
         let installed = candidate.status().unwrap();
         assert_eq!(installed.repositories, lease.target_repositories);
         assert_eq!(installed.last_authority_fence.len(), 5);
@@ -5477,6 +5524,10 @@ mod tests {
             control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION),
             Err(PublicationControlError::Admission(_))
         ));
+        // The release must be refused because the bootstrap reader is
+        // incompatible, not because the fence never completed. Those are
+        // different refusals and only the first one is this test's subject.
+        let lease = checkpoint_rollout_for_test(&control, &lease);
         assert!(matches!(
             control.release_rollout(ReleaseRolloutLeaseRequest {
                 lease: proof(&lease)
@@ -5492,6 +5543,7 @@ mod tests {
         let recovery = control
             .acquire_rollout(rollout_request("deploy", "compatible-recovery", None))
             .unwrap();
+        let recovery = checkpoint_rollout_for_test(&control, &recovery);
         control
             .admit_reader(AdmitReaderRequest {
                 lease: proof(&recovery),
@@ -5592,6 +5644,11 @@ mod tests {
             .unwrap();
         assert_eq!(kin_fence.pre_fence_generation, winner_generation);
         assert_eq!(kin_fence.snapshot_schema, future_schema);
+        // Complete the acquisition first. An uncompleted lease is refused for
+        // its incomplete fence, which is a different refusal from the schema
+        // incompatibility this test is about, and taking the first one would
+        // pass the assertion below while proving nothing about compatibility.
+        let rollout = checkpoint_rollout_for_test(&control, &rollout);
         assert!(matches!(
             control.admit_reader(AdmitReaderRequest {
                 lease: proof(&rollout),

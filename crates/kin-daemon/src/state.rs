@@ -4738,6 +4738,23 @@ impl DaemonState {
         if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
             return false;
         }
+        // A test that installed a durable backend has already answered the
+        // question this gate asks. `create_spine_backend` honours that
+        // injection; without the same check here the gate refuses first under
+        // a build with the `firestore` feature off, and the seam cannot do
+        // what it documents, which is to vary only what the backend is built
+        // over while every other configuration gate stays as production has
+        // it. This says nothing about a build that injected nothing, so the
+        // feature-absent fail-closed hold below is unchanged.
+        #[cfg(test)]
+        if self
+            .hosted_durable_spine_for_test
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+        {
+            return false;
+        }
         #[cfg(not(feature = "firestore"))]
         {
             true
