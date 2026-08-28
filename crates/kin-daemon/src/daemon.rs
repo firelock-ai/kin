@@ -3366,6 +3366,19 @@ fn held_relation_ids(
     held
 }
 
+/// Whether both of a relation's entity endpoints are entities this graph holds.
+///
+/// Only entity endpoints are judged. An artifact, test, contract, work or
+/// external-reference endpoint is already refused by `upsert_relation` itself,
+/// and judging it twice here would answer a question the store answers better.
+fn relation_endpoints_are_live(state: &DaemonState, relation: &kin_model::Relation) -> bool {
+    use kin_model::EntityStore;
+    [relation.src, relation.dst]
+        .into_iter()
+        .filter_map(|node| node.as_entity())
+        .all(|id| matches!(state.graph.get_entity(&id), Ok(Some(_))))
+}
+
 fn install_lsp_relations(
     state: &DaemonState,
     relations: &[kin_model::Relation],
@@ -3383,6 +3396,47 @@ fn install_lsp_relations(
     use kin_model::EntityStore;
     let graph_mutation = state.begin_graph_authority_mutation();
     let offered = relations.len();
+    // An enrichment edge may not name an entity the graph does not hold.
+    //
+    // kin-db deliberately admits a dangling ENTITY endpoint at write time, for
+    // the external-import placeholder shape, so nothing below this line would
+    // refuse one. Its transaction gate is not so forgiving: it validates every
+    // relation the graph holds against the staged tree, so one edge into a
+    // retired entity makes kin-db refuse EVERY later transition on this store
+    // with `unadmitted destination endpoint`, and the repository is wedged for
+    // writes until a restart rebuilds the graph without the strand. A sweep
+    // running against an entity index the last commit already retired is
+    // exactly how that edge gets written (FIR-2838).
+    //
+    // Dropping the edge is right rather than merely safe: its endpoint no
+    // longer exists, so there is no fact left to record, and the file's next
+    // reconcile re-derives whatever is true now. The drop is counted and said
+    // out loud, because a silently thinner sweep is the failure this whole
+    // function was rewritten to stop reporting as success.
+    let (relations, stranding): (Vec<kin_model::Relation>, Vec<kin_model::Relation>) = relations
+        .into_iter()
+        .partition(|relation| relation_endpoints_are_live(state, relation));
+    if !stranding.is_empty() {
+        warn!(
+            dropped = stranding.len(),
+            offered,
+            sample = ?stranding
+                .iter()
+                .take(3)
+                .map(|relation| format!("{:?} {} -> {}", relation.kind, relation.src, relation.dst))
+                .collect::<Vec<_>>(),
+            "enrichment relations named entities this graph no longer holds and were dropped; \
+             writing one would refuse every later commit on this repository"
+        );
+    }
+    if relations.is_empty() {
+        drop(graph_mutation);
+        return EnrichmentWrite {
+            published: 0,
+            offered,
+            vector_stale: 0,
+        };
+    }
     let mut errored: std::collections::HashSet<kin_model::RelationId> =
         std::collections::HashSet::new();
     for relation in &relations {
@@ -7497,6 +7551,95 @@ mod enrichment_marker_tests {
         .unwrap();
     }
 
+    fn lsp_call(src: kin_model::EntityId, dst: kin_model::EntityId) -> kin_model::Relation {
+        kin_model::Relation {
+            id: kin_model::RelationId::new(),
+            kind: kin_model::RelationKind::Calls,
+            src: kin_model::GraphNodeId::Entity(src),
+            dst: kin_model::GraphNodeId::Entity(dst),
+            confidence: 1.0,
+            origin: kin_model::RelationOrigin::Lsp,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        }
+    }
+
+    /// An enrichment edge into an entity the graph no longer holds must be
+    /// dropped, because writing it wedges the repository for writes.
+    ///
+    /// FIR-2838. `upsert_relation` deliberately admits a dangling ENTITY
+    /// endpoint, for the external-import placeholder shape, so nothing in the
+    /// store refuses this write. kin-db's TRANSACTION gate does refuse it, and
+    /// it refuses the whole transition rather than the edge, so from the moment
+    /// such an edge is written every commit on this repository fails with
+    /// `unadmitted destination endpoint` until a restart rebuilds the graph.
+    /// A sweep running against an entity index the last commit already retired
+    /// is exactly how the edge gets offered.
+    ///
+    /// Three arms, and the second and third are what let this fail. Arm two is
+    /// the control: a build that simply stopped writing enrichment would
+    /// satisfy arm one and be a far worse product. Arm three is the consequence
+    /// the ticket is about, and it is the assertion that goes red on the
+    /// unfixed code.
+    #[test]
+    fn an_enrichment_edge_into_a_retired_entity_is_dropped_rather_than_written() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let state = DaemonState::open(init.layout).unwrap();
+
+        let caller = entity("ingest");
+        let live_callee = entity("upsert_note");
+        // Never admitted: this is the entity the rename commit retired while
+        // the sweep still held it in its own index.
+        let retired = entity("forget_notes_outside");
+        state.graph.upsert_entity(&caller).unwrap();
+        state.graph.upsert_entity(&live_callee).unwrap();
+
+        let strand = lsp_call(caller.id, retired.id);
+        let written = install_lsp_relations(&state, std::slice::from_ref(&strand));
+        assert_eq!(
+            written.published, 0,
+            "an edge naming an entity the graph does not hold must not be published"
+        );
+        assert_eq!(
+            written.offered, 1,
+            "and the offer is still counted, so the drop is visible rather than silent"
+        );
+        assert!(
+            state
+                .graph
+                .get_all_relations_for_entity(&caller.id)
+                .unwrap()
+                .is_empty(),
+            "the graph must not hold an edge whose destination entity is absent"
+        );
+
+        let healthy = lsp_call(caller.id, live_callee.id);
+        let written = install_lsp_relations(&state, std::slice::from_ref(&healthy));
+        assert_eq!(
+            written.published, 1,
+            "an edge whose endpoints both exist is still written; without this arm the check \
+             above is satisfied by a sweep that installs nothing at all"
+        );
+
+        // The consequence. On the unfixed code the strand is in the graph and
+        // this refuses with `unadmitted destination endpoint`, which is the
+        // HTTP 500 a user meets on a commit that touched an unrelated file.
+        let repo_path = kin_model::RepoPath::from_utf8("README.md".to_string()).unwrap();
+        let entry = kin_model::TreeEntry::blob(kin_model::Hash256::from_bytes([7; 32]), false);
+        state
+            .graph
+            .apply_transaction_delta(&kin_model::TransactionDelta {
+                tree_deltas: vec![kin_model::TreeDelta::Added {
+                    artifact_id: kin_model::ArtifactId::new(),
+                    new: kin_model::LocatedEntry::new(repo_path, entry),
+                }],
+                ..kin_model::TransactionDelta::default()
+            })
+            .expect("a later transition must still apply; a stranded edge refuses every one");
+    }
+
     /// A marker whose relations are gone must not keep the loss permanent.
     ///
     /// This is what made the persistence defect unrecoverable rather than
@@ -7698,6 +7841,26 @@ mod enrichment_marker_tests {
         unbounded.graph.upsert_entity(&source).unwrap();
         bounded.graph.upsert_entity(&source).unwrap();
         let relations = derived_relations(source.id, 600);
+        // Admit the destination of every derived edge. The fixture left them
+        // out and the write path had no reason to care, but it does now: an
+        // edge into an entity the graph does not hold is refused by kin-db's
+        // transaction gate on every LATER transition, which wedges the
+        // repository for writes, so enrichment drops it rather than writing it
+        // (FIR-2838). The real path cannot produce one either, since the
+        // language-server index is built from graph entities and the live
+        // cross-file pass skips the one shape kin sanctions with an absent
+        // entity destination. What this test is about, that the bounded and
+        // unbounded paths agree and that a re-sweep writes nothing, is
+        // unchanged.
+        for relation in &relations {
+            let mut target = entity("target");
+            target.id = relation
+                .dst
+                .as_entity()
+                .expect("a derived edge names an entity destination");
+            unbounded.graph.upsert_entity(&target).unwrap();
+            bounded.graph.upsert_entity(&target).unwrap();
+        }
 
         // The unbounded path: every relation offered on its own, which is what
         // one language-server query arm used to do.
