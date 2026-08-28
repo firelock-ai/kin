@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 use kin_model::{Entity, EntityId, EntityKind, Relation, SemanticFingerprint};
 use parking_lot::Mutex as ParkingMutex;
@@ -66,12 +66,9 @@ use crate::publication::{
 use crate::publication::RepoPublicationPhase;
 #[cfg(test)]
 use crate::publication::SpineRolloutRepositoryFence;
-use crate::store::{LoadedRepoPublication, LoadedSpineRolloutFence, SpineStore};
 #[cfg(any(feature = "firestore", test))]
-use crate::store::{
-    PreparedStorePublication, RepoPublicationCleanupProgress, StoreHeadPrecondition,
-    StorePublicationStageGuard, StoreRepoHeadGuard,
-};
+use crate::store::PreparedStorePublication;
+use crate::store::{LoadedRepoPublication, LoadedSpineRolloutFence, SpineStore};
 
 const CLEANUP_DOCUMENTS_PER_COMMIT: usize = 100;
 const CLEANUP_PASSES_PER_TERMINAL_OUTCOME: usize = 4;
@@ -3557,16 +3554,12 @@ impl SpineStore for FirestoreStore {
 mod tests {
     use super::*;
     use crate::publication::RepoPublicationConflict;
-    use crate::store::LoadedRepo;
     use crate::test_support::*;
     use kin_model::{
         EntityKind, EntityRole, FingerprintAlgorithm, GraphNodeId, Hash256, LanguageId,
         RelationEvidence, RelationId, RelationKind, RelationOrigin, SemanticFingerprint,
         Visibility,
     };
-    use std::collections::HashMap;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::Mutex;
 
     /// In-memory [`SpineStore`] fake. Mirrors staged rows and a revision-checked
     /// repository head without any network.

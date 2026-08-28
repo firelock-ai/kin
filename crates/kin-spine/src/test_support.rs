@@ -13,7 +13,7 @@
 //! Compiled for this crate's tests and for any consumer enabling
 //! `test-support`. It is not part of the product surface.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,10 +25,9 @@ use crate::firestore::{
 };
 use crate::index::{CrossRepoEdge, EntityEntry};
 use crate::publication::{
-    CanonicalRepoPublication, LegacySpineWriterDrainAttestation, RepoPublicationCommit,
-    RepoPublicationHead, RepoPublicationPhase, RepoSpinePublication, SpineRolloutFence,
-    SpineRolloutFenceCommit, SpineRolloutFenceEvidence, SpineRolloutRepositoryFence,
-    SpineSourceCursor,
+    LegacySpineWriterDrainAttestation, RepoPublicationCommit, RepoPublicationHead,
+    RepoSpinePublication, SpineRolloutFence, SpineRolloutFenceCommit, SpineRolloutFenceEvidence,
+    SpineRolloutRepositoryFence,
 };
 use crate::store::{
     LoadedRepo, LoadedRepoPublication, LoadedSpineRolloutFence, PreparedStorePublication,
