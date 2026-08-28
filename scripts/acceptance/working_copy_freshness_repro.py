@@ -576,6 +576,36 @@ WITHHELD_UNEXPLAINED = {"negative": {
     "trust_reason": "some other reason entirely", "advice": "some other reason entirely"}}
 
 
+def report_payload(results):
+    """The report shape `scripts/acceptance/gate.py` reads.
+
+    The key is `results` and not `checks`. That is not a style choice: the gate
+    calls `payload.get("results")` at `gate.py:98` and refuses anything else
+    with "carries no results list". This suite shipped keyed `checks`, so the
+    post-merge run on kin#1205's squash printed four CHECK lines, wrote a report
+    carrying all four rows, and the verdict step still could not read one of
+    them. That is the second time this key has broken this gate; the first is
+    recorded in `same_owner_call_repro.py`. Written once here and read back
+    through the gate's own loader by the self-test, so it cannot drift again.
+    """
+    return {"suite": "working_copy_freshness", "ticket": TICKET,
+            "results": [{"id": r.ident, "ticket": TICKET, "status": r.status,
+                         "detail": r.detail} for r in results]}
+
+
+def absolute_binary(path):
+    """A binary path the fixtures can still find after they change directory.
+
+    Every check runs the binary with `cwd=` a `tempfile.mkdtemp` workspace, so a
+    relative `--kin target/release/kin` resolves against that temp directory
+    rather than the caller's, and raises `[Errno 2] No such file or directory`.
+    That is what happened to all four checks on kin#1205's squash, with the
+    workflow passing exactly the path every sibling step passes. The siblings
+    absolutize at parse time (`eject_journal_repro.py:918`); this does the same.
+    """
+    return path and os.path.abspath(os.path.expanduser(path))
+
+
 def self_test():
     graded = []
     failures = []
@@ -654,6 +684,99 @@ def self_test():
     expect("absence control cannot read a response with no negative block",
            grade_absence_stays_authoritative_over_a_committed_tree({}), UNREADABLE)
 
+    # The report shape, driven through the gate's own reader rather than through
+    # a copy of its rules. This suite printed four CHECK lines on kin#1205's
+    # squash and the verdict step still could not read one of them; a self-test
+    # that only grades graders cannot see that, and this one could not.
+    import importlib.util
+
+    gate_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.py")
+    if not os.path.exists(gate_path):
+        failures.append("gate.py is not beside this file, so the report shape went unchecked")
+    else:
+        spec = importlib.util.spec_from_file_location("acceptance_gate", gate_path)
+        gate = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(gate)
+        scratch = tempfile.mkdtemp(prefix="working-copy-freshness-selftest-")
+        try:
+            rows = [Result(ident, UNREADABLE, "%s check raised: fabricated" % TICKET)
+                    for ident, _ in CHECKS]
+            good = os.path.join(scratch, "good.json")
+            with open(good, "w") as handle:
+                json.dump(report_payload(rows), handle)
+            try:
+                loaded = gate.load_report(good)
+                expect("the gate reads every row this suite writes",
+                       (sorted(loaded), "loaded"), sorted(ident for ident, _ in CHECKS))
+                expect("the gate reads a status off each row",
+                       (loaded[CHECKS[0][0]].get("status"), "row status"), UNREADABLE)
+            except Exception as exc:  # noqa: BLE001 - a refusal is the finding
+                failures.append("the gate refused this suite's own report: %s" % exc)
+
+            # CONTROL: the shape that shipped must still be refused, or the two
+            # assertions above would pass over any payload at all.
+            bad = os.path.join(scratch, "bad.json")
+            with open(bad, "w") as handle:
+                json.dump({"suite": "working_copy_freshness", "ticket": TICKET,
+                           "checks": [{"id": ident, "status": UNREADABLE}
+                                      for ident, _ in CHECKS]}, handle)
+            try:
+                gate.load_report(bad)
+                refused = False
+            except Exception:  # noqa: BLE001 - the refusal is what is wanted
+                refused = True
+            expect("CONTROL the gate still refuses the `checks`-keyed shape that broke CI",
+                   (refused, "refused"), True)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+    # The path the fixtures need, driven through this file's own resolver. An
+    # assertion on `os.path.abspath` would say the standard library works, not
+    # that this suite calls it, and this suite's defect was that it did not.
+    expect("a relative kin path is absolutized by this suite",
+           (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)
+    expect("and an absent binary stays absent rather than becoming the cwd",
+           (absolute_binary(None), "absent"), None)
+
+    # And that main() actually calls it, which the two assertions above cannot
+    # see: deleting the call leaves every one of them green, measured. So this
+    # drives this file as a subprocess from another directory with a relative
+    # --kin, which is the shape the workflow passes, against a stub that exists
+    # only from that directory. A stub rather than a real binary because the
+    # question is whether the fixtures can FIND it, and that needs no build.
+    stub_root = tempfile.mkdtemp(prefix="working-copy-freshness-stub-")
+    try:
+        os.makedirs(os.path.join(stub_root, "bin"))
+        stub = os.path.join(stub_root, "bin", "kin")
+        with open(stub, "w") as handle:
+            handle.write("#!/bin/sh\nexit 42\n")
+        os.chmod(stub, 0o755)
+
+        def relative_run(binary):
+            """This file, run from `stub_root`, told to use `binary` relatively."""
+            proc = subprocess.Popen(
+                [sys.executable, os.path.abspath(__file__), "--kin", binary,
+                 "--json", os.path.join(stub_root, binary.replace("/", "-") + ".json")],
+                cwd=stub_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            try:
+                return proc.communicate(timeout=180)[0].decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001 - a hang is a failure, not a verdict
+                proc.kill()
+                proc.communicate()
+                return "SELFTEST the relative run did not finish inside 180s"
+
+        found = relative_run("bin/kin")
+        expect("main absolutizes, so the fixtures find a relative --kin from elsewhere",
+               ("No such file or directory: 'bin/kin'" in found, "relative run"), False)
+        # CONTROL: a binary that is absent from every directory must still be
+        # reported absent, or the assertion above would pass over a suite that
+        # never tried to run anything at all.
+        absent = relative_run("bin/not-kin")
+        expect("CONTROL a binary absent everywhere is still reported absent",
+               ("No such file or directory" in absent, "absent run"), True)
+    finally:
+        shutil.rmtree(stub_root, ignore_errors=True)
+
     for line in failures:
         print("SELFTEST FAIL %s" % line)
     # Counted, never written out. A hardcoded total drifts from the assertions it
@@ -684,6 +807,8 @@ def main(argv):
     if not opts.kin:
         print("SETUP no kin binary: pass --kin or set KIN_BIN")
         return 3
+    opts.kin = absolute_binary(opts.kin)
+    opts.daemon = absolute_binary(opts.daemon)
 
     workdir = tempfile.mkdtemp(prefix="working-copy-freshness-")
     suite = Suite(opts.kin, workdir, daemon=opts.daemon, verbose=opts.verbose)
@@ -698,9 +823,10 @@ def main(argv):
             print("CHECK %s %s %s %s" % (result.ident, TICKET, result.status, result.detail))
         asked = [ident for ident, _ in CHECKS]
         answered = [result.ident for result in results]
-        if answered != asked:
-            print("SETUP asked for %r and %r answered" % (asked, answered))
-            return 3
+        # Written before the asked/answered guard below, not after it. Four
+        # UNREADABLE rows are a verdict the gate can name; a missing report is
+        # one it can only refuse, and the refusal names the file rather than
+        # the check that broke.
         if opts.json_path:
             directory = os.path.dirname(os.path.abspath(opts.json_path))
             if directory:
@@ -709,9 +835,10 @@ def main(argv):
                 except OSError:
                     pass
             with open(opts.json_path, "w") as handle:
-                json.dump({"suite": "working_copy_freshness", "ticket": TICKET,
-                           "checks": [{"id": r.ident, "status": r.status, "detail": r.detail}
-                                      for r in results]}, handle, indent=2)
+                json.dump(report_payload(results), handle, indent=2)
+        if answered != asked:
+            print("SETUP asked for %r and %r answered" % (asked, answered))
+            return 3
         if any(result.status == FAIL for result in results):
             return 1
         if any(result.status == UNREADABLE for result in results):
