@@ -715,8 +715,12 @@ class Suite(object):
         self.observations[name] = observation
         return observation
 
-    def kin_in(self, cwd, args, timeout=900):
-        rc, out = run([self.kin] + args, cwd=cwd, env=self.env, timeout=timeout)
+    def kin_in(self, cwd, args, timeout=900, extra_env=None):
+        env = self.env
+        if extra_env:
+            env = dict(self.env)
+            env.update(extra_env)
+        rc, out = run([self.kin] + args, cwd=cwd, env=env, timeout=timeout)
         self.log("kin %s (in %s) -> %d" % (" ".join(args), cwd, rc))
         return rc, out
 
@@ -899,7 +903,16 @@ class Suite(object):
         receiver_endpoint = self.transfer_endpoint(destination)
         self.log("receiver daemon at %s" % receiver_endpoint)
 
-        rc, out = self.kin_in(destination, ["pull", "--url", endpoint, "--json"])
+        # KIN_DAEMON_URL is required, not a convenience. `kin pull` reaches its
+        # own daemon through `DaemonClient::try_connect`, which reads that
+        # variable and returns None when it is unset; it does not discover the
+        # worker the registry lists. Without it the command refuses with "no Kin
+        # daemon is reachable" even with a live registered daemon for this exact
+        # repository, which is what two runs of this arm reported.
+        pull_env = {"KIN_DAEMON_URL": receiver_endpoint}
+        rc, out = self.kin_in(
+            destination, ["pull", "--url", endpoint, "--json"], extra_env=pull_env
+        )
         if rc != 0:
             raise RuntimeError("kin pull exited %d: %s" % (rc, tail(out)))
         try:
@@ -929,7 +942,9 @@ class Suite(object):
         with open(staged, "w") as handle:
             json.dump(restored, handle, sort_keys=True)
         os.replace(staged, os.path.join(destination, STAMP_REL))
-        rc, control_out = self.kin_in(destination, ["pull", "--url", endpoint, "--json"])
+        rc, control_out = self.kin_in(
+            destination, ["pull", "--url", endpoint, "--json"], extra_env=pull_env
+        )
         control_receipts = []
         if rc == 0:
             try:
