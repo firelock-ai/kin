@@ -27,7 +27,7 @@ use kin_db::InMemoryGraph;
 use kin_index::{link_cross_file, FileParseData, IndexPipeline};
 use kin_mcp::caller_arrival::{observe_caller_arrival, ArrivalState};
 use kin_model::{
-    ArtifactId, Entity, FilePathId, GraphStore, Hash256, LocatedEntry, RelationKind, RepoPath,
+    ArtifactId, Entity, EntityStore, FilePathId, Hash256, LocatedEntry, RelationKind, RepoPath,
     TransactionDelta, TreeDelta, TreeEntry,
 };
 
@@ -78,7 +78,7 @@ fn parse(path: &str, source: &str) -> (FileParseData, Vec<Entity>) {
         .index_file_content_with_tests(
             &FilePathId::new(path),
             source.as_bytes(),
-            Hash256::from_bytes([5; 32]),
+            kin_blobs::Hash256::from_bytes([5; 32]),
         )
         .unwrap_or_else(|error| panic!("indexing {path} failed: {error}"))
         .indexed_file;
@@ -159,7 +159,7 @@ fn focal(entities: &[Entity], name: &str, file: &str) -> Entity {
 /// Resolved `Calls` edges leaving one file, counted the way the gate counts
 /// them, so the fixture cannot drift into proving something else.
 fn resolved_call_edges(graph: &InMemoryGraph, entities: &[Entity], file: &str) -> u64 {
-    let mut total = 0;
+    let mut total: u64 = 0;
     for entity in entities
         .iter()
         .filter(|entity| entity.file_origin.as_ref().is_some_and(|f| f.0 == file))
@@ -174,7 +174,7 @@ fn resolved_call_edges(graph: &InMemoryGraph, entities: &[Entity], file: &str) -
             })
             .count() as u64;
     }
-    total as u64
+    total
 }
 
 /// The finding, in one reading. The gate must name the file holding a call the
