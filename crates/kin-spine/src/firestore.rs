@@ -5576,6 +5576,45 @@ mod tests {
              {refused:?}"
         );
 
+        // The precondition on its own, isolated. Reclamation removes the
+        // marker AND the manifest, so the arm above cannot show WHICH guard
+        // refused: both halves of the stage precondition read absent and the
+        // commit would fail on the missing manifest regardless. Moving only the
+        // marker's revision leaves every other row in place, so a refusal here
+        // can only have come from the revision comparison.
+        let intact_store = Arc::new(FakeSpineStore::default());
+        let intact_backend = FirestoreSpineBackend::with_store(intact_store.clone());
+        publish_success(
+            &intact_backend,
+            metadata_publication("repo", 5, "root-5", Vec::new()),
+        );
+        let intact_paused = intact_backend
+            .prepare_repo_publication(metadata_publication(
+                "repo",
+                6,
+                "root-6",
+                vec![test_entry("repo", "later", EntityKind::Function)],
+            ))
+            .expect("a newer stage prepares");
+        let intact_id = intact_paused.candidate_head().publication_id.clone();
+        intact_store.bump_stage_revision(&intact_id);
+        {
+            let state = intact_store.publication_state.lock().unwrap();
+            assert!(
+                state.stages.contains_key(&intact_id) && state.manifests.contains_key(&intact_id),
+                "the stage and its manifest must survive, or this arm proves nothing about \
+                 the precondition"
+            );
+        }
+        let moved = intact_backend
+            .commit_repo_publication(intact_paused)
+            .expect("a writer whose marker moved is classified, not an error");
+        assert!(
+            matches!(moved, RepoPublicationCommit::Conflict(_)),
+            "a writer whose stage marker revision moved under it must lose its \
+             precondition, got {moved:?}"
+        );
+
         // The fence half, on the same shape: a returning writer whose rollout
         // fence advanced under it loses on the fence, and says so.
         let fenced_store = Arc::new(FakeSpineStore::default());

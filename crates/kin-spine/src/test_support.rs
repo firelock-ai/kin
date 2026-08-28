@@ -282,6 +282,31 @@ impl FakeSpineStore {
     /// Waiting an hour is not a test. This moves the one input the TTL reads,
     /// and nothing else, so a test that ages a stage and then sees it reclaimed
     /// has shown the age is what did it.
+    /// Move a stage marker's revision without removing the stage.
+    ///
+    /// Reclamation deletes the marker AND the manifest, so a writer returning
+    /// after one cannot show which guard refused it: both halves of the stage
+    /// precondition read absent and the commit would fail on the missing
+    /// manifest anyway. This moves only the revision, leaving every other row
+    /// in place, so a refusal can only have come from the precondition.
+    pub fn bump_stage_revision(&self, publication_id: &str) {
+        let mut state = self.publication_state.lock().unwrap();
+        let current = state
+            .stage_marker_values
+            .get(publication_id)
+            .cloned()
+            .expect("bumping a stage marker that was never written");
+        apply_fake_stage_marker(
+            &mut state,
+            publication_id,
+            FakeStageMarkerValue {
+                stage_sequence: current.stage_sequence + 1,
+                revision_kind: current.revision_kind,
+                revision_nonce: format!("{}:bumped", current.revision_nonce),
+            },
+        );
+    }
+
     pub fn age_stage(&self, publication_id: &str, by: std::time::Duration) {
         let mut state = self.publication_state.lock().unwrap();
         assert!(
