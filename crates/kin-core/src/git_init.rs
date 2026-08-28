@@ -1824,7 +1824,7 @@ mod tests {
             found.reclaimable_bytes() > 0,
             "a stranded capture holds bytes, and reporting zero would hide them"
         );
-        let rendered = crate::init_attempt::post_mortem_lines(found, None).join("\n");
+        let rendered = crate::init_attempt::post_mortem_lines(found, None, &source).join("\n");
         assert!(
             rendered.contains(&format!(
                 "phase {} of {}, {}",

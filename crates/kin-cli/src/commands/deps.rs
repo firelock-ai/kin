@@ -27,6 +27,13 @@ pub struct RepoDependencyView {
     pub repo_id: String,
     pub depends_on: Vec<DependencyEdge>,
     pub consumers: Vec<DependencyEdge>,
+    /// This repository's registration was written before any build recorded
+    /// dependencies, so an empty `depends_on` cannot be read as none.
+    pub depends_on_predates_recording: bool,
+    /// At least one OTHER registered repository's registration was, so an empty
+    /// `consumers` cannot be read as none either. A separate fact because the
+    /// two directions are answered by different entries' records.
+    pub consumers_predate_recording: bool,
 }
 
 /// Show the cross-repo dependencies of the repository the caller is in.
@@ -175,6 +182,11 @@ pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<Rep
         repo_id: repo_id.to_string(),
         depends_on,
         consumers,
+        depends_on_predates_recording: selected.dependencies_recorded_by.is_none(),
+        consumers_predate_recording: registry
+            .repos
+            .iter()
+            .any(|other| other.id != repo_id && other.dependencies_recorded_by.is_none()),
     })
 }
 
@@ -213,12 +225,18 @@ pub fn render_repo_view_lines(view: &RepoDependencyView) -> Vec<String> {
         }
     }
 
-    if view.depends_on.is_empty() || view.consumers.is_empty() {
+    // Keyed on which registrations recorded a build, not on the emptiness
+    // itself. An empty direction written by a build that records dependencies
+    // is a measured zero and saying it "may be unrecorded" makes the reader
+    // doubt a correct answer.
+    let unrecorded_direction = (view.depends_on.is_empty() && view.depends_on_predates_recording)
+        || (view.consumers.is_empty() && view.consumers_predate_recording);
+    if unrecorded_direction {
         lines.push(String::new());
         lines.push(
-            "note: dependency records are written when `kin init` registers a repository, so \
-             empty directions here may mean this repository predates that registration rather \
-             than that none exist."
+            "note: dependency records are written when `kin init` registers a repository, and a \
+             registration here predates that, so an empty direction above may mean unrecorded \
+             rather than none."
                 .to_string(),
         );
     }
@@ -280,12 +298,24 @@ fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()
     }
 
     println!("Cross-repo dependencies:\n");
+    // Which registrations were written by a build that records dependencies at
+    // all. The caveat below keys on this and never on an empty listing: with
+    // axum and flask both registered minutes earlier by the same 0.6.0 binary,
+    // keying on emptiness named them both as possibly predating that binary.
+    let predates_recording: HashSet<&str> = registry
+        .repos
+        .iter()
+        .filter(|repo| repo.dependencies_recorded_by.is_none())
+        .map(|repo| repo.id.as_str())
+        .collect();
     let mut unrecorded = Vec::new();
     for (id, deps) in &repo_deps {
         println!("  {}", id);
         if deps.is_empty() {
             println!("    (no cross-repo dependencies recorded)");
-            unrecorded.push(id.clone());
+            if predates_recording.contains(id.as_str()) {
+                unrecorded.push(id.clone());
+            }
         } else {
             for (name, dep_type) in deps {
                 println!("    -> {} ({})", name, dep_type);
@@ -296,9 +326,9 @@ fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()
 
     if !unrecorded.is_empty() {
         println!(
-            "note: dependency records are written when `kin init` registers a repository, so a \
-             repository initialized before this build may show no records rather than no \
-             dependencies: {}",
+            "note: dependency records are written when `kin init` registers a repository, and \
+             these registrations predate that, so their empty listing may mean unrecorded \
+             rather than no dependencies: {}",
             unrecorded.join(", ")
         );
     }
@@ -419,6 +449,7 @@ mod tests {
             entities: 0,
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies,
+            dependencies_recorded_by: None,
         }
     }
 
@@ -429,6 +460,7 @@ mod tests {
             entities: 0,
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies,
+            dependencies_recorded_by: None,
         }
     }
 
@@ -639,6 +671,7 @@ mod tests {
                 entities: 0,
                 last_commit: "2026-01-01T00:00:00Z".to_string(),
                 dependencies: Vec::new(),
+                dependencies_recorded_by: None,
             },
         ];
 

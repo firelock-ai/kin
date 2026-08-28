@@ -5996,17 +5996,87 @@ enum DaemonReadinessError {
     Timeout(String),
 }
 
+/// The stderr line a cold start prints while the caller waits for it.
+///
+/// Reports the phase the startup is actually in rather than a spinner, reading
+/// it from the lifecycle markers the daemon writes ([`daemon_startup_phase`]),
+/// so a wait that is stuck on the graph load says so and a wait that never got
+/// past spawning says that instead. On stderr, so a `--json` caller's stdout
+/// stays one parseable document, which is the same rule `kin cache status` and
+/// the init phase ladder already follow.
+struct StartupNotice {
+    progress: crate::progress::Progress,
+    started: Instant,
+    closed: bool,
+}
+
+impl StartupNotice {
+    fn open() -> Self {
+        let mut progress = crate::progress::Progress::stderr();
+        progress.update(format_args!(
+            "starting the kin daemon for this repository; the first query after a start waits \
+             for it to load the graph"
+        ));
+        Self {
+            progress,
+            started: Instant::now(),
+            closed: false,
+        }
+    }
+
+    fn tick(&mut self, kin_root: &Path) {
+        self.progress.update(format_args!(
+            "{} ({:.1}s)",
+            daemon_startup_phase(kin_root),
+            self.started.elapsed().as_secs_f64()
+        ));
+    }
+
+    /// Say the start finished and how long it took.
+    ///
+    /// The elapsed figure is the point. A reader who has just waited wants to
+    /// know whether the wait was the daemon or their query, and a closing line
+    /// with no number cannot answer that.
+    fn close(&mut self) {
+        self.closed = true;
+        self.progress.finish_with(format_args!(
+            "kin daemon ready in {:.1}s",
+            self.started.elapsed().as_secs_f64()
+        ));
+    }
+}
+
+/// Leave the cursor on its own line however this start ended.
+///
+/// On a terminal the ticks overwrite one line with `\r` and every early return
+/// between the announcement and readiness would otherwise print its error onto
+/// the half-written phase. There are several such returns (no daemon binary, a
+/// spawn that fails, a readiness timeout), so the guarantee belongs here rather
+/// than at each of them.
+impl Drop for StartupNotice {
+    fn drop(&mut self) {
+        if !self.closed {
+            self.progress.finish();
+        }
+    }
+}
+
 async fn wait_for_daemon_ready(
     kin_root: &Path,
     child: &mut Child,
     deadline: Instant,
     log_offset: u64,
+    notice: Option<&mut StartupNotice>,
 ) -> std::result::Result<String, DaemonReadinessError> {
     let timeout = deadline.saturating_duration_since(Instant::now());
     let client = daemon_health_client();
     let mut last_error = String::from("daemon did not report its port");
+    let mut notice = notice;
 
     while Instant::now() < deadline {
+        if let Some(notice) = notice.as_deref_mut() {
+            notice.tick(kin_root);
+        }
         if let Some(status) = child
             .try_wait()
             .context("check daemon child status")
@@ -7132,6 +7202,13 @@ pub async fn ensure_daemon_running_with_idle_timeout(
         ExistingDaemon::None => {}
     }
 
+    // Everything above this line either attached to a live daemon or proved
+    // there is none, so from here the caller is paying for a start. A stranger's
+    // first query after `kin daemon stop` took 7,552 ms against 78 ms warm and
+    // printed nothing for all of it, and silence and a hang are the same thing
+    // to read. Announced here rather than at entry so a warm call, which is
+    // every call that returned above, stays silent.
+    let mut notice = Some(StartupNotice::open());
     let daemon_bin = find_daemon_binary().map_err(|error| match error {
         DaemonBinaryDiscoveryError::NotFound => AutoStartError::BinaryNotFound,
         DaemonBinaryDiscoveryError::Invalid(detail) => AutoStartError::SpawnFailed(detail),
@@ -7185,16 +7262,27 @@ pub async fn ensure_daemon_running_with_idle_timeout(
 
     let timeout_secs = daemon_ready_timeout_secs();
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
-    let readiness = wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset).await;
+    let readiness =
+        wait_for_daemon_ready(kin_root, &mut child, deadline, log_offset, notice.as_mut()).await;
     // The daemon outlives this call either way, and this process may outlive the
     // daemon: `kin mcp start` reaches here for a whole agent session. Dropping
     // the handle waits on nothing, so hand it to the reaper before the borrow
     // ends rather than leaving a corpse behind for the session's duration.
     kin_daemon_spawn::adopt_watched_daemon_child(child, watch);
-    let base_url = readiness.map_err(|error| match error {
-        DaemonReadinessError::Failed(error) => AutoStartError::spawn(format!("{error:#}")),
-        DaemonReadinessError::Timeout(detail) => AutoStartError::StartupTimeout(detail),
-    })?;
+    let base_url = match readiness {
+        Ok(base_url) => {
+            if let Some(notice) = notice.as_mut() {
+                notice.close();
+            }
+            base_url
+        }
+        Err(DaemonReadinessError::Failed(error)) => {
+            return Err(AutoStartError::spawn(format!("{error:#}")))
+        }
+        Err(DaemonReadinessError::Timeout(detail)) => {
+            return Err(AutoStartError::StartupTimeout(detail))
+        }
+    };
     register_repo_daemon_with_supervisor(kin_root, &base_url, &supervisor_url)
         .await
         .map_err(AutoStartError::spawn)?;

@@ -2425,7 +2425,7 @@ pub async fn run(
     // Persist the paging cursor so `kin locate --next` can fetch the next page
     // without the caller re-supplying the query. Best-effort; never fatal.
     super::locate_cursor::persist_locate_cursor(result.next_cursor.as_deref());
-    output_result(&result, json, explain);
+    output_result(&result, json, explain, text);
     Ok(())
 }
 
@@ -2610,7 +2610,7 @@ pub fn run_with_graph(
     max_files_explicit: bool,
 ) -> Result<()> {
     let result = run_with_graph_capture(graph, text, explain, max_files, max_files_explicit)?;
-    output_result(&result, json, explain);
+    output_result(&result, json, explain, text);
     Ok(())
 }
 
@@ -18059,14 +18059,14 @@ fn coverage_banner(coverage: &SemanticCoverage) -> Option<String> {
     }))
 }
 
-fn output_result(result: &LocateResult, json: bool, explain: bool) {
+fn output_result(result: &LocateResult, json: bool, explain: bool, query: &str) {
     if json {
         println!(
             "{}",
             serde_json::to_string_pretty(result).unwrap_or_default()
         );
     } else {
-        output_text(result, explain);
+        output_text(result, explain, query);
     }
 }
 
@@ -18089,30 +18089,14 @@ fn output_result(result: &LocateResult, json: bool, explain: bool) {
 /// the emitted rank is explicit, and the per-row score is held back for
 /// `--explain`, where it is one diagnostic among the per-signal and per-stage
 /// breakdowns rather than an implied ordering.
-fn output_text(result: &LocateResult, explain: bool) {
-    // 0.1-R5: surface degraded semantic coverage on the main path. Written to
-    // stderr so the stdout file list stays clean for piping.
-    if let Some(banner) = result.semantic_coverage.as_ref().and_then(coverage_banner) {
-        eprintln!("⚠ {banner}");
-    }
-    // No-silent-degradation: one stderr line per capability that could not
-    // fully run, with the remediation. The coverage banner above already
-    // covers the vector-index state, so skip its duplicate entry here.
-    for degradation in &result.degradations {
-        if degradation.component == "vector_index"
-            && result.semantic_coverage.is_some()
-            && degradation.reason != "query_failed"
-        {
-            continue;
+fn output_text(result: &LocateResult, explain: bool, query: &str) {
+    let notes = coverage_notes(result);
+    if explain {
+        for note in &notes {
+            eprintln!("⚠ {}", note.full);
         }
-        if degradation.remediation.is_empty() {
-            eprintln!("⚠ {}: {}", degradation.component, degradation.detail);
-        } else {
-            eprintln!(
-                "⚠ {}: {} — {}",
-                degradation.component, degradation.detail, degradation.remediation
-            );
-        }
+    } else if let Some(summary) = collapsed_notes_line(&notes) {
+        eprintln!("⚠ {summary}");
     }
     if result.files.is_empty() {
         println!("No relevant files found.");
@@ -18126,9 +18110,157 @@ and are not comparable between rows"
         );
     }
 
-    for line in locate_text_lines(result, explain) {
+    for line in locate_text_lines(result, explain, query) {
         println!("{}", line);
     }
+
+    if let Some(floor) = answer_floor_note(result, query) {
+        eprintln!("⚠ {floor}");
+    }
+}
+
+/// One note about how the answer was produced, in both the lengths a surface
+/// needs.
+struct CoverageNote {
+    /// The machine-readable component, which is what the summary line names so
+    /// a reader can ask for the one they care about.
+    component: String,
+    /// Everything the note has to say, printed under `--explain`.
+    full: String,
+}
+
+/// Every note this answer owes a reader about its own coverage, longest form.
+///
+/// The coverage banner and the degradation ledger answer different questions
+/// (how much of the store ranking could see, versus which capability ran
+/// short), so both are here, and the vector-index degradation is dropped when
+/// the banner already carried that state rather than printed twice.
+fn coverage_notes(result: &LocateResult) -> Vec<CoverageNote> {
+    let mut notes = Vec::new();
+    if let Some(banner) = result.semantic_coverage.as_ref().and_then(coverage_banner) {
+        notes.push(CoverageNote {
+            component: "semantic_coverage".to_string(),
+            full: banner,
+        });
+    }
+    for degradation in &result.degradations {
+        if degradation.component == "vector_index"
+            && result.semantic_coverage.is_some()
+            && degradation.reason != "query_failed"
+        {
+            continue;
+        }
+        let full = if degradation.remediation.is_empty() {
+            format!("{}: {}", degradation.component, degradation.detail)
+        } else {
+            format!(
+                "{}: {} — {}",
+                degradation.component, degradation.detail, degradation.remediation
+            )
+        };
+        notes.push(CoverageNote {
+            component: degradation.component.clone(),
+            full,
+        });
+    }
+    notes
+}
+
+/// The one line that stands in for every note, or `None` when there are none.
+///
+/// A stranger's first `kin locate` printed about 1,100 characters of stacked
+/// warnings ahead of five result lines: the vector index was absent, the
+/// capability tier had narrowed a budget, and the role filter had withheld 134
+/// test paths. Each is worth having and none of them was the answer. Collapsed,
+/// the answer is first and every fact is one flag away, which is the trade this
+/// surface should make on a first run. `--explain` prints them all, unchanged.
+///
+/// The line names the components rather than only counting them, because a
+/// count alone cannot tell a reader whether the thing they care about is in
+/// there, and a reader who cannot tell has to re-run to find out.
+fn collapsed_notes_line(notes: &[CoverageNote]) -> Option<String> {
+    if notes.is_empty() {
+        return None;
+    }
+    let mut components: Vec<&str> = notes.iter().map(|note| note.component.as_str()).collect();
+    components.dedup();
+    Some(format!(
+        "{} note{} on how this answer was produced ({}). Re-run with --explain to read {}.",
+        notes.len(),
+        if notes.len() == 1 { "" } else { "s" },
+        components.join(", "),
+        if notes.len() == 1 { "it" } else { "them" },
+    ))
+}
+
+/// What evidence one ranked row rests on, from the symbols locate attributed
+/// to it.
+///
+/// Reuses [`classify_locate_match`], so the file surface and the entity surface
+/// answer "did the query name this" with one predicate rather than two that can
+/// drift. A row keeps its strongest symbol's kind: a file holding the symbol
+/// the query named is a named match whatever else it also holds.
+///
+/// A row with no attributed symbols is a text fallback, which is the honest
+/// reading rather than the flattering one: nothing about it was named and
+/// nothing about it came through the vector pool that this surface can see.
+fn file_row_match_kind(entry: &LocateFileEntry, query: &str) -> LocateMatchKind {
+    entry
+        .symbols
+        .iter()
+        .map(|symbol| {
+            classify_locate_match(query, &symbol.name, &symbol.origin, symbol.cosine)
+        })
+        .max_by_key(|kind| locate_match_kind_strength(*kind))
+        .unwrap_or(LocateMatchKind::TextFallback)
+}
+
+/// The bracketed strength a row carries.
+///
+/// A label rather than the score. The per-row score is stage-composed and is
+/// not comparable between rows (see [`output_text`]) or between queries, so a
+/// number printed beside a path would imply a comparison it cannot support and
+/// a threshold over it would drop real answers to hide wrong ones. What kind of
+/// evidence a row rests on is comparable, and it is the fact a reader is
+/// actually asking for.
+fn match_kind_row_label(kind: LocateMatchKind) -> &'static str {
+    match kind {
+        LocateMatchKind::Name => "named match",
+        LocateMatchKind::Semantic => "vector match",
+        LocateMatchKind::TextFallback => "lexical and graph only",
+    }
+}
+
+/// What to say when no row cleared the answer floor, or `None` when one did.
+///
+/// The floor is named rather than numeric: at least one returned row holds a
+/// symbol this query named, or carries vector evidence. Nothing here is a score
+/// threshold, for the reason [`LocateResult::all_fallback`] gives: a composite
+/// score is not comparable across queries, so a bar over it would drop real
+/// answers to hide wrong ones.
+///
+/// It exists because `kin locate "Router path_router"` inside a Flask store
+/// returned six confident-looking Flask paths with no caveat, and the reverse
+/// control did the same. Scoping was right in both directions; the rows simply
+/// never said that nothing had matched.
+fn answer_floor_note(result: &LocateResult, query: &str) -> Option<String> {
+    if result.files.is_empty() {
+        return None;
+    }
+    let cleared = result
+        .files
+        .iter()
+        .any(|entry| file_row_match_kind(entry, query) != LocateMatchKind::TextFallback);
+    if cleared {
+        return None;
+    }
+    let rows = result.files.len();
+    Some(format!(
+        "no row cleared the answer floor, which is one returned file holding a symbol this \
+         query named, or one carrying vector evidence. All {rows} rank on lexical and graph \
+         signals alone, so they are this store's nearest neighbours for your words rather \
+         than a match. Name a symbol, file or identifier for a stronger answer."
+    ))
 }
 
 /// The stdout lines `output_text` prints for the ranked file list, in order.
@@ -18136,20 +18268,24 @@ and are not comparable between rows"
 /// Split out from the printing so the emitted order and row shape are directly
 /// testable. Rows keep `result.files` order; see [`output_text`] for why that
 /// order is authoritative and why the per-row score is `--explain` only.
-fn locate_text_lines(result: &LocateResult, explain: bool) -> Vec<String> {
+fn locate_text_lines(result: &LocateResult, explain: bool, query: &str) -> Vec<String> {
     let mut lines = Vec::new();
     for (index, entry) in result.files.iter().enumerate() {
         let rank = index + 1;
         let signals = entry.signals.join(", ");
+        // Appended after the existing parenthesised group rather than inside
+        // it, so the row shape every other surface and test already pins stays
+        // byte-identical up to the bracket.
+        let strength = match_kind_row_label(file_row_match_kind(entry, query));
         if explain {
             lines.push(format!(
-                "  {:>3}. {:<50} (score: {:.2}, signals: {})",
-                rank, entry.path, entry.score, signals
+                "  {:>3}. {:<50} (score: {:.2}, signals: {}) [{}]",
+                rank, entry.path, entry.score, signals, strength
             ));
         } else {
             lines.push(format!(
-                "  {:>3}. {:<50} (signals: {})",
-                rank, entry.path, signals
+                "  {:>3}. {:<50} (signals: {}) [{}]",
+                rank, entry.path, signals, strength
             ));
         }
         for reason in &entry.explain {
@@ -19762,7 +19898,7 @@ mod tests {
     #[test]
     fn locate_text_rows_keep_ranked_order_over_printed_score() {
         let result = non_monotonic_ranking();
-        let lines = locate_text_lines(&result, false);
+        let lines = locate_text_lines(&result, false, "");
         let paths: Vec<&str> = lines
             .iter()
             .map(|line| line.split_whitespace().nth(1).unwrap())
@@ -19786,7 +19922,7 @@ mod tests {
 
     #[test]
     fn locate_text_rows_omit_incomparable_score_by_default() {
-        let lines = locate_text_lines(&non_monotonic_ranking(), false);
+        let lines = locate_text_lines(&non_monotonic_ranking(), false, "");
         for line in &lines {
             assert!(
                 !line.contains("score:"),
@@ -19801,7 +19937,7 @@ mod tests {
 
     #[test]
     fn locate_text_rows_carry_score_under_explain() {
-        let lines = locate_text_lines(&non_monotonic_ranking(), true);
+        let lines = locate_text_lines(&non_monotonic_ranking(), true, "");
         assert!(
             lines[1].contains("(score: 45.79, signals: lexical, graph)"),
             "explain keeps the score as a diagnostic: {:?}",
@@ -19825,7 +19961,7 @@ mod tests {
             .iter()
             .map(|f| f["path"].as_str().expect("path string").to_string())
             .collect();
-        let text_paths: Vec<String> = locate_text_lines(&result, false)
+        let text_paths: Vec<String> = locate_text_lines(&result, false, "")
             .iter()
             .map(|line| line.split_whitespace().nth(1).unwrap().to_string())
             .collect();
@@ -19839,7 +19975,7 @@ mod tests {
     fn locate_text_indents_explain_reasons_under_their_row() {
         let mut result = non_monotonic_ranking();
         result.files[0].explain = vec!["seeded by entity resolve".to_string()];
-        let lines = locate_text_lines(&result, true);
+        let lines = locate_text_lines(&result, true, "");
         assert!(lines[0].contains("src/top.rs"), "{:?}", lines[0]);
         assert_eq!(
             lines[1], "    - seeded by entity resolve",
