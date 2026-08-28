@@ -438,6 +438,34 @@ jobs:
             echo "::warning title=Response budget elision suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Trace spine clipping suite (verdict comes from the gate step)
+        id: trace_spine
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/trace_spine_clipping_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/trace_spine.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/trace_spine.log 2>&1 || rc=$?
+          cat acceptance/trace_spine.log
+          {
+            echo "### Trace spine clipping suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/trace_spine.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Trace spine clipping suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       - name: Parse-hole acceptance suite (verdict comes from the gate step)
         id: parsehole
         if: always()
@@ -841,6 +869,7 @@ jobs:
             --report magic=acceptance/magic.json \
             --report brownfield=acceptance/brownfield.json \
             --report response_budget=acceptance/response_budget.json \
+            --report trace_spine=acceptance/trace_spine.json \
             --report parsehole=acceptance/parsehole.json \
             --report hydration_semantics=acceptance/hydration_semantics.json \
             --report sameowner=acceptance/sameowner.json \
