@@ -25,6 +25,12 @@ can be satisfied by a broken tool:
      budget's name, and leaves no group empty
   6  a row whose inline source the budget took says so on the row
   7  `kin context` names the same cut in its lines and in its `--json`
+  9  each granularity names the literal collection it answers with, and the
+     count it publishes for it matches the array it ships
+ 10  a file page is a window over the file ranking rather than the whole
+     roll-up re-emitted under an advancing cursor
+ 11  an entity page that ranked nothing still ships its primary as an empty
+     array and counts it zero, with a populated page as the control
 
 FIR-2482 is checks 5 to 7, and it is the same rule reached through the OTHER
 budget. A context pack is cut twice: its own token budget refuses candidates
@@ -35,6 +41,13 @@ six dependencies serializes, and `kin context` printed "Dependencies: 6 entries"
 for both. The body case is the same defect one field down: a row that lost its
 source to the budget lost the key outright, which is the shape of a `compact`
 call and of source the graph never had.
+
+FIR-2814 is checks 9 to 11, and it is the same reading defect one field over. A
+`LocateResult` skips its `entities` array when empty while the secondary `files`
+roll-up serializes whatever it holds, so the one page that most needs to read as
+empty shipped no primary key at all beside a populated roll-up, and every reader
+had to re-derive which array was the answer from `granularity` and `routing`.
+Two of them did, in two places, with two slightly different rules.
 
 FIR-2602 is check 4. `impact_analysis` reported `{"bounded": false,
 "chars_before_budget": 50354, "max_chars": 2000}` and shipped all 50,354
@@ -1266,6 +1279,333 @@ def check_8(suite):
     return res
 
 
+# The keys a `semantic_locate` response may name as its primary collection:
+# `entities` on the fused arm, `results` on the cosine arm, `files` at file
+# granularity. Named here so a check grading a key outside this set is grading
+# something that is not a locate primary.
+LOCATE_PRIMARIES = ("entities", "results", "files")
+ENTITY_PRIMARIES = ("entities", "results")
+
+
+def declared_primary(payload):
+    """The collection this response names as its answer, or None."""
+    return ((payload.get("_kin") or {}).get("response") or {}).get("primary_collection")
+
+
+def declared_rows(payload):
+    """The row count this response publishes for its named primary, or None."""
+    return ((payload.get("_kin") or {}).get("response") or {}).get("primary_rows")
+
+
+def grade_primary_declaration(payload, allowed):
+    """Problems with how one locate page identifies its primary collection.
+
+    A reader must not have to infer which array is the answer, because presence
+    cannot tell it. `LocateResult` skips its `entities` field when empty while
+    the secondary `files` roll-up serializes whatever it holds, so on the one
+    page that most needs qualifying the first present array is the wrong one.
+    Returns a list of problems, empty on pass, so the self-test can drive it
+    with no binary.
+    """
+    problems = []
+    named = declared_primary(payload)
+    if not isinstance(named, str) or not named:
+        problems.append(
+            "the response named no primary collection in _kin.response, so a reader has to "
+            "guess which of %s is the answer" % (LOCATE_PRIMARIES,)
+        )
+        return problems
+    if named not in allowed:
+        problems.append(
+            "granularity %r named %r as its primary, which is not one of %s"
+            % (payload.get("granularity"), named, allowed)
+        )
+    rows = payload.get(named)
+    if not isinstance(rows, list):
+        problems.append(
+            "the response named %r as its primary and does not carry it as an array (got "
+            "%r), so an empty primary reads as a shape that has none"
+            % (named, type(rows).__name__)
+        )
+        return problems
+    count = declared_rows(payload)
+    if not isinstance(count, int):
+        problems.append(
+            "the response published no integer primary_rows beside `%s`" % named
+        )
+    elif count != len(rows):
+        problems.append(
+            "_kin.response.primary_rows says %d and `%s` carries %d rows"
+            % (count, named, len(rows))
+        )
+    return problems
+
+
+def grade_file_window(page1, page2, page_size):
+    """Problems with a file-granularity page that has to be a window.
+
+    A continuation that re-emits the whole roll-up hands back the same answer
+    while advancing a cursor, which reads as paging and is not. Pass `page2` as
+    None when the first page minted no cursor.
+    """
+    problems = []
+    rows = page1.get("files")
+    if not isinstance(rows, list):
+        problems.append("the first file page carries no `files` array")
+        return problems
+    if len(rows) > page_size:
+        problems.append(
+            "a page_size of %d returned %d file rows, so the page is not a window"
+            % (page_size, len(rows))
+        )
+    pages = [("page 1", page1)] + ([("page 2", page2)] if page2 is not None else [])
+    for label, page in pages:
+        for key in ENTITY_PRIMARIES:
+            carried = page.get(key)
+            if isinstance(carried, list) and carried:
+                problems.append(
+                    "%s of a file answer carries %d `%s` rows, so the entity ranking rides "
+                    "along with the file one" % (label, len(carried), key)
+                )
+    if page2 is None:
+        return problems
+    second = page2.get("files")
+    if not isinstance(second, list):
+        problems.append("the continuation carries no `files` array")
+        return problems
+    first_paths = [row.get("path") for row in rows]
+    second_paths = [row.get("path") for row in second]
+    if first_paths and first_paths == second_paths:
+        problems.append(
+            "the continuation repeated the first page verbatim: %r" % (first_paths,)
+        )
+    overlap = sorted(set(first_paths) & set(second_paths))
+    if overlap:
+        problems.append(
+            "the continuation repeated %d path(s) the first page already carried: %r"
+            % (len(overlap), overlap)
+        )
+    return problems
+
+
+def grade_empty_primary(payload):
+    """Problems with a page whose primary collection holds nothing.
+
+    Zero rows is an answer and has to read as one. The defect this grades is the
+    page that omits its empty primary outright and ships a secondary roll-up
+    beside it, which a reader takes for the answer. Fails when handed a
+    populated page, so the populated control cannot satisfy it by accident.
+    """
+    problems = grade_primary_declaration(payload, LOCATE_PRIMARIES)
+    named = declared_primary(payload)
+    if not isinstance(named, str) or not isinstance(payload.get(named), list):
+        return problems
+    rows = payload[named]
+    if rows:
+        problems.append(
+            "this grader was handed a populated primary: %d rows in `%s`"
+            % (len(rows), named)
+        )
+        return problems
+    if declared_rows(payload) != 0:
+        problems.append(
+            "`%s` is empty and _kin.response.primary_rows says %r"
+            % (named, declared_rows(payload))
+        )
+    return problems
+
+
+def grade_populated_primary(payload):
+    """Problems with a page that ranked something. The control direction.
+
+    A server that reported every page empty would satisfy `grade_empty_primary`
+    on every call, so the populated arm is graded by its own rule.
+    """
+    problems = grade_primary_declaration(payload, LOCATE_PRIMARIES)
+    named = declared_primary(payload)
+    if not isinstance(named, str) or not isinstance(payload.get(named), list):
+        return problems
+    if not payload[named]:
+        problems.append(
+            "this grader was handed an empty primary `%s`, so the populated control did "
+            "not rank anything" % named
+        )
+    return problems
+
+
+def secondary_rows(payload):
+    """Rows the page carries in collections that are NOT its declared primary."""
+    named = declared_primary(payload)
+    return {
+        key: len(payload[key])
+        for key in LOCATE_PRIMARIES
+        if key != named and isinstance(payload.get(key), list) and payload[key]
+    }
+
+
+def check_9(suite):
+    res = Result(
+        "9", "FIR-2814", "each granularity names the literal collection it answers with"
+    )
+    try:
+        entity = suite.mcp(
+            "semantic_locate",
+            {"query": "hop", "granularity": "entity", "limit": 5, "include_snippet": False},
+        )
+        files = suite.mcp(
+            "semantic_locate", {"query": "hop", "granularity": "file", "limit": 5}
+        )
+    except McpError as exc:
+        res.unknown("semantic_locate unreadable: %s" % exc)
+        return res
+    for problem in grade_primary_declaration(entity, ENTITY_PRIMARIES):
+        res.bad("entity granularity: %s" % problem)
+    for problem in grade_primary_declaration(files, ("files",)):
+        res.bad("file granularity: %s" % problem)
+    # Both halves together, because a server answering `files` to everything
+    # satisfies the file half alone and a server answering `entities` to
+    # everything satisfies the entity half alone.
+    if not res.failed:
+        res.ok(
+            "entity granularity named `%s` with %s rows and file granularity named `%s` "
+            "with %s rows"
+            % (
+                declared_primary(entity),
+                declared_rows(entity),
+                declared_primary(files),
+                declared_rows(files),
+            )
+        )
+    return res
+
+
+def check_10(suite):
+    res = Result("10", "FIR-2814", "a file page is a window, not the whole roll-up")
+    page_size = 1
+    # The continuation case needs a ranking wider than one page, and which query
+    # reaches two files is a property of the fixture rather than of the rule
+    # under test. So the query is chosen by measuring, and the sizes each one
+    # reached are reported when none of them does.
+    # `return` is measured rather than guessed: on this fixture it is the one
+    # token both source modules carry, so it ranks two files where every other
+    # candidate ranks one. The others stay as fallbacks in case the fixture
+    # grows.
+    seen = []
+    first = None
+    query = None
+    for candidate in ("return", "hop", "value"):
+        try:
+            probe = suite.mcp(
+                "semantic_locate",
+                {
+                    "query": candidate,
+                    "granularity": "file",
+                    "page_size": page_size,
+                    "limit": 20,
+                },
+            )
+        except McpError as exc:
+            res.unknown("semantic_locate unreadable: %s" % exc)
+            return res
+        seen.append((candidate, probe.get("total_ranked")))
+        if isinstance(probe.get("total_ranked"), int) and probe["total_ranked"] > page_size:
+            first, query = probe, candidate
+            break
+    if first is None:
+        res.unknown(
+            "no fixture query ranked more than %d file(s), so the continuation case was "
+            "not reached: %r" % (page_size, seen)
+        )
+        return res
+    total = first["total_ranked"]
+    cursor = first.get("next_cursor")
+    if not cursor:
+        res.bad(
+            "a %d-row file ranking returned %d row(s) and no cursor, so the rest is "
+            "unreachable" % (total, len(first.get("files") or []))
+        )
+        return res
+    try:
+        second = suite.mcp(
+            "semantic_locate", {"query": query, "granularity": "file", "cursor": cursor}
+        )
+    except McpError as exc:
+        res.unknown("the file continuation was unreadable: %s" % exc)
+        return res
+    for problem in grade_file_window(first, second, page_size):
+        res.bad(problem)
+    if not res.failed:
+        res.ok(
+            "page 1 carried %r and page 2 carried %r out of %d ranked files"
+            % (
+                [row.get("path") for row in first["files"]],
+                [row.get("path") for row in second["files"]],
+                total,
+            )
+        )
+    return res
+
+
+def check_11(suite):
+    res = Result(
+        "11", "FIR-2814", "an entity page that ranked nothing ships its empty primary"
+    )
+    # Which query empties the ranking is a property of the fixture, not of the
+    # rule under test, so it is measured rather than guessed. A multi-token
+    # absent symbol does NOT empty it: fused retrieval returns its best
+    # candidates and flags `all_fallback`, which is the documented behaviour
+    # rather than a defect. A single unmatched token does.
+    seen = []
+    empty = None
+    try:
+        for candidate in ("zzz", "quaternion sedimentation", "a0"):
+            probe = suite.mcp(
+                "semantic_locate",
+                {
+                    "query": candidate,
+                    "granularity": "entity",
+                    "limit": 5,
+                    "include_snippet": False,
+                },
+            )
+            named = declared_primary(probe)
+            rows = probe.get(named) if isinstance(named, str) else None
+            seen.append((candidate, named, len(rows) if isinstance(rows, list) else rows))
+            if isinstance(rows, list) and not rows:
+                empty = probe
+                break
+        populated = suite.mcp(
+            "semantic_locate",
+            {"query": "hop", "granularity": "entity", "limit": 5, "include_snippet": False},
+        )
+    except McpError as exc:
+        res.unknown("semantic_locate unreadable: %s" % exc)
+        return res
+    if empty is None:
+        res.unknown(
+            "no fixture query emptied the primary collection, so the empty-primary case "
+            "was not reached: %r" % (seen,)
+        )
+        return res
+    for problem in grade_empty_primary(empty):
+        res.bad("empty page: %s" % problem)
+    for problem in grade_populated_primary(populated):
+        res.bad("populated control: %s" % problem)
+    if not res.failed:
+        beside = secondary_rows(empty)
+        res.ok(
+            "the empty page carries `%s: []` with primary_rows 0 beside %s, and the "
+            "populated control carries %s rows in `%s`"
+            % (
+                declared_primary(empty),
+                beside or "no secondary rows",
+                declared_rows(populated),
+                declared_primary(populated),
+            )
+        )
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -1276,6 +1616,9 @@ CHECKS = [
     ("6", check_6),
     ("7", check_7),
     ("8", check_8),
+    ("9", check_9),
+    ("10", check_10),
+    ("11", check_11),
 ]
 
 
@@ -1829,6 +2172,144 @@ def self_test():
         0,
     )
 
+    # The granularity graders, each against one correct page and one break per
+    # rule. FIR-2814.
+    def locate_page(primary="entities", rows=2, granularity="entity", **over):
+        page = {
+            "query": "hop",
+            "granularity": granularity,
+            "routing": "fused-v1",
+            primary: [{"path": "src/f%d.py" % i, "name": "hop_%d" % i} for i in range(rows)],
+            "_kin": {"response": {"primary_collection": primary, "primary_rows": rows}},
+        }
+        page.update(over)
+        return page
+
+    expect(
+        "a page that names its primary and counts it grades clean",
+        grade_primary_declaration(locate_page(), ENTITY_PRIMARIES),
+        [],
+    )
+    expect(
+        "a page that names no primary is caught",
+        len(grade_primary_declaration(locate_page(_kin={"response": {}}), ENTITY_PRIMARIES))
+        >= 1,
+        True,
+    )
+    expect(
+        "an entity page naming the file roll-up as its primary is caught",
+        len(
+            grade_primary_declaration(
+                locate_page(primary="files"), ENTITY_PRIMARIES
+            )
+        )
+        >= 1,
+        True,
+    )
+    absent = locate_page()
+    del absent["entities"]
+    expect(
+        "a named primary the page does not carry is caught",
+        len(grade_primary_declaration(absent, ENTITY_PRIMARIES)) >= 1,
+        True,
+    )
+    miscounted = locate_page()
+    miscounted["_kin"]["response"]["primary_rows"] = 7
+    expect(
+        "a primary_rows that disagrees with the array is caught",
+        len(grade_primary_declaration(miscounted, ENTITY_PRIMARIES)) >= 1,
+        True,
+    )
+    uncounted = locate_page()
+    del uncounted["_kin"]["response"]["primary_rows"]
+    expect(
+        "a named primary with no row count is caught",
+        len(grade_primary_declaration(uncounted, ENTITY_PRIMARIES)) >= 1,
+        True,
+    )
+
+    def file_page(paths, **over):
+        page = {
+            "query": "hop",
+            "granularity": "file",
+            "routing": "fused-v1",
+            "files": [{"path": path} for path in paths],
+            "_kin": {"response": {"primary_collection": "files", "primary_rows": len(paths)}},
+        }
+        page.update(over)
+        return page
+
+    expect(
+        "two disjoint single-row file pages grade clean",
+        grade_file_window(file_page(["a.py"]), file_page(["b.py"]), 1),
+        [],
+    )
+    expect(
+        "a continuation that repeats the first page is caught",
+        len(grade_file_window(file_page(["a.py"]), file_page(["a.py"]), 1)) >= 1,
+        True,
+    )
+    expect(
+        "a continuation that overlaps the first page is caught",
+        len(grade_file_window(file_page(["a.py"]), file_page(["a.py", "b.py"]), 2)) >= 1,
+        True,
+    )
+    expect(
+        "a page wider than the page size is caught",
+        len(grade_file_window(file_page(["a.py", "b.py"]), file_page(["c.py"]), 1)) >= 1,
+        True,
+    )
+    expect(
+        "a file page carrying entity rows is caught",
+        len(
+            grade_file_window(
+                file_page(["a.py"], entities=[{"name": "hop_0"}]), file_page(["b.py"]), 1
+            )
+        )
+        >= 1,
+        True,
+    )
+    expect(
+        "a first file page with no cursor still grades what it can",
+        grade_file_window(file_page(["a.py"]), None, 1),
+        [],
+    )
+
+    empty_page = locate_page(rows=0)
+    expect(
+        "an empty primary present and counted zero grades clean",
+        grade_empty_primary(empty_page),
+        [],
+    )
+    disguised = locate_page(rows=0)
+    del disguised["entities"]
+    disguised["files"] = [{"path": "src/secondary.py"}]
+    expect(
+        "an omitted empty primary beside a populated roll-up is caught",
+        len(grade_empty_primary(disguised)) >= 1,
+        True,
+    )
+    expect(
+        "the empty grader refuses a populated page",
+        len(grade_empty_primary(locate_page(rows=2))) >= 1,
+        True,
+    )
+    expect(
+        "the populated grader accepts a populated page",
+        grade_populated_primary(locate_page(rows=2)),
+        [],
+    )
+    expect(
+        "the populated grader refuses an empty page",
+        len(grade_populated_primary(empty_page)) >= 1,
+        True,
+    )
+    expect(
+        "secondary rows are reported beside an empty primary",
+        secondary_rows(disguised),
+        {"files": 1},
+    )
+
     for line in problems:
         print("SELF-TEST FAIL %s" % line)
     print(
@@ -1836,6 +2317,25 @@ def self_test():
         % ("FAILED (%d)" % len(problems) if problems else "passed")
     )
     return 1 if problems else 0
+
+
+def tree_sha():
+    """The sha of the tree this suite was read from, measured rather than typed.
+
+    A `--label` is a string the caller writes; this is a value the run reads. When
+    the two disagree the report shows it, which is the whole defect a hand-typed
+    sha has: the numbers are right and nothing downstream reads as broken.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout.decode("utf-8", "replace").strip() if proc.returncode == 0 else None
 
 
 def main(argv):
@@ -1901,7 +2401,11 @@ def main(argv):
             os.makedirs(directory)
         with open(opts.json, "w") as handle:
             json.dump(
-                {"label": opts.label, "results": [r.row() for r in results]},
+                {
+                    "label": opts.label,
+                    "tree_sha": tree_sha(),
+                    "results": [r.row() for r in results],
+                },
                 handle,
                 indent=2,
                 sort_keys=True,

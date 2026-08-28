@@ -1208,20 +1208,21 @@ fn locate_result_count(payload: &Value) -> Option<usize> {
 /// Rows in the response's declared primary locate collection, before applying
 /// cross-field consistency checks.
 fn locate_primary_count(payload: &Value) -> Option<usize> {
-    let count = if payload.get("granularity").and_then(Value::as_str) == Some("file") {
-        collection_len(payload, "files")?
-    } else if payload.get("routing").and_then(Value::as_str) == Some("fused-v1") {
-        // `files` is serialized unconditionally by LocateResult and proves the
-        // fused shape even when its primary entity array is omitted as empty.
-        payload.get("files").and_then(Value::as_array)?;
-        payload
-            .get("entities")
-            .and_then(Value::as_array)
-            .map_or(0, Vec::len)
-    } else {
-        collection_len(payload, "results")?
-    };
-    Some(count)
+    // Which collection is the answer is decided in one place, by the budget's
+    // own rule, and read here. This block and the response budget's ladder used
+    // to derive it separately, from slightly different rules, so a payload
+    // existed for which the ladder cut one collection while this counted
+    // another.
+    let primary = crate::budget::primary_collection_for(payload, "semantic_locate")?;
+    match collection_len(payload, primary) {
+        Some(count) => Some(count),
+        // A producer that omitted its empty primary still proves the locate
+        // shape through `files`, which `LocateResult` serializes whatever it
+        // holds. An absent primary there is zero rows. A payload carrying
+        // neither is not a locate response, and its count stays unknown rather
+        // than being guessed at zero.
+        None => collection_len(payload, "files").map(|_| 0),
+    }
 }
 
 fn locate_empty_window_over_nonempty_ranking(payload: &Value) -> bool {
@@ -6882,6 +6883,83 @@ mod tests {
             &semantic_authoritative_envelope(),
         )
         .is_none());
+    }
+
+    /// The join, not the two endpoints.
+    ///
+    /// This block's row count and the response budget's ladder have to name one
+    /// collection on every locate shape the daemon produces. Two tests each
+    /// hardcoding the same key string would both stay green while the two sides
+    /// drifted apart, because neither can see the agreement. So this reads what
+    /// the budget chose and requires this block to have counted THAT array,
+    /// which no renaming on either side can satisfy by accident.
+    #[test]
+    fn the_negative_count_and_the_budget_primary_name_one_collection() {
+        let shapes = [
+            (
+                "fused entity page",
+                json!({
+                    "query": "q", "granularity": "entity", "routing": "fused-v1",
+                    "page": 0, "total_ranked": 2, "files": [],
+                    "entities": [{ "name": "a" }, { "name": "b" }],
+                }),
+            ),
+            (
+                "fused entity page that ranked nothing",
+                json!({
+                    "query": "q", "granularity": "entity", "routing": "fused-v1",
+                    "page": 0, "total_ranked": 0,
+                    "files": [{ "path": "src/secondary.rs", "score": 0.4 }],
+                }),
+            ),
+            (
+                "fused entity page that ships its empty primary",
+                json!({
+                    "query": "q", "granularity": "entity", "routing": "fused-v1",
+                    "page": 0, "total_ranked": 0, "entities": [],
+                    "files": [{ "path": "src/secondary.rs", "score": 0.4 }],
+                }),
+            ),
+            (
+                "cosine entity page",
+                json!({
+                    "query": "q", "granularity": "entity", "routing": "cosine-v0",
+                    "page": 0, "total_ranked": 1, "files": [],
+                    "results": [{ "name": "a" }],
+                }),
+            ),
+            (
+                "cosine file page",
+                json!({
+                    "query": "q", "granularity": "file", "routing": "cosine-v0",
+                    "page": 0, "total_ranked": 2,
+                    "files": [{ "path": "a.rs" }, { "path": "b.rs" }],
+                }),
+            ),
+            (
+                "fused file page",
+                json!({
+                    "query": "q", "granularity": "file", "routing": "fused-v1",
+                    "page": 0, "total_ranked": 1, "entities": [],
+                    "files": [{ "path": "a.rs" }],
+                }),
+            ),
+        ];
+        for (label, payload) in shapes {
+            let primary = crate::budget::primary_collection_for(&payload, "semantic_locate")
+                .unwrap_or_else(|| panic!("{label}: the budget named no primary collection"));
+            let counted = locate_primary_count(&payload)
+                .unwrap_or_else(|| panic!("{label}: the negative block counted nothing"));
+            let rows = payload
+                .get(primary)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len);
+            assert_eq!(
+                counted, rows,
+                "{label}: the negative counted {counted} rows while the budget's primary \
+                 `{primary}` carries {rows}"
+            );
+        }
     }
 
     #[test]

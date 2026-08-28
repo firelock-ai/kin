@@ -9403,6 +9403,19 @@ fn fused_semantic_locate_payload(
     // restart from an absent field. The cosine arm always states its page; now both
     // arms answer the question the same way.
     payload.insert("page".to_string(), json!(result.page));
+    // State the primary collection and its total explicitly, for the reason the
+    // line above states the page: `LocateResult` skips `entities` when it is
+    // empty and `total_ranked` when it is zero, so the one page that most needs
+    // to read as empty shipped neither key beside a `files` roll-up that
+    // serializes whatever it holds. A reader taking the first present array read
+    // that as a file answer. At file granularity `files` is the primary and is
+    // already serialized unconditionally, so only the entity arm needs this.
+    if !file_granularity {
+        payload
+            .entry("entities".to_string())
+            .or_insert_with(|| json!([]));
+    }
+    payload.insert("total_ranked".to_string(), json!(result.total_ranked));
     // The one list the per-hit variant attribution indexes. Written explicitly
     // rather than left to the `LocateResult` serialization, because a cursor page
     // restores it from the cached ranking and the two paths must publish the same
@@ -16277,10 +16290,12 @@ mod tests {
             kin_cli::commands::locate::LocateResult::default(),
             "where does the daemon start",
         );
-        assert!(
-            body.get("entities").is_none(),
-            "an empty fused page omits `entities` entirely: {body}"
+        assert_eq!(
+            body["entities"],
+            json!([]),
+            "an empty fused page states its primary rather than omitting it: {body}"
         );
+        assert_eq!(body["total_ranked"], json!(0));
         assert_eq!(body["files"], json!([]));
         let negative = kin_mcp::negative::negative_for(
             "semantic_locate",

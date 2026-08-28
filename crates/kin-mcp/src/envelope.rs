@@ -2527,6 +2527,10 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         return;
     }
     let chars_before = crate::budget::measure(annotated);
+    // Resolved once. Two calls in adjacent expressions cannot disagree today,
+    // but a change whose whole argument is that one rule lives in one place
+    // should not keep a second reader of it here.
+    let primary = crate::budget::primary_collection_for(annotated, tool_name);
     let mut accounting = crate::budget::BudgetAccounting {
         max_chars: budget.max_chars,
         chars_before,
@@ -2536,6 +2540,11 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         chars_after: chars_before,
         bounded: false,
         compact: budget.compact,
+        // Seeded with the real values for the same reason the size placeholder
+        // is: the stanza written first has to be the width of the stanza that
+        // ships, or the ladder charges the budget for the wrong bytes.
+        primary_collection: primary.map(str::to_string),
+        primary_rows: primary.map(|key| crate::budget::collection_rows(annotated, key)),
     };
     write_response_accounting(annotated, &accounting);
     let mut bounded = false;
