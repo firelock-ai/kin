@@ -252,6 +252,13 @@ pub struct DaemonSearchResponse {
     /// reader is.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub absence_qualifier: Vec<String>,
+    /// Why the vector half of this answer is not fully trustworthy, or empty
+    /// when it is. Populated when the runtime that produced the query vector
+    /// disagrees with the runtimes that produced the index it was ranked
+    /// against; the numbers alone cannot show that, because a mismatch ranks
+    /// perfectly happily and just ranks wrong.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub degradations: Vec<crate::commands::locate::RetrievalDegradation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -514,6 +521,7 @@ async fn run_daemon_search(
 fn search_absence_qualifier(
     graph: &kin_db::InMemoryGraph,
     envelope: &kin_mcp::Envelope,
+    degradations: &[crate::commands::locate::RetrievalDegradation],
 ) -> Vec<String> {
     let scoped = match graph.query_entities(&kin_model::graph::EntityFilter::default()) {
         Ok(scoped) => scoped,
@@ -523,9 +531,14 @@ fn search_absence_qualifier(
         // change exists to stop.
         Err(_) => return Vec::new(),
     };
+    // The degradations this run reported travel with the payload. The absence
+    // gate and the single verdict both read `degradations`, and a synthetic
+    // payload that omitted them let a query-producer mismatch certify an
+    // absence the mismatch had already made unproven.
     let payload = serde_json::json!({
         "results": [],
         "total_matches": 0,
+        "degradations": degradations,
         kin_mcp::EDGE_COVERAGE_KEY: kin_mcp::edge_coverage::observe_absence_scope(
             &kin_mcp::edge_coverage::languages_of(&scoped),
             Some(scoped.len()),
@@ -542,7 +555,8 @@ pub fn collect_daemon_search_response(
     if request.semantic {
         let mut response = collect_daemon_semantic_search_response(graph, request, envelope)?;
         if response.records.is_empty() {
-            response.absence_qualifier = search_absence_qualifier(graph, envelope);
+            let reported = response.degradations.clone();
+            response.absence_qualifier = search_absence_qualifier(graph, envelope, &reported);
         }
         return Ok(response);
     }
@@ -565,7 +579,7 @@ pub fn collect_daemon_search_response(
         .map(|matched| record_to_daemon_record(&matched.record, matched.match_kind, matched.score))
         .collect::<Vec<_>>();
     let absence_qualifier = if records.is_empty() {
-        search_absence_qualifier(graph, envelope)
+        search_absence_qualifier(graph, envelope, &[])
     } else {
         Vec::new()
     };
@@ -577,6 +591,7 @@ pub fn collect_daemon_search_response(
         records,
         semantic_coverage: None,
         absence_qualifier,
+        degradations: Vec::new(),
     })
 }
 
@@ -600,7 +615,17 @@ fn collect_daemon_semantic_search_response(
 ) -> Result<DaemonSearchResponse> {
     let coverage = evaluate_semantic_coverage(graph)?;
     let limit = request.limit.unwrap_or(10);
-    let vector_results = graph.semantic_search(&request.query, limit)?;
+    // The producer-aware variant, not the discarding wrapper: the caller has
+    // to be able to compare the runtime that produced this query vector with
+    // the lineage of the index it is about to rank against.
+    let produced = graph.semantic_search_with_producers(&request.query, limit)?;
+    let mut degradations: Vec<crate::commands::locate::RetrievalDegradation> = Vec::new();
+    crate::commands::locate::record_query_producer_verdict(
+        &mut degradations,
+        graph,
+        &produced.query_producers,
+    );
+    let vector_results = produced.matches;
 
     if vector_results.is_empty() {
         let mut response = collect_daemon_search_response(
@@ -616,6 +641,7 @@ fn collect_daemon_semantic_search_response(
         response.semantic = true;
         response.text_fallback = true;
         response.semantic_coverage = Some(coverage);
+        response.degradations = degradations;
         return Ok(response);
     }
 
@@ -720,7 +746,7 @@ fn collect_daemon_semantic_search_response(
     }
 
     let absence_qualifier = if records.is_empty() {
-        search_absence_qualifier(graph, envelope)
+        search_absence_qualifier(graph, envelope, &degradations)
     } else {
         Vec::new()
     };
@@ -732,6 +758,7 @@ fn collect_daemon_semantic_search_response(
         records,
         semantic_coverage: Some(coverage),
         absence_qualifier,
+        degradations,
     })
 }
 
@@ -1962,6 +1989,7 @@ mod tests {
 
         let response = DaemonSearchResponse {
             absence_qualifier: Vec::new(),
+            degradations: Vec::new(),
             query: "zzz_this_symbol_does_not_exist_anywhere_9f3a".into(),
             semantic: false,
             text_fallback: true,
@@ -2178,5 +2206,318 @@ mod tests {
             }),
         };
         assert_eq!(record_display_context(&opaque), "OpaqueArtifact, image/png");
+    }
+}
+
+/// The query-producer evidence link, driven end to end on the real search path.
+///
+/// The policy that decides a verdict is guarded in `kin-core`, and the consumer
+/// that turns a recorded degradation into an uncertified `_kin.verdict` is
+/// guarded in `kin-mcp`. Both were green while the call joining them existed
+/// only in production code, which is the shape where two correct tests jointly
+/// guard nothing: deleting every call site left the suite passing. These arms
+/// run the real `collect_daemon_semantic_search_response` against a real
+/// persisted index and a real query embedding, so the middle link is what is
+/// under test rather than a fixture standing in for it.
+///
+/// Both sides of the comparison are produced rather than written down. The
+/// index lineage is bound into the index bytes by
+/// `upsert_retrievable_with_producers`, and the query lineage comes from the
+/// embedder that actually answers, which attests `remote` for every vector it
+/// returns over HTTP. Varying only the index producer between the two arms is
+/// what makes the disagreement, and the matching arm is the control that
+/// separates "records on disagreement" from "records whenever a vector ranked".
+#[cfg(all(test, feature = "vector", feature = "embeddings"))]
+mod query_producer_evidence_tests {
+    use super::{collect_daemon_semantic_search_response, DaemonSearchRequest};
+    use crate::commands::locate::RetrievalDegradation;
+    use kin_core::vector_producer_policy::QueryProducerVerdict;
+    use kin_db::{EmbeddingProducer, EmbeddingProducerSet};
+    use kin_model::EntityId;
+    use serial_test::serial;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Small enough to keep the fixture vectors readable, and pinned through
+    /// `KIN_EMBED_OPENAI_DIMENSIONS` so the embedder never issues its own
+    /// dimension probe against the endpoint.
+    const FIXTURE_DIMENSIONS: usize = 4;
+
+    /// An OpenAI-compatible embeddings endpoint on loopback.
+    ///
+    /// This is the one door kin has into a query-time producer attestation:
+    /// kin-db's local-embedder injection points are crate-private, while the
+    /// HTTP route is selected from the process environment and attests every
+    /// vector it returns as `remote`. Each connection serves exactly one
+    /// request and closes, so the accept loop never blocks on a kept-alive
+    /// socket and `Drop` can join the thread.
+    struct FixtureEmbeddingEndpoint {
+        base_url: String,
+        stop: Arc<AtomicBool>,
+        server: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FixtureEmbeddingEndpoint {
+        fn start() -> Self {
+            let listener =
+                TcpListener::bind("127.0.0.1:0").expect("a loopback port for the fixture endpoint");
+            let port = listener
+                .local_addr()
+                .expect("the fixture listener reports its address")
+                .port();
+            listener
+                .set_nonblocking(true)
+                .expect("the fixture listener accepts without blocking");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_signal = Arc::clone(&stop);
+            let server = std::thread::spawn(move || {
+                while !stop_signal.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            let _ = serve_one_embedding_request(stream);
+                        }
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                base_url: format!("http://127.0.0.1:{port}/v1"),
+                stop,
+                server: Some(server),
+            }
+        }
+
+        fn base_url(&self) -> &str {
+            &self.base_url
+        }
+    }
+
+    impl Drop for FixtureEmbeddingEndpoint {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(server) = self.server.take() {
+                let _ = server.join();
+            }
+        }
+    }
+
+    /// Answer one embeddings request with one fixed vector per input.
+    ///
+    /// The response counts the inputs it was actually sent rather than assuming
+    /// one, because the parser refuses a response whose vector count does not
+    /// match the request, and that refusal would surface as an embedding error
+    /// rather than as the producer verdict under test.
+    fn serve_one_embedding_request(mut stream: TcpStream) -> std::io::Result<()> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        let mut reader = BufReader::new(stream.try_clone()?);
+        let mut content_length = 0usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line)? == 0 {
+                return Ok(());
+            }
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() {
+                break;
+            }
+            let lowered = trimmed.to_ascii_lowercase();
+            if let Some(value) = lowered.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0u8; content_length];
+        reader.read_exact(&mut body)?;
+        let inputs = serde_json::from_slice::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|request| {
+                request
+                    .get("input")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len)
+            })
+            .unwrap_or(1);
+        let mut unit = vec![0.0f32; FIXTURE_DIMENSIONS];
+        unit[0] = 1.0;
+        let data: Vec<serde_json::Value> = (0..inputs)
+            .map(|index| serde_json::json!({ "index": index, "embedding": unit }))
+            .collect();
+        let payload = serde_json::json!({ "data": data }).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        stream.write_all(response.as_bytes())?;
+        stream.flush()
+    }
+
+    /// A graph serving one persisted vector whose bytes carry `producer` as
+    /// their attested lineage.
+    ///
+    /// Built and loaded through the public producer-aware pair rather than by
+    /// reaching into the graph, which is the same route the daemon uses to
+    /// install an attested index.
+    fn graph_serving_an_index_attested_to(
+        producer: EmbeddingProducer,
+    ) -> (kin_db::InMemoryGraph, tempfile::TempDir) {
+        let home = tempfile::tempdir().expect("a scratch directory for the fixture index");
+        let path = home.path().join("graph.kvec");
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-producer-endpoint".to_string()),
+            graph_root: Some("fixture-producer-root".to_string()),
+        };
+        let index =
+            kin_db::VectorIndex::new(FIXTURE_DIMENSIONS).expect("a fixture vector index opens");
+        index.set_descriptor(descriptor.clone());
+        let mut unit = vec![0.0f32; FIXTURE_DIMENSIONS];
+        unit[0] = 1.0;
+        index
+            .upsert_retrievable_with_producers(
+                EntityId::new().into(),
+                &unit,
+                &EmbeddingProducerSet::singleton(producer),
+            )
+            .expect("a producer-attested vector is accepted");
+        index.save(&path).expect("the fixture index persists");
+        let graph = kin_db::InMemoryGraph::new();
+        assert!(
+            matches!(
+                graph.load_vector_index_compatible(&path, &descriptor),
+                kin_db::vector::VectorIndexLoad::Loaded(1)
+            ),
+            "the fixture index must install, or the query below ranks nothing and the \
+             producer sets are empty for a reason that has nothing to do with the verdict"
+        );
+        (graph, home)
+    }
+
+    /// Run one real semantic search against an index attested to
+    /// `index_producer` and return the degradations the response carries.
+    fn degradations_from_a_real_semantic_search(
+        index_producer: EmbeddingProducer,
+    ) -> Vec<RetrievalDegradation> {
+        let endpoint = FixtureEmbeddingEndpoint::start();
+        // The behavior under test is reached only through the embedder this
+        // process resolves, and that resolution reads the environment, so the
+        // guard is the sanctioned way to select it. `KIN_EMBED_CACHE` is off so
+        // no earlier run's cached vector can answer instead of the endpoint,
+        // and the strict-coverage lever is cleared so an inherited value cannot
+        // turn a partial index into an error before the verdict is reached.
+        let _environment = kin_core::test_env::EnvVarGuard::new()
+            .with("KIN_EMBED_PROVIDER", "openai-compatible")
+            .with("KIN_EMBED_OPENAI_BASE_URL", endpoint.base_url())
+            .with("KIN_EMBED_OPENAI_MODEL", "fixture-producer-endpoint")
+            .with(
+                "KIN_EMBED_OPENAI_DIMENSIONS",
+                FIXTURE_DIMENSIONS.to_string(),
+            )
+            .with("KIN_EMBED_CACHE", "0")
+            .without("KIN_REQUIRE_COMPLETE_EMBEDDINGS");
+        let (graph, _home) = graph_serving_an_index_attested_to(index_producer);
+        let request = DaemonSearchRequest {
+            query: "producer evidence probe".to_string(),
+            kind: None,
+            language: None,
+            limit: Some(5),
+            semantic: true,
+            show_body: false,
+            body_limit: None,
+        };
+        let envelope = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 0,
+            "graph_generation": 1,
+        }));
+        collect_daemon_semantic_search_response(&graph, &request, &envelope)
+            .expect("the real semantic search path answers")
+            .degradations
+    }
+
+    /// The reason the policy itself emits for a mismatch, read from the policy
+    /// rather than written here, so renaming it breaks this test instead of
+    /// quietly decoupling the two.
+    fn mismatch_reason() -> &'static str {
+        QueryProducerVerdict::Mismatched {
+            query: "remote".to_string(),
+            index: "cpu".to_string(),
+        }
+        .reason()
+        .expect("a mismatch names a machine reason")
+    }
+
+    /// What the verdict makes of exactly the degradations a run produced.
+    fn verdict_over(degradations: &[RetrievalDegradation]) -> serde_json::Value {
+        let payload = serde_json::json!({
+            "degradations": serde_json::to_value(degradations)
+                .expect("degradations serialize onto the payload"),
+        });
+        kin_mcp::Verdict::compute(
+            "semantic_search",
+            &payload,
+            &kin_mcp::Envelope::daemon(),
+            None,
+        )
+        .expect("a payload carrying a degradations array carries a verdict")
+        .to_value()
+    }
+
+    #[test]
+    #[serial]
+    fn a_query_producer_mismatch_on_the_real_search_path_reaches_the_verdict() {
+        let degradations = degradations_from_a_real_semantic_search(EmbeddingProducer::Cpu);
+        let reason = mismatch_reason();
+        assert!(
+            degradations
+                .iter()
+                .any(|entry| entry.component == "vector_index" && entry.reason == reason),
+            "a query embedded remotely against an index attested cpu must record the \
+             mismatch as a degradation on the real search path, got {degradations:?}"
+        );
+
+        // The join, taken over the value this run actually produced rather than
+        // over a second hand-written copy of the reason string.
+        let verdict = verdict_over(&degradations);
+        assert_eq!(
+            verdict["inputs"]["degradations"],
+            serde_json::json!("inconclusive"),
+            "the recorded mismatch must leave the verdict's degradations input \
+             inconclusive: {verdict}"
+        );
+        let factor = verdict["limiting_factor"]
+            .as_str()
+            .expect("an inconclusive verdict names its limiting factor");
+        assert!(
+            factor.contains(reason),
+            "the limiting factor must name the producer mismatch itself: {factor}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn a_matching_query_producer_on_the_same_path_records_nothing() {
+        let degradations = degradations_from_a_real_semantic_search(EmbeddingProducer::Remote);
+        assert!(
+            degradations.is_empty(),
+            "an index attested to the same runtime that produced the query is the healthy \
+             path and must record no degradation, got {degradations:?}"
+        );
+
+        // The separating control for the arm above: with the same payload shape
+        // and an empty degradations array the verdict certifies, so that arm's
+        // inconclusive came from the mismatch and not from the payload.
+        let verdict = verdict_over(&degradations);
+        assert_eq!(
+            verdict["inputs"]["degradations"],
+            serde_json::json!("certified"),
+            "an undegraded run must certify its degradations input: {verdict}"
+        );
     }
 }
