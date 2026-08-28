@@ -887,9 +887,17 @@ class Suite(object):
         # repository authority and every view derived from it live there, so
         # `kin pull` against a replica with no daemon refuses before it
         # negotiates anything. Creating the replica does not leave one running.
+        #
+        # Asserted from the registry rather than from the exit code of the
+        # command meant to start it. `kin graph status` exits 0 on an unborn
+        # replica whether or not a worker came up, so the exit code cannot tell
+        # a started daemon from an answer that needed none, and the run that
+        # found this had a zero there and a refused pull right after it.
         rc, out = self.kin_in(destination, ["graph", "status"])
         if rc != 0:
             raise RuntimeError("the receiver's daemon did not come up: %s" % tail(out))
+        receiver_endpoint = self.transfer_endpoint(destination)
+        self.log("receiver daemon at %s" % receiver_endpoint)
 
         rc, out = self.kin_in(destination, ["pull", "--url", endpoint, "--json"])
         if rc != 0:
