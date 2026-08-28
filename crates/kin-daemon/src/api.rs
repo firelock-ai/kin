@@ -2794,7 +2794,8 @@ where
 {
     // Initialize once outside the stamped interval: lazy spine hydration and
     // registration can be expensive, but it is not part of the graph read.
-    let spine = state.ensure_spine();
+    let spine_authority = state.acquire_spine_read_authority().await;
+    let spine = spine_authority.as_ref().map(|authority| authority.backend());
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
             settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
@@ -2857,7 +2858,8 @@ where
             kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS,
         ));
     }
-    let spine = state.ensure_spine();
+    let spine_authority = state.acquire_spine_read_authority().await;
+    let spine = spine_authority.as_ref().map(|authority| authority.backend());
     let repository_authority = mcp_repository_authority_source(state)?;
     let mut superseded = None;
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
@@ -3011,7 +3013,8 @@ async fn mcp_bulk_check_references_with_stable_authority<F>(
 where
     F: FnMut(usize),
 {
-    let spine = state.ensure_spine();
+    let spine_authority = state.acquire_spine_read_authority().await;
+    let spine = spine_authority.as_ref().map(|authority| authority.backend());
     let mut superseded = None;
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
@@ -3265,17 +3268,22 @@ async fn health(
 /// An initialized daemon has either loaded a snapshot or completed at least
 /// one reconciliation cycle. An empty but initialized workspace is ready.
 ///
-/// Readiness is deliberately independent of cross-repo spine warm-up: this
-/// daemon's own repo is what a client connecting to it needs served, and a
-/// sibling warm-up that gated readiness would report a busy daemon as a dead
-/// one. A warm-up in progress is reported through `warming` instead.
+/// Local readiness remains independent of optional cross-repo warm-up. Hosted
+/// graph service is different: the exact-fleet durable spine is part of the
+/// product authority, so a hydration, migration-seal, fleet-fence, cursor, or
+/// root failure must keep the pod out of service.
 async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
-    let warming = state.spine_warming();
+    let hosted_spine_ready = if initialized && state.hosted_spine_readiness_required() {
+        state.acquire_spine_read_authority().await.is_some()
+    } else {
+        true
+    };
+    let warming = state.spine_warming() || (initialized && !hosted_spine_ready);
 
-    if initialized {
+    if initialized && hosted_spine_ready {
         (
             StatusCode::OK,
             Json(ReadinessResponse {
@@ -11831,12 +11839,13 @@ struct SpineEdgesResponse {
 async fn spine_health(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     // Two completeness readings, never one. `cross_repo_edges: 0` beside nothing
     // else is a bare zero: it reads as "this install has no cross-repo edges"
@@ -11878,12 +11887,13 @@ async fn spine_health(
 async fn spine_repos(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     let repo_ids: Vec<String> = spine.registered_repo_ids().into_iter().collect();
     Ok(Json(json!({ "repos": repo_ids })))
@@ -11894,12 +11904,13 @@ async fn spine_resolve(
     Query(params): Query<SpineResolveParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     let kind_str = params.kind.as_deref();
     let kind = kind_str.and_then(parse_entity_kind);
@@ -11917,12 +11928,13 @@ async fn spine_impact(
     Query(params): Query<SpineImpactParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     let entity_id = parse_entity_id_hex(&params.entity)?;
     let impact = spine.federated_impact(&params.repo, &entity_id, params.depth);
@@ -11942,12 +11954,13 @@ async fn spine_xref(
     Query(params): Query<SpineXrefParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     let entity_id = parse_entity_id_hex(&params.entity)?;
     Ok(Json(
@@ -11964,12 +11977,13 @@ async fn spine_xref(
 async fn spine_edges(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
             state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
     let snapshot = spine.cross_repo_edges_snapshot();
 
     Ok(Json(SpineEdgesResponse {
@@ -12043,6 +12057,7 @@ async fn spine_ingest_repo(
         "entityCount": outcome.entity_count,
         "relationCount": outcome.relation_count,
         "resolvableRelationCount": outcome.resolvable_relations,
+        "rolloutFenceEvidence": outcome.rollout_fence_evidence,
     })))
 }
 
@@ -12065,6 +12080,7 @@ async fn spine_refresh_cross_repo_edges(
     Ok(Json(json!({
         "reposRefreshed": outcome.repos_refreshed,
         "crossRepoEdges": outcome.cross_repo_edges,
+        "rolloutFenceEvidence": outcome.rollout_fence_evidence,
     })))
 }
 

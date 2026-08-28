@@ -19,10 +19,14 @@ use crate::index::{
     CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry, SpineIndex, SpineXrefResponse,
 };
 use crate::publication::{
-    RepoPublicationCommit, RepoPublicationConflict, RepoPublicationHead, RepoSpinePublication,
-    SpineRolloutFence, SpineRolloutFenceCommit, SpineSourceCursor,
+    LegacySpineWriterDrainAttestation, RepoPublicationCommit, RepoPublicationConflict,
+    RepoPublicationHead, RepoSpinePublication, SpineRolloutFence, SpineRolloutFenceCommit,
+    SpineRolloutFenceEvidence, SpineSourceCursor,
 };
-use crate::store::{LoadedSpineRolloutFence, PreparedStorePublication, StoreHeadPrecondition};
+use crate::store::{
+    LoadedSpineRolloutFence, PreparedStorePublication, StoreHeadPrecondition,
+    StoreRepoHeadGuard,
+};
 
 /// Error type for spine backend operations.
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +87,10 @@ impl PreparedRepoSpinePublication {
         self.prepared.candidate_head()
     }
 
+    pub fn rollout_fence_evidence(&self) -> Option<SpineRolloutFenceEvidence> {
+        self.prepared.rollout_fence_evidence()
+    }
+
     /// Consume the token through its owning backend.
     pub fn into_store_preparation(
         self,
@@ -124,7 +132,10 @@ pub trait SpineBackend: Send + Sync {
     /// Persist the explicit one-way boundary that closes legacy cursorless
     /// collections after every repository has a committed v2 head and older
     /// writers have been removed from service.
-    fn complete_legacy_migration(&self) -> Result<(), SpineError> {
+    fn complete_legacy_migration(
+        &self,
+        _writer_drain: LegacySpineWriterDrainAttestation,
+    ) -> Result<(), SpineError> {
         Err(SpineError::Backend(
             "durable legacy spine migration completion is unsupported".to_string(),
         ))
@@ -153,6 +164,21 @@ pub trait SpineBackend: Send + Sync {
         Err(SpineError::Backend(
             "cursor-bound repo publication is unsupported".to_string(),
         ))
+    }
+
+    fn prepare_repo_publication_bound(
+        &self,
+        publication: RepoSpinePublication,
+        expected_rollout_fence: &SpineRolloutFenceEvidence,
+    ) -> Result<PreparedRepoSpinePublication, SpineError> {
+        let prepared = self.prepare_repo_publication(publication)?;
+        if prepared.rollout_fence_evidence().as_ref() != Some(expected_rollout_fence) {
+            return Err(SpineError::Backend(format!(
+                "repo {} publication prepared against rollout evidence different from the admitted GCS authority",
+                prepared.candidate_head().repo_id
+            )));
+        }
+        Ok(prepared)
     }
 
     /// Atomically move the repository head captured by `prepare`.
@@ -347,7 +373,44 @@ impl SpineBackend for InMemorySpineBackend {
             ),
             None => (StoreHeadPrecondition::Missing, None),
         };
-        let prepared = PreparedStorePublication::new(publication, observed_head, revision)?;
+        let mut dependency_heads = BTreeMap::new();
+        for (repo_id, expected_root) in publication
+            .resolution_roots
+            .as_ref()
+            .into_iter()
+            .flat_map(|roots| roots.iter())
+        {
+            if repo_id == &publication.repo_id {
+                continue;
+            }
+            let (dependency_revision, dependency_head) =
+                heads.get(repo_id).cloned().ok_or_else(|| {
+                    SpineError::Backend(format!(
+                        "edge publication cannot resolve against missing committed head {repo_id}"
+                    ))
+                })?;
+            if dependency_head.root_hash != *expected_root {
+                return Err(SpineError::Backend(format!(
+                    "edge publication resolved {repo_id} at root {expected_root}, but committed head is at {}",
+                    dependency_head.root_hash
+                )));
+            }
+            dependency_heads.insert(
+                repo_id.clone(),
+                StoreRepoHeadGuard {
+                    head: dependency_head,
+                    precondition: StoreHeadPrecondition::Revision(
+                        dependency_revision.to_string(),
+                    ),
+                },
+            );
+        }
+        let prepared = PreparedStorePublication::new_with_dependencies(
+            publication,
+            observed_head,
+            revision,
+            dependency_heads,
+        )?;
         Ok(PreparedRepoSpinePublication::bind(
             self.publication_backend_id,
             prepared,
@@ -368,6 +431,24 @@ impl SpineBackend for InMemorySpineBackend {
             heads.remove(&candidate.repo_id);
         }
         let current = heads.get(&candidate.repo_id).cloned();
+        for (repo_id, guard) in prepared.dependency_heads() {
+            let observed_dependency = heads.get(repo_id).cloned();
+            let dependency_matches = match (&guard.precondition, &observed_dependency) {
+                (StoreHeadPrecondition::Revision(expected), Some((revision, head))) => {
+                    expected == &revision.to_string() && head == &guard.head
+                }
+                _ => false,
+            };
+            if !dependency_matches {
+                return Ok(RepoPublicationCommit::Conflict(
+                    RepoPublicationConflict::against_dependency(
+                        candidate.source_cursor,
+                        repo_id,
+                        observed_dependency.as_ref().map(|(_, head)| head),
+                    ),
+                ));
+            }
+        }
         let precondition_matches = match (prepared.head_precondition(), &current) {
             (StoreHeadPrecondition::Missing, None) => true,
             (StoreHeadPrecondition::Revision(expected), Some((revision, _))) => {

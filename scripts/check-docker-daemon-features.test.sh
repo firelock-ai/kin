@@ -25,4 +25,18 @@ if "${guard}" "${fixture_dir}/firestore-only.Dockerfile" >/dev/null 2>&1; then
   exit 1
 fi
 
+sed 's/--features kin-daemon\/gcs,kin-daemon\/firestore/--features kin-daemon\/firestore,kin-daemon\/gcs/g' \
+  "${repo_root}/Dockerfile" >"${fixture_dir}/reordered.Dockerfile"
+if "${guard}" "${fixture_dir}/reordered.Dockerfile" >/dev/null 2>&1; then
+  echo "docker feature contract test: reordered feature mutant escaped" >&2
+  exit 1
+fi
+
+sed 's/--features kin-daemon\/gcs,kin-daemon\/firestore/--features kin-daemon\/gcs,kin-daemon\/firestore,kin-daemon\/vector/g' \
+  "${repo_root}/Dockerfile" >"${fixture_dir}/extra.Dockerfile"
+if "${guard}" "${fixture_dir}/extra.Dockerfile" >/dev/null 2>&1; then
+  echo "docker feature contract test: extra feature mutant escaped" >&2
+  exit 1
+fi
+
 echo "docker feature contract tests: PASS"

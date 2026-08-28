@@ -19,6 +19,8 @@ use crate::index::{CrossRepoEdge, EntityEntry};
 /// Version of the durable publication manifest and its canonical hash domain.
 pub const REPO_PUBLICATION_SCHEMA_VERSION: u32 = 2;
 pub const SPINE_ROLLOUT_FENCE_SCHEMA: &str = "kin.spine-rollout-fence.v1";
+pub const LEGACY_SPINE_WRITER_DRAIN_SCHEMA: &str =
+    "kin.spine-legacy-writer-drain.v1";
 const SPINE_ROLLOUT_TOKEN_HASH_DOMAIN: &[u8] = b"kin.spine-rollout-token.v1\0";
 const SPINE_ROLLOUT_FENCE_PAYLOAD_HASH_DOMAIN: &[u8] =
     b"kin.spine-rollout-fence-payload.v1\0";
@@ -317,6 +319,56 @@ pub struct SpineRolloutFenceEvidence {
     pub rollout_fence: u64,
     pub payload_sha256: String,
     pub update_time: String,
+}
+
+/// Trusted deployment evidence required before the one-way legacy migration
+/// seal can be created. A fleet fence alone cannot stop an older cursorless
+/// binary from writing the legacy collections, so the rollout owner must bind
+/// an externally produced old-revision drain proof and the exact deployed
+/// daemon image digest to the Firestore fence it admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacySpineWriterDrainAttestation {
+    pub schema: String,
+    pub rollout_fence_evidence: SpineRolloutFenceEvidence,
+    pub daemon_image_sha256: String,
+    pub drain_proof_sha256: String,
+}
+
+impl LegacySpineWriterDrainAttestation {
+    /// Validate the portable drain attestation before a storage backend uses
+    /// it to create or verify the durable one-way migration seal.
+    pub fn validate(&self) -> Result<(), SpineError> {
+        if self.schema != LEGACY_SPINE_WRITER_DRAIN_SCHEMA {
+            return Err(SpineError::Serialization(format!(
+                "unsupported legacy spine writer-drain schema {}",
+                self.schema
+            )));
+        }
+        if self.rollout_fence_evidence.rollout_fence == 0
+            || self.rollout_fence_evidence.update_time.is_empty()
+        {
+            return Err(SpineError::Serialization(
+                "legacy spine writer-drain attestation has incomplete rollout evidence"
+                    .to_string(),
+            ));
+        }
+        validate_sha256(
+            "legacy writer-drain rollout payload digest",
+            "fleet",
+            &self.rollout_fence_evidence.payload_sha256,
+        )?;
+        validate_sha256(
+            "legacy writer-drain daemon image digest",
+            "fleet",
+            &self.daemon_image_sha256,
+        )?;
+        validate_sha256(
+            "legacy writer-drain proof digest",
+            "fleet",
+            &self.drain_proof_sha256,
+        )?;
+        Ok(())
+    }
 }
 
 /// Outcome of advancing the shared rollout fence.
@@ -703,6 +755,9 @@ pub struct RepoPublicationConflict {
     pub attempted_rollout_fence: Option<u64>,
     pub observed_rollout_fence: Option<u64>,
     pub observed_rollout_payload_sha256: Option<String>,
+    pub observed_dependency_repo: Option<String>,
+    pub observed_dependency_cursor: Option<SpineSourceCursor>,
+    pub observed_dependency_publication_id: Option<String>,
 }
 
 impl RepoPublicationConflict {
@@ -721,7 +776,23 @@ impl RepoPublicationConflict {
             attempted_rollout_fence: None,
             observed_rollout_fence: None,
             observed_rollout_payload_sha256: None,
+            observed_dependency_repo: None,
+            observed_dependency_cursor: None,
+            observed_dependency_publication_id: None,
         }
+    }
+
+    pub fn against_dependency(
+        attempted_cursor: SpineSourceCursor,
+        dependency_repo: &str,
+        observed: Option<&RepoPublicationHead>,
+    ) -> Self {
+        let mut conflict = Self::against(attempted_cursor, None);
+        conflict.observed_dependency_repo = Some(dependency_repo.to_string());
+        conflict.observed_dependency_cursor = observed.map(|head| head.source_cursor);
+        conflict.observed_dependency_publication_id =
+            observed.map(|head| head.publication_id.clone());
+        conflict
     }
 
     pub fn against_rollout_fence(

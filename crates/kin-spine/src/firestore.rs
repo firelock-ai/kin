@@ -50,17 +50,20 @@ use crate::backend::{
     InMemorySpineBackend, PreparedRepoSpinePublication, SpineBackend, SpineError,
 };
 use crate::federation::FederatedImpact;
-use crate::index::{CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry};
+use crate::index::{
+    CommittedRepoIndexPublication, CrossRepoEdge, CrossRepoEdgesSnapshot, EntityEntry,
+};
 use crate::publication::{
-    CanonicalRepoPublication, RepoPublicationCommit, RepoPublicationHead,
-    RepoPublicationPhase, RepoSpinePublication, SpineRolloutFence, SpineRolloutFenceCommit,
-    SpineRolloutFenceEvidence, SpineSourceCursor,
+    CanonicalRepoPublication, LegacySpineWriterDrainAttestation, RepoPublicationCommit,
+    RepoPublicationHead, RepoPublicationPhase, RepoSpinePublication, SpineRolloutFence,
+    SpineRolloutFenceCommit, SpineRolloutFenceEvidence, SpineSourceCursor,
 };
 #[cfg(test)]
 use crate::publication::SpineRolloutRepositoryFence;
 use crate::store::{
     LoadedRepoPublication, LoadedSpineRolloutFence, PreparedStorePublication,
     RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition,
+    StorePublicationStageGuard, StoreRepoHeadGuard,
 };
 
 const CLEANUP_DOCUMENTS_PER_COMMIT: usize = 100;
@@ -68,6 +71,166 @@ const CLEANUP_PASSES_PER_TERMINAL_OUTCOME: usize = 4;
 const CLEANUP_CONTINUATION_RETRY_LIMIT: usize = 8;
 const CLEANUP_CONTINUATION_PASS_LIMIT: usize = 64;
 const CLEANUP_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+
+#[cfg(feature = "firestore")]
+const STAGE_MARKER_REVISION_HASH_DOMAIN: &[u8] = b"kin.spine-stage-marker-revision.v1\0";
+
+#[cfg(feature = "firestore")]
+const LEGACY_MIGRATION_HEAD_SET_HASH_DOMAIN: &[u8] =
+    b"kin.spine-legacy-migration-head-set.v1\0";
+
+#[cfg(feature = "firestore")]
+const LEGACY_MIGRATION_SEAL_SCHEMA: &str = "kin.spine-legacy-migration-seal.v1";
+
+#[cfg(feature = "firestore")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StageMarkerProgress {
+    stage_sequence: u64,
+    revision_kind: String,
+    revision_sha256: String,
+}
+
+#[cfg(feature = "firestore")]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct LegacyMigrationSeal {
+    schema: String,
+    scope: String,
+    repository_ids: Vec<String>,
+    rollout_fence_evidence: SpineRolloutFenceEvidence,
+    writer_drain: LegacySpineWriterDrainAttestation,
+    sealed_heads: Vec<RepoPublicationHead>,
+    head_set_sha256: String,
+}
+
+#[cfg(feature = "firestore")]
+fn legacy_migration_head_set_sha256(
+    scope: &str,
+    rollout_fence_evidence: &SpineRolloutFenceEvidence,
+    sealed_heads: &[RepoPublicationHead],
+) -> Result<String, SpineError> {
+    use sha2::{Digest, Sha256};
+
+    let payload = serde_json::to_vec(&(scope, rollout_fence_evidence, sealed_heads)).map_err(
+        |error| {
+            SpineError::Serialization(format!(
+                "failed to serialize legacy migration head-set evidence: {error}"
+            ))
+        },
+    )?;
+    let mut hasher = Sha256::new();
+    hasher.update(LEGACY_MIGRATION_HEAD_SET_HASH_DOMAIN);
+    hasher.update(payload);
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
+}
+
+#[cfg(feature = "firestore")]
+impl LegacyMigrationSeal {
+    fn build(
+        active: &LoadedSpineRolloutFence,
+        writer_drain: LegacySpineWriterDrainAttestation,
+        mut sealed_heads: Vec<RepoPublicationHead>,
+    ) -> Result<Self, SpineError> {
+        writer_drain.validate()?;
+        if writer_drain.rollout_fence_evidence != active.evidence() {
+            return Err(SpineError::Backend(
+                "legacy migration writer-drain evidence does not match the active rollout fence"
+                    .to_string(),
+            ));
+        }
+        sealed_heads.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+        let repository_ids = active
+            .fence
+            .repositories
+            .iter()
+            .map(|row| row.repo_id.clone())
+            .collect::<Vec<_>>();
+        let observed_ids = sealed_heads
+            .iter()
+            .map(|head| head.repo_id.clone())
+            .collect::<Vec<_>>();
+        if observed_ids != repository_ids {
+            return Err(SpineError::Backend(
+                "legacy migration seal requires one committed head for every exact fleet repository"
+                    .to_string(),
+            ));
+        }
+        let rollout_fence_evidence = active.evidence();
+        let head_set_sha256 = legacy_migration_head_set_sha256(
+            &active.fence.scope,
+            &rollout_fence_evidence,
+            &sealed_heads,
+        )?;
+        Ok(Self {
+            schema: LEGACY_MIGRATION_SEAL_SCHEMA.to_string(),
+            scope: active.fence.scope.clone(),
+            repository_ids,
+            rollout_fence_evidence,
+            writer_drain,
+            sealed_heads,
+            head_set_sha256,
+        })
+    }
+
+    fn validate_against_active(
+        &self,
+        active: &LoadedSpineRolloutFence,
+    ) -> Result<(), SpineError> {
+        if self.schema != LEGACY_MIGRATION_SEAL_SCHEMA {
+            return Err(SpineError::Serialization(format!(
+                "unsupported legacy migration seal schema {}",
+                self.schema
+            )));
+        }
+        self.writer_drain.validate()?;
+        if self.writer_drain.rollout_fence_evidence != self.rollout_fence_evidence {
+            return Err(SpineError::Serialization(
+                "legacy migration seal writer-drain evidence is not self-consistent"
+                    .to_string(),
+            ));
+        }
+        let expected_repository_ids = active
+            .fence
+            .repositories
+            .iter()
+            .map(|row| row.repo_id.clone())
+            .collect::<Vec<_>>();
+        if self.scope != active.fence.scope
+            || self.repository_ids != expected_repository_ids
+            || self.rollout_fence_evidence.rollout_fence > active.fence.rollout_fence
+        {
+            return Err(SpineError::Backend(
+                "legacy migration seal does not belong to the active rollout scope and exact fleet"
+                    .to_string(),
+            ));
+        }
+        if self.rollout_fence_evidence.rollout_fence == active.fence.rollout_fence
+            && self.rollout_fence_evidence != active.evidence()
+        {
+            return Err(SpineError::Backend(
+                "legacy migration seal carries different evidence for the active rollout fence"
+                    .to_string(),
+            ));
+        }
+        let observed_ids = self
+            .sealed_heads
+            .iter()
+            .map(|head| head.repo_id.clone())
+            .collect::<Vec<_>>();
+        if observed_ids != self.repository_ids
+            || self.head_set_sha256
+                != legacy_migration_head_set_sha256(
+                    &self.scope,
+                    &self.rollout_fence_evidence,
+                    &self.sealed_heads,
+                )?
+        {
+            return Err(SpineError::Serialization(
+                "legacy migration seal head-set evidence is invalid".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
 
 struct CleanupSweepGate {
     running: bool,
@@ -97,6 +260,15 @@ fn classify_rollout_fence_reconciliation(
         return RolloutFenceReconciliation::NewerOrDifferent(Some(observed.evidence()));
     }
     RolloutFenceReconciliation::Retry
+}
+
+fn publication_stage_is_cleanup_safe(
+    staged: &RepoPublicationHead,
+    active: &RepoPublicationHead,
+) -> bool {
+    staged.source_cursor < active.source_cursor
+        || (staged.source_cursor == active.source_cursor
+            && staged.phase <= active.phase)
 }
 
 /// Spine backend that reads from an in-memory cache and publishes through a
@@ -188,21 +360,44 @@ impl FirestoreSpineBackend {
     /// This method verifies coverage immediately before asking the store to
     /// create its immutable marker. It is intentionally explicit and is never
     /// called automatically during a rolling deployment.
-    pub fn complete_legacy_migration(&self) -> Result<(), SpineError> {
+    pub fn complete_legacy_migration(
+        &self,
+        writer_drain: LegacySpineWriterDrainAttestation,
+    ) -> Result<(), SpineError> {
         let _migration = self.refresh_write_lock.lock();
+        writer_drain.validate()?;
         let (active_rollout_fence, loaded) =
             self.load_stable_rollout_and_publications("legacy migration completion")?;
+        if writer_drain.rollout_fence_evidence != active_rollout_fence.evidence() {
+            return Err(SpineError::Backend(
+                "legacy writer-drain attestation does not bind the exact active rollout fence"
+                    .to_string(),
+            ));
+        }
         for publication in &loaded {
             active_rollout_fence
                 .fence
                 .validate_publication_repo(&publication.head.repo_id)?;
         }
-        let legacy_repos = self.store.load_repos()?;
-        let legacy_edges = self.store.load_edges()?;
+        let expected_repo_ids = active_rollout_fence
+            .fence
+            .repositories
+            .iter()
+            .map(|row| row.repo_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
         let committed_repo_ids = loaded
             .iter()
             .map(|publication| publication.head.repo_id.clone())
-            .collect::<HashSet<_>>();
+            .collect::<std::collections::BTreeSet<_>>();
+        if committed_repo_ids != expected_repo_ids {
+            return Err(SpineError::Backend(format!(
+                "legacy spine migration requires exact active-fleet v2 heads: expected {}, observed {}",
+                expected_repo_ids.iter().cloned().collect::<Vec<_>>().join(", "),
+                committed_repo_ids.iter().cloned().collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let legacy_repos = self.store.load_repos()?;
+        let legacy_edges = self.store.load_edges()?;
         let uncovered_legacy = legacy_repos
             .iter()
             .map(|repo| repo.repo_id.clone())
@@ -217,7 +412,8 @@ impl FirestoreSpineBackend {
                 uncovered_legacy.into_iter().collect::<Vec<_>>().join(", ")
             )));
         }
-        self.store.complete_legacy_migration(&active_rollout_fence)?;
+        self.store
+            .complete_legacy_migration(&active_rollout_fence, &writer_drain)?;
         Ok(())
     }
 
@@ -412,33 +608,16 @@ impl FirestoreSpineBackend {
         let (active_rollout_fence, loaded) =
             self.load_stable_rollout_and_publications("hydration")?;
 
-        // Legacy rows have no cursor or committed head. During migration they
-        // remain physically present but cannot be served. Refuse startup until
-        // every legacy repository has a v2 head, then ignore legacy collections
-        // permanently. This prevents a partial migration from silently dropping
-        // one repository or mixing generations.
-        let legacy_migration_complete = self.store.legacy_migration_complete()?;
-        if !legacy_migration_complete {
-            let legacy_repos = self.store.load_repos()?;
-            let legacy_edges = self.store.load_edges()?;
-            let committed_repo_ids = loaded
-                .iter()
-                .map(|publication| publication.head.repo_id.clone())
-                .collect::<HashSet<_>>();
-            let uncovered_legacy = legacy_repos
-                .iter()
-                .map(|repo| repo.repo_id.clone())
-                .chain(legacy_edges.iter().flat_map(|edge| {
-                    [edge.src_repo.clone(), edge.dst_repo.clone()]
-                }))
-                .filter(|repo_id| !committed_repo_ids.contains(repo_id))
-                .collect::<std::collections::BTreeSet<_>>();
-            if !uncovered_legacy.is_empty() {
-                return Err(SpineError::Backend(format!(
-                    "legacy spine rows have no committed cursor-bound head for repositories: {}; republish them before hydration",
-                    uncovered_legacy.into_iter().collect::<Vec<_>>().join(", ")
-                )));
-            }
+        // A point-in-time scan of the legacy collections cannot prove an old
+        // cursorless binary will not append another invisible row afterward.
+        // Reader installation therefore requires the durable, externally
+        // attested one-way migration seal even when the legacy collections are
+        // currently empty or every visible row happens to be covered.
+        if !self.store.legacy_migration_complete()? {
+            return Err(SpineError::Backend(
+                "hosted spine reads remain sealed until the durable legacy writer-drain migration marker is complete"
+                    .to_string(),
+            ));
         }
 
         let mut canonical = Vec::with_capacity(loaded.len());
@@ -464,6 +643,27 @@ impl FirestoreSpineBackend {
             .iter()
             .map(|publication| publication.head.repo_id.clone())
             .collect::<HashSet<_>>();
+        let expected_repo_ids = active_rollout_fence
+            .fence
+            .repositories
+            .iter()
+            .map(|row| row.repo_id.clone())
+            .collect::<HashSet<_>>();
+        if durable_repo_ids != expected_repo_ids {
+            return Err(SpineError::Backend(format!(
+                "committed spine head set does not equal the active exact fleet: expected {}, observed {}",
+                {
+                    let mut ids = expected_repo_ids.iter().cloned().collect::<Vec<_>>();
+                    ids.sort();
+                    ids.join(", ")
+                },
+                {
+                    let mut ids = durable_repo_ids.iter().cloned().collect::<Vec<_>>();
+                    ids.sort();
+                    ids.join(", ")
+                }
+            )));
+        }
         {
             let known = self.known_durable_repos.lock();
             if let Some(previous) = known.as_ref() {
@@ -500,33 +700,23 @@ impl FirestoreSpineBackend {
             })
             .sum();
 
-        // Install every committed root first. Edge publications carry a root
-        // map for the whole hydrated set, so resolving one repo before later
-        // roots exist would leave an otherwise complete earlier repo dirty.
-        for publication in &canonical {
-            let candidate = &publication.publication;
-            self.cache.index().install_repo_publication(
-                &candidate.repo_id,
-                candidate.entries.clone(),
-                &candidate.root_hash,
-                candidate.source_cursor,
-                None,
-                None,
-            );
-        }
-        for publication in canonical {
-            let candidate = publication.publication;
-            if candidate.outgoing_edges.is_some() {
-                self.cache.index().install_repo_publication(
-                    &candidate.repo_id,
-                    candidate.entries,
-                    &candidate.root_hash,
-                    candidate.source_cursor,
-                    candidate.outgoing_edges,
-                    candidate.resolution_roots.as_ref(),
-                );
-            }
-        }
+        let replacement = canonical
+            .into_iter()
+            .map(|publication| {
+                let candidate = publication.publication;
+                CommittedRepoIndexPublication {
+                    repo_id: candidate.repo_id,
+                    entries: candidate.entries,
+                    root_hash: candidate.root_hash,
+                    source_cursor: candidate.source_cursor,
+                    outgoing_edges: candidate.outgoing_edges,
+                    resolution_roots: candidate.resolution_roots,
+                }
+            })
+            .collect();
+        self.cache
+            .index()
+            .replace_committed_repo_publications(replacement, |_| {});
         *self.known_durable_repos.lock() = Some(durable_repo_ids);
 
         info!(
@@ -555,8 +745,11 @@ impl SpineBackend for FirestoreSpineBackend {
         })
     }
 
-    fn complete_legacy_migration(&self) -> Result<(), SpineError> {
-        FirestoreSpineBackend::complete_legacy_migration(self)
+    fn complete_legacy_migration(
+        &self,
+        writer_drain: LegacySpineWriterDrainAttestation,
+    ) -> Result<(), SpineError> {
+        FirestoreSpineBackend::complete_legacy_migration(self, writer_drain)
     }
 
     fn refresh_committed_publications(&self) -> Result<(), SpineError> {
@@ -568,6 +761,20 @@ impl SpineBackend for FirestoreSpineBackend {
         publication: RepoSpinePublication,
     ) -> Result<PreparedRepoSpinePublication, SpineError> {
         let prepared = self.store.prepare_repo_publication(publication)?;
+        Ok(PreparedRepoSpinePublication::bind(
+            self.publication_backend_id,
+            prepared,
+        ))
+    }
+
+    fn prepare_repo_publication_bound(
+        &self,
+        publication: RepoSpinePublication,
+        expected_rollout_fence: &SpineRolloutFenceEvidence,
+    ) -> Result<PreparedRepoSpinePublication, SpineError> {
+        let prepared = self
+            .store
+            .prepare_repo_publication_bound(publication, expected_rollout_fence)?;
         Ok(PreparedRepoSpinePublication::bind(
             self.publication_backend_id,
             prepared,
@@ -696,23 +903,16 @@ impl SpineBackend for FirestoreSpineBackend {
     }
 
     fn authority_complete(&self) -> bool {
-        // The same fail-closed rule the snapshot below applies, said directly.
-        // The trait's default derives this by materializing the whole snapshot,
-        // which for this backend clones every cached edge and entity to arrive
-        // at a constant. Stating it here keeps the policy in one readable place
-        // per backend rather than emergent from what the default happens to
-        // read, and a health probe stops paying a full clone for one boolean.
-        false
+        // Every durable edge head is bound to the exact root map it resolved
+        // against, and its head commit CAS-guards each sibling head plus the
+        // rollout fence. Hydration installs the full stable head set as one
+        // cache generation, so the index's dirty/closed check is now the exact
+        // committed-head completeness predicate rather than a pod-local guess.
+        self.cache.authority_complete()
     }
 
     fn cross_repo_edges_snapshot(&self) -> CrossRepoEdgesSnapshot {
-        // Durable rows and this pod's graph refreshes are useful advisory
-        // positives, but neither can prove that every other pod observed the
-        // same registered roots. Keep completeness fail-closed until the
-        // durable backend owns a shared pass/root CAS.
-        let mut snapshot = self.cache.cross_repo_edges_snapshot();
-        snapshot.complete = false;
-        snapshot
+        self.cache.cross_repo_edges_snapshot()
     }
 
     fn cross_repo_xref_response(
@@ -720,9 +920,7 @@ impl SpineBackend for FirestoreSpineBackend {
         repo_id: &str,
         entity_id: &EntityId,
     ) -> crate::SpineXrefResponse {
-        let mut response = self.cache.cross_repo_xref_response(repo_id, entity_id);
-        response.authority_complete = false;
-        response
+        self.cache.cross_repo_xref_response(repo_id, entity_id)
     }
 
     fn add_cross_repo_edge(&self, edge: CrossRepoEdge) {
@@ -793,15 +991,10 @@ impl SpineBackend for FirestoreSpineBackend {
         &self,
         token: u64,
         authority_roots: &BTreeMap<String, String>,
-        _success: bool,
+        success: bool,
     ) -> bool {
-        // Clear this pod's lease while deliberately retaining its dirty set.
-        // A successful local pass cannot be published as globally complete
-        // without a shared durable epoch/root compare-and-swap.
-        let _ = self
-            .cache
-            .finish_cross_repo_refresh_pass(token, authority_roots, false);
-        false
+        self.cache
+            .finish_cross_repo_refresh_pass(token, authority_roots, success)
     }
 
     fn federated_impact(
@@ -1201,6 +1394,39 @@ impl FirestoreStore {
         }
     }
 
+    fn read_publication_dependency_heads(
+        &self,
+        publication: &RepoSpinePublication,
+    ) -> Result<BTreeMap<String, StoreRepoHeadGuard>, SpineError> {
+        let mut guards = BTreeMap::new();
+        let Some(resolution_roots) = publication.resolution_roots.as_ref() else {
+            return Ok(guards);
+        };
+        for (repo_id, expected_root) in resolution_roots {
+            if repo_id == &publication.repo_id {
+                continue;
+            }
+            let (head, precondition) = self.read_repo_head(repo_id)?;
+            let head = head.ok_or_else(|| {
+                SpineError::Backend(format!(
+                    "repo {} edge publication cannot resolve against missing committed head {repo_id}",
+                    publication.repo_id
+                ))
+            })?;
+            if head.root_hash != *expected_root {
+                return Err(SpineError::Backend(format!(
+                    "repo {} edge publication resolved {repo_id} at root {expected_root}, but durable head is at {}",
+                    publication.repo_id, head.root_hash
+                )));
+            }
+            guards.insert(
+                repo_id.clone(),
+                StoreRepoHeadGuard { head, precondition },
+            );
+        }
+        Ok(guards)
+    }
+
     fn read_rollout_fence(
         &self,
     ) -> Result<Option<LoadedSpineRolloutFence>, SpineError> {
@@ -1404,10 +1630,151 @@ impl FirestoreStore {
         self.get_document(collection, document_id)
     }
 
+    fn stage_marker_revision_sha256(
+        head: &RepoPublicationHead,
+        revision_kind: &str,
+        stage_sequence: u64,
+        revision_payload: &[u8],
+    ) -> String {
+        use sha2::{Digest, Sha256};
+
+        let mut hasher = Sha256::new();
+        hasher.update(STAGE_MARKER_REVISION_HASH_DOMAIN);
+        hasher.update(head.publication_id.as_bytes());
+        hasher.update([0]);
+        hasher.update(revision_kind.as_bytes());
+        hasher.update([0]);
+        hasher.update(stage_sequence.to_be_bytes());
+        hasher.update(revision_payload);
+        format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+
+    fn initial_stage_marker_progress(
+        head: &RepoPublicationHead,
+    ) -> Result<StageMarkerProgress, SpineError> {
+        let payload = serde_json::to_vec(head).map_err(|error| {
+            SpineError::Serialization(format!(
+                "failed to serialize initial stage marker revision: {error}"
+            ))
+        })?;
+        Ok(StageMarkerProgress {
+            stage_sequence: 0,
+            revision_kind: "stage".to_string(),
+            revision_sha256: Self::stage_marker_revision_sha256(head, "stage", 0, &payload),
+        })
+    }
+
+    fn stage_batch_progress(
+        head: &RepoPublicationHead,
+        stage_sequence: u64,
+        writes: &[serde_json::Value],
+    ) -> Result<StageMarkerProgress, SpineError> {
+        let payload = serde_json::to_vec(writes).map_err(|error| {
+            SpineError::Serialization(format!(
+                "failed to serialize immutable stage batch revision: {error}"
+            ))
+        })?;
+        Ok(StageMarkerProgress {
+            stage_sequence,
+            revision_kind: "stage".to_string(),
+            revision_sha256: Self::stage_marker_revision_sha256(
+                head,
+                "stage",
+                stage_sequence,
+                &payload,
+            ),
+        })
+    }
+
+    fn cleanup_stage_progress(
+        head: &RepoPublicationHead,
+        current: &StageMarkerProgress,
+        stage_revision: &str,
+        delete_names: &[String],
+    ) -> Result<StageMarkerProgress, SpineError> {
+        let payload = serde_json::to_vec(&(
+            stage_revision,
+            current.stage_sequence,
+            &current.revision_sha256,
+            delete_names,
+        ))
+        .map_err(|error| {
+            SpineError::Serialization(format!(
+                "failed to serialize cleanup stage marker revision: {error}"
+            ))
+        })?;
+        Ok(StageMarkerProgress {
+            stage_sequence: current.stage_sequence,
+            revision_kind: "cleanup".to_string(),
+            revision_sha256: Self::stage_marker_revision_sha256(
+                head,
+                "cleanup",
+                current.stage_sequence,
+                &payload,
+            ),
+        })
+    }
+
+    fn committed_stage_progress(
+        head: &RepoPublicationHead,
+        current: &StorePublicationStageGuard,
+    ) -> Result<StageMarkerProgress, SpineError> {
+        let payload = serde_json::to_vec(&(
+            current.stage_sequence,
+            &current.revision_sha256,
+            &current.update_time,
+            &head.publication_id,
+        ))
+        .map_err(|error| {
+            SpineError::Serialization(format!(
+                "failed to serialize committed stage marker revision: {error}"
+            ))
+        })?;
+        Ok(StageMarkerProgress {
+            stage_sequence: current.stage_sequence,
+            revision_kind: "committed".to_string(),
+            revision_sha256: Self::stage_marker_revision_sha256(
+                head,
+                "committed",
+                current.stage_sequence,
+                &payload,
+            ),
+        })
+    }
+
+    fn committed_stage_marker_write(
+        &self,
+        head: &RepoPublicationHead,
+        current: &StorePublicationStageGuard,
+    ) -> Result<serde_json::Value, SpineError> {
+        let progress = Self::committed_stage_progress(head, current)?;
+        self.stage_marker_write(
+            head,
+            &progress,
+            serde_json::json!({ "updateTime": current.update_time }),
+        )
+    }
+
     fn stage_marker_fields(
         &self,
         head: &RepoPublicationHead,
+        progress: &StageMarkerProgress,
     ) -> Result<serde_json::Value, SpineError> {
+        if !matches!(
+            progress.revision_kind.as_str(),
+            "stage" | "committed" | "cleanup"
+        )
+            || !progress.revision_sha256.strip_prefix("sha256:").is_some_and(|digest| {
+                digest.len() == 64
+                    && digest.bytes().all(|byte| {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                    })
+            })
+        {
+            return Err(SpineError::Serialization(
+                "stage marker revision is not canonical".to_string(),
+            ));
+        }
         let payload = serde_json::to_string(head).map_err(|error| {
             SpineError::Serialization(format!("failed to serialize stage marker: {error}"))
         })?;
@@ -1416,22 +1783,194 @@ impl FirestoreStore {
             "source_cursor": { "stringValue": head.source_cursor.to_string() },
             "publication_id": { "stringValue": head.publication_id },
             "phase": { "stringValue": phase_name(head.phase) },
+            "stage_sequence": { "integerValue": progress.stage_sequence.to_string() },
+            "revision_kind": { "stringValue": progress.revision_kind },
+            "revision_sha256": { "stringValue": progress.revision_sha256 },
             "payload": { "stringValue": payload }
         }))
+    }
+
+    fn parse_stage_marker_progress(
+        &self,
+        document: &serde_json::Value,
+        head: &RepoPublicationHead,
+    ) -> Result<StageMarkerProgress, SpineError> {
+        let fields = document.get("fields").ok_or_else(|| {
+            SpineError::Serialization(format!(
+                "publication {} stage marker has no fields",
+                head.publication_id
+            ))
+        })?;
+        let stage_sequence = fields
+            .get("stage_sequence")
+            .and_then(|value| value.get("integerValue"))
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or_else(|| {
+                SpineError::Serialization(format!(
+                    "publication {} stage marker has no valid stage sequence",
+                    head.publication_id
+                ))
+            })?;
+        let revision_kind = fields
+            .get("revision_kind")
+            .and_then(|value| value.get("stringValue"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                SpineError::Serialization(format!(
+                    "publication {} stage marker has no revision kind",
+                    head.publication_id
+                ))
+            })?
+            .to_string();
+        let revision_sha256 = fields
+            .get("revision_sha256")
+            .and_then(|value| value.get("stringValue"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                SpineError::Serialization(format!(
+                    "publication {} stage marker has no revision digest",
+                    head.publication_id
+                ))
+            })?
+            .to_string();
+        let progress = StageMarkerProgress {
+            stage_sequence,
+            revision_kind,
+            revision_sha256,
+        };
+        if document.get("fields") != Some(&self.stage_marker_fields(head, &progress)?) {
+            return Err(SpineError::Serialization(format!(
+                "publication {} stage marker fields do not exactly match its immutable head",
+                head.publication_id
+            )));
+        }
+        Ok(progress)
     }
 
     fn stage_marker_write(
         &self,
         head: &RepoPublicationHead,
+        progress: &StageMarkerProgress,
         current_document: serde_json::Value,
     ) -> Result<serde_json::Value, SpineError> {
         Ok(serde_json::json!({
             "update": {
                 "name": self.document_name("spine_stages_v2", &head.publication_id),
-                "fields": self.stage_marker_fields(head)?
+                "fields": self.stage_marker_fields(head, progress)?
             },
             "currentDocument": current_document
         }))
+    }
+
+    /// Build the exact Firestore writes for one immutable row batch and its
+    /// marker heartbeat. The marker digest is bound to `certified_writes`, not
+    /// merely the outstanding retry subset, so a partial-response retry emits
+    /// the same marker bytes while every distinct original batch must emit a
+    /// distinct value. Keeping this construction in one helper also gives the
+    /// regression tests the production write shape instead of a parallel fake.
+    fn immutable_stage_batch_writes(
+        &self,
+        head: &RepoPublicationHead,
+        stage_sequence: u64,
+        certified_writes: &[serde_json::Value],
+        pending_writes: &[serde_json::Value],
+    ) -> Result<Vec<serde_json::Value>, SpineError> {
+        let progress = Self::stage_batch_progress(head, stage_sequence, certified_writes)?;
+        let marker_write = self.stage_marker_write(
+            head,
+            &progress,
+            serde_json::json!({ "exists": true }),
+        )?;
+        let mut atomic_writes = pending_writes.to_vec();
+        atomic_writes.push(marker_write);
+        Ok(atomic_writes)
+    }
+
+    fn ensure_stage_marker(&self, head: &RepoPublicationHead) -> Result<(), SpineError> {
+        let initial = Self::initial_stage_marker_progress(head)?;
+        let write = self.stage_marker_write(
+            head,
+            &initial,
+            serde_json::json!({ "exists": false }),
+        )?;
+        match self.commit_write_batches(
+            vec![write],
+            "stage immutable spine publication marker",
+        ) {
+            Ok(()) => Ok(()),
+            Err(commit_error) => {
+                let existing = self
+                    .get_document("spine_stages_v2", &head.publication_id)?
+                    .ok_or_else(|| {
+                        SpineError::Backend(format!(
+                            "{commit_error}; publication {} stage marker was not durably created",
+                            head.publication_id
+                        ))
+                    })?;
+                let existing_head: RepoPublicationHead =
+                    doc_payload(&existing, "spine stage marker")?;
+                if existing_head != *head {
+                    return Err(SpineError::Serialization(format!(
+                        "publication {} stage marker already exists with another immutable head",
+                        head.publication_id
+                    )));
+                }
+                let progress = self.parse_stage_marker_progress(&existing, head)?;
+                if progress.revision_kind == "cleanup" {
+                    return Err(SpineError::Backend(format!(
+                        "publication {} is already under marker-fenced cleanup",
+                        head.publication_id
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn observe_stage_guard(
+        &self,
+        head: &RepoPublicationHead,
+    ) -> Result<Option<StorePublicationStageGuard>, SpineError> {
+        let Some(document) = self.get_document("spine_stages_v2", &head.publication_id)? else {
+            return Ok(None);
+        };
+        let marker_head: RepoPublicationHead = doc_payload(&document, "spine stage marker")?;
+        if marker_head != *head {
+            return Ok(None);
+        }
+        let progress = self.parse_stage_marker_progress(&document, head)?;
+        if progress.revision_kind != "stage" {
+            return Ok(None);
+        }
+        let update_time = document
+            .get("updateTime")
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                SpineError::Serialization(format!(
+                    "publication {} final stage marker has no Firestore updateTime",
+                    head.publication_id
+                ))
+            })?
+            .to_string();
+        Ok(Some(StorePublicationStageGuard {
+            stage_sequence: progress.stage_sequence,
+            revision_sha256: progress.revision_sha256,
+            update_time,
+        }))
+    }
+
+    fn read_stage_guard(
+        &self,
+        head: &RepoPublicationHead,
+    ) -> Result<StorePublicationStageGuard, SpineError> {
+        self.observe_stage_guard(head)?.ok_or_else(|| {
+            SpineError::Backend(format!(
+                "publication {} final stage marker is missing or no longer prepared",
+                head.publication_id
+            ))
+        })
     }
 
     fn immutable_update_write(
@@ -1507,8 +2046,10 @@ impl FirestoreStore {
         const MAX_DATA_WRITES: usize = 99;
         const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
 
+        let initial_progress = Self::initial_stage_marker_progress(head)?;
         let marker_write = self.stage_marker_write(
             head,
+            &initial_progress,
             serde_json::json!({ "exists": true }),
         )?;
         let marker_bytes = serde_json::to_vec(&marker_write)
@@ -1517,11 +2058,13 @@ impl FirestoreStore {
                     "failed to size stage marker heartbeat: {error}"
                 ))
             })?
-            .len();
+            .len()
+            .saturating_add(32);
         let token = self.get_access_token()?;
         let url = format!("{}:commit", self.base_url());
         let mut batch = Vec::new();
         let mut estimated_bytes = marker_bytes;
+        let mut stage_sequence = 1_u64;
         for write in writes {
             let write_bytes = serde_json::to_vec(&write)
                 .map_err(|error| {
@@ -1544,9 +2087,15 @@ impl FirestoreStore {
                     &token,
                     &url,
                     head,
-                    &marker_write,
+                    stage_sequence,
                     batch,
                 )?;
+                stage_sequence = stage_sequence.checked_add(1).ok_or_else(|| {
+                    SpineError::Backend(format!(
+                        "publication {} exhausted its stage batch sequence",
+                        head.publication_id
+                    ))
+                })?;
                 batch = Vec::new();
                 estimated_bytes = marker_bytes;
             }
@@ -1558,7 +2107,7 @@ impl FirestoreStore {
                 &token,
                 &url,
                 head,
-                &marker_write,
+                stage_sequence,
                 batch,
             )?;
         }
@@ -1570,13 +2119,19 @@ impl FirestoreStore {
         token: &str,
         url: &str,
         head: &RepoPublicationHead,
-        marker_write: &serde_json::Value,
+        stage_sequence: u64,
         mut pending: Vec<serde_json::Value>,
     ) -> Result<(), SpineError> {
+        let certified_writes = pending.clone();
+        let progress = Self::stage_batch_progress(head, stage_sequence, &certified_writes)?;
         let mut last_error = None;
         for _ in 0..3 {
-            let mut atomic_writes = pending.clone();
-            atomic_writes.push(marker_write.clone());
+            let atomic_writes = self.immutable_stage_batch_writes(
+                head,
+                stage_sequence,
+                &certified_writes,
+                &pending,
+            )?;
             match self.commit_write_batch(
                 token,
                 url,
@@ -1595,24 +2150,51 @@ impl FirestoreStore {
                         head.publication_id
                     ))
                 })?;
-            if marker.get("fields") != Some(&self.stage_marker_fields(head)?) {
+            let marker_head: RepoPublicationHead =
+                doc_payload(&marker, "spine stage marker")?;
+            if marker_head != *head {
                 return Err(SpineError::Serialization(format!(
                     "publication {} stage marker changed identity while rows were being written",
                     head.publication_id
                 )));
             }
+            let observed_progress = self.parse_stage_marker_progress(&marker, head)?;
 
             let mut missing = Vec::new();
-            for write in pending {
+            for write in &pending {
                 if !self.validate_existing_immutable_write(
-                    &write,
+                    write,
                     "immutable spine publication row",
                 )? {
-                    missing.push(write);
+                    missing.push(write.clone());
                 }
             }
             if missing.is_empty() {
                 return Ok(());
+            }
+            if observed_progress.revision_kind == "cleanup" {
+                return Err(SpineError::Backend(format!(
+                    "publication {} began marker-fenced cleanup while stage batch {} was in flight",
+                    head.publication_id, stage_sequence
+                )));
+            }
+            if observed_progress.stage_sequence > stage_sequence {
+                return Err(SpineError::Serialization(format!(
+                    "publication {} stage marker advanced past batch {} while that batch still has missing rows",
+                    head.publication_id, stage_sequence
+                )));
+            }
+            if observed_progress.stage_sequence == stage_sequence {
+                if observed_progress.revision_sha256 != progress.revision_sha256 {
+                    return Err(SpineError::Serialization(format!(
+                        "publication {} stage batch {} has conflicting immutable bytes",
+                        head.publication_id, stage_sequence
+                    )));
+                }
+                return Err(SpineError::Serialization(format!(
+                    "publication {} stage marker certifies batch {} but that batch has missing rows",
+                    head.publication_id, stage_sequence
+                )));
             }
             pending = missing;
         }
@@ -1628,10 +2210,7 @@ impl FirestoreStore {
         let publication = prepared.publication();
         let head = prepared.candidate_head();
         let cursor = publication.source_cursor.to_string();
-        self.ensure_immutable_document(
-            self.stage_marker_write(head, serde_json::json!({ "exists": false }))?,
-            "stage immutable spine publication marker",
-        )?;
+        self.ensure_stage_marker(head)?;
 
         let mut writes = Vec::with_capacity(
             publication.entries.len()
@@ -1698,6 +2277,48 @@ impl FirestoreStore {
         self.commit_immutable_stage_batches(head, writes)
     }
 
+    fn prepare_repo_publication_with_expected_fence(
+        &self,
+        publication: RepoSpinePublication,
+        expected_rollout_fence: Option<&SpineRolloutFenceEvidence>,
+    ) -> Result<PreparedStorePublication, SpineError> {
+        let rollout_fence = self.read_rollout_fence()?.ok_or_else(|| {
+            SpineError::Backend(
+                "cannot prepare a hosted spine publication without an active durable rollout fence"
+                    .to_string(),
+            )
+        })?;
+        if expected_rollout_fence
+            .is_some_and(|expected| rollout_fence.evidence() != *expected)
+        {
+            return Err(SpineError::Backend(format!(
+                "repo {} publication refused before staging because Firestore rollout evidence differs from the admitted GCS authority",
+                publication.repo_id
+            )));
+        }
+        let (observed_head, precondition) = self.read_repo_head(&publication.repo_id)?;
+        let dependency_heads = self.read_publication_dependency_heads(&publication)?;
+        let mut prepared = PreparedStorePublication::new_fenced(
+            publication,
+            observed_head,
+            precondition,
+            dependency_heads,
+            rollout_fence,
+        )?;
+        if prepared.requires_staging() {
+            self.stage_publication(&prepared)?;
+            let staged = self.load_publication_for_head(prepared.candidate_head())?;
+            CanonicalRepoPublication::validate_loaded(
+                staged.head,
+                staged.entries,
+                staged.outgoing_edges,
+            )?;
+            let stage_guard = self.read_stage_guard(prepared.candidate_head())?;
+            prepared = prepared.bind_stage_guard(stage_guard)?;
+        }
+        Ok(prepared)
+    }
+
     fn commit_head_and_rollout_fence(
         &self,
         prepared: &PreparedStorePublication,
@@ -1719,7 +2340,24 @@ impl FirestoreStore {
             &prepared_fence.fence,
             &StoreHeadPrecondition::Revision(prepared_fence.update_time.clone()),
         )?;
-        let body = serde_json::json!({ "writes": [head_write, fence_write] });
+        let mut writes = vec![head_write, fence_write];
+        for (repo_id, guard) in prepared.dependency_heads() {
+            writes.push(firestore_head_write(
+                self.document_name("spine_repo_heads_v2", &sha256_hex(repo_id.as_bytes())),
+                &guard.head,
+                &guard.precondition,
+            )?);
+        }
+        if prepared.requires_staging() {
+            let stage_guard = prepared.stage_guard().ok_or_else(|| {
+                SpineError::Backend(format!(
+                    "repo {} publication has no final stage-marker CAS guard",
+                    head.repo_id
+                ))
+            })?;
+            writes.push(self.committed_stage_marker_write(head, stage_guard)?);
+        }
+        let body = serde_json::json!({ "writes": writes });
         let token = self.get_access_token()?;
         let url = format!("{}:commit", self.base_url());
         let response = self.run_async(async {
@@ -1789,7 +2427,7 @@ impl FirestoreStore {
                 "{cause}; publication preparation carried no rollout fence"
             ))
         })?;
-        let (observed_fence, observed, observed_precondition) = {
+        let (observed_fence, observed, observed_precondition, observed_dependencies) = {
             let mut stable = None;
             for _ in 0..3 {
                 let fence_before = self.read_rollout_fence().map_err(|reconcile_error| {
@@ -1803,13 +2441,31 @@ impl FirestoreStore {
                             "{cause}; durable head outcome is indeterminate because reconciliation failed: {reconcile_error}"
                         ))
                     })?;
+                let observed_dependencies = prepared
+                    .dependency_heads()
+                    .keys()
+                    .map(|repo_id| {
+                        self.read_repo_head(repo_id)
+                            .map(|observed| (repo_id.clone(), observed))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()
+                    .map_err(|reconcile_error| {
+                        SpineError::Backend(format!(
+                            "{cause}; dependency-head outcome is indeterminate because reconciliation failed: {reconcile_error}"
+                        ))
+                    })?;
                 let fence_after = self.read_rollout_fence().map_err(|reconcile_error| {
                     SpineError::Backend(format!(
                         "{cause}; rollout fence outcome is indeterminate because reconciliation failed: {reconcile_error}"
                     ))
                 })?;
                 if fence_before == fence_after {
-                    stable = Some((fence_after, observed, observed_precondition));
+                    stable = Some((
+                        fence_after,
+                        observed,
+                        observed_precondition,
+                        observed_dependencies,
+                    ));
                     break;
                 }
             }
@@ -1840,6 +2496,43 @@ impl FirestoreStore {
             return Ok(RepoPublicationCommit::AlreadyCommitted {
                 source_cursor: candidate.source_cursor,
             });
+        }
+        if let Some(expected_stage) = prepared.stage_guard() {
+            let observed_stage = self.observe_stage_guard(candidate).map_err(|error| {
+                SpineError::Backend(format!(
+                    "{cause}; repo {} stage-marker outcome is indeterminate, attempted cursor {}, observed head cursor {:?}: {error}",
+                    candidate.repo_id,
+                    candidate.source_cursor,
+                    observed.as_ref().map(|head| head.source_cursor)
+                ))
+            })?;
+            if observed_stage.as_ref() != Some(expected_stage) {
+                return Ok(RepoPublicationCommit::Conflict(
+                    crate::publication::RepoPublicationConflict::against(
+                        candidate.source_cursor,
+                        observed.as_ref(),
+                    ),
+                ));
+            }
+        }
+        for (repo_id, guard) in prepared.dependency_heads() {
+            let (observed_dependency, observed_dependency_precondition) =
+                observed_dependencies.get(repo_id).ok_or_else(|| {
+                    SpineError::Backend(format!(
+                        "{cause}; dependency-head reconciliation omitted {repo_id}"
+                    ))
+                })?;
+            if observed_dependency_precondition != &guard.precondition
+                || observed_dependency.as_ref() != Some(&guard.head)
+            {
+                return Ok(RepoPublicationCommit::Conflict(
+                    crate::publication::RepoPublicationConflict::against_dependency(
+                        candidate.source_cursor,
+                        repo_id,
+                        observed_dependency.as_ref(),
+                    ),
+                ));
+            }
         }
         if &observed_precondition == prepared.head_precondition() {
             return Err(SpineError::Backend(format!(
@@ -2121,94 +2814,122 @@ impl SpineStore for FirestoreStore {
                 "legacy migration marker is stored under the wrong document identity".to_string(),
             ));
         }
-        let fields = document.get("fields").ok_or_else(|| {
-            SpineError::Serialization("legacy migration marker has no fields".to_string())
+        let seal: LegacyMigrationSeal = doc_payload(&document, "legacy migration seal")?;
+        let active = self.read_rollout_fence()?.ok_or_else(|| {
+            SpineError::Backend(
+                "legacy migration seal exists without an active rollout fence".to_string(),
+            )
         })?;
-        let schema_version = fields
-            .get("schema_version")
-            .and_then(|value| value.get("integerValue"))
-            .and_then(serde_json::Value::as_str);
-        let state = fields
-            .get("state")
-            .and_then(|value| value.get("stringValue"))
-            .and_then(serde_json::Value::as_str);
-        let rollout_payload_sha256 = fields
-            .get("rollout_payload_sha256")
-            .and_then(|value| value.get("stringValue"))
-            .and_then(serde_json::Value::as_str);
-        let rollout_update_time = fields
-            .get("rollout_update_time")
-            .and_then(|value| value.get("stringValue"))
-            .and_then(serde_json::Value::as_str);
-        let rollout_fence = fields
-            .get("rollout_fence")
-            .and_then(|value| value.get("integerValue"))
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| value.parse::<u64>().ok());
-        if schema_version != Some("2")
-            || state != Some("complete")
-            || !rollout_payload_sha256.is_some_and(|value| {
-                value.strip_prefix("sha256:").is_some_and(|digest| {
-                    digest.len() == 64
-                        && digest.bytes().all(|byte| {
-                            byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                        })
-                })
-            })
-            || !rollout_update_time.is_some_and(|value| !value.is_empty())
-            || !rollout_fence.is_some_and(|value| value > 0)
-        {
-            return Err(SpineError::Serialization(
-                "legacy migration marker has unsupported contents".to_string(),
-            ));
-        }
+        seal.validate_against_active(&active)?;
         Ok(true)
     }
 
     fn complete_legacy_migration(
         &self,
         rollout_fence: &LoadedSpineRolloutFence,
+        writer_drain: &LegacySpineWriterDrainAttestation,
     ) -> Result<(), SpineError> {
-        let write = self.immutable_update_write(
+        if self.legacy_migration_complete()? {
+            return Ok(());
+        }
+        writer_drain.validate()?;
+        if writer_drain.rollout_fence_evidence != rollout_fence.evidence() {
+            return Err(SpineError::Backend(
+                "legacy migration completion received writer-drain evidence for another rollout fence"
+                    .to_string(),
+            ));
+        }
+        let loaded = self.load_repo_publications()?;
+        let mut heads = Vec::with_capacity(loaded.len());
+        for publication in loaded {
+            let head = publication.head.clone();
+            CanonicalRepoPublication::validate_loaded(
+                publication.head,
+                publication.entries,
+                publication.outgoing_edges,
+            )?;
+            heads.push(head);
+        }
+        let seal = LegacyMigrationSeal::build(
+            rollout_fence,
+            writer_drain.clone(),
+            heads.clone(),
+        )?;
+        let mut writes = vec![firestore_rollout_fence_write(
+            self.document_name("spine_control_v2", "rollout_fence"),
+            &rollout_fence.fence,
+            &StoreHeadPrecondition::Revision(rollout_fence.update_time.clone()),
+        )?];
+        for head in &heads {
+            let (observed, precondition) = self.read_repo_head(&head.repo_id)?;
+            if observed.as_ref() != Some(head) {
+                return Err(SpineError::Backend(format!(
+                    "repo {} head moved while the legacy migration seal was prepared",
+                    head.repo_id
+                )));
+            }
+            writes.push(firestore_head_write(
+                self.document_name(
+                    "spine_repo_heads_v2",
+                    &sha256_hex(head.repo_id.as_bytes()),
+                ),
+                head,
+                &precondition,
+            )?);
+        }
+        let payload = serde_json::to_string(&seal).map_err(|error| {
+            SpineError::Serialization(format!(
+                "failed to serialize legacy migration seal: {error}"
+            ))
+        })?;
+        writes.push(self.immutable_update_write(
             self.document_name("spine_metadata_v2", "legacy_migration"),
             serde_json::json!({
-                "schema_version": { "integerValue": "2" },
+                "schema": { "stringValue": LEGACY_MIGRATION_SEAL_SCHEMA },
                 "state": { "stringValue": "complete" },
-                "rollout_fence": { "integerValue": rollout_fence.fence.rollout_fence.to_string() },
-                "rollout_payload_sha256": { "stringValue": rollout_fence.fence.payload_sha256 },
-                "rollout_update_time": { "stringValue": rollout_fence.update_time }
+                "head_set_sha256": { "stringValue": seal.head_set_sha256 },
+                "payload": { "stringValue": payload }
             }),
-        );
-        self.ensure_immutable_document(write, "complete legacy spine migration")
+        ));
+        match self.commit_write_batches(writes, "complete legacy spine migration") {
+            Ok(()) => Ok(()),
+            Err(commit_error) => {
+                let Some(document) =
+                    self.get_document("spine_metadata_v2", "legacy_migration")?
+                else {
+                    return Err(SpineError::Backend(format!(
+                        "{commit_error}; legacy migration seal was not durably created"
+                    )));
+                };
+                let observed: LegacyMigrationSeal =
+                    doc_payload(&document, "legacy migration seal")?;
+                if observed == seal {
+                    Ok(())
+                } else {
+                    Err(SpineError::Backend(format!(
+                        "{commit_error}; a different legacy migration seal won"
+                    )))
+                }
+            }
+        }
     }
 
     fn prepare_repo_publication(
         &self,
         publication: RepoSpinePublication,
     ) -> Result<PreparedStorePublication, SpineError> {
-        let rollout_fence = self.read_rollout_fence()?.ok_or_else(|| {
-            SpineError::Backend(
-                "cannot prepare a hosted spine publication without an active durable rollout fence"
-                    .to_string(),
-            )
-        })?;
-        let (observed_head, precondition) = self.read_repo_head(&publication.repo_id)?;
-        let prepared = PreparedStorePublication::new_fenced(
+        self.prepare_repo_publication_with_expected_fence(publication, None)
+    }
+
+    fn prepare_repo_publication_bound(
+        &self,
+        publication: RepoSpinePublication,
+        expected_rollout_fence: &SpineRolloutFenceEvidence,
+    ) -> Result<PreparedStorePublication, SpineError> {
+        self.prepare_repo_publication_with_expected_fence(
             publication,
-            observed_head,
-            precondition,
-            rollout_fence,
-        )?;
-        if prepared.requires_staging() {
-            self.stage_publication(&prepared)?;
-            let staged = self.load_publication_for_head(prepared.candidate_head())?;
-            CanonicalRepoPublication::validate_loaded(
-                staged.head,
-                staged.entries,
-                staged.outgoing_edges,
-            )?;
-        }
-        Ok(prepared)
+            Some(expected_rollout_fence),
+        )
     }
 
     fn commit_repo_publication(
@@ -2297,6 +3018,7 @@ impl SpineStore for FirestoreStore {
             let head: RepoPublicationHead = doc_payload(&document, "publication stage marker")?;
             head.validate()?;
             validate_publication_row(&document, &head, "publication stage marker")?;
+            let progress = self.parse_stage_marker_progress(&document, &head)?;
             let expected_stage_name = self.document_name(
                 "spine_stages_v2",
                 &head.publication_id,
@@ -2320,21 +3042,19 @@ impl SpineStore for FirestoreStore {
             if head.publication_id == active_head.publication_id {
                 continue;
             }
-            let safe = head.source_cursor < active_head.source_cursor
-                || (head.source_cursor == active_head.source_cursor
-                    && head.phase <= active_head.phase);
+            let safe = publication_stage_is_cleanup_safe(&head, active_head);
             if safe {
-                stale.push((head, document));
+                stale.push((head, document, progress));
             }
         }
-        stale.sort_by(|(left, _), (right, _)| {
+        stale.sort_by(|(left, _, _), (right, _, _)| {
             left.source_cursor
                 .cmp(&right.source_cursor)
                 .then_with(|| left.phase.cmp(&right.phase))
                 .then_with(|| left.publication_id.cmp(&right.publication_id))
         });
         let more_candidates = stale.len() > 1;
-        let Some((stale_head, stage_document)) = stale.into_iter().next() else {
+        let Some((stale_head, stage_document, stage_progress)) = stale.into_iter().next() else {
             return Ok(RepoPublicationCleanupProgress::default());
         };
 
@@ -2485,8 +3205,15 @@ impl SpineStore for FirestoreStore {
                 "currentDocument": { "updateTime": stage_revision }
             }));
         } else {
+            let cleanup_progress = Self::cleanup_stage_progress(
+                &stale_head,
+                &stage_progress,
+                stage_revision,
+                &delete_names,
+            )?;
             writes.push(self.stage_marker_write(
                 &stale_head,
+                &cleanup_progress,
                 serde_json::json!({ "updateTime": stage_revision }),
             )?);
         }
@@ -2582,8 +3309,17 @@ mod tests {
         disable_head_precondition: AtomicBool,
         /// Test-only mutant switch restoring the paused pre-rollout writer.
         disable_rollout_fence_precondition: AtomicBool,
+        /// Test-only mutant restoring an edge writer paused while a sibling
+        /// repository head advances after resolution.
+        disable_dependency_head_precondition: AtomicBool,
         /// Test-only mutant switch for the stage-marker cleanup fence.
         disable_stage_fence: AtomicBool,
+        /// Test-only mutant that restores the byte-identical marker heartbeat
+        /// whose Firestore updateTime may remain unchanged for a distinct batch.
+        disable_distinct_stage_heartbeat: AtomicBool,
+        /// Test-only mutant dropping the final stage-marker precondition from
+        /// the atomic head commit.
+        disable_stage_head_precondition: AtomicBool,
         /// Optional deterministic pause after cleanup snapshots a stage but
         /// before its exact-revision atomic delete commit.
         cleanup_snapshot_barrier: Mutex<Option<Arc<std::sync::Barrier>>>,
@@ -2594,7 +3330,13 @@ mod tests {
         /// them. Production cleanup remains enabled and bounded.
         disable_cleanup: AtomicBool,
         cleanup_calls: AtomicUsize,
-        legacy_migration_complete: AtomicBool,
+        legacy_migration_seal: Mutex<
+            Option<(
+                LoadedSpineRolloutFence,
+                LegacySpineWriterDrainAttestation,
+                Vec<RepoPublicationHead>,
+            )>,
+        >,
     }
 
     #[derive(Default)]
@@ -2604,7 +3346,35 @@ mod tests {
         manifests: HashMap<String, RepoPublicationHead>,
         entity_rows: HashMap<String, Vec<EntityEntry>>,
         edge_rows: HashMap<String, Vec<CrossRepoEdge>>,
+        stage_marker_values: HashMap<String, FakeStageMarkerValue>,
         stage_revisions: HashMap<String, u64>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct FakeStageMarkerValue {
+        stage_sequence: u64,
+        revision_kind: &'static str,
+        revision_nonce: String,
+    }
+
+    fn apply_fake_stage_marker(
+        state: &mut FakePublicationState,
+        publication_id: &str,
+        marker: FakeStageMarkerValue,
+    ) {
+        let changed = state.stage_marker_values.get(publication_id) != Some(&marker);
+        if !changed {
+            return;
+        }
+        state
+            .stage_marker_values
+            .insert(publication_id.to_string(), marker);
+        match state.stage_revisions.get_mut(publication_id) {
+            Some(revision) => *revision += 1,
+            None => {
+                state.stage_revisions.insert(publication_id.to_string(), 1);
+            }
+        }
     }
 
     impl Default for FakeSpineStore {
@@ -2623,12 +3393,15 @@ mod tests {
                 atomicity_available: AtomicBool::new(true),
                 disable_head_precondition: AtomicBool::new(false),
                 disable_rollout_fence_precondition: AtomicBool::new(false),
+                disable_dependency_head_precondition: AtomicBool::new(false),
                 disable_stage_fence: AtomicBool::new(false),
+                disable_distinct_stage_heartbeat: AtomicBool::new(false),
+                disable_stage_head_precondition: AtomicBool::new(false),
                 cleanup_snapshot_barrier: Mutex::new(None),
                 load_snapshot_barrier: Mutex::new(None),
                 disable_cleanup: AtomicBool::new(false),
                 cleanup_calls: AtomicUsize::new(0),
-                legacy_migration_complete: AtomicBool::new(false),
+                legacy_migration_seal: Mutex::new(None),
             }
         }
     }
@@ -2669,6 +3442,67 @@ mod tests {
             "test-rollout-1",
             &["consumer", "provider", "repo", "repo-a", "repo-b", "source"],
         )
+    }
+
+    fn test_writer_drain(store: &FakeSpineStore) -> LegacySpineWriterDrainAttestation {
+        LegacySpineWriterDrainAttestation {
+            schema: crate::publication::LEGACY_SPINE_WRITER_DRAIN_SCHEMA.to_string(),
+            rollout_fence_evidence: store
+                .load_rollout_fence()
+                .unwrap()
+                .expect("test rollout fence")
+                .evidence(),
+            daemon_image_sha256: format!("sha256:{}", "a".repeat(64)),
+            drain_proof_sha256: format!("sha256:{}", "b".repeat(64)),
+        }
+    }
+
+    fn seal_fake_for_current_heads(store: &FakeSpineStore) {
+        let mut repo_ids = store
+            .publication_state
+            .lock()
+            .unwrap()
+            .heads
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        repo_ids.sort();
+        assert!(
+            !repo_ids.is_empty(),
+            "a migration seal requires at least one committed head"
+        );
+        let repo_id_refs = repo_ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut rollout = store.rollout_fence_state.lock().unwrap();
+        let active_ids = rollout
+            .as_ref()
+            .map(|(_, fence)| {
+                fence
+                    .repositories
+                    .iter()
+                    .map(|row| row.repo_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if active_ids != repo_ids {
+            let next_revision = rollout
+                .as_ref()
+                .map_or(1, |(revision, _)| revision.saturating_add(1));
+            let next_fence = rollout
+                .as_ref()
+                .map_or(1, |(_, fence)| fence.rollout_fence.saturating_add(1));
+            *rollout = Some((
+                next_revision,
+                test_rollout_fence(next_fence, "test-migration-seal", &repo_id_refs),
+            ));
+        }
+        drop(rollout);
+        let active = store
+            .load_rollout_fence()
+            .unwrap()
+            .expect("migration-seal rollout fence");
+        store
+            .complete_legacy_migration(&active, &test_writer_drain(store))
+            .expect("seal current fake head set");
     }
 
     fn merge_fake_immutable_rows<T: Clone + PartialEq>(
@@ -2782,14 +3616,95 @@ mod tests {
         }
 
         fn legacy_migration_complete(&self) -> Result<bool, SpineError> {
-            Ok(self.legacy_migration_complete.load(Ordering::SeqCst))
+            let seal = self.legacy_migration_seal.lock().unwrap();
+            let Some((sealed_fence, writer_drain, sealed_heads)) = seal.as_ref() else {
+                return Ok(false);
+            };
+            writer_drain.validate()?;
+            let current = self.load_rollout_fence()?.ok_or_else(|| {
+                SpineError::Backend(
+                    "fake legacy migration seal has no active rollout fence".to_string(),
+                )
+            })?;
+            let sealed_ids = sealed_fence
+                .fence
+                .repositories
+                .iter()
+                .map(|row| row.repo_id.as_str())
+                .collect::<Vec<_>>();
+            let current_ids = current
+                .fence
+                .repositories
+                .iter()
+                .map(|row| row.repo_id.as_str())
+                .collect::<Vec<_>>();
+            let head_ids = sealed_heads
+                .iter()
+                .map(|head| head.repo_id.as_str())
+                .collect::<Vec<_>>();
+            if sealed_fence.fence.scope != current.fence.scope
+                || sealed_ids != current_ids
+                || head_ids != current_ids
+                || sealed_fence.fence.rollout_fence > current.fence.rollout_fence
+                || writer_drain.rollout_fence_evidence != sealed_fence.evidence()
+            {
+                return Err(SpineError::Backend(
+                    "fake legacy migration seal does not match active authority".to_string(),
+                ));
+            }
+            Ok(true)
         }
 
         fn complete_legacy_migration(
             &self,
-            _rollout_fence: &LoadedSpineRolloutFence,
+            rollout_fence: &LoadedSpineRolloutFence,
+            writer_drain: &LegacySpineWriterDrainAttestation,
         ) -> Result<(), SpineError> {
-            self.legacy_migration_complete.store(true, Ordering::SeqCst);
+            writer_drain.validate()?;
+            if writer_drain.rollout_fence_evidence != rollout_fence.evidence() {
+                return Err(SpineError::Backend(
+                    "fake writer-drain attestation does not match rollout fence".to_string(),
+                ));
+            }
+            let state = self.publication_state.lock().unwrap();
+            let mut heads = state
+                .heads
+                .values()
+                .map(|(_, head)| head.clone())
+                .collect::<Vec<_>>();
+            heads.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+            let expected_ids = rollout_fence
+                .fence
+                .repositories
+                .iter()
+                .map(|row| row.repo_id.as_str())
+                .collect::<Vec<_>>();
+            let observed_ids = heads
+                .iter()
+                .map(|head| head.repo_id.as_str())
+                .collect::<Vec<_>>();
+            if observed_ids != expected_ids {
+                return Err(SpineError::Backend(
+                    "fake legacy migration seal requires exact fleet heads"
+                        .to_string(),
+                ));
+            }
+            drop(state);
+            let candidate = (
+                rollout_fence.clone(),
+                writer_drain.clone(),
+                heads,
+            );
+            let mut seal = self.legacy_migration_seal.lock().unwrap();
+            if let Some(existing) = seal.as_ref() {
+                if existing != &candidate {
+                    return Err(SpineError::Backend(
+                        "a different fake legacy migration seal already exists".to_string(),
+                    ));
+                }
+                return Ok(());
+            }
+            *seal = Some(candidate);
             Ok(())
         }
 
@@ -2814,10 +3729,40 @@ mod tests {
                 ),
                 None => (StoreHeadPrecondition::Missing, None),
             };
-            let prepared = PreparedStorePublication::new_fenced(
+            let mut dependency_heads = BTreeMap::new();
+            for (repo_id, expected_root) in publication
+                .resolution_roots
+                .as_ref()
+                .into_iter()
+                .flat_map(|roots| roots.iter())
+            {
+                if repo_id == &publication.repo_id {
+                    continue;
+                }
+                let (revision, head) = state.heads.get(repo_id).cloned().ok_or_else(|| {
+                    SpineError::Backend(format!(
+                        "fake edge publication cannot resolve against missing head {repo_id}"
+                    ))
+                })?;
+                if head.root_hash != *expected_root {
+                    return Err(SpineError::Backend(format!(
+                        "fake edge publication resolved {repo_id} at {expected_root}, but head is at {}",
+                        head.root_hash
+                    )));
+                }
+                dependency_heads.insert(
+                    repo_id.clone(),
+                    StoreRepoHeadGuard {
+                        head,
+                        precondition: StoreHeadPrecondition::Revision(revision.to_string()),
+                    },
+                );
+            }
+            let mut prepared = PreparedStorePublication::new_fenced(
                 publication,
                 observed_head,
                 precondition,
+                dependency_heads,
                 rollout_fence,
             )?;
             if !prepared.requires_staging() {
@@ -2835,7 +3780,15 @@ mod tests {
                 state
                     .stages
                     .insert(publication_id.clone(), prepared.candidate_head().clone());
-                state.stage_revisions.insert(publication_id.clone(), 1);
+                apply_fake_stage_marker(
+                    &mut state,
+                    &publication_id,
+                    FakeStageMarkerValue {
+                        stage_sequence: 0,
+                        revision_kind: "stage",
+                        revision_nonce: format!("init:{publication_id}"),
+                    },
+                );
             }
 
             let candidate = prepared.publication();
@@ -2850,7 +3803,15 @@ mod tests {
                         entities,
                         "entity",
                     )?;
-                    *state.stage_revisions.entry(publication_id.clone()).or_default() += 1;
+                    apply_fake_stage_marker(
+                        &mut state,
+                        &publication_id,
+                        FakeStageMarkerValue {
+                            stage_sequence: 1,
+                            revision_kind: "stage",
+                            revision_nonce: format!("entity-partial:{written}"),
+                        },
+                    );
                     return Err(SpineError::Backend(
                         "injected entity stage failure".to_string(),
                     ));
@@ -2873,7 +3834,15 @@ mod tests {
                         edges,
                         "edge",
                     )?;
-                    *state.stage_revisions.entry(publication_id.clone()).or_default() += 1;
+                    apply_fake_stage_marker(
+                        &mut state,
+                        &publication_id,
+                        FakeStageMarkerValue {
+                            stage_sequence: 1,
+                            revision_kind: "stage",
+                            revision_nonce: format!("edge-partial:{written}"),
+                        },
+                    );
                     return Err(SpineError::Backend(
                         "injected edge stage failure".to_string(),
                     ));
@@ -2904,8 +3873,53 @@ mod tests {
                     .manifests
                     .insert(publication_id.clone(), prepared.candidate_head().clone());
             }
-            *state.stage_revisions.entry(publication_id).or_default() += 1;
+            apply_fake_stage_marker(
+                &mut state,
+                &publication_id,
+                FakeStageMarkerValue {
+                    stage_sequence: 2,
+                    revision_kind: "stage",
+                    revision_nonce: format!(
+                        "complete:{}:{}:{}",
+                        candidate.entries.len(),
+                        candidate.outgoing_edges.as_ref().map_or(0, Vec::len),
+                        candidate.phase() as u8
+                    ),
+                },
+            );
+            let final_marker = state
+                .stage_marker_values
+                .get(&publication_id)
+                .cloned()
+                .expect("fake final stage marker");
+            let final_revision = state
+                .stage_revisions
+                .get(&publication_id)
+                .copied()
+                .expect("fake final stage revision");
+            prepared = prepared.bind_stage_guard(StorePublicationStageGuard {
+                stage_sequence: final_marker.stage_sequence,
+                revision_sha256: final_marker.revision_nonce,
+                update_time: final_revision.to_string(),
+            })?;
             Ok(prepared)
+        }
+
+        fn prepare_repo_publication_bound(
+            &self,
+            publication: RepoSpinePublication,
+            expected_rollout_fence: &SpineRolloutFenceEvidence,
+        ) -> Result<PreparedStorePublication, SpineError> {
+            let active = self.load_rollout_fence()?.ok_or_else(|| {
+                SpineError::Backend("fake active rollout fence is missing".to_string())
+            })?;
+            if active.evidence() != *expected_rollout_fence {
+                return Err(SpineError::Backend(format!(
+                    "repo {} fake publication refused before staging because rollout evidence differs from the admitted authority",
+                    publication.repo_id
+                )));
+            }
+            self.prepare_repo_publication(publication)
         }
 
         fn commit_repo_publication(
@@ -2953,6 +3967,62 @@ mod tests {
                     ),
                 ));
             }
+            if prepared.requires_staging()
+                && !self
+                    .disable_stage_head_precondition
+                    .load(Ordering::SeqCst)
+            {
+                let expected_stage = prepared.stage_guard().ok_or_else(|| {
+                    SpineError::Backend(
+                        "fake hosted publication has no final stage-marker guard".to_string(),
+                    )
+                })?;
+                let observed_revision = state
+                    .stage_revisions
+                    .get(&candidate.publication_id)
+                    .copied();
+                let observed_marker = state
+                    .stage_marker_values
+                    .get(&candidate.publication_id);
+                let stage_matches = observed_revision
+                    .is_some_and(|revision| revision.to_string() == expected_stage.update_time)
+                    && observed_marker.is_some_and(|marker| {
+                        marker.stage_sequence == expected_stage.stage_sequence
+                            && marker.revision_kind == "stage"
+                            && marker.revision_nonce == expected_stage.revision_sha256
+                    });
+                if !stage_matches {
+                    return Ok(RepoPublicationCommit::Conflict(
+                        crate::publication::RepoPublicationConflict::against(
+                            candidate.source_cursor,
+                            current.as_ref().map(|(_, head)| head),
+                        ),
+                    ));
+                }
+            }
+            if !self
+                .disable_dependency_head_precondition
+                .load(Ordering::SeqCst)
+            {
+                for (repo_id, guard) in prepared.dependency_heads() {
+                    let observed_dependency = state.heads.get(repo_id).cloned();
+                    let dependency_matches = match (&guard.precondition, &observed_dependency) {
+                        (StoreHeadPrecondition::Revision(expected), Some((revision, head))) => {
+                            expected == &revision.to_string() && head == &guard.head
+                        }
+                        _ => false,
+                    };
+                    if !dependency_matches {
+                        return Ok(RepoPublicationCommit::Conflict(
+                            crate::publication::RepoPublicationConflict::against_dependency(
+                                candidate.source_cursor,
+                                repo_id,
+                                observed_dependency.as_ref().map(|(_, head)| head),
+                            ),
+                        ));
+                    }
+                }
+            }
             let precondition_matches = self.disable_head_precondition.load(Ordering::SeqCst)
                 || match (prepared.head_precondition(), &current) {
                     (StoreHeadPrecondition::Missing, None) => true,
@@ -2996,10 +4066,23 @@ mod tests {
                     ),
                 ));
             }
-            if !state.manifests.contains_key(&candidate.publication_id) {
-                return Err(SpineError::Backend(
-                    "staged publication manifest is missing".to_string(),
-                ));
+            if let Some(stage_guard) = prepared.stage_guard()
+                && !self
+                    .disable_stage_head_precondition
+                    .load(Ordering::SeqCst)
+            {
+                apply_fake_stage_marker(
+                    &mut state,
+                    &candidate.publication_id,
+                    FakeStageMarkerValue {
+                        stage_sequence: stage_guard.stage_sequence,
+                        revision_kind: "committed",
+                        revision_nonce: format!(
+                            "committed:{}:{}",
+                            stage_guard.revision_sha256, candidate.publication_id
+                        ),
+                    },
+                );
             }
             let next_revision = match current.as_ref() {
                 Some((revision, _)) => revision.checked_add(1).ok_or_else(|| {
@@ -3117,9 +4200,7 @@ mod tests {
                     .filter(|head| {
                         head.repo_id == durable_head.repo_id
                             && head.publication_id != durable_head.publication_id
-                            && (head.source_cursor < durable_head.source_cursor
-                                || (head.source_cursor == durable_head.source_cursor
-                                    && head.phase <= durable_head.phase))
+                            && publication_stage_is_cleanup_safe(head, &durable_head)
                     })
                     .cloned()
                     .collect::<Vec<_>>();
@@ -3200,10 +4281,26 @@ mod tests {
                 deleted += 1;
             }
             if remove_stage && state.stages.remove(&publication_id).is_some() {
+                state.stage_marker_values.remove(&publication_id);
                 state.stage_revisions.remove(&publication_id);
                 deleted += 1;
-            } else if let Some(revision) = state.stage_revisions.get_mut(&publication_id) {
-                *revision += 1;
+            } else {
+                let stage_sequence = state
+                    .stage_marker_values
+                    .get(&publication_id)
+                    .map_or(0, |marker| marker.stage_sequence);
+                apply_fake_stage_marker(
+                    &mut state,
+                    &publication_id,
+                    FakeStageMarkerValue {
+                        stage_sequence,
+                        revision_kind: "cleanup",
+                        revision_nonce: format!(
+                            "cleanup:{expected_revision}:{entity_take}:{edge_take}:{}",
+                            usize::from(remove_manifest)
+                        ),
+                    },
+                );
             }
             let durable_head = state
                 .heads
@@ -3213,9 +4310,7 @@ mod tests {
             let more = state.stages.values().any(|head| {
                 head.repo_id == durable_head.repo_id
                     && head.publication_id != durable_head.publication_id
-                    && (head.source_cursor < durable_head.source_cursor
-                        || (head.source_cursor == durable_head.source_cursor
-                            && head.phase <= durable_head.phase))
+                    && publication_stage_is_cleanup_safe(head, durable_head)
             });
             Ok(RepoPublicationCleanupProgress { deleted, more })
         }
@@ -3459,6 +4554,7 @@ mod tests {
             RepoPublicationCommit::Committed { .. }
         ));
 
+        seal_fake_for_current_heads(&store);
         let reader = FirestoreSpineBackend::with_store(store);
         assert_eq!(reader.entity_count(), 0, "cache empty before hydrate");
         reader.hydrate().expect("hydrate");
@@ -3522,6 +4618,7 @@ mod tests {
             ),
         );
 
+        seal_fake_for_current_heads(&store);
         let reader = FirestoreSpineBackend::with_store(store);
         reader.hydrate().expect("hydrate both committed edge heads");
         assert_eq!(reader.source_cursor("provider"), Some(cursor(13)));
@@ -3621,6 +4718,7 @@ mod tests {
             .commit_repo_publication(stale_prepared)
             .expect("stale commit is classified");
         let durable = committed_head(&store, "repo");
+        seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
         reopened.hydrate().expect("reopen committed head");
         assert_eq!(reopened.source_cursor("repo"), Some(durable.source_cursor));
@@ -3959,6 +5057,7 @@ mod tests {
             .expect_err("entity staging fault must fail prepare");
         assert!(error.to_string().contains("entity stage failure"));
         assert_eq!(committed_head(&store, "repo").source_cursor, cursor(50));
+        seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
         reopened.hydrate().expect("reopen old committed head");
         assert_eq!(reopened.source_cursor("repo"), Some(cursor(50)));
@@ -4005,6 +5104,7 @@ mod tests {
             committed_head(&store, "consumer").phase,
             RepoPublicationPhase::Metadata
         );
+        seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
         reopened.hydrate().expect("metadata head remains valid");
         assert_eq!(reopened.edge_count(), 0);
@@ -4036,6 +5136,7 @@ mod tests {
             .commit_repo_publication(prepared)
             .expect_err("head fault must fail commit");
         assert!(error.to_string().contains("head commit failure"));
+        seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
         reopened.hydrate().expect("reopen old head");
         assert_eq!(reopened.source_cursor("repo"), Some(cursor(70)));
@@ -4090,6 +5191,7 @@ mod tests {
                 vec![test_entry("repo", "new", EntityKind::Function)],
             ))
             .expect("stage without committing");
+        seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
         reopened.hydrate().expect("head still references old publication");
         assert_eq!(reopened.source_cursor("repo"), Some(cursor(75)));
@@ -4108,6 +5210,7 @@ mod tests {
             ))
             .unwrap();
         commit_store_success(store.as_ref(), &first);
+        seal_fake_for_current_heads(&store);
 
         let barrier = Arc::new(std::sync::Barrier::new(2));
         *store.load_snapshot_barrier.lock().unwrap() = Some(barrier.clone());
@@ -4156,6 +5259,7 @@ mod tests {
                 vec![test_entry("repo", "present", EntityKind::Function)],
             ),
         );
+        seal_fake_for_current_heads(&store);
         let head = committed_head(&store, "repo");
         store
             .publication_state
@@ -4187,6 +5291,7 @@ mod tests {
                 vec![test_entry("repo", "authentic", EntityKind::Function)],
             ),
         );
+        seal_fake_for_current_heads(&store);
         let head = committed_head(&store, "repo");
         store
             .publication_state
@@ -4205,6 +5310,7 @@ mod tests {
 
     fn run_cleanup_stage_fence_race(
         disable_stage_fence: bool,
+        disable_distinct_stage_heartbeat: bool,
     ) -> (usize, bool, usize) {
         let store = Arc::new(FakeSpineStore::default());
         let seed = store
@@ -4237,6 +5343,9 @@ mod tests {
         store
             .disable_stage_fence
             .store(disable_stage_fence, Ordering::SeqCst);
+        store
+            .disable_distinct_stage_heartbeat
+            .store(disable_distinct_stage_heartbeat, Ordering::SeqCst);
         let barrier = Arc::new(std::sync::Barrier::new(2));
         *store.cleanup_snapshot_barrier.lock().unwrap() = Some(barrier.clone());
         let cleanup_store = store.clone();
@@ -4256,10 +5365,24 @@ mod tests {
                 .get_mut(&stale_id)
                 .expect("stale stage rows")
                 .push(test_entry("repo", "late", EntityKind::Function));
-            *state
-                .stage_revisions
-                .get_mut(&stale_id)
-                .expect("stale stage revision") += 1;
+            let current_marker = state
+                .stage_marker_values
+                .get(&stale_id)
+                .cloned()
+                .expect("stale stage marker value");
+            let late_marker = if store
+                .disable_distinct_stage_heartbeat
+                .load(Ordering::SeqCst)
+            {
+                current_marker
+            } else {
+                FakeStageMarkerValue {
+                    stage_sequence: current_marker.stage_sequence + 1,
+                    revision_kind: "stage",
+                    revision_nonce: "late-distinct-row-batch".to_string(),
+                }
+            };
+            apply_fake_stage_marker(&mut state, &stale_id, late_marker);
         }
         barrier.wait();
         let deleted = cleanup.join().unwrap();
@@ -4273,7 +5396,7 @@ mod tests {
 
     #[test]
     fn cleanup_stage_revision_fences_a_late_losing_writer_batch() {
-        let (deleted, stage_exists, row_count) = run_cleanup_stage_fence_race(false);
+        let (deleted, stage_exists, row_count) = run_cleanup_stage_fence_race(false, false);
         assert_eq!(deleted, 0, "the stale cleanup snapshot must lose its CAS");
         assert!(stage_exists, "late rows must remain discoverable by their marker");
         assert_eq!(row_count, 2);
@@ -4281,9 +5404,235 @@ mod tests {
 
     #[test]
     fn cleanup_fence_falsification_strands_the_late_row_without_marker_cas() {
-        let (_deleted, stage_exists, row_count) = run_cleanup_stage_fence_race(true);
+        let (_deleted, stage_exists, row_count) = run_cleanup_stage_fence_race(true, false);
         assert!(!stage_exists, "the mutant recreates the missing marker race");
         assert_eq!(row_count, 1, "the late row is orphaned by the mutant");
+    }
+
+    #[test]
+    fn byte_identical_stage_heartbeat_falsification_strands_the_late_row() {
+        let (_deleted, stage_exists, row_count) = run_cleanup_stage_fence_race(false, true);
+        assert!(
+            !stage_exists,
+            "a byte-identical marker write retains its Firestore updateTime and lets stale cleanup win"
+        );
+        assert_eq!(row_count, 1, "the mutant strands the distinct late row");
+    }
+
+    fn run_equal_cursor_edge_stage_cleanup_race(
+        disable_stage_head_precondition: bool,
+    ) -> (bool, bool, bool) {
+        let store = Arc::new(FakeSpineStore::default());
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+        publish_success(
+            &backend,
+            metadata_publication("provider", 1, "provider-r1", Vec::new()),
+        );
+        publish_success(
+            &backend,
+            metadata_publication("source", 7, "source-r7", Vec::new()),
+        );
+        publish_success(
+            &backend,
+            edge_publication(
+                "source",
+                7,
+                "source-r7",
+                Vec::new(),
+                Vec::new(),
+                [("provider", "provider-r1"), ("source", "source-r7")],
+            ),
+        );
+        let old_source_head = committed_head(&store, "source");
+        publish_success(
+            &backend,
+            metadata_publication("provider", 2, "provider-r2", Vec::new()),
+        );
+        let prepared = backend
+            .prepare_repo_publication(edge_publication(
+                "source",
+                7,
+                "source-r7",
+                Vec::new(),
+                Vec::new(),
+                [("provider", "provider-r2"), ("source", "source-r7")],
+            ))
+            .expect("same-cursor edge replacement stages against the new dependency root");
+        let candidate_id = prepared.candidate_head().publication_id.clone();
+        store
+            .disable_stage_head_precondition
+            .store(disable_stage_head_precondition, Ordering::SeqCst);
+        let cleanup = store
+            .cleanup_repo_publications(&old_source_head, 100)
+            .expect("bounded cleanup result");
+        assert!(cleanup.deleted > 0, "cleanup must win before the paused writer");
+        let commit = backend.commit_repo_publication(prepared);
+        let commit_conflicted = matches!(commit, Ok(RepoPublicationCommit::Conflict(_)));
+        let candidate_became_head = committed_head(&store, "source").publication_id == candidate_id;
+        seal_fake_for_current_heads(&store);
+        let reopened = FirestoreSpineBackend::with_store(store);
+        let reopen_succeeded = reopened.hydrate().is_ok();
+        (commit_conflicted, candidate_became_head, reopen_succeeded)
+    }
+
+    #[test]
+    fn stage_marker_cas_makes_a_paused_same_cursor_edge_writer_lose_cleanup() {
+        let (commit_conflicted, candidate_became_head, reopen_succeeded) =
+            run_equal_cursor_edge_stage_cleanup_race(false);
+        assert!(commit_conflicted);
+        assert!(!candidate_became_head);
+        assert!(reopen_succeeded, "the prior durable winner must still reopen");
+    }
+
+    #[test]
+    fn missing_stage_head_guard_falsification_commits_a_head_to_deleted_rows() {
+        let (commit_conflicted, candidate_became_head, reopen_succeeded) =
+            run_equal_cursor_edge_stage_cleanup_race(true);
+        assert!(!commit_conflicted);
+        assert!(candidate_became_head);
+        assert!(
+            !reopen_succeeded,
+            "dropping the marker precondition lets the durable head point at deleted rows"
+        );
+    }
+
+    fn run_cleanup_snapshot_before_head_commit_race(
+        disable_stage_head_precondition: bool,
+    ) -> (usize, bool, bool) {
+        let store = Arc::new(FakeSpineStore::default());
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+        publish_success(
+            &backend,
+            metadata_publication("provider", 1, "provider-r1", Vec::new()),
+        );
+        publish_success(
+            &backend,
+            metadata_publication("source", 7, "source-r7", Vec::new()),
+        );
+        publish_success(
+            &backend,
+            edge_publication(
+                "source",
+                7,
+                "source-r7",
+                Vec::new(),
+                Vec::new(),
+                [("provider", "provider-r1"), ("source", "source-r7")],
+            ),
+        );
+        let old_head = committed_head(&store, "source");
+        publish_success(
+            &backend,
+            metadata_publication("provider", 2, "provider-r2", Vec::new()),
+        );
+        let prepared = backend
+            .prepare_repo_publication(edge_publication(
+                "source",
+                7,
+                "source-r7",
+                Vec::new(),
+                Vec::new(),
+                [("provider", "provider-r2"), ("source", "source-r7")],
+            ))
+            .unwrap();
+        let candidate_id = prepared.candidate_head().publication_id.clone();
+        store
+            .disable_stage_head_precondition
+            .store(disable_stage_head_precondition, Ordering::SeqCst);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        *store.cleanup_snapshot_barrier.lock().unwrap() = Some(barrier.clone());
+        let cleanup_store = store.clone();
+        let cleanup = std::thread::spawn(move || {
+            cleanup_store
+                .cleanup_repo_publications(&old_head, 100)
+                .unwrap()
+                .deleted
+        });
+
+        barrier.wait();
+        let outcome = backend.commit_repo_publication(prepared).unwrap();
+        assert!(matches!(outcome, RepoPublicationCommit::Committed { .. }));
+        assert_eq!(committed_head(&store, "source").publication_id, candidate_id);
+        barrier.wait();
+        let deleted = cleanup.join().unwrap();
+        seal_fake_for_current_heads(&store);
+        let reopened = FirestoreSpineBackend::with_store(store);
+        let reopen_succeeded = reopened.hydrate().is_ok();
+        (deleted, reopen_succeeded, backend.authority_complete())
+    }
+
+    #[test]
+    fn committed_marker_revision_defeats_a_cleanup_snapshot_from_the_old_head() {
+        let (deleted, reopen_succeeded, complete) =
+            run_cleanup_snapshot_before_head_commit_race(false);
+        assert_eq!(deleted, 0, "cleanup's old marker revision must lose");
+        assert!(reopen_succeeded, "the committed winner must reopen cold");
+        assert!(complete);
+    }
+
+    #[test]
+    fn committed_marker_mutant_lets_old_cleanup_delete_the_new_winner() {
+        let (deleted, reopen_succeeded, _complete) =
+            run_cleanup_snapshot_before_head_commit_race(true);
+        assert!(deleted > 0, "the mutant cleanup must delete winner rows");
+        assert!(!reopen_succeeded, "the mutant durable head must fail cold reopen");
+    }
+
+    #[test]
+    fn static_source_edge_generations_are_drained_after_sibling_advances() {
+        let store = Arc::new(FakeSpineStore::default());
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+        publish_success(
+            &backend,
+            metadata_publication("provider", 1, "provider-r1", Vec::new()),
+        );
+        publish_success(
+            &backend,
+            metadata_publication("source", 7, "source-r7", Vec::new()),
+        );
+        publish_success(
+            &backend,
+            edge_publication(
+                "source",
+                7,
+                "source-r7",
+                Vec::new(),
+                Vec::new(),
+                [("provider", "provider-r1"), ("source", "source-r7")],
+            ),
+        );
+
+        for generation in 2..=12 {
+            let provider_root = format!("provider-r{generation}");
+            publish_success(
+                &backend,
+                metadata_publication("provider", generation, &provider_root, Vec::new()),
+            );
+            publish_success(
+                &backend,
+                edge_publication(
+                    "source",
+                    7,
+                    "source-r7",
+                    Vec::new(),
+                    Vec::new(),
+                    [
+                        ("provider", provider_root.as_str()),
+                        ("source", "source-r7"),
+                    ],
+                ),
+            );
+            let state = store.publication_state.lock().unwrap();
+            let source_stages = state
+                .stages
+                .values()
+                .filter(|head| head.repo_id == "source")
+                .count();
+            assert_eq!(
+                source_stages, 1,
+                "only the active static-source edge generation may remain after bounded cleanup"
+            );
+        }
     }
 
     #[test]
@@ -4482,21 +5831,23 @@ mod tests {
     #[test]
     fn legacy_rows_require_a_v2_head_then_remain_ignored() {
         let store = Arc::new(FakeSpineStore::default());
+        *store.rollout_fence_state.lock().unwrap() =
+            Some((1, test_rollout_fence(1, "legacy-cutover", &["repo"])));
         let legacy = test_entry("repo", "legacy", EntityKind::Function);
         store.write_entity(&legacy, "legacy-root").unwrap();
         let blocked = FirestoreSpineBackend::with_store(store.clone());
         let error = blocked
             .hydrate()
-            .expect_err("uncovered legacy repo must block migration");
+            .expect_err("an unsealed legacy boundary must block every read");
         assert!(error
             .to_string()
-            .contains("legacy spine rows have no committed cursor-bound head"));
+            .contains("legacy writer-drain migration marker"));
         let error = blocked
-            .complete_legacy_migration()
-            .expect_err("uncovered legacy rows must prevent the one-way marker");
+            .complete_legacy_migration(test_writer_drain(&store))
+            .expect_err("missing exact-fleet heads must prevent the one-way marker");
         assert!(error
             .to_string()
-            .contains("repositories lack v2 heads"));
+            .contains("exact active-fleet v2 heads"));
 
         let publisher = FirestoreSpineBackend::with_store(store.clone());
         publish_success(
@@ -4508,9 +5859,20 @@ mod tests {
                 vec![test_entry("repo", "current", EntityKind::Function)],
             ),
         );
+        publish_success(
+            &publisher,
+            edge_publication(
+                "repo",
+                100,
+                "current-root",
+                vec![test_entry("repo", "current", EntityKind::Function)],
+                Vec::new(),
+                [("repo", "current-root")],
+            ),
+        );
         publisher
-            .complete_legacy_migration()
-            .expect("covered legacy rows can receive the durable completion marker");
+            .complete_legacy_migration(test_writer_drain(&store))
+            .expect("exact edge-complete fleet plus drain proof can receive the durable marker");
         store.fail_next_load_edges.store(true, Ordering::SeqCst);
         let reopened = FirestoreSpineBackend::with_store(store);
         reopened
@@ -4550,6 +5912,40 @@ mod tests {
     }
 
     #[test]
+    fn gcs_evidence_mismatch_refuses_before_any_stage_write() {
+        let store = Arc::new(FakeSpineStore::default());
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+        let mut wrong = store
+            .load_rollout_fence()
+            .unwrap()
+            .expect("active fake rollout fence")
+            .evidence();
+        wrong.update_time = "different-firestore-revision".to_string();
+        let publication = metadata_publication(
+            "repo",
+            1,
+            "root",
+            vec![test_entry("repo", "never-staged", EntityKind::Function)],
+        );
+        let publication_id = publication
+            .clone()
+            .canonicalize()
+            .unwrap()
+            .head
+            .publication_id;
+
+        let error = backend
+            .prepare_repo_publication_bound(publication, &wrong)
+            .expect_err("cross-backend evidence mismatch must fail before staging");
+        assert!(error.to_string().contains("refused before staging"));
+        let state = store.publication_state.lock().unwrap();
+        assert!(!state.stages.contains_key(&publication_id));
+        assert!(!state.manifests.contains_key(&publication_id));
+        assert!(!state.entity_rows.contains_key(&publication_id));
+        assert!(!state.edge_rows.contains_key(&publication_id));
+    }
+
+    #[test]
     fn cursorless_legacy_mutations_are_refused_without_store_or_cache_changes() {
         let store = Arc::new(FakeSpineStore::default());
         let backend = FirestoreSpineBackend::with_store(store.clone());
@@ -4573,6 +5969,8 @@ mod tests {
     #[test]
     fn committed_head_refresh_advances_an_idle_reader() {
         let store = Arc::new(FakeSpineStore::default());
+        *store.rollout_fence_state.lock().unwrap() =
+            Some((1, test_rollout_fence(1, "idle-reader", &["repo-a"])));
         let writer = FirestoreSpineBackend::with_store(store.clone());
         publish_success(
             &writer,
@@ -4583,22 +5981,24 @@ mod tests {
                 vec![test_entry("repo-a", "a", EntityKind::Function)],
             ),
         );
-        let reader = FirestoreSpineBackend::with_store(store);
+        seal_fake_for_current_heads(&store);
+        let reader = FirestoreSpineBackend::with_store(store.clone());
         reader.hydrate().unwrap();
         publish_success(
             &writer,
             metadata_publication(
-                "repo-b",
-                1,
-                "b",
-                vec![test_entry("repo-b", "b", EntityKind::Function)],
+                "repo-a",
+                2,
+                "a2",
+                vec![test_entry("repo-a", "a2", EntityKind::Function)],
             ),
         );
         reader.refresh_committed_publications().unwrap();
-        assert_eq!(reader.repo_count(), 2);
+        assert_eq!(reader.repo_count(), 1);
+        assert_eq!(reader.source_cursor("repo-a"), Some(cursor(2)));
         assert_eq!(
             reader.registered_repo_ids(),
-            HashSet::from(["repo-a".to_string(), "repo-b".to_string()])
+            HashSet::from(["repo-a".to_string()])
         );
     }
 
@@ -4629,6 +6029,7 @@ mod tests {
             RepoPublicationCommit::Committed { source_cursor }
                 if source_cursor == cursor(1)
         ));
+        seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
         reopened.hydrate().unwrap();
         assert_eq!(reopened.source_cursor("repo"), Some(cursor(1)));
@@ -4768,6 +6169,69 @@ mod tests {
         ));
     }
 
+    fn run_paused_edge_writer_against_dependency_head(
+        disable_dependency_head_precondition: bool,
+    ) -> (RepoPublicationCommit, bool) {
+        let store = Arc::new(FakeSpineStore::default());
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+        publish_success(
+            &backend,
+            metadata_publication("provider", 1, "provider-r1", Vec::new()),
+        );
+        publish_success(
+            &backend,
+            metadata_publication("source", 5, "source-r5", Vec::new()),
+        );
+        let paused = backend
+            .prepare_repo_publication(edge_publication(
+                "source",
+                5,
+                "source-r5",
+                Vec::new(),
+                Vec::new(),
+                [("provider", "provider-r1"), ("source", "source-r5")],
+            ))
+            .expect("edge writer captures the provider head");
+        publish_success(
+            &backend,
+            metadata_publication("provider", 2, "provider-r2", Vec::new()),
+        );
+        store
+            .disable_dependency_head_precondition
+            .store(disable_dependency_head_precondition, Ordering::SeqCst);
+        let outcome = backend
+            .commit_repo_publication(paused)
+            .expect("paused edge commit is classified");
+        seal_fake_for_current_heads(&store);
+        let reopened = FirestoreSpineBackend::with_store(store);
+        reopened.hydrate().expect("durable heads remain readable");
+        (outcome, reopened.authority_complete())
+    }
+
+    #[test]
+    fn paused_edge_writer_loses_when_a_dependency_head_advances() {
+        let (outcome, complete) = run_paused_edge_writer_against_dependency_head(false);
+        assert!(matches!(
+            outcome,
+            RepoPublicationCommit::Conflict(RepoPublicationConflict {
+                observed_dependency_repo: Some(ref repo_id),
+                observed_dependency_cursor: Some(observed),
+                ..
+            }) if repo_id == "provider" && observed == cursor(2)
+        ));
+        assert!(!complete, "source metadata still needs a current edge publication");
+    }
+
+    #[test]
+    fn dependency_head_guard_falsification_commits_stale_resolution_roots() {
+        let (outcome, complete) = run_paused_edge_writer_against_dependency_head(true);
+        assert!(matches!(outcome, RepoPublicationCommit::Committed { .. }));
+        assert!(
+            !complete,
+            "the mutant commits an edge head resolved against the replaced provider root"
+        );
+    }
+
     #[test]
     fn rollout_fence_lost_response_reconciles_and_the_mutant_loses_evidence() {
         let fleet = ["consumer", "provider", "repo", "repo-a", "repo-b", "source"];
@@ -4822,8 +6286,10 @@ mod tests {
 
     #[test]
     fn writer_before_firestore_fence_remains_visible_only_for_daemon_root_reproof() {
-        let fleet = ["consumer", "provider", "repo", "repo-a", "repo-b", "source"];
+        let fleet = ["repo"];
         let store = Arc::new(FakeSpineStore::default());
+        *store.rollout_fence_state.lock().unwrap() =
+            Some((1, test_rollout_fence(1, "test-rollout-1", &fleet)));
         let writer = FirestoreSpineBackend::with_store(store.clone());
         publish_success(
             &writer,
@@ -4833,6 +6299,7 @@ mod tests {
             .advance_rollout_fence(test_rollout_fence(2, "test-rollout-2", &fleet))
             .unwrap();
 
+        seal_fake_for_current_heads(&store);
         let reopened = FirestoreSpineBackend::with_store(store);
         reopened.hydrate().unwrap();
         assert_eq!(reopened.source_cursor("repo"), Some(cursor(41)));
@@ -4847,13 +6314,14 @@ mod tests {
     }
 
     #[test]
-    fn refresh_rechecks_unsealed_legacy_rows_and_ttl_gates_cleanup_discovery() {
+    fn sealed_refresh_ignores_late_legacy_rows_and_ttl_gates_cleanup_discovery() {
         let store = Arc::new(FakeSpineStore::default());
         let backend = FirestoreSpineBackend::with_store(store.clone());
         publish_success(
             &backend,
             metadata_publication("repo", 1, "root", Vec::new()),
         );
+        seal_fake_for_current_heads(&store);
         backend.hydrate().unwrap();
         let deadline = Instant::now() + Duration::from_secs(1);
         while backend.cleanup_sweep_gate.lock().running {
@@ -4874,10 +6342,10 @@ mod tests {
             .lock()
             .unwrap()
             .insert("provider".to_string(), ("legacy".to_string(), Vec::new()));
-        let error = backend
+        store.fail_next_load_edges.store(true, Ordering::SeqCst);
+        backend
             .hydrate()
-            .expect_err("an unsealed process must recheck late legacy rows");
-        assert!(error.to_string().contains("repositories: provider"));
+            .expect("a sealed process must never consult late legacy rows");
     }
 
     #[test]
@@ -4896,12 +6364,13 @@ mod tests {
             &backend,
             metadata_publication("repo", 1, "root", Vec::new()),
         );
+        seal_fake_for_current_heads(&store);
         backend.hydrate().unwrap();
         store.publication_state.lock().unwrap().heads.remove("repo");
         let error = backend
             .hydrate()
             .expect_err("an append-only committed head must not disappear silently");
-        assert!(error.to_string().contains("heads disappeared"));
+        assert!(error.to_string().contains("active exact fleet"));
     }
 
     #[cfg(feature = "firestore")]
@@ -4978,6 +6447,130 @@ mod tests {
                 .pointer("/currentDocument/exists")
                 .and_then(serde_json::Value::as_bool),
             Some(false)
+        );
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn production_stage_batch_writes_change_marker_bytes_for_distinct_batches() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let head = metadata_publication("repo", 7, "root", Vec::new())
+            .canonicalize()
+            .unwrap()
+            .head;
+        let first_row = serde_json::json!({
+            "update": {
+                "name": "projects/project/databases/(default)/documents/spine_entities_v2/first",
+                "fields": { "payload": { "stringValue": "first" } }
+            },
+            "currentDocument": { "exists": false }
+        });
+        let second_row = serde_json::json!({
+            "update": {
+                "name": "projects/project/databases/(default)/documents/spine_entities_v2/second",
+                "fields": { "payload": { "stringValue": "second" } }
+            },
+            "currentDocument": { "exists": false }
+        });
+
+        let first = store
+            .immutable_stage_batch_writes(
+                &head,
+                1,
+                std::slice::from_ref(&first_row),
+                std::slice::from_ref(&first_row),
+            )
+            .unwrap();
+        let retry = store
+            .immutable_stage_batch_writes(
+                &head,
+                1,
+                std::slice::from_ref(&first_row),
+                std::slice::from_ref(&first_row),
+            )
+            .unwrap();
+        let distinct = store
+            .immutable_stage_batch_writes(
+                &head,
+                1,
+                std::slice::from_ref(&second_row),
+                std::slice::from_ref(&second_row),
+            )
+            .unwrap();
+        let marker_fields = |writes: &[serde_json::Value]| {
+            writes
+                .last()
+                .and_then(|write| write.pointer("/update/fields"))
+                .cloned()
+                .expect("production stage batch must end with its marker write")
+        };
+
+        assert_eq!(
+            marker_fields(&first),
+            marker_fields(&retry),
+            "an identical retry must retain the exact marker bytes"
+        );
+        assert_ne!(
+            marker_fields(&first),
+            marker_fields(&distinct),
+            "a distinct immutable row batch must change the actual marker write"
+        );
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn production_head_commit_changes_marker_bytes_under_the_exact_stage_revision() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let head = metadata_publication("repo", 8, "root", Vec::new())
+            .canonicalize()
+            .unwrap()
+            .head;
+        let row = serde_json::json!({
+            "update": {
+                "name": "projects/project/databases/(default)/documents/spine_entities_v2/row",
+                "fields": { "payload": { "stringValue": "row" } }
+            },
+            "currentDocument": { "exists": false }
+        });
+        let staged = store
+            .immutable_stage_batch_writes(
+                &head,
+                4,
+                std::slice::from_ref(&row),
+                std::slice::from_ref(&row),
+            )
+            .unwrap();
+        let staged_marker = staged.last().expect("stage marker write");
+        let stage_guard = StorePublicationStageGuard {
+            stage_sequence: 4,
+            revision_sha256: staged_marker
+                .pointer("/update/fields/revision_sha256/stringValue")
+                .and_then(serde_json::Value::as_str)
+                .expect("stage marker revision digest")
+                .to_string(),
+            update_time: "2026-08-27T12:34:56Z".to_string(),
+        };
+        let committed = store
+            .committed_stage_marker_write(&head, &stage_guard)
+            .unwrap();
+
+        assert_ne!(
+            staged_marker.pointer("/update/fields"),
+            committed.pointer("/update/fields"),
+            "the production head-commit marker must not be byte-identical to the prepared marker"
+        );
+        assert_eq!(
+            committed
+                .pointer("/currentDocument/updateTime")
+                .and_then(serde_json::Value::as_str),
+            Some(stage_guard.update_time.as_str()),
+            "the changed marker write must retain the exact prepared Firestore revision precondition"
+        );
+        assert_eq!(
+            committed
+                .pointer("/update/fields/revision_kind/stringValue")
+                .and_then(serde_json::Value::as_str),
+            Some("committed")
         );
     }
 

@@ -13,32 +13,24 @@ if [[ ! -f "${dockerfile}" ]]; then
   exit 1
 fi
 
-feature_lines="$({
-  grep -E 'cargo chef cook .*--features' "${dockerfile}" || true
-  grep -E 'cargo build .*--features .*--bin kin-daemon' "${dockerfile}" || true
+production_lines="$({
+  grep -E 'cargo chef cook ' "${dockerfile}" || true
+  grep -E 'cargo build .*--bin kin-daemon' "${dockerfile}" || true
 })"
-line_count="$(printf '%s\n' "${feature_lines}" | awk 'NF { count += 1 } END { print count + 0 }')"
+line_count="$(printf '%s\n' "${production_lines}" | awk 'NF { count += 1 } END { print count + 0 }')"
 if [[ "${line_count}" -ne 3 ]]; then
-  echo "docker feature contract: expected one cargo-chef and two kin-daemon build feature lines, found ${line_count}" >&2
+  echo "docker feature contract: expected one cargo-chef and two kin-daemon build lines, found ${line_count}" >&2
   exit 1
 fi
 
 while IFS= read -r line; do
   [[ -n "${line}" ]] || continue
-  if [[ "${line}" != *"${expected}"* ]]; then
-    echo "docker feature contract: production invocation lacks exact ${expected}: ${line}" >&2
+  feature_args="$(printf '%s\n' "${line}" | grep -oE -- '--features[[:space:]]+[^[:space:];\\]+' || true)"
+  if [[ "${feature_args}" != "${expected}" ]] ||
+    grep -Eq -- '(^|[[:space:]])(--all-features|-F)([=[:space:]]|$)' <<<"${line}"; then
+    echo "docker feature contract: production invocation must use only ${expected}: ${line}" >&2
     exit 1
   fi
-done <<<"${feature_lines}"
-
-if grep -Eq -- '--features[[:space:]]+(kin-daemon/)?gcs([[:space:];\\]|$)' "${dockerfile}"; then
-  echo "docker feature contract: found a gcs-only production build" >&2
-  exit 1
-fi
-
-if grep -Eq -- '--features[[:space:]]+(kin-daemon/)?firestore([[:space:];\\]|$)' "${dockerfile}"; then
-  echo "docker feature contract: found a firestore-only production build" >&2
-  exit 1
-fi
+done <<<"${production_lines}"
 
 echo "docker feature contract: PASS (${line_count} production invocations use kin-daemon/gcs,kin-daemon/firestore)"

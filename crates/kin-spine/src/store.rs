@@ -12,10 +12,11 @@
 use crate::backend::SpineError;
 use crate::index::{CrossRepoEdge, EntityEntry};
 use crate::publication::{
-    CanonicalRepoPublication, RepoPublicationCommit, RepoPublicationConflict,
-    RepoPublicationHead, RepoSpinePublication, SpineRolloutFence, SpineRolloutFenceCommit,
-    SpineRolloutFenceEvidence,
+    CanonicalRepoPublication, LegacySpineWriterDrainAttestation, RepoPublicationCommit,
+    RepoPublicationConflict, RepoPublicationHead, RepoSpinePublication, SpineRolloutFence,
+    SpineRolloutFenceCommit, SpineRolloutFenceEvidence,
 };
+use std::collections::BTreeMap;
 
 /// A repo's persisted entity set together with its graph root hash.
 #[derive(Debug, Clone)]
@@ -65,6 +66,29 @@ pub enum StoreHeadPrecondition {
     Revision(String),
 }
 
+/// One sibling repository head captured while preparing an edge publication.
+///
+/// The edge rows are valid only for the exact `resolution_roots` recorded in
+/// their publication. Durable stores same-bytes-write every guarded sibling
+/// head in the source head's atomic commit, so a sibling publication that wins
+/// after resolution but before commit forces the stale edge writer to lose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreRepoHeadGuard {
+    pub head: RepoPublicationHead,
+    pub precondition: StoreHeadPrecondition,
+}
+
+/// Exact final stage-marker state captured after all immutable rows and the
+/// manifest have been staged. Durable head commit conditionally same-bytes
+/// writes this marker in the same transaction as the head, fleet fence, and
+/// dependency guards. Cleanup and a paused writer therefore cannot both win.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePublicationStageGuard {
+    pub stage_sequence: u64,
+    pub revision_sha256: String,
+    pub update_time: String,
+}
+
 #[derive(Debug, Clone)]
 enum PreparedStoreDisposition {
     Publish,
@@ -82,6 +106,8 @@ pub struct PreparedStorePublication {
     canonical: CanonicalRepoPublication,
     observed_head: Option<RepoPublicationHead>,
     head_precondition: StoreHeadPrecondition,
+    dependency_heads: BTreeMap<String, StoreRepoHeadGuard>,
+    stage_guard: Option<StorePublicationStageGuard>,
     rollout_fence: Option<LoadedSpineRolloutFence>,
     disposition: PreparedStoreDisposition,
 }
@@ -97,7 +123,31 @@ impl PreparedStorePublication {
         observed_head: Option<RepoPublicationHead>,
         head_precondition: StoreHeadPrecondition,
     ) -> Result<Self, SpineError> {
-        Self::new_inner(publication, observed_head, head_precondition, None)
+        Self::new_inner(
+            publication,
+            observed_head,
+            head_precondition,
+            BTreeMap::new(),
+            None,
+        )
+    }
+
+    /// Validate a local/in-memory edge publication with exact sibling-head
+    /// guards. Durable hosted stores use [`Self::new_fenced`] so the same token
+    /// also captures the active rollout fence.
+    pub fn new_with_dependencies(
+        publication: RepoSpinePublication,
+        observed_head: Option<RepoPublicationHead>,
+        head_precondition: StoreHeadPrecondition,
+        dependency_heads: BTreeMap<String, StoreRepoHeadGuard>,
+    ) -> Result<Self, SpineError> {
+        Self::new_inner(
+            publication,
+            observed_head,
+            head_precondition,
+            dependency_heads,
+            None,
+        )
     }
 
     /// Validate a durable publication while binding it to the exact active
@@ -106,6 +156,7 @@ impl PreparedStorePublication {
         publication: RepoSpinePublication,
         observed_head: Option<RepoPublicationHead>,
         head_precondition: StoreHeadPrecondition,
+        dependency_heads: BTreeMap<String, StoreRepoHeadGuard>,
         rollout_fence: LoadedSpineRolloutFence,
     ) -> Result<Self, SpineError> {
         rollout_fence.fence.validate()?;
@@ -121,6 +172,7 @@ impl PreparedStorePublication {
             publication,
             observed_head,
             head_precondition,
+            dependency_heads,
             Some(rollout_fence),
         )
     }
@@ -129,6 +181,7 @@ impl PreparedStorePublication {
         publication: RepoSpinePublication,
         observed_head: Option<RepoPublicationHead>,
         head_precondition: StoreHeadPrecondition,
+        dependency_heads: BTreeMap<String, StoreRepoHeadGuard>,
         rollout_fence: Option<LoadedSpineRolloutFence>,
     ) -> Result<Self, SpineError> {
         match (&observed_head, &head_precondition) {
@@ -144,6 +197,33 @@ impl PreparedStorePublication {
             head.validate()?;
         }
         let canonical = publication.canonicalize()?;
+        let expected_dependencies = canonical
+            .head
+            .resolution_roots
+            .iter()
+            .filter(|(repo_id, _)| *repo_id != &canonical.head.repo_id)
+            .map(|(repo_id, root_hash)| (repo_id.clone(), root_hash.clone()))
+            .collect::<BTreeMap<_, _>>();
+        if dependency_heads.len() != expected_dependencies.len()
+            || dependency_heads.keys().ne(expected_dependencies.keys())
+        {
+            return Err(SpineError::Backend(format!(
+                "repo {} publication did not capture every exact resolution dependency head",
+                canonical.head.repo_id
+            )));
+        }
+        for (repo_id, guard) in &dependency_heads {
+            guard.head.validate()?;
+            if guard.head.repo_id != *repo_id
+                || expected_dependencies.get(repo_id) != Some(&guard.head.root_hash)
+                || !matches!(guard.precondition, StoreHeadPrecondition::Revision(_))
+            {
+                return Err(SpineError::Backend(format!(
+                    "repo {} publication dependency guard for {repo_id} does not match its exact committed root/revision",
+                    canonical.head.repo_id
+                )));
+            }
+        }
         let disposition = match observed_head.as_ref() {
             Some(head) if head.publication_id == canonical.head.publication_id => {
                 PreparedStoreDisposition::AlreadyCommitted
@@ -151,9 +231,13 @@ impl PreparedStorePublication {
             Some(head)
                 if canonical.head.source_cursor < head.source_cursor
                     || (canonical.head.source_cursor == head.source_cursor
-                        && (canonical.head.phase <= head.phase
+                        && (canonical.head.phase < head.phase
                             || canonical.head.root_hash != head.root_hash
-                            || canonical.head.metadata_sha256 != head.metadata_sha256)) =>
+                            || canonical.head.metadata_sha256 != head.metadata_sha256
+                            || (canonical.head.phase == head.phase
+                                && (canonical.head.phase != crate::publication::RepoPublicationPhase::Edges
+                                    || canonical.head.resolution_roots
+                                        == head.resolution_roots)))) =>
             {
                 PreparedStoreDisposition::Conflict(RepoPublicationConflict::against(
                     canonical.head.source_cursor,
@@ -166,6 +250,8 @@ impl PreparedStorePublication {
             canonical,
             observed_head,
             head_precondition,
+            dependency_heads,
+            stage_guard: None,
             rollout_fence,
             disposition,
         })
@@ -187,8 +273,39 @@ impl PreparedStorePublication {
         &self.head_precondition
     }
 
+    pub fn dependency_heads(&self) -> &BTreeMap<String, StoreRepoHeadGuard> {
+        &self.dependency_heads
+    }
+
+    pub fn bind_stage_guard(
+        mut self,
+        stage_guard: StorePublicationStageGuard,
+    ) -> Result<Self, SpineError> {
+        if !self.requires_staging()
+            || stage_guard.update_time.is_empty()
+            || stage_guard.revision_sha256.is_empty()
+        {
+            return Err(SpineError::Backend(format!(
+                "repo {} publication cannot bind an invalid final stage-marker guard",
+                self.canonical.head.repo_id
+            )));
+        }
+        self.stage_guard = Some(stage_guard);
+        Ok(self)
+    }
+
+    pub fn stage_guard(&self) -> Option<&StorePublicationStageGuard> {
+        self.stage_guard.as_ref()
+    }
+
     pub fn rollout_fence(&self) -> Option<&LoadedSpineRolloutFence> {
         self.rollout_fence.as_ref()
+    }
+
+    pub fn rollout_fence_evidence(&self) -> Option<SpineRolloutFenceEvidence> {
+        self.rollout_fence
+            .as_ref()
+            .map(LoadedSpineRolloutFence::evidence)
     }
 
     pub fn requires_staging(&self) -> bool {
@@ -251,6 +368,7 @@ pub trait SpineStore: Send + Sync {
     fn complete_legacy_migration(
         &self,
         _rollout_fence: &LoadedSpineRolloutFence,
+        _writer_drain: &LegacySpineWriterDrainAttestation,
     ) -> Result<(), SpineError> {
         Err(SpineError::Backend(
             "durable legacy spine migration completion is unsupported by this store".to_string(),
@@ -267,6 +385,25 @@ pub trait SpineStore: Send + Sync {
         Err(SpineError::Backend(
             "cursor-bound spine publication is unsupported by this store".to_string(),
         ))
+    }
+
+    /// Prepare only against the exact rollout authority already admitted by
+    /// the external GCS control record. Reading whichever Firestore fence is
+    /// active is not sufficient: the caller's evidence is the cross-backend
+    /// binding, and any mismatch or absence fails before commit.
+    fn prepare_repo_publication_bound(
+        &self,
+        publication: RepoSpinePublication,
+        expected_rollout_fence: &SpineRolloutFenceEvidence,
+    ) -> Result<PreparedStorePublication, SpineError> {
+        let prepared = self.prepare_repo_publication(publication)?;
+        if prepared.rollout_fence_evidence().as_ref() != Some(expected_rollout_fence) {
+            return Err(SpineError::Backend(format!(
+                "repo {} publication prepared against Firestore rollout evidence different from the GCS control record",
+                prepared.candidate_head().repo_id
+            )));
+        }
+        Ok(prepared)
     }
 
     /// Atomically move one repository head if and only if the preparation's

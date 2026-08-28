@@ -1427,6 +1427,14 @@ jobs:
         if: matrix.shard == 1
         run: cargo fmt -- --check
 
+      - name: Check Docker daemon production features
+        if: matrix.shard == 1
+        run: bash scripts/check-docker-daemon-features.sh
+
+      - name: Falsify Docker daemon production feature guard
+        if: matrix.shard == 1
+        run: bash scripts/check-docker-daemon-features.test.sh
+
       # Two guards, two jobs. The Python checker walks every crate and carries
       # the owned, dated, existence-validated allowlist. The shell guard is a
       # dependency-free check on the ten core answer modules and is the one the
@@ -2068,37 +2076,24 @@ jobs:
         with:
           tool: nextest
 
-      # `gcs` is a non-default feature, so the default-feature passes in Check &
-      # Test never execute the hosted-storage code it gates, and the
+      # `gcs` and `firestore` are non-default features, so the default-feature
+      # passes in Check & Test never execute the hosted-storage code they gate, and the
       # `--all-features` Clippy pass there only type-checks it. Without this
-      # step a behavioral regression in the
-      # GCS-mode startup admission path compiles clean and reaches main with a
-      # green required context. The whole package runs rather than just the
-      # binary target: the feature gates only `bin/kin-daemon.rs` today, and
-      # scoping to that target would silently stop covering a gate added to the
-      # library later. No companion doctest pass belongs here because
+      # step, a behavioral regression in the exact hosted production feature
+      # shape compiles clean and reaches main with a green required context. The
+      # whole package runs rather than just the binary target. No companion
+      # doctest pass belongs here because
       # kin-daemon declares `doctest = false`.
-      - name: Test gcs feature
-        run: cargo nextest run -p kin-daemon --features gcs --locked
+      - name: Test hosted production features
+        run: cargo nextest run -p kin-daemon --features gcs,firestore --locked
 
-      # The production Dockerfile builds gcs without firestore. Hosted mode
-      # must still refuse the process-local in-memory fallback, which cannot
-      # publish durable cursor authority. Keep this exact gcs-only behavioral
-      # guard beside the broader feature pass so the deployed feature shape,
-      # not an all-features surrogate, owns the fail-closed contract.
-      - name: Test hosted gcs spine cursor hold
+      # Keep the focused durable cursor-authority check beside the package pass.
+      # The exact deployed feature pair, not either partial backend and not an
+      # all-features surrogate, owns the fail-closed contract.
+      - name: Test hosted production spine cursor authority
         if: matrix.os == 'ubuntu-latest'
         run: >-
-          cargo test -p kin-daemon --features gcs --locked
-          state::tests::hosted_spine_refuses_persistence_without_cursor_cas
-          -- --exact --nocapture --test-threads=1
-
-      # The optional Firestore factory is held at the same pre-construction
-      # boundary until cursor-bound staged rows and a head CAS replace it.
-      - name: Test hosted Firestore spine cursor hold
-        if: matrix.os == 'ubuntu-latest'
-        run: >-
-          cargo test -p kin-daemon --features firestore --locked
+          cargo test -p kin-daemon --features gcs,firestore --locked
           state::tests::hosted_spine_refuses_persistence_without_cursor_cas
           -- --exact --nocapture --test-threads=1
 

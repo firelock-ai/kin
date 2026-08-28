@@ -39,16 +39,18 @@ pub use index::{
     SpineXrefAuthorityAnchor, SpineXrefDecodeError, SpineXrefResponse,
 };
 pub use publication::{
-    RepoPublicationCommit, RepoPublicationConflict, RepoPublicationHead, RepoPublicationPhase,
-    RepoSpinePublication, SpineRolloutFence, SpineRolloutFenceCommit,
-    SpineRolloutFenceEvidence, SpineRolloutRepositoryFence, SpineSourceCursor,
-    REPO_PUBLICATION_SCHEMA_VERSION, SPINE_ROLLOUT_FENCE_SCHEMA,
+    LegacySpineWriterDrainAttestation, RepoPublicationCommit, RepoPublicationConflict,
+    RepoPublicationHead, RepoPublicationPhase, RepoSpinePublication, SpineRolloutFence,
+    SpineRolloutFenceCommit, SpineRolloutFenceEvidence, SpineRolloutRepositoryFence,
+    SpineSourceCursor, LEGACY_SPINE_WRITER_DRAIN_SCHEMA, REPO_PUBLICATION_SCHEMA_VERSION,
+    SPINE_ROLLOUT_FENCE_SCHEMA,
 };
 pub use query::{classify_spine_probe, SpineProbe, SpineQuery};
 pub use routing::{RepoEndpoint, RoutingTable};
 pub use store::{
     LoadedRepo, LoadedRepoPublication, LoadedSpineRolloutFence, PreparedStorePublication,
     RepoPublicationCleanupProgress, SpineStore, StoreHeadPrecondition,
+    StorePublicationStageGuard, StoreRepoHeadGuard,
 };
 pub use xref::{
     collect_unresolved_imports, materialize_edges, resolve_imports, ResolveResult, UnresolvedImport,
