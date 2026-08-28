@@ -93,6 +93,7 @@ impl LanguageAdapter for PhpAdapter {
             imports,
             tests,
             parse_state,
+            parsed_call_sites: None,
         })
     }
 }
