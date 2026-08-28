@@ -18955,10 +18955,17 @@ mod tests {
             drop(working);
         }
 
-        /// CLI pull, and every segment of a multi-pack gap, which share one
-        /// admission closure.
+        /// The control on the pull path: a pull that admits nothing must leave
+        /// the record alone.
+        ///
+        /// A receiver that discarded its record on every pull rather than on
+        /// every admission would pass the clone arm below and degrade a healthy
+        /// store on each no-op sync. The admitting half of `pull_into_replica`
+        /// is what the clone arm exercises, because a native clone's first pull
+        /// is that function, and the acceptance suite drives a second replica's
+        /// real `kin pull` against the shipped binaries.
         #[tokio::test]
-        async fn a_pull_discards_the_receivers_creation_record() {
+        async fn a_pull_that_admits_nothing_leaves_the_creation_record_alone() {
             let peer = native_clone_peer().await;
             let destination = tempfile::tempdir().unwrap();
             let cloned = crate::replica_adoption::clone_native_replica(
@@ -18969,33 +18976,27 @@ mod tests {
             .await
             .expect("a native clone of a served peer");
 
-            // The clone already admitted history, so put the receiver back into
-            // the standing the defect produced before asking pull to repeat it.
+            // The clone already admitted everything the peer holds, so put the
+            // receiver back to current and ask for the same history again.
             let layout = cloned.state.layout.clone();
             restamp_current(&layout);
 
             let repo_id = cloned.state.cached_repo_id.clone();
-            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
-            let destination_ref = kin_model::RefName::branch(b"main").unwrap();
             let request = pull_request(&peer.url, &repo_id);
             let (status, body) =
                 transfer_command(Arc::clone(&cloned.state), "pull", &request).await;
             assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-            let _ = (repository_id, destination_ref);
 
-            // An up-to-date pull moves nothing and therefore admits no pack, so
-            // the record it leaves is whatever it found. Only a pull that
-            // admitted a pack is evidence about the commit boundary.
             let pulled: kin_cli::commands::transfer::CommandTransferResponse =
                 serde_json::from_slice(&body).unwrap();
-            if pulled.outcome.moved_history() {
-                assert_unstamped(&layout, "a pull that admitted history");
-            } else {
-                assert!(
-                    !hydration_semantics::standing(&layout).is_gap(),
-                    "a pull that admitted nothing must leave the record alone"
-                );
-            }
+            assert!(
+                !pulled.outcome.moved_history(),
+                "the fixture admitted a pack, so this is not the no-admission control"
+            );
+            assert!(
+                !hydration_semantics::standing(&layout).is_gap(),
+                "a pull that admitted nothing discarded the creation record"
+            );
         }
 
         /// Native clone, with the transported-history mismatch control the
