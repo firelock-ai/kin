@@ -333,6 +333,7 @@ DOCS_ONLY_WORKFLOW_HEADER = textwrap.dedent(
         branches: [main]
       pull_request:
         branches: [main]
+        types: [opened, synchronize, reopened]
       merge_group:
       repository_dispatch:
         types: [dependency-updated]
@@ -735,6 +736,22 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     },
     ".github/workflows/install-proof.yml": {
         "install-proof": "${{ matrix.os }}",
+    },
+    # The dependency receiver validates the exact payload, prepares and compiles
+    # candidate registry bytes without a write credential, then admits only the
+    # hash-bound manifest delta on a fresh App-authenticated runner. It publishes
+    # no pull-request or merge-group context.
+    ".github/workflows/kin-registry-release.yml": {
+        "validate-dispatch": "Validate Kin registry release",
+        "disarm-wave": "Disarm inherited Kin registry landing state",
+        "prepare-wave": "Prepare and compile Kin registry pins",
+        "mutate-wave": "Update the fixed Kin registry PR",
+    },
+    # This workflow_run consumer persists the exact App attestation only after
+    # the receiver attempt is terminal-successful. It produces no required
+    # context; the required CI gate reads and revalidates its server evidence.
+    ".github/workflows/kin-registry-release-attest.yml": {
+        "attest-completed-receiver": "Attest completed Kin registry receiver",
     },
     ".github/workflows/link-check.yml": {
         "link-check": "Check public documentation links",
