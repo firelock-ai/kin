@@ -490,14 +490,25 @@ class Suite(object):
         return {"raw": text, "relations": rels}
 
     def dead_code(self, repo):
+        """`kin dead-code`, with every listed row parsed off the output.
+
+        Rows are read with DEAD_CODE_ROW rather than a pattern of this method's
+        own, because the renderer puts an `[unverified: <factor>]` label in front
+        of a row it cannot stand behind and a pattern that does not tolerate one
+        reads a labelled row as no row at all. That is not a cosmetic miss: a
+        check that grades an empty `rows` list passes both its arms on nothing.
+        The label is carried on the row rather than discarded, so a caller can
+        assert on it instead of re-parsing `raw`.
+        """
         rc, out, err = self.kin_run(["dead-code"], repo)
         text = out + "\n" + err
         rows = []
         for line in text.splitlines():
-            match = re.match(r"\s+(\S+)\s+\((\w+),\s*(\w+)\)\s+-\s+(.+?)\s*$", line)
+            match = DEAD_CODE_ROW.match(line)
             if match:
-                rows.append({"name": match.group(1), "kind": match.group(2),
-                             "file": match.group(4)})
+                rows.append({"name": match.group(2), "kind": match.group(3),
+                             "file": match.group(5),
+                             "label": (match.group(1) or "").strip()})
         return {"raw": text, "rows": rows, "rc": rc}
 
     def references(self, repo, query, settle=2, relation_kinds=None):
@@ -1272,6 +1283,30 @@ def check_4(suite):
     repo = suite.fixture("incremental")
     dead = suite.dead_code(repo)
     names = [row["name"] for row in dead["rows"]]
+
+    # Both graded arms below run over `names`, and an empty `names` passes them
+    # both while proving nothing: the entry point is not in an empty list, and
+    # the contradiction loop iterates nothing. That is not hypothetical. The row
+    # parser was blind to the `[unverified: <factor>]` label the renderer puts on
+    # a row it cannot stand behind, so on any store where every row is labelled
+    # this check stopped grading its own ticket and said so in the affirmative.
+    #
+    # So the parse is joined to the verdict sentence, which counts rows in prose
+    # and cannot be read by the same pattern. A verdict claiming candidates over
+    # a parse that found none is a blind parser, and it refuses here rather than
+    # passing two arms over nothing.
+    claimed = re.search(r"^(?:Found (\d+) unreferenced entit|UNVERIFIED: (\d+) candidate)",
+                        dead["raw"], re.M)
+    claimed_rows = int(claimed.group(1) or claimed.group(2)) if claimed else 0
+    if claimed_rows and not names:
+        res.bad("the verdict claims %d candidate row(s) and this suite parsed none, so the "
+                "arms below would grade an empty list and pass on nothing; the row parser "
+                "cannot read the output it was handed. Verdict: %s"
+                % (claimed_rows, (claimed.group(0) if claimed else "")))
+        return res
+    res.ok("the parse agrees with the verdict sentence: %d claimed, %d row(s) read"
+           % (claimed_rows, len(names)))
+
     if "main" in names:
         res.bad("dead-code lists 'main', the declared console entry point in pyproject.toml")
     else:

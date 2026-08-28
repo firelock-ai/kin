@@ -5489,6 +5489,33 @@ mod tests {
     };
     use kin_spine::SpineBackend as _;
 
+    /// A `Calls` edge carrying the call-site span an adapter that records sites
+    /// produces.
+    ///
+    /// The arrival reading refuses to measure a file whose call edges record no
+    /// span, so a fixture meaning "this call resolved" has to say where, or the
+    /// reading declines on the join rather than answering about the shortfall.
+    fn make_spanned_call(src: &Entity, dst: &Entity, start_byte: usize) -> Relation {
+        Relation {
+            evidence: vec![RelationEvidence {
+                source_span: Some(kin_model::entity::SourceSpan {
+                    file: src
+                        .file_origin
+                        .clone()
+                        .expect("a call edge is minted from an entity that has a file"),
+                    start_byte,
+                    end_byte: start_byte + 8,
+                    start_line: start_byte as u32,
+                    start_col: 0,
+                    end_line: start_byte as u32,
+                    end_col: 8,
+                }),
+                ..RelationEvidence::default()
+            }],
+            ..make_relation(src.id, dst.id, RelationKind::Calls)
+        }
+    }
+
     /// FIR-2821 review, second P1. The agent-facing `dead_code` tool reaches the
     /// same absence verdict as `caller_arrival::absence_gap` and publishes it on
     /// every row.
@@ -5532,11 +5559,7 @@ mod tests {
             ))
             .unwrap();
         store
-            .upsert_relation(&make_relation(
-                caller.id,
-                store_module.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_spanned_call(&caller, &store_module, 100))
             .unwrap();
 
         let args = HashMap::from([("files".to_string(), serde_json::json!(["src/store.rs"]))]);
@@ -5602,11 +5625,7 @@ mod tests {
             ))
             .unwrap();
         store
-            .upsert_relation(&make_relation(
-                caller.id,
-                store_module.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_spanned_call(&caller, &store_module, 100))
             .unwrap();
 
         let args = HashMap::from([(

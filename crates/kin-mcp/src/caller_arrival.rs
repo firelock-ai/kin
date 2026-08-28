@@ -27,7 +27,10 @@
 //!
 //! - how many call sites the parser read there
 //!   ([`kin_parser::FILE_PARSED_CALL_SITES_KEY`], stamped on every entity of the
-//!   file at extraction),
+//!   file at extraction, and WITHHELD from a file whose call extraction the
+//!   parser could not fully represent, which as this is written is nearly every
+//!   real Python file; FIR-2828 publishes the count beside a completeness flag
+//!   instead, and this paragraph is stale the day that lands),
 //! - how many `Calls` edges the graph holds whose source is one of that file's
 //!   entities.
 //!
@@ -147,8 +150,9 @@ impl ArrivalState {
 pub struct UnaccountedFile {
     pub file: String,
     /// `None` when the file carries no parse-side count, which the parser omits
-    /// on any file whose call extraction it could not represent. Absent, not
-    /// zero, and it is its own kind of gap.
+    /// on any file whose call extraction it could not represent, and which as
+    /// this is written is nearly every real Python file until FIR-2828 lands.
+    /// Absent, not zero, and it is its own kind of gap.
     pub parsed_call_sites: Option<u64>,
     pub resolved_call_edges: u64,
     /// `parsed - resolved`, floored at zero. `None` when the parse side was not
@@ -292,6 +296,14 @@ const MODULE_BINDING_KIND: RelationKind = RelationKind::References;
 
 /// Read the per-file parse-side call count the extractor stamped on every
 /// entity of the file. `None` means unmeasured, never zero.
+///
+/// The extractor withholds the key rather than reporting a count it cannot
+/// stand behind, and as this is written it withholds it from nearly every real
+/// Python file, which is why the uncounted branch below is the common case
+/// rather than an edge. FIR-2828 changes that by publishing the count beside a
+/// completeness flag; when it lands, "nearly every" stops being true here and
+/// the measured branch becomes the common one. Nothing in this function needs
+/// to change for that, but this sentence does.
 fn parsed_call_sites(entity: &Entity) -> Option<u64> {
     entity
         .metadata
@@ -366,6 +378,19 @@ fn file_entities<G: GraphStore>(
     ))
 }
 
+/// What one file's resolved side came to, or why it could not be taken.
+enum ResolvedSites {
+    /// Every `Calls` edge from this file's entities joined to a call site, and
+    /// this is how many distinct sites they came to.
+    Counted(u64),
+    /// At least one `Calls` edge records no call-site span in this file, so the
+    /// resolved side cannot be compared with a parse side that counts sites.
+    /// Not zero, and not a count with that edge dropped.
+    Unjoinable,
+    /// The relation index could not be read.
+    Unreadable,
+}
+
 /// How many distinct call SITES the graph holds an edge for, among the entities
 /// of one file.
 ///
@@ -396,17 +421,45 @@ fn file_entities<G: GraphStore>(
 /// claims for it, because two edges sharing a span and a collapse count
 /// describe one set of occurrences fanned out, not two sets.
 ///
-/// `None` means the relation index could not be read, which is not zero.
+/// ## Where the join exists, and what happens where it does not
+///
+/// The join binds only where the adapter that produced the edge recorded a
+/// call-site span. Counted over `crates/kin-parser/src/languages/` by reading
+/// each `ExtractedRelation` construction whose `kind` is `Calls` and asking
+/// whether it sets `site: Some`: `python.rs` spans both of its two emitters and
+/// `javascript.rs` spans its one. Nine adapters span none of theirs, and they
+/// are `c_lang.rs`, `cpp_lang.rs`, `go.rs`, `java.rs`, `kotlin.rs`, `php.rs`,
+/// `rust_lang.rs` (two emitters), `shallow_backed.rs` (two) and `swift.rs`;
+/// `typescript.rs` declares no emitter of its own.
+///
+/// A spanless edge cannot be joined to a site, and giving it a weight of one is
+/// not a neutral fallback: that is exactly the relation count this whole
+/// function replaces, so a Rust file whose thirteen parsed sites produce ten
+/// edges, three of them a fan-out from one site, subtracts to zero and
+/// certifies while three sites became nothing. So an unjoinable edge makes the
+/// file UNMEASURABLE rather than counting as a site, which is the same ruling
+/// an absent parse-side count gets and for the same reason: a measurement that
+/// could not be taken is not a clean one.
+///
+/// The grain is the RELATION rather than the evidence record, deliberately. The
+/// linker attaches a span-free marker record beside a spanned one for a raise
+/// target (`kin-index/src/linker.rs`, and its own comment says the record is
+/// deliberately span-free so no consumer counts it as a second site), and
+/// merging two shape-blind edges pushes a bare default record. Refusing on any
+/// span-free RECORD would make every Python file holding a `raise Foo()`
+/// unmeasurable on a marker that exists precisely so it counts for nothing.
+/// A relation joins when any one of its records carries a usable span.
 fn resolved_call_sites<G: GraphStore>(
     store: &G,
     file: &FilePathId,
     entity_ids: &[(EntityId, kin_model::EntityKind)],
-) -> Option<u64> {
+) -> ResolvedSites {
     let mut sites: std::collections::HashMap<(usize, usize), u64> =
         std::collections::HashMap::new();
-    let mut unjoinable = 0u64;
     for (entity_id, _) in entity_ids {
-        let relations = store.get_all_relations_for_entity(entity_id).ok()?;
+        let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
+            return ResolvedSites::Unreadable;
+        };
         for relation in relations.iter().filter(|relation| {
             relation.kind == RelationKind::Calls && relation.src.as_entity() == Some(*entity_id)
         }) {
@@ -425,11 +478,11 @@ fn resolved_call_sites<G: GraphStore>(
                 joined = true;
             }
             if !joined {
-                unjoinable += 1;
+                return ResolvedSites::Unjoinable;
             }
         }
     }
-    Some(sites.values().sum::<u64>() + unjoinable)
+    ResolvedSites::Counted(sites.values().sum::<u64>())
 }
 
 /// One file's own call-site accounting, the same arithmetic
@@ -446,12 +499,22 @@ fn resolved_call_sites<G: GraphStore>(
 pub fn observe_file_call_sites<G: GraphStore>(
     store: &G,
     file: &FilePathId,
-) -> Result<Option<UnaccountedFile>, &'static str> {
+) -> Result<Option<UnaccountedFile>, String> {
     let Some((entity_ids, parsed)) = file_entities(store, file) else {
-        return Err("the entity index could not be read for the focal's own file");
+        return Err("the entity index could not be read for the focal's own file".to_string());
     };
-    let Some(resolved) = resolved_call_sites(store, file, &entity_ids) else {
-        return Err("the relation index could not be read for the focal's own file");
+    let resolved = match resolved_call_sites(store, file, &entity_ids) {
+        ResolvedSites::Counted(resolved) => resolved,
+        ResolvedSites::Unjoinable => {
+            return Err(format!(
+                "{} holds call edges the graph records no call-site span for, so the calls made \
+                 there could not be counted as sites",
+                file.0
+            ))
+        }
+        ResolvedSites::Unreadable => {
+            return Err("the relation index could not be read for the focal's own file".to_string())
+        }
     };
     let missing = parsed.map(|parsed| parsed.saturating_sub(resolved));
     if missing.is_some_and(|missing| missing == 0) {
@@ -603,10 +666,26 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
         if parsed.is_some() {
             family_measured += 1;
         }
-        let Some(resolved) = resolved_call_sites(store, file, &entity_ids) else {
-            return CallerArrival::unmeasured(
-                "the relation index could not be read for a file in the focal's family",
-            );
+        let resolved = match resolved_call_sites(store, file, &entity_ids) {
+            ResolvedSites::Counted(resolved) => resolved,
+            // Fail closed rather than fall back to counting relations, which is
+            // the arithmetic the fan-out repair exists to replace. Nine of the
+            // eleven adapters that emit `Calls` record no call-site span, so
+            // this is the state most non-Python files are in today, and saying
+            // so is the honest reading.
+            ResolvedSites::Unjoinable => {
+                return CallerArrival::unmeasured(format!(
+                    "{} can reach the focal and holds call edges the graph records no call-site \
+                     span for, so its calls could not be counted as sites and a fan-out there \
+                     could hide a site that became no edge",
+                    file.0
+                ))
+            }
+            ResolvedSites::Unreadable => {
+                return CallerArrival::unmeasured(
+                    "the relation index could not be read for a file in the focal's family",
+                )
+            }
         };
         // A call site can still fan out to several same-named destinations that
         // the graph records without a joinable span, so the resolved side can
@@ -803,7 +882,7 @@ pub fn absence_gap<G: GraphStore>(store: &G, focal: &Entity) -> Option<(&'static
     // remains is the file itself, which is in no family.
     let file = focal.file_origin.as_ref()?;
     match observe_file_call_sites(store, file) {
-        Err(reason) => Some((UNMEASURED_ARRIVAL_LIMITING_FACTOR, reason.to_string())),
+        Err(reason) => Some((UNMEASURED_ARRIVAL_LIMITING_FACTOR, reason)),
         Ok(None) => None,
         Ok(Some(row)) => match row.unaccounted_call_sites {
             Some(missing) => Some((
@@ -975,6 +1054,12 @@ mod tests {
         // Whatever the linker did bind from the test file. `find_note` stands in
         // for the calls that resolved; `note_body` is the one that did not, so
         // the focal has no incoming edge in any arm.
+        //
+        // Each edge sits at its own call-site span, which is what an adapter
+        // that records sites produces and what these arms mean by "resolved
+        // calls". Leaving them span-free would make every arm here read
+        // `unmeasured` on the join refusal rather than on the shortfall they are
+        // about, and that state has its own arm.
         for index in 0..caller_resolved_calls {
             let target = if index == 0 {
                 &find_note
@@ -982,14 +1067,12 @@ mod tests {
                 &focal_module
             };
             store
-                .upsert_relation(&Relation {
-                    id: RelationId::from_content(
-                        &caller.id.0.to_string(),
-                        &target.id.0.to_string(),
-                        &format!("Calls{index}"),
-                    ),
-                    ..edge(RelationKind::Calls, &caller, target)
-                })
+                .upsert_relation(&call_edge_at(
+                    &caller,
+                    target,
+                    CALLER_FILE,
+                    100 * (index + 1),
+                ))
                 .unwrap();
         }
         (store, focal)
@@ -1036,16 +1119,15 @@ mod tests {
         store
             .upsert_relation(&edge(RelationKind::References, &caller, destination))
             .unwrap();
+        // One span per resolved call, for the reason `store_with` states.
         for index in 0..caller_resolved_calls {
             store
-                .upsert_relation(&Relation {
-                    id: RelationId::from_content(
-                        &caller.id.0.to_string(),
-                        &neighbour.id.0.to_string(),
-                        &format!("Calls{index}"),
-                    ),
-                    ..edge(RelationKind::Calls, &caller, &neighbour)
-                })
+                .upsert_relation(&call_edge_at(
+                    &caller,
+                    &neighbour,
+                    CALLER_FILE,
+                    100 * (index + 1),
+                ))
                 .unwrap();
         }
         (store, focal)
@@ -1594,20 +1676,120 @@ mod tests {
         );
     }
 
-    /// A store recording no span at all reads exactly as it did before this
-    /// join existed, so the change cannot quietly move a graph it cannot join.
+    /// A file whose call edges record no call-site span cannot be measured, and
+    /// giving those edges a weight of one is not a neutral fallback.
+    ///
+    /// It is exactly the relation count the fan-out repair replaces, so a file
+    /// whose two parsed sites produce two edges from ONE site subtracts to zero
+    /// and certifies while a site became nothing. Nine of the eleven adapters
+    /// that emit `Calls` record no span, so this is the state most non-Python
+    /// files are in.
     #[test]
-    fn edges_carrying_no_span_keep_their_old_weight_of_one() {
-        // `store_with` builds spanless edges, which is what a store that does
-        // not record call-site evidence looks like.
+    fn a_file_whose_call_edges_carry_no_span_reads_unmeasured() {
+        let (store, focal) = store_with_spanless_calls(2, 2);
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Unmeasured,
+            "the resolved side could not be counted as sites, and a count that could not be \
+             taken is not a clean one: {:?}",
+            arrival.unaccounted
+        );
+        let reason = arrival.unmeasured_reason.unwrap_or_default();
+        assert!(
+            reason.contains("no call-site span"),
+            "the reason names what is missing rather than a cause it cannot know: {reason}"
+        );
+    }
+
+    /// The control, and the half that keeps the arm above from being a refusal
+    /// dressed as a measurement: the identical shape whose edges DO carry spans,
+    /// which is what `python.rs` and `javascript.rs` produce, still measures and
+    /// still certifies.
+    #[test]
+    fn a_file_whose_call_edges_carry_spans_still_measures() {
         let (store, focal) = store_with(Some(2), 2, true);
         let arrival = observe_caller_arrival(&store, &focal);
         assert_eq!(
             arrival.state,
             ArrivalState::Accounted,
-            "two spanless edges still count as two: {:?}",
+            "two spanned edges at two sites account for two parsed sites: {:?}",
             arrival.unaccounted
         );
+    }
+
+    /// A raise-target marker record must not make its file unmeasurable.
+    ///
+    /// The linker attaches a span-free record beside the spanned one for a raise
+    /// target, and its own comment says the record is deliberately span-free so
+    /// no consumer counts it as a second site. Refusing on any span-free RECORD
+    /// rather than on an unjoinable RELATION would make every Python file
+    /// holding a `raise Foo()` unmeasurable on a marker that exists precisely so
+    /// it counts for nothing.
+    #[test]
+    fn a_span_free_marker_beside_a_spanned_record_still_measures() {
+        let store = InMemoryGraph::new();
+        let focal = entity_in("note_body", FOCAL_FILE, Some(0));
+        let focal_module = entity_in("storage", FOCAL_FILE, Some(0));
+        let caller_module = entity_in("test_storage", CALLER_FILE, Some(1));
+        let caller = entity_in("test_bodies_round_trip", CALLER_FILE, Some(1));
+        for entity in [&focal, &focal_module, &caller_module, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&edge(RelationKind::Imports, &caller_module, &focal_module))
+            .unwrap();
+        let mut call = call_edge_at(&caller, &focal_module, CALLER_FILE, 100);
+        call.evidence.push(RelationEvidence {
+            parser_rule: Some("python_raise_target_call".to_string()),
+            ..RelationEvidence::default()
+        });
+        store.upsert_relation(&call).unwrap();
+
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Accounted,
+            "the relation joined through its spanned record, so the marker beside it costs \
+             nothing: {:?}",
+            arrival.unaccounted
+        );
+    }
+
+    /// The stranger's shape with span-free call edges, which is what the nine
+    /// adapters that record no call site produce.
+    fn store_with_spanless_calls(
+        caller_parsed_calls: u64,
+        caller_resolved_calls: usize,
+    ) -> (InMemoryGraph, Entity) {
+        let store = InMemoryGraph::new();
+        let focal = entity_in("note_body", FOCAL_FILE, Some(0));
+        let focal_module = entity_in("storage", FOCAL_FILE, Some(0));
+        let caller_module = entity_in("test_storage", CALLER_FILE, Some(caller_parsed_calls));
+        let caller = entity_in(
+            "test_bodies_round_trip",
+            CALLER_FILE,
+            Some(caller_parsed_calls),
+        );
+        for entity in [&focal, &focal_module, &caller_module, &caller] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&edge(RelationKind::Imports, &caller_module, &focal_module))
+            .unwrap();
+        for index in 0..caller_resolved_calls {
+            store
+                .upsert_relation(&Relation {
+                    id: RelationId::from_content(
+                        &caller.id.0.to_string(),
+                        &focal_module.id.0.to_string(),
+                        &format!("Calls{index}"),
+                    ),
+                    ..edge(RelationKind::Calls, &caller, &focal_module)
+                })
+                .unwrap();
+        }
+        (store, focal)
     }
 
     /// A record standing for several folded occurrences is several sites.

@@ -979,20 +979,10 @@ mod tests {
         // the clean arm. A one-way edge leaves the caller itself unreferenced,
         // which is a populated answer and a different test.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                live.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &live, 0.9))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                live.id,
-                caller.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&live, &caller, 0.9))
             .unwrap();
 
         let degraded = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
@@ -1033,20 +1023,10 @@ mod tests {
         // the clean arm. A one-way edge leaves the caller itself unreferenced,
         // which is a populated answer and a different test.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                live.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &live, 0.9))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                live.id,
-                caller.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&live, &caller, 0.9))
             .unwrap();
 
         let coverage =
@@ -1154,6 +1134,52 @@ mod tests {
             created_in: None,
             import_source: None,
             evidence: vec![],
+        }
+    }
+
+    /// A distinct call-site offset per edge, so two `Calls` edges from one file
+    /// are two sites unless a fixture deliberately puts them at the same one.
+    static NEXT_CALL_SITE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+    /// A `Calls` edge carrying the call-site span an adapter that records sites
+    /// produces.
+    ///
+    /// The arrival reading counts distinct call SITES on the resolved side and
+    /// refuses to measure a file whose call edges record no span, because giving
+    /// a spanless edge weight one is the relation count that lets a fan-out pay
+    /// for a site that became no edge. A fixture meaning "this call resolved"
+    /// therefore has to say where, or it is a fixture about the refusal instead.
+    fn make_call_relation(src: &Entity, dst: &Entity) -> Relation {
+        make_call_relation_with(src, dst, 1.0)
+    }
+
+    /// The same edge at an explicit linker confidence tier.
+    fn make_call_relation_with(src: &Entity, dst: &Entity, confidence: f32) -> Relation {
+        let start_byte = NEXT_CALL_SITE.fetch_add(16, std::sync::atomic::Ordering::Relaxed);
+        let file = src
+            .file_origin
+            .clone()
+            .expect("a call edge is minted from an entity that has a file");
+        Relation {
+            confidence,
+            origin: if confidence < 1.0 {
+                RelationOrigin::Inferred
+            } else {
+                RelationOrigin::Parsed
+            },
+            evidence: vec![kin_model::relation::RelationEvidence {
+                source_span: Some(kin_model::entity::SourceSpan {
+                    file,
+                    start_byte,
+                    end_byte: start_byte + 8,
+                    start_line: start_byte as u32,
+                    start_col: 0,
+                    end_line: start_byte as u32,
+                    end_col: 8,
+                }),
+                ..kin_model::relation::RelationEvidence::default()
+            }],
+            ..make_call_relation(&src, &dst)
         }
     }
 
@@ -1317,12 +1343,7 @@ mod tests {
             .unwrap();
         // The one call of the caller's that the linker did bind.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                neighbour.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &neighbour, 0.9))
             .unwrap();
         (graph, dead_target)
     }
@@ -1415,12 +1436,7 @@ mod tests {
         // One resolved call and no edge of any kind between the two files, so
         // the family cannot be established at all.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                neighbour.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &neighbour, 0.9))
             .unwrap();
 
         let response = scan(&graph);
@@ -1484,20 +1500,10 @@ mod tests {
         // 0.3 is the receiver-method fan-out tier: every same-named method in
         // the repo. 0.9 is module-known, symbol-selected-inside-it.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                guessed.id,
-                RelationKind::Calls,
-                0.3,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &guessed, 0.3))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                proven.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &proven, 0.9))
             .unwrap();
         add_cross_file_import_witness(
             &graph,
@@ -1548,12 +1554,7 @@ mod tests {
         graph.upsert_entity(&live).unwrap();
         graph.upsert_entity(&orphan).unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                live.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &live, 0.9))
             .unwrap();
         add_cross_file_import_witness(
             &graph,
@@ -1968,34 +1969,18 @@ mod tests {
         }
         // Intra-file callers, the edges the two surfaces disagreed about.
         graph
-            .upsert_relation(&make_relation(
-                parse_note.id,
-                extract_tags.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_call_relation(&parse_note, &extract_tags))
             .unwrap();
         graph
-            .upsert_relation(&make_relation(
-                parse_note.id,
-                strip_code.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_call_relation(&parse_note, &strip_code))
             .unwrap();
         graph
-            .upsert_relation(&make_relation(
-                ingest_dir.id,
-                ingest_note.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_call_relation(&ingest_dir, &ingest_note))
             .unwrap();
         // One cross-file edge, so the graph can support an absence claim at all
         // and this test is about agreement rather than about the gate.
         graph
-            .upsert_relation(&make_relation(
-                ingest_dir.id,
-                parse_note.id,
-                RelationKind::Calls,
-            ))
+            .upsert_relation(&make_call_relation(&ingest_dir, &parse_note))
             .unwrap();
         add_cross_file_import_witness(
             &graph,
@@ -2068,13 +2053,17 @@ mod tests {
         }
         // Only the intra-file calls resolved, exactly as the 0.5.36 graph held
         // them: 16 intra-file Calls edges and not one crossing a file.
+        // Spanned, so this fixture's `unmeasured` has exactly one producer: it
+        // holds no import family. Leaving these edges span-free would make the
+        // reading decline on the join too, and the arm below would pass while
+        // naming a reason that was no longer the only one in play.
         for (src, dst) in [
-            (main.id, cmd_ingest.id),
-            (parse_note.id, extract_tags.id),
-            (ingest_dir.id, ingest_note.id),
+            (&main, &cmd_ingest),
+            (&parse_note, &extract_tags),
+            (&ingest_dir, &ingest_note),
         ] {
             graph
-                .upsert_relation(&make_relation(src, dst, RelationKind::Calls))
+                .upsert_relation(&make_call_relation(src, dst))
                 .unwrap();
         }
 
@@ -2131,12 +2120,12 @@ mod tests {
         // Same project, cross-file edges resolved: the graph can now support the
         // claim, and there is nothing left to report.
         for (src, dst) in [
-            (cmd_ingest.id, ingest_dir.id),
-            (ingest_dir.id, parse_note.id),
-            (suite.id, parse_note.id),
+            (&cmd_ingest, &ingest_dir),
+            (&ingest_dir, &parse_note),
+            (&suite, &parse_note),
         ] {
             graph
-                .upsert_relation(&make_relation(src, dst, RelationKind::Calls))
+                .upsert_relation(&make_call_relation(src, dst))
                 .unwrap();
         }
         let repaired = scan(&graph);
@@ -2190,7 +2179,7 @@ mod tests {
         // a dead-code candidate, so this changes only whether Rust arrival was
         // measured.
         graph
-            .upsert_relation(&make_relation(caller.id, called.id, RelationKind::Calls))
+            .upsert_relation(&make_call_relation(&caller, &called))
             .unwrap();
         add_cross_file_import_witness(
             &graph,
@@ -2422,22 +2411,12 @@ mod tests {
         // language reads as unsupportable and every row would be labelled for a
         // different reason, which would make this test unable to fail.
         graph
-            .upsert_relation(&make_relation_at(
-                cmd_ingest.id,
-                parse_file.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&cmd_ingest, &parse_file, 0.9))
             .unwrap();
         // `main` dispatches to the subcommand, so the caller is itself reached
         // and the list is the three the mechanism is about.
         graph
-            .upsert_relation(&make_relation_at(
-                main.id,
-                cmd_ingest.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&main, &cmd_ingest, 0.9))
             .unwrap();
         add_cross_file_import_witness(
             &graph,
@@ -2540,23 +2519,13 @@ mod tests {
             graph.upsert_entity(entity).unwrap();
         }
         graph
-            .upsert_relation(&make_relation_at(
-                suite.id,
-                format_row.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&suite, &format_row, 0.9))
             .unwrap();
         // A production caller for the third function, so the in-file exclusion
         // is exercised in the same run and the two dispositions can be told
         // apart.
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                render_header.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &render_header, 0.9))
             .unwrap();
         // This fixture is about the test-only bucket, not about a graph that
         // cannot establish caller arrival. Give the language a genuine
@@ -2657,7 +2626,7 @@ mod tests {
         }
         // The same-file test call keeps `format_row` in the test-only bucket.
         graph
-            .upsert_relation(&make_relation(suite.id, format_row.id, RelationKind::Calls))
+            .upsert_relation(&make_call_relation(&suite, &format_row))
             .unwrap();
         // The production entry point can reach report.rs, but its two parsed
         // calls produced no Calls edge. Either missing call could target
@@ -2756,20 +2725,10 @@ mod tests {
             graph.upsert_entity(entity).unwrap();
         }
         graph
-            .upsert_relation(&make_relation_at(
-                off_path_suite.id,
-                format_row.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&off_path_suite, &format_row, 0.9))
             .unwrap();
         graph
-            .upsert_relation(&make_relation_at(
-                caller.id,
-                render_header.id,
-                RelationKind::Calls,
-                0.9,
-            ))
+            .upsert_relation(&make_call_relation_with(&caller, &render_header, 0.9))
             .unwrap();
         graph
             .upsert_relation(&make_relation(
