@@ -6151,6 +6151,13 @@ impl DaemonState {
                 Some(hex::encode(binding.retrieval_authority_hash)[..16].to_string()),
             )
         };
+        // Which producer fence this process is enforcing. It is a property of
+        // the process rather than of the artifact, so it is reported wherever
+        // a hosted store exists to be fenced, and left absent exactly when the
+        // policy itself cannot resolve one.
+        let producer_profile = hosted_vector_producer_policy()
+            .ok()
+            .map(|policy| policy.profile);
         let health = match &*state {
             HostedVectorPersistenceState::NotHosted => HostedVectorPersistenceHealth {
                 status: "unsupported".to_string(),
@@ -6169,6 +6176,7 @@ impl DaemonState {
                     binding_fields(authority.binding);
                 HostedVectorPersistenceHealth {
                     status: "empty".to_string(),
+                    producer_profile,
                     snapshot_cursor,
                     vector_cursor: Some(authority.cursor.backend_generation()),
                     retrieval_hash_prefix,
@@ -6189,6 +6197,7 @@ impl DaemonState {
                     } else {
                         "ready".to_string()
                     },
+                    producer_profile,
                     snapshot_cursor,
                     vector_cursor: Some(authority.cursor.backend_generation()),
                     retrieval_hash_prefix,
@@ -6202,6 +6211,7 @@ impl DaemonState {
                     binding_fields(authority.binding);
                 HostedVectorPersistenceHealth {
                     status: "repairable_corrupt".to_string(),
+                    producer_profile,
                     snapshot_cursor,
                     vector_cursor: Some(authority.cursor.backend_generation()),
                     retrieval_hash_prefix,
@@ -6217,6 +6227,7 @@ impl DaemonState {
                 let (snapshot_cursor, retrieval_hash_prefix) = binding_fields(*binding);
                 HostedVectorPersistenceHealth {
                     status: "conflict_reloading".to_string(),
+                    producer_profile,
                     snapshot_cursor,
                     vector_cursor: observed_cursor.map(|cursor| cursor.backend_generation()),
                     retrieval_hash_prefix,
@@ -6234,6 +6245,7 @@ impl DaemonState {
                     .unwrap_or((None, None));
                 HostedVectorPersistenceHealth {
                     status: "indeterminate".to_string(),
+                    producer_profile,
                     snapshot_cursor,
                     vector_cursor: observed_cursor.map(|cursor| cursor.backend_generation()),
                     retrieval_hash_prefix,
@@ -8715,6 +8727,29 @@ mod tests {
             backend.vector_save_count(),
             1,
             "the admitted producer must reach the backend exactly once"
+        );
+
+        // And health must NAME the fence it enforced. The field existed and
+        // nothing ever filled it, which is how a health record advertises a
+        // policy while telling an operator nothing about it.
+        let health = state
+            .hosted_vector_persistence_health()
+            .expect("a hosted store must report vector persistence health");
+        assert!(
+            matches!(health.status.as_str(), "ready" | "backfilling"),
+            "a committed artifact must report a serving status, got {}",
+            health.status
+        );
+        let profile = health
+            .producer_profile
+            .expect("health must name the producer fence this process enforces");
+        let admitted = admitted_hosted_producers();
+        let label = kin_core::vector_producer_policy::producer_label(
+            admitted.iter().next().expect("one admitted producer"),
+        );
+        assert!(
+            profile.contains(&format!("backend={label}")),
+            "health profile {profile} must name the admitted runtime {label}"
         );
     }
 
