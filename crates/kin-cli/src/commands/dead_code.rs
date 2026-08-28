@@ -1179,7 +1179,11 @@ mod tests {
                 }),
                 ..kin_model::relation::RelationEvidence::default()
             }],
-            ..make_call_relation(&src, &dst)
+            // NOT `make_call_relation`, which is this function's own caller. The
+            // rewrite that spanned every fixture edge matched this line too and
+            // made the helper call itself; the suite caught it as a stack
+            // overflow rather than a wrong answer, which is the good outcome.
+            ..make_relation(src.id, dst.id, RelationKind::Calls)
         }
     }
 
