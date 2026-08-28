@@ -852,11 +852,24 @@ class Suite(object):
 
         source = os.path.join(self.workdir, "transfer-source")
         destination = os.path.join(self.workdir, "transfer-destination")
-        self.seed_git_repo(source, "def transported():\n    return 3\n")
+        # A NATIVE source, not a Git import. Transfer v1 requires identical
+        # imported-Git authority on both replicas or a destination that has
+        # admitted nothing, and the adopting receiver holds no Git authority at
+        # all, so a Git-admitted source is refused at export with a
+        # repository-v6 conflict. Both sides are native here, so the only
+        # divergence is the history the transfer exists to move.
+        os.makedirs(source, exist_ok=True)
+        with open(os.path.join(source, "transported.py"), "w") as handle:
+            handle.write("def transported():\n    return 3\n")
         rc, out = self.kin_in(source, ["init"])
         if rc != 0:
             raise RuntimeError("kin init on the transfer source failed: %s" % tail(out))
         self._stop_repos.append(source)
+        # `kin init` on a bare directory admits no history, so the source has
+        # nothing to publish until its working tree reaches graph authority.
+        rc, out = self.kin_in(source, ["admit"])
+        if rc != 0:
+            raise RuntimeError("kin admit on the transfer source failed: %s" % tail(out))
         repo_id = self.repository_id_of(source)
 
         source_stamp, why = read_stamp(source)
