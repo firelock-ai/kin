@@ -8335,6 +8335,37 @@ mod tests {
     use kin_reconcile::ReconcileOutcome;
     use serde_json::json;
 
+    /// The producer set this process's hosted policy admits.
+    ///
+    /// A fixture that hardcoded one runtime would pass on the platform that
+    /// resolves it and fail on the other, so the healthy fixture asks the same
+    /// policy the fence asks rather than writing the answer down twice.
+    #[cfg(feature = "embeddings")]
+    fn admitted_hosted_producers() -> kin_db::EmbeddingProducerSet {
+        hosted_vector_producer_policy()
+            .expect("a test process must resolve a single numerical producer")
+            .allowed
+    }
+
+    /// One producer this process's hosted policy does NOT admit.
+    ///
+    /// Panics rather than returning if every producer is admitted, because a
+    /// refusal test against a fence that refuses nothing would pass while
+    /// proving nothing.
+    #[cfg(feature = "embeddings")]
+    fn a_disallowed_hosted_producer() -> kin_db::EmbeddingProducer {
+        let allowed = admitted_hosted_producers();
+        [
+            kin_db::EmbeddingProducer::Cpu,
+            kin_db::EmbeddingProducer::Metal,
+            kin_db::EmbeddingProducer::Cuda,
+            kin_db::EmbeddingProducer::Remote,
+        ]
+        .into_iter()
+        .find(|candidate| !allowed.contains(*candidate))
+        .expect("the hosted fence admits every producer, so nothing can be refused")
+    }
+
     #[cfg(feature = "embeddings")]
     fn install_checkpoint_vector(
         state: &DaemonState,
@@ -8346,7 +8377,13 @@ mod tests {
         };
         let vectors = kin_db::VectorIndex::new(4).unwrap();
         vectors.set_descriptor(descriptor.clone());
-        vectors.upsert(entity_id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors
+            .upsert_retrievable_with_producers(
+                entity_id.into(),
+                &[1.0, 0.0, 0.0, 0.0],
+                &admitted_hosted_producers(),
+            )
+            .unwrap();
         vectors
             .save(&state.layout.kindb_vector_index_path())
             .unwrap();
@@ -8445,7 +8482,13 @@ mod tests {
         };
         let vectors = kin_db::VectorIndex::new(4).unwrap();
         vectors.set_descriptor(descriptor.clone());
-        vectors.upsert(entity.id, &[1.0, 0.0, 0.0, 0.0]).unwrap();
+        vectors
+            .upsert_retrievable_with_producers(
+                entity.id.into(),
+                &[1.0, 0.0, 0.0, 0.0],
+                &admitted_hosted_producers(),
+            )
+            .unwrap();
         vectors.save(&layout.kindb_vector_index_path()).unwrap();
         assert!(matches!(
             state
@@ -8481,6 +8524,119 @@ mod tests {
             backend.vector_save_count(),
             2,
             "reopen must not rewrite an already committed artifact"
+        );
+    }
+
+    /// External P1-1, through the daemon's real save path: a vector index
+    /// whose bytes attest a runtime this process does not admit never becomes
+    /// a hosted artifact, and the graph keeps serving while it is refused.
+    ///
+    /// The compatibility validator this replaced proves an artifact is
+    /// internally coherent and then discards exactly this evidence, so under
+    /// it this save committed.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hosted_vector_save_refuses_an_index_produced_by_a_disallowed_runtime() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-disallowed-producer";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("foreign_producer_vector", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+
+        let foreign = a_disallowed_hosted_producer();
+        let descriptor = kin_db::vector::IndexDescriptor {
+            model_id: Some("fixture-embedder-v1".to_string()),
+            graph_root: Some("fixture-root".to_string()),
+        };
+        let vectors = kin_db::VectorIndex::new(4).unwrap();
+        vectors.set_descriptor(descriptor.clone());
+        vectors
+            .upsert_retrievable_with_producers(
+                entity.id.into(),
+                &[1.0, 0.0, 0.0, 0.0],
+                &kin_db::EmbeddingProducerSet::singleton(foreign),
+            )
+            .unwrap();
+        vectors.save(&layout.kindb_vector_index_path()).unwrap();
+        assert!(
+            matches!(
+                state
+                    .graph
+                    .load_vector_index_compatible(&layout.kindb_vector_index_path(), &descriptor),
+                kin_db::vector::VectorIndexLoad::Loaded(1)
+            ),
+            "the fixture index must load locally, or this test is refusing the wrong thing"
+        );
+        std::fs::remove_file(layout.kindb_vector_index_path()).unwrap();
+
+        let refusal = state
+            .flush_embed_progress()
+            .expect_err("a vector index produced by a disallowed runtime must not be published");
+        let refusal = refusal.to_string();
+        assert!(
+            refusal.contains("outside the permitted set"),
+            "the refusal must name the producer fence, not some other coincidental failure: \
+             {refusal}"
+        );
+        assert!(
+            refusal.contains(kin_core::vector_producer_policy::producer_label(foreign)),
+            "the refusal must name the runtime it refused ({foreign:?}): {refusal}"
+        );
+        assert_eq!(
+            backend.vector_save_count(),
+            0,
+            "a refused artifact must never reach the backend"
+        );
+        assert_eq!(
+            state.graph.entity_count(),
+            1,
+            "the graph must keep serving while its vector artifact is refused"
+        );
+    }
+
+    /// The same path with an admitted producer must COMMIT, or the refusal
+    /// above is measuring the fixture rather than the fence.
+    #[cfg(feature = "embeddings")]
+    #[test]
+    fn hosted_vector_save_commits_an_index_produced_by_an_admitted_runtime() {
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        let backend = DurableVectorTestBackend::new(storage.path());
+        let repo_id = "durable-hosted-vector-admitted-producer";
+        let graph = kin_db::InMemoryGraph::new();
+        let entity = test_entity("admitted_producer_vector", "src/lib.rs");
+        graph.upsert_entity(&entity).unwrap();
+        backend.publish_graph(repo_id, &graph, 0);
+
+        let state = DaemonState::open_with_backend(
+            layout.clone(),
+            Box::new(backend.clone()),
+            repo_id,
+            None,
+        )
+        .unwrap();
+        install_checkpoint_vector(&state, entity.id);
+
+        state
+            .flush_embed_progress()
+            .expect("an index produced by the admitted runtime must publish");
+        assert_eq!(
+            backend.vector_save_count(),
+            1,
+            "the admitted producer must reach the backend exactly once"
         );
     }
 
@@ -8885,7 +9041,11 @@ mod tests {
         let repair = kin_db::VectorIndex::new(4).unwrap();
         repair.set_descriptor(repair_descriptor.clone());
         repair
-            .upsert(entity.id, &[1.0, 0.0, 0.0, 0.0])
+            .upsert_retrievable_with_producers(
+                entity.id.into(),
+                &[1.0, 0.0, 0.0, 0.0],
+                &admitted_hosted_producers(),
+            )
             .unwrap();
         repair.save(&layout.kindb_vector_index_path()).unwrap();
         assert!(matches!(
