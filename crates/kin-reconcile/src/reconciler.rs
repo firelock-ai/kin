@@ -1155,9 +1155,17 @@ impl Reconciler {
         //
         // An entity THIS delta removes is not admitted either, and that is the
         // half the graph-truth read cannot answer: it is still in the store
-        // while the same transaction retires it, so `get_entity` says yes and
-        // kin-db then refuses the transition with `unadmitted destination
-        // endpoint`, which is the repository-wide write wedge (FIR-2838).
+        // while the same transaction retires it, so `get_entity` says yes.
+        //
+        // Said plainly, because the comment above would otherwise claim more
+        // than the line delivers: no input reaches this arm today. The
+        // endpoints it judges come from the linker's universe, and
+        // `install_file` replaced this file's entities there before the pass
+        // resolved anything, so an entity this delta removes is already absent
+        // from the set the linker could resolve to. Deleting the arm turned no
+        // test red in the FIR-2838 falsification grid and that is recorded
+        // rather than papered over. It stays as a precondition on a closure
+        // whose whole job is deciding what may be an endpoint, not as a fix.
         let admits_entity = |id: EntityId| -> bool {
             if removed_entity_ids.contains(&id) {
                 return false;
