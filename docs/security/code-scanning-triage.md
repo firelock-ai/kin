@@ -32,11 +32,15 @@ Rust diff:
 
 | ref | Rust lines changed | `results_count` | CodeQL |
 |---|---|---|---|
-| `refs/heads/main` | n/a | 71 | n/a |
+| `refs/heads/main` | n/a | 71 (read 2026-08-28) | n/a |
 | a 451-line Rust diff | 451 | 0 | success |
 | a 3759-line Rust diff | 3759 | 12 | failure |
 | a 9111-line Rust diff | 9111 | 42 | failure |
 | an 18349-line Rust diff | 18349 | 42 | failure |
+
+Read `main`'s figure rather than quoting this one. Every count from the analyses API is a property
+of one ref at one instant, and this one drops whenever an alert it carried is fixed or dismissed and
+the analysis re-runs.
 
 Nothing widens or falls back to a full scan. There is no baseline subtraction anywhere: a passing
 pull request passes because its analysis produced nothing, and **every result that does exist is
@@ -69,8 +73,11 @@ have produced confident wrong answers here:
 
 ## Standing dispositions
 
-A triage of all 70 open alerts was completed on 2026-08-28 under **FIR-2837**. Two were real. The
-other 67 were dismissed as false positives with per-alert evidence, authorized by the founder.
+A triage of all 70 open alerts was completed on 2026-08-28 under **FIR-2837**. Two were real. Of
+the other 68, sixty-seven were dismissed as false positives with per-alert evidence, authorized by
+the founder, and one was fixed in the same pass rather than dismissed. The counts differ because a
+dismissal and a fix are different dispositions, so 67 is the number of dismissals rather than the
+number of false positives.
 
 | rule | disposition | why |
 |---|---|---|
@@ -80,6 +87,7 @@ other 67 were dismissed as false positives with per-alert evidence, authorized b
 | `rust/uncontrolled-allocation-size` | false positive | Both allocations are bounded on or beside the flagged line. |
 | `rust/non-https-url` | false positive | The GCE metadata server is link-local and does not serve HTTPS. |
 | `rust/access-invalid-pointer` | false positive, except one | Two are guarded before the dereference. |
+| `js/incomplete-sanitization` | false positive, fixed anyway | One site, a package name joined into a registry path. It was fixed rather than dismissed, which is why it is outside the 67. |
 
 **A Kin session id is not a bearer credential**, and that single fact decides most of the cleartext
 alerts. `crates/kin-daemon/src/api.rs` states it directly: nothing on a request proves the caller
