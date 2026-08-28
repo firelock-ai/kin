@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import importlib.util
 import json
@@ -436,6 +437,34 @@ def ci_run_document(
     }
 
 
+def ci_job_document(
+    *,
+    run_id: int = 901,
+    job_id: int = 9901,
+    name: str = "Fast gate lint and policy",
+    status: str = "queued",
+    conclusion: str | None = None,
+) -> dict[str, object]:
+    return {
+        "id": job_id,
+        "name": name,
+        "status": status,
+        "conclusion": conclusion,
+        "run_url": (
+            f"https://api.github.com/repos/firelock-ai/kin/actions/runs/{run_id}"
+        ),
+    }
+
+
+def ci_jobs_listing(jobs: list[dict[str, object]]) -> dict[str, object]:
+    """Wrap an explicit job list the way the jobs endpoint reports it.
+
+    A run that is seconds old reports an empty list here, which is the shape
+    FIR-2865 turned into a hard failure, so tests need to build it directly.
+    """
+    return {"total_count": len(jobs), "jobs": jobs}
+
+
 def ci_jobs_document(
     *,
     run_id: int = 901,
@@ -443,21 +472,16 @@ def ci_jobs_document(
     status: str = "queued",
     conclusion: str | None = None,
 ) -> dict[str, object]:
-    return {
-        "total_count": 1,
-        "jobs": [
-            {
-                "id": 9901,
-                "name": name,
-                "status": status,
-                "conclusion": conclusion,
-                "run_url": (
-                    "https://api.github.com/repos/firelock-ai/kin/actions/runs/"
-                    f"{run_id}"
-                ),
-            }
-        ],
-    }
+    return ci_jobs_listing(
+        [
+            ci_job_document(
+                run_id=run_id,
+                name=name,
+                status=status,
+                conclusion=conclusion,
+            )
+        ]
+    )
 
 
 class ValidatorTests(unittest.TestCase):
@@ -1759,7 +1783,8 @@ class PostCompletionAttesterTests(unittest.TestCase):
             ), self._live_graphql(head):
                 with self.assertRaisesRegex(
                     attester.AttesterError,
-                    "exactly one required fast gate",
+                    r"looked for a job named 'Fast gate lint and policy'.*"
+                    r"found only run 901 \(in_progress, 1 jobs listed\)",
                 ):
                     attester.recheck_status(
                         admission_file=result_file,
@@ -1768,6 +1793,181 @@ class PostCompletionAttesterTests(unittest.TestCase):
                         wait_seconds=0,
                         require_recheck=True,
                     )
+
+    def test_recheck_waits_for_a_young_runs_jobs_to_be_listed(self) -> None:
+        """FIR-2865: the recheck read a three-second-old run and found no jobs.
+
+        Run 33185320130 was created at 15:28:38Z, the attester read it at
+        15:28:41Z, and its one 'Fast gate lint and policy' job started at
+        15:28:57Z. The old code raised on that empty listing, so the raise
+        escaped the wait loop and the step died 3.3 seconds into a 120 second
+        budget. Each arm below pins one producer of an absent required fast gate
+        apart from the others, because one message used to cover them all.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _, result_file, base, head = self._changed(directory)
+            pull = pull_document(head, base)
+            reviews, comments = attestation_documents(repo, base, head)
+            empty = ci_jobs_listing([])
+            with_gate = ci_jobs_document()
+            live = ci_run_document(head, base)
+            finished = copy.deepcopy(live)
+            finished["status"] = "completed"
+            finished["conclusion"] = "failure"
+
+            def reader(
+                runs: list[dict[str, object]],
+                listings: list[dict[str, object]],
+            ) -> tuple[object, dict[str, int]]:
+                """Serve the jobs endpoint one listing per call, then repeat the last."""
+                calls = {"jobs": 0, "runs": 0}
+
+                def fake(arguments: list[str]) -> object:
+                    endpoint = next(
+                        (item for item in arguments if item.startswith("repos/")), ""
+                    )
+                    if endpoint.endswith("/git/ref/heads/main"):
+                        return {"object": {"sha": base}}
+                    if endpoint == f"repos/{head_guard.EXPECTED_REPOSITORY}/pulls/77":
+                        return pull
+                    if endpoint.endswith("/reviews?per_page=100"):
+                        return [reviews]
+                    if endpoint.endswith("/comments?per_page=100"):
+                        return [comments]
+                    if endpoint.endswith("/actions/workflows/ci.yml/runs"):
+                        calls["runs"] += 1
+                        return [{"total_count": len(runs), "workflow_runs": runs}]
+                    if endpoint.endswith("/actions/runs/901/attempts/1/jobs"):
+                        index = min(calls["jobs"], len(listings) - 1)
+                        calls["jobs"] += 1
+                        return listings[index]
+                    raise AssertionError(
+                        f"unexpected mocked GitHub request: {arguments}"
+                    )
+
+                return fake, calls
+
+            @contextlib.contextmanager
+            def observing(
+                runs: list[dict[str, object]],
+                listings: list[dict[str, object]],
+            ):
+                fake, calls = reader(runs, listings)
+                slept: list[float] = []
+                with mock.patch.object(
+                    attester, "gh_json", side_effect=fake
+                ), mock.patch.object(
+                    attester.guard,
+                    "gh_json",
+                    return_value=workflow_run_document(base),
+                ), mock.patch.object(
+                    attester.time, "sleep", side_effect=slept.append
+                ), self._live_graphql(head):
+                    yield calls, slept
+
+            # Arm one, the production shape. The gate appears on the third poll
+            # and the wait has to survive the two empty ones.
+            with observing([live], [empty, empty, with_gate]) as (calls, slept):
+                arrived = attester.recheck_status(
+                    admission_file=result_file,
+                    workspace=repo,
+                    repository=attester.EXPECTED_REPOSITORY,
+                    wait_seconds=5,
+                    require_recheck=True,
+                )
+            self.assertIs(arrived["needs_retrigger"], False)
+            self.assertEqual(arrived["run_id"], 901)
+            self.assertEqual(arrived["job_id"], 9901)
+            self.assertEqual(arrived["job_status"], "queued")
+            self.assertEqual(calls["jobs"], 3)
+            self.assertEqual(len(slept), 2)
+
+            # Arm two. A run already in flight is the reason NOT to retrigger,
+            # because reopening the pull would cancel it.
+            with observing([live], [empty]) as (calls, _):
+                in_flight = attester.recheck_status(
+                    admission_file=result_file,
+                    workspace=repo,
+                    repository=attester.EXPECTED_REPOSITORY,
+                    wait_seconds=0,
+                    require_recheck=False,
+                )
+            self.assertIs(in_flight["needs_retrigger"], False)
+            self.assertEqual(calls["jobs"], 1)
+
+            # Arm three. Under --require-recheck the deadline is still a
+            # refusal, and the message names the job, the branch, the head and
+            # the run it did find.
+            with observing([live], [empty]) as (_, _slept):
+                with self.assertRaisesRegex(
+                    attester.AttesterError,
+                    r"looked for a job named 'Fast gate lint and policy' on "
+                    r"\.github/workflows/ci\.yml runs on "
+                    r"automation/kin-registry-dependency-wave at head "
+                    rf"{head}.*found only run 901 \(in_progress, 0 jobs listed\)",
+                ):
+                    attester.recheck_status(
+                        admission_file=result_file,
+                        workspace=repo,
+                        repository=attester.EXPECTED_REPOSITORY,
+                        wait_seconds=0,
+                        require_recheck=True,
+                    )
+
+            # Arm four. A COMPLETED run that never published the gate is a real
+            # authority failure, and no wait may soften it. One jobs call proves
+            # it refused rather than waited.
+            with observing(
+                [finished], [ci_jobs_document(name="not the required context")]
+            ) as (calls, slept):
+                with self.assertRaisesRegex(
+                    attester.AttesterError,
+                    r"completed post-attestation CI run 901 publishes no job named "
+                    r"'Fast gate lint and policy' among its 1 jobs",
+                ):
+                    attester.recheck_status(
+                        admission_file=result_file,
+                        workspace=repo,
+                        repository=attester.EXPECTED_REPOSITORY,
+                        wait_seconds=5,
+                        require_recheck=True,
+                    )
+            self.assertEqual(calls["jobs"], 1)
+            self.assertEqual(slept, [])
+
+            # Arm five. Two gates never resolve by waiting, so a live run with
+            # duplicates refuses on the first poll too.
+            duplicated = ci_jobs_listing(
+                [ci_job_document(job_id=9901), ci_job_document(job_id=9902)]
+            )
+            with observing([live], [duplicated]) as (calls, slept):
+                with self.assertRaisesRegex(
+                    attester.AttesterError,
+                    r"post-attestation CI run 901 publishes 2 jobs named "
+                    r"'Fast gate lint and policy'; the recheck requires exactly one",
+                ):
+                    attester.recheck_status(
+                        admission_file=result_file,
+                        workspace=repo,
+                        repository=attester.EXPECTED_REPOSITORY,
+                        wait_seconds=5,
+                        require_recheck=True,
+                    )
+            self.assertEqual(calls["jobs"], 1)
+            self.assertEqual(slept, [])
+
+            # Arm six. No candidate run at all is the one case that still asks
+            # for a retrigger, which is what separates it from arm two.
+            with observing([], [empty]) as (calls, _):
+                absent = attester.recheck_status(
+                    admission_file=result_file,
+                    workspace=repo,
+                    repository=attester.EXPECTED_REPOSITORY,
+                    wait_seconds=0,
+                    require_recheck=False,
+                )
+            self.assertIs(absent["needs_retrigger"], True)
+            self.assertEqual(calls["jobs"], 0)
 
     def test_retrigger_reopens_after_an_uncertain_close_response(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
