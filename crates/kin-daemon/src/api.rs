@@ -17948,9 +17948,12 @@ mod tests {
         symbols: &[(&str, &str, &str)],
     ) -> (SemanticChangeId, Vec<EntityId>) {
         use kin_model::{
-            compute_semantic_change_id, AdmissionPolicyDelta, ChangeOrigin, DefaultRefExpectation,
-            DefaultRefMutation, RefExpectation, RefMutation, RefTarget, RefUpdatePolicy,
-            RepositoryTransaction, SharedAdmissionPolicy, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            compute_resolved_tree_hash, compute_semantic_change_id, AdmissionCase,
+            AdmissionPolicyDelta, ChangeOrigin, DefaultRefExpectation, DefaultRefMutation,
+            EffectiveAdmissionPolicyStamp, FrozenLocalOverlay, FrozenLocalOverlayDelta,
+            RefExpectation, RefMutation, RefTarget, RefUpdatePolicy, RepositoryTransaction,
+            SharedAdmissionPolicy, WorkspaceExpectation, WorkspaceHead, WorkspaceMutation,
+            WorkspaceSemanticDelta, REPOSITORY_TRANSACTION_SCHEMA_VERSION,
         };
 
         let manager = RepositoryAuthorityManager::open(
@@ -18030,6 +18033,78 @@ mod tests {
         change.id = compute_semantic_change_id(&change).unwrap();
         let main = kin_model::RefName::branch(b"main").unwrap();
         let lease = manager.read_authority();
+
+        // A Native change that INTRODUCES artifacts has to arrive bound to the
+        // workspace that publishes it. KinDB has refused an unbound one since
+        // 0.5.0, and `seed_replica_change` above meets that rule only because
+        // it carries no tree deltas at all: the check skips a change that
+        // introduces nothing. This fixture publishes real files, so it builds
+        // the same binding `kin init` does, and every part of it is
+        // load-bearing. The successor workspace must be based on this exact
+        // change, must carry each introduced artifact exactly, and must resolve
+        // both a shared policy and a local overlay, because the admission
+        // matcher is assembled from the two together.
+        let policy = SharedAdmissionPolicy::empty(0);
+        let existing_workspace = lease
+            .snapshot()
+            .repository_authority
+            .as_ref()
+            .and_then(|metadata| metadata.workspaces.first().cloned());
+        let workspace_id = existing_workspace
+            .as_ref()
+            .map(|workspace| workspace.workspace_id)
+            .unwrap_or_else(kin_model::WorkspaceId::new);
+        let base_tree = existing_workspace
+            .as_ref()
+            .map(|workspace| workspace.tree.clone())
+            .unwrap_or_default();
+        let workspace_tree = base_tree.apply(&change.tree_deltas).unwrap();
+        let workspace_tree_hash = compute_resolved_tree_hash(&workspace_tree).unwrap();
+        let overlay =
+            FrozenLocalOverlay::new(workspace_id, 0, AdmissionCase::FoldAscii, Vec::new()).unwrap();
+        let local_stamp = existing_workspace
+            .as_ref()
+            .map(|workspace| workspace.admission_policy.local)
+            .unwrap_or_else(|| overlay.stamp());
+        let workspace_mutation = WorkspaceMutation {
+            workspace_id,
+            expected: match existing_workspace.as_ref() {
+                None => WorkspaceExpectation::MustNotExist,
+                Some(workspace) => WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                },
+            },
+            new_generation: existing_workspace
+                .as_ref()
+                .map(|workspace| workspace.generation + 1)
+                .unwrap_or(0),
+            new_head: WorkspaceHead::Symbolic {
+                target: main.clone(),
+            },
+            new_base_target: Some(RefTarget::change(change.id)),
+            new_base_tree_hash: Some(workspace_tree_hash),
+            tree_deltas: change.tree_deltas.clone(),
+            new_tree_hash: workspace_tree_hash,
+            semantic_delta: WorkspaceSemanticDelta::new(
+                change.entity_deltas.clone(),
+                change.relation_deltas.clone(),
+            )
+            .unwrap(),
+            new_shared_admission_policy: policy.clone(),
+            new_admission_policy: EffectiveAdmissionPolicyStamp {
+                shared: policy.stamp(),
+                local: local_stamp,
+            },
+        };
+        let local_overlay_delta = existing_workspace
+            .is_none()
+            .then(|| FrozenLocalOverlayDelta::initialize(overlay));
+
         let transaction = RepositoryTransaction {
             schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
             operation_id: kin_model::OperationId::from_uuid(Uuid::from_u128(operation)),
@@ -18057,8 +18132,8 @@ mod tests {
                 expected: DefaultRefExpectation::MustBeUnset,
                 new_default: Some(main),
             }),
-            workspace_mutation: None,
-            local_overlay_delta: None,
+            workspace_mutation: Some(workspace_mutation),
+            local_overlay_delta,
             merge_transaction_delta: None,
             sealed_observation: None,
         };
