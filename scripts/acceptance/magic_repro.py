@@ -1895,10 +1895,21 @@ def check_12(suite):
     because no fixture in this suite held such a file. This is that fixture.
 
     Four arms, and the third is what makes the others falsifiable. The scan
-    answers ordinarily; the benign file is named nowhere in the answer; the one
-    function nothing calls is still listed, so the check cannot pass by the
-    scan reporting nothing at all; and that row carries no label saying the
-    graph cannot stand behind it.
+    must not REFUSE, which replaces the answer outright; the benign file is
+    named nowhere in the answer; the one function nothing calls is still listed,
+    so the check cannot pass by the scan reporting nothing at all; and any label
+    that row carries names an arrival factor rather than anything a file
+    declaring nothing could have caused.
+
+    The first and fourth arms used to forbid an UNVERIFIED verdict and any label
+    at all. That stopped grading this ticket the day the arrival reading began
+    declining over call edges that record no call-site span, which this fixture's
+    language does not emit: every row here is now labelled for a reason that has
+    nothing to do with a re-export file, and a check red for someone else's cause
+    is measuring the wrong thing. So the arms name the cause instead of the
+    symptom. A regression of the FIR-2605 class labels rows because a file
+    produced no entity, and that label is not an arrival factor, so it still goes
+    red here; a REFUSED verdict still goes red outright.
     """
     res = Result("12", "FIR-2605", "dead-code answers over a benign re-export file")
     repo = suite.fixture("reexport")
@@ -1939,14 +1950,15 @@ def check_12(suite):
                     % (dead["rc"], excerpt[-300:] or "(no output)"))
         return res
 
-    # The first arm. REFUSED replaces the answer outright and an UNVERIFIED
-    # opener withholds the whole list. The mixed "Found N, M of them UNVERIFIED"
-    # form withholds only some rows, and the fourth arm reads that one per row.
-    if verdict.startswith("REFUSED") or verdict.startswith("UNVERIFIED"):
-        res.bad("kin dead-code withheld its answer over a store whose only unusual file is a "
-                "pure re-export: %s" % verdict)
+    # The first arm. REFUSED replaces the answer outright, which is what this
+    # ticket forbids however the store looks. An UNVERIFIED opener is allowed
+    # only when every reason behind it is one the fourth arm recognizes, and it
+    # is read there per row rather than guessed at from the opener.
+    if verdict.startswith("REFUSED"):
+        res.bad("kin dead-code replaced its answer with a refusal over a store whose only "
+                "unusual file is a pure re-export: %s" % verdict)
     else:
-        res.ok("kin dead-code answered ordinarily: %s" % verdict)
+        res.ok("kin dead-code answered rather than refusing: %s" % verdict)
 
     # The second arm. The benign file holds no entity, so it can be neither a
     # row nor a reason; naming it at all means the scan read "declares nothing"
@@ -1969,14 +1981,25 @@ def check_12(suite):
     res.ok("the one function nothing calls is listed (%d row(s): %s)"
            % (len(listed), ", ".join(sorted(listed))))
 
-    # The fourth arm. A row the scan cannot stand behind is a candidate rather
-    # than a find, and nothing about this fixture makes that true.
+    # The fourth arm, and the one that carries this ticket's claim now. A label
+    # is allowed, because this fixture's language emits no call-site span and the
+    # arrival reading declines over that for every row in every such store. What
+    # is not allowed is a label naming any other cause, because the only thing
+    # unusual about this store is a file that declares nothing, and that must
+    # never be what costs a row its standing.
     label = listed[REEXPORT_DEAD_FUNCTION]
-    if label:
-        res.bad("the row for %s is labeled %s over a store whose only unusual file declares "
-                "nothing" % (REEXPORT_DEAD_FUNCTION, label))
-    else:
+    arrival_labels = ["caller_arrival_unmeasured", "caller_arrival_unresolved"]
+    if not label:
         res.ok("the row for %s carries no unverified label" % REEXPORT_DEAD_FUNCTION)
+    elif any(factor in label for factor in arrival_labels):
+        res.ok("the row for %s is labeled %s, which names the arrival reading rather than "
+               "anything a file that declares nothing could have caused"
+               % (REEXPORT_DEAD_FUNCTION, label))
+    else:
+        res.bad("the row for %s is labeled %s over a store whose only unusual file declares "
+                "nothing, and that factor is not the arrival reading, so something about the "
+                "benign file cost this row its standing"
+                % (REEXPORT_DEAD_FUNCTION, label))
     return res
 
 
@@ -3187,20 +3210,24 @@ def check_22(suite):
     same_file_only = (state == "accounted"
                       and clean_label.startswith("[unverified: caller_arrival_"))
     if same_file_only:
-        res.ok("the family accounted for its arrivals and the row still carries %s, which is "
-               "the focal's own file; this suite grades that through the verdict coupling "
-               "below rather than against a value it cannot compute" % clean_label)
+        res.ok("join branch=same-file (does not grade the consumer): the family accounted for "
+               "its arrivals and the row still carries %s, which is the focal's own file; this "
+               "suite grades that through the verdict coupling below rather than against a "
+               "value it cannot compute" % clean_label)
     elif clean_label != expected_label:
         res.bad("find_references reports caller_arrival state %r for pkg/store.py, so the "
                 "dead-code row for %s owes the label %r and carries %r instead; the two "
                 "surfaces are reading one store about one file and disagree"
                 % (state, RELIMPORT_DEAD_FUNCTION, expected_label, clean_label))
     elif expected_label:
-        res.ok("the dead row carries exactly the label its own file's arrival state (%s) owes: "
-               "%s" % (state, expected_label))
+        res.ok("join branch=non-accounted (grades the consumer): the dead row carries exactly "
+               "the label its own file's arrival state (%s) owes, %s, and removing the consumer "
+               "leaves it bare while the reading still reports the gap"
+               % (state, expected_label))
     else:
-        res.ok("arrival is accounted for this file and the dead row carries no caveat, which "
-               "grades the gate's ability to stay silent rather than its consumer")
+        res.ok("join branch=accounted (does not grade the consumer): arrival is accounted for "
+               "this file and the dead row carries no caveat, which grades the gate's ability "
+               "to stay silent")
 
     # And the coupling, which is the half that holds whichever branch ran: a row
     # this graph cannot stand behind must not sit under a confident heading, and

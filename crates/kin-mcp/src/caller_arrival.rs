@@ -90,6 +90,17 @@ pub const UNRESOLVED_ARRIVAL_LIMITING_FACTOR: &str = "caller_arrival_unresolved"
 /// Limiting-factor id for a family that could not be established at all.
 pub const UNMEASURED_ARRIVAL_LIMITING_FACTOR: &str = "caller_arrival_unmeasured";
 
+/// The phrase every spanless-edge refusal carries, and no other refusal does.
+///
+/// `ArrivalState::Unmeasured` has several producers: a language that links no
+/// imports, a family above the cap, an index that could not be read, and this
+/// one. A reader keying on the state alone cannot tell them apart, and a reason
+/// shared between two causes is the exact join hazard this module tests
+/// elsewhere, so the spanless condition owns a string nothing else uses and a
+/// test pins that it is unique among the reasons this module can produce.
+pub const NO_CALL_SITE_SPAN_REASON: &str =
+    "holds call edges the graph records no call-site span for";
+
 /// Importing files examined before the reading declines.
 ///
 /// Each costs one entity query plus one relation read per entity of that file.
@@ -507,8 +518,8 @@ pub fn observe_file_call_sites<G: GraphStore>(
         ResolvedSites::Counted(resolved) => resolved,
         ResolvedSites::Unjoinable => {
             return Err(format!(
-                "{} holds call edges the graph records no call-site span for, so the calls made \
-                 there could not be counted as sites",
+                "{} {NO_CALL_SITE_SPAN_REASON}, so the calls made there could not be counted as \
+                 sites and a fan-out there could hide a call to the row that became no edge",
                 file.0
             ))
         }
@@ -675,9 +686,9 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
             // so is the honest reading.
             ResolvedSites::Unjoinable => {
                 return CallerArrival::unmeasured(format!(
-                    "{} can reach the focal and holds call edges the graph records no call-site \
-                     span for, so its calls could not be counted as sites and a fan-out there \
-                     could hide a site that became no edge",
+                    "{} can reach the focal and {NO_CALL_SITE_SPAN_REASON}, so its calls could \
+                     not be counted as sites and a fan-out there could hide a site that became \
+                     no edge",
                     file.0
                 ))
             }
@@ -1697,8 +1708,79 @@ mod tests {
         );
         let reason = arrival.unmeasured_reason.unwrap_or_default();
         assert!(
-            reason.contains("no call-site span"),
+            reason.contains(NO_CALL_SITE_SPAN_REASON),
             "the reason names what is missing rather than a cause it cannot know: {reason}"
+        );
+    }
+
+    /// The spanless refusal owns its reason, and no other refusal borrows it.
+    ///
+    /// `Unmeasured` has four producers here, and a reader keying on the state
+    /// cannot tell them apart. A reason shared between two causes is the join
+    /// hazard this module tests elsewhere: an operator reading "could not be
+    /// measured" would have no way to know whether to teach an adapter to emit
+    /// spans or to look at an index that failed to read.
+    #[test]
+    fn only_the_spanless_refusal_carries_the_spanless_reason() {
+        let (store, focal) = store_with_spanless_calls(2, 2);
+        let reason = observe_caller_arrival(&store, &focal)
+            .unmeasured_reason
+            .unwrap_or_default();
+        assert!(reason.contains(NO_CALL_SITE_SPAN_REASON), "{reason}");
+
+        // The other producers of the same state, DRIVEN rather than quoted. A
+        // control assembled from copies of the strings this module emits cannot
+        // tell you what the producer actually says, so each of these reaches
+        // `Unmeasured` through a real store and each must decline to borrow the
+        // spanless phrase.
+        let (no_imports_store, no_imports_focal) = store_with(Some(2), 0, false);
+        let no_imports = observe_caller_arrival(&no_imports_store, &no_imports_focal);
+
+        let orphan_store = InMemoryGraph::new();
+        let mut orphan = entity_in("floating", FOCAL_FILE, Some(0));
+        orphan.file_origin = None;
+        orphan_store.upsert_entity(&orphan).unwrap();
+        let no_file = observe_caller_arrival(&orphan_store, &orphan);
+
+        for other in [&no_imports, &no_file] {
+            assert_eq!(
+                other.state,
+                ArrivalState::Unmeasured,
+                "this control is only a control while it reaches the same state: {other:?}"
+            );
+            let text = other.unmeasured_reason.clone().unwrap_or_default();
+            assert!(
+                !text.contains(NO_CALL_SITE_SPAN_REASON),
+                "another producer of Unmeasured borrowed the spanless reason: {text}"
+            );
+        }
+        // The index-unreadable branch is not driven here: an in-memory store
+        // does not fail a read, so nothing in this test can reach it. Said out
+        // loud rather than left as a silent hole in the enumeration.
+    }
+
+    /// The spanned control's second half: a store whose edges carry spans and
+    /// whose parse side genuinely exceeds them reads Unaccounted with a real
+    /// shortfall, not Unmeasured.
+    ///
+    /// Without this arm the clean control alone leaves the spanned path proven
+    /// only where nothing is wrong, and a rule that declined every spanned store
+    /// with a gap would pass it.
+    #[test]
+    fn a_spanned_store_with_a_real_shortfall_reads_unaccounted() {
+        let (store, focal) = store_with(Some(3), 1, true);
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Unaccounted,
+            "three parsed sites against one spanned edge is a measured shortfall: {:?}",
+            arrival.unaccounted
+        );
+        let row = &arrival.unaccounted[0];
+        assert_eq!(
+            row.unaccounted_call_sites,
+            Some(2),
+            "and the shortfall is measured rather than absent: {row:?}"
         );
     }
 
