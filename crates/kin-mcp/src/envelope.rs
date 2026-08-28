@@ -1460,6 +1460,76 @@ fn completeness_note(
     }
 }
 
+/// What this store's creation-time replay record says, and what is safe to do
+/// about it.
+///
+/// A boolean was the whole defect. `Behind`, `Ahead`, `Unstamped` and
+/// `Unreadable` need four different actions and only one of them is safe to
+/// re-ingest directly: an `Ahead` store was made by a NEWER build than the one
+/// answering, so re-ingesting with this binary would overwrite a store this
+/// build cannot author, and an unknown record could be either. Publishing all
+/// four under a field named `stale` told automation the one thing that is wrong
+/// in three of the four cases.
+///
+/// Present for agreement as well as for every gap, whenever the comparison was
+/// actually made. An object that appeared only on failure could not prove the
+/// call compared anything at all, which is the difference between "this store
+/// is current" and "nobody looked".
+///
+/// Disclosure, not a second verdict. `degraded.hydration_semantics_stale`
+/// remains the one input the verdict is computed from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HydrationSemanticsObservation {
+    /// The stable standing label from `kin_core`: `current`, `behind`, `ahead`,
+    /// `unstamped` or `unreadable`.
+    pub standing: String,
+    /// The replay-semantics version the build answering this call derives.
+    pub derives: u32,
+    /// The version recorded when the store was created, when a record exists
+    /// and could be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_under: Option<u32>,
+    /// Why the record could not be read, on `unreadable` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The direction-safe action, absent when the store is current and there is
+    /// nothing to do.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remedy: Option<String>,
+}
+
+impl From<&kin_core::hydration_semantics::HydrationStanding> for HydrationSemanticsObservation {
+    /// Projected from the one comparison authority. Every field is read off the
+    /// standing rather than recomputed here, because a second place that
+    /// compares the numbers or authors the advice is a second answer waiting to
+    /// disagree with the first.
+    fn from(standing: &kin_core::hydration_semantics::HydrationStanding) -> Self {
+        use kin_core::hydration_semantics::HydrationStanding as Standing;
+        // One arm per variant, so a new standing has to be projected here
+        // rather than silently inheriting whichever default it fell through to.
+        let (created_under, derives, reason) = match standing {
+            Standing::Current { version } => (Some(*version), *version, None),
+            Standing::Behind {
+                created_under,
+                derives,
+            }
+            | Standing::Ahead {
+                created_under,
+                derives,
+            } => (Some(*created_under), *derives, None),
+            Standing::Unstamped { derives } => (None, *derives, None),
+            Standing::Unreadable { reason, derives } => (None, *derives, Some(reason.clone())),
+        };
+        Self {
+            standing: standing.label().to_string(),
+            derives,
+            created_under,
+            reason,
+            remedy: standing.remedy(),
+        }
+    }
+}
+
 /// The versioned MCP response envelope shared by every tool family.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Envelope {
@@ -1512,6 +1582,11 @@ pub struct Envelope {
     /// Degraded-state flags (always present; individual flags omitted when not
     /// observed).
     pub degraded: Degraded,
+    /// What this store's creation-time replay record says and what is safe to do
+    /// about it. Absent when no repository is discoverable, so no comparison was
+    /// made. See [`HydrationSemanticsObservation`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hydration_semantics: Option<HydrationSemanticsObservation>,
     /// The completeness signal (FIR-2357): what this answer's substrate could
     /// have found, present on every retrieval response whether it came back
     /// empty or full. `negative` guards only the empty case; this guards the
@@ -1553,6 +1628,7 @@ impl Envelope {
                 offline_fallback: Some(true),
                 ..Degraded::default()
             },
+            hydration_semantics: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -1573,6 +1649,7 @@ impl Envelope {
             freshness: None,
             graph_state: GraphState::default(),
             degraded: Degraded::default(),
+            hydration_semantics: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -1645,6 +1722,10 @@ impl Envelope {
             hydration_semantics_stale: self.degraded.hydration_semantics_stale,
             ..Degraded::default()
         };
+        // The structured observation is store-wide for the same reason the flag
+        // is, and dropping it here would leave graph status carrying the
+        // compatibility boolean with none of the direction an agent acts on.
+        // `self.hydration_semantics` is deliberately not reassigned.
         self
     }
 
@@ -1736,8 +1817,8 @@ impl Envelope {
         self
     }
 
-    /// Stamp that this store's recorded creation-time hydration semantics differ
-    /// from the ones this binary carries or cannot establish agreement.
+    /// Publish what this store's creation-time replay record says, and stamp the
+    /// compatibility gap flag when it is a gap.
     ///
     /// The successful empty answer is the one this changes. Historical deltas
     /// are not re-derived when the binary's replay semantics change, so an
@@ -1749,11 +1830,12 @@ impl Envelope {
     /// Absent rather than `false` when no repository is discoverable or the
     /// store is current. `None` makes no claim; a fabricated `false` would claim
     /// a comparison a call outside a Kin repository never performed.
-    pub fn with_hydration_semantics_gap(
+    pub fn with_hydration_semantics_observation(
         mut self,
         standing: Option<&kin_core::hydration_semantics::HydrationStanding>,
     ) -> Self {
-        if standing.is_some_and(|standing| standing.is_gap()) {
+        self.hydration_semantics = standing.map(HydrationSemanticsObservation::from);
+        if standing.is_some_and(kin_core::hydration_semantics::HydrationStanding::is_gap) {
             self.degraded.hydration_semantics_stale = Some(true);
         }
         self
@@ -1797,6 +1879,7 @@ impl Envelope {
                 daemon_unreachable: Some(true),
                 ..Degraded::default()
             },
+            hydration_semantics: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -1825,6 +1908,7 @@ impl Envelope {
                 workspace_mismatch: Some(true),
                 ..Degraded::default()
             },
+            hydration_semantics: None,
             completeness: None,
             verdict: None,
             response: None,
@@ -3790,7 +3874,7 @@ mod tests {
         use kin_core::hydration_semantics::HydrationStanding;
 
         let current = HydrationStanding::Current { version: 10 };
-        let whole = Envelope::daemon().with_hydration_semantics_gap(Some(&current));
+        let whole = Envelope::daemon().with_hydration_semantics_observation(Some(&current));
         assert_eq!(whole.degraded.hydration_semantics_stale, None);
         assert!(!whole.degraded.any());
         assert!(!serde_json::to_string(&whole.degraded)
@@ -3812,7 +3896,7 @@ mod tests {
                 derives: 10,
             },
         ] {
-            let flagged = Envelope::daemon().with_hydration_semantics_gap(Some(&standing));
+            let flagged = Envelope::daemon().with_hydration_semantics_observation(Some(&standing));
             assert_eq!(flagged.degraded.hydration_semantics_stale, Some(true));
             assert!(flagged.degraded.any());
             assert!(flagged
@@ -3831,8 +3915,183 @@ mod tests {
             );
         }
 
-        let outside = Envelope::daemon().with_hydration_semantics_gap(None);
+        let outside = Envelope::daemon().with_hydration_semantics_observation(None);
         assert_eq!(outside.degraded.hydration_semantics_stale, None);
+    }
+
+    /// The four gaps need four different actions and only one of them is safe to
+    /// re-ingest directly, so the wire has to separate them. Each arm asserts
+    /// the exact projection rather than "some observation is present", because a
+    /// builder that stamped every store `behind` would satisfy the weaker check
+    /// and mislead the agent in exactly the direction that destroys a store.
+    #[test]
+    fn every_standing_projects_its_own_direction_versions_and_safe_action() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let observed = |standing: &HydrationStanding| {
+            Envelope::daemon()
+                .with_hydration_semantics_observation(Some(standing))
+                .hydration_semantics
+                .expect("an observed comparison publishes an observation")
+        };
+
+        let current = observed(&HydrationStanding::Current { version: 10 });
+        assert_eq!(current.standing, "current");
+        assert_eq!(current.created_under, Some(10));
+        assert_eq!(current.derives, 10);
+        assert_eq!(current.reason, None);
+        assert_eq!(
+            current.remedy, None,
+            "a current store has nothing to do, and advice on it would send a reader to re-ingest \
+             a healthy store"
+        );
+
+        let behind = observed(&HydrationStanding::Behind {
+            created_under: 9,
+            derives: 10,
+        });
+        assert_eq!(behind.standing, "behind");
+        assert_eq!(behind.created_under, Some(9));
+        assert_eq!(behind.derives, 10);
+        assert_eq!(
+            behind.remedy,
+            HydrationStanding::Behind {
+                created_under: 9,
+                derives: 10
+            }
+            .remedy(),
+            "the projection must carry the core remedy, not a second copy of the advice"
+        );
+
+        let ahead = observed(&HydrationStanding::Ahead {
+            created_under: 11,
+            derives: 10,
+        });
+        assert_eq!(ahead.standing, "ahead");
+        assert_eq!(ahead.created_under, Some(11));
+        assert_eq!(ahead.derives, 10);
+        assert!(
+            ahead.created_under > Some(ahead.derives),
+            "ahead must read as the store being newer than the build"
+        );
+        assert_ne!(
+            ahead.remedy, behind.remedy,
+            "ahead and behind must not share advice: re-ingesting an ahead store with this older \
+             build overwrites a store this build cannot author"
+        );
+
+        let unstamped = observed(&HydrationStanding::Unstamped { derives: 10 });
+        assert_eq!(unstamped.standing, "unstamped");
+        assert_eq!(
+            unstamped.created_under, None,
+            "an unstamped store has no recorded version, and inventing one would be a fabricated \
+             comparison"
+        );
+        assert_eq!(unstamped.reason, None);
+        assert_eq!(unstamped.derives, 10);
+
+        let unreadable = observed(&HydrationStanding::Unreadable {
+            reason: "schema kin.hydration-semantics.v2 is not v1".to_string(),
+            derives: 10,
+        });
+        assert_eq!(unreadable.standing, "unreadable");
+        assert_eq!(unreadable.created_under, None);
+        assert_eq!(
+            unreadable.reason.as_deref(),
+            Some("schema kin.hydration-semantics.v2 is not v1")
+        );
+        assert_eq!(
+            unreadable.remedy, unstamped.remedy,
+            "both unknown-direction cases carry the same upgrade-first advice"
+        );
+
+        // Outside a repository nothing was compared, so the envelope makes no
+        // claim rather than manufacturing a current reading.
+        assert_eq!(
+            Envelope::daemon()
+                .with_hydration_semantics_observation(None)
+                .hydration_semantics,
+            None
+        );
+    }
+
+    /// Graph status rebuilds selected-graph health and discards HEAD-only flags.
+    /// The creation record is store-wide, so it has to survive that pass. The
+    /// compatibility flag already did; the structured observation is the half an
+    /// agent acts on and would have been silently erased.
+    #[test]
+    fn the_structured_observation_survives_selected_graph_requalification() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let standing = HydrationStanding::Ahead {
+            created_under: 11,
+            derives: 10,
+        };
+        let selected = Envelope::daemon()
+            .with_hydration_semantics_observation(Some(&standing))
+            .with_selected_graph_observation(4, 4, 0, 4, Some(4));
+
+        let observation = selected
+            .hydration_semantics
+            .as_ref()
+            .expect("selected-graph status must keep the store-wide observation");
+        assert_eq!(observation.standing, "ahead");
+        assert_eq!(observation.created_under, Some(11));
+        assert_eq!(observation.remedy, standing.remedy());
+        assert_eq!(selected.degraded.hydration_semantics_stale, Some(true));
+    }
+
+    /// The observation is disclosure and the flag is the verdict input. A
+    /// serialized response has to carry both under the names consumers read, and
+    /// a current store must not carry the deprecated boolean at all.
+    #[test]
+    fn the_observation_and_the_compatibility_flag_serialize_under_their_own_names() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let gap = serde_json::to_value(
+            Envelope::daemon().with_hydration_semantics_observation(Some(
+                &HydrationStanding::Unreadable {
+                    reason: "truncated".to_string(),
+                    derives: 10,
+                },
+            )),
+        )
+        .expect("the envelope serializes");
+        assert_eq!(gap["hydration_semantics"]["standing"], "unreadable");
+        assert_eq!(gap["hydration_semantics"]["derives"], 10);
+        assert_eq!(gap["hydration_semantics"]["reason"], "truncated");
+        assert!(
+            gap["hydration_semantics"].get("created_under").is_none(),
+            "an absent version must be absent from the wire, not null: {gap}"
+        );
+        assert_eq!(gap["degraded"]["hydration_semantics_stale"], true);
+
+        let current = serde_json::to_value(
+            Envelope::daemon()
+                .with_hydration_semantics_observation(Some(&HydrationStanding::Current {
+                    version: 10,
+                })),
+        )
+        .expect("the envelope serializes");
+        assert_eq!(current["hydration_semantics"]["standing"], "current");
+        assert_eq!(current["hydration_semantics"]["created_under"], 10);
+        assert!(
+            current["hydration_semantics"].get("remedy").is_none(),
+            "a current store must publish no remedy: {current}"
+        );
+        assert!(
+            current["degraded"].get("hydration_semantics_stale").is_none(),
+            "a current store must not carry the gap flag: {current}"
+        );
+
+        let outside = serde_json::to_value(
+            Envelope::daemon().with_hydration_semantics_observation(None),
+        )
+        .expect("the envelope serializes");
+        assert!(
+            outside.get("hydration_semantics").is_none(),
+            "a call that compared nothing must claim nothing: {outside}"
+        );
     }
 }
 
