@@ -1285,13 +1285,18 @@ def self_test():
            grade_named_target_survives_response_budget(
                WIDE_ELISION, fabricated_lines, SELFTEST_RESPONSE_BUDGET), FAIL,
            "changed reference_lines")
+    # Both arms have to carry the bad reason. Mutating only the bounded arm disagrees
+    # with the wide one, and the identity comparison answers first, which would leave the
+    # contract check green on a tree that had removed it.
     invented_absence = json.loads(json.dumps(TARGETED_ELISION))
-    for row in invented_absence["chain"]:
-        row["reference_lines"] = []
-        row["reference_lines_absent_reason"] = "garbage_reason"
+    invented_wide = json.loads(json.dumps(WIDE_ELISION))
+    for payload in (invented_absence, invented_wide):
+        for row in payload["chain"]:
+            row["reference_lines"] = []
+            row["reference_lines_absent_reason"] = "garbage_reason"
     expect("4 fails a trimmed row whose absence reason is outside the vocabulary",
            grade_named_target_survives_response_budget(
-               WIDE_ELISION, invented_absence, SELFTEST_RESPONSE_BUDGET), FAIL,
+               invented_wide, invented_absence, SELFTEST_RESPONSE_BUDGET), FAIL,
            "unknown reference_lines_absent_reason")
     expect("4 fails when the named branch was still elided",
            grade_named_target_survives_response_budget(WIDE_ELISION, lost_targeted, SELFTEST_RESPONSE_BUDGET), FAIL,
