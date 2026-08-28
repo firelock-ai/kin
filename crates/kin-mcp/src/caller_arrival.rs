@@ -27,10 +27,13 @@
 //!
 //! - how many call sites the parser read there
 //!   ([`kin_parser::FILE_PARSED_CALL_SITES_KEY`], stamped on every entity of the
-//!   file at extraction, and WITHHELD from a file whose call extraction the
-//!   parser could not fully represent, which as this is written is nearly every
-//!   real Python file; FIR-2828 publishes the count beside a completeness flag
-//!   instead, and this paragraph is stale the day that lands),
+//!   file at extraction). An adapter that censuses its call sites publishes that
+//!   census, which counts every site the file holds rather than only the ones
+//!   extraction could represent, so the count is present whatever extraction
+//!   managed; Python does this since kin#1206. An adapter with no census still
+//!   publishes the representable count when extraction was complete and
+//!   withholds it otherwise, so an absent count remains possible and remains its
+//!   own kind of gap,
 //! - how many `Calls` edges the graph holds whose source is one of that file's
 //!   entities.
 //!
@@ -160,15 +163,26 @@ impl ArrivalState {
 #[derive(Debug, Clone, Serialize)]
 pub struct UnaccountedFile {
     pub file: String,
-    /// `None` when the file carries no parse-side count, which the parser omits
-    /// on any file whose call extraction it could not represent, and which as
-    /// this is written is nearly every real Python file until FIR-2828 lands.
-    /// Absent, not zero, and it is its own kind of gap.
+    /// `None` when the file carries no parse-side count. An adapter that
+    /// censuses its call sites always publishes one, which Python does since
+    /// kin#1206; one that does not withholds the key on any file whose call
+    /// extraction it could not represent. Absent, not zero, and it is its own
+    /// kind of gap.
     pub parsed_call_sites: Option<u64>,
     pub resolved_call_edges: u64,
     /// `parsed - resolved`, floored at zero. `None` when the parse side was not
     /// measured.
     pub unaccounted_call_sites: Option<u64>,
+    /// Whether the number above is a FLOOR rather than an exact count.
+    ///
+    /// True when the file holds `Calls` edges the graph records no call site
+    /// for, so the resolved side is a range and only its worst case can be
+    /// asserted. The distinction is published rather than smoothed over,
+    /// because "at least two sites became no edge" and "exactly two did" are
+    /// different claims and a reader acting on a delete list is entitled to
+    /// know which one this is.
+    #[serde(default)]
+    pub shortfall_is_floor: bool,
 }
 
 /// The reading itself.
@@ -308,13 +322,13 @@ const MODULE_BINDING_KIND: RelationKind = RelationKind::References;
 /// Read the per-file parse-side call count the extractor stamped on every
 /// entity of the file. `None` means unmeasured, never zero.
 ///
-/// The extractor withholds the key rather than reporting a count it cannot
-/// stand behind, and as this is written it withholds it from nearly every real
-/// Python file, which is why the uncounted branch below is the common case
-/// rather than an edge. FIR-2828 changes that by publishing the count beside a
-/// completeness flag; when it lands, "nearly every" stops being true here and
-/// the measured branch becomes the common one. Nothing in this function needs
-/// to change for that, but this sentence does.
+/// Whether the key is present depends on the adapter. One that censuses its
+/// call sites publishes the census whatever extraction managed, which is what
+/// Python does since kin#1206, so the measured branch is the common one there.
+/// One with no census publishes the representable count when extraction was
+/// complete and withholds the key rather than reporting a number it cannot
+/// stand behind, so the uncounted branch is still reachable and is still a gap
+/// rather than a zero.
 fn parsed_call_sites(entity: &Entity) -> Option<u64> {
     entity
         .metadata
@@ -391,15 +405,66 @@ fn file_entities<G: GraphStore>(
 
 /// What one file's resolved side came to, or why it could not be taken.
 enum ResolvedSites {
-    /// Every `Calls` edge from this file's entities joined to a call site, and
-    /// this is how many distinct sites they came to.
-    Counted(u64),
-    /// At least one `Calls` edge records no call-site span in this file, so the
-    /// resolved side cannot be compared with a parse side that counts sites.
-    /// Not zero, and not a count with that edge dropped.
-    Unjoinable,
+    /// The `Calls` edges from this file's entities, split by whether each could
+    /// be joined to a call site.
+    Counted {
+        /// Distinct call sites the joinable edges came to.
+        sites: u64,
+        /// Edges carrying no usable span in this file. Each one stands for
+        /// somewhere between a share of one site and a site of its own, which
+        /// is the whole reason the shortfall becomes an interval.
+        spanless: u64,
+    },
     /// The relation index could not be read.
     Unreadable,
+}
+
+/// What one file's shortfall can be once the spanless edges are accounted for
+/// as a RANGE rather than a number.
+///
+/// With `P` parsed sites, `S` distinct joined sites and `R` spanless edges, the
+/// spanless edges stand for at least one site (they all fan out from one) and at
+/// most `R` sites (they are all distinct), so writing `Q` for `P - S` floored at
+/// zero, the true shortfall lies in `[Q - R, Q - min(R, 1)]` floored at zero.
+/// Three branches follow, and they are not the same claim:
+///
+/// - the top of the range is zero, so nothing went missing whichever way the
+///   spanless edges fall, and an absence here is the whole set;
+/// - the bottom of the range is above zero, so at least that many parsed sites
+///   became no edge whichever way they fall, which is a floor to disclose with
+///   its number rather than a certification;
+/// - the range straddles zero, so the spanless edges decide the answer and
+///   nothing available here can, which is the only branch that declines.
+///
+/// The middle branch is what keeps this from withholding every verdict on the
+/// nine adapters that record no call site: a file that parses more sites than it
+/// holds edges of any kind still reports a real shortfall, and a file that
+/// parses at most one site still certifies, because a single site cannot fan out
+/// into a hidden second one.
+#[derive(Debug, PartialEq, Eq)]
+enum FileShortfall {
+    /// Every call site the parser read became an edge, whichever way the
+    /// spanless edges fall.
+    None,
+    /// At least this many parsed sites became no edge, whichever way they fall.
+    /// A floor, never an exact count when spanless edges are in play.
+    AtLeast(u64),
+    /// The spanless edges decide the answer and this reading cannot.
+    Undecidable,
+}
+
+/// The interval above, as a function so it can be tested without a store.
+fn file_shortfall(parsed: u64, sites: u64, spanless: u64) -> FileShortfall {
+    let remaining = parsed.saturating_sub(sites);
+    let upper = remaining.saturating_sub(spanless.min(1));
+    let lower = remaining.saturating_sub(spanless);
+    if upper == 0 {
+        FileShortfall::None
+    } else if lower > 0 {
+        FileShortfall::AtLeast(lower)
+    } else {
+        FileShortfall::Undecidable
+    }
 }
 
 /// How many distinct call SITES the graph holds an edge for, among the entities
@@ -447,10 +512,13 @@ enum ResolvedSites {
 /// not a neutral fallback: that is exactly the relation count this whole
 /// function replaces, so a Rust file whose thirteen parsed sites produce ten
 /// edges, three of them a fan-out from one site, subtracts to zero and
-/// certifies while three sites became nothing. So an unjoinable edge makes the
-/// file UNMEASURABLE rather than counting as a site, which is the same ruling
-/// an absent parse-side count gets and for the same reason: a measurement that
-/// could not be taken is not a clean one.
+/// certifies while three sites became nothing. So the spanless edges are
+/// COUNTED here and turned into a range by [`file_shortfall`], which certifies
+/// where the range's top is zero, discloses a floor where its bottom is above
+/// zero, and declines only where the range straddles zero. Refusing outright on
+/// any spanless edge was the first shape of this fix and it withheld every
+/// dead-code verdict on nine languages, which is failing closed over a question
+/// the join does not decide.
 ///
 /// The grain is the RELATION rather than the evidence record, deliberately. The
 /// linker attaches a span-free marker record beside a spanned one for a raise
@@ -467,6 +535,7 @@ fn resolved_call_sites<G: GraphStore>(
 ) -> ResolvedSites {
     let mut sites: std::collections::HashMap<(usize, usize), u64> =
         std::collections::HashMap::new();
+    let mut spanless = 0u64;
     for (entity_id, _) in entity_ids {
         let Ok(relations) = store.get_all_relations_for_entity(entity_id) else {
             return ResolvedSites::Unreadable;
@@ -489,11 +558,14 @@ fn resolved_call_sites<G: GraphStore>(
                 joined = true;
             }
             if !joined {
-                return ResolvedSites::Unjoinable;
+                spanless += 1;
             }
         }
     }
-    ResolvedSites::Counted(sites.values().sum::<u64>())
+    ResolvedSites::Counted {
+        sites: sites.values().sum::<u64>(),
+        spanless,
+    }
 }
 
 /// One file's own call-site accounting, the same arithmetic
@@ -514,28 +586,32 @@ pub fn observe_file_call_sites<G: GraphStore>(
     let Some((entity_ids, parsed)) = file_entities(store, file) else {
         return Err("the entity index could not be read for the focal's own file".to_string());
     };
-    let resolved = match resolved_call_sites(store, file, &entity_ids) {
-        ResolvedSites::Counted(resolved) => resolved,
-        ResolvedSites::Unjoinable => {
-            return Err(format!(
-                "{} {NO_CALL_SITE_SPAN_REASON}, so the calls made there could not be counted as \
-                 sites and a fan-out there could hide a call to the row that became no edge",
-                file.0
-            ))
-        }
+    let (sites, spanless) = match resolved_call_sites(store, file, &entity_ids) {
+        ResolvedSites::Counted { sites, spanless } => (sites, spanless),
         ResolvedSites::Unreadable => {
             return Err("the relation index could not be read for the focal's own file".to_string())
         }
     };
-    let missing = parsed.map(|parsed| parsed.saturating_sub(resolved));
-    if missing.is_some_and(|missing| missing == 0) {
-        return Ok(None);
-    }
+    // The same three branches [`file_shortfall`] states, on the focal's own file.
+    let missing = match parsed.map(|parsed| file_shortfall(parsed, sites, spanless)) {
+        Some(FileShortfall::None) => return Ok(None),
+        Some(FileShortfall::AtLeast(floor)) => Some(floor),
+        Some(FileShortfall::Undecidable) => {
+            return Err(format!(
+                "{} {NO_CALL_SITE_SPAN_REASON}, and it parses more call sites than this reading \
+                 could join, so whether a call to the row from beside it became no edge depends \
+                 on how those edges fan out and nothing here can settle it",
+                file.0
+            ))
+        }
+        None => None,
+    };
     Ok(Some(UnaccountedFile {
         file: file.0.clone(),
         parsed_call_sites: parsed,
-        resolved_call_edges: resolved,
+        resolved_call_edges: sites + spanless,
         unaccounted_call_sites: missing,
+        shortfall_is_floor: spanless > 0,
     }))
 }
 
@@ -677,43 +753,46 @@ pub fn observe_caller_arrival<G: GraphStore>(store: &G, focal: &Entity) -> Calle
         if parsed.is_some() {
             family_measured += 1;
         }
-        let resolved = match resolved_call_sites(store, file, &entity_ids) {
-            ResolvedSites::Counted(resolved) => resolved,
-            // Fail closed rather than fall back to counting relations, which is
-            // the arithmetic the fan-out repair exists to replace. Nine of the
-            // eleven adapters that emit `Calls` record no call-site span, so
-            // this is the state most non-Python files are in today, and saying
-            // so is the honest reading.
-            ResolvedSites::Unjoinable => {
-                return CallerArrival::unmeasured(format!(
-                    "{} can reach the focal and {NO_CALL_SITE_SPAN_REASON}, so its calls could \
-                     not be counted as sites and a fan-out there could hide a site that became \
-                     no edge",
-                    file.0
-                ))
-            }
+        let (sites, spanless) = match resolved_call_sites(store, file, &entity_ids) {
+            ResolvedSites::Counted { sites, spanless } => (sites, spanless),
             ResolvedSites::Unreadable => {
                 return CallerArrival::unmeasured(
                     "the relation index could not be read for a file in the focal's family",
                 )
             }
         };
-        // A call site can still fan out to several same-named destinations that
-        // the graph records without a joinable span, so the resolved side can
-        // exceed the parsed side; the shortfall floors at zero rather than
-        // wrapping, which is the same cap `call_percent` puts on the ratio for
-        // the same reason.
-        let missing = parsed.map(|parsed| parsed.saturating_sub(resolved));
-        // Two distinct gaps and both count. A positive shortfall is call sites
-        // that reached no destination. An absent count is a file whose call
-        // extraction the parser could not represent at all, which it signals by
-        // withholding the number rather than by reporting zero.
+        // Three branches, and only the third declines. See [`file_shortfall`]:
+        // the spanless edges make the shortfall a range, the range's top being
+        // zero certifies, its bottom being above zero is a floor to disclose,
+        // and a range straddling zero is the only case where the answer depends
+        // on something this reading cannot see.
+        let shortfall = parsed.map(|parsed| file_shortfall(parsed, sites, spanless));
+        if shortfall == Some(FileShortfall::Undecidable) {
+            return CallerArrival::unmeasured(format!(
+                "{} can reach the focal and {NO_CALL_SITE_SPAN_REASON}, and it parses more call \
+                 sites than the sites this reading could join, so whether one of them became no \
+                 edge depends on how those edges fan out and nothing here can settle it",
+                file.0
+            ));
+        }
+        // Two distinct gaps and both count. A shortfall is call sites that
+        // reached no destination, exact when every edge joined and a floor when
+        // some did not. An absent count is a file whose call extraction the
+        // parser could not represent at all, which it signals by withholding the
+        // number rather than by reporting zero.
+        let missing = match shortfall {
+            Some(FileShortfall::None) => Some(0),
+            Some(FileShortfall::AtLeast(floor)) => Some(floor),
+            Some(FileShortfall::Undecidable) => unreachable!("returned above"),
+            None => None,
+        };
         if missing.is_none_or(|missing| missing > 0) {
             unaccounted.push(UnaccountedFile {
                 file: file.0.clone(),
                 parsed_call_sites: parsed,
-                resolved_call_edges: resolved,
+                resolved_call_edges: sites + spanless,
                 unaccounted_call_sites: missing,
+                shortfall_is_floor: spanless > 0,
             });
         }
     }
@@ -1535,12 +1614,14 @@ mod tests {
             parsed_call_sites: Some(3),
             resolved_call_edges: 2,
             unaccounted_call_sites: Some(1),
+            shortfall_is_floor: false,
         };
         let withheld = UnaccountedFile {
             file: "tests/test_linkgraph.py".to_string(),
             parsed_call_sites: None,
             resolved_call_edges: 4,
             unaccounted_call_sites: None,
+            shortfall_is_floor: false,
         };
         let many: Vec<UnaccountedFile> = (0..8)
             .map(|index| UnaccountedFile {
@@ -1548,6 +1629,7 @@ mod tests {
                 parsed_call_sites: Some(index + 2),
                 resolved_call_edges: 1,
                 unaccounted_call_sites: Some(index + 1),
+                shortfall_is_floor: false,
             })
             .collect();
         let build = |unaccounted: Vec<UnaccountedFile>| CallerArrival {
@@ -1687,14 +1769,15 @@ mod tests {
         );
     }
 
-    /// A file whose call edges record no call-site span cannot be measured, and
-    /// giving those edges a weight of one is not a neutral fallback.
+    /// The decline branch. Two parsed sites against two spanless edges is the
+    /// case where the fan-out decides the answer: both edges from one site
+    /// leaves a site missing, one from each accounts for both, and nothing here
+    /// can tell those apart.
     ///
-    /// It is exactly the relation count the fan-out repair replaces, so a file
-    /// whose two parsed sites produce two edges from ONE site subtracts to zero
-    /// and certifies while a site became nothing. Nine of the eleven adapters
-    /// that emit `Calls` record no span, so this is the state most non-Python
-    /// files are in.
+    /// Giving a spanless edge a weight of one would answer "accounted" for both
+    /// readings, which is exactly the relation count the fan-out repair
+    /// replaces. The two arms beside this one hold the other branches: one
+    /// parsed site certifies, and a file short of edges reports a floor.
     #[test]
     fn a_file_whose_call_edges_carry_no_span_reads_unmeasured() {
         let (store, focal) = store_with_spanless_calls(2, 2);
@@ -1710,6 +1793,117 @@ mod tests {
         assert!(
             reason.contains(NO_CALL_SITE_SPAN_REASON),
             "the reason names what is missing rather than a cause it cannot know: {reason}"
+        );
+    }
+
+    /// The three branches of the interval, stated as a table so each one is a
+    /// row a mutation has to move rather than a sentence in a doc comment.
+    ///
+    /// `P` parsed sites, `S` joined sites, `R` spanless edges. The spanless
+    /// edges stand for between one site and `R` sites, so the shortfall is a
+    /// range and only its ends decide anything.
+    #[test]
+    fn the_shortfall_interval_certifies_floors_and_declines_in_the_right_places() {
+        use FileShortfall::{AtLeast, None as NoShortfall, Undecidable};
+        let cases: [(u64, u64, u64, FileShortfall, &str); 9] = [
+            // Every edge joined, so the range collapses to a number.
+            (0, 0, 0, NoShortfall, "nothing parsed, nothing to miss"),
+            (2, 2, 0, NoShortfall, "two parsed, two joined sites"),
+            (
+                3,
+                1,
+                0,
+                AtLeast(2),
+                "two parsed sites became no edge, exactly",
+            ),
+            // Spanless edges, and the top of the range is zero.
+            (0, 0, 3, NoShortfall, "no parsed site can go missing"),
+            (1, 0, 1, NoShortfall, "one parsed site cannot hide a second"),
+            (1, 0, 5, NoShortfall, "still one site, whatever the fan-out"),
+            // Spanless edges, and the bottom of the range is above zero.
+            (
+                3,
+                0,
+                1,
+                AtLeast(2),
+                "at least two became no edge, whichever way",
+            ),
+            (
+                5,
+                1,
+                2,
+                AtLeast(2),
+                "joined sites count first, then the floor",
+            ),
+            // Spanless edges, and the range straddles zero.
+            (
+                2,
+                0,
+                3,
+                Undecidable,
+                "the fan-out decides and this reading cannot",
+            ),
+        ];
+        for (parsed, sites, spanless, expected, why) in cases {
+            assert_eq!(
+                file_shortfall(parsed, sites, spanless),
+                expected,
+                "P={parsed} S={sites} R={spanless}: {why}"
+            );
+        }
+    }
+
+    /// The certify branch, end to end. A file parsing one call site certifies
+    /// however its edges fan out, because one site cannot hide a second.
+    ///
+    /// This is the branch that keeps the rule from withholding every verdict on
+    /// the nine adapters that record no call site.
+    #[test]
+    fn one_parsed_call_site_certifies_even_with_spanless_edges() {
+        let (store, focal) = store_with_spanless_calls(1, 3);
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Accounted,
+            "one parsed site cannot fan out into a hidden second one: {:?}",
+            arrival.unaccounted
+        );
+    }
+
+    /// The floor branch, end to end. A file parsing more sites than it holds
+    /// edges of any kind reports a real shortfall even when nothing joined, and
+    /// says on the row that the number is a floor.
+    #[test]
+    fn a_spanless_file_short_of_edges_reports_a_floor_rather_than_declining() {
+        let (store, focal) = store_with_spanless_calls(3, 1);
+        let arrival = observe_caller_arrival(&store, &focal);
+        assert_eq!(
+            arrival.state,
+            ArrivalState::Unaccounted,
+            "three parsed sites against one edge is short whichever way it fans: {:?}",
+            arrival.unaccounted
+        );
+        let row = &arrival.unaccounted[0];
+        assert_eq!(row.unaccounted_call_sites, Some(2), "{row:?}");
+        assert!(
+            row.shortfall_is_floor,
+            "the row says the number is a floor, because a spanless edge leaves the resolved \
+             side a range: {row:?}"
+        );
+    }
+
+    /// And its control: the same shortfall where every edge joined is exact
+    /// rather than a floor, so the flag separates the two claims instead of
+    /// being set on everything.
+    #[test]
+    fn a_spanned_shortfall_is_exact_rather_than_a_floor() {
+        let (store, focal) = store_with(Some(3), 1, true);
+        let arrival = observe_caller_arrival(&store, &focal);
+        let row = &arrival.unaccounted[0];
+        assert_eq!(row.unaccounted_call_sites, Some(2), "{row:?}");
+        assert!(
+            !row.shortfall_is_floor,
+            "every edge joined, so this count is exact: {row:?}"
         );
     }
 
