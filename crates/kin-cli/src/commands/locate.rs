@@ -11240,7 +11240,10 @@ fn extract_embedding_signals(
         ) {
             Ok(r) => r,
             Err(e) => {
-                tracing::error!("semantic_search_batch_filtered_with_producers failed: {:?}", e);
+                tracing::error!(
+                    "semantic_search_batch_filtered_with_producers failed: {:?}",
+                    e
+                );
                 record_degradation(
                     degradations,
                     RetrievalDegradation {
