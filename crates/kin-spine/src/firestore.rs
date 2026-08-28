@@ -6206,14 +6206,16 @@ mod tests {
         assert!(error.to_string().contains("exact active-fleet v2 heads"));
 
         let publisher = FirestoreSpineBackend::with_store(store.clone());
+        // One entry value, built once and reused. `test_entry` mints a fresh
+        // `EntityId` on every call, so building it twice changes the entity set
+        // under one cursor, and a metadata change at a fixed cursor is refused:
+        // this test would then never reach the metadata-to-edges upgrade it
+        // exists to exercise. The refusal itself is the subject of
+        // `a_same_cursor_metadata_change_is_refused_and_the_next_cursor_takes_it`.
+        let current = test_entry("repo", "current", EntityKind::Function);
         publish_success(
             &publisher,
-            metadata_publication(
-                "repo",
-                100,
-                "current-root",
-                vec![test_entry("repo", "current", EntityKind::Function)],
-            ),
+            metadata_publication("repo", 100, "current-root", vec![current.clone()]),
         );
         publish_success(
             &publisher,
@@ -6221,7 +6223,7 @@ mod tests {
                 "repo",
                 100,
                 "current-root",
-                vec![test_entry("repo", "current", EntityKind::Function)],
+                vec![current],
                 Vec::new(),
                 [("repo", "current-root")],
             ),
@@ -6236,6 +6238,68 @@ mod tests {
             .expect("durable completion marker removes legacy collections from cold reopen");
         assert!(reopened.resolve("legacy", None, None).is_empty());
         assert_eq!(reopened.resolve("current", None, None).len(), 1);
+    }
+
+    /// Metadata moves with the cursor or not at all.
+    ///
+    /// A source cursor names one frame of the repository. Two different entity
+    /// sets published under the same cursor are two frames wearing one
+    /// identity, which is exactly the ambiguity an exact compare-and-swap
+    /// exists to prevent: a reader that has resolved against one of them has no
+    /// way to tell it is now holding the other. So the same-cursor change is
+    /// refused, and the way to publish it is to advance the cursor, where the
+    /// receipt names the frame the caller is now on.
+    ///
+    /// Both arms are here on purpose. The refusal alone would pass on a store
+    /// that refused every publication, and the acceptance alone would pass on
+    /// one that accepted every publication; only the pair pins the rule.
+    #[test]
+    fn a_same_cursor_metadata_change_is_refused_and_the_next_cursor_takes_it() {
+        let store = Arc::new(FakeSpineStore::default());
+        let backend = FirestoreSpineBackend::with_store(store);
+        publish_success(
+            &backend,
+            metadata_publication(
+                "repo",
+                7,
+                "root-at-7",
+                vec![test_entry("repo", "first", EntityKind::Function)],
+            ),
+        );
+
+        let changed = publish(
+            &backend,
+            metadata_publication(
+                "repo",
+                7,
+                "root-at-7",
+                vec![test_entry("repo", "second", EntityKind::Function)],
+            ),
+        );
+        assert!(
+            matches!(changed, RepoPublicationCommit::Conflict(_)),
+            "a metadata change under an unchanged cursor must be refused, got {changed:?}"
+        );
+
+        let advanced = publish(
+            &backend,
+            metadata_publication(
+                "repo",
+                8,
+                "root-at-8",
+                vec![test_entry("repo", "second", EntityKind::Function)],
+            ),
+        );
+        assert!(
+            matches!(
+                advanced,
+                RepoPublicationCommit::Committed { source_cursor } if source_cursor == cursor(8)
+            ),
+            "the same change at the next cursor must commit with a receipt naming that \
+             cursor, got {advanced:?}"
+        );
+        assert_eq!(backend.source_cursor("repo"), Some(cursor(8)));
+        assert_eq!(backend.root_hash("repo").as_deref(), Some("root-at-8"));
     }
 
     #[test]
