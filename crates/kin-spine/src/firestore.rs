@@ -5002,7 +5002,18 @@ mod tests {
             race.reopen_succeeded,
             "the committed winner must reopen cold"
         );
-        assert!(race.writer_complete);
+        // The provider in this fixture publishes metadata only, and a metadata
+        // publication keeps that repository's outgoing topology unresolved, so
+        // the fleet is not edge-complete at either surface. Certifying it would
+        // answer "what does provider reference" with an empty set AND call that
+        // set authoritative. See `SpineIndex::authority_is_complete`.
+        assert!(
+            !race.writer_complete && !race.reopened_complete,
+            "a fleet with a metadata-only repository must not certify completeness: \
+             writer_dirty {:?}, reopened_dirty {:?}",
+            race.writer_dirty,
+            race.reopened_dirty
+        );
     }
 
     #[test]
@@ -5018,35 +5029,48 @@ mod tests {
         );
     }
 
-    /// Print the dirty set at both surfaces, with a control.
+    /// A metadata-only repository blocks fleet edge completeness, at both
+    /// surfaces, and a current edge publication unblocks it.
     ///
-    /// Ordered before either side of the completeness question is changed:
-    /// `authority_complete()` being false says only that something is dirty,
-    /// and whether that is a repository with a pending edge publication or one
-    /// that never publishes edges at all decides which surface the property
-    /// belongs on. The control arm gives the provider its own edge publication,
-    /// so a reading that shows both sets empty there and only the provider
-    /// dirty in the main arm isolates the metadata-only case as the cause.
+    /// Both arms, because neither alone pins the rule: the refusal would pass
+    /// on an index that never certified anything, and the acceptance would pass
+    /// on one that certified everything. Both surfaces, because the writer's
+    /// live cache and a reopened backend reach completeness by different paths
+    /// and the property has to hold on the one a caller actually reads.
     ///
-    /// This asserts only what it is sure of, that the control converges. The
-    /// main arm's sets are printed for the ruling, not asserted.
+    /// The dirty set is asserted beside the boolean because the boolean alone
+    /// cannot say WHY: a repository with a pending edge publication and one
+    /// that never publishes edges both read false, and only the first is a
+    /// transient.
     #[test]
-    fn dirty_edge_repos_are_printed_at_both_surfaces_with_a_control() {
+    fn a_metadata_only_repository_blocks_completeness_at_both_surfaces() {
         let main = run_cleanup_snapshot_race(false, false);
-        println!(
-            "MAIN provider-metadata-only: writer_complete={} writer_dirty={:?} reopened_complete={} reopened_dirty={:?}",
-            main.writer_complete, main.writer_dirty, main.reopened_complete, main.reopened_dirty
+        assert!(
+            !main.writer_complete && !main.reopened_complete,
+            "a metadata-only provider leaves its outgoing topology unresolved, so neither \
+             surface may certify completeness: writer_dirty {:?}, reopened_dirty {:?}",
+            main.writer_dirty,
+            main.reopened_dirty
+        );
+        let provider_only: std::collections::BTreeSet<String> =
+            ["provider".to_string()].into_iter().collect();
+        assert_eq!(
+            main.writer_dirty, provider_only,
+            "the provider must be the reason, not something else"
+        );
+        assert_eq!(
+            main.reopened_dirty, provider_only,
+            "hydration does not clear a metadata-only repository either"
         );
 
         let control = run_cleanup_snapshot_race(false, true);
-        println!(
-            "CONTROL provider-publishes-edges: writer_complete={} writer_dirty={:?} reopened_complete={} reopened_dirty={:?}",
-            control.writer_complete,
+        assert!(
+            control.writer_complete && control.reopened_complete,
+            "a provider with a current edge publication must let both surfaces certify: \
+             writer_dirty {:?}, reopened_dirty {:?}",
             control.writer_dirty,
-            control.reopened_complete,
             control.reopened_dirty
         );
-
         assert!(
             control.writer_dirty.is_empty() && control.reopened_dirty.is_empty(),
             "the control must converge at both surfaces, or it cannot isolate the \
