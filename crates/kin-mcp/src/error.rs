@@ -102,10 +102,17 @@ mod tests {
     /// goes red first.
     #[test]
     fn an_authority_gap_message_is_classified_as_one() {
-        let gap = McpError::Context(format!(
-            "{GRAPH_AUTHORITY_GAP_PREFIX}: cannot load immutable source blob abc"
-        ));
+        // The message is spelled out rather than built from the constant. A
+        // fixture interpolating the constant moves with it, so renaming the
+        // prefix would leave this green while every consumer classifying on it
+        // silently changed its mind.
+        let gap =
+            McpError::Context("graph authority gap: cannot load immutable source blob abc".into());
         assert!(gap.is_graph_authority_gap(), "{gap}");
+        assert_eq!(
+            GRAPH_AUTHORITY_GAP_PREFIX, "graph authority gap",
+            "the producers in handlers::repository_authority spell this literally"
+        );
     }
 
     /// The control that must stay silent. A caller asking for something the

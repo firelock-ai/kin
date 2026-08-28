@@ -90,17 +90,26 @@ impl ActiveRepositoryAuthorityManager {
         }
     }
 
-    fn load_source_blob(
+    /// Read one immutable body without permitting an allocation above
+    /// `max_bytes`.
+    ///
+    /// The caller's ceiling is what travels, so a request that derived a
+    /// smaller allowance from its response budget actually gets it. The hosted
+    /// arm still clamps to [`HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES`], because a
+    /// caller asking for more than these surfaces can return is asking for
+    /// something no hosted response has room to ship.
+    fn load_source_blob_bounded(
         &self,
         repository_id: &RepositoryId,
         digest: Hash256,
+        max_bytes: u64,
     ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
         match self {
             Self::Local(manager) => manager.load_source_blob(digest),
             Self::Hosted { backend, .. } => backend.load_source_blob_bounded(
                 repository_id.as_str(),
                 *digest.as_bytes(),
-                HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES,
+                max_bytes.min(HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES),
             ),
         }
     }
@@ -661,7 +670,7 @@ impl ActiveRepositoryAuthority {
         max_bytes: u64,
     ) -> Result<Vec<u8>> {
         self.manager
-            .load_source_blob(&self.repository_id, digest, max_bytes)
+            .load_source_blob_bounded(&self.repository_id, digest, max_bytes)
             .map_err(|error| {
                 McpError::Context(format!(
                     "graph authority gap: cannot load immutable source blob {digest}: {error}"

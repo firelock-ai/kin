@@ -10867,7 +10867,7 @@ async fn repo_mcp_tools_call(
     };
 
     if let Some(message) = mcp_tool_result_error(&result) {
-        let authority_gap = message.contains("graph authority gap");
+        let authority_gap = message.contains(kin_mcp::error::GRAPH_AUTHORITY_GAP_PREFIX);
         let cursor_unavailable =
             message.contains("repo-scoped semantic cursor ranking is unavailable");
         if cursor_unavailable || authority_gap || request.name == "semantic_locate" {
@@ -19421,7 +19421,7 @@ mod tests {
         let repo_id = format!("repo-scoped-blob-budget-{}", Uuid::new_v4());
         let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
         let (state, faults, backend_dir) =
-            hosted_state_with_backend_dir("repo-mcp-blob-budget", &repo_id);
+            hosted_state_with_backend_dir("repo-mcp-blob-budget", &repo_id, &[]);
         publish_hosted_semantic_change(
             &backend_dir,
             &repository_id,
@@ -19481,6 +19481,14 @@ mod tests {
                 *ceiling <= per_blob,
                 "a hosted source read asked for {ceiling} bytes against a {per_blob}-byte per-blob allowance"
             );
+            // The literal beside the derived bound, because a derived bound
+            // moves with the code it is derived from and cannot catch a change
+            // to it. A 2,000-character budget floors this call's allowance at
+            // 256 KiB, so nothing it reads may ask for more.
+            assert!(
+                *ceiling <= 256 * 1024,
+                "a hosted source read asked for {ceiling} bytes under a 2,000-character response budget"
+            );
             assert!(
                 *ceiling < kin_db::MAX_SOURCE_BLOB_BYTES,
                 "a hosted source read inherited the general-purpose {} byte ceiling",
@@ -19539,7 +19547,7 @@ mod tests {
         let repo_id = format!("repo-scoped-offruntime-{}", Uuid::new_v4());
         let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
         let (state, faults, backend_dir) =
-            hosted_state_with_backend_dir("repo-mcp-offruntime", &repo_id);
+            hosted_state_with_backend_dir("repo-mcp-offruntime", &repo_id, &[]);
         publish_hosted_semantic_change(
             &backend_dir,
             &repository_id,
@@ -19728,6 +19736,10 @@ mod tests {
             StatusCode::OK,
             "a cursor minted for one repository must not answer under another: {mismatch}"
         );
+        assert_eq!(
+            mismatch["error"]["code"], "cursor_repository_mismatch",
+            "the refusal must name the binding it enforced, not a downstream miss: {mismatch}"
+        );
     }
 
     /// P2: a graph or source failure must leave as a typed 503, not as a 200
@@ -19737,7 +19749,7 @@ mod tests {
         let repo_id = format!("repo-scoped-blob-fault-{}", Uuid::new_v4());
         let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
         let (state, faults, backend_dir) =
-            hosted_state_with_backend_dir("repo-mcp-blob-fault", &repo_id);
+            hosted_state_with_backend_dir("repo-mcp-blob-fault", &repo_id, &[]);
         publish_hosted_semantic_change(
             &backend_dir,
             &repository_id,
@@ -19808,7 +19820,13 @@ mod tests {
                 .to_string(),
             )
         };
-        for (component, reason) in REPO_SCOPED_AUTHORITY_FAILURE_DEGRADATIONS {
+        // Named here rather than read off the constant. A test that iterates
+        // the list it is guarding cannot notice a pair being removed from it:
+        // the loop simply runs one fewer time and passes.
+        for (component, reason) in [
+            ("entity_source", "source_unreadable"),
+            ("vector_index", "query_failed"),
+        ] {
             let classified = repo_scoped_authority_degradation(&failure(component, reason))
                 .unwrap_or_else(|| panic!("{component}/{reason} must be a service error"));
             assert_eq!(classified.status, StatusCode::SERVICE_UNAVAILABLE);
@@ -27119,33 +27137,8 @@ mod tests {
     fn hosted_state_with_backend_dir(
         label: &str,
         advertised: &str,
-    ) -> (Arc<DaemonState>, FaultSwitch, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("kin-daemon-{label}-{}", Uuid::new_v4()));
-        let kin_dir = dir.join(".kin");
-        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
-        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
-        let layout = kin_core::KinLayout::new(kin_dir);
-        kin_core::manifest::KinManifest::new()
-            .save(&layout.manifest_path())
-            .unwrap();
-        let backend_dir = dir.join("backend");
-        std::fs::create_dir_all(&backend_dir).unwrap();
-
-        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
-        let allowed: std::collections::HashSet<String> =
-            std::iter::once(advertised.to_string()).collect();
-        let state = Arc::new(
-            DaemonState::open_with_backend(layout, Box::new(backend), advertised, Some(allowed))
-                .unwrap(),
-        );
-        (state, faults, backend_dir)
-    }
-
-    fn hosted_state_with_allowlist(
-        label: &str,
-        advertised: &str,
         siblings: &[&str],
-    ) -> (Arc<DaemonState>, FaultSwitch) {
+    ) -> (Arc<DaemonState>, FaultSwitch, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("kin-daemon-{label}-{}", Uuid::new_v4()));
         let kin_dir = dir.join(".kin");
         std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
@@ -27166,6 +27159,16 @@ mod tests {
             DaemonState::open_with_backend(layout, Box::new(backend), advertised, Some(allowed))
                 .unwrap(),
         );
+        (state, faults, backend_dir)
+    }
+
+    fn hosted_state_with_allowlist(
+        label: &str,
+        advertised: &str,
+        siblings: &[&str],
+    ) -> (Arc<DaemonState>, FaultSwitch) {
+        let (state, faults, _backend_dir) =
+            hosted_state_with_backend_dir(label, advertised, siblings);
         (state, faults)
     }
 
