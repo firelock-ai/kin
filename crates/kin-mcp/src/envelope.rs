@@ -3135,7 +3135,10 @@ mod tests {
             Some(&serde_json::json!(true)),
             "the control: a walk did produce this count: {wire}"
         );
-        assert_eq!(wire.get("measured_age_seconds"), Some(&serde_json::json!(4)));
+        assert_eq!(
+            wire.get("measured_age_seconds"),
+            Some(&serde_json::json!(4))
+        );
     }
 
     /// The control that keeps the gate above from firing on every daemon whose
