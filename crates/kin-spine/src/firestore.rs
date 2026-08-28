@@ -4851,19 +4851,6 @@ mod tests {
             &backend,
             metadata_publication("source", 7, "source-r7", Vec::new()),
         );
-        if provider_publishes_edges {
-            publish_success(
-                &backend,
-                edge_publication(
-                    "provider",
-                    1,
-                    "provider-r1",
-                    Vec::new(),
-                    Vec::new(),
-                    [("provider", "provider-r1"), ("source", "source-r7")],
-                ),
-            );
-        }
         publish_success(
             &backend,
             edge_publication(
@@ -4880,6 +4867,26 @@ mod tests {
             &backend,
             metadata_publication("provider", 2, "provider-r2", Vec::new()),
         );
+        if provider_publishes_edges {
+            // AFTER provider@2, not before it. Giving the provider edges at
+            // cursor 1 and then letting the fixture publish provider@2 metadata
+            // leaves it dirty again, so that arm controls for nothing: it varies
+            // the provider's history without changing the state under test. A
+            // control has to give the provider a CURRENT edge publication,
+            // resolved against the roots that hold at the end. The first
+            // attempt got this wrong and the printout caught it.
+            publish_success(
+                &backend,
+                edge_publication(
+                    "provider",
+                    2,
+                    "provider-r2",
+                    Vec::new(),
+                    Vec::new(),
+                    [("provider", "provider-r2"), ("source", "source-r7")],
+                ),
+            );
+        }
         let prepared = backend
             .prepare_repo_publication(edge_publication(
                 "source",
