@@ -291,20 +291,15 @@ impl FakeSpineStore {
     /// in place, so a refusal can only have come from the precondition.
     pub fn bump_stage_revision(&self, publication_id: &str) {
         let mut state = self.publication_state.lock().unwrap();
-        let current = state
-            .stage_marker_values
-            .get(publication_id)
-            .cloned()
-            .expect("bumping a stage marker that was never written");
-        apply_fake_stage_marker(
-            &mut state,
-            publication_id,
-            FakeStageMarkerValue {
-                stage_sequence: current.stage_sequence + 1,
-                revision_kind: current.revision_kind,
-                revision_nonce: format!("{}:bumped", current.revision_nonce),
-            },
-        );
+        // Move the REVISION and nothing else. Going through
+        // `apply_fake_stage_marker` would change the marker value too, and the
+        // precondition compares both, so either half alone would still refuse
+        // and neither could be isolated from the other.
+        let revision = state
+            .stage_revisions
+            .get_mut(publication_id)
+            .expect("bumping a stage revision that was never written");
+        *revision += 1;
     }
 
     pub fn age_stage(&self, publication_id: &str, by: std::time::Duration) {
