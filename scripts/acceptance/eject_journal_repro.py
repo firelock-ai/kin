@@ -21,7 +21,7 @@ every projection open after that refused. The only exit the stranger found was
 `.git/hooks/docs.url`, a 34-byte URL gitoxide's init template writes and Git
 never runs, which `kin eject` itself had put there.
 
-Six checks, each with its own control:
+Seven checks, each with its own control:
 
   archive   a finished eject leaves no journal in the archived `kin/`, while
             the same directory still carries the authority key
@@ -34,9 +34,15 @@ Six checks, each with its own control:
             store commits once the file is gone
   hook      `kin init` re-admits the ejected repository with gitoxide's
             `docs.url` in place, and still refuses an executable `pre-commit`
-  author    a native commit is stamped with the repository's own Git identity,
-            read back out of Git rather than written here, and a repository
-            where no identity resolves refuses instead of inventing one
+  author    a native commit is stamped with the repository's own Git identity
+            at REPOSITORY scope, read back out of Git rather than written here,
+            and a repository where no identity resolves refuses instead of
+            inventing one
+  author_global
+            the same stamp when the only identity that exists is at GLOBAL
+            scope, which is the scope the report that started this came from,
+            with a local read asserted empty so the arm cannot quietly become a
+            second repository-scope test
 
     CHECK <id> <ticket> PASS|FAIL|UNREADABLE <detail>
 
@@ -571,6 +577,10 @@ def check_author(suite):
     Git rather than a constant written here, because a constant this file and the
     fixture both spell would agree with itself while the product stamped anybody.
 
+    This arm pins REPOSITORY scope. The container's identity was global, and
+    `check_author_global` covers that, because closing the class at one scope
+    says nothing about the other.
+
     The second arm is the half that makes the first mean something: with no
     identity resolvable anywhere, the commit must refuse. A product that stamps
     the configured identity when there is one and invents one when there is not
@@ -631,8 +641,104 @@ def check_author(suite):
     return result
 
 
-CHECKS = [check_archive, check_copyback, check_carried, check_refusal, check_hook, check_author]
-DECLARED = ("archive", "copyback", "carried", "refusal", "hook", "author")
+def check_author_global(suite):
+    """A native commit carries an identity that exists only at GLOBAL Git scope.
+
+    Its sibling `author` sets the fixture identity at repository scope, which
+    closes the class one scope away from where the report came from. The rc061a
+    container carried no repository identity at all: its `requests` checkout had
+    no `[user]` section and no `default_author`, and the name the stranger read
+    out of `kin log` was the image's global one. A check that only ever sees a
+    local identity would keep passing if global scope stopped resolving
+    tomorrow, and a global scope that stopped resolving is exactly the shape of
+    the defect that was alleged, because the next thing kin does is refuse.
+
+    So this repository is given no local identity at all, and that is asserted
+    rather than assumed: a local read must come back empty while the merged read
+    returns the global value. Without that control the arm would silently become
+    a second repository-scope test the first time something wrote a local
+    identity into the fixture.
+    """
+    result = Result("author_global", "a native commit carries an identity that resolves only "
+                                     "from global Git scope")
+    repo = os.path.join(suite.workdir, "trees", "author-global")
+    os.makedirs(repo)
+    global_config = os.path.join(suite.workdir, "author-global.gitconfig")
+    with open(global_config, "w") as handle:
+        handle.write("[user]\n\tname = eject-repro-global\n\temail = global@example.invalid\n")
+    env = dict(suite.env)
+    env["GIT_CONFIG_NOSYSTEM"] = "1"
+    env["GIT_CONFIG_GLOBAL"] = global_config
+
+    def git(args):
+        return run(["git", "-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false"] + args,
+                   cwd=repo, env=env)
+
+    rc, out = git(["init", "-q", "--initial-branch=main"])
+    if rc != 0:
+        result.unknown("git init failed: %s" % tail(out))
+        return result
+
+    # The control, before anything is measured: no local identity exists, and
+    # the merged read still resolves, so what follows is global scope or
+    # nothing.
+    rc, local_name = git(["config", "--local", "--get", "user.name"])
+    if local_name.strip():
+        result.unknown("the fixture has a local user.name (%r), so this arm would be measuring "
+                       "repository scope again rather than global" % local_name.strip())
+        return result
+    merged = []
+    for field in ("user.name", "user.email"):
+        rc, value = git(["config", "--get", field])
+        if rc != 0 or not value.strip():
+            result.unknown("global %s does not resolve in the fixture, so there is no global "
+                           "identity for kin to find" % field)
+            return result
+        merged.append(value.strip())
+    want = "%s <%s>" % (merged[0], merged[1])
+
+    with open(os.path.join(repo, "app.py"), "w") as handle:
+        handle.write("def hello():\n    return 'hi'\n")
+    git(["add", "--all"])
+    rc, out = git(["commit", "-q", "-m", "a python module"])
+    if rc != 0:
+        result.unknown("git commit failed under global-only identity: %s" % tail(out))
+        return result
+
+    rc, out = run([suite.kin, "init"], cwd=repo, env=env, timeout=900)
+    if rc != 0:
+        result.unknown("kin init failed: %s" % error_lines(out))
+        return result
+    run([suite.kin, "graph", "status"], cwd=repo, env=env)
+    with open(os.path.join(repo, "note_global.py"), "w") as handle:
+        handle.write("def note_global():\n    return 1\n")
+    rc, out = run([suite.kin, "commit", "-m", "a change authored from global scope"],
+                  cwd=repo, env=env)
+    suite.log("kin commit under global-only identity -> %d" % rc)
+    if not commit_landed(rc, out):
+        result.unknown("the commit under a global-only identity did not land (rc=%d): %s"
+                       % (rc, error_lines(out)))
+        return result
+
+    rc, out = run([suite.kin, "log"], cwd=repo, env=env)
+    if rc != 0:
+        result.unknown("kin log failed (rc=%d): %s" % (rc, error_lines(out)))
+        return result
+    stamped = native_change_author(out)
+    if stamped is None:
+        result.unknown("kin log printed no native change with an Author line: %s" % tail(out))
+        return result
+    if stamped != want:
+        result.bad("the native change is stamped %r, but the only identity resolvable here is the "
+                   "global %r; kin did not read global scope" % (stamped, want))
+    else:
+        result.ok("stamped %r from global scope alone, with no local identity present" % stamped)
+    return result
+
+
+CHECKS = [check_archive, check_copyback, check_carried, check_refusal, check_hook,
+          check_author, check_author_global]
+DECLARED = ("archive", "copyback", "carried", "refusal", "hook", "author", "author_global")
 
 
 # ------------------------------------------------------------------ self-test
