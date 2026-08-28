@@ -17,13 +17,28 @@ setup for every configured language and is a deliberate choice rather than a con
 **Run this first.** It answers pass or fail before you open a single annotation:
 
 ```
-gh api 'repos/firelock-ai/kin/code-scanning/analyses?ref=refs/pull/<n>/head&per_page=100' --paginate \
-  --jq '[.[] | select(.category=="/language:rust")] | max_by(.created_at).results_count'
+gh api 'repos/firelock-ai/kin/code-scanning/alerts?state=open&ref=refs/pull/<n>/head&per_page=100' \
+  --paginate --jq '.[].number' | wc -l
 ```
 
-**CodeQL fails exactly when that number is not zero.** Measured across 19 pull requests on
-2026-08-28: 15 with `results_count` 0 all passed, 3 with a non-zero count all failed, and one with
-no Rust analysis at all was neutral. Eighteen for eighteen wherever an analysis existed.
+**CodeQL fails exactly when that count is not zero.** The number that decides the check is how many
+alerts on your head are still OPEN. Read across nine pull requests on 2026-08-28: #1227 at one open
+alert failed, #1224, #1174, #1158 and the merged #1212 at zero open alerts all passed, and #1203,
+#1202, #1200 and #1199 carried no Rust analysis at all and came back neutral, which is a third state
+and not a red.
+
+An earlier version of this page named `results_count` on the pull request's `/language:rust`
+analysis instead, and it was wrong in a way worth keeping on the page, because the same mistake is
+available to anyone reading here. `results_count` counts the analysis's RESULTS, and a dismissed
+alert still counts. The two numbers are equal only while nothing on the repository has been
+dismissed, and until the 67 dismissals landed on 2026-08-28 that was true of every pull request
+anyone had looked at. `refs/pull/1212/head` carries the whole before and after in four analyses: 42
+at 16:44:24Z, 42 at 18:23:44Z, 42 at 21:11:28Z, then 41 at 21:28:20Z on `c923dba20`. The check was
+red on the first three and SUCCESS on the last, and that ref now reads zero open, 41 dismissed and
+one fixed. So a sample of nineteen pull requests agreed with the old rule 18 times out of 18 and
+could not have caught the difference, because every pull request in it predated the dismissals. A
+sample that never varies the thing separating a proxy from the thing it stands for cannot separate
+them at any size.
 
 ### What the number means
 
@@ -37,8 +52,11 @@ Rust diff:
 | a 3759-line Rust diff | 3759 | 12 | failure |
 | a 9111-line Rust diff | 9111 | 42 | failure |
 | an 18349-line Rust diff | 18349 | 42 | failure |
+| the same 18349-line diff, after the dismissals | 18349 | 41 | success |
 
-Read `main`'s figure rather than quoting this one. Every count from the analyses API is a property
+Every row above the last was read before the dismissals. The last row is the same pull request after
+them, and it is the row that shows `results_count` is a measure of scope rather than of the check's
+verdict. Read `main`'s figure rather than quoting this one. Every count from the analyses API is a property
 of one ref at one instant, and this one drops whenever an alert it carried is fixed or dismissed and
 the analysis re-runs.
 
@@ -108,6 +126,12 @@ lane's. When it is authorized:
 - Control the endpoint as a pair. A fabricated alert number must be refused **and** a real one must
   be found, through the same call. A refusal on its own can come from something unrelated, and one
   that reads as a passing control while proving nothing is worse than no control.
+- That works because an alert number lives in the PATH, which this API validates. A QUERY PARAMETER
+  is not validated, so the same trick there proves nothing: `alerts?state=open` returns 1 and
+  `alerts?state=dismissed` returns 69, while `alerts?state=zzznotastate` returns 72, the whole
+  unfiltered set, and a bogus `severity` does the same. A fabricated filter value is silently
+  dropped and the answer looks like a working query. Control a filter with two real values that must
+  return different counts instead.
 - `dismissed_comment` is capped at **280 characters**. Over that, the API returns HTTP 422 and
   dismisses nothing, which at least fails loudly.
 - Cite the rule's evidence in each reason, not just the policy. A dismissal without evidence is
