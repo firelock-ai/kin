@@ -67,4 +67,4 @@ pub use shallow::{
     extract_shallow, get_shallow_grammar, parse_shallow_file, ShallowDecl, ShallowDeclKind,
     ShallowFile, ShallowFingerprint, ShallowImport,
 };
-pub use todos::{extract_todos, ExtractedTodo};
+pub use todos::{extract_todos, resolve_scan_root, ExtractedTodo};

@@ -58,6 +58,11 @@ EXPECTED_SUITES = (
         "acceptance/response_budget.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/trace_spine_clipping_repro.py",
+        "trace_spine",
+        "acceptance/trace_spine.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/parse_hole_repro.py",
         "parsehole",
         "acceptance/parsehole.json",

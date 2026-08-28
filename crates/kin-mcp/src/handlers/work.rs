@@ -544,11 +544,28 @@ pub fn handle_todo_import<G: GraphStore>(
     args: &HashMap<String, serde_json::Value>,
     store: &G,
 ) -> Result<ToolCallResult> {
-    let path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    // `path` arrives in a tool call, and the schema advertises it to every
+    // connected agent, so it is untrusted input. This handler holds only a
+    // GraphStore, which carries no filesystem root, so the scan boundary is
+    // discovered the way the rest of kin-mcp resolves one: `KinLayout::discover`
+    // from the process working directory, as in daemon_delegate.rs and
+    // repository_authority.rs. That is the same directory this handler already
+    // used as its default scan root, so a well-formed call is unchanged; what
+    // changes is that a caller-supplied path is now bounded by it. Fail closed
+    // when no repository is found rather than walking the working directory.
+    let start = std::env::current_dir()
+        .map_err(|e| McpError::Other(format!("cannot read the working directory: {e}")))?;
+    let layout = kin_core::KinLayout::discover(&start).ok_or_else(|| {
+        McpError::Other(format!(
+            "kin_todo_import needs a Kin repository; none found from {}",
+            start.display()
+        ))
+    })?;
+    let path = kin_parser::resolve_scan_root(
+        layout.working_dir(),
+        args.get("path").and_then(|v| v.as_str()),
+    )
+    .map_err(|e| McpError::Other(format!("todo import scan root refused: {e}")))?;
 
     let todos = kin_parser::extract_todos(&path)
         .map_err(|e| McpError::Other(format!("todo extraction failed: {}", e)))?;
@@ -596,4 +613,101 @@ pub fn handle_todo_import<G: GraphStore>(
     });
     let json = serde_json::to_string_pretty(&result).map_err(McpError::Json)?;
     Ok(ToolCallResult::text(json))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, OnceLock};
+
+    // `handle_todo_import` discovers its scan boundary from the process working
+    // directory, which is global to the test binary, so the tests that move it
+    // share one lock and restore it on drop.
+    static CWD_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct CurrentDirGuard(PathBuf);
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.0);
+        }
+    }
+
+    fn path_args(path: &str) -> HashMap<String, serde_json::Value> {
+        let mut args = HashMap::new();
+        args.insert(
+            "path".to_string(),
+            serde_json::Value::String(path.to_string()),
+        );
+        args
+    }
+
+    fn result_text(result: &ToolCallResult) -> String {
+        result
+            .content
+            .iter()
+            .map(|block| match block {
+                crate::types::ContentBlock::Text { text } => text.clone(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mcp_todo_import_refuses_a_scan_root_outside_the_repository() {
+        let _lock = CWD_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cwd = CurrentDirGuard(std::env::current_dir().unwrap());
+
+        let repo = tempfile::tempdir().unwrap();
+        kin_core::init(repo.path()).unwrap();
+
+        // A tree this tool has no business reading. The marker text is what says
+        // whether the walk reached it.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("secret.rs"),
+            "// TODO: outside the repo\n",
+        )
+        .unwrap();
+
+        std::env::set_current_dir(repo.path()).unwrap();
+        let store = kin_db::InMemoryGraph::new();
+        let refused = handle_todo_import(&path_args(&outside.path().to_string_lossy()), &store);
+        assert!(
+            refused.is_err(),
+            "the MCP route must refuse a scan root outside the repository, got {:?}",
+            refused.map(|ok| result_text(&ok))
+        );
+    }
+
+    #[test]
+    fn mcp_todo_import_accepts_a_scan_root_inside_the_repository() {
+        let _lock = CWD_MUTEX
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _cwd = CurrentDirGuard(std::env::current_dir().unwrap());
+
+        let repo = tempfile::tempdir().unwrap();
+        kin_core::init(repo.path()).unwrap();
+        std::fs::create_dir_all(repo.path().join("src")).unwrap();
+        std::fs::write(
+            repo.path().join("src").join("lib.rs"),
+            "// TODO: inside a subdirectory\n",
+        )
+        .unwrap();
+
+        std::env::set_current_dir(repo.path()).unwrap();
+        let store = kin_db::InMemoryGraph::new();
+        let text = result_text(
+            &handle_todo_import(&path_args("src"), &store)
+                .expect("a subdirectory of the repository is a legitimate scan root"),
+        );
+        assert!(
+            text.contains("\"work_items_created\": 1"),
+            "a legitimate subdirectory scan must still import: {text}"
+        );
+    }
 }

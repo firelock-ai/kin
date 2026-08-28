@@ -445,6 +445,33 @@ pub fn measure(value: &Value) -> usize {
 /// class this codebase keeps paying for, so the rule is written once, generically
 /// over the step type, and both arms call it.
 ///
+/// ## Why the question outranks relevance
+///
+/// Relevance orders the children of a node. It does not know what was asked.
+/// `trace_data_flow` takes a `target`, and before this the target governed the
+/// per-step fan-out cap and nothing else, so a branch could be walked BECAUSE
+/// the caller named it and then given up here as "least relevant", which is the
+/// worst of both: the work was done and the result was thrown away.
+///
+/// Measured on the converted `psf/requests` by the rc061y stranger, focal
+/// `Session.send`, `depth: 3`, `limit_per_step: 25`, `target: "cert_verify"`:
+/// `HTTPAdapter.send` was walked and continued beneath, and the answer came back
+/// holding `RequestsCookieJar.items` and `Response.iter_content` with the named
+/// branch gone. Their words: "the relevance ordering used for elision does not
+/// appear to consult `target` at all, even though the fan-out cap's own
+/// remediation text tells you to set `target` for exactly this purpose."
+///
+/// So `must_keep` names the steps the question asked for, and neither they nor
+/// any step between them and the root is ever offered up. Everything else sheds
+/// first, in the same order as before. When the caller names nothing, or names
+/// something the walk never reached, no step is protected and this behaves
+/// exactly as it did: a rule that could never drop anything would be no rule.
+///
+/// The protection is a preference, not a refusal. If holding the named branch
+/// leaves nothing that fits, the drop order is rebuilt without it and the
+/// narrowing runs again, because a shorter answer that loses the target still
+/// beats falling through to the suffix cut that loses the depth of every branch.
+///
 /// `fits` is called on candidate survivor sets, bisected over the drop order, so
 /// a caller pays a handful of serializations rather than one per branch. It may
 /// mutate whatever it needs to measure and is not required to leave it restored:
@@ -458,17 +485,20 @@ pub fn narrow_fanout_to_fit<T: Clone>(
     steps: &[T],
     id_of: &dyn Fn(&T) -> u64,
     parent_of: &dyn Fn(&T) -> Option<u64>,
+    must_keep: &dyn Fn(&T) -> bool,
     fits: &mut dyn FnMut(&[T]) -> bool,
 ) -> Option<Vec<T>> {
     // Children in the order they were discovered, which is the order relevance
     // put them in. A step that names itself as its own parent is skipped rather
     // than trusted: it would make the descendant walk below cyclic.
     let mut children: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    let mut parent_of_id: BTreeMap<u64, u64> = BTreeMap::new();
     for step in steps {
         if let Some(parent) = parent_of(step) {
             let id = id_of(step);
             if id != parent {
                 children.entry(parent).or_default().push(id);
+                parent_of_id.insert(id, parent);
             }
         }
     }
@@ -503,15 +533,58 @@ pub fn narrow_fanout_to_fit<T: Clone>(
         }
     }
 
-    // The drop order: within a node, shallowest branch first and least relevant
-    // among equals, so the branch it keeps is the one that reaches deepest.
-    // Across nodes, widest first, so the budget is reclaimed where it was spent.
-    // Ties broken by parent id so the order is deterministic.
+    // The steps the question named, and every step between each of them and the
+    // root. Ancestors are protected too because a dropped branch takes its
+    // descendants with it: protecting the target alone and then giving up the
+    // node above it would drop the target anyway, silently, one level up.
+    //
+    // The insert-or-break walk is what makes this cycle-safe. A chain is a tree
+    // by construction, and a malformed one must not hang the bounder.
+    let mut protected: BTreeSet<u64> = BTreeSet::new();
+    for step in steps.iter().filter(|step| must_keep(step)) {
+        let mut at = Some(id_of(step));
+        while let Some(id) = at {
+            if !protected.insert(id) {
+                break;
+            }
+            at = parent_of_id.get(&id).copied();
+        }
+    }
+
+    let mut drop_order = fanout_drop_order(&children, &reach, &protected);
+    let mut chosen = bisect_narrowing(steps, id_of, &children, &drop_order, fits);
+    if chosen.is_none() && !protected.is_empty() {
+        // Holding the named branch left nothing that fits. Give it up rather
+        // than fall through to the suffix cut, which would amputate the far end
+        // of every branch including this one.
+        drop_order = fanout_drop_order(&children, &reach, &BTreeSet::new());
+        chosen = bisect_narrowing(steps, id_of, &children, &drop_order, fits);
+    }
+    chosen
+}
+
+/// Which branches to give up, in the order to give them up.
+///
+/// Within a node, shallowest branch first and least relevant among equals, so
+/// the branch it keeps is the one that reaches deepest. Across nodes, widest
+/// first, so the budget is reclaimed where it was spent. Ties broken by parent
+/// id so the order is deterministic.
+///
+/// A protected child is never offered, and it also satisfies the keep-one-child
+/// floor on its own: a node with a protected child among six may give up the
+/// other five, because the protection is already keeping one. A node with no
+/// protected child keeps its deepest, exactly as before, which is why an
+/// unprotected walk narrows identically to how it did before protection existed
+/// (`giveups.len()` is then `kids.len() - 1` for every node, and subtracting one
+/// from every width leaves the widest-first order unchanged).
+fn fanout_drop_order(
+    children: &BTreeMap<u64, Vec<u64>>,
+    reach: &BTreeMap<u64, usize>,
+    protected: &BTreeSet<u64>,
+) -> Vec<u64> {
     let mut by_width: Vec<(u64, Vec<u64>)> = children
         .iter()
-        .filter(|(_, kids)| kids.len() > 1)
-        .map(|(parent, kids)| {
-            let mut ordered: Vec<u64> = kids.clone();
+        .filter_map(|(parent, kids)| {
             // Sorted into GIVE-UP order: shallowest first, and among equally
             // deep branches the one relevance put last.
             let rank: BTreeMap<u64, usize> = kids
@@ -519,6 +592,7 @@ pub fn narrow_fanout_to_fit<T: Clone>(
                 .enumerate()
                 .map(|(at, kid)| (*kid, at))
                 .collect();
+            let mut ordered: Vec<u64> = kids.clone();
             ordered.sort_by(|left, right| {
                 reach
                     .get(left)
@@ -527,7 +601,16 @@ pub fn narrow_fanout_to_fit<T: Clone>(
                     .cmp(&reach.get(right).copied().unwrap_or(0))
                     .then_with(|| rank[right].cmp(&rank[left]))
             });
-            (*parent, ordered)
+            let mut giveups: Vec<u64> = ordered
+                .into_iter()
+                .filter(|kid| !protected.contains(kid))
+                .collect();
+            if giveups.len() == kids.len() {
+                // Nothing here is protected, so one child still has to survive,
+                // and it is the last in give-up order: the deepest.
+                giveups.pop();
+            }
+            (!giveups.is_empty()).then_some((*parent, giveups))
         })
         .collect();
     by_width.sort_by(|left, right| {
@@ -541,10 +624,9 @@ pub fn narrow_fanout_to_fit<T: Clone>(
     let mut round = 0usize;
     loop {
         let mut moved = false;
-        for (_parent, kids) in &by_width {
-            // Keep one child always; peel from the give-up end inward.
-            if kids.len() > 1 + round {
-                drop_order.push(kids[round]);
+        for (_parent, giveups) in &by_width {
+            if round < giveups.len() {
+                drop_order.push(giveups[round]);
                 moved = true;
             }
         }
@@ -553,10 +635,24 @@ pub fn narrow_fanout_to_fit<T: Clone>(
         }
         round += 1;
     }
+    drop_order
+}
+
+/// The fewest drops off the front of `drop_order` that fit, or `None` when no
+/// prefix of it does.
+///
+/// One drop is the floor: zero drops is the input, and the input is why this was
+/// called.
+fn bisect_narrowing<T: Clone>(
+    steps: &[T],
+    id_of: &dyn Fn(&T) -> u64,
+    children: &BTreeMap<u64, Vec<u64>>,
+    drop_order: &[u64],
+    fits: &mut dyn FnMut(&[T]) -> bool,
+) -> Option<Vec<T>> {
     if drop_order.is_empty() {
         return None;
     }
-
     let retained = |dropped: usize| -> Vec<T> {
         let mut condemned: BTreeSet<u64> = drop_order[..dropped].iter().copied().collect();
         // Breadth-first over the children map rather than one pass over
@@ -577,8 +673,6 @@ pub fn narrow_fanout_to_fit<T: Clone>(
             .collect()
     };
 
-    // Bisected for the FEWEST drops that fit. One drop is the floor: zero drops
-    // is the input, and the input is why this was called.
     let mut low = 1usize;
     let mut high = drop_order.len();
     let mut chosen: Option<Vec<T>> = None;
@@ -1137,19 +1231,17 @@ fn run_ladder(
         // follow. Retaining rows here instead shipped a response over the
         // ceiling and published no elision at all, which is what took
         // `response_budget:3` to UNREADABLE on main.
-        let (withheld, narrowed) = trim_collection(payload, key, target, 1);
+        let (withheld, cut_shape) = trim_collection(payload, key, target, 1);
         if withheld > 0 {
             accounting.bounded = true;
             withheld_any = true;
             // Which cut, not just how much. A list narrowed by branch still
             // reaches as deep as the walk did; one cut from the end does not,
             // and a reader who cannot tell them apart cannot tell whether the
-            // far end of the answer is missing.
-            let how = if narrowed {
-                "as whole branches, least relevant first"
-            } else {
-                "from the end of the list"
-            };
+            // far end of the answer is missing. A cut that held the named target
+            // says so too, because "the branch you asked for is still here" is
+            // the one thing a caller who named a target needs to read.
+            let how = cut_shape.phrase();
             cuts.push(format!(
                 "{withheld} of {found} entries withheld from `{key}`, {how}"
             ));
@@ -1438,13 +1530,21 @@ fn remove_present(map: &mut Map<String, Value>, key: &str) -> bool {
 /// Every entry must carry both keys before this fires. A collection where only
 /// some do is one this rule cannot reason about, and guessing at the rest would
 /// be a cut nobody could predict.
+///
+/// The question the response echoes is what the narrowing protects. A walk that
+/// resolved a `target` reports it as `target_name`, and an entry standing for
+/// that symbol carries the same string in `entity_name` (verified against the
+/// rc061y transcript, where a surviving target read
+/// `"SessionRedirectMixin.resolve_redirects"` in both fields). A payload with no
+/// `target_name`, or one no entry matches, protects nothing and narrows exactly
+/// as it did before.
 fn trim_parented_collection(
     payload: &mut Value,
     key: &str,
     target: usize,
     min_keep: usize,
     full: &[Value],
-) -> Option<usize> {
+) -> Option<(usize, bool)> {
     let parented = full.iter().all(|entry| {
         entry.get("step").and_then(Value::as_u64).is_some()
             && entry.get("parent_step").and_then(Value::as_u64).is_some()
@@ -1452,10 +1552,25 @@ fn trim_parented_collection(
     if !parented {
         return None;
     }
+    // Read before the `fits` closure borrows the payload, and owned because that
+    // closure rewrites the very array these names came from.
+    let named = payload
+        .get("target_name")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let reached = named.as_deref().is_some_and(|name| {
+        full.iter()
+            .any(|entry| entry.get("entity_name").and_then(Value::as_str) == Some(name))
+    });
     let kept = narrow_fanout_to_fit(
         full,
         &|entry: &Value| entry["step"].as_u64().unwrap_or(0),
         &|entry: &Value| entry["parent_step"].as_u64(),
+        &|entry: &Value| {
+            named
+                .as_deref()
+                .is_some_and(|name| entry.get("entity_name").and_then(Value::as_str) == Some(name))
+        },
         &mut |candidate: &[Value]| {
             payload[key] = Value::Array(candidate.to_vec());
             measure(payload) <= target
@@ -1464,6 +1579,13 @@ fn trim_parented_collection(
     if kept.len() < min_keep {
         return None;
     }
+    // Claimed only when the target is still there. Protection is a preference
+    // the second pass gives up, and a sentence saying the named branch was kept
+    // must not outlive the branch it describes.
+    let held = reached
+        && kept
+            .iter()
+            .any(|entry| entry.get("entity_name").and_then(Value::as_str) == named.as_deref());
     let withheld = full.len() - kept.len();
     payload[key] = Value::Array(kept);
     if withheld > 0 {
@@ -1473,7 +1595,38 @@ fn trim_parented_collection(
             .unwrap_or(0) as usize;
         payload[format!("{key}_withheld")] = Value::from(prior.saturating_add(withheld));
     }
-    Some(withheld)
+    Some((withheld, held))
+}
+
+/// Which cut a reader of a bounded collection actually received.
+///
+/// Reported rather than inferred because the three read differently and a reader
+/// who cannot tell them apart cannot tell what is missing: a suffix cut has lost
+/// the far end of every branch, a branch cut has not, and a branch cut that held
+/// the named target has not lost the thing that was asked for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CutShape {
+    Suffix,
+    Branches,
+    BranchesKeepingTarget,
+}
+
+impl CutShape {
+    /// How this cut describes itself inside the disclosure sentence.
+    ///
+    /// No semicolons: these clauses are joined with `"; "` downstream, and a
+    /// clause carrying the separator its own join uses is the composed-string
+    /// defect this codebase has already paid for once.
+    fn phrase(self) -> &'static str {
+        match self {
+            CutShape::Suffix => "from the end of the list",
+            CutShape::Branches => "as whole branches, least relevant first",
+            CutShape::BranchesKeepingTarget => {
+                "as whole branches, least relevant first, keeping the branch that reaches the \
+                 named target"
+            }
+        }
+    }
 }
 
 /// Withhold entries from one collection until the payload fits, returning how
@@ -1505,15 +1658,23 @@ fn trim_collection(
     key: &str,
     target: usize,
     min_keep: usize,
-) -> (usize, bool) {
+) -> (usize, CutShape) {
     let Some(full) = payload.get(key).and_then(Value::as_array).cloned() else {
-        return (0, false);
+        return (0, CutShape::Suffix);
     };
     if full.len() <= min_keep || measure(payload) <= target {
-        return (0, false);
+        return (0, CutShape::Suffix);
     }
-    if let Some(withheld) = trim_parented_collection(payload, key, target, min_keep, &full) {
-        return (withheld, true);
+    if let Some((withheld, held)) = trim_parented_collection(payload, key, target, min_keep, &full)
+    {
+        return (
+            withheld,
+            if held {
+                CutShape::BranchesKeepingTarget
+            } else {
+                CutShape::Branches
+            },
+        );
     }
     let mut kept = min_keep;
     let mut low = min_keep;
@@ -1544,7 +1705,7 @@ fn trim_collection(
             .unwrap_or(0) as usize;
         payload[format!("{key}_withheld")] = Value::from(prior.saturating_add(withheld));
     }
-    (withheld, false)
+    (withheld, CutShape::Suffix)
 }
 
 /// Append the cuts to the `degradations` channel the retrieval tools already
@@ -1645,6 +1806,18 @@ mod tests {
             steps,
             &|step: &(u64, u64)| step.0,
             &|step: &(u64, u64)| Some(step.1),
+            &|_step: &(u64, u64)| false,
+            &mut |kept: &[(u64, u64)]| kept.len() <= budget,
+        )
+    }
+
+    /// The same narrowing with one step named as the question's answer.
+    fn narrowed_keeping(steps: &[(u64, u64)], keep: u64, budget: usize) -> Option<Vec<(u64, u64)>> {
+        narrow_fanout_to_fit(
+            steps,
+            &|step: &(u64, u64)| step.0,
+            &|step: &(u64, u64)| Some(step.1),
+            &|step: &(u64, u64)| step.0 == keep,
             &mut |kept: &[(u64, u64)]| kept.len() <= budget,
         )
     }
@@ -1758,10 +1931,146 @@ mod tests {
                 &steps,
                 &|step: &(u64, u64)| step.0,
                 &|step: &(u64, u64)| Some(step.1),
+                &|_step: &(u64, u64)| false,
                 &mut |_kept: &[(u64, u64)]| false,
             )
             .is_none(),
             "a spine has no branch to give up"
+        );
+    }
+
+    /// A branch the caller named survives the trim
+    /// that gives up "least relevant" branches, and the arm beside it is what
+    /// makes that mean anything: the SAME walk at the SAME budget loses that
+    /// branch when nothing names it.
+    ///
+    /// Two branches off the focal, the second reaching deeper, so relevance
+    /// order and depth order disagree and the give-up rule has a real choice to
+    /// make.
+    #[test]
+    fn a_named_branch_survives_a_trim_that_drops_it_unnamed() {
+        // Focal 0 with three children; the FIRST is a leaf, so the give-up rule
+        // sheds it first, and the target hangs under it.
+        let steps: Vec<(u64, u64)> = vec![
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 1), // the target, under the shallowest child
+            (5, 2),
+            (6, 5),
+            (7, 3),
+            (8, 7),
+        ];
+
+        // The premise, asserted rather than assumed: unnamed, this budget loses
+        // the step. A fixture that never lost it would make the named half pass
+        // against a tool that does nothing.
+        let unnamed = narrowed(&steps, 5).expect("the unnamed walk narrows");
+        let unnamed_ids: Vec<u64> = unnamed.iter().map(|step| step.0).collect();
+        assert!(
+            !unnamed_ids.contains(&4),
+            "the fixture no longer drops step 4 unnamed, so naming it proves nothing: \
+             {unnamed_ids:?}"
+        );
+
+        let named = narrowed_keeping(&steps, 4, 5).expect("the named walk narrows");
+        let named_ids: Vec<u64> = named.iter().map(|step| step.0).collect();
+        assert!(
+            named_ids.contains(&4),
+            "the named step was given up as least relevant: {named_ids:?}"
+        );
+        assert!(
+            named_ids.contains(&1),
+            "the named step survived without the step that introduced it, so its \
+             parent_step names a step the caller no longer has: {named_ids:?}"
+        );
+        assert!(
+            named.len() < steps.len(),
+            "protecting one branch stopped the trim from cutting anything at all, \
+             which is an elision that can never fire: {named_ids:?}"
+        );
+    }
+
+    /// Protection is a preference, not a refusal. A budget too small to hold the
+    /// named branch still gets an answer rather than falling through to the
+    /// suffix cut, which loses the far end of every branch including that one.
+    #[test]
+    fn a_budget_too_small_for_the_named_branch_still_narrows() {
+        let steps: Vec<(u64, u64)> = vec![(1, 0), (2, 0), (3, 0), (4, 1), (5, 2), (6, 5)];
+        let named = narrowed_keeping(&steps, 4, 2)
+            .expect("a budget that cannot hold the named branch must still narrow, not refuse");
+        assert!(
+            named.len() <= 2,
+            "protecting the named branch still left an answer inside the budget: {named:?}"
+        );
+    }
+
+    /// The give-up fallback, on the only shape that reaches it.
+    ///
+    /// The test above cannot reach it, and its old message claimed otherwise.
+    /// Protecting a target protects its ancestry, and when what fits is counted
+    /// in STEPS that ancestry is never larger than the deepest spine the
+    /// keep-one-child floor would hold anyway, so the first pass always has an
+    /// answer and the second pass is unreachable. Deleting the fallback leaves
+    /// every count-based test green.
+    ///
+    /// A real budget is not a count. It is serialized size, and a shallow
+    /// branch of fat steps can cost more than a deeper branch of thin ones. So
+    /// depth decides which branch the floor holds and cost decides what fits,
+    /// and here the two disagree on purpose: the named target sits in the
+    /// shallow expensive branch, and holding it cannot fit at any price the
+    /// first pass can pay.
+    #[test]
+    fn a_protected_branch_too_expensive_to_hold_is_given_up_rather_than_refused() {
+        // Two branches under the focal: `1 -> 2` is shallow and expensive and
+        // holds the target, `5 -> 6 -> 7` is deeper and cheap.
+        let steps: Vec<(u64, u64)> = vec![(1, 0), (2, 1), (5, 0), (6, 5), (7, 6)];
+        const TARGET: u64 = 2;
+        const BUDGET: usize = 5;
+        let weight = |id: u64| -> usize {
+            if id == 1 || id == TARGET {
+                10
+            } else {
+                1
+            }
+        };
+        let cost = |kept: &[(u64, u64)]| -> usize { kept.iter().map(|step| weight(step.0)).sum() };
+
+        // The premise, asserted rather than assumed: the protected branch alone
+        // is already over budget, so the first pass has nothing it can return.
+        // Without this the test would pass on a fixture that never reached the
+        // second pass at all, which is exactly how the sibling above read as
+        // covered.
+        assert!(
+            weight(1) + weight(TARGET) > BUDGET,
+            "the protected branch must not fit, or the first pass answers and this grades nothing"
+        );
+
+        let narrowed = narrow_fanout_to_fit(
+            &steps,
+            &|step: &(u64, u64)| step.0,
+            &|step: &(u64, u64)| Some(step.1),
+            &|step: &(u64, u64)| step.0 == TARGET,
+            &mut |kept: &[(u64, u64)]| cost(kept) <= BUDGET,
+        );
+
+        // Read as an assertion rather than an expect, so deleting the fallback
+        // fails HERE by name instead of panicking somewhere downstream.
+        assert!(
+            narrowed.is_some(),
+            "protection is a preference, not a refusal: a budget too small to hold the named \
+             branch must still come back with a narrowed answer"
+        );
+        let kept = narrowed.expect("asserted present above");
+        let ids: Vec<u64> = kept.iter().map(|step| step.0).collect();
+        assert!(
+            cost(&kept) <= BUDGET,
+            "the answer must fit the budget it was given: {ids:?} costs {}",
+            cost(&kept)
+        );
+        assert!(
+            !ids.contains(&TARGET),
+            "the second pass gives the protection up, so the target cannot still be here: {ids:?}"
         );
     }
 
@@ -1796,9 +2105,13 @@ mod tests {
         let mut payload = json!({"chain": entries});
         let target = measure(&payload) / 2;
 
-        let (withheld, narrowed) = trim_collection(&mut payload, "chain", target, 1);
+        let (withheld, shape) = trim_collection(&mut payload, "chain", target, 1);
 
-        assert!(narrowed, "a parented collection must be narrowed, not cut");
+        assert_eq!(
+            shape,
+            CutShape::Branches,
+            "a parented collection must be narrowed, not cut"
+        );
         assert!(withheld > 0, "the fixture must reach the cut");
         let kept: Vec<u64> = payload["chain"]
             .as_array()
@@ -1825,11 +2138,12 @@ mod tests {
         let mut payload = json!({"entities": entries});
         let target = measure(&payload) / 2;
 
-        let (withheld, narrowed) = trim_collection(&mut payload, "entities", target, 1);
+        let (withheld, shape) = trim_collection(&mut payload, "entities", target, 1);
 
         assert!(withheld > 0, "the fixture must reach the cut");
-        assert!(
-            !narrowed,
+        assert_eq!(
+            shape,
+            CutShape::Suffix,
             "a collection with no parents cannot be narrowed by branch"
         );
         let kept = payload["entities"].as_array().expect("entities survive");
@@ -1947,6 +2261,161 @@ mod tests {
         assert!(cuts
             .iter()
             .all(|cut| cut["component"] == json!("response_budget")));
+    }
+
+    /// One `trace_data_flow` chain, wide and shallow, with `target_name` echoing
+    /// a step the walk reached. Named after the shape the rc061y stranger hit.
+    fn targeted_chain_payload(width: usize, target_step: usize) -> Value {
+        let chain: Vec<Value> = (1..=width)
+            .map(|step| {
+                json!({
+                    "step": step,
+                    "parent_step": 0,
+                    "depth": 1,
+                    "entity_id": format!("id-{step}"),
+                    "entity_name": format!("Neighbour.call_{step}"),
+                    "relation_kind": "Calls",
+                    "resolution": "type_resolved",
+                    "file_path": format!("src/module_{step}.py"),
+                    "signature": "def call(self, request, stream=False, timeout=None): ...",
+                    "fanout_truncated": false,
+                    "fanout_dropped": 0,
+                    "terminal": null,
+                })
+            })
+            .collect();
+        json!({
+            "focal_name": "Session.send",
+            "target_name": format!("Neighbour.call_{target_step}"),
+            "total_steps": width,
+            "chain": chain,
+        })
+    }
+
+    /// At the surface a caller reads, the sentence is COMPOSED from
+    /// clauses and joined, so it is probed rather than reasoned about: reading
+    /// the code says what each clause holds, and only printing the join says
+    /// what a caller receives.
+    #[test]
+    fn a_bounded_trace_says_it_kept_the_branch_the_caller_named() {
+        const BUDGET: usize = 4_000;
+        // The target sits LAST, which is where relevance order puts the branch
+        // it is most willing to give up.
+        let mut payload = targeted_chain_payload(40, 40);
+        assert!(
+            measure(&payload) > BUDGET,
+            "the fixture must overflow or nothing is trimmed"
+        );
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+
+        let kept: Vec<String> = payload["chain"]
+            .as_array()
+            .expect("chain survives")
+            .iter()
+            .filter_map(|entry| entry["entity_name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            kept.contains(&"Neighbour.call_40".to_string()),
+            "the trim gave up the branch the caller named: {kept:?}"
+        );
+        assert!(
+            kept.len() < 40,
+            "nothing was trimmed, so this grades an elision that never fired: {kept:?}"
+        );
+
+        let detail = payload["degradations"]
+            .as_array()
+            .expect("a cut is disclosed")
+            .iter()
+            .filter(|cut| cut["reason"] == json!(BOUNDED_REASON))
+            .filter_map(|cut| cut["detail"].as_str())
+            .next()
+            .expect("the bounded cut carries a detail")
+            .to_string();
+        // Printed, not merely asserted: the composed sentence is the artifact.
+        println!("composed disclosure: {detail}");
+        assert!(
+            detail.contains("keeping the branch that reaches the named target"),
+            "the disclosure does not say the named branch was held: {detail}"
+        );
+        assert!(
+            !CutShape::BranchesKeepingTarget.phrase().contains("; "),
+            "a clause carrying the separator its own join uses splits itself apart"
+        );
+    }
+
+    /// The control, and the half that makes the test above mean anything. The
+    /// same chain at the same budget, with no target named, still gives up its
+    /// last branch and says so in the words it always did. An elision that can
+    /// never drop anything is a check that cannot fail.
+    #[test]
+    fn an_unnamed_trace_still_elides_least_relevant_first() {
+        const BUDGET: usize = 4_000;
+        let mut payload = targeted_chain_payload(40, 40);
+        payload
+            .as_object_mut()
+            .expect("payload is an object")
+            .remove("target_name");
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+
+        let kept: Vec<String> = payload["chain"]
+            .as_array()
+            .expect("chain survives")
+            .iter()
+            .filter_map(|entry| entry["entity_name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !kept.contains(&"Neighbour.call_40".to_string()),
+            "the unnamed walk kept the last branch anyway, so the named half above \
+             proves nothing: {kept:?}"
+        );
+        let detail = payload["degradations"]
+            .as_array()
+            .expect("a cut is disclosed")
+            .iter()
+            .filter(|cut| cut["reason"] == json!(BOUNDED_REASON))
+            .filter_map(|cut| cut["detail"].as_str())
+            .next()
+            .expect("the bounded cut carries a detail")
+            .to_string();
+        assert!(
+            !detail.contains("keeping the branch that reaches the named target"),
+            "a walk that named no target claims to have held one: {detail}"
+        );
+    }
+
+    /// A target the walk never reached protects nothing, which is the case that
+    /// separates "the question steered the trim" from "the trim stopped
+    /// trimming". Named but absent, the chain sheds exactly as the unnamed one
+    /// does.
+    #[test]
+    fn a_target_the_walk_never_reached_protects_nothing() {
+        const BUDGET: usize = 4_000;
+        let mut payload = targeted_chain_payload(40, 40);
+        payload["target_name"] = json!("HTTPAdapter.never_walked");
+        let budget = ResponseBudget {
+            max_chars: BUDGET,
+            ..ResponseBudget::default()
+        };
+        enforce(&mut payload, "trace_data_flow", &budget).expect("trace_data_flow is budgeted");
+        let kept: Vec<String> = payload["chain"]
+            .as_array()
+            .expect("chain survives")
+            .iter()
+            .filter_map(|entry| entry["entity_name"].as_str().map(str::to_string))
+            .collect();
+        assert!(
+            !kept.contains(&"Neighbour.call_40".to_string()),
+            "an unreached target changed what the trim kept: {kept:?}"
+        );
     }
 
     /// At the floor of the clamp the disclosure is a large fraction of the whole
