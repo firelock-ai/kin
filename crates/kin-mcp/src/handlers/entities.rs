@@ -3403,9 +3403,12 @@ you are trying to reach and every neighbor from which it is still reachable sort
 every neighbor that is not, BEFORE the cap cuts. Without a target, read \
 `spine_clipped_steps`: when it is above zero the walk continued beneath a node whose \
 fan-out was already cut, so this chain is one route among several and a hop it does not \
-contain was never looked for. Do not read such a chain as evidence that X never reaches Y. Every step reports the same keys: a \
-symbol the graph owns no file for carries explicit nulls plus `external: true` rather than a \
-shorter record, and one symbol never appears both located and file-less in one response. \
+contain was never looked for. Do not read such a chain as evidence that X never reaches Y. Every step reports the same keys, \
+including `reference_lines` for the 1-based syntax sites that introduced the hop and \
+`reference_lines_absent_reason` when the parser recorded no usable site. For a `callee` step \
+those lines live in its parent's file; for a `caller` step they live in the step's own \
+`entity_file`. A symbol the graph owns no file for carries explicit nulls plus `external: true` \
+rather than a shorter record, and one symbol never appears both located and file-less in one response. \
 When the chain comes back empty, the additive `negative` object's `safe_to_conclude_absent` \
 flag says whether \"no flow from here\" is authoritative or merely \"not indexed yet\", and its \
 `subject` scopes the absence to the direction that was walked, so an empty 'callers' result is \
@@ -3453,6 +3456,9 @@ struct TraceFrontierNode {
     id: kin_model::ids::EntityId,
     depth: usize,
     file: Option<String>,
+    /// The same file in graph identity form, for checking relation evidence
+    /// against the referencing entity without rebuilding it from display text.
+    file_origin: Option<kin_model::ids::FilePathId>,
     dir: Option<String>,
 }
 
@@ -3463,6 +3469,7 @@ impl TraceFrontierNode {
             id: entity.id,
             depth,
             file: entity.file_origin.as_ref().map(|path| path.0.clone()),
+            file_origin: entity.file_origin.clone(),
             dir: kin_ranking::entity_ranking::entity_directory(entity),
         }
     }
@@ -3497,6 +3504,12 @@ struct TraceFanoutCandidate {
     /// requested depth. False for every candidate when no target was named, so
     /// an untargeted walk orders exactly as it did before this existed.
     reaches_target: bool,
+    /// Call/reference sites accumulated across every edge that reaches this
+    /// step, independent of which edge supplies the displayed relation kind.
+    reference_lines: Vec<u32>,
+    /// Evidence spans naming a file other than the caller's. This distinguishes
+    /// unusable evidence from an edge whose parser recorded no span at all.
+    reference_spans_outside_caller_file: usize,
 }
 
 impl TraceFanoutCandidate {
@@ -3508,6 +3521,21 @@ impl TraceFanoutCandidate {
     /// repository with a language server installed.
     fn is_raise_target(&self) -> bool {
         self.call_edges > 0 && self.raise_call_edges == self.call_edges
+    }
+
+    fn normalize_reference_lines(&mut self) {
+        self.reference_lines.sort_unstable();
+        self.reference_lines.dedup();
+    }
+
+    fn reference_lines_absent_reason(&self) -> Option<&'static str> {
+        if !self.reference_lines.is_empty() {
+            None
+        } else if self.reference_spans_outside_caller_file > 0 {
+            Some(ReferenceLinesAbsent::SpanOutsideCallerFile.as_str())
+        } else {
+            Some(ReferenceLinesAbsent::NoEvidenceSpan.as_str())
+        }
     }
 }
 
@@ -3691,6 +3719,8 @@ fn trace_step_value(
     resolution: &str,
     parent_step: usize,
     depth: usize,
+    reference_lines: Vec<u32>,
+    reference_lines_absent_reason: Option<&str>,
     entity: &kin_model::entity::Entity,
     terminal: Option<TraceTerminal>,
     crossing: Option<&kin_index::TraceCrossing>,
@@ -3705,6 +3735,13 @@ fn trace_step_value(
         "resolution": resolution,
         "parent_step": parent_step,
         "depth": depth,
+        // The edge's 1-based source sites, not the entity definition line. A
+        // callee's sites live in its parent file; a caller's sites live in its
+        // own entity_file. The role plus parent_step identifies which.
+        "reference_lines": reference_lines,
+        // Explicit null when lines exist, and the same two reason strings
+        // `find_references` uses when they do not.
+        "reference_lines_absent_reason": reference_lines_absent_reason,
         "fanout_truncated": false,
         "fanout_dropped": 0,
         // Why the walk stopped here, or null for an ordinary step. Written on
@@ -3827,10 +3864,24 @@ fn narrow_trace_fanout_to_fit(
 ) -> usize {
     let step_of = |value: &serde_json::Value| value["step"].as_u64().unwrap_or(0);
     let parent_of = |value: &serde_json::Value| value["parent_step"].as_u64();
+    // The question this walk was given, so the branch that answers it is not
+    // offered up as "least relevant". Read off the result rather than passed in
+    // because this is the same string the response echoes to the caller, and a
+    // rule keyed on a second copy is a rule that can drift from the answer.
+    let named = result
+        .get("target_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let must_keep = |value: &serde_json::Value| {
+        named.as_deref().is_some_and(|name| {
+            value.get("entity_name").and_then(serde_json::Value::as_str) == Some(name)
+        })
+    };
     let narrowed = crate::budget::narrow_fanout_to_fit(
         discovered,
         &step_of,
         &parent_of,
+        &must_keep,
         &mut |kept: &[serde_json::Value]| {
             result["chain"] = serde_json::Value::Array(kept.to_vec());
             result["total_steps"] = serde_json::Value::from(kept.len());
@@ -4198,7 +4249,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     continue;
                 }
 
-                match candidate_index.get(&(next_id, role)) {
+                let candidate_at = match candidate_index.get(&(next_id, role)) {
                     Some(&existing) => {
                         let candidate: &mut TraceFanoutCandidate = &mut candidates[existing];
                         let stronger = trace_relation_rank(rel.kind)
@@ -4228,6 +4279,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                                 candidate.crossing = Some(named);
                             }
                         }
+                        existing
                     }
                     None => {
                         let Some(entity) = store.get_entity(&next_id).map_err(McpError::graph)?
@@ -4250,8 +4302,37 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                             confidence: rel.confidence,
                             resolution: RelationResolution::of(rel),
                             crossing,
+                            reference_lines: Vec::new(),
+                            reference_spans_outside_caller_file: 0,
                         });
+                        candidates.len() - 1
                     }
+                };
+
+                // The source site belongs to the referencing entity. An
+                // outgoing step's caller is the parent node; an incoming
+                // step's caller is the candidate itself. Keep every edge's
+                // site even when another edge ranks stronger for display.
+                //
+                // Every REFERENCE edge, that is. `allowed` also carries
+                // `UsesType` so an annotation target is a named leaf, and the
+                // graph holds one beside the `Calls` edge for the same pair.
+                // Its span is the annotation's target, which is the callee's
+                // own definition rather than a site where the caller calls it,
+                // so accumulating it published `[def_line, call_line]` on every
+                // row with nothing to tell them apart. `reference_kinds` is
+                // what the reference surface reads, so gating on it keeps the
+                // two answers the same.
+                if reference_kinds.contains(&rel.kind) {
+                    let caller_file = if role == "callee" {
+                        node.file_origin.as_ref()
+                    } else {
+                        candidates[candidate_at].entity.file_origin.as_ref()
+                    };
+                    let tally = relation_reference_lines(rel, caller_file);
+                    candidates[candidate_at].reference_lines.extend(tally.lines);
+                    candidates[candidate_at].reference_spans_outside_caller_file +=
+                        tally.outside_caller_file;
                 }
             }
 
@@ -4309,7 +4390,7 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                 clipped_steps.push(clip);
             }
 
-            for candidate in callees.into_iter().chain(callers) {
+            for mut candidate in callees.into_iter().chain(callers) {
                 if chain.len() >= MAX_TOTAL_STEPS {
                     truncated = true;
                     break;
@@ -4348,6 +4429,16 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                                 .unwrap_or_else(|| RelationResolution::NameOnly.as_str()),
                             chain[existing - 1]["parent_step"].as_u64().unwrap_or(0) as usize,
                             promoted_depth,
+                            chain[existing - 1]["reference_lines"]
+                                .as_array()
+                                .cloned()
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter_map(|line| {
+                                    line.as_u64().and_then(|line| u32::try_from(line).ok())
+                                })
+                                .collect(),
+                            chain[existing - 1]["reference_lines_absent_reason"].as_str(),
                             &candidate.entity,
                             promoted_terminal,
                             candidate.crossing.as_ref(),
@@ -4384,6 +4475,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     candidate.relation_kind,
                     include_type_edges,
                 );
+                candidate.normalize_reference_lines();
+                let reference_lines_absent_reason = candidate.reference_lines_absent_reason();
                 chain.push(trace_step_value(
                     step_index,
                     candidate.role,
@@ -4391,6 +4484,8 @@ pub fn handle_trace_data_flow<G: GraphStore>(
                     candidate.resolution.as_str(),
                     node.step,
                     next_depth,
+                    candidate.reference_lines,
+                    reference_lines_absent_reason,
                     &candidate.entity,
                     terminal,
                     candidate.crossing.as_ref(),
@@ -6209,6 +6304,29 @@ mod tests {
             import_source: None,
             evidence: Vec::new(),
         }
+    }
+
+    fn make_relation_with_site(
+        src: EntityId,
+        dst: EntityId,
+        kind: RelationKind,
+        file: &str,
+        row: u32,
+    ) -> Relation {
+        let mut relation = make_relation(src, dst, kind);
+        relation.evidence = vec![RelationEvidence {
+            source_span: Some(kin_model::entity::SourceSpan {
+                file: FilePathId::new(file),
+                start_byte: 0,
+                end_byte: 1,
+                start_line: row,
+                start_col: 0,
+                end_line: row,
+                end_col: 1,
+            }),
+            ..RelationEvidence::default()
+        }];
+        relation
     }
 
     fn graph_root(graph: &InMemoryGraph) -> String {
@@ -9610,6 +9728,219 @@ mod tests {
         assert_eq!(targeted["target_name"], "HTTPAdapter.send");
     }
 
+    /// An annotation edge's span is not a call site.
+    ///
+    /// The graph holds a `UsesType` edge beside the `Calls` edge for the same
+    /// pair, and its span is the annotation's target, which is the callee's own
+    /// definition rather than anywhere the caller calls it. `allowed` admits
+    /// `UsesType` so an annotation target is a named leaf, and the reference
+    /// surface deliberately does not read it, so publishing its span here made
+    /// this tool disagree with `kin refs` about the same pair and gave every row
+    /// a definition line beside its call line with nothing to tell them apart.
+    ///
+    /// Both spans are in the CALLER's file on purpose. The caller-file filter
+    /// can never separate them, so passing this can only mean the edge class
+    /// was consulted.
+    #[test]
+    fn trace_data_flow_offline_leaves_annotation_spans_out_of_call_sites() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("focal", "src/focal.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        for entity in [&focal, &callee] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::Calls,
+                "src/focal.rs",
+                11,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::UsesType,
+                "src/focal.rs",
+                4,
+            ))
+            .unwrap();
+
+        let response = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal.id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+            ],
+        );
+        let steps = response["chain"].as_array().unwrap();
+        let row = steps
+            .iter()
+            .find(|step| step["entity_name"] == "callee")
+            .unwrap_or_else(|| {
+                panic!("the annotation edge must still reach the leaf: {response:#}")
+            });
+
+        // The premise: the leaf is here at all, which is what `UsesType` being
+        // in `allowed` buys and what this fix must not take away.
+        assert_eq!(
+            row["reference_lines"],
+            serde_json::json!([12]),
+            "only the call site belongs here, not the annotation's target: {row}"
+        );
+        assert!(row["reference_lines_absent_reason"].is_null());
+    }
+
+    /// The call-site contract on the generic GraphStore arm. The line
+    /// belongs to the referencing entity, which is the parent for a callee and
+    /// the child for a caller. Duplicate edges contribute every site, and an
+    /// empty list states whether evidence was missing or unusable.
+    #[test]
+    fn trace_data_flow_offline_carries_call_sites_for_every_chain_step() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("focal", "src/focal.rs");
+        let callee = make_entity("callee", "src/callee.rs");
+        let caller = make_entity("caller", "src/caller.rs");
+        let missing = make_entity("missing_site", "src/missing.rs");
+        let outside = make_entity("outside_site", "src/outside.rs");
+        // An incoming edge whose span names a THIRD file, which is what makes the
+        // caller arm's filter falsifiable. Every other incoming span already
+        // sits in the caller's own file, so passing `None` for the filter and
+        // passing the caller's file admit the same set, and the mutation that
+        // disables the filter outright produces identical output. Only a span
+        // the filter must reject separates "admitted because it matched" from
+        // "admitted because nothing filtered".
+        let caller_outside = make_entity("caller_outside_site", "src/caller-outside.rs");
+        for entity in [
+            &focal,
+            &callee,
+            &caller,
+            &missing,
+            &outside,
+            &caller_outside,
+        ] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::Calls,
+                "src/focal.rs",
+                11,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::References,
+                "src/focal.rs",
+                41,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                callee.id,
+                RelationKind::Imports,
+                "src/focal.rs",
+                41,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                caller.id,
+                focal.id,
+                RelationKind::Calls,
+                "src/caller.rs",
+                7,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(focal.id, missing.id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                outside.id,
+                RelationKind::Calls,
+                "src/not-the-caller.rs",
+                19,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                caller_outside.id,
+                focal.id,
+                RelationKind::Calls,
+                "src/third-party.rs",
+                19,
+            ))
+            .unwrap();
+
+        let response = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal.id.to_string())),
+                ("direction", serde_json::json!("both")),
+                ("depth", serde_json::json!(1)),
+                ("limit_per_step", serde_json::json!(25)),
+            ],
+        );
+        let steps = response["chain"].as_array().unwrap();
+        let step = |name: &str| {
+            steps
+                .iter()
+                .find(|step| step["entity_name"] == name)
+                .unwrap_or_else(|| panic!("missing {name}: {response:#}"))
+        };
+        assert_eq!(
+            step("callee")["reference_lines"],
+            serde_json::json!([12, 42])
+        );
+        assert!(step("callee")["reference_lines_absent_reason"].is_null());
+        assert_eq!(step("caller")["reference_lines"], serde_json::json!([8]));
+        assert!(step("caller")["reference_lines_absent_reason"].is_null());
+        assert_eq!(
+            step("missing_site")["reference_lines"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            step("missing_site")["reference_lines_absent_reason"],
+            "no_evidence_span"
+        );
+        assert_eq!(
+            step("outside_site")["reference_lines"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            step("outside_site")["reference_lines_absent_reason"],
+            "span_outside_caller_file"
+        );
+        // The caller arm filters against the CHILD's own file, not the focal's.
+        // This span names neither, so a row that carries lines here means the
+        // filter is not running rather than that it chose the wrong file.
+        assert_eq!(
+            step("caller_outside_site")["reference_lines"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            step("caller_outside_site")["reference_lines_absent_reason"],
+            "span_outside_caller_file"
+        );
+
+        let expected: Vec<String> = steps[0].as_object().unwrap().keys().cloned().collect();
+        for item in steps {
+            let keys: Vec<String> = item.as_object().unwrap().keys().cloned().collect();
+            assert_eq!(keys, expected, "every step carries one key set: {item}");
+        }
+    }
+
     /// Both arms of one tool have to answer the same way, so the offline arm
     /// gets the same fixture at the same reported parameters.
     #[test]
@@ -9939,6 +10270,71 @@ mod tests {
         }
     }
 
+    /// A located record can arrive one depth after its file-less placeholder.
+    /// Promotion replaces identity and location, but the edge into the existing
+    /// step does not change, so its call-site evidence must not be reset to the
+    /// later edge's site.
+    #[test]
+    fn trace_data_flow_offline_promotion_preserves_the_original_edge_site() {
+        let store = InMemoryGraph::new();
+        let focal = make_entity("focal", "src/focal.rs");
+        let bridge = make_entity("bridge", "src/bridge.rs");
+        let admitted = make_entity("shared", "src/shared.rs");
+        let mut placeholder = make_entity("shared", "unused");
+        placeholder.kind = EntityKind::Module;
+        placeholder.file_origin = None;
+        placeholder.span = None;
+        for entity in [&focal, &bridge, &admitted, &placeholder] {
+            store.upsert_entity(entity).unwrap();
+        }
+        store
+            .upsert_relation(&make_relation_with_site(
+                focal.id,
+                placeholder.id,
+                RelationKind::Calls,
+                "src/focal.rs",
+                4,
+            ))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation(focal.id, bridge.id, RelationKind::Calls))
+            .unwrap();
+        store
+            .upsert_relation(&make_relation_with_site(
+                bridge.id,
+                admitted.id,
+                RelationKind::Calls,
+                "src/bridge.rs",
+                9,
+            ))
+            .unwrap();
+
+        let response = traced_payload(
+            &store,
+            &[
+                ("focal", serde_json::json!(focal.id.to_string())),
+                ("direction", serde_json::json!("calls")),
+                ("depth", serde_json::json!(2)),
+                ("limit_per_step", serde_json::json!(25)),
+            ],
+        );
+        let shared = response["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["entity_name"] == "shared")
+            .unwrap_or_else(|| panic!("missing promoted step: {response:#}"));
+        assert_eq!(shared["entity_id"], admitted.id.to_string());
+        assert_eq!(shared["entity_file"], "src/shared.rs");
+        assert_eq!(shared["reference_lines"], serde_json::json!([5]));
+        assert!(shared["reference_lines_absent_reason"].is_null());
+        assert_ne!(
+            shared["reference_lines"],
+            serde_json::json!([10]),
+            "the promoting edge's line does not replace the edge already in the chain"
+        );
+    }
+
     /// This arm inlines no bodies, so what it can shed is steps — and it must,
     /// because 200 steps of identity and signature is a six-figure character
     /// count on its own.
@@ -10010,6 +10406,95 @@ mod tests {
             .find(|entry| entry["component"] == serde_json::json!("response_budget"))
             .expect("the cut must name itself");
         assert_eq!(disclosure["reason"], serde_json::json!("steps_omitted"));
+    }
+
+    /// At the GraphStore arm's first response-boundary stage, the
+    /// target branch is shallower than the distractor, so ordinary deep-branch
+    /// preservation gives it up. Reading `target_name` is the only thing that
+    /// can make the named and unnamed arms choose differently.
+    #[test]
+    fn trace_data_flow_offline_response_narrowing_keeps_the_named_branch() {
+        let discovered = vec![
+            serde_json::json!({
+                "step": 1, "parent_step": 0, "entity_name": "target_parent", "pad": "p".repeat(300),
+            }),
+            serde_json::json!({
+                "step": 2, "parent_step": 0, "entity_name": "distractor", "pad": "p".repeat(300),
+            }),
+            serde_json::json!({
+                "step": 3, "parent_step": 1, "entity_name": "cert_verify", "pad": "p".repeat(300),
+            }),
+            serde_json::json!({
+                "step": 4, "parent_step": 2, "entity_name": "deeper", "pad": "p".repeat(300),
+            }),
+            serde_json::json!({
+                "step": 5, "parent_step": 4, "entity_name": "deepest", "pad": "p".repeat(300),
+            }),
+        ];
+        let payload = |target_name: Option<&str>, chain: Vec<serde_json::Value>| {
+            let mut value = serde_json::json!({
+                "chain": chain,
+                "total_steps": 5,
+            });
+            if let Some(name) = target_name {
+                value["target_name"] = serde_json::json!(name);
+            }
+            value
+        };
+        let measure =
+            |value: &serde_json::Value| serde_json::to_string_pretty(value).unwrap().len();
+        let protected_shape = payload(
+            Some("cert_verify"),
+            vec![discovered[0].clone(), discovered[2].clone()],
+        );
+        let deep_shape = payload(
+            None,
+            vec![
+                discovered[1].clone(),
+                discovered[3].clone(),
+                discovered[4].clone(),
+            ],
+        );
+        let target_chars = measure(&protected_shape).max(measure(&deep_shape));
+        let full = payload(Some("cert_verify"), discovered.clone());
+        assert!(measure(&full) > target_chars, "the fixture must need a cut");
+
+        let mut unnamed = payload(None, discovered.clone());
+        let unnamed_dropped =
+            narrow_trace_fanout_to_fit(&mut unnamed, &discovered, target_chars, measure);
+        assert!(unnamed_dropped > 0, "the unnamed control must narrow");
+        assert!(
+            !traced_step_names(&unnamed)
+                .iter()
+                .any(|name| name == "cert_verify"),
+            "the unnamed control kept the shallow target branch: {unnamed}"
+        );
+
+        let mut named = payload(Some("cert_verify"), discovered.clone());
+        let named_dropped =
+            narrow_trace_fanout_to_fit(&mut named, &discovered, target_chars, measure);
+        assert!(named_dropped > 0, "the named arm must still narrow");
+        let named_steps = named["chain"].as_array().unwrap();
+        let names: std::collections::BTreeSet<&str> = named_steps
+            .iter()
+            .filter_map(|step| step["entity_name"].as_str())
+            .collect();
+        assert!(
+            names.contains("cert_verify"),
+            "the first response bounder dropped the named branch: {named}"
+        );
+        assert!(
+            names.contains("target_parent"),
+            "the target survived without the parent that introduced it: {named}"
+        );
+        let present: std::collections::BTreeSet<u64> = named_steps
+            .iter()
+            .filter_map(|step| step["step"].as_u64())
+            .collect();
+        assert!(named_steps.iter().all(|step| {
+            let parent = step["parent_step"].as_u64().unwrap_or(0);
+            parent == 0 || present.contains(&parent)
+        }));
     }
 
     /// The authoritative side of the trace absence: a focal that is in the

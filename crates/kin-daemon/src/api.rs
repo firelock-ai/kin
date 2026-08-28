@@ -15309,6 +15309,257 @@ mod tests {
         }
     }
 
+    /// The exact refusal each cursor-identity dimension owns.
+    ///
+    /// Asserting the MESSAGE rather than `is_err()` is the whole point of these
+    /// tests. `cursor_projection_inherits_omissions_and_rejects_conflicts` and
+    /// `fused_cursor_explanation_can_contract_but_cannot_expand` already prove
+    /// that a conflict fails, but a validator that answered every conflict with
+    /// one dimension's message would satisfy both of them: a mutation that
+    /// merely redirects a refusal from one branch into another survives an
+    /// `is_err()` assertion, because both branches still error. Naming the
+    /// message per dimension is what makes the dimensions independently
+    /// verifiable, which is what C4 asks for and what an `is_err()` cannot give.
+    const CURSOR_REFUSAL_QUERY: &str =
+        "semantic_locate cursor belongs to a different query; re-run the requested query";
+    const CURSOR_REFUSAL_GRANULARITY: &str =
+        "semantic_locate cursor preserves its original granularity; re-run the original query to change it";
+    const CURSOR_REFUSAL_SNIPPET: &str =
+        "semantic_locate cursor preserves its original snippet projection; re-run the original query to change it";
+    const CURSOR_REFUSAL_ALIAS: &str =
+        "semantic_locate cursor preserves its original snippet alias setting; re-run the original query to change it";
+    const CURSOR_REFUSAL_VARIANTS: &str =
+        "semantic_locate cursor preserves its original query variants; re-run the original query to change them";
+    const CURSOR_REFUSAL_TEST_SCOPE: &str =
+        "semantic_locate cursor preserves its original test-role scope; re-run the original query to change it";
+    const CURSOR_REFUSAL_EXPLAIN: &str =
+        "semantic_locate cursor cannot expand a ranking whose explanation was not built; re-run the original query with explain: true";
+
+    /// Every refusal message a cursor validator can produce, so a test can
+    /// require that the message it expected is the one that answered AND that no
+    /// other dimension's message did. Without the second half, a redirected
+    /// refusal reads exactly like the right one.
+    fn assert_only_this_refusal(error: &str, expected: &str, dimension: &str) {
+        assert_eq!(
+            error, expected,
+            "{dimension} must be refused by its own message"
+        );
+        for other in [
+            CURSOR_REFUSAL_QUERY,
+            CURSOR_REFUSAL_GRANULARITY,
+            CURSOR_REFUSAL_SNIPPET,
+            CURSOR_REFUSAL_ALIAS,
+            CURSOR_REFUSAL_VARIANTS,
+            CURSOR_REFUSAL_TEST_SCOPE,
+            CURSOR_REFUSAL_EXPLAIN,
+        ] {
+            if other != expected {
+                assert_ne!(
+                    error, other,
+                    "{dimension} must not be refused by another dimension's message"
+                );
+            }
+        }
+    }
+
+    /// Query variants are their own cursor-identity dimension.
+    ///
+    /// No unit test reached this branch before: every existing call to
+    /// `validate_fused_cursor_shape` passes an empty held variant list and sets
+    /// no `queries` argument, so only the explanation branch was exercised.
+    #[test]
+    fn cursor_identity_binds_query_variants_independently() {
+        let held = vec!["parse config".to_string(), "config loader".to_string()];
+
+        // Control: an unchanged dimension reuses the held entry. Omitting the
+        // field inherits, and repeating it exactly is not a conflict.
+        assert!(
+            validate_fused_cursor_shape(&HashMap::new(), &held, false, false).is_ok(),
+            "an omitted variant list must inherit the held ranking"
+        );
+        let repeated = HashMap::from([(
+            "queries".to_string(),
+            json!(["parse config", "config loader"]),
+        )]);
+        assert!(
+            validate_fused_cursor_shape(&repeated, &held, false, false).is_ok(),
+            "repeating the held variant list exactly must reuse the held ranking"
+        );
+
+        // Only this dimension changes in each arm below.
+        for (label, arguments) in [
+            (
+                "a reordered list",
+                HashMap::from([(
+                    "queries".to_string(),
+                    json!(["config loader", "parse config"]),
+                )]),
+            ),
+            (
+                "a dropped variant",
+                HashMap::from([("queries".to_string(), json!(["parse config"]))]),
+            ),
+            (
+                "an added variant",
+                HashMap::from([(
+                    "queries".to_string(),
+                    json!(["parse config", "config loader", "settings"]),
+                )]),
+            ),
+            (
+                "an explicitly emptied list",
+                HashMap::from([("queries".to_string(), json!([]))]),
+            ),
+        ] {
+            let error = validate_fused_cursor_shape(&arguments, &held, false, false)
+                .expect_err(label)
+                .to_string();
+            assert_only_this_refusal(&error, CURSOR_REFUSAL_VARIANTS, label);
+        }
+    }
+
+    /// Test-role scope is its own cursor-identity dimension. Also previously
+    /// unreached at the unit level: no existing call sets `include_tests`.
+    #[test]
+    fn cursor_identity_binds_test_scope_independently() {
+        // Control, in both directions, so the assertion cannot be satisfied by a
+        // validator that simply refuses every explicit value.
+        for held in [true, false] {
+            assert!(
+                validate_fused_cursor_shape(&HashMap::new(), &[], held, true).is_ok(),
+                "an omitted test scope must inherit the held ranking"
+            );
+            let repeated = HashMap::from([("include_tests".to_string(), json!(held))]);
+            assert!(
+                validate_fused_cursor_shape(&repeated, &[], held, true).is_ok(),
+                "repeating the held test scope must reuse the held ranking"
+            );
+
+            let flipped = HashMap::from([("include_tests".to_string(), json!(!held))]);
+            let error = validate_fused_cursor_shape(&flipped, &[], held, true)
+                .expect_err("a flipped test scope must be refused")
+                .to_string();
+            assert_only_this_refusal(&error, CURSOR_REFUSAL_TEST_SCOPE, "test scope");
+        }
+    }
+
+    /// Explanation is one-directional identity: a page may shed held explanation
+    /// but cannot expand a ranking that never built one. The existing test proves
+    /// the direction; this one proves the refusal carries its own message and is
+    /// not another dimension's refusal wearing the right shape.
+    #[test]
+    fn cursor_identity_binds_explanation_independently() {
+        let expanding = HashMap::from([("explain".to_string(), json!(true))]);
+        let error = validate_fused_cursor_shape(&expanding, &[], false, false)
+            .expect_err("explain:true over a ranking with no explanation must be refused")
+            .to_string();
+        assert_only_this_refusal(&error, CURSOR_REFUSAL_EXPLAIN, "explanation");
+
+        // Control: the same argument over a ranking that DID build explanation is
+        // not a conflict, so the refusal above is about the held ranking rather
+        // than about the argument being present.
+        assert!(
+            validate_fused_cursor_shape(&expanding, &[], false, true).is_ok(),
+            "a held explanation must still serve an explaining continuation"
+        );
+
+        // `compact` reaches identity only through this branch: it decides whether
+        // the page requests explanation, and owns no refusal of its own. A
+        // continuation may flip it freely over a ranking that built explanation.
+        let compact_off = HashMap::from([("compact".to_string(), json!(false))]);
+        assert!(
+            fused_explanation_requested(&compact_off),
+            "compact:false is an effective request for explanation"
+        );
+        let error = validate_fused_cursor_shape(&compact_off, &[], false, false)
+            .expect_err("compact:false cannot expand a ranking with no explanation")
+            .to_string();
+        assert_only_this_refusal(&error, CURSOR_REFUSAL_EXPLAIN, "compact as explanation");
+        for compact in [true, false] {
+            assert!(
+                validate_fused_cursor_shape(
+                    &HashMap::from([("compact".to_string(), json!(compact))]),
+                    &[],
+                    false,
+                    true,
+                )
+                .is_ok(),
+                "compact is per-page presentation over a ranking that built explanation"
+            );
+        }
+    }
+
+    /// Each projection dimension owns its own refusal.
+    ///
+    /// The existing projection test perturbs the same four dimensions but asserts
+    /// only `is_err()`, so a validator that answered all four with one message
+    /// would pass it. These arms name the message per dimension, and each control
+    /// proves the matching value is accepted rather than refused for some other
+    /// reason.
+    #[test]
+    fn cursor_identity_binds_each_projection_dimension_independently() {
+        let held_query = "find parser";
+        let held_mode = kin_cli::commands::locate::projection_mode(true, true);
+
+        // Control: every dimension repeated at its held value reuses the entry.
+        let matching = HashMap::from([
+            ("query".to_string(), json!(held_query)),
+            ("granularity".to_string(), json!("entity")),
+            ("include_snippet".to_string(), json!(true)),
+            ("snippet_alias".to_string(), json!(false)),
+        ]);
+        assert!(
+            validate_cursor_projection(&matching, held_query, false, held_mode, Some(false))
+                .is_ok(),
+            "every dimension at its held value must reuse the held ranking"
+        );
+
+        for (dimension, expected, arguments) in [
+            (
+                "query",
+                CURSOR_REFUSAL_QUERY,
+                HashMap::from([("query".to_string(), json!("some other query"))]),
+            ),
+            (
+                "granularity",
+                CURSOR_REFUSAL_GRANULARITY,
+                HashMap::from([("granularity".to_string(), json!("file"))]),
+            ),
+            (
+                "snippet projection",
+                CURSOR_REFUSAL_SNIPPET,
+                HashMap::from([("include_snippet".to_string(), json!(false))]),
+            ),
+            (
+                "snippet alias",
+                CURSOR_REFUSAL_ALIAS,
+                HashMap::from([("snippet_alias".to_string(), json!(true))]),
+            ),
+        ] {
+            let error =
+                validate_cursor_projection(&arguments, held_query, false, held_mode, Some(false))
+                    .expect_err(dimension)
+                    .to_string();
+            assert_only_this_refusal(&error, expected, dimension);
+        }
+
+        // An invalid granularity is a different refusal from a conflicting one,
+        // and folding the two together would let a typo read as a cursor
+        // conflict and send a caller to re-run a query that was never the problem.
+        let invalid = HashMap::from([("granularity".to_string(), json!("entities"))]);
+        let error = validate_cursor_projection(&invalid, held_query, false, held_mode, Some(false))
+            .expect_err("an unknown granularity must be refused")
+            .to_string();
+        assert!(
+            error.contains("invalid granularity 'entities'"),
+            "an unknown granularity must name itself, not the cursor: {error}"
+        );
+        assert_ne!(
+            error, CURSOR_REFUSAL_GRANULARITY,
+            "a malformed value and a conflicting value are different news"
+        );
+    }
+
     /// One cosine-arm ranked row, in the shape the serving loop builds.
     fn cosine_row(
         name: &str,
@@ -36833,7 +37084,7 @@ mod tests {
     /// receives.
     #[tokio::test]
     async fn a_trace_over_its_budget_drops_bodies_and_keeps_every_edge() {
-        const BUDGET: usize = 6_000;
+        const ORIGINAL_BUDGET: usize = 6_000;
         let state = test_state();
         let ids = install_trace_chain(&state, 6);
         // The chain links only its calls. Every requested class decides
@@ -36856,8 +37107,48 @@ mod tests {
             json!({ "focal": ids[0].to_string(), "depth": 5, "direction": "calls" }),
         )
         .await;
+
+        // Keep the original 6k fixture load-bearing after the trace step gained
+        // its two uniform call-site fields. The old shape still has to fit the
+        // exact target this ladder used before the call-site contract. Only the serialized
+        // cost of those two fields is added back to the exercised budget, and
+        // that increment has its own ceiling, so unrelated per-step growth
+        // cannot hide inside a raised magic number.
+        let compact = call_mcp_tool_text(
+            app.clone(),
+            "trace_data_flow",
+            json!({
+                "focal": ids[0].to_string(),
+                "depth": 5,
+                "direction": "calls",
+                "include_body": false,
+            }),
+        )
+        .await;
+        let mut without_site_contract: serde_json::Value = serde_json::from_str(&compact).unwrap();
+        for step in without_site_contract["chain"].as_array_mut().unwrap() {
+            let row = step.as_object_mut().unwrap();
+            row.remove("reference_lines");
+            row.remove("reference_lines_absent_reason");
+        }
+        let old_shape_chars = serde_json::to_string_pretty(&without_site_contract)
+            .unwrap()
+            .len();
+        let original_target =
+            ORIGINAL_BUDGET.saturating_sub(kin_mcp::budget::RESPONSE_DISCLOSURE_RESERVE_CHARS);
         assert!(
-            unbounded.len() > BUDGET,
+            old_shape_chars <= original_target,
+            "the pre-call-site shape must still fit the original ladder target: {old_shape_chars} \
+             chars against {original_target}"
+        );
+        let site_contract_chars = compact.len().saturating_sub(old_shape_chars);
+        assert!(
+            (1..1_000).contains(&site_contract_chars),
+            "the two uniform site fields added {site_contract_chars} chars to this five-step chain"
+        );
+        let budget = ORIGINAL_BUDGET + site_contract_chars;
+        assert!(
+            unbounded.len() > budget,
             "the fixture must exceed the budget under test or this proves nothing: {} chars",
             unbounded.len()
         );
@@ -36870,15 +37161,15 @@ mod tests {
                 "focal": ids[0].to_string(),
                 "depth": 5,
                 "direction": "calls",
-                "max_response_chars": BUDGET,
+                "max_response_chars": budget,
             }),
         )
         .await;
         let cut: serde_json::Value = serde_json::from_str(&bounded).unwrap();
 
         assert!(
-            bounded.len() <= BUDGET,
-            "the tool must return what it promised to fit: {} chars against {BUDGET}",
+            bounded.len() <= budget,
+            "the tool must return what it promised to fit: {} chars against {budget}",
             bounded.len()
         );
         assert_eq!(

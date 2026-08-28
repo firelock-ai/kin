@@ -111,7 +111,12 @@ function normalizeRegistryUrl(value) {
 }
 
 function encodePackageForMetadataPath(name) {
-  return name.replace("/", "%2F");
+  // replaceAll, not replace: a string pattern replaces the first match only,
+  // so any name carrying a second slash would reach the registry path
+  // half-encoded. The one call site passes a name already proven equal to
+  // @kin/boundary-contracts above, so this is correctness rather than a fix
+  // for a reachable input.
+  return name.replaceAll("/", "%2F");
 }
 
 function registryAuthLine(registryUrl) {
