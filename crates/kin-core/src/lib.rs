@@ -34,6 +34,7 @@ pub mod last_admission;
 pub mod layout;
 pub mod manifest;
 pub mod memory_pressure;
+pub mod paging;
 pub mod ranking;
 pub mod ref_view;
 pub mod reference_coverage;
@@ -86,6 +87,7 @@ pub use init::{
 };
 pub use layout::KinLayout;
 pub use manifest::KinManifest;
+pub use paging::LocateCursor;
 pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolver};
 pub use sync_state::SyncStateStore;
 pub use tree::{

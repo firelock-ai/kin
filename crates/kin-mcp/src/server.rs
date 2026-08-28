@@ -1248,6 +1248,11 @@ async fn handle_tools_call_daemon(
         }
     }
 
+    // Graph status carries its own selected-graph coverage observation. Mark
+    // the beginning before forwarding so a refusal published during the call
+    // cannot be discharged by counters that may have preceded it.
+    let graph_status_observation_started_at_unix =
+        (call_params.name == "kin_graph_status").then(daemon_delegate::current_unix_seconds);
     let (result, mut base_env) =
         match daemon_delegate::forward_tool_call(&call_params.name, &call_params.arguments).await {
             Ok(Some(result)) => (result, Envelope::daemon()),
@@ -1273,8 +1278,15 @@ async fn handle_tools_call_daemon(
     // Stamped for the same reason and on the same calls. Work Kin declined
     // because the machine had no room is work no producer is doing, and the
     // answer it changes the reading of is the one that succeeds and returns
-    // nothing.
-    base_env = base_env.with_memory_pressure(daemon_delegate::memory_pressure_refusal().as_ref());
+    // nothing. Generic tools reconcile an embedding refusal against the exact
+    // selected-graph coverage returned by `/commands/resources`. Graph status
+    // is handled below from the typed report it returns, so it never mixes two
+    // independently sampled graph observations.
+    if call_params.name != "kin_graph_status" {
+        let pressure_refusal =
+            daemon_delegate::outstanding_memory_pressure_refusal(&call_params.arguments).await;
+        base_env = base_env.with_memory_pressure(pressure_refusal.as_ref());
+    }
     // Stamped on every answer for the same reason, and it is the one of the
     // three that qualifies an answer which came back looking complete. A graph
     // short of its own last verified-good census returns rows that are all true
@@ -1300,18 +1312,50 @@ async fn handle_tools_call_daemon(
     // borrowing its entity count or generation here would mix two authorities
     // in one response. Build the standard `_kin` envelope from the report
     // itself and validate the fully annotated stdio payload instead.
-    if call_params.name == "kin_graph_status" {
-        let enveloped = finalize_daemon_graph_status(result, base_env);
-        return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
-    }
-
     // Enrich the envelope with honest degraded/freshness signals from the daemon
     // `/health` body when the daemon is actually reachable. When it was already
     // determined unreachable, skip the probe — there is nothing to ask.
-    if base_env.degraded.daemon_unreachable != Some(true) {
-        if let Some(health) = daemon_delegate::fetch_health_snapshot().await {
-            base_env = base_env.with_health(&health);
+    //
+    // Fetched before the graph-status branch below, not after it. That branch
+    // used to return first and so never reached this probe at all, which took
+    // the working-copy reading away from it along with the counts it is right to
+    // refuse, and left it publishing "0 uncommitted" over a repository holding a
+    // module the graph had never met (FIR-2820).
+    let health = if base_env.degraded.daemon_unreachable == Some(true) {
+        None
+    } else {
+        daemon_delegate::fetch_health_snapshot().await
+    };
+
+    if call_params.name == "kin_graph_status" {
+        // Two narrow lifts off the one health probe above, and nothing else
+        // from it. Vector persistence is a property of this daemon's storage
+        // backend rather than a HEAD graph observation, and the working-copy
+        // reading is a fact about the disk rather than about the selected
+        // graph; selected-graph finalization below still replaces every graph
+        // field from the report itself.
+        if let Some(health) = health.as_ref() {
+            base_env = base_env.with_working_copy_health(health);
+            if let Some(unavailable) = health
+                .get("embed_persistence_unavailable")
+                .and_then(serde_json::Value::as_bool)
+            {
+                base_env = base_env.with_embed_persistence_unavailable(unavailable);
+            }
         }
+        let pressure_refusals = daemon_delegate::recorded_memory_pressure_refusals();
+        let enveloped = finalize_daemon_graph_status(
+            result,
+            base_env,
+            &pressure_refusals,
+            graph_status_observation_started_at_unix
+                .expect("graph status records its observation start before forwarding"),
+        );
+        return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
+    }
+
+    if let Some(health) = health.as_ref() {
+        base_env = base_env.with_health(health);
     }
 
     let enveloped = envelope::finalize_bounded(result, base_env, &call_params.name, &budget);
@@ -1342,14 +1386,41 @@ fn envelope_for_delegate_error(
     }
 }
 
-fn finalize_daemon_graph_status(result: ToolCallResult, base_env: Envelope) -> ToolCallResult {
+fn finalize_daemon_graph_status(
+    result: ToolCallResult,
+    base_env: Envelope,
+    pressure_refusals: &[kin_core::memory_pressure::PressureRefusal],
+    observation_started_at_unix: u64,
+) -> ToolCallResult {
+    let unobserved_pressure_refusal = pressure_refusals.last();
     let mut report = match daemon_delegate::parse_graph_status_report(&result) {
         Ok(Some(report)) => report,
-        Ok(None) => return envelope::finalize(result, base_env, "kin_graph_status"),
+        Ok(None) => {
+            return envelope::finalize(
+                result,
+                base_env.with_memory_pressure(unobserved_pressure_refusal),
+                "kin_graph_status",
+            );
+        }
         Err(error) => {
-            return envelope::finalize(ToolCallResult::error(error), base_env, "kin_graph_status");
+            return envelope::finalize(
+                ToolCallResult::error(error),
+                base_env.with_memory_pressure(unobserved_pressure_refusal),
+                "kin_graph_status",
+            );
         }
     };
+
+    let embedding_coverage = kin_core::memory_pressure::EmbeddingCoverage {
+        pending: report.embeddings_pending,
+        indexed: report.embeddings_indexed,
+        total: report.embeddings_total,
+    };
+    let pressure_refusal = daemon_delegate::pressure_refusal_for_selected_graph(
+        pressure_refusals,
+        embedding_coverage,
+        observation_started_at_unix,
+    );
 
     let counts = (
         u64::try_from(report.entity_count),
@@ -1362,7 +1433,7 @@ fn finalize_daemon_graph_status(result: ToolCallResult, base_env: Envelope) -> T
             ToolCallResult::error(
                 "daemon kin_graph_status counters do not fit the stdio response envelope",
             ),
-            base_env,
+            base_env.with_memory_pressure(pressure_refusal.as_ref()),
             "kin_graph_status",
         );
     };
@@ -1380,18 +1451,20 @@ fn finalize_daemon_graph_status(result: ToolCallResult, base_env: Envelope) -> T
                     "stdio kin_graph_status could not serialize the validated daemon report: \
                      {error}"
                 )),
-                base_env,
+                base_env.with_memory_pressure(pressure_refusal.as_ref()),
                 "kin_graph_status",
             );
         }
     };
-    let selected_env = base_env.with_selected_graph_observation(
-        entity_count,
-        indexed,
-        pending,
-        total,
-        report.durable_entity_count,
-    );
+    let selected_env = base_env
+        .with_selected_graph_observation(
+            entity_count,
+            indexed,
+            pending,
+            total,
+            report.durable_entity_count,
+        )
+        .with_memory_pressure(pressure_refusal.as_ref());
     let enveloped = envelope::finalize(result, selected_env, "kin_graph_status");
     if let Err(error) = daemon_delegate::parse_graph_status_report(&enveloped) {
         return envelope::finalize(
@@ -1515,7 +1588,11 @@ mod tests {
         );
     }
 
-    fn direct_graph_status_result() -> ToolCallResult {
+    fn direct_graph_status_result_with_coverage(
+        pending: usize,
+        indexed: usize,
+        total: usize,
+    ) -> ToolCallResult {
         ToolCallResult::text(
             serde_json::json!({
                 "schema": "kin.graph-status.v1",
@@ -1527,13 +1604,17 @@ mod tests {
                 "entity_count": 2,
                 "relation_count": 1,
                 "embedding_source": "selected_graph",
-                "embeddings_indexed": 1,
-                "embeddings_pending": 1,
-                "embeddings_total": 2,
+                "embeddings_indexed": indexed,
+                "embeddings_pending": pending,
+                "embeddings_total": total,
                 "completion_attested": false
             })
             .to_string(),
         )
+    }
+
+    fn direct_graph_status_result() -> ToolCallResult {
+        direct_graph_status_result_with_coverage(1, 1, 2)
     }
 
     #[test]
@@ -1547,10 +1628,11 @@ mod tests {
             "initialized": true,
             "graph_loaded": true,
             "reconciliation_status": "head-only",
-            "embed_worker_failed": true
+            "embed_worker_failed": true,
+            "embed_persistence_unavailable": true
         });
         let base = Envelope::daemon().with_health(&head_health);
-        let enveloped = finalize_daemon_graph_status(direct_graph_status_result(), base);
+        let enveloped = finalize_daemon_graph_status(direct_graph_status_result(), base, &[], 2);
         let report = daemon_delegate::parse_graph_status_report(&enveloped)
             .unwrap()
             .expect("successful stdio status report");
@@ -1569,6 +1651,11 @@ mod tests {
         assert!(response_env.graph_state.initialized.is_none());
         assert!(response_env.graph_state.reconciliation_status.is_none());
         assert!(response_env.degraded.embed_worker_failed.is_none());
+        assert_eq!(
+            response_env.degraded.embed_persistence_unavailable,
+            Some(true),
+            "an incomplete selected graph keeps the daemon storage blocker"
+        );
         let coverage = response_env
             .semantic_coverage
             .expect("selected-graph embedding coverage");
@@ -1581,7 +1668,7 @@ mod tests {
     #[test]
     fn graph_status_stdio_schema_rejects_a_mixed_head_envelope() {
         let enveloped =
-            finalize_daemon_graph_status(direct_graph_status_result(), Envelope::daemon());
+            finalize_daemon_graph_status(direct_graph_status_result(), Envelope::daemon(), &[], 2);
         let ContentBlock::Text { text } = &enveloped.content[0];
         let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
         payload["_kin"]["graph_state"]["entity_count"] = serde_json::json!(999);
@@ -1599,7 +1686,7 @@ mod tests {
     #[test]
     fn graph_status_stdio_replaces_daemon_supplied_envelope_and_validates_coverage_note() {
         let enveloped =
-            finalize_daemon_graph_status(direct_graph_status_result(), Envelope::daemon());
+            finalize_daemon_graph_status(direct_graph_status_result(), Envelope::daemon(), &[], 2);
         let ContentBlock::Text { text } = &enveloped.content[0];
         let mut payload: serde_json::Value = serde_json::from_str(text).unwrap();
         payload["_kin"]["graph_state"]["head_generation"] = serde_json::json!(77);
@@ -1607,6 +1694,8 @@ mod tests {
         let sanitized = finalize_daemon_graph_status(
             ToolCallResult::text(payload.to_string()),
             Envelope::daemon(),
+            &[],
+            2,
         );
         let ContentBlock::Text { text } = &sanitized.content[0];
         let sanitized_payload: serde_json::Value = serde_json::from_str(text).unwrap();
@@ -1634,6 +1723,186 @@ mod tests {
                 .contains("note must be present exactly when coverage is incomplete"),
             "{error}"
         );
+    }
+
+    fn response_pressure_refusal(work: &str) -> kin_core::memory_pressure::PressureRefusal {
+        kin_core::memory_pressure::PressureRefusal {
+            work: work.to_string(),
+            level: "constrained".to_string(),
+            reason: format!("{work} was refused"),
+            at_unix: 1,
+        }
+    }
+
+    fn finalized_graph_status_with_pressure(
+        work: &str,
+        pending: usize,
+        indexed: usize,
+        total: usize,
+    ) -> serde_json::Value {
+        let refusal = response_pressure_refusal(work);
+        // Production order: the typed report and durable refusal meet at the
+        // graph-status finalizer. No second resources sample participates.
+        let result = finalize_daemon_graph_status(
+            direct_graph_status_result_with_coverage(pending, indexed, total),
+            Envelope::daemon(),
+            std::slice::from_ref(&refusal),
+            2,
+        );
+        let ContentBlock::Text { text } = result.content.first().expect("one content block");
+        serde_json::from_str(text).expect("annotated graph-status response")
+    }
+
+    #[test]
+    fn graph_status_preserves_only_pressure_for_work_the_selected_graph_still_owes() {
+        for (name, payload) in [
+            (
+                "incomplete selected embedding coverage",
+                finalized_graph_status_with_pressure("embed-batch", 1, 8, 9),
+            ),
+            (
+                "live embedding backlog",
+                finalized_graph_status_with_pressure("embed-batch", 1, 9, 9),
+            ),
+            (
+                "language-server work",
+                finalized_graph_status_with_pressure("lsp-sweep", 0, 9, 9),
+            ),
+            (
+                "future work",
+                finalized_graph_status_with_pressure("future-heavy-work", 0, 9, 9),
+            ),
+        ] {
+            assert_eq!(
+                payload[ENVELOPE_KEY]["degraded"]["memory_pressure"],
+                serde_json::json!(true),
+                "{name} must survive selected-graph finalization: {payload}"
+            );
+        }
+
+        let complete = finalized_graph_status_with_pressure("embed-batch", 0, 9, 9);
+        assert!(
+            complete[ENVELOPE_KEY]["degraded"]
+                .get("memory_pressure")
+                .is_none(),
+            "exactly complete embedding coverage retires the response-level signal: {complete}"
+        );
+    }
+
+    #[test]
+    fn graph_status_qualifies_unavailable_persistence_by_selected_coverage() {
+        let incomplete = finalize_daemon_graph_status(
+            direct_graph_status_result_with_coverage(1, 8, 9),
+            Envelope::daemon().with_embed_persistence_unavailable(true),
+            &[],
+            2,
+        );
+        let ContentBlock::Text { text } = incomplete.content.first().expect("one content block");
+        let incomplete: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(
+            incomplete[ENVELOPE_KEY]["degraded"]["embed_persistence_unavailable"],
+            serde_json::json!(true),
+            "incomplete selected coverage has no producer that can fill it"
+        );
+
+        let complete = finalize_daemon_graph_status(
+            direct_graph_status_result_with_coverage(0, 9, 9),
+            Envelope::daemon().with_embed_persistence_unavailable(true),
+            &[],
+            2,
+        );
+        let ContentBlock::Text { text } = complete.content.first().expect("one content block");
+        let complete: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(
+            complete[ENVELOPE_KEY]["degraded"]
+                .get("embed_persistence_unavailable")
+                .is_none(),
+            "a fully covered selected graph has no embedding work for the unavailable producer"
+        );
+    }
+
+    fn finalized_empty_locate_with_pressure(
+        work: &str,
+        embedding_coverage: Option<kin_core::memory_pressure::EmbeddingCoverage>,
+    ) -> serde_json::Value {
+        let refusal = daemon_delegate::pressure_refusal_for_coverage(
+            response_pressure_refusal(work),
+            embedding_coverage,
+        );
+        let env = Envelope::daemon()
+            .with_selected_graph_observation(1, 1, 0, 1, Some(1))
+            .with_memory_pressure(refusal.as_ref());
+        let result = envelope::finalize(
+            ToolCallResult::text(
+                serde_json::json!({
+                    "query": "missing_authenticator",
+                    "results": [],
+                    "total_ranked": 0,
+                })
+                .to_string(),
+            ),
+            env,
+            "semantic_locate",
+        );
+        let ContentBlock::Text { text } = result.content.first().expect("one content block");
+        serde_json::from_str(text).expect("annotated locate response")
+    }
+
+    #[test]
+    fn memory_pressure_qualifies_verdicts_only_for_outstanding_work() {
+        let coverage = |pending, indexed, total| kin_core::memory_pressure::EmbeddingCoverage {
+            pending,
+            indexed,
+            total,
+        };
+        let completed_embed =
+            finalized_empty_locate_with_pressure("embed-batch", Some(coverage(0, 9, 9)));
+        assert!(
+            completed_embed[ENVELOPE_KEY]["degraded"]
+                .get("memory_pressure")
+                .is_none(),
+            "completed embedding work must not leave a degradation: {completed_embed}"
+        );
+        assert!(!completed_embed["negative"]["degraded_signals"]
+            .as_array()
+            .expect("negative degradation labels")
+            .iter()
+            .any(|label| label.as_str() == Some("memory_pressure")));
+        assert_eq!(
+            completed_embed["negative"]["trust"], "authoritative",
+            "whole coverage must not poison an otherwise exact semantic absence"
+        );
+        assert_eq!(
+            completed_embed[ENVELOPE_KEY]["verdict"]["inputs"]["absence_gate"],
+            "certified"
+        );
+
+        for (work, observed) in [
+            ("embed-batch", Some(coverage(1, 9, 9))),
+            ("embed-batch", Some(coverage(0, 8, 9))),
+            ("embed-batch", None),
+            ("lsp-sweep", Some(coverage(0, 9, 9))),
+            ("future-heavy-work", Some(coverage(0, 9, 9))),
+        ] {
+            let response = finalized_empty_locate_with_pressure(work, observed);
+            assert_eq!(
+                response[ENVELOPE_KEY]["degraded"]["memory_pressure"], true,
+                "{work} with coverage {observed:?} stays visible: {response}"
+            );
+            assert!(
+                response["negative"]["degraded_signals"]
+                    .as_array()
+                    .expect("negative degradation labels")
+                    .iter()
+                    .any(|label| label.as_str() == Some("memory_pressure")),
+                "{work} must reach the response-level negative: {response}"
+            );
+            assert_eq!(response["negative"]["trust"], "inconclusive");
+            assert_eq!(
+                response[ENVELOPE_KEY]["verdict"]["inputs"]["absence_gate"],
+                "inconclusive"
+            );
+        }
     }
 
     // ── Track C: confidence-qualified negatives ride the envelope through the

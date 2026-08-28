@@ -198,7 +198,7 @@ into one deduped result. The fan-out is echoed once under `queries` and each hit
 that surfaced it (diverse variants, meaning identifiers, behavior and subsystem, recover \
 more than any single phrasing); multi-query fusion always uses the fused pipeline. Both \
 pipelines report semantic_coverage as one counter object (indexed, total, pending, \
-complete), the same shape `_kin.semantic_coverage` carries; the fused arm additionally reports a `degradations` array \
+complete), the same shape `_kin.semantic_coverage` carries, and both report a `degradations` array \
 naming any retrieval capability that could not fully run (empty vector index, reranker \
 model not cached, …), so a thin result set is attributable instead of silent. Ranking \
 demotes test-role entities, and at several stages excludes them, unless the query text \
@@ -211,7 +211,7 @@ error in offline/no-daemon mode. On an empty result the additive `negative` obje
 `safe_to_conclude_absent` flag distinguishes an authoritative \"no match\" from \"not \
 yet embedded\". A NON-empty result needs the opposite check, because retrieval always \
 returns its best candidates: each hit carries `match_kind` (`name` when a query token is \
-that entity's name, else `semantic` or `text_fallback`), and the response carries \
+that entity's name, else `semantic` or `text_fallback`), and an entity-granularity response carries \
 `all_fallback: true` when NOT ONE returned entity was named by the query. Asking for a \
 symbol that does not exist yields a full, confident-looking page with `all_fallback` set \
 — treat that as \"this symbol was not found\" rather than as the answer. Every hit also \
@@ -221,13 +221,19 @@ the graph, so get_entity_source, get_context_pack, graph_neighborhood, and find_
 all take it. `id_space: \"artifact\"` means the hit is an artifact-level embedding — a \
 tracked file the parsers produced no entities for — so it carries `artifact_path` and NO \
 `entity_id`, and those tools will refuse it; read it with kin_artifact_read instead. Do \
-not synthesize an entity id from an artifact hit's path. The response bounds its own size \
-(max_chars, default 45000 serialized characters, ceiling 60000) so it is never refused by a \
-client for being too large: it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
-ask with explain=true or compact=false, and under pressure it sheds the per-file symbol roll-up, \
-then inline snippets, and only then withholds hits from the end of the page. Any cut is reported \
+not synthesize an entity id from an artifact hit's path. The response attempts to bound its own size \
+(max_chars, default 45000 serialized characters, ceiling 60000): it is compact by default, meaning no per-signal `match_evidence` breakdown unless you \
+ask with explain=true or compact=false, and under pressure an entity-granularity response first \
+sheds its secondary per-file symbol roll-up. File granularity preserves those symbols because they \
+are primary answer detail. It then sheds inline snippets, and only then withholds hits from the end \
+of the page. Any cut is reported \
 in `degradations` and in `_kin.response`, which carries the budget applied and what the response \
-measured before it, and the rest of the ranking stays reachable through `next_cursor`.";
+measured before it. When primary rows are withheld and `next_cursor` can be rebased, every row \
+stays reachable and the remedy says so. A cursorless final page is cut to its ceiling too, keeping \
+at least one entry, and the cut is published in `elisions` and `degradations`; its remedy names \
+`max_chars` and a narrower request, because with no `next_cursor` the withheld entries cannot be \
+reached by paging. Only when one surviving entry per list still exceeds the ceiling does the \
+response ship over budget, and it discloses that as `response_over_budget`.";
 
 /// Offline/generic dispatch arm for `semantic_locate`.
 ///
@@ -5426,6 +5432,90 @@ mod tests {
         GraphNodeId, Relation, RelationEvidence, RelationKind, RelationOrigin,
     };
     use kin_spine::SpineBackend as _;
+
+    /// The `semantic_locate` description and the budget it describes must not
+    /// drift apart again.
+    ///
+    /// kin #1208 reversed the final-page rule and the description kept the old
+    /// one (FIR-2860). Agents read the description to decide how to page, so
+    /// main told them to expect rows this server cuts.
+    ///
+    /// Asserting `SEMANTIC_LOCATE_DESC.contains("max_chars")` would be a check
+    /// that cannot fail. The description already names `max_chars` where it
+    /// introduces the budget, so that assertion passes with the final-page
+    /// sentence deleted outright. `budget.rs` met the same trap from the other
+    /// side: a bare `max_chars` substring was satisfied by the residual
+    /// disclosure, and the mutation that deleted the branch survived it. So the
+    /// budget half binds to the producer, by running the real budget over a
+    /// cursorless over-budget page and requiring the description to carry the
+    /// clause the remedy actually emitted, and the `max_chars` half is scoped to
+    /// the final-page sentence rather than to the whole string.
+    #[test]
+    fn the_locate_description_states_the_final_page_rule_the_budget_enforces() {
+        // The old claim in the words it shipped in. This is the assertion that
+        // goes red if the pre-#1208 sentence is restored.
+        assert!(
+            !SEMANTIC_LOCATE_DESC.contains("keeps its primary rows"),
+            "the description still promises a cursorless final page keeps its primary rows, \
+             which is the rule kin #1208 reversed"
+        );
+
+        // A cursorless page whose primary list alone exceeds the floor budget,
+        // which is the branch the description is about.
+        let hits = 20;
+        let mut payload = serde_json::json!({
+            "query": "where redirects are resolved",
+            "routing": "cosine-v0",
+            "results": (0..hits).map(|index| serde_json::json!({
+                "entity_id": format!("00000000-0000-0000-0000-{index:012}"),
+                "name": format!("handler_{index}_{}", "x".repeat(500)),
+                "kind": "function",
+                "score": 0.5,
+            })).collect::<Vec<_>>(),
+            "next_cursor": serde_json::Value::Null,
+        });
+        let budget = crate::budget::ResponseBudget {
+            max_chars: crate::budget::RESPONSE_MIN_MAX_CHARS,
+            ..crate::budget::ResponseBudget::default()
+        };
+        crate::budget::enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+
+        // Read what the producer wrote rather than a second copy of it. If the
+        // budget's no-cursor wording moves, this fails here and names the
+        // description as the thing to rewrite, which is the drift both halves
+        // exist to catch.
+        let no_cursor_clause = "cannot be reached by paging";
+        let remedy = payload["degradations"]
+            .as_array()
+            .expect("a cut publishes a degradation")
+            .iter()
+            .filter_map(|entry| entry["remediation"].as_str())
+            .find(|remedy| remedy.contains(no_cursor_clause))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the budget no longer emits a no-cursor remedy saying {no_cursor_clause:?}; \
+                     the rule moved and SEMANTIC_LOCATE_DESC is what needs rewriting"
+                )
+            });
+        assert!(
+            SEMANTIC_LOCATE_DESC.contains(no_cursor_clause),
+            "the budget's no-cursor remedy says {no_cursor_clause:?} and the description does \
+             not, so an agent reading it cannot tell that paging will not recover the withheld \
+             rows. Remedy emitted: {remedy:?}"
+        );
+
+        // Scoped, so the `max_chars` the description already names when it
+        // introduces the budget cannot satisfy this on its own.
+        let final_page = SEMANTIC_LOCATE_DESC
+            .split_once("A cursorless final page")
+            .expect("the description must describe the cursorless final page")
+            .1;
+        assert!(
+            final_page.contains("max_chars"),
+            "the final-page sentence must name `max_chars` as the remedy, because no cursor \
+             reaches the withheld rows: {final_page:?}"
+        );
+    }
 
     /// A row as the wire carries it, so the field cannot be added to the struct
     /// and dropped by the serializer.

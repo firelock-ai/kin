@@ -80,6 +80,7 @@ impl LanguageAdapter for CAdapter {
             imports,
             tests: Vec::new(),
             parse_state,
+            parsed_call_sites: None,
         })
     }
 }

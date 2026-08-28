@@ -331,13 +331,6 @@ fn resolve_layout(path: &Path) -> Option<KinLayout> {
     KinLayout::discover(path)
 }
 
-fn env_flag(name: &str) -> bool {
-    env::var(name)
-        .ok()
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(false)
-}
-
 fn idle_timeout_from_env() -> Result<Option<Duration>, String> {
     let Some(raw) = env::var("KIN_DAEMON_IDLE_TIMEOUT_SECS").ok() else {
         return Ok(Some(Duration::from_secs(3600))); // Default to 1 hour auto-cleanup
@@ -691,7 +684,10 @@ async fn async_main() -> i32 {
 
     let config = DaemonConfig {
         api_port: args.port,
-        lsp_enabled: !env_flag("KIN_DAEMON_DISABLE_LSP"),
+        // Through the shared reader rather than this file's own `env_flag`, so
+        // the switch a daemon obeys and the sentence that advises about the
+        // switch cannot answer from two truthiness tables.
+        lsp_enabled: !kin_daemon_spawn::enrichment_disabled(),
         idle_timeout: match idle_timeout_from_env() {
             Ok(timeout) => timeout,
             Err(error) => {

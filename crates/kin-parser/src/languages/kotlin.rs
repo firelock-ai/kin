@@ -91,6 +91,7 @@ impl LanguageAdapter for KotlinAdapter {
             imports,
             tests,
             parse_state,
+            parsed_call_sites: None,
         })
     }
 }
