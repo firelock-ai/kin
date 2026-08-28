@@ -909,7 +909,29 @@ class Suite(object):
         # worker the registry lists. Without it the command refuses with "no Kin
         # daemon is reachable" even with a live registered daemon for this exact
         # repository, which is what two runs of this arm reported.
-        pull_env = {"KIN_DAEMON_URL": receiver_endpoint}
+        # And the source's own loopback token, as the peer bearer token. The
+        # serving daemon enforces `.kin/daemon.token` by default and a local
+        # client is expected to read that file and send it as
+        # `Authorization: Bearer`, which is what the CLI does for its OWN
+        # daemon. `--url` names a peer with no configured remote, so nothing
+        # supplies a token for the far side and the advertisement comes back
+        # HTTP 401. KIN_REMOTE_BEARER_TOKEN is the documented override the peer
+        # resolver reads first.
+        source_token_path = os.path.join(source, ".kin", "daemon.token")
+        try:
+            with open(source_token_path) as handle:
+                source_token = handle.read().strip()
+        except OSError as error:
+            raise RuntimeError(
+                "the source daemon published no loopback token at %s: %s"
+                % (source_token_path, error)
+            )
+        if not source_token:
+            raise RuntimeError("the source's loopback token is empty at %s" % source_token_path)
+        pull_env = {
+            "KIN_DAEMON_URL": receiver_endpoint,
+            "KIN_REMOTE_BEARER_TOKEN": source_token,
+        }
         rc, out = self.kin_in(
             destination, ["pull", "--url", endpoint, "--json"], extra_env=pull_env
         )
