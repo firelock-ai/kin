@@ -1162,6 +1162,110 @@ def check_7(suite):
     return res
 
 
+def grade_final_page(payload, ceiling, lists):
+    """Problems with a final page that went over its ceiling.
+
+    A page with no cursor cannot be continued, so the budget owes it this: the
+    ranked list is cut and says so, the cut leaves an entry, the page either
+    fits under the ceiling or discloses that one entry per list cannot fit, and
+    no remediation names a cursor the page does not have. Returns a list of
+    problems, empty when the page is correct, so the self-test can drive it with
+    no binary and no fixture.
+    """
+    problems = []
+    after = ((payload.get("_kin") or {}).get("response") or {}).get("chars_after_budget")
+    reasons = [entry.get("reason") for entry in (payload.get("degradations") or [])]
+    residual = "response_over_budget" in reasons
+    if not isinstance(after, int):
+        problems.append("the response published no integer chars_after_budget")
+    elif after > ceiling and not residual:
+        problems.append(
+            "the final page shipped %d characters against a %d ceiling and disclosed no "
+            "residual" % (after, ceiling)
+        )
+    elif after <= ceiling and residual:
+        problems.append(
+            "the final page fits at %d under %d yet still claims it could not fit"
+            % (after, ceiling)
+        )
+    elisions = payload.get("elisions") or {}
+    cut_lists = [key for key in lists if key in elisions]
+    if not cut_lists:
+        problems.append(
+            "no ranked list published an elision, so the ceiling was not paid for by a cut"
+        )
+    for key in cut_lists:
+        rows = payload.get(key)
+        if not isinstance(rows, list) or not rows:
+            problems.append("`%s` was cut to %r, so the budget emptied it" % (key, rows))
+    remedies = [
+        entry.get("remediation") or "" for entry in (payload.get("degradations") or [])
+    ]
+    if any("follow `next_cursor`" in remedy for remedy in remedies):
+        problems.append(
+            "a page with no cursor offered cursor recovery: %r" % (remedies,)
+        )
+    if not any("max_chars" in remedy for remedy in remedies):
+        problems.append(
+            "no remediation named max_chars as the way to the withheld rows: %r" % (remedies,)
+        )
+    return problems
+
+
+def check_8(suite):
+    res = Result("8", "FIR-2600", "a final page over the ceiling is cut, fits, and says so")
+    ceiling = 2000
+    lists = ["entities", "files"]
+    try:
+        cut = suite.mcp(
+            "semantic_locate", {"query": "hop", "limit": 60, "max_chars": ceiling}
+        )
+    except McpError as exc:
+        res.unknown("semantic_locate unreadable: %s" % exc)
+        return res
+
+    # This check is about the page that cannot be continued. A followable cursor
+    # means the caller was handed a recovery path and check 3 owns that case, so
+    # say the case was not reached rather than grading the wrong one.
+    cursor = cut.get("next_cursor")
+    if cursor:
+        res.unknown(
+            "the floor call returned a followable cursor (%r), so the final-page "
+            "case was not exercised" % (cursor,)
+        )
+        return res
+    # A page that was never over its ceiling has nothing to pay for, so there is
+    # no cut to grade. Anything else, over the ceiling or already cut, is the
+    # case this check owns.
+    after = ((cut.get("_kin") or {}).get("response") or {}).get("chars_after_budget")
+    if isinstance(after, int) and after <= ceiling and not (cut.get("elisions") or {}):
+        res.unknown(
+            "the floor call fit under its ceiling with nothing cut, so the "
+            "final-page elision rule was not exercised"
+        )
+        return res
+    for problem in grade_final_page(cut, ceiling, lists):
+        res.bad(problem)
+    if not res.failed:
+        after = ((cut.get("_kin") or {}).get("response") or {}).get("chars_after_budget")
+        # Say which of the two legal outcomes held. Calling an over-ceiling page
+        # "under its ceiling" would be the check reporting something false while
+        # passing, which is the shape this suite exists to catch.
+        if isinstance(after, int) and after <= ceiling:
+            where = "and fits at %s characters under its %d ceiling" % (after, ceiling)
+        else:
+            where = (
+                "and, at %s characters against a %d ceiling, discloses that one entry per "
+                "list still does not fit" % (after, ceiling)
+            )
+        res.ok(
+            "the final page was cut, kept an entry in every list it cut, named the ceiling "
+            "rather than a cursor, %s: %s"
+            % (where, json.dumps(cut.get("elisions") or {}, sort_keys=True))
+        )
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -1171,6 +1275,7 @@ CHECKS = [
     ("5", check_5),
     ("6", check_6),
     ("7", check_7),
+    ("8", check_8),
 ]
 
 
@@ -1181,6 +1286,104 @@ def self_test():
     def expect(label, got, want):
         if got != want:
             problems.append("%s: got %r, wanted %r" % (label, got, want))
+
+    # The final-page grader, against one correct page and one break per rule it
+    # enforces. A grader that cannot fail is what lets a regression ship green.
+    def final_page(**over):
+        page = {
+            "_kin": {"response": {"chars_after_budget": 1900}},
+            "entities": [{"id": "a"}],
+            "elisions": {"entities": {"kept": 1, "elided": 19, "total": 20}},
+            "degradations": [
+                {"remediation": "raise `max_chars`, or narrow the request with `limit`"}
+            ],
+        }
+        page.update(over)
+        return page
+
+    expect("a correct final page passes", grade_final_page(final_page(), 2000, ["entities"]), [])
+    # The second legal outcome. The envelope alone can exceed a 2000-character
+    # ceiling, measured at 19,344 on the real fixture, so a page that cannot fit
+    # even at one entry per list is correct when it says exactly that.
+    expect(
+        "an over-ceiling page that discloses the residual passes",
+        grade_final_page(
+            final_page(
+                _kin={"response": {"chars_after_budget": 2400}},
+                degradations=[
+                    {
+                        "reason": "response_over_budget",
+                        "remediation": "narrow the request, or raise max_chars",
+                    }
+                ],
+            ),
+            2000,
+            ["entities"],
+        ),
+        [],
+    )
+    expect(
+        "a final page over its ceiling with no residual disclosure fails",
+        len(grade_final_page(
+            final_page(_kin={"response": {"chars_after_budget": 2400}}), 2000, ["entities"]
+        )),
+        1,
+    )
+    expect(
+        "a page that fits yet claims it could not fit fails",
+        len(grade_final_page(
+            final_page(
+                degradations=[
+                    {
+                        "reason": "response_over_budget",
+                        "remediation": "narrow the request, or raise max_chars",
+                    }
+                ]
+            ),
+            2000,
+            ["entities"],
+        )),
+        1,
+    )
+    expect(
+        "a final page that cut nothing fails",
+        len(grade_final_page(final_page(elisions={}), 2000, ["entities"])),
+        1,
+    )
+    expect(
+        "a final page with an emptied list fails",
+        len(grade_final_page(final_page(entities=[]), 2000, ["entities"])),
+        1,
+    )
+    expect(
+        "a final page claiming cursor recovery fails",
+        len(grade_final_page(
+            final_page(degradations=[{"remediation": "follow `next_cursor`"}]),
+            2000,
+            ["entities"],
+        )),
+        2,
+    )
+    # This input separates the two remedy rules. The one above breaks both at
+    # once, so either rule going missing showed up as the same 2-to-1 count and
+    # the two hid each other. Here the ceiling IS named, so only the cursor
+    # claim is wrong and only that rule can catch it.
+    expect(
+        "a cursor claim is caught even when the ceiling is named",
+        len(grade_final_page(
+            final_page(degradations=[
+                {"remediation": "follow `next_cursor`, or raise `max_chars`"}
+            ]),
+            2000,
+            ["entities"],
+        )),
+        1,
+    )
+    expect(
+        "a final page with no size fails",
+        len(grade_final_page(final_page(_kin={}), 2000, ["entities"])),
+        1,
+    )
 
     whole = {
         "chain": [{"step": 1}, {"step": 2}],
