@@ -2160,9 +2160,16 @@ mod tests {
     fn a_gap_in_one_language_does_not_label_another_languages_rows() {
         let graph = InMemoryGraph::new();
 
-        let caller = measured(make_entity("run_task", "src/tasks.rs"), 2, 1);
-        let called = measured(make_entity("spawn_task", "src/spawn.rs"), 2, 1);
-        let rust_orphan = measured(make_entity("retired_task", "src/retired.rs"), 1, 1);
+        // Every rust file's own parse side matches the edges the graph holds from
+        // it, so rust is accounted end to end and any label on a rust row would
+        // have to come from python. Giving them a count they cannot back is not
+        // a harmless fixture detail: the delete-list authority accounts the
+        // focal's own file, so a rust file parsing more call sites than it
+        // resolved is a genuine same-file gap and would label these rows for a
+        // reason that has nothing to do with the claim under test.
+        let caller = measured(make_entity("run_task", "src/tasks.rs"), 1, 1);
+        let called = measured(make_entity("spawn_task", "src/spawn.rs"), 0, 1);
+        let rust_orphan = measured(make_entity("retired_task", "src/retired.rs"), 0, 1);
 
         let mut python_orphan = measured(make_entity("legacy_import", "tools/legacy.py"), 2, 2);
         python_orphan.language = LanguageId::Python;
