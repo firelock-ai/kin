@@ -6,11 +6,11 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener as StdTcpListener};
 use std::path::{Path as FsPath, PathBuf};
 use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::state::{
     CachedLocateRanking, CachedSemanticPage, CoordinationEventDraft, DaemonEvent, DaemonState,
-    RequestGraphAuthority, LOCATE_RANKING_CACHE_CAP,
+    HostedSemanticCursor, RequestGraphAuthority, LOCATE_RANKING_CACHE_CAP,
 };
 
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -19,7 +19,10 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
-use kin_db::{LocalFileBackend, RepositoryAuthorityManager, StorageBackend};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use kin_db::{
+    LocalFileBackend, RepositoryAuthorityManager, SnapshotCursor, StorageBackend,
+};
 use kin_model::session::{Intent, IntentScope, IntentSummary, LockType};
 use kin_model::{
     ChangeStore, ContractId, EntityId, EntityStore, FilePathId, GraphNodeId, IntentId, RepoPath,
@@ -885,6 +888,78 @@ struct McpToolCallRequest {
     arguments: HashMap<String, serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoScopedMcpToolCallRequest {
+    schema_version: u32,
+    name: String,
+    arguments: HashMap<String, serde_json::Value>,
+}
+
+const REPO_SCOPED_SEMANTIC_CAPABILITY: &str = "repo_scoped_semantic_tools_v1";
+const REPO_SCOPED_CURSOR_CAP: usize = 256;
+/// A hosted view retains a complete graph plus its source-authority manager, so
+/// it needs a much smaller bound than the lightweight locate-ranking caches.
+/// The map is only a reuse optimization: an evicted repository is reopened
+/// from its exact backend authority on the next request.
+const REPO_SCOPED_VIEW_CACHE_CAP: usize = 8;
+const REPO_SCOPED_CALL_MAX_BODY_BYTES: usize = 256 * 1024;
+const REPO_SCOPED_LOCATE_MAX_PAGE_SIZE: u64 = 50;
+const REPO_SCOPED_LOCATE_MAX_ADDITIONAL_QUERIES: usize = 1;
+const REPO_SCOPED_LOCATE_MAX_QUERY_CHARS: usize = 4 * 1024;
+const REPO_SCOPED_LOCATE_REQUEST_BUDGET_SECS: u64 = 30;
+const REPO_SCOPED_LOCATE_SOURCE_READ_CAP: usize = 12;
+const REPO_SCOPED_CONTEXT_MAX_DEPTH: u64 = 8;
+const REPO_SCOPED_CONTEXT_MAX_TOKEN_BUDGET: u64 = 32_000;
+const REPO_SCOPED_TRACE_MAX_SELECTOR_CHARS: usize = 4 * 1024;
+const REPO_SCOPED_TRACE_BODY_READ_UNIT_CHARS: usize = 8_000;
+const REPO_SCOPED_TRACE_BODY_READ_CAP: usize = 8;
+/// Room for source provenance, cap disclosure and repository authority fields
+/// added after the trace's body-free shape is measured.
+const REPO_SCOPED_TRACE_BODY_METADATA_RESERVE_CHARS: usize = 2_000;
+
+#[derive(Debug, Serialize)]
+struct RepoScopedMcpErrorBody {
+    code: String,
+    message: String,
+    repo_id: String,
+    retryable: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct RepoScopedMcpErrorResponse {
+    schema_version: u32,
+    capability: &'static str,
+    error: RepoScopedMcpErrorBody,
+}
+
+#[derive(Debug, Serialize)]
+struct RepoScopedMcpAuthorityResponse {
+    repo_id: String,
+    snapshot_cursor: u64,
+    graph_root: String,
+    selected_change_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RepoScopedMcpSuccessResponse {
+    schema_version: u32,
+    capability: &'static str,
+    repository: RepoScopedMcpAuthorityResponse,
+    name: String,
+    result: kin_mcp::ToolCallResult,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RepoScopedMcpCursorPayload {
+    cursor_id: Uuid,
+    repo_id: String,
+    snapshot_cursor: u64,
+    graph_root: String,
+    issued_at_unix_secs: u64,
+    daemon_instance_id: Uuid,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct SessionStartResponse {
     session_id: String,
@@ -1043,6 +1118,9 @@ pub struct RepoHealthResponse {
     /// False is the wedged reading, and it is the one a supervisor acts on.
     #[serde(default = "default_true")]
     pub status_answerable: bool,
+    /// Hosted semantic tool contracts available for this addressed repository.
+    #[serde(default)]
+    pub semantic_capabilities: Vec<String>,
 }
 
 /// Serde default for a boolean whose healthy value is `true`, so a payload from
@@ -1285,6 +1363,13 @@ fn is_public_route(path: &str) -> bool {
     matches!(path, "/health" | "/ready" | "/readiness" | "/spine/health")
 }
 
+fn repo_scoped_semantic_repo_id_from_path(path: &str) -> Option<&str> {
+    let path = path.strip_prefix("/v2").unwrap_or(path);
+    let rest = path.strip_prefix("/repos/")?;
+    let (repo_id, suffix) = rest.split_once('/')?;
+    (!repo_id.is_empty() && suffix == "mcp/tools/call").then_some(repo_id)
+}
+
 async fn daemon_auth(
     State(auth_state): State<DaemonAuthState>,
     request: axum::http::Request<axum::body::Body>,
@@ -1303,6 +1388,17 @@ async fn daemon_auth(
         .map(str::trim);
 
     if provided != Some(expected_token) {
+        if let Some(repo_id) = repo_scoped_semantic_repo_id_from_path(request.uri().path()) {
+            return repo_scoped_mcp_error(
+                repo_id,
+                RepoScopedMcpFailure::new(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_required",
+                    "Authentication required",
+                    false,
+                ),
+            );
+        }
         return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
@@ -1538,6 +1634,11 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/pull", post(command_pull))
         .route("/commands/transfer-plan", post(command_transfer_plan))
         .route("/mcp/tools/call", post(mcp_tools_call))
+        .route(
+            "/repos/{repo_id}/mcp/tools/call",
+            post(repo_mcp_tools_call)
+                .layer(DefaultBodyLimit::max(REPO_SCOPED_CALL_MAX_BODY_BYTES)),
+        )
         // Multi-repo endpoints — list and query lazily-loaded repo graphs
         .route("/repos", get(list_repos))
         .route("/repos/{repo_id}/health", get(repo_health))
@@ -6204,8 +6305,8 @@ async fn locate(
                 return Ok(Json(result));
             }
         }
-        // Cache miss / stale / undecodable cursor: fall through to a fresh run
-        // (returns page 0) rather than silently failing the page.
+        // The legacy local route preserves its compatibility behavior: a cache
+        // miss, stale cursor, or undecodable token re-runs page zero.
     }
 
     // Scope token for the cursor key (explicit ref, else the session's temporal
@@ -6428,6 +6529,85 @@ async fn run_fused_locate_for_state(
     .map_err(|error| error.to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_fused_locate_for_hosted_view(
+    view: &HostedRepositoryMcpView,
+    request_deadline: Instant,
+    text: &str,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: kin_cli::commands::locate::SnippetOptions,
+    scope: kin_cli::commands::locate::LocateScope,
+) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    kin_cli::commands::locate::run_with_graph_capture_with_priority_files_and_vector_source_capped(
+        view.graph.as_ref(),
+        None,
+        text,
+        explain,
+        max_files,
+        max_files_explicit,
+        Vec::new(),
+        Some(view.graph.as_ref()),
+        snippet_opts,
+        Some(&view.repository_authority),
+        kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+        scope,
+        request_deadline.saturating_duration_since(Instant::now()),
+    )
+    .map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_multiquery_fused_locate_for_hosted_view(
+    view: &HostedRepositoryMcpView,
+    request_deadline: Instant,
+    variants: &[String],
+    auto_fanout: bool,
+    explain: bool,
+    max_files: usize,
+    max_files_explicit: bool,
+    snippet_opts: kin_cli::commands::locate::SnippetOptions,
+    scope: kin_cli::commands::locate::LocateScope,
+) -> Result<kin_cli::commands::locate::LocateResult, String> {
+    let mut per_variant = Vec::with_capacity(variants.len());
+    for (index, variant) in variants.iter().enumerate() {
+        per_variant.push(run_fused_locate_for_hosted_view(
+            view,
+            request_deadline,
+            variant,
+            explain,
+            max_files,
+            max_files_explicit,
+            snippet_opts,
+            scope,
+        )?);
+        if index == 0
+            && auto_fanout
+            && !kin_cli::commands::locate::auto_fanout_should_fuse_for(&per_variant[0])
+        {
+            return Ok(per_variant.pop().expect("primary result present"));
+        }
+    }
+    let primary_declared = per_variant
+        .first()
+        .map(|result| result.files.len())
+        .unwrap_or(0);
+    let mut fused = kin_cli::commands::locate::fuse_locate_results(
+        variants.to_vec(),
+        per_variant,
+        kin_cli::commands::locate::locate_rrf_k(),
+    );
+    if auto_fanout {
+        kin_cli::commands::locate::bound_fused_declaration_to_primary(
+            &mut fused,
+            primary_declared,
+            !max_files_explicit,
+        );
+    }
+    Ok(fused)
+}
+
 /// Build the ordered, deduped query-variant list for a multi-query locate: the
 /// primary query first (when non-empty), then each extra variant, trimmed and
 /// de-duplicated exactly so the same phrasing is never retrieved twice. A result
@@ -6644,7 +6824,25 @@ fn cache_locate_ranking(
     graph_version: u64,
     mode: &'static str,
 ) {
-    let mut cache = state.locate_rankings.lock().unwrap();
+    cache_locate_ranking_in(
+        &state.locate_rankings,
+        key,
+        entities,
+        queries,
+        graph_version,
+        mode,
+    );
+}
+
+fn cache_locate_ranking_in(
+    rankings: &std::sync::Mutex<HashMap<String, CachedLocateRanking>>,
+    key: &str,
+    entities: &[kin_cli::commands::locate::LocateEntity],
+    queries: &[String],
+    graph_version: u64,
+    mode: &'static str,
+) {
+    let mut cache = rankings.lock().unwrap();
     if cache.len() >= LOCATE_RANKING_CACHE_CAP && !cache.contains_key(key) {
         if let Some(oldest) = cache
             .iter()
@@ -8265,7 +8463,10 @@ fn build_semantic_locate_result(
     let include_snippet = arguments
         .get("include_snippet")
         .and_then(serde_json::Value::as_bool)
-        .unwrap_or(true)
+        // Hosted calls default to coordinates-only. A body is an explicit
+        // object-store projection and is hydrated only after final paging;
+        // local MCP keeps its historical body-by-default contract.
+        .unwrap_or(hosted_view.is_none())
         && !file_granularity;
     let repository_authority = if include_snippet {
         match require_mcp_local_repository_authority(state) {
@@ -8820,11 +9021,90 @@ fn fused_semantic_locate_payload(
 /// (default `limit`) windows the graph-native `entities[]` ranking, the full
 /// ranking is cached under a graph-version-stamped key, and a `cursor` pages it
 /// straight from cache with no retrieval re-run.
+fn hydrate_hosted_locate_page(
+    view: &HostedRepositoryMcpView,
+    result: &mut kin_cli::commands::locate::LocateResult,
+    include_snippet: bool,
+) -> kin_mcp::Result<()> {
+    for entity in &mut result.entities {
+        entity.body = None;
+    }
+    if !include_snippet {
+        return Ok(());
+    }
+
+    let eligible = result
+        .entities
+        .iter()
+        .filter(|entity| entity.definition && !entity.entity_id.is_empty())
+        .count();
+    let held = kin_mcp::handlers::common::HeldSourceAuthority::new(
+        view.graph.as_ref(),
+        Some(&view.repository_authority),
+    );
+    let mut attempted = 0usize;
+    for row in result
+        .entities
+        .iter_mut()
+        .filter(|entity| entity.definition && !entity.entity_id.is_empty())
+        .take(REPO_SCOPED_LOCATE_SOURCE_READ_CAP)
+    {
+        attempted += 1;
+        let entity_id = Uuid::parse_str(&row.entity_id)
+            .map(EntityId)
+            .map_err(|error| {
+                kin_mcp::McpError::GraphStore(format!(
+                    "hosted locate ranking carried invalid entity id {}: {error}",
+                    row.entity_id
+                ))
+            })?;
+        let entity = view
+            .graph
+            .get_entity(&entity_id)
+            .map_err(kin_mcp::McpError::graph)?
+            .ok_or_else(|| {
+                kin_mcp::McpError::GraphStore(format!(
+                    "hosted locate ranking entity {entity_id} is absent from its immutable graph view"
+                ))
+            })?;
+        match kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
+            &held,
+            &entity,
+            kin_mcp::handlers::common::RETRIEVAL_SNIPPET_MAX_LINES,
+            kin_mcp::handlers::common::RETRIEVAL_SNIPPET_MAX_CHARS,
+            kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+        ) {
+            Ok(Some(source)) => row.body = Some(source.body),
+            Ok(None) => {}
+            Err(error) if kin_mcp::handlers::common::is_absent_at_generation(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+
+    let withheld = eligible.saturating_sub(attempted);
+    if withheld > 0 {
+        kin_cli::commands::locate::record_degradation(
+            &mut result.degradations,
+            kin_cli::commands::locate::RetrievalDegradation {
+                component: "entity_source".to_string(),
+                reason: "hosted_source_read_cap".to_string(),
+                detail: format!(
+                    "hosted locate projected bodies for {attempted} of {eligible} eligible entities on this page and withheld {withheld} at the per-request source-read cap"
+                ),
+                remediation: "page or narrow the locate query, or call get_context_pack for a selected entity"
+                    .to_string(),
+            },
+        );
+    }
+    Ok(())
+}
+
 async fn build_fused_semantic_locate_result(
     state: &Arc<DaemonState>,
     session_id: Option<&SessionId>,
     graph: &kin_db::InMemoryGraph,
     arguments: &HashMap<String, serde_json::Value>,
+    hosted_view: Option<&HostedRepositoryMcpView>,
 ) -> kin_mcp::ToolCallResult {
     let query = match arguments.get("query").and_then(serde_json::Value::as_str) {
         Some(value) if !value.trim().is_empty() => value.to_string(),
@@ -8901,13 +9181,25 @@ async fn build_fused_semantic_locate_result(
     } else {
         kin_cli::commands::locate::SnippetOptions::enabled(None).without_bodies()
     };
+    // Hosted retrieval ranks without source bodies. Hydration happens only on
+    // the final page below, so fan-out never multiplies body GETs and a page of
+    // N does not project the full retained ranking first.
+    let ranking_snippet_opts = if hosted_view.is_some() {
+        kin_cli::commands::locate::SnippetOptions::enabled(None).without_bodies()
+    } else {
+        snippet_opts
+    };
 
-    // Graph version stamps the paging cursor: any mutation bumps `vfs_version`,
-    // so a stale cursor can never page a ranking built against different truth.
-    let graph_version = state.vfs_version.load(std::sync::atomic::Ordering::SeqCst);
-    // Scope token for the cursor key (the session's temporal scope) so cursors
-    // never collide across scopes for the same query — matching `POST /locate`.
-    let scope_token: Option<String> = if let Some(sid) = session_id {
+    // Hosted paging is stamped with the selected backend authority, while the
+    // local route keeps its live graph mutation clock. The cache namespace also
+    // carries the repository id and root, so identical queries in two hosted
+    // repositories cannot address one another's ranking.
+    let graph_version = hosted_view
+        .map(|view| view.snapshot_cursor.backend_generation())
+        .unwrap_or_else(|| state.vfs_version.load(std::sync::atomic::Ordering::SeqCst));
+    let scope_token: Option<String> = if let Some(view) = hosted_view {
+        Some(view.cache_scope())
+    } else if let Some(sid) = session_id {
         state
             .get_session_scope(sid)
             .await
@@ -8923,7 +9215,10 @@ async fn build_fused_semantic_locate_result(
     if let Some(cursor_token) = arguments.get("cursor").and_then(serde_json::Value::as_str) {
         if let Some(parsed) = kin_cli::commands::locate::LocateCursor::decode(cursor_token) {
             let cached = {
-                let cache = state.locate_rankings.lock().unwrap();
+                let rankings = hosted_view
+                    .map(|_| &state.repo_semantic_locate_rankings)
+                    .unwrap_or(&state.locate_rankings);
+                let cache = rankings.lock().unwrap();
                 cache
                     .get(&parsed.key)
                     .filter(|entry| entry.graph_version == graph_version)
@@ -8947,12 +9242,23 @@ async fn build_fused_semantic_locate_result(
                     parsed.page,
                     page_size,
                 );
+                if let Some(view) = hosted_view {
+                    if let Err(error) =
+                        hydrate_hosted_locate_page(view, &mut result, include_snippet)
+                    {
+                        return kin_mcp::ToolCallResult::error(error.to_string());
+                    }
+                }
                 // A cache hit runs no retrieval, so re-report coverage from the
                 // live embedding status — the same struct the fresh page carried.
                 result.semantic_coverage =
                     Some(kin_cli::commands::locate::local_semantic_coverage(
                         graph,
-                        Some(state.graph.as_ref()),
+                        Some(
+                            hosted_view
+                                .map(|view| view.graph.as_ref())
+                                .unwrap_or_else(|| state.graph.as_ref()),
+                        ),
                     ));
                 return fused_semantic_locate_payload(
                     result,
@@ -8961,6 +9267,11 @@ async fn build_fused_semantic_locate_result(
                     snippet_alias,
                 );
             }
+        }
+        if hosted_view.is_some() {
+            return kin_mcp::ToolCallResult::error(
+                "repo-scoped semantic cursor ranking is unavailable".to_string(),
+            );
         }
         // Cache miss / stale / undecodable cursor: fall through to a fresh run
         // (returns page 0) rather than silently failing the page.
@@ -8974,12 +9285,39 @@ async fn build_fused_semantic_locate_result(
         &arg_string_array(arguments, "queries"),
     ));
     let multi_query = variants.len() >= 2;
+    let request_deadline =
+        Instant::now() + Duration::from_secs(REPO_SCOPED_LOCATE_REQUEST_BUDGET_SECS);
 
     // The agent asked for `limit` ranked hits; give the fused pipeline the
     // same number of file slots EXPLICITLY so the adaptive cap cannot shrink
     // the pool below what the caller asked to see (the graph-native entity
     // ranking is projected from the file ranking).
-    let run_result = if multi_query {
+    let run_result = if let Some(view) = hosted_view {
+        if multi_query {
+            run_multiquery_fused_locate_for_hosted_view(
+                view,
+                request_deadline,
+                &variants,
+                auto_fanout,
+                explain,
+                limit,
+                true,
+                ranking_snippet_opts,
+                scope,
+            )
+        } else {
+            run_fused_locate_for_hosted_view(
+                view,
+                request_deadline,
+                &query,
+                explain,
+                limit,
+                true,
+                ranking_snippet_opts,
+                scope,
+            )
+        }
+    } else if multi_query {
         run_multiquery_fused_locate(
             state,
             session_id,
@@ -9030,8 +9368,11 @@ async fn build_fused_semantic_locate_result(
         graph_version,
         snippet_opts.projection_mode(),
     );
-    cache_locate_ranking(
-        state,
+    let rankings = hosted_view
+        .map(|_| &state.repo_semantic_locate_rankings)
+        .unwrap_or(&state.locate_rankings);
+    cache_locate_ranking_in(
+        rankings,
         &key,
         &locate_result.entities,
         &locate_result.queries,
@@ -9039,6 +9380,12 @@ async fn build_fused_semantic_locate_result(
         snippet_opts.projection_mode(),
     );
     kin_cli::commands::locate::apply_entity_page(&mut locate_result, &key, 0, page_size);
+
+    if let Some(view) = hosted_view {
+        if let Err(error) = hydrate_hosted_locate_page(view, &mut locate_result, include_snippet) {
+            return kin_mcp::ToolCallResult::error(error.to_string());
+        }
+    }
 
     fused_semantic_locate_payload(locate_result, &query, file_granularity, snippet_alias)
 }
@@ -9120,6 +9467,1475 @@ fn resolved_entity_source_from_outcome<E: std::fmt::Display>(
     }
 }
 
+/// One coherent hosted repository authority selected for a single MCP call.
+pub(crate) struct HostedRepositoryMcpView {
+    repository_id: RepositoryId,
+    snapshot_cursor: SnapshotCursor,
+    graph_root: String,
+    selected_change_id: kin_model::SemanticChangeId,
+    graph: Arc<kin_db::InMemoryGraph>,
+    repository_authority: kin_mcp::handlers::RequestRepositoryAuthority,
+    last_used: std::sync::Mutex<Instant>,
+}
+
+impl HostedRepositoryMcpView {
+    fn cache_scope(&self) -> String {
+        format!(
+            "repo:{}:cursor:{}:root:{}",
+            self.repository_id,
+            self.snapshot_cursor.backend_generation(),
+            self.graph_root
+        )
+    }
+
+    fn touch(&self) {
+        *lock_recover(&self.last_used) = Instant::now();
+    }
+
+    fn last_used(&self) -> Instant {
+        *lock_recover(&self.last_used)
+    }
+}
+
+struct RepoScopedMcpFailure {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+    retryable: bool,
+}
+
+impl RepoScopedMcpFailure {
+    fn new(
+        status: StatusCode,
+        code: &'static str,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            status,
+            code,
+            message: message.into(),
+            retryable,
+        }
+    }
+}
+
+fn repo_scoped_mcp_error(repo_id: &str, failure: RepoScopedMcpFailure) -> Response {
+    let mut response = (
+        failure.status,
+        Json(RepoScopedMcpErrorResponse {
+            schema_version: 1,
+            capability: REPO_SCOPED_SEMANTIC_CAPABILITY,
+            error: RepoScopedMcpErrorBody {
+                code: failure.code.to_string(),
+                message: failure.message,
+                repo_id: repo_id.to_string(),
+                retryable: failure.retryable,
+            },
+        }),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("x-kin-semantic-capability"),
+        HeaderValue::from_static(REPO_SCOPED_SEMANTIC_CAPABILITY),
+    );
+    response
+}
+
+fn repo_scoped_mcp_success(
+    view: &HostedRepositoryMcpView,
+    name: String,
+    result: kin_mcp::ToolCallResult,
+) -> Response {
+    let mut response = Json(RepoScopedMcpSuccessResponse {
+        schema_version: 1,
+        capability: REPO_SCOPED_SEMANTIC_CAPABILITY,
+        repository: RepoScopedMcpAuthorityResponse {
+            repo_id: view.repository_id.to_string(),
+            snapshot_cursor: view.snapshot_cursor.backend_generation(),
+            graph_root: view.graph_root.clone(),
+            selected_change_id: view.selected_change_id.to_string(),
+        },
+        name,
+        result,
+    })
+    .into_response();
+    response.headers_mut().insert(
+        HeaderName::from_static("x-kin-semantic-capability"),
+        HeaderValue::from_static(REPO_SCOPED_SEMANTIC_CAPABILITY),
+    );
+    if let Ok(repository_id) = HeaderValue::from_str(view.repository_id.as_str()) {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-kin-repository-id"),
+            repository_id,
+        );
+    }
+    if let Ok(cursor) = HeaderValue::from_str(
+        &view
+            .snapshot_cursor
+            .backend_generation()
+            .to_string(),
+    ) {
+        response.headers_mut().insert(
+            HeaderName::from_static("x-kin-repository-authority-cursor"),
+            cursor,
+        );
+    }
+    response
+}
+
+fn hosted_snapshot_cursor_blocking(
+    backend: &Arc<dyn StorageBackend>,
+    repo_id: &str,
+) -> std::result::Result<Option<SnapshotCursor>, RepoScopedMcpFailure> {
+    backend
+        .load_snapshot_cursor(repo_id)
+        .map_err(|error| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_authority_unavailable",
+                format!("repository {repo_id} authority probe failed: {error}"),
+                true,
+            )
+        })
+}
+
+async fn hosted_snapshot_cursor(
+    backend: &Arc<dyn StorageBackend>,
+    repo_id: &str,
+) -> std::result::Result<Option<SnapshotCursor>, RepoScopedMcpFailure> {
+    let backend = Arc::clone(backend);
+    let worker_repo_id = repo_id.to_string();
+    let error_repo_id = worker_repo_id.clone();
+    tokio::task::spawn_blocking(move || {
+        hosted_snapshot_cursor_blocking(&backend, &worker_repo_id)
+    })
+    .await
+    .map_err(|error| {
+        RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_authority_unavailable",
+            format!("repository {error_repo_id} authority probe worker failed: {error}"),
+            true,
+        )
+    })?
+}
+
+fn open_hosted_repository_mcp_view_blocking(
+    backend: Arc<dyn StorageBackend>,
+    repository_id: RepositoryId,
+    repo_id: String,
+) -> std::result::Result<HostedRepositoryMcpView, RepoScopedMcpFailure> {
+    for attempt in 0..2 {
+        let before = hosted_snapshot_cursor_blocking(&backend, &repo_id)?.ok_or_else(|| {
+            RepoScopedMcpFailure::new(
+                StatusCode::NOT_FOUND,
+                "repo_not_ingested",
+                format!("repository {repo_id} has no persisted repository authority"),
+                false,
+            )
+        })?;
+        let manager = RepositoryAuthorityManager::<dyn StorageBackend>::open(
+            repository_id.clone(),
+            Arc::clone(&backend),
+        )
+        .map_err(|error| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_authority_unavailable",
+                format!("repository {repo_id} authority could not be opened: {error}"),
+                true,
+            )
+        })?;
+        let authority_snapshot = manager.read_authority().snapshot().clone();
+        let (query_snapshot, selected_change_id) =
+            crate::state::materialize_hosted_repository_snapshot(authority_snapshot).map_err(
+                |error| {
+                    RepoScopedMcpFailure::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "repo_semantic_unready",
+                        format!(
+                            "repository {repo_id} default ref is not materializable: {error}"
+                        ),
+                        true,
+                    )
+                },
+            )?;
+        let selected_change_id = selected_change_id.ok_or_else(|| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_semantic_unready",
+                format!("repository {repo_id} has no selected default-ref head"),
+                true,
+            )
+        })?;
+        let graph_root = hex::encode(kin_db::compute_graph_root_hash(&query_snapshot));
+        let selected_tree = query_snapshot.resolved_tree.clone();
+        let graph = Arc::new(
+            kin_db::InMemoryGraph::from_snapshot(query_snapshot).map_err(|error| {
+                RepoScopedMcpFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repo_semantic_unready",
+                    format!("repository {repo_id} query graph could not be opened: {error}"),
+                    true,
+                )
+            })?,
+        );
+        let authority = kin_mcp::handlers::ActiveRepositoryAuthority::hosted(
+            manager,
+            Arc::clone(&backend),
+            repository_id.clone(),
+            selected_change_id,
+            selected_tree,
+            before.backend_generation(),
+        )
+        .map_err(|error| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_semantic_unready",
+                error.to_string(),
+                true,
+            )
+        })?;
+        let after = hosted_snapshot_cursor_blocking(&backend, &repo_id)?.ok_or_else(|| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_semantic_unready",
+                format!("repository {repo_id} authority disappeared while opening"),
+                true,
+            )
+        })?;
+        if before == after {
+            return Ok(HostedRepositoryMcpView {
+                repository_id,
+                snapshot_cursor: before,
+                graph_root,
+                selected_change_id,
+                graph,
+                repository_authority: kin_mcp::handlers::RequestRepositoryAuthority::hosted(
+                    Arc::new(authority),
+                ),
+                last_used: std::sync::Mutex::new(Instant::now()),
+            });
+        }
+        if attempt == 1 {
+            return Err(RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_semantic_unready",
+                format!(
+                    "repository {repo_id} authority moved while opening from cursor {} to {}",
+                    before.backend_generation(),
+                    after.backend_generation()
+                ),
+                true,
+            ));
+        }
+    }
+    unreachable!("bounded hosted authority open either returns or reports its second race")
+}
+
+async fn load_hosted_repository_mcp_view(
+    state: &Arc<DaemonState>,
+    repo_id: &str,
+) -> std::result::Result<Arc<HostedRepositoryMcpView>, RepoScopedMcpFailure> {
+    let repository_id = RepositoryId::new(repo_id.to_string()).map_err(|error| {
+        RepoScopedMcpFailure::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_repository_id",
+            error.to_string(),
+            false,
+        )
+    })?;
+    if !state.serves_repo_id(repo_id) {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::NOT_FOUND,
+            "repo_not_served",
+            format!("repository {repo_id} is not admitted by this daemon"),
+            false,
+        ));
+    }
+    let backend = state.storage_backend.as_ref().ok_or_else(|| {
+        RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "hosted_authority_required",
+            "repo-scoped semantic tools require hosted storage authority; local daemon and filesystem fallback are disabled",
+            false,
+        )
+    })?;
+    if let Some(detail) = state.derived_views_stale.read().await.clone() {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_semantic_unready",
+            detail,
+            true,
+        ));
+    }
+    let observed = match hosted_snapshot_cursor(backend, repo_id).await {
+        Ok(Some(observed)) => observed,
+        Ok(None) => {
+            state.repo_semantic_views.write().await.remove(repo_id);
+            return Err(RepoScopedMcpFailure::new(
+                StatusCode::NOT_FOUND,
+                "repo_not_ingested",
+                format!("repository {repo_id} has no persisted repository authority"),
+                false,
+            ));
+        }
+        Err(failure) => {
+            state.repo_semantic_views.write().await.remove(repo_id);
+            return Err(failure);
+        }
+    };
+    if let Some(detail) = state.derived_views_stale.read().await.clone() {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_semantic_unready",
+            detail,
+            true,
+        ));
+    }
+    let cached = {
+        let views = state.repo_semantic_views.read().await;
+        views.get(repo_id).cloned()
+    };
+    if let Some(cached) = cached {
+        if cached.snapshot_cursor == observed {
+            cached.touch();
+            return Ok(cached);
+        }
+        // `SnapshotCursor` is an opaque equality token, not an ordered
+        // generation counter. Any inequality invalidates the cached view; a
+        // numerically smaller replacement is no more a regression than a
+        // numerically larger one is proof of progress.
+        let mut views = state.repo_semantic_views.write().await;
+        if views
+            .get(repo_id)
+            .is_some_and(|current| Arc::ptr_eq(current, &cached))
+        {
+            views.remove(repo_id);
+        }
+    }
+
+    let worker_backend = Arc::clone(backend);
+    let worker_repository_id = repository_id;
+    let worker_repo_id = repo_id.to_string();
+    let error_repo_id = worker_repo_id.clone();
+    let view = tokio::task::spawn_blocking(move || {
+        open_hosted_repository_mcp_view_blocking(
+            worker_backend,
+            worker_repository_id,
+            worker_repo_id,
+        )
+    })
+    .await
+    .map_err(|error| {
+        RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_authority_unavailable",
+            format!("repository {error_repo_id} authority worker failed: {error}"),
+            true,
+        )
+    })??;
+    if let Some(detail) = state.derived_views_stale.read().await.clone() {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_semantic_unready",
+            detail,
+            true,
+        ));
+    }
+    let view = Arc::new(view);
+    let mut views = state.repo_semantic_views.write().await;
+    if let Some(existing) = views.get(repo_id) {
+        if existing.snapshot_cursor == view.snapshot_cursor {
+            if existing.graph_root != view.graph_root {
+                return Err(RepoScopedMcpFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "repo_semantic_unready",
+                    format!(
+                        "repository {repo_id} produced different graph roots at authority cursor {}",
+                        view.snapshot_cursor.backend_generation()
+                    ),
+                    true,
+                ));
+            }
+            existing.touch();
+            return Ok(Arc::clone(existing));
+        }
+        // Two requests raced while opening different opaque publications.
+        // Neither cursor may be ordered to pick a winner. Drop the competing
+        // cache entry and fail this request; the next request re-probes the
+        // backend and opens whichever exact cursor is then authoritative.
+        let existing_cursor = existing.snapshot_cursor.backend_generation();
+        let loaded_cursor = view.snapshot_cursor.backend_generation();
+        views.remove(repo_id);
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_semantic_unready",
+            format!(
+                "repository {repo_id} produced competing authority views at opaque cursors {existing_cursor} and {loaded_cursor}; retry after a fresh authority probe"
+            ),
+            true,
+        ));
+    }
+    if views.len() >= REPO_SCOPED_VIEW_CACHE_CAP && !views.contains_key(repo_id) {
+        if let Some(oldest_repo_id) = views
+            .iter()
+            .min_by_key(|(_, cached)| cached.last_used())
+            .map(|(repo_id, _)| repo_id.clone())
+        {
+            views.remove(&oldest_repo_id);
+        }
+    }
+    views.insert(repo_id.to_string(), Arc::clone(&view));
+    Ok(view)
+}
+
+fn repo_semantic_cursor_mac(secret: &[u8; 32], payload: &[u8]) -> [u8; 32] {
+    let mut inner_pad = [0x36u8; 64];
+    let mut outer_pad = [0x5cu8; 64];
+    for (index, byte) in secret.iter().enumerate() {
+        inner_pad[index] ^= byte;
+        outer_pad[index] ^= byte;
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(payload);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer.finalize().into()
+}
+
+fn repo_semantic_cursor_mac_matches(expected: &[u8; 32], actual: &[u8]) -> bool {
+    if actual.len() != expected.len() {
+        return false;
+    }
+    expected
+        .iter()
+        .zip(actual)
+        .fold(0u8, |difference, (left, right)| {
+            difference | (*left ^ *right)
+        })
+        == 0
+}
+
+fn decode_repo_semantic_cursor(
+    state: &DaemonState,
+    token: &str,
+) -> std::result::Result<RepoScopedMcpCursorPayload, RepoScopedMcpFailure> {
+    let invalid = || {
+        RepoScopedMcpFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "semantic cursor is malformed or has an invalid signature",
+            false,
+        )
+    };
+    let mut parts = token.split('.');
+    if parts.next() != Some("v1") {
+        return Err(invalid());
+    }
+    let encoded_payload = parts.next().ok_or_else(|| invalid())?;
+    let encoded_mac = parts.next().ok_or_else(|| invalid())?;
+    if parts.next().is_some() {
+        return Err(invalid());
+    }
+    let payload_bytes = URL_SAFE_NO_PAD
+        .decode(encoded_payload)
+        .map_err(|_| invalid())?;
+    let payload = serde_json::from_slice::<RepoScopedMcpCursorPayload>(&payload_bytes)
+        .map_err(|_| invalid())?;
+
+    // An earlier incarnation's token is a known lifecycle outcome, not a bad
+    // request. The instance id is intentionally readable before authentication
+    // because the old process key no longer exists after a real restart.
+    if payload.daemon_instance_id != state.repo_semantic_instance_id {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::GONE,
+            "cursor_unavailable",
+            "semantic cursor belongs to a prior daemon incarnation",
+            false,
+        ));
+    }
+    let supplied_mac = URL_SAFE_NO_PAD.decode(encoded_mac).map_err(|_| invalid())?;
+    let expected_mac = repo_semantic_cursor_mac(&state.repo_semantic_cursor_secret, &payload_bytes);
+    if !repo_semantic_cursor_mac_matches(&expected_mac, &supplied_mac) {
+        return Err(invalid());
+    }
+    Ok(payload)
+}
+
+struct PreparedRepoSemanticCursor {
+    snapshot_cursor: u64,
+    graph_root: String,
+    inner_cursor: String,
+}
+
+fn prepare_repo_semantic_cursor(
+    state: &DaemonState,
+    repo_id: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<Option<PreparedRepoSemanticCursor>, RepoScopedMcpFailure> {
+    let token = match arguments.get("cursor") {
+        None => return Ok(None),
+        Some(serde_json::Value::String(token)) => token.clone(),
+        Some(_) => {
+            return Err(RepoScopedMcpFailure::new(
+                StatusCode::BAD_REQUEST,
+                "invalid_cursor",
+                "semantic cursor must be a string",
+                false,
+            ));
+        }
+    };
+    let payload = decode_repo_semantic_cursor(state, &token)?;
+    let cursors = lock_recover(&state.repo_semantic_cursors);
+    let cursor = cursors.get(&token).ok_or_else(|| {
+        RepoScopedMcpFailure::new(
+            StatusCode::GONE,
+            "cursor_unavailable",
+            "semantic cursor ranking was evicted from this daemon incarnation",
+            false,
+        )
+    })?;
+    if cursor.repo_id != payload.repo_id
+        || cursor.snapshot_cursor.backend_generation() != payload.snapshot_cursor
+        || cursor.graph_root != payload.graph_root
+    {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::BAD_REQUEST,
+            "invalid_cursor",
+            "semantic cursor payload does not match the retained ranking authority",
+            false,
+        ));
+    }
+    if payload.repo_id != repo_id {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::CONFLICT,
+            "cursor_repository_mismatch",
+            format!(
+                "semantic cursor belongs to repository {}, not {}",
+                payload.repo_id, repo_id
+            ),
+            false,
+        ));
+    }
+    let prepared = PreparedRepoSemanticCursor {
+        snapshot_cursor: payload.snapshot_cursor,
+        graph_root: payload.graph_root,
+        inner_cursor: cursor.inner_cursor.clone(),
+    };
+    drop(cursors);
+    Ok(Some(prepared))
+}
+
+fn resolve_prepared_repo_semantic_cursor(
+    prepared: Option<PreparedRepoSemanticCursor>,
+    view: &HostedRepositoryMcpView,
+    arguments: &mut HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), RepoScopedMcpFailure> {
+    let Some(prepared) = prepared else {
+        return Ok(());
+    };
+    if prepared.snapshot_cursor != view.snapshot_cursor.backend_generation()
+        || prepared.graph_root != view.graph_root
+    {
+        return Err(RepoScopedMcpFailure::new(
+            StatusCode::CONFLICT,
+            "cursor_stale",
+            format!(
+                "semantic cursor for repository {} no longer matches current authority",
+                view.repository_id
+            ),
+            false,
+        ));
+    }
+    arguments.insert("cursor".to_string(), json!(prepared.inner_cursor));
+    Ok(())
+}
+
+fn bind_repo_semantic_cursor(
+    state: &DaemonState,
+    view: &HostedRepositoryMcpView,
+    result: &mut kin_mcp::ToolCallResult,
+) -> std::result::Result<(), RepoScopedMcpFailure> {
+    for block in &mut result.content {
+        let kin_mcp::ContentBlock::Text { text } = block;
+        let Ok(mut payload) = serde_json::from_str::<serde_json::Value>(text) else {
+            continue;
+        };
+        let Some(inner_cursor) = payload
+            .get("next_cursor")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let cursor_payload = RepoScopedMcpCursorPayload {
+            cursor_id: Uuid::new_v4(),
+            repo_id: view.repository_id.to_string(),
+            snapshot_cursor: view.snapshot_cursor.backend_generation(),
+            graph_root: view.graph_root.clone(),
+            issued_at_unix_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| {
+                    RepoScopedMcpFailure::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "cursor_encoding_failed",
+                        error.to_string(),
+                        true,
+                    )
+                })?
+                .as_secs(),
+            daemon_instance_id: state.repo_semantic_instance_id,
+        };
+        let payload_bytes = serde_json::to_vec(&cursor_payload).map_err(|error| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cursor_encoding_failed",
+                error.to_string(),
+                true,
+            )
+        })?;
+        let mac = repo_semantic_cursor_mac(&state.repo_semantic_cursor_secret, &payload_bytes);
+        let token = format!(
+            "v1.{}.{}",
+            URL_SAFE_NO_PAD.encode(payload_bytes),
+            URL_SAFE_NO_PAD.encode(mac)
+        );
+        let mut cursors = lock_recover(&state.repo_semantic_cursors);
+        if cursors.len() >= REPO_SCOPED_CURSOR_CAP {
+            if let Some(oldest) = cursors
+                .iter()
+                .min_by_key(|(_, cursor)| cursor.created)
+                .map(|(token, _)| token.clone())
+            {
+                cursors.remove(&oldest);
+            }
+        }
+        cursors.insert(
+            token.clone(),
+            HostedSemanticCursor {
+                repo_id: view.repository_id.to_string(),
+                snapshot_cursor: view.snapshot_cursor,
+                graph_root: view.graph_root.clone(),
+                inner_cursor,
+                created: Instant::now(),
+            },
+        );
+        drop(cursors);
+        payload["next_cursor"] = json!(token);
+        *text = serde_json::to_string_pretty(&payload).map_err(|error| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "cursor_encoding_failed",
+                error.to_string(),
+                true,
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn mcp_tool_result_error(result: &kin_mcp::ToolCallResult) -> Option<String> {
+    result.is_error.filter(|is_error| *is_error).map(|_| {
+        result
+            .content
+            .iter()
+            .map(|block| {
+                let kin_mcp::ContentBlock::Text { text } = block;
+                text.as_str()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
+fn repo_scoped_handler_failure(error: kin_mcp::McpError) -> RepoScopedMcpFailure {
+    let (status, code, retryable) = match &error {
+        kin_mcp::McpError::InvalidParams(_)
+        | kin_mcp::McpError::WorkspaceAbsent(_)
+        | kin_mcp::McpError::ToolNotFound(_)
+        | kin_mcp::McpError::Session(_)
+        | kin_mcp::McpError::Protocol(_)
+        | kin_mcp::McpError::Review(_) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_semantic_tool_call",
+            false,
+        ),
+        kin_mcp::McpError::Context(message) if !message.contains("graph authority gap") => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_semantic_tool_call",
+            false,
+        ),
+        kin_mcp::McpError::Context(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_authority_unavailable",
+            true,
+        ),
+        kin_mcp::McpError::GraphStore(_)
+        | kin_mcp::McpError::Io(_)
+        | kin_mcp::McpError::Json(_)
+        | kin_mcp::McpError::Other(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_semantic_unready",
+            true,
+        ),
+    };
+    RepoScopedMcpFailure::new(status, code, error.to_string(), retryable)
+}
+
+fn repo_scoped_source_degradation(
+    result: &kin_mcp::ToolCallResult,
+) -> Option<RepoScopedMcpFailure> {
+    result.content.iter().find_map(|block| {
+        let kin_mcp::ContentBlock::Text { text } = block;
+        let payload: serde_json::Value = serde_json::from_str(text).ok()?;
+        let degradation = payload
+            .get("degradations")?
+            .as_array()?
+            .iter()
+            .find(|degradation| degradation.get("reason")?.as_str()? == "source_unreadable")?;
+        let detail = degradation
+            .get("detail")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("hosted graph-owned source could not be projected");
+        Some(RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_authority_unavailable",
+            detail,
+            true,
+        ))
+    })
+}
+
+fn invalid_repo_scoped_call(message: impl Into<String>) -> RepoScopedMcpFailure {
+    RepoScopedMcpFailure::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_semantic_tool_call",
+        message,
+        false,
+    )
+}
+
+fn validate_optional_bool(
+    arguments: &HashMap<String, serde_json::Value>,
+    key: &str,
+) -> std::result::Result<(), RepoScopedMcpFailure> {
+    if arguments
+        .get(key)
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(invalid_repo_scoped_call(format!(
+            "argument '{key}' must be a boolean"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_u64_range(
+    arguments: &HashMap<String, serde_json::Value>,
+    key: &str,
+    minimum: u64,
+    maximum: u64,
+) -> std::result::Result<(), RepoScopedMcpFailure> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(());
+    };
+    let Some(value) = value.as_u64() else {
+        return Err(invalid_repo_scoped_call(format!(
+            "argument '{key}' must be an unsigned integer"
+        )));
+    };
+    if !(minimum..=maximum).contains(&value) {
+        return Err(invalid_repo_scoped_call(format!(
+            "argument '{key}' must be between {minimum} and {maximum}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_optional_string(
+    arguments: &HashMap<String, serde_json::Value>,
+    key: &str,
+    allow_blank: bool,
+) -> std::result::Result<Option<String>, RepoScopedMcpFailure> {
+    let Some(value) = arguments.get(key) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        return Err(invalid_repo_scoped_call(format!(
+            "argument '{key}' must be a string"
+        )));
+    };
+    if !allow_blank && value.trim().is_empty() {
+        return Err(invalid_repo_scoped_call(format!(
+            "argument '{key}' must be a non-empty string"
+        )));
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn validate_response_budget_arguments(
+    arguments: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), RepoScopedMcpFailure> {
+    if arguments.contains_key("max_chars") && arguments.contains_key("max_response_chars") {
+        return Err(invalid_repo_scoped_call(
+            "arguments 'max_chars' and 'max_response_chars' are aliases; provide only one response ceiling",
+        ));
+    }
+    for key in ["max_chars", "max_response_chars"] {
+        if arguments.contains_key(key) {
+            validate_optional_u64_range(
+                arguments,
+                key,
+                kin_mcp::budget::RESPONSE_MIN_MAX_CHARS as u64,
+                kin_mcp::budget::RESPONSE_MAX_MAX_CHARS as u64,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn reject_unknown_repo_scoped_arguments(
+    arguments: &HashMap<String, serde_json::Value>,
+    allowed: &[&str],
+) -> std::result::Result<(), RepoScopedMcpFailure> {
+    if let Some(key) = arguments
+        .keys()
+        .find(|key| !allowed.contains(&key.as_str()))
+    {
+        return Err(invalid_repo_scoped_call(format!(
+            "argument '{key}' is not supported by this repo-scoped semantic tool contract"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate the bounded hosted contract before opening any repository
+/// authority. The underlying MCP handlers remain authoritative for their
+/// detailed semantics, but malformed or unbounded input must not first spend a
+/// full hosted snapshot load.
+fn validate_repo_scoped_tool_arguments(
+    name: &str,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), RepoScopedMcpFailure> {
+    validate_response_budget_arguments(arguments)?;
+    match name {
+        "semantic_locate" => {
+            reject_unknown_repo_scoped_arguments(
+                arguments,
+                &[
+                    "query",
+                    "queries",
+                    "limit",
+                    "page_size",
+                    "cursor",
+                    "granularity",
+                    "include_snippet",
+                    "snippet_alias",
+                    "pipeline",
+                    "include_tests",
+                    "explain",
+                    "compact",
+                    "max_chars",
+                    "max_response_chars",
+                ],
+            )?;
+            let cursor = match arguments.get("cursor") {
+                None => None,
+                Some(serde_json::Value::String(cursor)) if !cursor.trim().is_empty() => {
+                    Some(cursor.clone())
+                }
+                Some(_) => {
+                    return Err(RepoScopedMcpFailure::new(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_cursor",
+                        "semantic cursor must be a non-empty string",
+                        false,
+                    ));
+                }
+            };
+            let query = validate_optional_string(arguments, "query", false)?;
+            if cursor.is_none() && query.is_none() {
+                return Err(invalid_repo_scoped_call(
+                    "semantic_locate requires a non-empty 'query' when no cursor is supplied",
+                ));
+            }
+            if let Some(query) = query {
+                if query.chars().count() > REPO_SCOPED_LOCATE_MAX_QUERY_CHARS {
+                    return Err(invalid_repo_scoped_call(format!(
+                        "argument 'query' exceeds the {REPO_SCOPED_LOCATE_MAX_QUERY_CHARS}-character hosted limit"
+                    )));
+                }
+            }
+            if let Some(queries) = arguments.get("queries") {
+                let Some(queries) = queries.as_array() else {
+                    return Err(invalid_repo_scoped_call(
+                        "argument 'queries' must be an array of non-empty strings",
+                    ));
+                };
+                if queries.len() > REPO_SCOPED_LOCATE_MAX_ADDITIONAL_QUERIES {
+                    return Err(invalid_repo_scoped_call(format!(
+                        "argument 'queries' may contain at most {REPO_SCOPED_LOCATE_MAX_ADDITIONAL_QUERIES} additional variants"
+                    )));
+                }
+                for (index, query) in queries.iter().enumerate() {
+                    let Some(query) = query.as_str() else {
+                        return Err(invalid_repo_scoped_call(format!(
+                            "argument 'queries[{index}]' must be a string"
+                        )));
+                    };
+                    if query.trim().is_empty()
+                        || query.chars().count() > REPO_SCOPED_LOCATE_MAX_QUERY_CHARS
+                    {
+                        return Err(invalid_repo_scoped_call(format!(
+                            "argument 'queries[{index}]' must be non-empty and at most {REPO_SCOPED_LOCATE_MAX_QUERY_CHARS} characters"
+                        )));
+                    }
+                }
+            }
+            for key in ["limit", "page_size"] {
+                validate_optional_u64_range(
+                    arguments,
+                    key,
+                    1,
+                    REPO_SCOPED_LOCATE_MAX_PAGE_SIZE,
+                )?;
+            }
+            for key in [
+                "compact",
+                "include_snippet",
+                "snippet_alias",
+                "include_tests",
+                "explain",
+            ] {
+                validate_optional_bool(arguments, key)?;
+            }
+            if let Some(granularity) = validate_optional_string(arguments, "granularity", false)?
+            {
+                if !matches!(granularity.as_str(), "file" | "entity") {
+                    return Err(invalid_repo_scoped_call(
+                        "argument 'granularity' must be 'file' or 'entity'",
+                    ));
+                }
+            }
+            if let Some(pipeline) = validate_optional_string(arguments, "pipeline", false)? {
+                if pipeline != "fused" {
+                    return Err(invalid_repo_scoped_call(
+                        "repo-scoped semantic_locate supports the graph-native fused pipeline only",
+                    ));
+                }
+            }
+        }
+        "get_context_pack" => {
+            reject_unknown_repo_scoped_arguments(
+                arguments,
+                &[
+                    "entity_id",
+                    "token_budget",
+                    "depth",
+                    "include_traffic",
+                    "compact",
+                    "max_chars",
+                    "max_response_chars",
+                ],
+            )?;
+            let entity_id = validate_optional_string(arguments, "entity_id", false)?
+                .ok_or_else(|| invalid_repo_scoped_call("get_context_pack requires 'entity_id'"))?;
+            let parsed_entity_id = Uuid::parse_str(&entity_id).map_err(|_| {
+                invalid_repo_scoped_call(
+                    "get_context_pack argument 'entity_id' must be a UUID",
+                )
+            })?;
+            if !entity_id.eq_ignore_ascii_case(&parsed_entity_id.hyphenated().to_string()) {
+                return Err(invalid_repo_scoped_call(
+                    "get_context_pack argument 'entity_id' must use hyphenated UUID form",
+                ));
+            }
+            validate_optional_u64_range(
+                arguments,
+                "token_budget",
+                1,
+                REPO_SCOPED_CONTEXT_MAX_TOKEN_BUDGET,
+            )?;
+            validate_optional_u64_range(
+                arguments,
+                "depth",
+                1,
+                REPO_SCOPED_CONTEXT_MAX_DEPTH,
+            )?;
+            validate_optional_bool(arguments, "include_traffic")?;
+            validate_optional_bool(arguments, "compact")?;
+            if arguments.get("include_traffic") == Some(&serde_json::Value::Bool(true)) {
+                return Err(invalid_repo_scoped_call(
+                    "repo-scoped get_context_pack cannot include daemon-wide session traffic",
+                ));
+            }
+        }
+        "trace_data_flow" => {
+            reject_unknown_repo_scoped_arguments(
+                arguments,
+                &[
+                    "focal",
+                    "depth",
+                    "direction",
+                    "limit_per_step",
+                    "target",
+                    "include_body",
+                    "compact",
+                    "include_type_edges",
+                    "max_chars",
+                    "max_response_chars",
+                ],
+            )?;
+            let focal = validate_optional_string(arguments, "focal", false)?.ok_or_else(|| {
+                invalid_repo_scoped_call("trace_data_flow requires 'focal'")
+            })?;
+            if focal.chars().count() > REPO_SCOPED_TRACE_MAX_SELECTOR_CHARS {
+                return Err(invalid_repo_scoped_call(format!(
+                    "argument 'focal' exceeds the {REPO_SCOPED_TRACE_MAX_SELECTOR_CHARS}-character hosted limit"
+                )));
+            }
+            validate_optional_u64_range(arguments, "depth", 1, 8)?;
+            validate_optional_u64_range(arguments, "limit_per_step", 1, 25)?;
+            for key in ["include_body", "compact", "include_type_edges"] {
+                validate_optional_bool(arguments, key)?;
+            }
+            if let Some(target) = validate_optional_string(arguments, "target", false)? {
+                if target.chars().count() > REPO_SCOPED_TRACE_MAX_SELECTOR_CHARS {
+                    return Err(invalid_repo_scoped_call(format!(
+                        "argument 'target' exceeds the {REPO_SCOPED_TRACE_MAX_SELECTOR_CHARS}-character hosted limit"
+                    )));
+                }
+            }
+            if let Some(direction) = validate_optional_string(arguments, "direction", false)? {
+                if !matches!(direction.as_str(), "calls" | "callers" | "both") {
+                    return Err(invalid_repo_scoped_call(
+                        "argument 'direction' must be 'calls', 'callers', or 'both'",
+                    ));
+                }
+            }
+        }
+        _ => unreachable!("repo-scoped semantic tool allowlist checked before validation"),
+    }
+    Ok(())
+}
+
+async fn repo_mcp_tools_call(
+    Path(repo_id): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+    request: std::result::Result<
+        Json<RepoScopedMcpToolCallRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return repo_scoped_mcp_error(
+                &repo_id,
+                RepoScopedMcpFailure::new(
+                    rejection.status(),
+                    "invalid_semantic_tool_call",
+                    format!(
+                        "invalid repo-scoped semantic call envelope: {}",
+                        rejection.body_text()
+                    ),
+                    false,
+                ),
+            );
+        }
+    };
+    if request.schema_version != 1 {
+        return repo_scoped_mcp_error(
+            &repo_id,
+            RepoScopedMcpFailure::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_semantic_tool_call",
+                format!(
+                    "unsupported repo-scoped semantic schema version {}",
+                    request.schema_version
+                ),
+                false,
+            ),
+        );
+    }
+    if let Some(selector) = [
+        "repo_id",
+        "repository",
+        "repo_path",
+        "cwd",
+        "workspace",
+        "session_id",
+    ]
+    .into_iter()
+    .find(|selector| request.arguments.contains_key(*selector))
+    {
+        return repo_scoped_mcp_error(
+            &repo_id,
+            RepoScopedMcpFailure::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_semantic_tool_call",
+                format!(
+                    "argument '{selector}' is not allowed; the path repository is the only repository selector"
+                ),
+                false,
+            ),
+        );
+    }
+    if !matches!(
+        request.name.as_str(),
+        "semantic_locate" | "get_context_pack" | "trace_data_flow"
+    ) {
+        return repo_scoped_mcp_error(
+            &repo_id,
+            RepoScopedMcpFailure::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid_semantic_tool_call",
+                format!(
+                    "tool '{}' is not available on the repo-scoped hosted semantic route",
+                    request.name
+                ),
+                false,
+            ),
+        );
+    }
+    if request.name != "semantic_locate" && request.arguments.contains_key("cursor") {
+        return repo_scoped_mcp_error(
+            &repo_id,
+            invalid_repo_scoped_call("semantic cursors are valid only for semantic_locate"),
+        );
+    }
+    if let Err(failure) = validate_repo_scoped_tool_arguments(&request.name, &request.arguments) {
+        return repo_scoped_mcp_error(&repo_id, failure);
+    }
+    let prepared_cursor =
+        match prepare_repo_semantic_cursor(&state, &repo_id, &request.arguments) {
+            Ok(cursor) => cursor,
+            Err(failure) => return repo_scoped_mcp_error(&repo_id, failure),
+        };
+    let view = match load_hosted_repository_mcp_view(&state, &repo_id).await {
+        Ok(view) => view,
+        Err(failure) => return repo_scoped_mcp_error(&repo_id, failure),
+    };
+    let mut arguments = request.arguments;
+    if let Err(failure) =
+        resolve_prepared_repo_semantic_cursor(prepared_cursor, view.as_ref(), &mut arguments)
+    {
+        return repo_scoped_mcp_error(&repo_id, failure);
+    }
+
+    // Hosted semantic calls have no repository-scoped session authority yet.
+    // The daemon-wide coordinator is not a safe substitute: entity IDs are
+    // content-derived without a repository component, so an intent registered
+    // for repo A can name the same ID as an entity in repo B. Default hosted
+    // context packs to no traffic and reject an explicit request for it instead
+    // of leaking cross-repository coordination state or silently pretending it
+    // was scoped.
+    if request.name == "get_context_pack" {
+        arguments.insert("include_traffic".to_string(), json!(false));
+    }
+
+    let result = match request.name.as_str() {
+        "semantic_locate" => {
+            build_fused_semantic_locate_result(
+                &state,
+                None,
+                view.graph.as_ref(),
+                &arguments,
+                Some(view.as_ref()),
+            )
+            .await
+        }
+        "get_context_pack" => {
+            let sessions = kin_mcp::SessionRegistry::new();
+            match kin_mcp::handlers::entities::handle_get_context_pack(
+                &arguments,
+                view.graph.as_ref(),
+                &sessions,
+                Some(&view.repository_authority),
+            )
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    return repo_scoped_mcp_error(
+                        &repo_id,
+                        repo_scoped_handler_failure(error),
+                    );
+                }
+            }
+        }
+        "trace_data_flow" => match hosted_trace_data_flow_result(view.as_ref(), &arguments) {
+            Ok(result) => result,
+            Err(failure) => return repo_scoped_mcp_error(&repo_id, failure),
+        },
+        _ => unreachable!("repo-scoped semantic tool allowlist checked above"),
+    };
+
+    if let Some(message) = mcp_tool_result_error(&result) {
+        let authority_gap = message.contains("graph authority gap");
+        let cursor_unavailable =
+            message.contains("repo-scoped semantic cursor ranking is unavailable");
+        if cursor_unavailable || authority_gap || request.name == "semantic_locate" {
+            return repo_scoped_mcp_error(
+                &repo_id,
+                RepoScopedMcpFailure::new(
+                    if cursor_unavailable {
+                        StatusCode::GONE
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    },
+                    if cursor_unavailable {
+                        "cursor_unavailable"
+                    } else if authority_gap {
+                        "repo_authority_unavailable"
+                    } else {
+                        "repo_semantic_unready"
+                    },
+                    message,
+                    cursor_unavailable || authority_gap || request.name == "semantic_locate",
+                ),
+            );
+        }
+    }
+    if let Some(failure) = repo_scoped_source_degradation(&result) {
+        return repo_scoped_mcp_error(&repo_id, failure);
+    }
+
+    let mut result = result;
+    if request.name == "semantic_locate" {
+        if let Err(failure) =
+            bind_repo_semantic_cursor(&state, view.as_ref(), &mut result)
+        {
+            return repo_scoped_mcp_error(&repo_id, failure);
+        }
+    }
+    let budget = kin_mcp::budget::ResponseBudget::from_arguments(&arguments).less_envelope_reserve();
+    let result = bound_mcp_tool_result(result, &request.name, &budget);
+    repo_scoped_mcp_success(view.as_ref(), request.name, result)
+}
+
+fn enrich_hosted_trace_record(
+    view: &HostedRepositoryMcpView,
+    held: &kin_mcp::handlers::common::HeldSourceAuthority<'_, kin_db::InMemoryGraph>,
+    record: &mut serde_json::Value,
+    max_chars: usize,
+) -> std::result::Result<bool, RepoScopedMcpFailure> {
+    let Some(entity_id) = hosted_trace_record_entity_id(record) else {
+        return Ok(false);
+    };
+    let Some(entity) = view.graph.get_entity(&entity_id).map_err(|error| {
+        RepoScopedMcpFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "repo_semantic_unready",
+            error.to_string(),
+            true,
+        )
+    })?
+    else {
+        return Ok(false);
+    };
+    let source = match kin_mcp::handlers::common::read_entity_source_excerpt_detailed_held(
+        held,
+        &entity,
+        400,
+        max_chars,
+        kin_mcp::handlers::common::EntitySourceScope::WorkspaceHead,
+    ) {
+        Ok(source) => source,
+        Err(error) if kin_mcp::handlers::common::is_absent_at_generation(&error) => None,
+        Err(error) => {
+            return Err(RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "repo_authority_unavailable",
+                error.to_string(),
+                true,
+            ));
+        }
+    };
+    let Some(source) = source else {
+        return Ok(false);
+    };
+    record["body"] = json!(source.body);
+    if let Some(record) = record.as_object_mut() {
+        for (key, value) in kin_mcp::handlers::common::source_provenance_fields(&source) {
+            record.insert(key, value);
+        }
+    }
+    Ok(true)
+}
+
+fn hosted_trace_record_entity_id(record: &serde_json::Value) -> Option<EntityId> {
+    record
+        .get("entity_id")
+        .or_else(|| record.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|entity_id| Uuid::parse_str(entity_id).ok())
+        .map(EntityId)
+}
+
+fn hosted_trace_source_read_budget(
+    payload: &serde_json::Value,
+    response_budget: &kin_mcp::budget::ResponseBudget,
+) -> (usize, usize) {
+    let remaining_chars = response_budget
+        .max_chars
+        .saturating_sub(kin_mcp::budget::measure(payload))
+        .saturating_sub(REPO_SCOPED_TRACE_BODY_METADATA_RESERVE_CHARS);
+    if remaining_chars < 512 {
+        return (0, 0);
+    }
+    let read_cap = (remaining_chars / REPO_SCOPED_TRACE_BODY_READ_UNIT_CHARS)
+        .clamp(1, REPO_SCOPED_TRACE_BODY_READ_CAP);
+    let max_chars_per_body = (remaining_chars / read_cap).min(32 * 1024);
+    (read_cap, max_chars_per_body)
+}
+
+fn hosted_trace_data_flow_result(
+    view: &HostedRepositoryMcpView,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<kin_mcp::ToolCallResult, RepoScopedMcpFailure> {
+    let mut result = kin_mcp::handlers::entities::handle_trace_data_flow(
+        arguments,
+        view.graph.as_ref(),
+    )
+    .map_err(repo_scoped_handler_failure)?;
+    if result.is_error == Some(true) {
+        return Ok(result);
+    }
+    let include_body = arguments
+        .get("include_body")
+        .and_then(serde_json::Value::as_bool)
+        .or_else(|| {
+            arguments
+                .get("compact")
+                .and_then(serde_json::Value::as_bool)
+                .map(|compact| !compact)
+        })
+        .unwrap_or(true);
+    let response_budget =
+        kin_mcp::budget::ResponseBudget::from_arguments(arguments).less_envelope_reserve();
+    let mut remaining_body_reads = REPO_SCOPED_TRACE_BODY_READ_CAP;
+    for block in &mut result.content {
+        let kin_mcp::ContentBlock::Text { text } = block;
+        let mut payload = serde_json::from_str::<serde_json::Value>(text).map_err(|error| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "trace_response_invalid",
+                error.to_string(),
+                true,
+            )
+        })?;
+        let mut bodies_included = 0usize;
+        let source_read_eligible_records = if include_body {
+            usize::from(
+                payload
+                    .get("focal_entity")
+                    .and_then(hosted_trace_record_entity_id)
+                    .is_some(),
+            ) + payload
+                .get("chain")
+                .and_then(serde_json::Value::as_array)
+                .map(|chain| {
+                    chain
+                        .iter()
+                        .filter(|step| hosted_trace_record_entity_id(step).is_some())
+                        .count()
+                })
+                .unwrap_or_default()
+        } else {
+            0
+        };
+        let (payload_body_read_cap, max_chars_per_body) =
+            hosted_trace_source_read_budget(&payload, &response_budget);
+        let mut payload_body_reads_remaining =
+            remaining_body_reads.min(payload_body_read_cap);
+        let mut body_reads = 0usize;
+        if include_body {
+            let held = kin_mcp::handlers::common::HeldSourceAuthority::new(
+                view.graph.as_ref(),
+                Some(&view.repository_authority),
+            );
+            if payload_body_reads_remaining > 0 {
+                if let Some(focal) = payload.get_mut("focal_entity") {
+                    if hosted_trace_record_entity_id(focal).is_some() {
+                        body_reads += 1;
+                        payload_body_reads_remaining -= 1;
+                        remaining_body_reads -= 1;
+                        bodies_included += usize::from(enrich_hosted_trace_record(
+                            view,
+                            &held,
+                            focal,
+                            max_chars_per_body,
+                        )?);
+                    }
+                }
+            }
+            if let Some(chain) = payload
+                .get_mut("chain")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for step in chain {
+                    if payload_body_reads_remaining == 0 {
+                        break;
+                    }
+                    if hosted_trace_record_entity_id(step).is_none() {
+                        continue;
+                    }
+                    body_reads += 1;
+                    payload_body_reads_remaining -= 1;
+                    remaining_body_reads -= 1;
+                    bodies_included += usize::from(enrich_hosted_trace_record(
+                        view,
+                        &held,
+                        step,
+                        max_chars_per_body,
+                    )?);
+                }
+            }
+        }
+        let source_reads_withheld = source_read_eligible_records.saturating_sub(body_reads);
+        payload["bodies_included"] = json!(bodies_included > 0);
+        payload["source_reads_attempted"] = json!(body_reads);
+        payload["source_read_eligible_records"] = json!(source_read_eligible_records);
+        if source_reads_withheld > 0 {
+            payload["source_reads_capped"] = json!(true);
+            payload["source_reads_withheld"] = json!(source_reads_withheld);
+            let disclosure = json!({
+                "component": "entity_source",
+                "reason": "response_budget_source_reads_capped",
+                "detail": format!(
+                    "the hosted trace attempted source projection for {body_reads} of {source_read_eligible_records} eligible entity records before response assembly under its {}-character budget; eligibility does not claim that every record has a source body",
+                    response_budget.max_chars
+                ),
+                "remediation": "request include_body: false for chain shape, narrow depth or limit_per_step, or make targeted get_context_pack calls for omitted entities"
+            });
+            match payload
+                .get_mut("degradations")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                Some(degradations) => degradations.push(disclosure),
+                None => payload["degradations"] = json!([disclosure]),
+            }
+        }
+        payload["repository_id"] = json!(view.repository_id.to_string());
+        payload["repository_graph_root"] = json!(view.graph_root);
+        payload["source_change_id"] = json!(view.selected_change_id.to_string());
+        *text = serde_json::to_string_pretty(&payload).map_err(|error| {
+            RepoScopedMcpFailure::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "trace_response_invalid",
+                error.to_string(),
+                true,
+            )
+        })?;
+    }
+    Ok(result)
+}
+
 /// POST /mcp/tools/call.
 ///
 /// The route bounds every retrieval response it serves, on the same budget and
@@ -9174,6 +10990,9 @@ fn bound_mcp_tool_result(
                 return kin_mcp::ContentBlock::Text { text };
             }
             kin_mcp::budget::enforce(&mut payload, tool, budget);
+            if tool == "trace_data_flow" {
+                reconcile_trace_body_presence(&mut payload);
+            }
             match serde_json::to_string_pretty(&payload) {
                 Ok(rendered) => kin_mcp::ContentBlock::Text { text: rendered },
                 Err(_) => kin_mcp::ContentBlock::Text { text },
@@ -9184,6 +11003,28 @@ fn bound_mcp_tool_result(
         content,
         is_error: result.is_error,
     }
+}
+
+/// Keep the trace's body-presence claim aligned with what survives the common
+/// response-budget ladder. The ladder represents removed bodies as explicit
+/// nulls after the hosted trace assembled its metadata, so the pre-budget
+/// boolean cannot be trusted after that pass.
+fn reconcile_trace_body_presence(payload: &mut serde_json::Value) {
+    fn carries_body(record: &serde_json::Value) -> bool {
+        record
+            .as_object()
+            .and_then(|record| record.get("body"))
+            .is_some_and(|body| !body.is_null())
+    }
+    let focal_carries_body = ["focal_entity", "focal"]
+        .into_iter()
+        .filter_map(|key| payload.get(key))
+        .any(carries_body);
+    let chain_carries_body = payload
+        .get("chain")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|chain| chain.iter().any(carries_body));
+    payload["bodies_included"] = json!(focal_carries_body || chain_carries_body);
 }
 
 async fn mcp_tools_call_inner(
@@ -9523,6 +11364,7 @@ async fn mcp_tools_call_inner(
                     session_id.as_ref(),
                     graph.as_ref(),
                     &request.arguments,
+                    None,
                 )
                 .await,
             ));
@@ -10833,6 +12675,11 @@ async fn repo_health(
             .graph_status_live_sample_failures
             .load(std::sync::atomic::Ordering::Relaxed),
         status_answerable: state.graph_status_is_answerable(),
+        semantic_capabilities: state
+            .storage_backend
+            .as_ref()
+            .map(|_| vec![REPO_SCOPED_SEMANTIC_CAPABILITY.to_string()])
+            .unwrap_or_default(),
     }))
 }
 
@@ -15908,6 +17755,237 @@ mod tests {
         change.id
     }
 
+    fn publish_hosted_semantic_change(
+        storage: &FsPath,
+        repository_id: &RepositoryId,
+        previous: Option<SemanticChangeId>,
+        operation: u128,
+        message: &str,
+        symbols: &[(&str, &str, &str)],
+    ) -> (SemanticChangeId, Vec<EntityId>) {
+        use kin_model::{
+            compute_semantic_change_id, AdmissionPolicyDelta, ChangeOrigin,
+            DefaultRefExpectation, DefaultRefMutation, RefExpectation, RefMutation, RefTarget,
+            RefUpdatePolicy, RepositoryTransaction, SharedAdmissionPolicy,
+            REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        };
+
+        let manager = RepositoryAuthorityManager::open(
+            repository_id.clone(),
+            Arc::new(kin_db::LocalFileBackend::new(storage.to_path_buf())),
+        )
+        .unwrap();
+        let mut entities = Vec::with_capacity(symbols.len());
+        let mut entity_deltas = Vec::with_capacity(symbols.len());
+        let mut tree_deltas = Vec::with_capacity(symbols.len());
+        for &(name, path, body) in symbols {
+            let bytes = body.as_bytes();
+            let digest = Hash256::from_bytes(Sha256::digest(bytes).into());
+            manager.save_source_blob(digest, bytes).unwrap();
+            let mut entity = test_entity(name, path);
+            entity.span = Some(SourceSpan {
+                file: FilePathId::new(path),
+                start_byte: 0,
+                end_byte: bytes.len(),
+                start_line: 0,
+                start_col: 0,
+                end_line: u32::try_from(body.lines().count().saturating_sub(1)).unwrap(),
+                end_col: u32::try_from(body.lines().last().map(str::len).unwrap_or(0)).unwrap(),
+            });
+            entity.signature = body.lines().next().unwrap_or(name).to_string();
+            entity.metadata.extra.insert(
+                "embedding_body_preview".to_string(),
+                json!(body.lines().next().unwrap_or(name)),
+            );
+            entities.push(entity.id);
+            entity_deltas.push(EntityDelta::Added {
+                new: entity.clone(),
+            });
+            tree_deltas.push(kin_model::TreeDelta::Added {
+                artifact_id: kin_model::ArtifactId::new(),
+                new: kin_model::LocatedEntry::new(
+                    RepoPath::from_utf8(path).unwrap(),
+                    TreeEntry::blob(digest, false),
+                ),
+            });
+        }
+        let relation_deltas = entities
+            .windows(2)
+            .map(|pair| {
+                kin_model::RelationDelta::Added {
+                    new: kin_model::Relation {
+                        id: kin_model::RelationId::new(),
+                        kind: RelationKind::Calls,
+                        src: GraphNodeId::Entity(pair[0]),
+                        dst: GraphNodeId::Entity(pair[1]),
+                        confidence: 1.0,
+                        origin: kin_model::RelationOrigin::Parsed,
+                        created_in: None,
+                        import_source: None,
+                        evidence: Vec::new(),
+                    },
+                }
+            })
+            .collect();
+        let mut change = SemanticChange {
+            id: SemanticChangeId::from_hash(Hash256::from_bytes([0; 32])),
+            origin: ChangeOrigin::Native,
+            parents: previous.into_iter().collect(),
+            timestamp: Timestamp::now(),
+            author: AuthorId::new("repo-scoped-mcp-test"),
+            message: message.to_string(),
+            entity_deltas,
+            relation_deltas,
+            tree_deltas,
+            admission_policy_delta: previous
+                .is_none()
+                .then(|| AdmissionPolicyDelta::initialize(SharedAdmissionPolicy::empty(0))),
+            projected_files: Vec::new(),
+            spec_link: None,
+            evidence: Vec::new(),
+            risk_summary: None,
+            external_reference_deltas: Vec::new(),
+        };
+        change.id = compute_semantic_change_id(&change).unwrap();
+        let main = kin_model::RefName::branch(b"main").unwrap();
+        let lease = manager.read_authority();
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: kin_model::OperationId::from_uuid(Uuid::from_u128(operation)),
+            repository_id: repository_id.clone(),
+            expected_generation: lease.roots().generation,
+            expected_roots: lease.roots().clone(),
+            actor: AuthorId::new("repo-scoped-mcp-test"),
+            reason: message.to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: vec![change.clone()],
+            aliases: Vec::new(),
+            ref_mutations: vec![RefMutation {
+                name: main.clone(),
+                expected: match previous {
+                    Some(head) => RefExpectation::MustEqual {
+                        target: RefTarget::change(head),
+                    },
+                    None => RefExpectation::MustNotExist,
+                },
+                new_target: Some(RefTarget::change(change.id)),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+            default_ref_mutation: previous.is_none().then_some(DefaultRefMutation {
+                expected: DefaultRefExpectation::MustBeUnset,
+                new_default: Some(main),
+            }),
+            workspace_mutation: None,
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        drop(lease);
+        manager.commit_repository_transaction(transaction).unwrap();
+        (change.id, entities)
+    }
+
+    fn reopen_hosted_state(
+        storage: &FsPath,
+        advertised_repo_id: &str,
+    ) -> (Arc<DaemonState>, tempfile::TempDir) {
+        install_test_registry_override();
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let state = Arc::new(
+            DaemonState::open_with_backend(
+                layout,
+                Box::new(kin_db::LocalFileBackend::new(storage.to_path_buf())),
+                advertised_repo_id,
+                None,
+            )
+            .unwrap(),
+        );
+        (state, working)
+    }
+
+    async fn call_repo_mcp_tool(
+        app: Router,
+        repo_id: &str,
+        name: &str,
+        arguments: serde_json::Value,
+        token: Option<&str>,
+    ) -> (StatusCode, HeaderMap, serde_json::Value) {
+        let mut request = Request::post(format!("/repos/{repo_id}/mcp/tools/call"))
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .oneshot(
+                request
+                    .body(Body::from(
+                        json!({
+                            "schema_version": 1,
+                            "name": name,
+                            "arguments": arguments
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&body).unwrap_or_else(|_| {
+            json!({ "unparsed": String::from_utf8_lossy(&body).to_string() })
+        });
+        (status, headers, value)
+    }
+
+    async fn call_repo_mcp_raw(
+        app: Router,
+        repo_id: &str,
+        body: String,
+        content_type: Option<&str>,
+        token: Option<&str>,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut request = Request::post(format!("/repos/{repo_id}/mcp/tools/call"));
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body)).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let value = serde_json::from_slice(&body).unwrap_or_else(|_| {
+            json!({ "unparsed": String::from_utf8_lossy(&body).to_string() })
+        });
+        (status, value)
+    }
+
+    fn successful_repo_mcp_payload(value: serde_json::Value) -> serde_json::Value {
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(
+            value["capability"],
+            REPO_SCOPED_SEMANTIC_CAPABILITY
+        );
+        let result: kin_mcp::ToolCallResult =
+            serde_json::from_value(value["result"].clone()).unwrap();
+        assert_ne!(result.is_error, Some(true), "repo-scoped MCP call failed");
+        let text = match result.content.first().unwrap() {
+            kin_mcp::ContentBlock::Text { text } => text,
+        };
+        serde_json::from_str(text).unwrap()
+    }
+
     async fn transfer_command(
         state: Arc<DaemonState>,
         leaf: &str,
@@ -16031,6 +18109,1105 @@ mod tests {
             detail.contains("authority envelope"),
             "the refusal must name the missing envelope, got: {detail}"
         );
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_hosted_tools_answer_only_from_the_selected_repository() {
+        let _budget = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_TOTAL_TIMEOUT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", "0")
+            .with("KIN_LOCATE_PHASE_MULTIHOP_SECS", "0")
+            .with("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SCORING_SECS", "0");
+        let repo_a = format!("repo-scoped-a-{}", Uuid::new_v4());
+        let repo_b = format!("repo-scoped-b-{}", Uuid::new_v4());
+        let repo_a_id = RepositoryId::new(repo_a.clone()).unwrap();
+        let repo_b_id = RepositoryId::new(repo_b.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_a);
+        let (_, a_entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repo_a_id,
+            None,
+            0x8a01,
+            "publish repository A semantic fixture",
+            &[
+                (
+                    "shared_symbol",
+                    "src/repo_a.rs",
+                    "pub fn shared_symbol() -> &'static str { a_only_sink(); \"repo_a_marker\" }\n",
+                ),
+                (
+                    "a_only_sink",
+                    "src/a_sink.rs",
+                    "pub fn a_only_sink() -> &'static str { \"repo_a_sink_marker\" }\n",
+                ),
+            ],
+        );
+        let (_, b_entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repo_b_id,
+            None,
+            0x8b01,
+            "publish repository B semantic fixture",
+            &[
+                (
+                    "shared_symbol",
+                    "src/repo_b.rs",
+                    "pub fn shared_symbol() -> &'static str { b_only_sink(); \"repo_b_marker\" }\n",
+                ),
+                (
+                    "b_only_sink",
+                    "src/b_sink.rs",
+                    "pub fn b_only_sink() -> &'static str { \"repo_b_sink_marker\" }\n",
+                ),
+            ],
+        );
+        let local_poison = "LOCAL_FALLBACK_POISON";
+        std::fs::create_dir_all(state.layout.working_dir().join("src")).unwrap();
+        for path in ["repo_a.rs", "a_sink.rs", "repo_b.rs", "b_sink.rs"] {
+            std::fs::write(
+                state.layout.working_dir().join("src").join(path),
+                format!("fn {local_poison}() {{}}\n"),
+            )
+            .unwrap();
+        }
+        let app = router(state);
+        let mut locate_authorities: Vec<(String, String, String)> = Vec::new();
+
+        for (
+            repo_id,
+            entity_id,
+            other_entity_id,
+            own_marker,
+            other_marker,
+            own_path,
+            other_path,
+            own_sink,
+            other_sink,
+            own_sink_marker,
+            other_sink_marker,
+        ) in [
+            (
+                &repo_a,
+                a_entities[0],
+                b_entities[0],
+                "repo_a_marker",
+                "repo_b_marker",
+                "src/repo_a.rs",
+                "src/repo_b.rs",
+                "a_only_sink",
+                "b_only_sink",
+                "repo_a_sink_marker",
+                "repo_b_sink_marker",
+            ),
+            (
+                &repo_b,
+                b_entities[0],
+                a_entities[0],
+                "repo_b_marker",
+                "repo_a_marker",
+                "src/repo_b.rs",
+                "src/repo_a.rs",
+                "b_only_sink",
+                "a_only_sink",
+                "repo_b_sink_marker",
+                "repo_a_sink_marker",
+            ),
+        ] {
+            let (status, headers, located) = call_repo_mcp_tool(
+                app.clone(),
+                repo_id,
+                "semantic_locate",
+                json!({
+                    "query": "shared_symbol",
+                    "limit": 5,
+                    "include_snippet": true
+                }),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{located}");
+            assert_eq!(located["repository"]["repo_id"], repo_id.as_str());
+            let own_root = located["repository"]["graph_root"]
+                .as_str()
+                .expect("a hosted semantic response must name its graph root")
+                .to_string();
+            assert_eq!(own_root.len(), 64, "{located}");
+            let full_located = located.to_string();
+            assert!(full_located.contains(&own_root), "{located}");
+            locate_authorities.push((repo_id.to_string(), own_root, full_located));
+            assert_eq!(
+                headers
+                    .get("x-kin-repository-id")
+                    .and_then(|value| value.to_str().ok()),
+                Some(repo_id.as_str())
+            );
+            let located = successful_repo_mcp_payload(located);
+            let rendered = located.to_string();
+            assert!(rendered.contains(&entity_id.to_string()), "{located}");
+            assert!(!rendered.contains(&other_entity_id.to_string()), "{located}");
+            assert!(rendered.contains(own_path), "{located}");
+            assert!(!rendered.contains(other_path), "{located}");
+            assert!(rendered.contains(own_marker), "{located}");
+            assert!(!rendered.contains(other_marker), "{located}");
+            assert!(
+                !rendered.contains(local_poison),
+                "hosted locate must not consult the daemon working tree: {located}"
+            );
+
+            let (status, _, pack) = call_repo_mcp_tool(
+                app.clone(),
+                repo_id,
+                "get_context_pack",
+                json!({ "entity_id": entity_id.to_string() }),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{pack}");
+            let pack = successful_repo_mcp_payload(pack);
+            let rendered = pack.to_string();
+            assert!(rendered.contains(own_sink), "{pack}");
+            assert!(!rendered.contains(other_sink), "{pack}");
+            assert!(rendered.contains(own_marker), "{pack}");
+            assert!(!rendered.contains(other_marker), "{pack}");
+            assert!(
+                !rendered.contains(local_poison),
+                "hosted context must not consult the daemon working tree: {pack}"
+            );
+
+            let (status, _, trace) = call_repo_mcp_tool(
+                app.clone(),
+                repo_id,
+                "trace_data_flow",
+                json!({ "focal": entity_id.to_string(), "include_body": true }),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{trace}");
+            let trace = successful_repo_mcp_payload(trace);
+            assert_eq!(trace["repository_id"], repo_id.as_str());
+            assert_eq!(trace["bodies_included"], true);
+            let rendered = trace.to_string();
+            assert!(rendered.contains(own_sink), "{trace}");
+            assert!(!rendered.contains(other_sink), "{trace}");
+            assert!(rendered.contains(own_marker), "{trace}");
+            assert!(!rendered.contains(other_marker), "{trace}");
+            assert!(
+                !rendered.contains(local_poison),
+                "hosted trace must not consult the daemon working tree: {trace}"
+            );
+            assert!(
+                trace["focal_entity"]["body"]
+                    .as_str()
+                    .is_some_and(|body| body.contains(own_marker)),
+                "the focal source body must come from the selected repository: {trace}"
+            );
+            assert!(
+                trace["chain"]
+                    .as_array()
+                    .is_some_and(|chain| chain.iter().any(|step| step["body"]
+                        .as_str()
+                        .is_some_and(|body| body.contains(own_sink_marker)))),
+                "the traced sink body must come from the selected repository: {trace}"
+            );
+            assert!(
+                !rendered.contains(other_sink_marker),
+                "the trace must not carry the other repository's sink body: {trace}"
+            );
+        }
+        assert_eq!(locate_authorities.len(), 2);
+        assert_ne!(
+            locate_authorities[0].1, locate_authorities[1].1,
+            "conflicting-symbol fixtures must produce distinct graph roots"
+        );
+        for index in 0..locate_authorities.len() {
+            let other_index = 1 - index;
+            assert!(
+                !locate_authorities[index]
+                    .2
+                    .contains(&locate_authorities[other_index].1),
+                "repository {} response carried repository {} graph root: {}",
+                locate_authorities[index].0,
+                locate_authorities[other_index].0,
+                locate_authorities[index].2
+            );
+        }
+
+        let (status, _, rejected) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "semantic_locate",
+            json!({ "query": "shared_symbol", "repo_id": repo_b }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "invalid_semantic_tool_call");
+
+        let (status, _, wrong_repository_entity) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_b,
+            "get_context_pack",
+            json!({ "entity_id": a_entities[0].to_string() }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{wrong_repository_entity}");
+        assert_eq!(
+            wrong_repository_entity["result"]["isError"],
+            true,
+            "an entity from repository A must not resolve through repository B: {wrong_repository_entity}"
+        );
+        assert!(
+            !wrong_repository_entity.to_string().contains("repo_a_marker"),
+            "the failed B lookup must not carry A source: {wrong_repository_entity}"
+        );
+
+        let (status, _, rejected) = call_repo_mcp_tool(
+            app,
+            &repo_a,
+            "get_context_pack",
+            json!({
+                "entity_id": a_entities[0].to_string(),
+                "include_traffic": true
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
+        assert_eq!(rejected["error"]["code"], "invalid_semantic_tool_call");
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("daemon-wide session traffic")),
+            "hosted context must fail loud instead of reading the global traffic registry: {rejected}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_hosted_auth_rejects_missing_and_wrong_tokens() {
+        let repo_id = format!("repo-scoped-auth-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8c01,
+            "publish protected semantic fixture",
+            &[("protected_symbol", "src/auth.rs", "fn protected_symbol() {}\n")],
+        );
+        let app = router_with_auth(state, Some("repo-secret".to_string()));
+
+        for token in [None, Some("wrong-secret")] {
+            let (status, headers, body) = call_repo_mcp_tool(
+                app.clone(),
+                &repo_id,
+                "semantic_locate",
+                json!({ "query": "protected_symbol" }),
+                token,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["schema_version"], 1, "{body}");
+            assert_eq!(body["capability"], REPO_SCOPED_SEMANTIC_CAPABILITY, "{body}");
+            assert_eq!(body["error"]["code"], "authentication_required", "{body}");
+            assert_eq!(body["error"]["repo_id"], repo_id, "{body}");
+            assert_eq!(body["error"]["retryable"], false, "{body}");
+            assert_eq!(
+                headers
+                    .get("x-kin-semantic-capability")
+                    .and_then(|value| value.to_str().ok()),
+                Some(REPO_SCOPED_SEMANTIC_CAPABILITY)
+            );
+        }
+        let (status, headers, result) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_id,
+            "semantic_locate",
+            json!({ "query": "protected_symbol" }),
+            Some("repo-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(
+            headers
+                .get("x-kin-semantic-capability")
+                .and_then(|value| value.to_str().ok()),
+            Some(REPO_SCOPED_SEMANTIC_CAPABILITY)
+        );
+
+        let response = app
+            .oneshot(
+                Request::get(format!("/repos/{repo_id}/health"))
+                    .header("authorization", "Bearer repo-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let health: RepoHealthResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            health.semantic_capabilities,
+            vec![REPO_SCOPED_SEMANTIC_CAPABILITY.to_string()]
+        );
+
+        // Authentication must run before even the cheap repository-address
+        // check or the hosted snapshot probe. The armed backend makes the
+        // ordering falsifiable: the same valid call reaches a 503 only after a
+        // correct token, while missing and wrong tokens stay 401.
+        let fault_repo = format!("repo-scoped-auth-fault-{}", Uuid::new_v4());
+        let (fault_state, faults) =
+            hosted_state_with_allowlist("repo-mcp-auth-before-load", &fault_repo, &[]);
+        faults.start_faulting(&fault_repo);
+        let fault_app = router_with_auth(fault_state, Some("fault-secret".to_string()));
+        for token in [None, Some("wrong-secret")] {
+            let (status, headers, body) = call_repo_mcp_tool(
+                fault_app.clone(),
+                &fault_repo,
+                "semantic_locate",
+                json!({ "query": "protected_symbol" }),
+                token,
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+            assert_eq!(body["error"]["code"], "authentication_required", "{body}");
+            assert_eq!(body["error"]["repo_id"], fault_repo, "{body}");
+            assert_eq!(
+                headers
+                    .get("x-kin-semantic-capability")
+                    .and_then(|value| value.to_str().ok()),
+                Some(REPO_SCOPED_SEMANTIC_CAPABILITY)
+            );
+            assert!(
+                !body.to_string().contains(BACKEND_FAULT_TEXT),
+                "an unauthenticated call must not touch hosted authority: {body}"
+            );
+        }
+        let (status, _, body) = call_repo_mcp_tool(
+            fault_app,
+            &fault_repo,
+            "semantic_locate",
+            json!({ "query": "protected_symbol" }),
+            Some("fault-secret"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert!(
+            body.to_string().contains(BACKEND_FAULT_TEXT),
+            "the control must prove the armed backend would be reached after authentication: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_envelope_and_bounds_fail_before_authority_load() {
+        let repo_id = format!("repo-scoped-invalid-{}", Uuid::new_v4());
+        let (state, faults) =
+            hosted_state_with_allowlist("repo-mcp-invalid-before-load", &repo_id, &[]);
+        faults.start_faulting(&repo_id);
+        let app = router(state);
+
+        for (body, content_type, expected) in [
+            ("{".to_string(), Some("application/json"), StatusCode::BAD_REQUEST),
+            (
+                "{}".to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "semantic_locate",
+                    "arguments": { "query": "bounded", "page_size": 201 }
+                })
+                .to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "semantic_locate",
+                    "arguments": { "query": "bounded", "unexpected": true }
+                })
+                .to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "semantic_locate",
+                    "arguments": { "query": "x".repeat(REPO_SCOPED_LOCATE_MAX_QUERY_CHARS + 1) }
+                })
+                .to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "get_context_pack",
+                    "arguments": { "entity_id": "not-a-uuid" }
+                })
+                .to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "trace_data_flow",
+                    "arguments": { "focal": "bounded", "cursor": "not-valid-here" }
+                })
+                .to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "trace_data_flow",
+                    "arguments": { "focal": "bounded", "max_chars": 1_999 }
+                })
+                .to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "trace_data_flow",
+                    "arguments": {
+                        "focal": "bounded",
+                        "max_chars": 20_000,
+                        "max_response_chars": 30_000
+                    }
+                })
+                .to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "trace_data_flow",
+                    "arguments": {
+                        "focal": "x".repeat(REPO_SCOPED_TRACE_MAX_SELECTOR_CHARS + 1)
+                    }
+                })
+                .to_string(),
+                Some("application/json"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                json!({
+                    "schema_version": 1,
+                    "name": "semantic_locate",
+                    "arguments": { "query": "bounded" }
+                })
+                .to_string(),
+                Some("text/plain"),
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ] {
+            let (status, response) =
+                call_repo_mcp_raw(app.clone(), &repo_id, body, content_type, None).await;
+            assert_eq!(status, expected, "{response}");
+            assert_eq!(response["schema_version"], 1, "{response}");
+            assert_eq!(
+                response["error"]["code"],
+                "invalid_semantic_tool_call",
+                "{response}"
+            );
+            assert!(
+                !response.to_string().contains(BACKEND_FAULT_TEXT),
+                "invalid input must be rejected before the hosted backend is read: {response}"
+            );
+        }
+
+        let oversized = " ".repeat(REPO_SCOPED_CALL_MAX_BODY_BYTES + 1);
+        let (status, response) = call_repo_mcp_raw(
+            app.clone(),
+            &repo_id,
+            oversized,
+            Some("application/json"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{response}");
+        assert_eq!(response["error"]["code"], "invalid_semantic_tool_call");
+        assert!(
+            !response.to_string().contains(BACKEND_FAULT_TEXT),
+            "an oversized body must be bounded before authority is read: {response}"
+        );
+
+        let (status, control) = call_repo_mcp_raw(
+            app,
+            &repo_id,
+            json!({
+                "schema_version": 1,
+                "name": "semantic_locate",
+                "arguments": { "query": "bounded" }
+            })
+            .to_string(),
+            Some("application/vnd.kin.semantic+json"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{control}");
+        assert!(
+            control.to_string().contains(BACKEND_FAULT_TEXT),
+            "vendor JSON must reach the armed backend after typed extraction: {control}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_warm_cache_revalidates_with_cursor_without_authority_body_load() {
+        install_test_registry_override();
+        let repo_id = format!("repo-scoped-cursor-probe-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let working = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(working.path()).unwrap().layout;
+        let storage = tempfile::tempdir().unwrap();
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8ef0,
+            "publish metadata-only cursor fixture",
+            &[(
+                "cursor_probe_symbol",
+                "src/cursor_probe.rs",
+                "fn cursor_probe_symbol() {}\n",
+            )],
+        );
+        let (backend, faults) = RepoFaultBackend::new(storage.path());
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+
+        let first = load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .expect("the cold load must materialize the published authority");
+        let authority_loads = faults.authority_loads(&repo_id);
+        let cursor_probes = faults.cursor_probes(&repo_id);
+        assert!(
+            authority_loads > 0,
+            "the cold control must prove full authority was materialized"
+        );
+        assert!(
+            cursor_probes >= 2,
+            "the cold load must fence materialization with cursor probes"
+        );
+
+        // A metadata-only cursor probe remains healthy while every full
+        // authority read is armed to fail. If the warm path regresses to
+        // load_snapshot_authority or recovery, this call fails rather than
+        // silently serving the cached graph.
+        faults.start_authority_faulting(&repo_id);
+        let cached = load_hosted_repository_mcp_view(&state, &repo_id)
+            .await
+            .expect("an unchanged warm view needs only the typed cursor probe");
+        assert!(Arc::ptr_eq(&first, &cached));
+        assert_eq!(
+            faults.authority_loads(&repo_id),
+            authority_loads,
+            "a warm cache hit must perform zero additional authority body loads"
+        );
+        assert!(
+            faults.cursor_probes(&repo_id) > cursor_probes,
+            "the warm hit must still prove the backend publication cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_full_graph_view_cache_is_bounded() {
+        let repo_ids: Vec<String> = (0..=REPO_SCOPED_VIEW_CACHE_CAP)
+            .map(|index| format!("repo-scoped-view-{index}-{}", Uuid::new_v4()))
+            .collect();
+        let (state, _working, storage) = replica_state(&repo_ids[0]);
+        for (index, repo_id) in repo_ids.iter().enumerate() {
+            let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+            let name = format!("view_symbol_{index}");
+            let path = format!("src/view_{index}.rs");
+            let body = format!("fn {name}() {{}}\n");
+            publish_hosted_semantic_change(
+                storage.path(),
+                &repository_id,
+                None,
+                0x8f00 + index as u128,
+                "publish bounded hosted view fixture",
+                &[(name.as_str(), path.as_str(), body.as_str())],
+            );
+        }
+
+        for repo_id in repo_ids.iter().take(REPO_SCOPED_VIEW_CACHE_CAP) {
+            load_hosted_repository_mcp_view(&state, repo_id)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            state.repo_semantic_views.read().await.len(),
+            REPO_SCOPED_VIEW_CACHE_CAP
+        );
+
+        let newest = repo_ids.last().unwrap();
+        load_hosted_repository_mcp_view(&state, newest)
+            .await
+            .unwrap();
+        let views = state.repo_semantic_views.read().await;
+        assert_eq!(
+            views.len(),
+            REPO_SCOPED_VIEW_CACHE_CAP,
+            "loading a ninth complete graph must evict one cached view"
+        );
+        assert!(
+            views.contains_key(newest),
+            "the just-loaded repository must be retained"
+        );
+        assert_eq!(
+            repo_ids
+                .iter()
+                .take(REPO_SCOPED_VIEW_CACHE_CAP)
+                .filter(|repo_id| views.contains_key(repo_id.as_str()))
+                .count(),
+            REPO_SCOPED_VIEW_CACHE_CAP - 1,
+            "exactly one older complete graph view must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_trace_caps_source_reads_before_response_assembly() {
+        let repo_id = format!("repo-scoped-trace-budget-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+        let symbols: Vec<(String, String, String)> = (0..10)
+            .map(|index| {
+                (
+                    format!("trace_node_{index}"),
+                    format!("src/trace_node_{index}.rs"),
+                    format!(
+                        "fn trace_node_{index}() {{ let _ = \"trace_body_marker_{index}\"; }}\n"
+                    ),
+                )
+            })
+            .collect();
+        let symbol_refs: Vec<(&str, &str, &str)> = symbols
+            .iter()
+            .map(|(name, path, body)| (name.as_str(), path.as_str(), body.as_str()))
+            .collect();
+        let (_, entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x8f20,
+            "publish bounded hosted trace fixture",
+            &symbol_refs,
+        );
+        let (status, _, result) = call_repo_mcp_tool(
+            router(state),
+            &repo_id,
+            "trace_data_flow",
+            json!({
+                "focal": entities[0].to_string(),
+                "direction": "calls",
+                "depth": 8,
+                "limit_per_step": 25,
+                "include_body": true,
+                "max_chars": 45_000
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let result = successful_repo_mcp_payload(result);
+        let attempted = result["source_reads_attempted"].as_u64().unwrap();
+        let eligible = result["source_read_eligible_records"].as_u64().unwrap();
+        let withheld = result["source_reads_withheld"].as_u64().unwrap();
+        assert!(
+            attempted > 0
+                && attempted as usize
+                    <= (45_000 / REPO_SCOPED_TRACE_BODY_READ_UNIT_CHARS)
+                        .clamp(1, REPO_SCOPED_TRACE_BODY_READ_CAP),
+            "the hosted trace must budget source reads from the remaining pre-assembly room: {result}"
+        );
+        assert!(eligible > attempted, "the fixture must exceed the cap: {result}");
+        assert_eq!(withheld, eligible - attempted, "{result}");
+        assert_eq!(result["source_reads_capped"], true, "{result}");
+        assert!(
+            result["degradations"]
+                .as_array()
+                .is_some_and(|degradations| degradations.iter().any(|degradation| {
+                    degradation["reason"] == "response_budget_source_reads_capped"
+                })),
+            "the response must disclose pre-assembly source-read elision: {result}"
+        );
+    }
+
+    #[test]
+    fn repo_scoped_trace_source_reads_are_charged_after_the_body_free_payload() {
+        let arguments = HashMap::from([("max_chars".to_string(), json!(45_000))]);
+        let budget = kin_mcp::budget::ResponseBudget::from_arguments(&arguments);
+        let roomy = json!({ "chain": [] });
+        let crowded = json!({ "chain": [], "diagnostics": "x".repeat(41_000) });
+        let (roomy_reads, roomy_chars) = hosted_trace_source_read_budget(&roomy, &budget);
+        let (crowded_reads, crowded_chars) =
+            hosted_trace_source_read_budget(&crowded, &budget);
+
+        assert!(
+            roomy_reads > crowded_reads,
+            "roomy={roomy_reads}, crowded={crowded_reads}"
+        );
+        assert!(
+            roomy_chars > crowded_chars,
+            "roomy={roomy_chars}, crowded={crowded_chars}"
+        );
+        assert_eq!(crowded_reads, 1);
+        assert!(crowded_chars <= 2_000, "crowded={crowded_chars}");
+    }
+
+    #[test]
+    fn repo_scoped_trace_body_claim_follows_the_common_budget_cut() {
+        let result = kin_mcp::ToolCallResult::text(
+            json!({
+                "focal_entity": {
+                    "entity_id": Uuid::new_v4().to_string(),
+                    "body": "x".repeat(8_000)
+                },
+                "chain": [],
+                "bodies_included": true
+            })
+            .to_string(),
+        );
+        let arguments = HashMap::from([("max_chars".to_string(), json!(2_000))]);
+        let budget = kin_mcp::budget::ResponseBudget::from_arguments(&arguments);
+        let bounded = bound_mcp_tool_result(result, "trace_data_flow", &budget);
+        let text = match bounded.content.first().unwrap() {
+            kin_mcp::ContentBlock::Text { text } => text,
+        };
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert!(payload["focal_entity"]["body"].is_null(), "{payload}");
+        assert_eq!(
+            payload["bodies_included"],
+            false,
+            "the post-budget response must not claim a body the ladder removed: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_cursor_is_bound_to_repo_authority_and_process_incarnation() {
+        let _budget = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_TOTAL_TIMEOUT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_DISCOVERY_SECS", "0")
+            .with("KIN_LOCATE_PHASE_ENTITY_RESOLUTION_SECS", "0")
+            .with("KIN_LOCATE_PHASE_MULTIHOP_SECS", "0")
+            .with("KIN_LOCATE_PHASE_TEXT_SEARCH_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SOURCE_TEXT_SECS", "0")
+            .with("KIN_LOCATE_PHASE_SCORING_SECS", "0");
+        let repo_a = format!("repo-cursor-a-{}", Uuid::new_v4());
+        let repo_b = format!("repo-cursor-b-{}", Uuid::new_v4());
+        let repo_a_id = RepositoryId::new(repo_a.clone()).unwrap();
+        let repo_b_id = RepositoryId::new(repo_b.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_a);
+        let (head_a, _) = publish_hosted_semantic_change(
+            storage.path(),
+            &repo_a_id,
+            None,
+            0x8d01,
+            "publish repository A cursor fixture",
+            &[
+                ("shared_cursor_one", "src/a1.rs", "fn shared_cursor_one() {}\n"),
+                ("shared_cursor_two", "src/a2.rs", "fn shared_cursor_two() {}\n"),
+                ("shared_cursor_three", "src/a3.rs", "fn shared_cursor_three() {}\n"),
+            ],
+        );
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repo_b_id,
+            None,
+            0x8e01,
+            "publish repository B cursor fixture",
+            &[
+                ("shared_cursor_one", "src/b1.rs", "fn shared_cursor_one() {}\n"),
+                ("shared_cursor_two", "src/b2.rs", "fn shared_cursor_two() {}\n"),
+                ("shared_cursor_three", "src/b3.rs", "fn shared_cursor_three() {}\n"),
+            ],
+        );
+        let app = router(Arc::clone(&state));
+        let (status, _, first) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "semantic_locate",
+            json!({
+                "query": "shared cursor",
+                "page_size": 1,
+                "limit": 5,
+                "include_snippet": false
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let first_authority_cursor = first["repository"]["snapshot_cursor"]
+            .as_u64()
+            .expect("a successful scoped response must name its backend cursor");
+        let first = successful_repo_mcp_payload(first);
+        let cursor = first["next_cursor"]
+            .as_str()
+            .expect("a three-hit page of one must issue a cursor")
+            .to_string();
+
+        let (status, _, second_repo) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_b,
+            "semantic_locate",
+            json!({
+                "query": "shared cursor",
+                "page_size": 1,
+                "limit": 5,
+                "include_snippet": false
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second_repo}");
+        let second_repo = successful_repo_mcp_payload(second_repo);
+        let repo_b_cursor = second_repo["next_cursor"]
+            .as_str()
+            .expect("repository B must issue its own independently bound cursor")
+            .to_string();
+        assert!(
+            lock_recover(&state.repo_semantic_locate_rankings).len() >= 2,
+            "identical queries in two repositories must occupy distinct cache keys"
+        );
+        assert!(
+            lock_recover(&state.locate_rankings).is_empty(),
+            "hosted rankings must not enter the cache read by the legacy unscoped route"
+        );
+
+        let (status, _, page_one) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "semantic_locate",
+            json!({
+                "cursor": cursor.clone(),
+                "page_size": 1,
+                "include_snippet": false
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{page_one}");
+        let page_one = successful_repo_mcp_payload(page_one);
+        assert_eq!(page_one["page"], 1, "{page_one}");
+        assert_eq!(
+            page_one["entities"].as_array().map(Vec::len),
+            Some(1),
+            "a valid repo-bound cursor must page the held ranking: {page_one}"
+        );
+
+        let (status, _, mismatch) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_b,
+            "semantic_locate",
+            json!({ "cursor": cursor.clone() }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{mismatch}");
+        assert_eq!(mismatch["error"]["code"], "cursor_repository_mismatch");
+
+        let mut tampered = cursor.clone();
+        let signature_start = tampered.rfind('.').expect("cursor carries a signature") + 1;
+        let replacement = if tampered.as_bytes()[signature_start] == b'A' {
+            "B"
+        } else {
+            "A"
+        };
+        tampered.replace_range(signature_start..signature_start + 1, replacement);
+        let (status, _, bad_signature) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "semantic_locate",
+            json!({ "cursor": tampered }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{bad_signature}");
+        assert_eq!(bad_signature["error"]["code"], "invalid_cursor");
+
+        let (status, _, malformed) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "semantic_locate",
+            json!({ "cursor": 7 }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{malformed}");
+        assert_eq!(malformed["error"]["code"], "invalid_cursor");
+
+        let (status, _, wrong_tool) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "get_context_pack",
+            json!({
+                "entity_id": "00000000-0000-0000-0000-000000000000",
+                "cursor": cursor.clone()
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{wrong_tool}");
+        assert_eq!(
+            wrong_tool["error"]["code"],
+            "invalid_semantic_tool_call"
+        );
+
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repo_a_id,
+            Some(head_a),
+            0x8d02,
+            "advance repository A authority",
+            &[(
+                "shared_cursor_four",
+                "src/a4.rs",
+                "fn shared_cursor_four() { let _ = \"restart_generation_marker\"; }\n",
+            )],
+        );
+        let (status, _, stale) = call_repo_mcp_tool(
+            app.clone(),
+            &repo_a,
+            "semantic_locate",
+            json!({ "cursor": cursor.clone() }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+        assert_eq!(stale["error"]["code"], "cursor_stale");
+
+        let (status, _, still_valid) = call_repo_mcp_tool(
+            app,
+            &repo_b,
+            "semantic_locate",
+            json!({
+                "cursor": repo_b_cursor,
+                "page_size": 1,
+                "include_snippet": false
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{still_valid}");
+        let still_valid = successful_repo_mcp_payload(still_valid);
+        assert_eq!(
+            still_valid["page"], 1,
+            "publishing repository A must not invalidate repository B's cursor: {still_valid}"
+        );
+
+        let (restarted, _restart_working) = reopen_hosted_state(storage.path(), &repo_a);
+        let restarted_app = router(restarted);
+        let (status, _, gone) = call_repo_mcp_tool(
+            restarted_app.clone(),
+            &repo_a,
+            "semantic_locate",
+            json!({ "cursor": cursor }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::GONE, "{gone}");
+        assert_eq!(gone["error"]["code"], "cursor_unavailable");
+
+        let (status, _, fresh) = call_repo_mcp_tool(
+            restarted_app,
+            &repo_a,
+            "semantic_locate",
+            json!({
+                "query": "shared cursor",
+                "limit": 10,
+                "include_snippet": true
+            }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{fresh}");
+        assert!(
+            fresh["repository"]["snapshot_cursor"]
+                .as_u64()
+                .is_some_and(|cursor| cursor > first_authority_cursor),
+            "the restarted pod must answer from the advanced backend cursor: {fresh}"
+        );
+        let fresh = successful_repo_mcp_payload(fresh);
+        assert!(
+            fresh.to_string().contains("restart_generation_marker"),
+            "the restarted pod must not replay its predecessor's cached success: {fresh}"
+        );
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_route_never_falls_back_to_a_local_daemon() {
+        let state = test_state();
+        let repo_id = state.cached_repo_id.clone();
+        let (status, _, body) = call_repo_mcp_tool(
+            router(state),
+            &repo_id,
+            "semantic_locate",
+            json!({ "query": "anything" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "hosted_authority_required");
+    }
+
+    #[tokio::test]
+    async fn repo_scoped_route_distinguishes_unserved_from_not_ingested() {
+        let admitted = format!("repo-admitted-empty-{}", Uuid::new_v4());
+        let unserved = format!("repo-unserved-{}", Uuid::new_v4());
+        let (state, _) = hosted_state_with_allowlist("repo-mcp-errors", &admitted, &[]);
+        let app = router(Arc::clone(&state));
+
+        let (status, _, body) = call_repo_mcp_tool(
+            app.clone(),
+            &unserved,
+            "semantic_locate",
+            json!({ "query": "anything" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"]["code"], "repo_not_served");
+
+        let (status, _, body) = call_repo_mcp_tool(
+            app,
+            &admitted,
+            "semantic_locate",
+            json!({ "query": "anything" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["error"]["code"], "repo_not_ingested");
+
+        *state.derived_views_stale.write().await = Some(
+            "repository authority is durable but its semantic view has not refreshed".to_string(),
+        );
+        let (status, _, body) = call_repo_mcp_tool(
+            router(state),
+            &admitted,
+            "semantic_locate",
+            json!({ "query": "anything" }),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["error"]["code"], "repo_semantic_unready");
     }
 
     /// Read the authority envelope straight off the persisted object.
@@ -22861,28 +26038,102 @@ mod tests {
 
     /// Handle the test keeps after the backend is moved into the daemon, so a
     /// fault can be armed once the daemon has already opened healthy.
+    #[derive(Default)]
+    struct FaultState {
+        authority_faults: std::collections::HashSet<String>,
+        cursor_faults: std::collections::HashSet<String>,
+        authority_loads: std::collections::HashMap<String, usize>,
+        cursor_probes: std::collections::HashMap<String, usize>,
+    }
+
     #[derive(Clone)]
-    struct FaultSwitch(Arc<std::sync::Mutex<std::collections::HashSet<String>>>);
+    struct FaultSwitch(Arc<std::sync::Mutex<FaultState>>);
 
     impl FaultSwitch {
         fn start_faulting(&self, repo_id: &str) {
-            self.0.lock().unwrap().insert(repo_id.to_string());
+            let mut state = self.0.lock().unwrap();
+            state.authority_faults.insert(repo_id.to_string());
+            state.cursor_faults.insert(repo_id.to_string());
         }
 
-        fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
-            self.0.lock().unwrap().contains(repo_id).then(|| {
-                kin_db::KinDbError::StorageError(format!(
-                    "{BACKEND_FAULT_TEXT} while reading {repo_id}"
-                ))
-            })
+        fn start_authority_faulting(&self, repo_id: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .authority_faults
+                .insert(repo_id.to_string());
+        }
+
+        fn authority_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.0
+                .lock()
+                .unwrap()
+                .authority_faults
+                .contains(repo_id)
+                .then(|| {
+                    kin_db::KinDbError::StorageError(format!(
+                        "{BACKEND_FAULT_TEXT} while reading {repo_id}"
+                    ))
+                })
+        }
+
+        fn cursor_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_faults
+                .contains(repo_id)
+                .then(|| {
+                    kin_db::KinDbError::StorageError(format!(
+                        "{BACKEND_FAULT_TEXT} while reading {repo_id}"
+                    ))
+                })
+        }
+
+        fn record_authority_load(&self, repo_id: &str) {
+            *self
+                .0
+                .lock()
+                .unwrap()
+                .authority_loads
+                .entry(repo_id.to_string())
+                .or_default() += 1;
+        }
+
+        fn record_cursor_probe(&self, repo_id: &str) {
+            *self
+                .0
+                .lock()
+                .unwrap()
+                .cursor_probes
+                .entry(repo_id.to_string())
+                .or_default() += 1;
+        }
+
+        fn authority_loads(&self, repo_id: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .authority_loads
+                .get(repo_id)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn cursor_probes(&self, repo_id: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_probes
+                .get(repo_id)
+                .copied()
+                .unwrap_or_default()
         }
     }
 
     impl RepoFaultBackend {
         fn new(path: &std::path::Path) -> (Self, FaultSwitch) {
-            let faulting = FaultSwitch(Arc::new(std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            )));
+            let faulting = FaultSwitch(Arc::new(std::sync::Mutex::new(FaultState::default())));
             (
                 Self {
                     inner: kin_db::LocalFileBackend::new(path),
@@ -22893,7 +26144,7 @@ mod tests {
         }
 
         fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
-            self.faulting.fault_for(repo_id)
+            self.faulting.authority_fault_for(repo_id)
         }
     }
 
@@ -22908,9 +26159,21 @@ mod tests {
             &self,
             repo_id: &str,
         ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
+            self.faulting.record_authority_load(repo_id);
             match self.fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_recovery_state(repo_id),
+            }
+        }
+
+        fn load_snapshot_cursor(
+            &self,
+            repo_id: &str,
+        ) -> std::result::Result<Option<kin_db::SnapshotCursor>, kin_db::KinDbError> {
+            self.faulting.record_cursor_probe(repo_id);
+            match self.faulting.cursor_fault_for(repo_id) {
+                Some(error) => Err(error),
+                None => self.inner.load_snapshot_cursor(repo_id),
             }
         }
 
@@ -22918,6 +26181,7 @@ mod tests {
             &self,
             repo_id: &str,
         ) -> std::result::Result<Option<kin_db::SnapshotAuthority>, kin_db::KinDbError> {
+            self.faulting.record_authority_load(repo_id);
             match self.fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_snapshot_authority(repo_id),
@@ -22929,6 +26193,7 @@ mod tests {
             repo_id: &str,
         ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
         {
+            self.faulting.record_authority_load(repo_id);
             match self.fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_snapshot(repo_id),

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/repo-scoped-semantic-tool-error",
+  "description": "Fail-loud hosted semantic routing, authority, and cursor error.",
+  "type": "object",
+  "required": ["schema_version", "capability", "error"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "capability": { "const": "repo_scoped_semantic_tools_v1" },
+    "error": {
+      "type": "object",
+      "required": ["code", "message", "repo_id", "retryable"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "authentication_required",
+            "invalid_semantic_tool_call",
+            "invalid_repository_id",
+            "repo_not_served",
+            "repo_not_ingested",
+            "repo_semantic_unready",
+            "repo_authority_unavailable",
+            "hosted_authority_required",
+            "invalid_cursor",
+            "cursor_repository_mismatch",
+            "cursor_stale",
+            "cursor_unavailable",
+            "cursor_encoding_failed",
+            "trace_response_invalid"
+          ]
+        },
+        "message": { "type": "string" },
+        "repo_id": { "type": "string" },
+        "retryable": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

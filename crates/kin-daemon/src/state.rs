@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use kin_blobs::{BlobError, BlobStore};
 use kin_core::KinLayout;
 use kin_db::{
-    LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager, StorageBackend,
+    LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager, SnapshotCursor,
+    StorageBackend,
 };
 use kin_model::ChangeStore;
 use kin_model::{
@@ -222,7 +223,7 @@ pub(crate) fn resolve_repository_target(
 /// requires its top-level entity, relation, tree, and revision caches to be
 /// empty. Every hosted authority-to-query conversion must pass through this
 /// helper, or a valid transfer presents as a zero-entity repository.
-fn materialize_hosted_repository_snapshot(
+pub(crate) fn materialize_hosted_repository_snapshot(
     mut snapshot: kin_db::GraphSnapshot,
 ) -> Result<(kin_db::GraphSnapshot, Option<SemanticChangeId>)> {
     let Some(metadata) = snapshot.repository_authority.as_ref() else {
@@ -1923,6 +1924,42 @@ pub struct DaemonState {
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
+    /// Coherent hosted graph and source authority views, keyed by repository.
+    /// Each request probes the backend cursor before reusing an entry.
+    pub(crate) repo_semantic_views:
+        RwLock<HashMap<String, Arc<crate::api::HostedRepositoryMcpView>>>,
+    /// Hosted-only locate rankings. The legacy unscoped route never reads this
+    /// cache, so it cannot address a hosted ranking even with a forged inner
+    /// locate cursor.
+    pub repo_semantic_locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
+    /// Process-incarnation identity authenticated into every hosted semantic
+    /// cursor. A restarted daemon rejects a prior token before touching caches.
+    pub repo_semantic_instance_id: uuid::Uuid,
+    /// Per-incarnation HMAC key for hosted semantic cursor payloads.
+    pub(crate) repo_semantic_cursor_secret: [u8; 32],
+    /// Opaque hosted MCP paging cursors retained by this daemon incarnation.
+    /// Each token is bound to one repository and one exact backend authority
+    /// cursor plus graph root. A restart intentionally drops this map so an
+    /// old token fails closed instead of silently replaying page zero.
+    pub repo_semantic_cursors: Mutex<HashMap<String, HostedSemanticCursor>>,
+}
+
+/// Server-side authority carried by one opaque hosted semantic cursor.
+pub struct HostedSemanticCursor {
+    pub repo_id: String,
+    pub snapshot_cursor: SnapshotCursor,
+    pub graph_root: String,
+    pub inner_cursor: String,
+    pub created: Instant,
+}
+
+fn new_repo_semantic_cursor_secret() -> [u8; 32] {
+    let first = uuid::Uuid::new_v4();
+    let second = uuid::Uuid::new_v4();
+    let mut secret = [0u8; 32];
+    secret[..16].copy_from_slice(first.as_bytes());
+    secret[16..].copy_from_slice(second.as_bytes());
+    secret
 }
 
 /// Cached full locate entity-ranking for cursor paging. The daemon caches the
@@ -3087,6 +3124,11 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
+            repo_semantic_views: RwLock::new(HashMap::new()),
+            repo_semantic_locate_rankings: Mutex::new(HashMap::new()),
+            repo_semantic_instance_id: uuid::Uuid::new_v4(),
+            repo_semantic_cursor_secret: new_repo_semantic_cursor_secret(),
+            repo_semantic_cursors: Mutex::new(HashMap::new()),
         };
         // Restore in-flight MCP transactions persisted before a restart
         // so staged-but-uncommitted work is not silently dropped across a daemon
@@ -3348,6 +3390,11 @@ impl DaemonState {
             mcp_transactions: Mutex::new(HashMap::new()),
             locate_rankings: Mutex::new(HashMap::new()),
             semantic_locate_pages: Mutex::new(HashMap::new()),
+            repo_semantic_views: RwLock::new(HashMap::new()),
+            repo_semantic_locate_rankings: Mutex::new(HashMap::new()),
+            repo_semantic_instance_id: uuid::Uuid::new_v4(),
+            repo_semantic_cursor_secret: new_repo_semantic_cursor_secret(),
+            repo_semantic_cursors: Mutex::new(HashMap::new()),
         };
 
         // Restore in-flight MCP transactions persisted before a restart.

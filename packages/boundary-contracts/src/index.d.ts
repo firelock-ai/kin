@@ -8,6 +8,118 @@ export declare function loadAllSchemas(): Promise<Record<string, unknown>>;
 export declare function validateContract(name: string, payload: unknown): Promise<CommandValidationResult>;
 export declare function assertContract(name: string, payload: unknown): Promise<void>;
 
+export type RepoScopedSemanticToolName =
+  | "semantic_locate"
+  | "get_context_pack"
+  | "trace_data_flow";
+
+export type RepoScopedSemanticBudgetArguments =
+  | { max_chars?: number; max_response_chars?: never }
+  | { max_chars?: never; max_response_chars?: number };
+
+export type RepoScopedSemanticLocateArguments = RepoScopedSemanticBudgetArguments &
+  ({ query: string; cursor?: string } | { query?: string; cursor: string }) & {
+  queries?: string[];
+  limit?: number;
+  page_size?: number;
+  cursor?: string;
+  granularity?: "file" | "entity";
+  include_snippet?: boolean;
+  snippet_alias?: boolean;
+  pipeline?: "fused";
+  include_tests?: boolean;
+  explain?: boolean;
+  compact?: boolean;
+};
+
+export type RepoScopedContextPackArguments = RepoScopedSemanticBudgetArguments & {
+  entity_id: string;
+  token_budget?: number;
+  depth?: number;
+  include_traffic?: false;
+  compact?: boolean;
+};
+
+export type RepoScopedTraceDataFlowArguments = RepoScopedSemanticBudgetArguments & {
+  focal: string;
+  depth?: number;
+  direction?: "calls" | "callers" | "both";
+  limit_per_step?: number;
+  target?: string;
+  include_body?: boolean;
+  compact?: boolean;
+  include_type_edges?: boolean;
+};
+
+export type RepoScopedSemanticToolCall =
+  | {
+      schema_version: 1;
+      name: "semantic_locate";
+      arguments: RepoScopedSemanticLocateArguments;
+    }
+  | {
+      schema_version: 1;
+      name: "get_context_pack";
+      arguments: RepoScopedContextPackArguments;
+    }
+  | {
+      schema_version: 1;
+      name: "trace_data_flow";
+      arguments: RepoScopedTraceDataFlowArguments;
+    };
+
+export interface RepoScopedSemanticAuthority {
+  repo_id: string;
+  snapshot_cursor: number;
+  graph_root: string;
+  selected_change_id: string;
+}
+
+export interface RepoScopedSemanticTextContent {
+  type: "text";
+  text: string;
+}
+
+export interface RepoScopedSemanticToolResult {
+  content: RepoScopedSemanticTextContent[];
+  isError?: boolean;
+}
+
+export interface RepoScopedSemanticToolResponse {
+  schema_version: 1;
+  capability: "repo_scoped_semantic_tools_v1";
+  repository: RepoScopedSemanticAuthority;
+  name: RepoScopedSemanticToolName;
+  result: RepoScopedSemanticToolResult;
+}
+
+export type RepoScopedSemanticToolErrorCode =
+  | "authentication_required"
+  | "invalid_semantic_tool_call"
+  | "invalid_repository_id"
+  | "repo_not_served"
+  | "repo_not_ingested"
+  | "repo_semantic_unready"
+  | "repo_authority_unavailable"
+  | "hosted_authority_required"
+  | "invalid_cursor"
+  | "cursor_repository_mismatch"
+  | "cursor_stale"
+  | "cursor_unavailable"
+  | "cursor_encoding_failed"
+  | "trace_response_invalid";
+
+export interface RepoScopedSemanticToolError {
+  schema_version: 1;
+  capability: "repo_scoped_semantic_tools_v1";
+  error: {
+    code: RepoScopedSemanticToolErrorCode;
+    message: string;
+    repo_id: string;
+    retryable: boolean;
+  };
+}
+
 export type ActorKind = "human" | "agent" | "system";
 export type EvidenceStatus = "complete" | "partial" | "missing";
 export type ReviewRisk = "low" | "medium" | "high";

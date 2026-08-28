@@ -24,7 +24,7 @@ thread_local! {
 }
 
 use super::repository_authority::{
-    ActiveRepositoryAuthority, RequestRepositoryAuthority, WorkspaceReadSample,
+    ActiveRepositoryAuthority, AuthorityHeadReadSample, RequestRepositoryAuthority,
 };
 use crate::error::{McpError, Result};
 
@@ -1930,7 +1930,7 @@ pub fn span_source_coherence(
 /// open would have produced at the instant it sampled the publication.
 ///
 /// Reusing one sample is also strictly MORE coherent than re-sampling per
-/// entity. [`WorkspaceReadSample`] exists because pairing a tree from one
+/// entity. [`AuthorityHeadReadSample`] exists because pairing a tree from one
 /// generation with provenance from another is a real defect; sampling once per
 /// entity reintroduced exactly that hazard across a result set, where page 1 of
 /// a response could describe a generation page 40 no longer read from.
@@ -1940,7 +1940,7 @@ pub fn span_source_coherence(
 /// authority error, so constructing a session neither opens authority nor
 /// replays anything.
 ///
-/// [`WorkspaceReadSample`]: super::repository_authority::WorkspaceReadSample
+/// [`AuthorityHeadReadSample`]: super::repository_authority::AuthorityHeadReadSample
 pub struct HeldSourceAuthority<'store, G: GraphStore> {
     store: &'store G,
     source: Option<RequestRepositoryAuthority>,
@@ -1948,7 +1948,7 @@ pub struct HeldSourceAuthority<'store, G: GraphStore> {
     /// every entity that needs authority reports the same gap this session hit,
     /// instead of re-attempting a recovery that already failed.
     authority: std::sync::OnceLock<std::result::Result<Arc<ActiveRepositoryAuthority>, String>>,
-    head_sample: std::sync::OnceLock<std::result::Result<Arc<WorkspaceReadSample>, String>>,
+    head_sample: std::sync::OnceLock<std::result::Result<Arc<AuthorityHeadReadSample>, String>>,
     graph_at: Mutex<HashMap<SemanticChangeId, Arc<kin_model::graph::ResolvedGraphState>>>,
     tree_at: Mutex<HashMap<SemanticChangeId, Arc<kin_model::ResolvedTree>>>,
     /// Replays this session actually performed, as opposed to served from its
@@ -2009,7 +2009,7 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
     }
 
     /// The one instant of workspace authority this request reads at.
-    fn workspace_sample(&self) -> Result<&WorkspaceReadSample> {
+    fn workspace_sample(&self) -> Result<&AuthorityHeadReadSample> {
         match self.head_sample.get_or_init(|| {
             self.authority()
                 .and_then(|authority| authority.workspace_sample())
@@ -2134,13 +2134,12 @@ fn resolve_entity_source_authority<G: GraphStore>(
             // the change id from another let a response pair generation N's bytes
             // with generation N+1's provenance, with nothing serializing the two.
             let sample = held.workspace_sample()?;
-            let workspace = &sample.workspace;
             // Absence from the current tree is graph truth answering, not
             // authority failing: the store carries history, and a file deleted
             // or renamed upstream is legitimately not here. Typed apart from a
             // gap so a multi-entity projection can skip THIS candidate while a
             // genuinely unservable path below still fails the read.
-            let artifact = workspace
+            let artifact = sample
                 .tree
                 .artifact_at_path(&path)
                 .cloned()
@@ -2148,24 +2147,24 @@ fn resolve_entity_source_authority<G: GraphStore>(
                     entity_absent_at_generation(
                         entity,
                         &recorded_origin.0,
-                        workspace.generation,
-                        workspace.workspace_id,
+                        sample.generation,
+                        &sample.label,
                     )
                 })?;
-            let source_change_id = sample.base_change_id;
+            let source_change_id = sample.source_change_id;
 
             // Report what these bytes actually are. The exact tree includes
             // uncommitted state, so it is only the committed state at base when
             // it still hashes to the tree at base; otherwise no change contains
             // it and the answer says so instead of naming one.
-            let provenance = if workspace.base_tree_hash == Some(workspace.tree_hash) {
+            let provenance = if sample.committed {
                 SourceProvenance::Committed {
                     change_id: source_change_id,
                 }
             } else {
                 SourceProvenance::Workspace {
-                    tree_hash: workspace.tree_hash,
-                    generation: workspace.generation,
+                    tree_hash: sample.tree_hash,
+                    generation: sample.generation,
                     base_change_id: source_change_id,
                 }
             };
