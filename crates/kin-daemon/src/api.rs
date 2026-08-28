@@ -23317,14 +23317,22 @@ mod tests {
                     "min_snapshot_schema": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
                     "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
                     "valid_for_seconds": 3600
-                }
+                },
+                // Without this the seal is never created and hosted reads stay
+                // closed behind the legacy writer-drain boundary, which is the
+                // fail-closed behaviour the negative fixture already covers.
+                // Supplying it is what the daemon binary does from
+                // KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL, so the sequence
+                // under test is the deployed one.
+                "legacy_writer_drain_proof_sha256": format!("sha256:{}", "b".repeat(64))
             }),
         )
         .await;
         assert_eq!(
             status,
             StatusCode::OK,
-            "admit must publish the exact fleet and bind the reader: {admitted}"
+            "admit must publish the exact fleet, seal the legacy boundary and bind the \
+             reader: {admitted}"
         );
 
         let (status, released) = publication_post(
