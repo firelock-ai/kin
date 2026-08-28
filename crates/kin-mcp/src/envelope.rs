@@ -15,6 +15,7 @@
 //!   report, lifted from the tool payload when the daemon already included it,
 //! - graph freshness (`graph_as_of` plus honest `/health`-derived state),
 //! - degraded flags: daemon-unreachable, `embed_worker_failed` (#11),
+//!   `embed_persistence_unavailable`,
 //!   `mass_deletion_blocked`, offline-fallback, and workspace-mismatch.
 //!
 //! Honesty contract (CLAUDE.md): the envelope NEVER fabricates coverage or
@@ -179,6 +180,12 @@ impl EmbeddingState {
 }
 
 impl SemanticCoverage {
+    /// Whether this observation leaves no embedding work for a disabled
+    /// producer to perform.
+    fn embedding_work_complete(&self) -> bool {
+        self.pending == 0 && self.indexed == self.total
+    }
+
     /// The one embedding verdict every surface in this crate reads.
     ///
     /// Prefers the observation the producing surface published, because that is
@@ -312,6 +319,11 @@ pub struct Degraded {
     /// (#11). The graph still serves; the vector index is frozen until restart.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub embed_worker_failed: Option<bool>,
+    /// Daemon `/health`: this graph authority has no durable local vector
+    /// sidecar contract, so the embedding worker is intentionally unavailable.
+    /// This is not a memory refusal and cannot be cleared by freeing memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_persistence_unavailable: Option<bool>,
     /// Daemon `/health`: a suspected mass-deletion wipe is being withheld pending
     /// operator confirmation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -376,6 +388,7 @@ impl Degraded {
         [
             self.daemon_unreachable,
             self.embed_worker_failed,
+            self.embed_persistence_unavailable,
             self.mass_deletion_blocked,
             self.offline_fallback,
             self.workspace_mismatch,
@@ -399,6 +412,9 @@ impl Degraded {
         }
         if self.embed_worker_failed == Some(true) {
             labels.push("embed_worker_failed");
+        }
+        if self.embed_persistence_unavailable == Some(true) {
+            labels.push("embed_persistence_unavailable");
         }
         if self.mass_deletion_blocked == Some(true) {
             labels.push("mass_deletion_blocked");
@@ -1636,7 +1652,24 @@ impl Envelope {
             entity_count: Some(entity_count),
             ..GraphState::default()
         };
-        self.degraded = Degraded::default();
+        // The selected report replaces HEAD-scoped health observations, but it
+        // must not erase store-scoped records the stdio boundary already read
+        // for this response. In production these four are stamped before graph
+        // status is finalized. Resetting the whole object here made a refused
+        // producer disappear only on `kin_graph_status`, while the same record
+        // remained visible on every other tool.
+        self.degraded = Degraded {
+            embed_persistence_unavailable: if complete {
+                None
+            } else {
+                self.degraded.embed_persistence_unavailable
+            },
+            sweep_suspended: self.degraded.sweep_suspended,
+            memory_pressure: self.degraded.memory_pressure,
+            relation_census_loss: self.degraded.relation_census_loss,
+            enrichment_shortfall: self.degraded.enrichment_shortfall,
+            ..Degraded::default()
+        };
         self
     }
 
@@ -1801,12 +1834,18 @@ impl Envelope {
     }
 
     /// Fold honest signals from a daemon `/health` JSON body into the envelope:
-    /// the `embed_worker_failed` / `mass_deletion_blocked` degraded flags and the
-    /// graph freshness state. Missing fields stay unknown (absent), never
+    /// the embedding-worker / persistence / mass-deletion degraded flags and
+    /// the graph freshness state. Missing fields stay unknown (absent), never
     /// fabricated.
     pub fn with_health(mut self, health: &Value) -> Self {
         if let Some(value) = health.get("embed_worker_failed").and_then(Value::as_bool) {
             self.degraded.embed_worker_failed = Some(value);
+        }
+        if let Some(value) = health
+            .get("embed_persistence_unavailable")
+            .and_then(Value::as_bool)
+        {
+            self.degraded.embed_persistence_unavailable = Some(value);
         }
         if let Some(value) = health.get("mass_deletion_blocked").and_then(Value::as_bool) {
             self.degraded.mass_deletion_blocked = Some(value);
@@ -1892,6 +1931,17 @@ impl Envelope {
         self
     }
 
+    /// Stamp the daemon storage capability without importing HEAD-scoped
+    /// graph observations from `/health`.
+    ///
+    /// Temporal graph status uses this narrow seam because vector persistence
+    /// is a property of the serving daemon's backend, while health's entity
+    /// count, generation, freshness and reconcile state describe HEAD.
+    pub fn with_embed_persistence_unavailable(mut self, unavailable: bool) -> Self {
+        self.degraded.embed_persistence_unavailable = Some(unavailable);
+        self
+    }
+
     /// Lift `semantic_coverage` and `graph_as_of` out of a tool payload when the
     /// daemon already computed them, so they live in one predictable place on the
     /// envelope. Absent fields stay unknown.
@@ -1914,6 +1964,17 @@ impl Envelope {
             {
                 self.semantic_coverage = Some(coverage);
             }
+        }
+        if self
+            .semantic_coverage
+            .as_ref()
+            .is_some_and(SemanticCoverage::embedding_work_complete)
+        {
+            // A backend capability is actionable only while this selected
+            // graph still owes embeddings. This is the same precedence as CLI
+            // semantic readiness: exact complete coverage is healthy even when
+            // no future local vector checkpoint could be written.
+            self.degraded.embed_persistence_unavailable = None;
         }
         if self.graph_as_of.is_none() {
             for key in ["graph_as_of", "as_of"] {
@@ -2273,7 +2334,6 @@ fn annotate_block(
     };
     let mut annotated = annotated;
     apply_response_budget(&mut annotated, tool_name, budget);
-    disclose_self_contradictions(&mut annotated, tool_name);
     let rendered =
         serde_json::to_string_pretty(&annotated).unwrap_or_else(|_| annotated.to_string());
     ContentBlock::Text { text: rendered }
@@ -2315,6 +2375,12 @@ fn annotate_block(
 fn disclose_self_contradictions(annotated: &mut Value, tool_name: &str) {
     let found = crate::verdict::disagreements(annotated);
     if found.is_empty() {
+        if let Some(envelope) = annotated
+            .get_mut(ENVELOPE_KEY)
+            .and_then(Value::as_object_mut)
+        {
+            envelope.remove("self_check");
+        }
         return;
     }
     tracing::warn!(
@@ -2343,17 +2409,21 @@ fn disclose_self_contradictions(annotated: &mut Value, tool_name: &str) {
     );
 }
 
-/// Bound the fully annotated payload and record what that cost under
+/// Bound the fully annotated payload and record its exact final size under
 /// `_kin.response`.
 ///
 /// The accounting stanza is written BEFORE the cut as well as after it. The
 /// number it carries is a property of the object it sits inside, so a stanza
 /// added afterwards would push a response that had just been cut to fit back
-/// over its ceiling by its own length. Writing it first means the ladder
-/// measures the bytes that actually ship. `chars_before` is then restored to the
-/// first measurement, which is the one taken before anything was removed.
+/// over its ceiling by its own length. The budget downgrade and contradiction
+/// check can also grow the envelope after the first cut, so the ladder is rerun
+/// to a stable value and the accounting number is solved to a fixed point. A
+/// final response is therefore either inside the ceiling or carries the
+/// residual-over-budget disclosure, and `chars_after_budget` equals the bytes
+/// that actually ship.
 fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &ResponseBudget) {
     if !crate::budget::is_budgeted(tool_name) {
+        disclose_self_contradictions(annotated, tool_name);
         return;
     }
     let chars_before = crate::budget::measure(annotated);
@@ -2368,27 +2438,66 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         compact: budget.compact,
     };
     write_response_accounting(annotated, &accounting);
-    if let Some(applied) = crate::budget::enforce(annotated, tool_name, budget) {
-        accounting = applied;
-        // This arm's own measurement, taken before the placeholder stanza was
-        // written, is the more accurate one for this pass. It loses only to a
-        // larger number the ladder recovered from an earlier arm's disclosure,
-        // which is the size the answer was actually built at.
-        accounting.chars_before = accounting.chars_before.max(chars_before);
-    }
-    write_response_accounting(annotated, &accounting);
-    if accounting.bounded {
-        if let Some(completeness) = annotated
-            .get_mut(ENVELOPE_KEY)
-            .and_then(Value::as_object_mut)
-            .and_then(|envelope| envelope.get_mut("completeness"))
-        {
-            Completeness::mark_response_bounded(completeness);
+    let mut bounded = false;
+    let mut largest_before = chars_before;
+
+    // A pass can add its own disclosure; the epistemic downgrade and self-check
+    // can then add more. Re-run until one whole pass leaves the response
+    // unchanged. Every removable field or row is finite, and the downgrade is
+    // idempotent, so this converges after a handful of passes while preserving
+    // the rule that verdict inputs themselves are never trimmed.
+    for _ in 0..16 {
+        let before = annotated.clone();
+        if let Some(applied) = crate::budget::enforce(annotated, tool_name, budget) {
+            bounded |= applied.bounded;
+            largest_before = largest_before.max(applied.chars_before);
+            accounting = applied;
         }
-        // The verdict and the absence object are downgraded with it. A budget
-        // that removed rows on purpose is the one cut that cannot leave a
-        // response certifying what it no longer carries.
-        crate::verdict::mark_response_bounded(annotated);
+        accounting.bounded = bounded;
+        accounting.chars_before = largest_before;
+
+        if bounded {
+            if let Some(completeness) = annotated
+                .get_mut(ENVELOPE_KEY)
+                .and_then(Value::as_object_mut)
+                .and_then(|envelope| envelope.get_mut("completeness"))
+            {
+                Completeness::mark_response_bounded(completeness);
+            }
+            // The verdict and the absence object are downgraded with it. A
+            // budget that removed rows on purpose is the one cut that cannot
+            // leave a response certifying what it no longer carries.
+            crate::verdict::mark_response_bounded(annotated);
+        }
+        disclose_self_contradictions(annotated, tool_name);
+        settle_response_accounting(annotated, &mut accounting);
+
+        if *annotated == before {
+            break;
+        }
+    }
+
+    // The last accounting rewrite is itself part of the response. Reconcile
+    // the residual marker against that exact shape, then settle its size once
+    // more because adding or removing the marker changes the measured bytes.
+    crate::budget::reconcile_residual(annotated, budget);
+    settle_response_accounting(annotated, &mut accounting);
+}
+
+/// Write `_kin.response` until its `chars_after_budget` field equals the exact
+/// pretty-serialized size of the object that contains it.
+fn settle_response_accounting(
+    annotated: &mut Value,
+    accounting: &mut crate::budget::BudgetAccounting,
+) {
+    write_response_accounting(annotated, accounting);
+    loop {
+        let measured = crate::budget::measure(annotated);
+        if accounting.chars_after == measured {
+            break;
+        }
+        accounting.chars_after = measured;
+        write_response_accounting(annotated, accounting);
     }
 }
 
@@ -2461,6 +2570,7 @@ mod tests {
         let health = serde_json::json!({
             "status": "attention",
             "embed_worker_failed": true,
+            "embed_persistence_unavailable": true,
             "mass_deletion_blocked": false,
             "reconciliation_status": "clean",
             "graph_entity_count": 1234,
@@ -2469,6 +2579,7 @@ mod tests {
         });
         let env = Envelope::daemon().with_health(&health);
         assert_eq!(env.degraded.embed_worker_failed, Some(true));
+        assert_eq!(env.degraded.embed_persistence_unavailable, Some(true));
         assert_eq!(env.degraded.mass_deletion_blocked, Some(false));
         assert_eq!(
             env.graph_state.reconciliation_status.as_deref(),
@@ -2478,6 +2589,51 @@ mod tests {
         assert_eq!(env.graph_state.loaded, Some(true));
         assert_eq!(env.graph_state.initialized, Some(true));
         assert!(env.degraded.any());
+        assert!(env
+            .degraded
+            .active_labels()
+            .contains(&"embed_persistence_unavailable"));
+    }
+
+    #[test]
+    fn unavailable_embed_persistence_qualifies_only_outstanding_embedding_work() {
+        let observed = |pending, indexed, total, complete| {
+            Envelope::daemon()
+                .with_health(&serde_json::json!({
+                    "embed_persistence_unavailable": true,
+                }))
+                .with_payload_metadata(&serde_json::json!({
+                    "semantic_coverage": {
+                        "pending": pending,
+                        "indexed": indexed,
+                        "total": total,
+                        "complete": complete,
+                    }
+                }))
+        };
+
+        let exact = observed(0, 9, 9, false);
+        assert!(
+            exact.degraded.embed_persistence_unavailable.is_none(),
+            "exact embedding completion outranks an unavailable future producer even when scope makes the overall coverage incomplete"
+        );
+
+        for (name, env) in [
+            ("queue-empty short coverage", observed(0, 8, 9, false)),
+            ("live backlog", observed(1, 8, 9, false)),
+            ("over-indexed observation", observed(0, 10, 9, false)),
+        ] {
+            assert_eq!(
+                env.degraded.embed_persistence_unavailable,
+                Some(true),
+                "{name} cannot dismiss the producer blocker"
+            );
+            assert!(env.degraded.any());
+            assert!(env
+                .degraded
+                .active_labels()
+                .contains(&"embed_persistence_unavailable"));
+        }
     }
 
     /// The four states a durability observation can be in, including the two
@@ -3359,6 +3515,46 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("response_bounded")));
+
+        let ContentBlock::Text { text } = annotated.content.first().unwrap();
+        let final_payload: Value = serde_json::from_str(text).unwrap();
+        let final_chars = crate::budget::measure(&final_payload);
+        assert_eq!(
+            envelope["response"]["chars_after_budget"],
+            json!(final_chars),
+            "accounting is measured after the downgrade and every disclosure: {final_payload}"
+        );
+        let residual = final_payload
+            .get("degradations")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.get("reason").and_then(Value::as_str)
+                        == Some(crate::budget::OVER_BUDGET_REASON)
+                })
+            });
+        assert!(
+            final_chars <= budget.max_chars || residual,
+            "a response over the caller ceiling must disclose the residual: {final_payload}"
+        );
+        assert_eq!(
+            final_payload[ENVELOPE_KEY]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .matches("response_bounded:")
+                .count(),
+            1,
+            "reconciliation must not repeat the verdict factor"
+        );
+        assert_eq!(
+            final_payload[crate::negative::NEGATIVE_KEY]["trust_reason"]
+                .as_str()
+                .unwrap()
+                .matches("response_bounded:")
+                .count(),
+            1,
+            "reconciliation must not repeat the negative reason"
+        );
     }
 
     /// One shape, but not one substrate. A ranked answer depends on embeddings
@@ -3950,6 +4146,42 @@ mod self_check_tests {
         assert!(
             value["_kin"].get("self_check").is_none(),
             "an agreeing response disclosed a contradiction: {value}"
+        );
+    }
+
+    #[test]
+    fn response_accounting_includes_the_final_self_check_and_residual_state() {
+        let mut value = agreeing();
+        value["references"] = json!([{"name": "one surviving answer"}]);
+        value["_kin"]["completeness"]["status"] = json!("unknown");
+        value["_kin"]["completeness"]["bound"] = json!("at_least");
+        let budget = ResponseBudget {
+            max_chars: crate::budget::measure(&value) + 100,
+            compact: false,
+            ..ResponseBudget::default()
+        };
+
+        apply_response_budget(&mut value, "find_references", &budget);
+
+        assert_eq!(value["_kin"]["self_check"]["status"], "contradicted");
+        let final_chars = crate::budget::measure(&value);
+        assert_eq!(
+            value["_kin"]["response"]["chars_after_budget"],
+            json!(final_chars),
+            "the self-check is part of the bytes the accounting reports: {value}"
+        );
+        let residual = value
+            .get("degradations")
+            .and_then(Value::as_array)
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.get("reason").and_then(Value::as_str)
+                        == Some(crate::budget::OVER_BUDGET_REASON)
+                })
+            });
+        assert!(
+            final_chars <= budget.max_chars || residual,
+            "post-budget self-check growth must fit or disclose: {value}"
         );
     }
 }

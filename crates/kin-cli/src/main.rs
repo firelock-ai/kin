@@ -2826,6 +2826,13 @@ fn main() -> Result<()> {
                     let paging = commands::locate::LocatePaging {
                         cursor: paging_cursor,
                         page_size,
+                        snippet_override: if snippets {
+                            Some(true)
+                        } else if no_snippets {
+                            Some(false)
+                        } else {
+                            None
+                        },
                     };
                     // On a paging request the query text is carried by the cursor
                     // (the daemon holds the cached ranking), so it is optional.

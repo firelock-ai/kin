@@ -1114,9 +1114,97 @@ fn host_reading() -> Result<MemoryReading, String> {
 /// sits next to.
 pub const PRESSURE_RECORD_FILE_NAME: &str = "memory-pressure";
 
+/// Current per-work refusal state.
+///
+/// The stable single-record path above cannot safely become a collection while
+/// an older daemon may remain attached during an upgrade: its next truncate
+/// and write would erase every other producer. Current writers therefore keep
+/// the collection in a separate file and use the old path only as the newest
+/// compatibility projection.
+pub const PRESSURE_RECORDS_FILE_NAME: &str = "memory-pressure-records";
+
+/// Fail-closed work id used when an existing legacy publication cannot yet be
+/// parsed. It is deliberately not a known [`HeavyWork`]: no coverage counter
+/// may suppress a durability gap whose contents are still unknown.
+pub const PRESSURE_RECORD_UNREADABLE_WORK_ID: &str = "pressure-record-unreadable";
+
+/// What a reader can do when a mixed-version legacy publication is present but
+/// not readable as one complete record yet.
+pub const PRESSURE_RECORD_UNREADABLE_REMEDY: &str =
+    "Retry after the daemon finishes publishing, or restart the repository daemon so the current atomic pressure-record writer takes authority.";
+
 /// Where `kin_root` keeps it.
 pub fn pressure_record_path(kin_root: &Path) -> PathBuf {
     kin_root.join(PRESSURE_RECORD_FILE_NAME)
+}
+
+/// Where `kin_root` keeps the per-work collection.
+pub fn pressure_records_path(kin_root: &Path) -> PathBuf {
+    kin_root.join(PRESSURE_RECORDS_FILE_NAME)
+}
+
+/// Publish one whole refusal record without exposing its partial bytes.
+///
+/// The MCP and CLI readers live in other processes, so a daemon-local mutex
+/// cannot keep them from opening this file while it is being replaced. Stage
+/// beside the target, where the final rename is atomic, and remove the private
+/// sibling on every failed publication.
+fn write_pressure_record_atomically(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let staged = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    if let Err(error) = std::fs::write(&staged, body) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    if let Err(error) = replace_pressure_record(&staged, path) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Atomically replace the published record on platforms with different rename
+/// contracts.
+#[cfg(not(windows))]
+fn replace_pressure_record(staged: &Path, path: &Path) -> std::io::Result<()> {
+    std::fs::rename(staged, path)
+}
+
+/// `std::fs::rename` cannot replace an existing destination on Windows. The
+/// native replacing move preserves the same one-step publication contract as
+/// Unix rather than creating an observable remove-then-rename gap.
+#[cfg(windows)]
+fn replace_pressure_record(staged: &Path, path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let staged = staged
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let path = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            staged.as_ptr(),
+            path.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 /// A piece of heavy work this store's daemon declined, and what it measured
@@ -1139,13 +1227,253 @@ pub struct PressureRefusal {
     pub at_unix: u64,
 }
 
+/// Exact embedding state that can prove an old embed refusal is complete.
+///
+/// Queue depth alone is not coverage. The background worker can drain its
+/// in-memory queue, discover graph keys that were never queued, and then have
+/// its backfill refused before it materializes that missing work. That state is
+/// `pending == 0` while `indexed < total`, and the refusal must stay visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbeddingCoverage {
+    pub pending: usize,
+    pub indexed: usize,
+    pub total: usize,
+}
+
+impl EmbeddingCoverage {
+    /// Whole selected-graph coverage, not merely an empty current queue.
+    pub fn is_complete(self) -> bool {
+        self.pending == 0 && self.indexed == self.total
+    }
+}
+
+const PRESSURE_REFUSAL_COLLECTION_SCHEMA: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct LegacyProjectionWitness {
+    record: PressureRefusal,
+    #[serde(default)]
+    nonce: Option<String>,
+}
+
+/// One legacy-readable projection plus a current-writer identity.
+///
+/// Older `PressureRefusal` readers ignore the extra nonce field. Current
+/// readers use it to distinguish an identical same-second rewrite by an older
+/// daemon from the projection this sidecar actually published.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LegacyPressureRefusalProjection {
+    work: String,
+    level: String,
+    reason: String,
+    at_unix: u64,
+    #[serde(default)]
+    pressure_records_nonce: Option<String>,
+}
+
+impl LegacyPressureRefusalProjection {
+    fn from_witness(witness: &LegacyProjectionWitness) -> Self {
+        Self {
+            work: witness.record.work.clone(),
+            level: witness.record.level.clone(),
+            reason: witness.record.reason.clone(),
+            at_unix: witness.record.at_unix,
+            pressure_records_nonce: witness.nonce.clone(),
+        }
+    }
+
+    fn into_witness(self) -> LegacyProjectionWitness {
+        LegacyProjectionWitness {
+            record: PressureRefusal {
+                work: self.work,
+                level: self.level,
+                reason: self.reason,
+                at_unix: self.at_unix,
+            },
+            nonce: self.pressure_records_nonce,
+        }
+    }
+}
+
+/// Current sidecar format.
+///
+/// `legacy_projection` records what the current writer last intended the
+/// stable single-record path to contain. A different live value came from an
+/// older writer and is merged into this collection rather than being allowed
+/// to replace it.
+#[derive(Debug, serde::Serialize)]
+struct PressureRefusalCollection {
+    schema: u32,
+    legacy_projection: Option<LegacyProjectionWitness>,
+    refusals: Vec<PressureRefusal>,
+}
+
+#[derive(serde::Deserialize)]
+struct PressureRefusalCollectionWire {
+    schema: u32,
+    legacy_projection: Option<LegacyProjectionWitness>,
+    refusals: Vec<PressureRefusal>,
+}
+
+impl<'de> serde::Deserialize<'de> for PressureRefusalCollection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        let object = value.as_object().ok_or_else(|| {
+            serde::de::Error::custom("pressure refusal sidecar must be an object")
+        })?;
+        if !object.contains_key("legacy_projection") {
+            return Err(serde::de::Error::missing_field("legacy_projection"));
+        }
+        if !object.contains_key("refusals") {
+            return Err(serde::de::Error::missing_field("refusals"));
+        }
+        let wire: PressureRefusalCollectionWire =
+            serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            schema: wire.schema,
+            legacy_projection: wire.legacy_projection,
+            refusals: wire.refusals,
+        })
+    }
+}
+
+impl PressureRefusalCollection {
+    fn new(
+        refusals: Vec<PressureRefusal>,
+        legacy_projection: Option<LegacyProjectionWitness>,
+    ) -> Self {
+        Self {
+            schema: PRESSURE_REFUSAL_COLLECTION_SCHEMA,
+            legacy_projection,
+            refusals: PressureRefusal::newest_per_work(refusals),
+        }
+    }
+}
+
+/// Transitional collection format briefly written at the legacy path.
+///
+/// Keeping this reader makes an in-place development upgrade lossless. New
+/// writes always project one ordinary [`PressureRefusal`] there for old
+/// binaries and place the collection in [`PRESSURE_RECORDS_FILE_NAME`].
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LegacyPressureRefusalRecords {
+    work: String,
+    level: String,
+    reason: String,
+    at_unix: u64,
+    refusals: Vec<PressureRefusal>,
+}
+
+impl LegacyPressureRefusalRecords {
+    #[cfg(test)]
+    fn new(refusals: Vec<PressureRefusal>) -> Option<Self> {
+        let newest = refusals.last()?.clone();
+        Some(Self {
+            work: newest.work,
+            level: newest.level,
+            reason: newest.reason,
+            at_unix: newest.at_unix,
+            refusals,
+        })
+    }
+
+    fn projection(&self) -> LegacyProjectionWitness {
+        LegacyProjectionWitness {
+            record: PressureRefusal {
+                work: self.work.clone(),
+                level: self.level.clone(),
+                reason: self.reason.clone(),
+                at_unix: self.at_unix,
+            },
+            nonce: None,
+        }
+    }
+
+    fn into_refusals(self) -> Vec<PressureRefusal> {
+        let Self {
+            work,
+            level,
+            reason,
+            at_unix,
+            refusals,
+        } = self;
+        if refusals.is_empty() {
+            vec![PressureRefusal {
+                work,
+                level,
+                reason,
+                at_unix,
+            }]
+        } else {
+            refusals
+        }
+    }
+}
+
+/// Both generations accepted at the stable single-record path.
+#[derive(Debug, serde::Deserialize)]
+#[serde(untagged)]
+enum StoredLegacyPressureRefusals {
+    Records(LegacyPressureRefusalRecords),
+    Projection(LegacyPressureRefusalProjection),
+}
+
+struct LegacyPressureRefusalState {
+    projection: LegacyProjectionWitness,
+    refusals: Vec<PressureRefusal>,
+}
+
+enum LegacyPressureRefusalRead {
+    Absent,
+    Records(LegacyPressureRefusalState),
+    Unreadable,
+}
+
+enum PressureRefusalCollectionRead {
+    Absent,
+    Records(PressureRefusalCollection),
+    Unreadable,
+}
+
+/// Serialize every current-writer read/modify/publish cycle in this process.
+///
+/// Production mutation has one process owner: the repository daemon, whose
+/// lifecycle lock admits only one daemon for a store. Older daemons touch only
+/// the legacy projection, which the sidecar merge protocol handles separately.
+/// Keeping the lock here, rather than only at today's daemon call sites, also
+/// prevents two daemon worker threads or future in-process callers from
+/// reading the same collection and publishing two individually complete but
+/// mutually destructive replacements.
+static PRESSURE_REFUSAL_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Acquire the mutation lock, exposing only the deterministic contended edge
+/// to tests. A callback after a timeout cannot prove another thread attempted
+/// the lock; this callback runs only after `try_lock` observed the owner.
+fn pressure_refusal_mutation_guard(
+    on_contended: impl FnOnce(),
+) -> std::sync::MutexGuard<'static, ()> {
+    match PRESSURE_REFUSAL_MUTATION_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::WouldBlock) => {
+            on_contended();
+            PRESSURE_REFUSAL_MUTATION_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        }
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+    }
+}
+
 impl PressureRefusal {
-    /// Record one refusal for this store.
+    /// Record one refusal for this store, without erasing other work.
     ///
-    /// Last writer wins, deliberately: the useful fact is the most recent
-    /// refusal, and a store keeping a history of them would be a log with worse
-    /// ergonomics. A write that fails is dropped, because a daemon that cannot
-    /// write its own disclosure must not fail the work it was disclosing about.
+    /// Last writer wins for the exact work id. Other work remains outstanding,
+    /// including ids this build does not recognise. A write that fails is
+    /// dropped, because a daemon that cannot write its own disclosure must not
+    /// fail the work it was disclosing about.
     pub fn record(kin_root: &Path, work: HeavyWork, level: PressureLevel, reason: &str) {
         let record = Self {
             work: work.id().to_string(),
@@ -1153,29 +1481,353 @@ impl PressureRefusal {
             reason: reason.to_string(),
             at_unix: unix_now(),
         };
-        if let Ok(body) = serde_json::to_vec(&record) {
-            let _ = std::fs::write(pressure_record_path(kin_root), body);
+        let _ = Self::mutate_with(kin_root, |refusals| {
+            refusals.retain(|existing| existing.work != record.work);
+            refusals.push(record);
+            true
+        });
+    }
+
+    /// The newest refusal this store records, for compatibility with surfaces
+    /// that can render only one cause.
+    ///
+    /// An absent record reads as absent. An existing but unreadable legacy
+    /// publication returns a fail-closed synthetic record, because treating a
+    /// mixed-version truncate/write window as clean would hide the refusal this
+    /// record exists to disclose.
+    pub fn read(kin_root: &Path) -> Option<Self> {
+        let mut refusals = Self::read_all(kin_root);
+        refusals.pop()
+    }
+
+    /// Every refusal this store records, oldest to newest.
+    ///
+    /// A valid sidecar is authoritative, including an explicitly empty one.
+    /// The legacy path is the fallback before migration. When it differs from
+    /// the projection recorded in the sidecar, it is an observation from an
+    /// older writer and is merged by exact work id without replacing the other
+    /// sidecar entries.
+    pub fn read_all(kin_root: &Path) -> Vec<Self> {
+        let legacy = Self::read_legacy(kin_root);
+        let collection = match Self::read_collection(kin_root) {
+            PressureRefusalCollectionRead::Records(collection) => collection,
+            PressureRefusalCollectionRead::Absent => {
+                return match legacy {
+                    LegacyPressureRefusalRead::Records(legacy) => {
+                        Self::newest_per_work(legacy.refusals)
+                    }
+                    LegacyPressureRefusalRead::Absent => Vec::new(),
+                    LegacyPressureRefusalRead::Unreadable => vec![Self::unreadable_record()],
+                };
+            }
+            PressureRefusalCollectionRead::Unreadable => {
+                let mut refusals = match legacy {
+                    LegacyPressureRefusalRead::Records(legacy) => legacy.refusals,
+                    LegacyPressureRefusalRead::Absent | LegacyPressureRefusalRead::Unreadable => {
+                        Vec::new()
+                    }
+                };
+                refusals.push(Self::unreadable_record());
+                return Self::newest_per_work(refusals);
+            }
+        };
+
+        let mut refusals = Self::newest_per_work(collection.refusals);
+        match legacy {
+            LegacyPressureRefusalRead::Records(legacy) => {
+                if Some(&legacy.projection) != collection.legacy_projection.as_ref() {
+                    for refusal in legacy.refusals {
+                        Self::merge_legacy_observation(&mut refusals, refusal);
+                    }
+                }
+            }
+            LegacyPressureRefusalRead::Unreadable => {
+                refusals.push(Self::unreadable_record());
+            }
+            LegacyPressureRefusalRead::Absent => {}
+        }
+        Self::newest_per_work(refusals)
+    }
+
+    fn unreadable_record() -> Self {
+        Self {
+            work: PRESSURE_RECORD_UNREADABLE_WORK_ID.to_string(),
+            level: PressureLevel::Unknown.as_str().to_string(),
+            reason: "Kin found an existing memory-pressure publication but could not read one complete record from it; an older daemon may still be replacing it"
+                .to_string(),
+            at_unix: unix_now(),
         }
     }
 
-    /// What this store records, or `None` when it records nothing.
-    ///
-    /// An unreadable or unparsable record reads as absent, for the same reason
-    /// the sweep tally does: this record exists to report a degradation, and it
-    /// must never become one.
-    pub fn read(kin_root: &Path) -> Option<Self> {
-        let raw = std::fs::read(pressure_record_path(kin_root)).ok()?;
-        serde_json::from_slice(&raw).ok()
+    fn is_unreadable_record(&self) -> bool {
+        self.work == PRESSURE_RECORD_UNREADABLE_WORK_ID
     }
 
-    /// Retire the record, because the work it describes has since run.
+    /// The newest refusal for one exact producer.
+    pub fn read_for_work(kin_root: &Path, work: HeavyWork) -> Option<Self> {
+        Self::read_all(kin_root)
+            .into_iter()
+            .rev()
+            .find(|refusal| refusal.work == work.id())
+    }
+
+    /// Keep only the newest occurrence of each work id while retaining its
+    /// relative publication order.
+    fn newest_per_work(refusals: Vec<Self>) -> Vec<Self> {
+        let mut normalized = Vec::<Self>::new();
+        for refusal in refusals {
+            normalized.retain(|existing| existing.work != refusal.work);
+            normalized.push(refusal);
+        }
+        normalized
+    }
+
+    fn read_collection(kin_root: &Path) -> PressureRefusalCollectionRead {
+        let raw = match std::fs::read(pressure_records_path(kin_root)) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return PressureRefusalCollectionRead::Absent;
+            }
+            Err(_) => return PressureRefusalCollectionRead::Unreadable,
+        };
+        match serde_json::from_slice::<PressureRefusalCollection>(&raw) {
+            Ok(collection) if collection.schema == PRESSURE_REFUSAL_COLLECTION_SCHEMA => {
+                PressureRefusalCollectionRead::Records(collection)
+            }
+            Ok(_) | Err(_) => PressureRefusalCollectionRead::Unreadable,
+        }
+    }
+
+    fn read_legacy(kin_root: &Path) -> LegacyPressureRefusalRead {
+        Self::read_legacy_with(|| std::fs::read(pressure_record_path(kin_root)))
+    }
+
+    /// Read through the one mixed-version publication shape that is not
+    /// atomic: an older daemon truncates the legacy file before filling it.
+    /// A parse failure while the path exists gets one immediate retry so that
+    /// transient empty or partial bytes do not become a clean response. New
+    /// writers never need this because both of their files use atomic replace.
+    fn read_legacy_with(
+        mut read: impl FnMut() -> std::io::Result<Vec<u8>>,
+    ) -> LegacyPressureRefusalRead {
+        let mut saw_existing_or_unreadable = false;
+        for attempt in 0..2 {
+            match read() {
+                Ok(raw) => {
+                    saw_existing_or_unreadable = true;
+                    if let Ok(stored) = serde_json::from_slice::<StoredLegacyPressureRefusals>(&raw)
+                    {
+                        return LegacyPressureRefusalRead::Records(match stored {
+                            StoredLegacyPressureRefusals::Records(records) => {
+                                LegacyPressureRefusalState {
+                                    projection: records.projection(),
+                                    refusals: records.into_refusals(),
+                                }
+                            }
+                            StoredLegacyPressureRefusals::Projection(projection) => {
+                                let projection = projection.into_witness();
+                                LegacyPressureRefusalState {
+                                    projection: projection.clone(),
+                                    refusals: vec![projection.record],
+                                }
+                            }
+                        });
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    saw_existing_or_unreadable = true;
+                }
+            }
+            if attempt == 0 {
+                std::thread::yield_now();
+            }
+        }
+        if saw_existing_or_unreadable {
+            LegacyPressureRefusalRead::Unreadable
+        } else {
+            LegacyPressureRefusalRead::Absent
+        }
+    }
+
+    /// Merge a legacy writer's observation without allowing it to discard
+    /// sidecar state. A later timestamp wins for the same work. An equal record
+    /// is still moved to newest because this function is called only after the
+    /// legacy projection witness changed, including a same-second old rewrite
+    /// that stripped the current writer's nonce.
+    fn merge_legacy_observation(refusals: &mut Vec<Self>, observed: Self) {
+        let Some(index) = refusals
+            .iter()
+            .position(|existing| existing.work == observed.work)
+        else {
+            refusals.push(observed);
+            return;
+        };
+        if observed.at_unix < refusals[index].at_unix {
+            return;
+        }
+        refusals.remove(index);
+        refusals.push(observed);
+    }
+
+    /// Publish a complete current collection and its single-record legacy
+    /// projection without ever exposing an absent collection mid-transition.
     ///
-    /// Called by the work itself on the pass that proceeds. Without this the
-    /// row heals only when a store is reinitialized, and a surface reporting a
+    /// The first sidecar write deliberately carries no matching projection
+    /// witness. Until the compatibility update succeeds, current readers must
+    /// merge the still-live legacy record instead of treating it as already
+    /// reconciled. The final sidecar write records the new projection. Any
+    /// failure leaves either the previous state or a conservative mergeable
+    /// intermediate, not a partial JSON document or a clean-looking absence.
+    fn publish(kin_root: &Path, refusals: Vec<Self>) -> bool {
+        Self::publish_with_legacy_step(kin_root, refusals, |projection| {
+            Self::publish_legacy_projection(kin_root, projection)
+        })
+    }
+
+    /// Publish through an injected compatibility step so interruption after
+    /// the authoritative sidecar write is deterministic in tests.
+    fn publish_with_legacy_step(
+        kin_root: &Path,
+        refusals: Vec<Self>,
+        publish_legacy: impl FnOnce(Option<&LegacyProjectionWitness>) -> bool,
+    ) -> bool {
+        // A synthetic unreadable record is durable fail-closed authority, not
+        // scratch state. Exact-work retirement and later upserts must preserve
+        // it until an explicit all-record repair calls `clear`; otherwise an
+        // automatic embed completion could launder unknown per-work state into
+        // a clean response simply by republishing the records it could parse.
+        let refusals = Self::newest_per_work(refusals);
+        let initial = PressureRefusalCollection::new(refusals.clone(), None);
+        let Ok(initial_body) = serde_json::to_vec(&initial) else {
+            return false;
+        };
+        if write_pressure_record_atomically(&pressure_records_path(kin_root), &initial_body)
+            .is_err()
+        {
+            return false;
+        }
+
+        let projection = refusals
+            .last()
+            .cloned()
+            .map(|record| LegacyProjectionWitness {
+                record,
+                nonce: Some(uuid::Uuid::new_v4().to_string()),
+            });
+        if !publish_legacy(projection.as_ref()) {
+            return false;
+        }
+
+        let final_collection = PressureRefusalCollection::new(refusals, projection);
+        let Ok(final_body) = serde_json::to_vec(&final_collection) else {
+            return false;
+        };
+        write_pressure_record_atomically(&pressure_records_path(kin_root), &final_body).is_ok()
+    }
+
+    fn publish_legacy_projection(
+        kin_root: &Path,
+        projection: Option<&LegacyProjectionWitness>,
+    ) -> bool {
+        match projection {
+            Some(projection) => {
+                serde_json::to_vec(&LegacyPressureRefusalProjection::from_witness(projection))
+                    .ok()
+                    .is_some_and(|body| {
+                        write_pressure_record_atomically(&pressure_record_path(kin_root), &body)
+                            .is_ok()
+                    })
+            }
+            None => match std::fs::remove_file(pressure_record_path(kin_root)) {
+                Ok(()) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => false,
+            },
+        }
+    }
+
+    /// Run one current-writer mutation as a single read/modify/publish cycle.
+    fn mutate_with(kin_root: &Path, mutation: impl FnOnce(&mut Vec<Self>) -> bool) -> bool {
+        Self::mutate_with_after_read(kin_root, mutation, || {})
+    }
+
+    /// Test seam for proving that the mutation lock covers the read through
+    /// the final publication rather than merely serializing either endpoint.
+    fn mutate_with_after_read(
+        kin_root: &Path,
+        mutation: impl FnOnce(&mut Vec<Self>) -> bool,
+        after_read: impl FnOnce(),
+    ) -> bool {
+        Self::mutate_with_after_read_and_contention(kin_root, mutation, after_read, || {})
+    }
+
+    /// Test seam for proving a second writer reached the owned lock rather than
+    /// inferring it from scheduler timing.
+    fn mutate_with_after_read_and_contention(
+        kin_root: &Path,
+        mutation: impl FnOnce(&mut Vec<Self>) -> bool,
+        after_read: impl FnOnce(),
+        on_contended: impl FnOnce(),
+    ) -> bool {
+        let _mutation_guard = pressure_refusal_mutation_guard(on_contended);
+        let mut refusals = Self::read_all(kin_root);
+        after_read();
+        if !mutation(&mut refusals) {
+            return false;
+        }
+        Self::publish(kin_root, refusals)
+    }
+
+    /// Retire every refusal in this store, including fail-closed unreadable
+    /// authority as an explicit repair operation.
+    ///
+    /// Returns whether a record was actually removed. Without this the row
+    /// heals only when a store is reinitialized, and a surface reporting a
     /// refusal from last week reads exactly like one reporting a refusal from
     /// this second.
-    pub fn clear(kin_root: &Path) {
-        let _ = std::fs::remove_file(pressure_record_path(kin_root));
+    pub fn clear(kin_root: &Path) -> bool {
+        Self::mutate_with(kin_root, |refusals| {
+            if refusals.is_empty() {
+                return false;
+            }
+            refusals.clear();
+            true
+        })
+    }
+
+    /// Retire only the refusal for work that has since completed.
+    ///
+    /// Other known and future work ids are atomically republished in their
+    /// existing order. The legacy single-record format follows the same rule.
+    pub fn clear_for_work(kin_root: &Path, completed_work: HeavyWork) -> bool {
+        Self::mutate_with(kin_root, |refusals| {
+            let previous_len = refusals.len();
+            refusals.retain(|refusal| refusal.work != completed_work.id());
+            refusals.len() != previous_len
+        })
+    }
+
+    /// Whether this record still describes work that has anything to do.
+    ///
+    /// A refusal is a fact about a decision, not about a backlog, and the two
+    /// come apart. An express checkout reporting `Embeddings: 952/952 indexed
+    /// (0 pending)` printed "so background embedding did not start" two rows
+    /// under that line and an all-clear beside it, because the refusal is
+    /// derived from footprint alone and never asks whether there is a batch to
+    /// hold. The reader is told their indexing is stalled on a store that has
+    /// nothing left to index.
+    ///
+    /// Only the embed arm can be emptied this way, and this reports on every
+    /// other. A refused sweep costs cross-file relations whatever the vector
+    /// count says, and a work id this build does not recognise has no known
+    /// backlog to check, so both stay reported: this is a mute for a state that
+    /// was measured, never a default for one that was not.
+    pub fn describes_outstanding_work(&self, coverage: EmbeddingCoverage) -> bool {
+        if self.work != HeavyWork::EmbedBatch.id() {
+            return true;
+        }
+        !coverage.is_complete()
     }
 
     /// The fact alone, for a surface that carries its own remediation field.
@@ -1185,7 +1837,11 @@ impl PressureRefusal {
 
     /// What the reader can do about it.
     pub fn remediation(&self) -> String {
-        PRESSURE_REMEDY.to_string()
+        if self.is_unreadable_record() {
+            PRESSURE_RECORD_UNREADABLE_REMEDY.to_string()
+        } else {
+            PRESSURE_REMEDY.to_string()
+        }
     }
 }
 
@@ -1968,20 +2624,801 @@ mod tests {
         assert_eq!(record.work, "lsp-sweep");
         assert_eq!(record.level, "critical");
         assert_eq!(record.reason, "host memory pressure is critical");
-        PressureRefusal::clear(dir.path());
+        assert!(PressureRefusal::clear(dir.path()));
         assert!(
             PressureRefusal::read(dir.path()).is_none(),
             "the pass that proceeds retires the record, or the row never heals"
         );
+        assert!(
+            !PressureRefusal::clear(dir.path()),
+            "a caller can distinguish a record it retired from one already absent"
+        );
     }
 
     #[test]
-    fn an_unparsable_record_reads_as_absent() {
+    fn pressure_refusal_upsert_replaces_one_whole_record_without_temp_debris() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::LspSweep,
+            PressureLevel::Critical,
+            "old refusal",
+        );
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::LspSweep,
+            PressureLevel::Elevated,
+            "replacement refusal",
+        );
+
+        let record = PressureRefusal::read(dir.path()).expect("the replacement record");
+        assert_eq!(record.work, HeavyWork::LspSweep.id());
+        assert_eq!(record.level, PressureLevel::Elevated.as_str());
+        assert_eq!(record.reason, "replacement refusal");
+        assert_eq!(
+            PressureRefusal::read_all(dir.path()),
+            vec![record],
+            "upserting one producer replaces its entry instead of growing a history"
+        );
+        let published = std::fs::read(pressure_record_path(dir.path())).expect("read publication");
+        let legacy_view = serde_json::from_slice::<PressureRefusal>(&published)
+            .expect("an older single-record reader still sees the newest refusal");
+        assert_eq!(legacy_view.reason, "replacement refusal");
+        let mut names = std::fs::read_dir(dir.path())
+            .expect("read pressure-record directory")
+            .map(|entry| entry.expect("a directory entry").file_name())
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                std::ffi::OsString::from(PRESSURE_RECORD_FILE_NAME),
+                std::ffi::OsString::from(PRESSURE_RECORDS_FILE_NAME),
+            ],
+            "both atomic publications replace their staged siblings without debris"
+        );
+    }
+
+    #[test]
+    fn clearing_embed_preserves_lsp_in_both_publication_orders() {
+        for order in [
+            [HeavyWork::LspSweep, HeavyWork::EmbedBatch],
+            [HeavyWork::EmbedBatch, HeavyWork::LspSweep],
+        ] {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            for work in order {
+                PressureRefusal::record(dir.path(), work, PressureLevel::Critical, work.id());
+            }
+
+            assert!(PressureRefusal::read_for_work(dir.path(), HeavyWork::LspSweep).is_some());
+            assert!(PressureRefusal::read_for_work(dir.path(), HeavyWork::EmbedBatch).is_some());
+            assert!(PressureRefusal::clear_for_work(
+                dir.path(),
+                HeavyWork::EmbedBatch
+            ));
+            assert!(PressureRefusal::read_for_work(dir.path(), HeavyWork::EmbedBatch).is_none());
+            assert_eq!(
+                PressureRefusal::read(dir.path())
+                    .expect("the independent LSP refusal survives")
+                    .work,
+                HeavyWork::LspSweep.id()
+            );
+            let published = std::fs::read(pressure_record_path(dir.path()))
+                .expect("read exact-key retirement publication");
+            assert_eq!(
+                serde_json::from_slice::<PressureRefusal>(&published)
+                    .expect("an older reader still sees the surviving refusal")
+                    .work,
+                HeavyWork::LspSweep.id()
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_work_upserts_share_one_read_modify_publish_cycle() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let root = std::sync::Arc::new(dir.path().to_path_buf());
+        let (first_read_tx, first_read_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_first_tx, release_first_rx) = std::sync::mpsc::sync_channel(0);
+        let first_root = std::sync::Arc::clone(&root);
+        let first = std::thread::spawn(move || {
+            PressureRefusal::mutate_with_after_read(
+                first_root.as_ref(),
+                |refusals| {
+                    refusals.push(PressureRefusal {
+                        work: HeavyWork::LspSweep.id().to_string(),
+                        level: PressureLevel::Critical.as_str().to_string(),
+                        reason: "lsp refused".to_string(),
+                        at_unix: 1,
+                    });
+                    true
+                },
+                || {
+                    first_read_tx.send(()).expect("announce first read");
+                    release_first_rx.recv().expect("release first writer");
+                },
+            )
+        });
+        first_read_rx.recv().expect("first writer reached its read");
+
+        let (second_contended_tx, second_contended_rx) = std::sync::mpsc::sync_channel(0);
+        let (second_read_tx, second_read_rx) = std::sync::mpsc::sync_channel(0);
+        let second_root = std::sync::Arc::clone(&root);
+        let second = std::thread::spawn(move || {
+            PressureRefusal::mutate_with_after_read_and_contention(
+                second_root.as_ref(),
+                |refusals| {
+                    refusals.push(PressureRefusal {
+                        work: HeavyWork::EmbedBatch.id().to_string(),
+                        level: PressureLevel::Critical.as_str().to_string(),
+                        reason: "embed refused".to_string(),
+                        at_unix: 2,
+                    });
+                    true
+                },
+                || second_read_tx.send(()).expect("announce second read"),
+                || {
+                    second_contended_tx
+                        .send(())
+                        .expect("announce owned mutation lock")
+                },
+            )
+        });
+        second_contended_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("the second writer must observe the first writer's owned lock");
+        assert!(
+            matches!(
+                second_read_rx.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
+            "the contending writer cannot reach its collection read while the first owns the lock"
+        );
+        release_first_tx.send(()).expect("release first writer");
+        assert!(first.join().expect("first writer did not panic"));
+        second_read_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("second writer proceeds after the first publishes");
+        assert!(second.join().expect("second writer did not panic"));
+        assert_eq!(
+            PressureRefusal::read_all(root.as_ref())
+                .into_iter()
+                .map(|refusal| refusal.work)
+                .collect::<Vec<_>>(),
+            vec![
+                HeavyWork::LspSweep.id().to_string(),
+                HeavyWork::EmbedBatch.id().to_string(),
+            ],
+            "serialized writers preserve both exact work records"
+        );
+    }
+
+    #[test]
+    fn future_work_survives_known_work_upserts_and_retirement() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let future = PressureRefusal {
+            work: "future-heavy-work".to_string(),
+            level: "critical".to_string(),
+            reason: "future work was refused".to_string(),
+            at_unix: 1,
+        };
+        let body = serde_json::to_vec(&future).expect("serialize future record");
+        write_pressure_record_atomically(&pressure_record_path(dir.path()), &body)
+            .expect("publish a future record through the legacy-writer surface");
+
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "embed refused",
+        );
+        assert!(PressureRefusal::clear_for_work(
+            dir.path(),
+            HeavyWork::EmbedBatch
+        ));
+        assert_eq!(PressureRefusal::read_all(dir.path()), vec![future]);
+    }
+
+    #[test]
+    fn a_legacy_single_record_migrates_without_losing_its_work() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let legacy = PressureRefusal {
+            work: HeavyWork::LspSweep.id().to_string(),
+            level: "critical".to_string(),
+            reason: "legacy sweep refusal".to_string(),
+            at_unix: 1,
+        };
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&legacy).expect("serialize legacy refusal"),
+        )
+        .expect("publish legacy refusal");
+
+        assert_eq!(PressureRefusal::read_all(dir.path()), vec![legacy.clone()]);
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "new embed refusal",
+        );
+        assert_eq!(
+            PressureRefusal::read_all(dir.path())
+                .into_iter()
+                .map(|refusal| refusal.work)
+                .collect::<Vec<_>>(),
+            vec![
+                HeavyWork::LspSweep.id().to_string(),
+                HeavyWork::EmbedBatch.id().to_string(),
+            ]
+        );
+        let published =
+            std::fs::read(pressure_record_path(dir.path())).expect("read legacy projection");
+        assert!(
+            serde_json::from_slice::<PressureRefusal>(&published).is_ok(),
+            "the legacy path remains one record for older readers"
+        );
+        let sidecar =
+            std::fs::read(pressure_records_path(dir.path())).expect("read migrated collection");
+        assert!(
+            serde_json::from_slice::<PressureRefusalCollection>(&sidecar).is_ok(),
+            "the first upsert migrates the complete set into the sidecar"
+        );
+    }
+
+    #[test]
+    fn a_transitional_same_path_collection_migrates_to_the_sidecar() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let lsp = PressureRefusal {
+            work: HeavyWork::LspSweep.id().to_string(),
+            level: "critical".to_string(),
+            reason: "lsp refused".to_string(),
+            at_unix: 1,
+        };
+        let future = PressureRefusal {
+            work: "future-heavy-work".to_string(),
+            level: "critical".to_string(),
+            reason: "future refused".to_string(),
+            at_unix: 2,
+        };
+        let transitional = LegacyPressureRefusalRecords::new(vec![lsp.clone(), future.clone()])
+            .expect("two refusal collection");
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&transitional).expect("serialize transitional collection"),
+        )
+        .expect("publish transitional collection");
+
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "embed refused",
+        );
+
+        let all = PressureRefusal::read_all(dir.path());
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&lsp));
+        assert!(all.contains(&future));
+        assert!(PressureRefusal::read_for_work(dir.path(), HeavyWork::EmbedBatch).is_some());
+        assert!(
+            serde_json::from_slice::<PressureRefusal>(
+                &std::fs::read(pressure_record_path(dir.path())).expect("read projection")
+            )
+            .is_ok(),
+            "migration restores the old path to its single-record contract"
+        );
+    }
+
+    #[test]
+    fn a_partial_legacy_write_is_retried_before_it_can_look_absent() {
+        let refusal = PressureRefusal {
+            work: HeavyWork::EmbedBatch.id().to_string(),
+            level: "critical".to_string(),
+            reason: "old daemon refusal".to_string(),
+            at_unix: 7,
+        };
+        let complete = serde_json::to_vec(&refusal).expect("serialize complete legacy record");
+        let mut reads = vec![b"{\"work\":".to_vec(), complete].into_iter();
+
+        let observed = match PressureRefusal::read_legacy_with(|| {
+            Ok(reads.next().expect("the reader is bounded to two attempts"))
+        }) {
+            LegacyPressureRefusalRead::Records(observed) => observed,
+            LegacyPressureRefusalRead::Absent | LegacyPressureRefusalRead::Unreadable => {
+                panic!("the retry must observe the completed old-writer publication")
+            }
+        };
+
+        assert_eq!(observed.projection.record, refusal);
+        assert_eq!(observed.projection.nonce, None);
+        assert!(reads.next().is_none(), "only the one documented retry runs");
+    }
+
+    #[test]
+    fn a_writer_stalled_across_both_reads_fails_closed() {
+        let mut reads = vec![b"{".to_vec(), b"{\"work\":".to_vec()].into_iter();
+        assert!(matches!(
+            PressureRefusal::read_legacy_with(|| {
+                Ok(reads.next().expect("the reader is bounded to two attempts"))
+            }),
+            LegacyPressureRefusalRead::Unreadable
+        ));
+        assert!(reads.next().is_none());
+    }
+
+    #[test]
+    fn an_identical_old_rewrite_cannot_hide_behind_same_second_equality() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let record = PressureRefusal {
+            work: HeavyWork::EmbedBatch.id().to_string(),
+            level: "critical".to_string(),
+            reason: "same-second refusal".to_string(),
+            at_unix: 7,
+        };
+        let independent = PressureRefusal {
+            work: HeavyWork::LspSweep.id().to_string(),
+            level: "critical".to_string(),
+            reason: "independent newer work".to_string(),
+            at_unix: 8,
+        };
+        let witness = LegacyProjectionWitness {
+            record: record.clone(),
+            nonce: Some("current-writer".to_string()),
+        };
+        std::fs::write(
+            pressure_records_path(dir.path()),
+            serde_json::to_vec(&PressureRefusalCollection::new(
+                vec![record.clone(), independent.clone()],
+                Some(witness.clone()),
+            ))
+            .expect("serialize transitional sidecar"),
+        )
+        .expect("publish transitional sidecar");
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&LegacyPressureRefusalProjection::from_witness(&witness))
+                .expect("serialize current projection"),
+        )
+        .expect("publish current projection");
+
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&record).expect("serialize byte-identical old record"),
+        )
+        .expect("simulate an old same-second rewrite without the nonce");
+
+        assert_eq!(
+            PressureRefusal::read_all(dir.path()),
+            vec![independent, record.clone()],
+            "the missing nonce proves this is a new legacy observation and moves it behind work the sidecar published later"
+        );
+        assert_eq!(
+            PressureRefusal::read(dir.path()),
+            Some(record),
+            "the same-second rewrite becomes the compatibility reader's newest observation"
+        );
+    }
+
+    #[test]
+    fn an_old_single_record_writer_cannot_erase_per_work_sidecar_state() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::LspSweep,
+            PressureLevel::Critical,
+            "lsp refused",
+        );
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "embed refused",
+        );
+
+        let legacy_only = PressureRefusal {
+            work: "future-heavy-work".to_string(),
+            level: "critical".to_string(),
+            reason: "an older daemon rewrote the stable path".to_string(),
+            at_unix: u64::MAX,
+        };
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&legacy_only).expect("serialize old-writer record"),
+        )
+        .expect("simulate an old daemon truncate and write");
+
+        let after_write = PressureRefusal::read_all(dir.path());
+        assert_eq!(after_write.len(), 3);
+        assert!(after_write
+            .iter()
+            .any(|record| record.work == HeavyWork::LspSweep.id()));
+        assert!(after_write
+            .iter()
+            .any(|record| record.work == HeavyWork::EmbedBatch.id()));
+        assert!(after_write.contains(&legacy_only));
+
+        std::fs::remove_file(pressure_record_path(dir.path()))
+            .expect("simulate an old daemon's non-exact clear");
+        let after_clear = PressureRefusal::read_all(dir.path());
+        assert_eq!(
+            after_clear
+                .iter()
+                .map(|record| record.work.as_str())
+                .collect::<Vec<_>>(),
+            vec![HeavyWork::LspSweep.id(), HeavyWork::EmbedBatch.id()],
+            "an old clear cannot delete the exact per-work state it cannot represent"
+        );
+    }
+
+    #[test]
+    fn an_old_same_work_clear_conservatively_resurrects_sidecar_authority() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::LspSweep,
+            PressureLevel::Critical,
+            "current sidecar refusal",
+        );
+        let current = PressureRefusal::read_for_work(dir.path(), HeavyWork::LspSweep)
+            .expect("current refusal");
+        let old_update = PressureRefusal {
+            reason: "old daemon replacement".to_string(),
+            at_unix: u64::MAX,
+            ..current.clone()
+        };
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&old_update).expect("serialize old update"),
+        )
+        .expect("publish old update");
+        assert_eq!(
+            PressureRefusal::read_for_work(dir.path(), HeavyWork::LspSweep),
+            Some(old_update),
+            "a newer old-writer observation remains visible"
+        );
+
+        std::fs::remove_file(pressure_record_path(dir.path())).expect("old non-exact clear");
+        assert_eq!(
+            PressureRefusal::read_for_work(dir.path(), HeavyWork::LspSweep),
+            Some(current),
+            "an old clear cannot prove which work completed, so current exact sidecar authority is retained until a current writer reconciles it"
+        );
+    }
+
+    #[test]
+    fn failed_pressure_refusal_publication_cleans_its_staged_sibling() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::create_dir(pressure_record_path(dir.path())).expect("block the target with a dir");
+
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "publication must remain best effort",
+        );
+
+        let mut entries = std::fs::read_dir(dir.path())
+            .expect("read pressure-record directory")
+            .map(|entry| entry.expect("a directory entry").path())
+            .collect::<Vec<_>>();
+        entries.sort();
+        assert_eq!(
+            entries,
+            vec![
+                pressure_record_path(dir.path()),
+                pressure_records_path(dir.path()),
+            ]
+        );
+        assert!(
+            pressure_record_path(dir.path()).is_dir(),
+            "failed compatibility publication leaves the old target untouched"
+        );
+        assert!(
+            PressureRefusal::read_for_work(dir.path(), HeavyWork::EmbedBatch).is_some(),
+            "the authoritative sidecar still receives the best-effort disclosure"
+        );
+        assert!(
+            entries.iter().all(|path| !path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .contains(".tmp-")),
+            "failed publication cleans every staged sibling"
+        );
+    }
+
+    #[test]
+    fn failed_clear_last_legacy_step_cannot_publish_a_clean_current_view() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let legacy = PressureRefusal {
+            work: HeavyWork::EmbedBatch.id().to_string(),
+            level: PressureLevel::Critical.as_str().to_string(),
+            reason: "legacy refusal remains readable".to_string(),
+            at_unix: 7,
+        };
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&legacy).expect("serialize readable legacy refusal"),
+        )
+        .expect("publish readable legacy refusal");
+
+        assert!(
+            !PressureRefusal::publish_with_legacy_step(dir.path(), Vec::new(), |projection| {
+                assert!(
+                    projection.is_none(),
+                    "clearing the last record publishes no replacement projection"
+                );
+                false
+            }),
+            "the injected compatibility removal failed"
+        );
+        assert_eq!(
+            PressureRefusal::read_all(dir.path()),
+            vec![legacy.clone()],
+            "the transitional sidecar must merge the still-live legacy refusal after failure"
+        );
+        assert_eq!(
+            serde_json::from_slice::<PressureRefusal>(
+                &std::fs::read(pressure_record_path(dir.path()))
+                    .expect("old readers still see the failed-to-remove projection"),
+            )
+            .expect("legacy projection remains readable"),
+            legacy,
+        );
+
+        assert!(
+            PressureRefusal::clear(dir.path()),
+            "a later successful clear retries the compatibility removal"
+        );
+        assert!(PressureRefusal::read_all(dir.path()).is_empty());
+        assert!(
+            !pressure_record_path(dir.path()).exists(),
+            "successful clear removes the old-reader projection"
+        );
+    }
+
+    /// A recorded refusal is not itself evidence that work remains. Only an
+    /// embed refusal can be discharged by exact whole-coverage state; a sweep
+    /// refusal and an unknown future work id remain visible controls.
+    #[test]
+    fn an_embed_refusal_is_retired_only_when_coverage_is_complete() {
+        let refusal = |work: &str| PressureRefusal {
+            work: work.to_string(),
+            level: "critical".to_string(),
+            reason: "host memory pressure is critical".to_string(),
+            at_unix: 1,
+        };
+        let complete = EmbeddingCoverage {
+            pending: 0,
+            indexed: 9,
+            total: 9,
+        };
+        let queue_empty_but_short = EmbeddingCoverage {
+            pending: 0,
+            indexed: 8,
+            total: 9,
+        };
+        let queued = EmbeddingCoverage {
+            pending: 1,
+            indexed: 9,
+            total: 9,
+        };
+        let over_indexed = EmbeddingCoverage {
+            pending: 0,
+            indexed: 10,
+            total: 9,
+        };
+
+        assert!(
+            !refusal(HeavyWork::EmbedBatch.id()).describes_outstanding_work(complete),
+            "whole selected-graph coverage leaves no embed work for the refusal to describe"
+        );
+        assert!(
+            refusal(HeavyWork::EmbedBatch.id()).describes_outstanding_work(queue_empty_but_short),
+            "an empty queue cannot hide refused work while indexed coverage is short"
+        );
+        assert!(
+            refusal(HeavyWork::EmbedBatch.id()).describes_outstanding_work(queued),
+            "a live embed backlog keeps the refusal visible"
+        );
+        assert!(
+            refusal(HeavyWork::EmbedBatch.id()).describes_outstanding_work(over_indexed),
+            "an impossible over-indexed observation cannot authorize an all-clear"
+        );
+        assert!(
+            refusal(HeavyWork::LspSweep.id()).describes_outstanding_work(complete),
+            "vector completion says nothing about a refused enrichment sweep"
+        );
+        assert!(
+            refusal("future-heavy-work").describes_outstanding_work(complete),
+            "unknown work cannot be dismissed using the embedding counter"
+        );
+    }
+
+    #[test]
+    fn an_unparsable_existing_record_is_a_visible_degradation() {
         let dir = tempfile::tempdir().expect("a temp dir");
         std::fs::write(pressure_record_path(dir.path()), b"{not json").expect("write");
+        let record = PressureRefusal::read(dir.path())
+            .expect("an existing unreadable publication must fail closed");
+        assert_eq!(record.work, PRESSURE_RECORD_UNREADABLE_WORK_ID);
+        assert_eq!(record.level, PressureLevel::Unknown.as_str());
+        assert!(record.reason.contains("could not read one complete record"));
+        assert_eq!(record.remediation(), PRESSURE_RECORD_UNREADABLE_REMEDY);
+    }
+
+    #[test]
+    fn an_unparsable_authoritative_sidecar_is_also_a_visible_degradation() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let legacy = PressureRefusal {
+            work: HeavyWork::LspSweep.id().to_string(),
+            level: "critical".to_string(),
+            reason: "legacy projection survives".to_string(),
+            at_unix: 1,
+        };
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&legacy).expect("serialize legacy projection"),
+        )
+        .expect("publish legacy projection");
+        std::fs::write(pressure_records_path(dir.path()), b"{not json")
+            .expect("corrupt sidecar fixture");
+
+        let records = PressureRefusal::read_all(dir.path());
+        assert!(records.contains(&legacy));
+        assert!(records
+            .iter()
+            .any(|record| record.work == PRESSURE_RECORD_UNREADABLE_WORK_ID));
+    }
+
+    #[test]
+    fn a_structurally_truncated_sidecar_fails_closed() {
+        for (name, body) in [
+            ("schema only", serde_json::json!({ "schema": 1 })),
+            (
+                "missing refusals",
+                serde_json::json!({ "schema": 1, "legacy_projection": null }),
+            ),
+            (
+                "missing projection witness",
+                serde_json::json!({ "schema": 1, "refusals": [] }),
+            ),
+        ] {
+            let dir = tempfile::tempdir().expect("a temp dir");
+            std::fs::write(
+                pressure_records_path(dir.path()),
+                serde_json::to_vec(&body).expect("serialize truncated fixture"),
+            )
+            .expect("publish truncated sidecar fixture");
+            assert!(
+                PressureRefusal::read_all(dir.path())
+                    .iter()
+                    .any(|record| record.work == PRESSURE_RECORD_UNREADABLE_WORK_ID),
+                "{name} must not deserialize as authoritative all-clear"
+            );
+        }
+
+        let dir = tempfile::tempdir().expect("a temp dir");
+        std::fs::write(
+            pressure_records_path(dir.path()),
+            serde_json::to_vec(&serde_json::json!({
+                "schema": 1,
+                "legacy_projection": null,
+                "refusals": [],
+            }))
+            .expect("serialize explicit empty collection"),
+        )
+        .expect("publish explicit empty collection");
         assert!(
-            PressureRefusal::read(dir.path()).is_none(),
-            "a record that exists to report a degradation must never become one"
+            PressureRefusal::read_all(dir.path()).is_empty(),
+            "only the complete explicit empty shape is an authoritative all-clear"
+        );
+    }
+
+    #[test]
+    fn exact_clear_preserves_fail_closed_authority_from_a_malformed_sidecar() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let legacy = PressureRefusal {
+            work: HeavyWork::EmbedBatch.id().to_string(),
+            level: "critical".to_string(),
+            reason: "legacy embed refusal".to_string(),
+            at_unix: 1,
+        };
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&legacy).expect("serialize legacy refusal"),
+        )
+        .expect("publish readable legacy refusal");
+        std::fs::write(
+            pressure_records_path(dir.path()),
+            b"{unknown per-work state",
+        )
+        .expect("publish malformed sidecar fixture");
+
+        assert!(PressureRefusal::clear_for_work(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+        ));
+        let records = PressureRefusal::read_all(dir.path());
+        assert!(records
+            .iter()
+            .all(|record| record.work != HeavyWork::EmbedBatch.id()));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.work == PRESSURE_RECORD_UNREADABLE_WORK_ID),
+            "retiring the known embed key must not turn unreadable per-work authority into all-clear"
+        );
+    }
+
+    #[test]
+    fn later_upserts_preserve_fail_closed_authority_from_a_malformed_sidecar() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let legacy = PressureRefusal {
+            work: HeavyWork::LspSweep.id().to_string(),
+            level: "critical".to_string(),
+            reason: "legacy LSP refusal".to_string(),
+            at_unix: 1,
+        };
+        std::fs::write(
+            pressure_record_path(dir.path()),
+            serde_json::to_vec(&legacy).expect("serialize legacy refusal"),
+        )
+        .expect("publish readable legacy refusal");
+        std::fs::write(
+            pressure_records_path(dir.path()),
+            b"{unknown per-work state",
+        )
+        .expect("publish malformed sidecar fixture");
+
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "embed refused",
+        );
+        assert!(PressureRefusal::clear_for_work(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+        ));
+
+        let records = PressureRefusal::read_all(dir.path());
+        assert!(records.contains(&legacy));
+        assert!(records
+            .iter()
+            .any(|record| record.work == PRESSURE_RECORD_UNREADABLE_WORK_ID));
+        assert!(records
+            .iter()
+            .all(|record| record.work != HeavyWork::EmbedBatch.id()));
+    }
+
+    #[test]
+    fn exact_clear_preserves_fail_closed_authority_while_legacy_is_unreadable() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "embed refused",
+        );
+        std::fs::remove_file(pressure_record_path(dir.path()))
+            .expect("remove the atomic projection fixture");
+        std::fs::create_dir(pressure_record_path(dir.path()))
+            .expect("make the legacy path unreadable as a record");
+
+        assert!(
+            !PressureRefusal::clear_for_work(dir.path(), HeavyWork::EmbedBatch),
+            "the full two-file publication cannot claim success while the legacy path is blocked"
+        );
+        let records = PressureRefusal::read_all(dir.path());
+        assert!(records
+            .iter()
+            .all(|record| record.work != HeavyWork::EmbedBatch.id()));
+        assert!(
+            records
+                .iter()
+                .any(|record| record.work == PRESSURE_RECORD_UNREADABLE_WORK_ID),
+            "the valid sidecar must retain fail-closed authority across an exact clear"
         );
     }
 

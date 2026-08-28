@@ -397,6 +397,19 @@ fn embed_resource_exhaustion(
     rendered: &str,
     evidence: &crate::capability::MemoryEvidence,
 ) -> Option<String> {
+    embed_resource_exhaustion_for(rendered, evidence, kin_daemon_spawn::enrichment_disabled())
+}
+
+/// [`embed_resource_exhaustion`] with the process switch supplied explicitly.
+///
+/// The production wrapper reads the real process environment once. Tests use
+/// this pure seam so a developer's `KIN_DAEMON_DISABLE_LSP` cannot silently
+/// choose which sentence they grade.
+fn embed_resource_exhaustion_for(
+    rendered: &str,
+    evidence: &crate::capability::MemoryEvidence,
+    enrichment_disabled: bool,
+) -> Option<String> {
     if !lost_the_daemon_mid_request(rendered) {
         return None;
     }
@@ -441,13 +454,29 @@ fn embed_resource_exhaustion(
             human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
         )
     } else {
+        // The last sentence reads this process's own switch rather than
+        // assuming it is unset. Advice to set a variable the caller has already
+        // set is the shape a stranger hit on the memory-kill warning: they took
+        // it, re-ran, and were told to take it again.
         format!(
             "This machine already clears the {} the {EMBED_MODEL_DOWNLOAD} {EMBED_MODEL_ID} \
              model needs, so more memory is not the first thing to reach for. The other heavy \
              resident in this daemon is the language-server enrichment sweep, measured taking a \
-             daemon from 15 MB to 11.5 GB on a store of about one gigabyte. Set \
-             `KIN_DAEMON_DISABLE_LSP=1` and re-run to take it out of the picture.",
+             daemon from 15 MB to 11.5 GB on a store of about one gigabyte. {}",
             human_bytes(RECOMMENDED_EMBED_MEMORY_BYTES),
+            if enrichment_disabled {
+                format!(
+                    "This process already carries \
+                     `{}=1`, so stop the daemon (`kin daemon stop`) before re-running: a daemon \
+                     that was already up kept the setting it started with.",
+                    kin_daemon_spawn::DISABLE_ENRICHMENT_ENV
+                )
+            } else {
+                format!(
+                    "Set `{}=1` and re-run to take it out of the picture.",
+                    kin_daemon_spawn::DISABLE_ENRICHMENT_ENV
+                )
+            },
         )
     };
     Some(format!(
@@ -890,11 +919,11 @@ pub fn build_embed_response(
 mod tests {
     use super::{
         constrained_memory_notice, effective_batch_size, embed_completion_line,
-        embed_pass_should_continue, embed_resource_exhaustion, eta_suffix, format_duration_secs,
-        lost_the_daemon_mid_request, resolve_total_budget, should_queue_missing_embedding_pass,
-        throughput_per_sec, EmbedResult, PassCoverage, DEFAULT_BATCH_SIZE,
-        DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD, EMBED_MODEL_ID,
-        RECOMMENDED_EMBED_MEMORY_BYTES,
+        embed_pass_should_continue, embed_resource_exhaustion, embed_resource_exhaustion_for,
+        eta_suffix, format_duration_secs, lost_the_daemon_mid_request, resolve_total_budget,
+        should_queue_missing_embedding_pass, throughput_per_sec, EmbedResult, PassCoverage,
+        DEFAULT_BATCH_SIZE, DEFAULT_CONSTRAINED_TOTAL_SECONDS, EMBED_MODEL_DOWNLOAD,
+        EMBED_MODEL_ID, RECOMMENDED_EMBED_MEMORY_BYTES,
     };
 
     fn result_with(pending_entities: usize, pending_artifacts: usize) -> EmbedResult {
@@ -1455,8 +1484,12 @@ mod tests {
     /// fails here rather than passing everything.
     #[test]
     fn a_machine_above_the_model_floor_is_not_told_to_reach_it() {
-        let roomy = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(12 << 30, Some(27)))
-            .expect("a kill during the pass is a memory diagnosis");
+        let roomy = embed_resource_exhaustion_for(
+            OOM_KILLED_MID_PASS,
+            &evidence(12 << 30, Some(27)),
+            false,
+        )
+        .expect("a kill during the pass is a memory diagnosis");
         let cramped = embed_resource_exhaustion(OOM_KILLED_MID_PASS, &evidence(512 << 20, Some(1)))
             .expect("a kill under the floor is a memory diagnosis too");
 
@@ -1496,6 +1529,31 @@ mod tests {
         );
 
         assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// The workaround sentence reads the exact switch it advises about. Both
+    /// arms are pure inputs so this test cannot inherit host state.
+    #[test]
+    fn enrichment_advice_does_not_repeat_a_switch_the_process_already_carries() {
+        let evidence = evidence(12 << 30, Some(1));
+        let unset = embed_resource_exhaustion_for(OOM_KILLED_MID_PASS, &evidence, false)
+            .expect("the recorded kill produces guidance");
+        let set = embed_resource_exhaustion_for(OOM_KILLED_MID_PASS, &evidence, true)
+            .expect("the recorded kill produces guidance");
+
+        assert!(
+            unset.contains("Set `KIN_DAEMON_DISABLE_LSP=1`"),
+            "an unset process still gets the actionable switch: {unset}"
+        );
+        assert!(
+            set.contains("already carries `KIN_DAEMON_DISABLE_LSP=1`")
+                && set.contains("kin daemon stop"),
+            "an already-set process gets the remaining daemon restart action: {set}"
+        );
+        assert!(
+            !set.contains("Set `KIN_DAEMON_DISABLE_LSP=1`"),
+            "already-taken advice must not be repeated: {set}"
+        );
     }
 
     #[test]
