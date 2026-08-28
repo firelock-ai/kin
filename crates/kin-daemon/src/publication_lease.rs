@@ -100,6 +100,13 @@ pub struct ActivePublicationLease {
     /// Durable strict-prefix progress while `authority_fencing_token` is set;
     /// the complete fleet after `authority_fenced_at` is set.
     pub authority_fence: Vec<RepositoryAuthorityFence>,
+    /// Exact Firestore fleet-fence evidence checkpointed after every GCS graph
+    /// object in `authority_fence` has been conditionally rewritten. The pair
+    /// is absent until that secondary fence succeeds and must appear together.
+    #[serde(default)]
+    pub spine_rollout_fence_payload_sha256: Option<String>,
+    #[serde(default)]
+    pub spine_rollout_fence_update_time: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -138,6 +145,10 @@ pub struct CompletedPublicationLease {
     pub fence_repositories: Vec<String>,
     pub authority_fenced_at: Option<DateTime<Utc>>,
     pub authority_fence: Vec<RepositoryAuthorityFence>,
+    #[serde(default)]
+    pub spine_rollout_fence_payload_sha256: Option<String>,
+    #[serde(default)]
+    pub spine_rollout_fence_update_time: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -151,6 +162,18 @@ pub struct PublicationControlRecord {
     pub reader: ReaderAdmission,
     pub last_authority_fenced_at: Option<DateTime<Utc>>,
     pub last_authority_fence: Vec<RepositoryAuthorityFence>,
+    #[serde(default)]
+    pub spine_rollout_fence_payload_sha256: Option<String>,
+    #[serde(default)]
+    pub spine_rollout_fence_update_time: Option<String>,
+    /// Exact Firestore evidence the currently admitted reader proved. This is
+    /// separate from the latest completed rollout so a retry cannot mistake an
+    /// unchanged reader identity for a successful admission under a newer
+    /// fence.
+    #[serde(default)]
+    pub reader_spine_rollout_fence_payload_sha256: Option<String>,
+    #[serde(default)]
+    pub reader_spine_rollout_fence_update_time: Option<String>,
     pub active_lease: Option<ActivePublicationLease>,
     pub last_completed_lease: Option<CompletedPublicationLease>,
     #[serde(default)]
@@ -172,6 +195,10 @@ pub struct PublicationControlStatus {
     pub reader: ReaderAdmission,
     pub last_authority_fenced_at: Option<DateTime<Utc>>,
     pub last_authority_fence: Vec<RepositoryAuthorityFence>,
+    pub spine_rollout_fence_payload_sha256: Option<String>,
+    pub spine_rollout_fence_update_time: Option<String>,
+    pub reader_spine_rollout_fence_payload_sha256: Option<String>,
+    pub reader_spine_rollout_fence_update_time: Option<String>,
     pub active_lease: Option<ActivePublicationLeaseStatus>,
 }
 
@@ -190,6 +217,8 @@ pub struct ActivePublicationLeaseStatus {
     pub authority_fencing_in_progress: bool,
     pub authority_fenced_at: Option<DateTime<Utc>>,
     pub authority_fence: Vec<RepositoryAuthorityFence>,
+    pub spine_rollout_fence_payload_sha256: Option<String>,
+    pub spine_rollout_fence_update_time: Option<String>,
 }
 
 impl From<PublicationControlRecord> for PublicationControlStatus {
@@ -203,6 +232,13 @@ impl From<PublicationControlRecord> for PublicationControlStatus {
             reader: record.reader,
             last_authority_fenced_at: record.last_authority_fenced_at,
             last_authority_fence: record.last_authority_fence,
+            spine_rollout_fence_payload_sha256: record
+                .spine_rollout_fence_payload_sha256,
+            spine_rollout_fence_update_time: record.spine_rollout_fence_update_time,
+            reader_spine_rollout_fence_payload_sha256: record
+                .reader_spine_rollout_fence_payload_sha256,
+            reader_spine_rollout_fence_update_time: record
+                .reader_spine_rollout_fence_update_time,
             active_lease: record.active_lease.map(|active| ActivePublicationLeaseStatus {
                 kind: active.kind,
                 holder: active.holder,
@@ -217,6 +253,9 @@ impl From<PublicationControlRecord> for PublicationControlStatus {
                 authority_fencing_in_progress: active.authority_fencing_token.is_some(),
                 authority_fenced_at: active.authority_fenced_at,
                 authority_fence: active.authority_fence,
+                spine_rollout_fence_payload_sha256: active
+                    .spine_rollout_fence_payload_sha256,
+                spine_rollout_fence_update_time: active.spine_rollout_fence_update_time,
             }),
         }
     }
@@ -268,6 +307,13 @@ pub struct AdmitReaderRequest {
     pub lease: LeaseProof,
     pub repositories: Vec<String>,
     pub reader: ReaderAdmissionInput,
+    /// Digest of externally authenticated deployment evidence that every
+    /// cursorless legacy writer revision is drained. The server constructs the
+    /// attestation from this digest, its own runtime image identity, and the
+    /// persisted active Firestore evidence. Required only until the durable
+    /// migration seal exists.
+    #[serde(default)]
+    pub legacy_writer_drain_proof_sha256: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -275,6 +321,18 @@ pub struct AdmitReaderRequest {
 pub struct ReleaseRolloutLeaseRequest {
     #[serde(flatten)]
     pub lease: LeaseProof,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RolloutReleaseDisposition {
+    Active,
+    CompletedExact,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RuntimeSpineAuthority {
+    Completed(kin_spine::SpineRolloutFenceEvidence),
+    RolloutActive,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -593,6 +651,30 @@ impl PublicationControl {
             .clone()
     }
 
+    /// Load only completed, reader-admitted Firestore evidence from durable
+    /// publication control. Active, half-checkpointed, legacy, or mismatched
+    /// records are never used to seed a restarted daemon.
+    pub fn runtime_spine_authority(
+        &self,
+    ) -> Result<RuntimeSpineAuthority, PublicationControlError> {
+        let stored = self.load_required()?;
+        self.validate_record(&stored.record)?;
+        if stored.record.active_lease.as_ref().is_some_and(|active| {
+            active.kind == LeaseKind::Rollout
+        }) {
+            return Ok(RuntimeSpineAuthority::RolloutActive);
+        }
+        require_complete_record_authority_fence(&stored.record)?;
+        record_spine_rollout_fence_evidence(&stored.record)?
+            .map(RuntimeSpineAuthority::Completed)
+            .ok_or_else(|| {
+                PublicationControlError::Admission(
+                    "completed publication-control record has no Firestore spine evidence"
+                        .to_string(),
+                )
+            })
+    }
+
     /// Create the first fleet record before a hosted daemon opens authority.
     ///
     /// Kubernetes cannot call an HTTP bootstrap route on a pod that correctly
@@ -606,7 +688,9 @@ impl PublicationControl {
     /// rollout must use the authenticated rollout API. The only existing-record
     /// recovery performed here is resuming this exact startup lease after a
     /// crash or retry.
-    pub fn bootstrap_runtime_if_absent(&self) -> Result<(), PublicationControlError> {
+    pub fn bootstrap_runtime_if_absent(
+        &self,
+    ) -> Result<Option<ActivePublicationLease>, PublicationControlError> {
         let existing = self.store.load()?;
         if let Some(stored) = existing.as_ref() {
             self.validate_record(&stored.record)?;
@@ -621,7 +705,7 @@ impl PublicationControl {
             });
             if !resumes_startup {
                 let _ = self.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -639,15 +723,7 @@ impl PublicationControl {
                 valid_for_seconds: MAX_READER_ADMISSION_SECONDS,
             }),
         })?;
-        self.release_rollout(ReleaseRolloutLeaseRequest {
-            lease: LeaseProof {
-                scope: self.scope.clone(),
-                token: lease.token,
-                fence: lease.fence,
-            },
-        })?;
-        let _ = self.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
-        Ok(())
+        Ok(Some(lease))
     }
 
     pub fn acquire_rollout(
@@ -712,6 +788,10 @@ impl PublicationControl {
                         reader: materialize_reader(bootstrap, now)?,
                         last_authority_fenced_at: None,
                         last_authority_fence: Vec::new(),
+                        spine_rollout_fence_payload_sha256: None,
+                        spine_rollout_fence_update_time: None,
+                        reader_spine_rollout_fence_payload_sha256: None,
+                        reader_spine_rollout_fence_update_time: None,
                         active_lease: Some(lease.clone()),
                         last_completed_lease: None,
                         last_completed_rollout: None,
@@ -917,11 +997,222 @@ impl PublicationControl {
                 progress = checkpointed.authority_fence;
             }
 
-            return self.complete_fencing_attempt(&proof, &fencing_token);
+            return self.require_gcs_fencing_ready(&proof, &fencing_token);
         }
         Err(PublicationControlError::Conflict(
             "graph authority changed during every full-fleet recapture attempt".to_string(),
         ))
+    }
+
+    fn require_gcs_fencing_ready(
+        &self,
+        proof: &LeaseProof,
+        fencing_token: &str,
+    ) -> Result<ActivePublicationLease, PublicationControlError> {
+        let stored = self.load_required()?;
+        self.validate_record(&stored.record)?;
+        let active = require_lease(
+            &stored.record,
+            proof,
+            LeaseKind::Rollout,
+            self.clock.now(),
+        )?;
+        if active.authority_fenced_at.is_some() {
+            require_complete_authority_fence(active, &active.fence_repositories)?;
+            return Ok(active.clone());
+        }
+        if active.authority_fencing_token.as_deref() != Some(fencing_token) {
+            return Err(PublicationControlError::Fenced(format!(
+                "rollout fence {} resource-fencing claim changed before Firestore fencing",
+                active.fence
+            )));
+        }
+        validate_authority_capture(&active.authority_capture, &active.fence_repositories)?;
+        validate_authority_fence(&active.authority_fence, &active.fence_repositories)?;
+        Ok(active.clone())
+    }
+
+    /// Derive the exact Firestore fence from server-owned GCS evidence. The raw
+    /// lease token never crosses into a caller-provided payload, and a fleet
+    /// transition selects only target rows rather than the previous/target
+    /// union needed to fence removed graph objects.
+    pub fn spine_rollout_fence(
+        &self,
+        proof: &LeaseProof,
+    ) -> Result<kin_spine::SpineRolloutFence, PublicationControlError> {
+        self.validate_scope(&proof.scope)?;
+        let stored = self.load_required()?;
+        self.validate_record(&stored.record)?;
+        let active = require_lease(
+            &stored.record,
+            proof,
+            LeaseKind::Rollout,
+            self.clock.now(),
+        )?;
+        if active.authority_fenced_at.is_none() {
+            if active.authority_fencing_token.is_none() {
+                return Err(PublicationControlError::Fenced(format!(
+                    "rollout fence {} has not claimed graph authority fencing",
+                    active.fence
+                )));
+            }
+            validate_authority_capture(&active.authority_capture, &active.fence_repositories)?;
+        }
+        validate_authority_fence(&active.authority_fence, &active.fence_repositories)?;
+        let target = authority_fence_for_repositories(
+            &active.authority_fence,
+            &active.target_repositories,
+        )?;
+        let rows = target
+            .into_iter()
+            .map(|row| kin_spine::SpineRolloutRepositoryFence {
+                repo_id: row.repo_id,
+                pre_fence_generation: row.pre_fence_generation,
+                fenced_generation: row.fenced_generation,
+                snapshot_schema: row.snapshot_schema,
+                e_tag: row.e_tag,
+            })
+            .collect();
+        kin_spine::SpineRolloutFence::new_exact(
+            self.scope.clone(),
+            active.fence,
+            &active.token,
+            &active.target_repositories,
+            rows,
+        )
+        .map_err(|error| PublicationControlError::Admission(error.to_string()))
+    }
+
+    /// Checkpoint the exact Firestore updateTime and canonical payload digest
+    /// into the active GCS lease. A lost Firestore response is safe to retry only
+    /// when it resolves to this exact pair; a different pair is fenced.
+    pub fn checkpoint_spine_rollout_fence(
+        &self,
+        proof: &LeaseProof,
+        evidence: &kin_spine::SpineRolloutFenceEvidence,
+    ) -> Result<ActivePublicationLease, PublicationControlError> {
+        self.validate_scope(&proof.scope)?;
+        validate_spine_rollout_fence_evidence(evidence)?;
+        let expected = self.spine_rollout_fence(proof)?;
+        if evidence.rollout_fence != expected.rollout_fence
+            || evidence.payload_sha256 != expected.payload_sha256
+        {
+            return Err(PublicationControlError::Fenced(format!(
+                "Firestore spine fence evidence does not match canonical GCS rollout fence {}",
+                expected.rollout_fence
+            )));
+        }
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let stored = self.load_required()?;
+            self.validate_record(&stored.record)?;
+            let active = require_lease(
+                &stored.record,
+                proof,
+                LeaseKind::Rollout,
+                self.clock.now(),
+            )?;
+            validate_authority_fence(&active.authority_fence, &active.fence_repositories)?;
+            match active_spine_rollout_fence_evidence(active)? {
+                Some(current) if current == *evidence => return Ok(active.clone()),
+                Some(current) => {
+                    return Err(PublicationControlError::Fenced(format!(
+                        "rollout fence {} already checkpointed different Firestore evidence {:?}",
+                        active.fence, current
+                    )))
+                }
+                None if active.authority_fenced_at.is_some() => {
+                    return Err(PublicationControlError::Admission(format!(
+                        "completed rollout fence {} has no Firestore spine evidence",
+                        active.fence
+                    )))
+                }
+                None => {}
+            }
+            let mut checkpointed = active.clone();
+            checkpointed.spine_rollout_fence_payload_sha256 =
+                Some(evidence.payload_sha256.clone());
+            checkpointed.spine_rollout_fence_update_time = Some(evidence.update_time.clone());
+            let mut record = stored.record;
+            record.revision = checked_revision(record.revision)?;
+            record.active_lease = Some(checkpointed.clone());
+            match self.store.update(&stored.version, &record) {
+                Ok(_) => return Ok(checkpointed),
+                Err(error) if error.is_cas_conflict() => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(PublicationControlError::Conflict(
+            "Firestore spine-fence evidence changed during every checkpoint attempt".to_string(),
+        ))
+    }
+
+    /// Make the GCS fleet transition visible only after its exact Firestore
+    /// companion fence is durably checkpointed.
+    pub fn complete_rollout_acquisition(
+        &self,
+        proof: &LeaseProof,
+    ) -> Result<ActivePublicationLease, PublicationControlError> {
+        self.validate_scope(&proof.scope)?;
+        let stored = self.load_required()?;
+        self.validate_record(&stored.record)?;
+        let active = require_lease(
+            &stored.record,
+            proof,
+            LeaseKind::Rollout,
+            self.clock.now(),
+        )?;
+        if active.authority_fenced_at.is_some() {
+            require_complete_authority_fence(active, &active.fence_repositories)?;
+            active_spine_rollout_fence_evidence(active)?.ok_or_else(|| {
+                PublicationControlError::Admission(format!(
+                    "completed rollout fence {} has no Firestore spine evidence",
+                    active.fence
+                ))
+            })?;
+            return Ok(active.clone());
+        }
+        let fencing_token = active.authority_fencing_token.clone().ok_or_else(|| {
+            PublicationControlError::Fenced(format!(
+                "rollout fence {} has no active graph-fencing claim",
+                active.fence
+            ))
+        })?;
+        self.complete_fencing_attempt(proof, &fencing_token)
+    }
+
+    pub fn assert_rollout_lease(
+        &self,
+        proof: &LeaseProof,
+    ) -> Result<ActivePublicationLease, PublicationControlError> {
+        self.validate_scope(&proof.scope)?;
+        let stored = self.load_required()?;
+        self.validate_record(&stored.record)?;
+        Ok(require_lease(
+            &stored.record,
+            proof,
+            LeaseKind::Rollout,
+            self.clock.now(),
+        )?
+        .clone())
+    }
+
+    pub fn rollout_spine_fence_evidence(
+        &self,
+        proof: &LeaseProof,
+    ) -> Result<kin_spine::SpineRolloutFenceEvidence, PublicationControlError> {
+        let active = self.assert_rollout_lease(proof)?;
+        if active.authority_fenced_at.is_none() {
+            return Err(PublicationControlError::Fenced(format!(
+                "rollout fence {} has not completed GCS and Firestore fencing",
+                active.fence
+            )));
+        }
+        active_spine_rollout_fence_evidence(&active)?.ok_or_else(|| {
+            PublicationControlError::Admission(format!(
+                "rollout fence {} has no Firestore spine evidence",
+                active.fence
+            ))
+        })
     }
 
     /// A real writer may win after the full-fleet capture but before its row is
@@ -1101,6 +1392,21 @@ impl PublicationControl {
                 &active.fence_repositories,
             )?;
             validate_authority_fence(&active.authority_fence, &active.fence_repositories)?;
+            let evidence = active_spine_rollout_fence_evidence(active)?.ok_or_else(|| {
+                PublicationControlError::Fenced(format!(
+                    "rollout fence {} has no checkpointed Firestore spine evidence",
+                    active.fence
+                ))
+            })?;
+            let canonical = self.spine_rollout_fence(proof)?;
+            if evidence.rollout_fence != canonical.rollout_fence
+                || evidence.payload_sha256 != canonical.payload_sha256
+            {
+                return Err(PublicationControlError::Fenced(format!(
+                    "rollout fence {} checkpointed Firestore evidence for a different canonical GCS fence",
+                    active.fence
+                )));
+            }
             let target_authority_fence = authority_fence_for_repositories(
                 &active.authority_fence,
                 &active.target_repositories,
@@ -1115,6 +1421,10 @@ impl PublicationControl {
             record.repositories = completed.target_repositories.clone();
             record.last_authority_fenced_at = Some(now);
             record.last_authority_fence = target_authority_fence;
+            record.spine_rollout_fence_payload_sha256 =
+                completed.spine_rollout_fence_payload_sha256.clone();
+            record.spine_rollout_fence_update_time =
+                completed.spine_rollout_fence_update_time.clone();
             record.active_lease = Some(completed.clone());
             match self.store.update(&stored.version, &record) {
                 Ok(_) => return Ok(completed),
@@ -1184,15 +1494,36 @@ impl PublicationControl {
                 )));
             }
             require_complete_authority_fence(active, &active.fence_repositories)?;
+            let active_spine_evidence = active_spine_rollout_fence_evidence(active)?.ok_or_else(
+                || {
+                    PublicationControlError::Admission(format!(
+                        "rollout fence {} cannot admit a reader without Firestore spine evidence",
+                        active.fence
+                    ))
+                },
+            )?;
             let target_authority_fence = authority_fence_for_repositories(
                 &active.authority_fence,
                 &active.target_repositories,
             )?;
+            let current_reader_evidence = reader_spine_rollout_fence_evidence(&stored.record)?;
+            if stored.record.reader.identity == request.reader.identity
+                && stored.record.reader.min_snapshot_schema == request.reader.min_snapshot_schema
+                && stored.record.reader.max_snapshot_schema == request.reader.max_snapshot_schema
+                && current_reader_evidence.as_ref() == Some(&active_spine_evidence)
+            {
+                validate_reader_admission(&stored.record.reader, now)?;
+                return Ok(stored.record);
+            }
             let candidate = materialize_reader(&request.reader, now)?;
             validate_reader_against_authority_fence(&candidate, &target_authority_fence)?;
             let mut record = stored.record;
             record.revision = checked_revision(record.revision)?;
             record.reader = candidate;
+            record.reader_spine_rollout_fence_payload_sha256 =
+                Some(active_spine_evidence.payload_sha256);
+            record.reader_spine_rollout_fence_update_time =
+                Some(active_spine_evidence.update_time);
             match self.store.update(&stored.version, &record) {
                 Ok(_) => return Ok(record),
                 Err(error) if error.is_cas_conflict() => continue,
@@ -1210,6 +1541,34 @@ impl PublicationControl {
     ) -> Result<PublicationControlRecord, PublicationControlError> {
         self.validate_scope(&request.lease.scope)?;
         self.release(&request.lease, LeaseKind::Rollout)
+    }
+
+    /// Classify one rollout release proof from a single validated durable read.
+    /// Storage faults and malformed records remain errors; they must never be
+    /// treated as a completed lost-response retry.
+    pub fn classify_rollout_release(
+        &self,
+        proof: &LeaseProof,
+    ) -> Result<RolloutReleaseDisposition, PublicationControlError> {
+        self.validate_scope(&proof.scope)?;
+        let stored = self.load_required()?;
+        self.validate_record(&stored.record)?;
+        if stored
+            .record
+            .completed_rollout_history
+            .iter()
+            .chain(stored.record.last_completed_rollout.iter())
+            .any(|completed| completed_lease_matches(completed, LeaseKind::Rollout, proof))
+        {
+            return Ok(RolloutReleaseDisposition::CompletedExact);
+        }
+        require_lease(
+            &stored.record,
+            proof,
+            LeaseKind::Rollout,
+            self.clock.now(),
+        )?;
+        Ok(RolloutReleaseDisposition::Active)
     }
 
     pub(crate) fn acquire_publication(
@@ -1421,6 +1780,33 @@ impl PublicationControl {
             let active = require_lease(&stored.record, proof, kind, now)?.clone();
             if kind == LeaseKind::Rollout {
                 require_complete_authority_fence(&active, &active.fence_repositories)?;
+                let active_spine_evidence = active_spine_rollout_fence_evidence(&active)?
+                    .ok_or_else(|| {
+                        PublicationControlError::Admission(format!(
+                            "rollout fence {} cannot release without Firestore spine evidence",
+                            active.fence
+                        ))
+                    })?;
+                let record_spine_evidence = record_spine_rollout_fence_evidence(&stored.record)?
+                    .ok_or_else(|| {
+                        PublicationControlError::Admission(
+                            "publication-control authority has no Firestore spine evidence"
+                                .to_string(),
+                        )
+                    })?;
+                let reader_spine_evidence = reader_spine_rollout_fence_evidence(&stored.record)?
+                    .ok_or_else(|| {
+                        PublicationControlError::Admission(
+                            "admitted reader has no Firestore spine evidence".to_string(),
+                        )
+                    })?;
+                if active_spine_evidence != record_spine_evidence
+                    || reader_spine_evidence != record_spine_evidence
+                {
+                    return Err(PublicationControlError::Admission(format!(
+                        "rollout release requires active, authority, and reader Firestore evidence to match: active {active_spine_evidence:?}, authority {record_spine_evidence:?}, reader {reader_spine_evidence:?}"
+                    )));
+                }
                 if active.target_repositories != stored.record.repositories {
                     return Err(PublicationControlError::Admission(format!(
                         "completed rollout target {:?} does not equal installed fleet {:?}",
@@ -1446,6 +1832,9 @@ impl PublicationControl {
                 fence_repositories: active.fence_repositories,
                 authority_fenced_at: active.authority_fenced_at,
                 authority_fence: active.authority_fence,
+                spine_rollout_fence_payload_sha256: active
+                    .spine_rollout_fence_payload_sha256,
+                spine_rollout_fence_update_time: active.spine_rollout_fence_update_time,
             };
             record.last_completed_lease = Some(completed.clone());
             if kind == LeaseKind::Rollout {
@@ -1538,6 +1927,8 @@ impl PublicationControl {
             )));
         }
         validate_reader_shape(&record.reader)?;
+        let record_spine_evidence = record_spine_rollout_fence_evidence(record)?;
+        let reader_spine_evidence = reader_spine_rollout_fence_evidence(record)?;
         match record.last_authority_fenced_at {
             Some(_) => {
                 validate_authority_fence(&record.last_authority_fence, &record.repositories)?;
@@ -1600,6 +1991,7 @@ impl PublicationControl {
                         || !active.authority_capture.is_empty()
                         || active.authority_fenced_at.is_some()
                         || !active.authority_fence.is_empty()
+                        || active_spine_rollout_fence_evidence(active)?.is_some()
                     {
                         return Err(PublicationControlError::Admission(
                             "publication lease must not carry rollout fencing state".to_string(),
@@ -1622,6 +2014,8 @@ impl PublicationControl {
                             active,
                             &active.fence_repositories,
                         )?;
+                        let active_spine_evidence =
+                            active_spine_rollout_fence_evidence(active)?;
                         let target_authority_fence = authority_fence_for_repositories(
                             &active.authority_fence,
                             &active.target_repositories,
@@ -1629,12 +2023,17 @@ impl PublicationControl {
                         if active.target_repositories != record.repositories
                             || active.authority_fenced_at != record.last_authority_fenced_at
                             || target_authority_fence != record.last_authority_fence
+                            || match active_spine_evidence.as_ref() {
+                                Some(evidence) => record_spine_evidence.as_ref() != Some(evidence),
+                                None => record_spine_evidence.is_some(),
+                            }
                         {
                             return Err(PublicationControlError::Admission(
                                 "completed active rollout does not install its target fleet and target-only fence evidence".to_string(),
                             ));
                         }
                     } else {
+                        let _ = active_spine_rollout_fence_evidence(active)?;
                         match (
                             active.authority_fencing_token.as_deref(),
                             active.authority_fencing_started_at,
@@ -1700,6 +2099,7 @@ impl PublicationControl {
                         || !completed.fence_repositories.is_empty()
                         || completed.authority_fenced_at.is_some()
                         || !completed.authority_fence.is_empty()
+                        || completed_spine_rollout_fence_evidence(completed)?.is_some()
                     {
                         return Err(PublicationControlError::Admission(
                             "completed publication lease carries rollout fence evidence"
@@ -1707,7 +2107,10 @@ impl PublicationControl {
                         ));
                     }
                 }
-                LeaseKind::Rollout => require_complete_completed_authority_fence(completed)?,
+                LeaseKind::Rollout => {
+                    require_complete_completed_authority_fence(completed)?;
+                    let _ = completed_spine_rollout_fence_evidence(completed)?;
+                }
             }
         }
         if let Some(completed) = record.last_completed_rollout.as_ref() {
@@ -1724,6 +2127,7 @@ impl PublicationControl {
                 )));
             }
             require_complete_completed_authority_fence(completed)?;
+            let _ = completed_spine_rollout_fence_evidence(completed)?;
         }
         if record.completed_rollout_history.len() > MAX_COMPLETED_ROLLOUT_HISTORY {
             return Err(PublicationControlError::Admission(format!(
@@ -1751,6 +2155,7 @@ impl PublicationControl {
                 ));
             }
             require_complete_completed_authority_fence(completed)?;
+            let _ = completed_spine_rollout_fence_evidence(completed)?;
             previous_fence = Some(completed.fence);
         }
         if let Some(latest) = record.completed_rollout_history.last() {
@@ -1769,6 +2174,27 @@ impl PublicationControl {
         {
             return Err(PublicationControlError::Admission(
                 "latest completed rollout does not match rollout retry history".to_string(),
+            ));
+        }
+        if let Some(latest) = record.last_completed_rollout.as_ref() {
+            let latest_evidence = completed_spine_rollout_fence_evidence(latest)?;
+            let active_installs_newer = record.active_lease.as_ref().is_some_and(|active| {
+                active.kind == LeaseKind::Rollout && active.authority_fenced_at.is_some()
+            });
+            if !active_installs_newer && record_spine_evidence != latest_evidence {
+                return Err(PublicationControlError::Admission(
+                    "publication-control Firestore evidence does not match its last completed rollout"
+                        .to_string(),
+                ));
+            }
+        }
+        if record.active_lease.is_none()
+            && record_spine_evidence.is_some()
+            && reader_spine_evidence != record_spine_evidence
+        {
+            return Err(PublicationControlError::Admission(
+                "released publication-control record admits a reader under different Firestore spine evidence"
+                    .to_string(),
             ));
         }
         Ok(())
@@ -1805,6 +2231,8 @@ impl PublicationControl {
             authority_capture: Vec::new(),
             authority_fenced_at: None,
             authority_fence: Vec::new(),
+            spine_rollout_fence_payload_sha256: None,
+            spine_rollout_fence_update_time: None,
         })
     }
 }
@@ -2078,7 +2506,145 @@ fn require_complete_record_authority_fence(
             "fleet graph authority has not completed its generation fence".to_string(),
         ));
     }
-    validate_authority_fence(&record.last_authority_fence, &record.repositories)
+    validate_authority_fence(&record.last_authority_fence, &record.repositories)?;
+    let authority = record_spine_rollout_fence_evidence(record)?.ok_or_else(|| {
+        PublicationControlError::Admission(
+            "fleet graph authority has no completed Firestore spine fence evidence".to_string(),
+        )
+    })?;
+    let reader = reader_spine_rollout_fence_evidence(record)?.ok_or_else(|| {
+        PublicationControlError::Admission(
+            "admitted reader has no Firestore spine fence evidence".to_string(),
+        )
+    })?;
+    if reader != authority {
+        return Err(PublicationControlError::Admission(format!(
+            "admitted reader Firestore spine evidence {reader:?} does not equal fleet authority {authority:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_spine_rollout_fence_evidence(
+    evidence: &kin_spine::SpineRolloutFenceEvidence,
+) -> Result<(), PublicationControlError> {
+    if evidence.rollout_fence == 0 {
+        return Err(PublicationControlError::Admission(
+            "Firestore spine rollout fence must be positive".to_string(),
+        ));
+    }
+    let digest = evidence
+        .payload_sha256
+        .strip_prefix("sha256:")
+        .ok_or_else(|| {
+            PublicationControlError::Admission(
+                "Firestore spine payload digest must be sha256:<64 lowercase hex>".to_string(),
+            )
+        })?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(PublicationControlError::Admission(
+            "Firestore spine payload digest must be sha256:<64 lowercase hex>".to_string(),
+        ));
+    }
+    if evidence.update_time.is_empty() || evidence.update_time.trim() != evidence.update_time {
+        return Err(PublicationControlError::Admission(
+            "Firestore spine update_time must be non-empty canonical text".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn spine_rollout_fence_evidence_from_pair(
+    fence: u64,
+    payload_sha256: &Option<String>,
+    update_time: &Option<String>,
+    owner: &str,
+) -> Result<Option<kin_spine::SpineRolloutFenceEvidence>, PublicationControlError> {
+    match (payload_sha256.as_ref(), update_time.as_ref()) {
+        (None, None) => Ok(None),
+        (Some(payload_sha256), Some(update_time)) => {
+            let evidence = kin_spine::SpineRolloutFenceEvidence {
+                rollout_fence: fence,
+                payload_sha256: payload_sha256.clone(),
+                update_time: update_time.clone(),
+            };
+            validate_spine_rollout_fence_evidence(&evidence)?;
+            Ok(Some(evidence))
+        }
+        _ => Err(PublicationControlError::Admission(format!(
+            "{owner} carries only one half of its Firestore spine fence evidence"
+        ))),
+    }
+}
+
+fn active_spine_rollout_fence_evidence(
+    active: &ActivePublicationLease,
+) -> Result<Option<kin_spine::SpineRolloutFenceEvidence>, PublicationControlError> {
+    spine_rollout_fence_evidence_from_pair(
+        active.fence,
+        &active.spine_rollout_fence_payload_sha256,
+        &active.spine_rollout_fence_update_time,
+        "active rollout lease",
+    )
+}
+
+fn completed_spine_rollout_fence_evidence(
+    completed: &CompletedPublicationLease,
+) -> Result<Option<kin_spine::SpineRolloutFenceEvidence>, PublicationControlError> {
+    spine_rollout_fence_evidence_from_pair(
+        completed.fence,
+        &completed.spine_rollout_fence_payload_sha256,
+        &completed.spine_rollout_fence_update_time,
+        "completed rollout lease",
+    )
+}
+
+fn record_spine_rollout_fence_evidence(
+    record: &PublicationControlRecord,
+) -> Result<Option<kin_spine::SpineRolloutFenceEvidence>, PublicationControlError> {
+    let fence = record
+        .active_lease
+        .as_ref()
+        .filter(|active| {
+            active.kind == LeaseKind::Rollout
+                && active.authority_fenced_at.is_some()
+                && active.spine_rollout_fence_payload_sha256
+                    == record.spine_rollout_fence_payload_sha256
+                && active.spine_rollout_fence_update_time
+                    == record.spine_rollout_fence_update_time
+        })
+        .map(|active| active.fence)
+        .or_else(|| {
+            record
+                .last_completed_rollout
+                .as_ref()
+                .map(|completed| completed.fence)
+        })
+        .unwrap_or(record.last_fence);
+    spine_rollout_fence_evidence_from_pair(
+        fence,
+        &record.spine_rollout_fence_payload_sha256,
+        &record.spine_rollout_fence_update_time,
+        "publication-control authority",
+    )
+}
+
+fn reader_spine_rollout_fence_evidence(
+    record: &PublicationControlRecord,
+) -> Result<Option<kin_spine::SpineRolloutFenceEvidence>, PublicationControlError> {
+    let fence = record_spine_rollout_fence_evidence(record)?
+        .map(|evidence| evidence.rollout_fence)
+        .unwrap_or(record.last_fence);
+    spine_rollout_fence_evidence_from_pair(
+        fence,
+        &record.reader_spine_rollout_fence_payload_sha256,
+        &record.reader_spine_rollout_fence_update_time,
+        "admitted reader",
+    )
 }
 
 fn validate_reader_against_authority_fence(
@@ -3944,7 +4510,51 @@ mod tests {
         }
     }
 
+    fn checkpoint_rollout_for_test(
+        control: &PublicationControl,
+        lease: &ActivePublicationLease,
+    ) -> ActivePublicationLease {
+        let proof = proof(lease);
+        let evidence = match control.rollout_spine_fence_evidence(&proof) {
+            Ok(evidence) => evidence,
+            Err(_) => {
+                let fence = control.spine_rollout_fence(&proof).unwrap();
+                let evidence = kin_spine::SpineRolloutFenceEvidence {
+                    rollout_fence: fence.rollout_fence,
+                    payload_sha256: fence.payload_sha256,
+                    update_time: format!("test-firestore-update-{}", fence.rollout_fence),
+                };
+                control
+                    .checkpoint_spine_rollout_fence(&proof, &evidence)
+                    .unwrap();
+                evidence
+            }
+        };
+        let completed = control.complete_rollout_acquisition(&proof).unwrap();
+        assert_eq!(
+            control.rollout_spine_fence_evidence(&proof).unwrap(),
+            evidence
+        );
+        completed
+    }
+
     fn release(control: &PublicationControl, lease: &ActivePublicationLease) {
+        if lease.kind == LeaseKind::Rollout {
+            let completed = checkpoint_rollout_for_test(control, lease);
+            let record = control.status().unwrap();
+            if reader_spine_rollout_fence_evidence(&record).unwrap()
+                != record_spine_rollout_fence_evidence(&record).unwrap()
+            {
+                control
+                    .admit_reader(AdmitReaderRequest {
+                        lease: proof(&completed),
+                        repositories: completed.target_repositories.clone(),
+                        reader: reader(control.runtime_reader_identity(), 300),
+                        legacy_writer_drain_proof_sha256: None,
+                    })
+                    .unwrap();
+            }
+        }
         control
             .release_rollout(ReleaseRolloutLeaseRequest {
                 lease: proof(lease),
@@ -3964,7 +4574,12 @@ mod tests {
             repositories.clone(),
         );
 
-        control.bootstrap_runtime_if_absent().unwrap();
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("absent runtime must leave one pending startup rollout");
+        assert!(control.status().unwrap().active_lease.is_some());
+        release(&control, &pending);
 
         let record = control.status().unwrap();
         assert!(record.active_lease.is_none());
@@ -3989,7 +4604,7 @@ mod tests {
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap();
 
-        control.bootstrap_runtime_if_absent().unwrap();
+        assert!(control.bootstrap_runtime_if_absent().unwrap().is_none());
         let unchanged = control.status().unwrap();
         assert_eq!(unchanged.revision, record.revision);
         assert_eq!(unchanged.last_fence, record.last_fence);
@@ -4024,7 +4639,11 @@ mod tests {
         assert!(lease.authority_fence.len() < repositories.len());
 
         store.fail_fence_on(None);
-        control.bootstrap_runtime_if_absent().unwrap();
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("the exact failed startup rollout must resume");
+        release(&control, &pending);
         let recovered = control.status().unwrap();
         assert!(recovered.active_lease.is_none());
         assert_eq!(recovered.last_authority_fence.len(), repositories.len());
@@ -4111,11 +4730,15 @@ mod tests {
         let store = Arc::new(InMemoryPublicationControlStore::default());
         let clock = Arc::new(ManualClock::new());
         let old = control(Arc::clone(&store), Arc::clone(&clock), READER_A);
-        old.bootstrap_runtime_if_absent().unwrap();
+        let old_bootstrap = old
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first runtime must bootstrap");
+        release(&old, &old_bootstrap);
         let before = old.status().unwrap();
 
         let candidate = control(store, clock, READER_B);
-        candidate.bootstrap_runtime_if_absent().unwrap();
+        assert!(candidate.bootstrap_runtime_if_absent().unwrap().is_none());
         let after = candidate.status().unwrap();
         assert_eq!(after, before);
         let refusal = candidate
@@ -4254,6 +4877,10 @@ mod tests {
             reader: materialize_reader(&reader(READER_A, 300), clock.now()).unwrap(),
             last_authority_fenced_at: None,
             last_authority_fence: Vec::new(),
+            spine_rollout_fence_payload_sha256: None,
+            spine_rollout_fence_update_time: None,
+            reader_spine_rollout_fence_payload_sha256: None,
+            reader_spine_rollout_fence_update_time: None,
             active_lease: None,
             last_completed_lease: None,
             last_completed_rollout: None,
@@ -4342,6 +4969,7 @@ mod tests {
             lease: proof(&lease),
             repositories: fleet(),
             reader: reader(READER_B, 300),
+            legacy_writer_drain_proof_sha256: None,
         })
         .unwrap();
         let released = old
@@ -4740,7 +5368,7 @@ mod tests {
         );
         let before = candidate.status().unwrap();
 
-        candidate.bootstrap_runtime_if_absent().unwrap();
+        assert!(candidate.bootstrap_runtime_if_absent().unwrap().is_none());
 
         assert_eq!(candidate.status().unwrap(), before);
         assert!(store.authority_state("kin-search").is_none());
@@ -4761,7 +5389,11 @@ mod tests {
             READER_A,
             old_repositories.clone(),
         );
-        old.bootstrap_runtime_if_absent().unwrap();
+        let old_bootstrap = old
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first fleet must bootstrap");
+        release(&old, &old_bootstrap);
         let paused_removed_repo_generation = store.authority_state("kin-editor").unwrap().0;
 
         let target_repositories = canonical_repositories(&[
@@ -4782,7 +5414,7 @@ mod tests {
         // A changed daemon configuration is only a recovery/control surface.
         // Startup neither rewrites membership nor silently admits itself.
         let before = candidate.status().unwrap();
-        candidate.bootstrap_runtime_if_absent().unwrap();
+        assert!(candidate.bootstrap_runtime_if_absent().unwrap().is_none());
         assert_eq!(candidate.status().unwrap(), before);
         let mismatch = candidate
             .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
@@ -4869,6 +5501,7 @@ mod tests {
                 lease: proof(&lease),
                 repositories: lease.target_repositories.clone(),
                 reader: reader(READER_B, 300),
+                legacy_writer_drain_proof_sha256: None,
             })
             .unwrap();
         release(&candidate, &lease);
@@ -4896,7 +5529,11 @@ mod tests {
             READER_A,
             current.clone(),
         );
-        old.bootstrap_runtime_if_absent().unwrap();
+        let old_bootstrap = old
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("first oversized fleet must bootstrap");
+        release(&old, &old_bootstrap);
         let before = old.status().unwrap();
 
         let candidate = control_for_fleet(
@@ -5016,6 +5653,7 @@ mod tests {
                     max_snapshot_schema: future_schema,
                     valid_for_seconds: 300,
                 },
+                legacy_writer_drain_proof_sha256: None,
             })
             .unwrap();
         release(&control, &recovery);
@@ -5059,6 +5697,7 @@ mod tests {
                 lease: proof(&active),
                 repositories: repositories.clone(),
                 reader: reader(READER_B, 300),
+                legacy_writer_drain_proof_sha256: None,
             }),
             Err(PublicationControlError::Fenced(_))
         ));
@@ -5114,6 +5753,7 @@ mod tests {
                 lease: proof(&rollout),
                 repositories: fleet(),
                 reader: reader(READER_B, 300),
+                legacy_writer_drain_proof_sha256: None,
             }),
             Err(PublicationControlError::Admission(_))
         ));
@@ -5127,6 +5767,7 @@ mod tests {
                     max_snapshot_schema: future_schema,
                     valid_for_seconds: 300,
                 },
+                legacy_writer_drain_proof_sha256: None,
             })
             .unwrap();
         release(&control, &rollout);
@@ -5611,6 +6252,7 @@ mod tests {
                 lease: proof(&rollout),
                 repositories: repositories.clone(),
                 reader: reader(READER_B, 300),
+                legacy_writer_drain_proof_sha256: None,
             }),
             Err(PublicationControlError::Admission(_))
         ));
@@ -5624,6 +6266,7 @@ mod tests {
                     max_snapshot_schema: future_schema,
                     valid_for_seconds: 300,
                 },
+                legacy_writer_drain_proof_sha256: None,
             })
             .unwrap();
         release(&control, &rollout);

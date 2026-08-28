@@ -1282,6 +1282,7 @@ pub struct SpineRefreshOutcome {
 struct HostedPublicationGuard {
     control: Option<Arc<crate::publication_lease::PublicationControl>>,
     lease: Option<crate::publication_lease::ActivePublicationLease>,
+    rollout: Option<crate::publication_lease::LeaseProof>,
 }
 
 impl HostedPublicationGuard {
@@ -1289,6 +1290,7 @@ impl HostedPublicationGuard {
         Self {
             control: None,
             lease: None,
+            rollout: None,
         }
     }
 
@@ -1299,6 +1301,18 @@ impl HostedPublicationGuard {
         Self {
             control: Some(control),
             lease: Some(lease),
+            rollout: None,
+        }
+    }
+
+    fn rollout(
+        control: Arc<crate::publication_lease::PublicationControl>,
+        proof: crate::publication_lease::LeaseProof,
+    ) -> Self {
+        Self {
+            control: Some(control),
+            lease: None,
+            rollout: Some(proof),
         }
     }
 
@@ -1312,6 +1326,12 @@ impl HostedPublicationGuard {
     /// mutation. A lease that expired, was fenced, or changed hands cannot
     /// authorize the next write.
     fn reassert_before_mutation(&mut self) -> Result<()> {
+        if let (Some(control), Some(proof)) = (self.control.as_ref(), self.rollout.as_ref()) {
+            control
+                .assert_rollout_lease(proof)
+                .map_err(|error| Self::publication_error("rollout proof reassertion", error))?;
+            return Ok(());
+        }
         let (Some(control), Some(lease)) = (self.control.as_ref().cloned(), self.lease.as_ref())
         else {
             return Ok(());
@@ -1876,6 +1896,11 @@ pub struct DaemonState {
     /// empty on startup failure, and an existing backend is not returned after a
     /// failed durable refresh or authority proof.
     spine_initialization_failure: Mutex<Option<String>>,
+    /// True only when this process opened graph state before a failed startup
+    /// fence so it can expose the authenticated recovery API. Durable control
+    /// repair may proceed, but this process can never admit semantic reads; a
+    /// restart must reopen the graph after the completed fence.
+    hosted_restart_required: AtomicBool,
     /// Exact durable-fence, Firestore-head, GCS-cursor, and graph-root proof
     /// accepted for the hosted backend currently exposed by `ensure_spine`.
     hosted_spine_authority_proof: Mutex<Option<HostedSpineAuthorityProof>>,
@@ -3321,6 +3346,7 @@ impl DaemonState {
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             spine_initialization_failure: Mutex::new(None),
+            hosted_restart_required: AtomicBool::new(false),
             hosted_spine_authority_proof: Mutex::new(None),
             hosted_spine_expected_rollout_fence: Mutex::new(None),
             #[cfg(test)]
@@ -3655,6 +3681,7 @@ impl DaemonState {
             session_scopes: RwLock::new(HashMap::new()),
             spine: std::sync::OnceLock::new(),
             spine_initialization_failure: Mutex::new(None),
+            hosted_restart_required: AtomicBool::new(false),
             hosted_spine_authority_proof: Mutex::new(None),
             hosted_spine_expected_rollout_fence: Mutex::new(None),
             #[cfg(test)]
@@ -3845,7 +3872,8 @@ impl DaemonState {
     /// therefore fail closed until the GCS control-record CAS durably
     /// checkpoints the returned evidence and calls
     /// `admit_hosted_spine_rollout_fence`.
-    pub(crate) async fn advance_hosted_spine_rollout_fence(
+    #[doc(hidden)]
+    pub async fn advance_hosted_spine_rollout_fence(
         &self,
         fence: kin_spine::SpineRolloutFence,
     ) -> std::result::Result<kin_spine::SpineRolloutFenceEvidence, String> {
@@ -3865,13 +3893,7 @@ impl DaemonState {
             .hosted_spine_authority_proof
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        let spine = self.ensure_spine_initialized().ok_or_else(|| {
-            self.spine_initialization_failure
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .unwrap_or_else(|| "hosted durable spine backend is unavailable".to_string())
-        })?;
+        let spine = self.ensure_hosted_spine_backend_constructed()?;
         let outcome = without_blocking_runtime_worker(|| spine.advance_rollout_fence(fence))
             .map_err(|error| format!("advance hosted Firestore spine fleet fence: {error}"))?;
         match outcome {
@@ -3886,26 +3908,166 @@ impl DaemonState {
         }
     }
 
-    /// Admit only evidence already persisted in the GCS publication-control
-    /// record. Exact equality with the active Firestore document, plus full
-    /// scope and fleet validation of that document, is required before any
-    /// hosted spine reader or writer can proceed.
-    pub(crate) async fn admit_hosted_spine_rollout_fence(
+    /// Publish the exact target fleet under the still-active rollout proof.
+    /// Ordinary publication leases are intentionally unavailable while a
+    /// rollout is active, so the rollout control plane owns this one bounded
+    /// transition path. It reasserts the exact rollout proof before every
+    /// Firestore mutation, creates the legacy writer-drain seal when supplied,
+    /// and cold-hydrates the committed winner set before reader admission.
+    #[doc(hidden)]
+    pub async fn prepare_hosted_spine_rollout(
+        &self,
+        request: &crate::publication_lease::AdmitReaderRequest,
+    ) -> std::result::Result<kin_spine::SpineRolloutFenceEvidence, String> {
+        let control = self
+            .publication_control
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "hosted publication control is unavailable".to_string())?;
+        control
+            .assert_rollout_lease(&request.lease)
+            .map_err(|error| format!("reassert hosted rollout before spine publication: {error}"))?;
+        let evidence = control
+            .rollout_spine_fence_evidence(&request.lease)
+            .map_err(|error| format!("load hosted rollout Firestore evidence: {error}"))?;
+        if request.reader.identity != control.runtime_reader_identity() {
+            return Err(format!(
+                "rollout requested reader {}, but this daemon runs {}",
+                request.reader.identity,
+                control.runtime_reader_identity()
+            ));
+        }
+        let writer_drain = request
+            .legacy_writer_drain_proof_sha256
+            .as_ref()
+            .map(|drain_proof_sha256| {
+                let attestation = kin_spine::LegacySpineWriterDrainAttestation {
+                    schema: kin_spine::LEGACY_SPINE_WRITER_DRAIN_SCHEMA.to_string(),
+                    rollout_fence_evidence: evidence.clone(),
+                    daemon_image_sha256: control.runtime_reader_identity().to_string(),
+                    drain_proof_sha256: drain_proof_sha256.clone(),
+                };
+                attestation
+                    .validate()
+                    .map_err(|error| format!("validate legacy writer-drain attestation: {error}"))?;
+                Ok::<_, String>(attestation)
+            })
+            .transpose()?;
+
+        let spine = self.ensure_hosted_spine_backend_constructed()?;
+        let active = without_blocking_runtime_worker(|| spine.active_rollout_fence())
+            .map_err(|error| format!("load hosted Firestore spine fleet fence: {error}"))?;
+        if active.evidence() != evidence {
+            return Err(format!(
+                "GCS rollout evidence {evidence:?} does not match active Firestore evidence {:?}",
+                active.evidence()
+            ));
+        }
+        *self
+            .hosted_spine_expected_rollout_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence.clone());
+        *self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+
+        let mut publication =
+            HostedPublicationGuard::rollout(Arc::clone(&control), request.lease.clone());
+        self.refresh_all_hosted_cross_repo_edges_with_before_commit_hook(
+            &mut publication,
+            || {},
+        )
+        .await
+        .map_err(|error| format!("publish exact hosted spine fleet during rollout: {error}"))?;
+
+        let _publication_gate = self.spine_refresh_gate.write().await;
+        publication
+            .reassert_before_mutation()
+            .map_err(|error| error.to_string())?;
+        if let Some(writer_drain) = writer_drain {
+            without_blocking_runtime_worker(|| spine.complete_legacy_migration(writer_drain))
+                .map_err(|error| format!("complete hosted spine legacy migration: {error}"))?;
+        }
+        publication
+            .reassert_before_mutation()
+            .map_err(|error| error.to_string())?;
+        without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))?;
+        Ok(evidence)
+    }
+
+    /// Seed a restarted process only from completed GCS reader evidence, then
+    /// hydrate and prove the exact five committed Firestore heads before the
+    /// daemon can report readiness.
+    #[doc(hidden)]
+    pub async fn adopt_hosted_spine_rollout_fence(
         &self,
         evidence: kin_spine::SpineRolloutFenceEvidence,
     ) -> std::result::Result<(), String> {
         if self.storage_backend.is_none() {
-            return Err("cannot admit a hosted spine fence on a local daemon".to_string());
+            return Err("cannot adopt hosted spine evidence on a local daemon".to_string());
         }
         let _publication_gate = self.spine_refresh_gate.write().await;
         let (expected_scope, fleet) = self.hosted_spine_contract()?;
-        let spine = self.ensure_spine_initialized().ok_or_else(|| {
-            self.spine_initialization_failure
+        let spine = self.ensure_hosted_spine_backend_constructed()?;
+        let active = without_blocking_runtime_worker(|| spine.active_rollout_fence())
+            .map_err(|error| format!("load hosted Firestore spine fleet fence: {error}"))?;
+        active
+            .fence
+            .validate_exact_fleet(&expected_scope, &fleet)
+            .map_err(|error| error.to_string())?;
+        if active.evidence() != evidence {
+            return Err(format!(
+                "completed GCS reader evidence {evidence:?} does not match active Firestore fence {:?}",
+                active.evidence()
+            ));
+        }
+        *self
+            .hosted_spine_expected_rollout_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence);
+        *self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        if let Err(error) = without_blocking_runtime_worker(|| {
+            self.refresh_hosted_spine_authority(spine)
+        }) {
+            *self
+                .hosted_spine_expected_rollout_fence
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone()
-                .unwrap_or_else(|| "hosted durable spine backend is unavailable".to_string())
-        })?;
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Admit only evidence already persisted in the GCS publication-control
+    /// record. Exact equality with the active Firestore document, plus full
+    /// scope and fleet validation of that document, is required before any
+    /// hosted spine reader or writer can proceed.
+    #[doc(hidden)]
+    pub async fn admit_hosted_spine_rollout_fence(
+        &self,
+        request: crate::publication_lease::AdmitReaderRequest,
+    ) -> std::result::Result<crate::publication_lease::PublicationControlRecord, String> {
+        if self.storage_backend.is_none() {
+            return Err("cannot admit a hosted spine fence on a local daemon".to_string());
+        }
+        let control = self
+            .publication_control
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "hosted publication control is unavailable".to_string())?;
+        let evidence = control
+            .rollout_spine_fence_evidence(&request.lease)
+            .map_err(|error| format!("load rollout evidence before reader admission: {error}"))?;
+        let _publication_gate = self.spine_refresh_gate.write().await;
+        control
+            .assert_rollout_lease(&request.lease)
+            .map_err(|error| format!("reassert rollout before reader admission: {error}"))?;
+        let (expected_scope, fleet) = self.hosted_spine_contract()?;
+        let spine = self.ensure_hosted_spine_backend_constructed()?;
         let active = without_blocking_runtime_worker(|| spine.active_rollout_fence())
             .map_err(|error| format!("load hosted Firestore spine fleet fence: {error}"))?;
         active
@@ -3926,7 +4088,56 @@ impl DaemonState {
             .hosted_spine_authority_proof
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        Ok(())
+        if let Err(error) = without_blocking_runtime_worker(|| {
+            self.refresh_hosted_spine_authority(spine)
+        }) {
+            *self
+                .hosted_spine_expected_rollout_fence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            return Err(error);
+        }
+        control
+            .assert_rollout_lease(&request.lease)
+            .map_err(|error| format!("rollout moved during hosted spine admission proof: {error}"))?;
+        control
+            .admit_reader(request)
+            .map_err(|error| format!("checkpoint hosted reader admission: {error}"))
+    }
+
+    /// Repeat the exact Firestore evidence and loaded five-repo proof while the
+    /// rollout is still active, then release its GCS lease under the same write
+    /// gate. A caller with an already-completed proof bypasses this method and
+    /// uses the control store's lost-response retry path.
+    #[doc(hidden)]
+    pub async fn release_hosted_spine_rollout(
+        &self,
+        request: crate::publication_lease::ReleaseRolloutLeaseRequest,
+    ) -> std::result::Result<crate::publication_lease::PublicationControlRecord, String> {
+        let control = self
+            .publication_control
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| "hosted publication control is unavailable".to_string())?;
+        let evidence = control
+            .rollout_spine_fence_evidence(&request.lease)
+            .map_err(|error| format!("load rollout evidence before release: {error}"))?;
+        let _publication_gate = self.spine_refresh_gate.write().await;
+        control
+            .assert_rollout_lease(&request.lease)
+            .map_err(|error| format!("reassert rollout before release: {error}"))?;
+        *self
+            .hosted_spine_expected_rollout_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(evidence);
+        let spine = self.ensure_hosted_spine_backend_constructed()?;
+        without_blocking_runtime_worker(|| self.refresh_hosted_spine_authority(spine))?;
+        control
+            .assert_rollout_lease(&request.lease)
+            .map_err(|error| format!("rollout moved during release proof: {error}"))?;
+        control
+            .release_rollout(request)
+            .map_err(|error| format!("release hosted rollout after spine proof: {error}"))
     }
 
     fn snapshot_cursor_for_spine(
@@ -4042,12 +4253,62 @@ impl DaemonState {
         Ok(())
     }
 
+    /// Construct the durable hosted backend without acquiring a GCS
+    /// publication lease or reading any repo head. Rollout fencing necessarily
+    /// runs while an exclusive rollout lease is active, and hosted writers
+    /// already hold their own publication lease. Re-entering either lease from
+    /// this bootstrap seam deadlocks the first rollout and refuses the first
+    /// ingest, so callers that already own authority use this storage-only
+    /// primitive.
+    fn ensure_hosted_spine_backend_constructed(
+        &self,
+    ) -> std::result::Result<&dyn kin_spine::SpineBackend, String> {
+        if !self.hosted_spine_readiness_required() {
+            return Err("hosted durable spine backend requested for a local daemon".to_string());
+        }
+        if self.hosted_persistent_spine_blocked() {
+            return Err(self.spine_unavailable_reason());
+        }
+        if self.spine.get().is_none() {
+            without_blocking_runtime_worker(|| -> std::result::Result<(), String> {
+                let _initialization = self
+                    .spine_initialization
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if self.spine.get().is_none() {
+                    let backend = self.create_spine_backend()?;
+                    self.spine.set(backend).map_err(|_| {
+                        "hosted durable spine backend raced initialization".to_string()
+                    })?;
+                }
+                Ok(())
+            })?;
+        }
+        self.spine
+            .get()
+            .map(AsRef::as_ref)
+            .ok_or_else(|| "hosted durable spine backend is unavailable".to_string())
+    }
+
     /// Lazily initialize the selected backend without certifying that every
     /// exact-fleet head exists yet. Hosted publication uses this bootstrap path;
     /// reader readiness additionally requires `refresh_hosted_spine_authority`.
     fn ensure_spine_initialized(&self) -> Option<&dyn kin_spine::SpineBackend> {
         if self.spine_disabled || self.hosted_persistent_spine_blocked() {
             return None;
+        }
+        if self.hosted_spine_readiness_required() {
+            return match self.ensure_hosted_spine_backend_constructed() {
+                Ok(spine) => Some(spine),
+                Err(error) => {
+                    *self
+                        .spine_initialization_failure
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.clone());
+                    warn!(%error, "hosted durable spine construction failed closed");
+                    None
+                }
+            };
         }
         if let Some(spine) = self.spine.get() {
             if self.primary_spine_registration_is_current(spine.as_ref()) {
@@ -4086,31 +4347,31 @@ impl DaemonState {
             return Ok(None);
         }
         if self.spine.get().is_none() {
-            // The entire synchronous O(graph) pass belongs inside the Tokio
-            // blocking handoff, not only the sibling thread join buried within
-            // it. The mutex is acquired there too so a contending initializer
-            // cannot park another async worker.
-            without_blocking_runtime_worker(|| -> Result<()> {
-                let _initialization = self
-                    .spine_initialization
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if self.spine.get().is_none() {
-                    if self.hosted_spine_readiness_required() {
-                        // Hosted construction is deliberately storage-only.
-                        // Startup graph captures must never flow through the
-                        // legacy register/refresh methods or block creation of
-                        // the first Firestore fleet fence.
-                        let backend = self.create_spine_backend().map_err(|error| {
-                            DaemonError::Graph(kin_db::KinDbError::StorageError(error))
-                        })?;
-                        let _ = self.spine.set(backend);
-                    } else {
+            if self.hosted_spine_readiness_required() {
+                // Hosted construction is deliberately storage-only. Startup
+                // graph captures must never flow through the legacy
+                // register/refresh methods or reacquire the publication lease
+                // this caller already holds.
+                self.ensure_hosted_spine_backend_constructed()
+                    .map_err(|error| {
+                        DaemonError::Graph(kin_db::KinDbError::StorageError(error))
+                    })?;
+            } else {
+                // The entire synchronous O(graph) pass belongs inside the
+                // Tokio blocking handoff, not only the sibling thread join
+                // buried within it. The mutex is acquired there too so a
+                // contending initializer cannot park another async worker.
+                without_blocking_runtime_worker(|| -> Result<()> {
+                    let _initialization = self
+                        .spine_initialization
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if self.spine.get().is_none() {
                         self.initialize_spine_lazy(publication)?;
                     }
-                }
-                Ok(())
-            })?;
+                    Ok(())
+                })?;
+            }
         }
         let Some(spine) = self.spine.get() else {
             return Ok(None);
@@ -4147,7 +4408,10 @@ impl DaemonState {
     }
 
     fn ensure_spine_for_publication(&self) -> Option<&dyn kin_spine::SpineBackend> {
-        let spine = self.ensure_spine_initialized()?;
+        // Every caller reaches this point only after
+        // `ensure_spine_under_publication`, so initialization must not acquire
+        // a second mutually exclusive publication lease.
+        let spine = self.spine.get().map(AsRef::as_ref)?;
         #[cfg(test)]
         if self.hosted_in_memory_spine_allowed.load(Ordering::SeqCst) {
             return Some(spine);
@@ -4220,7 +4484,16 @@ impl DaemonState {
                 return None;
             }
         } else {
-            self.reregister_primary_at_current_root(spine);
+            let mut publication = HostedPublicationGuard::local();
+            if let Err(error) = self.reregister_primary_at_current_root(spine, &mut publication) {
+                *self
+                    .spine_initialization_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(error.to_string());
+                warn!(%error, "local spine primary refresh failed closed");
+                return None;
+            }
         }
         *self
             .spine_initialization_failure
@@ -4236,8 +4509,93 @@ impl DaemonState {
         &self,
     ) -> Option<SpineAuthorityReadGuard<'_>> {
         let publication_gate = self.spine_refresh_gate.read().await;
+        if let Some(control) = self.publication_control.as_ref() {
+            if let Err(error) =
+                control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            {
+                *self
+                    .spine_initialization_failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!(
+                    "hosted spine query lost durable reader admission after acquiring its authority guard: {error}"
+                ));
+                return None;
+            }
+        }
         let backend = self.ensure_spine()?;
         Some(SpineAuthorityReadGuard {
+            backend,
+            _publication_gate: publication_gate,
+        })
+    }
+
+    /// Guard an already-initialized spine for side-effect-free diagnostics.
+    /// Hosted health must never warm, hydrate, or publish, but it also must not
+    /// report an unadmitted cached generation as healthy. The durable reader
+    /// admission and Firestore evidence are re-read only after the local writer
+    /// gate is held, then compared with the exact cached authority proof.
+    pub(crate) async fn acquire_initialized_spine_read_authority(
+        &self,
+    ) -> std::result::Result<SpineAuthorityReadGuard<'_>, String> {
+        let publication_gate = self.spine_refresh_gate.read().await;
+        let backend = self
+            .spine
+            .get()
+            .map(AsRef::as_ref)
+            .ok_or_else(|| "spine is disabled or has not been initialized".to_string())?;
+        if let Some(control) = self.publication_control.as_ref() {
+            control
+                .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+                .map_err(|error| format!("hosted spine reader is not durably admitted: {error}"))?;
+            let durable = match control
+                .runtime_spine_authority()
+                .map_err(|error| format!("load hosted spine runtime authority: {error}"))?
+            {
+                crate::publication_lease::RuntimeSpineAuthority::Completed(evidence) => evidence,
+                crate::publication_lease::RuntimeSpineAuthority::RolloutActive => {
+                    return Err(
+                        "hosted spine rollout remains active; cached authority is not readable"
+                            .to_string(),
+                    )
+                }
+            };
+            let expected = self.expected_hosted_spine_rollout_fence()?;
+            if expected != durable {
+                return Err(
+                    "cached hosted spine evidence differs from the GCS publication-control record"
+                        .to_string(),
+                );
+            }
+            let cached = self
+                .hosted_spine_authority_proof
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .ok_or_else(|| {
+                    "hosted spine has no completed cursor/root authority proof".to_string()
+                })?;
+            let active = without_blocking_runtime_worker(|| backend.active_rollout_fence())
+                .map_err(|error| format!("load active Firestore spine fence: {error}"))?;
+            if active != cached.rollout_fence || active.evidence() != durable {
+                return Err(
+                    "cached hosted spine proof differs from active Firestore authority"
+                        .to_string(),
+                );
+            }
+            let registered = backend.registered_repo_ids();
+            if cached.repositories.len() != registered.len()
+                || cached
+                    .repositories
+                    .keys()
+                    .any(|repo_id| !registered.contains(repo_id))
+            {
+                return Err(
+                    "cached hosted spine proof does not cover the exact registered fleet"
+                        .to_string(),
+                );
+            }
+        }
+        Ok(SpineAuthorityReadGuard {
             backend,
             _publication_gate: publication_gate,
         })
@@ -4285,6 +4643,9 @@ impl DaemonState {
     pub(crate) fn spine_unavailable_reason(&self) -> String {
         if self.spine_disabled {
             "spine disabled via KIN_DISABLE_SPINE".to_string()
+        } else if self.hosted_restart_required.load(Ordering::SeqCst) {
+            "hosted authority recovery completed or remains in progress; restart is required before this process may serve semantic graph state"
+                .to_string()
         } else if self.hosted_persistent_spine_blocked() {
             self.hosted_spine_contract().err().unwrap_or_else(|| {
                 HOSTED_SPINE_CURSOR_CAS_REQUIRED.to_string()
@@ -4299,6 +4660,35 @@ impl DaemonState {
         } else {
             "spine initialization could not capture stable graph authority; retry".to_string()
         }
+    }
+
+    /// Retain a hosted bootstrap or hydration failure on the constructed state
+    /// so the authenticated recovery API remains available while readiness and
+    /// every semantic spine read fail with the exact startup cause.
+    #[doc(hidden)]
+    pub fn record_hosted_spine_startup_failure(&self, error: impl Into<String>) {
+        *self
+            .spine_initialization_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error.into());
+        *self
+            .hosted_spine_authority_proof
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Mark an unfenced startup-opened process as permanently recovery-only.
+    /// The control plane can repair durable state, but this process must never
+    /// transition to reader-ready because its primary graph Arc predates the
+    /// successful fleet fence.
+    #[doc(hidden)]
+    pub fn require_hosted_restart_after_recovery(&self, error: impl Into<String>) {
+        self.hosted_restart_required.store(true, Ordering::SeqCst);
+        self.record_hosted_spine_startup_failure(error);
+    }
+
+    pub(crate) fn hosted_restart_required(&self) -> bool {
+        self.hosted_restart_required.load(Ordering::SeqCst)
     }
 
     /// Whether the spine's registered primary watermark is the live graph root.
@@ -8278,7 +8668,45 @@ mod tests {
             )
             .unwrap(),
         );
-        control.bootstrap_runtime_if_absent().unwrap();
+        let pending = control
+            .bootstrap_runtime_if_absent()
+            .unwrap()
+            .expect("absent control record must leave a pending startup rollout");
+        let bootstrap_proof = crate::publication_lease::LeaseProof {
+            scope: control.scope().to_string(),
+            token: pending.token,
+            fence: pending.fence,
+        };
+        let fence = control.spine_rollout_fence(&bootstrap_proof).unwrap();
+        let evidence = kin_spine::SpineRolloutFenceEvidence {
+            rollout_fence: fence.rollout_fence,
+            payload_sha256: fence.payload_sha256,
+            update_time: "test-firestore-update-1".to_string(),
+        };
+        control
+            .checkpoint_spine_rollout_fence(&bootstrap_proof, &evidence)
+            .unwrap();
+        let completed = control
+            .complete_rollout_acquisition(&bootstrap_proof)
+            .unwrap();
+        control
+            .admit_reader(crate::publication_lease::AdmitReaderRequest {
+                lease: bootstrap_proof.clone(),
+                repositories: completed.target_repositories,
+                reader: crate::publication_lease::ReaderAdmissionInput {
+                    identity: READER.to_string(),
+                    min_snapshot_schema: kin_db::GraphSnapshot::CURRENT_VERSION,
+                    max_snapshot_schema: kin_db::GraphSnapshot::CURRENT_VERSION,
+                    valid_for_seconds: 300,
+                },
+                legacy_writer_drain_proof_sha256: None,
+            })
+            .unwrap();
+        control
+            .release_rollout(crate::publication_lease::ReleaseRolloutLeaseRequest {
+                lease: bootstrap_proof,
+            })
+            .unwrap();
         let lease = control
             .acquire_publication("kin", kin_db::GraphSnapshot::CURRENT_VERSION)
             .unwrap();
@@ -11065,6 +11493,51 @@ mod tests {
             hydrations_before,
             "the ingest refusal must also happen before durable hydration"
         );
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    #[serial_test::serial]
+    fn hosted_production_feature_pair_selects_durable_backend() {
+        use kin_db::{InMemoryGraph, LocalFileBackend, StorageBackend, GENERATION_INIT};
+
+        let repositories = ["kin", "kin-db", "kin-lsp", "kin-model", "kin-search"];
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&repositories.join(",")));
+        environment.apply("KIN_DISABLE_SPINE", None);
+
+        let storage = tempfile::tempdir().unwrap();
+        let graph = InMemoryGraph::new();
+        graph
+            .upsert_entity(&test_entity("durable_backend", "src/durable.rs"))
+            .unwrap();
+        LocalFileBackend::new(storage.path())
+            .save_snapshot(
+                "kin",
+                &graph.to_snapshot().to_bytes().unwrap(),
+                GENERATION_INIT,
+            )
+            .unwrap();
+        let repo_dir = tempfile::tempdir().unwrap();
+        let layout = kin_core::init(repo_dir.path()).unwrap().layout;
+        let state = DaemonState::open_with_backend(
+            layout,
+            Box::new(LocalFileBackend::new(storage.path())),
+            "kin",
+            Some(repositories.into_iter().map(str::to_string).collect()),
+        )
+        .unwrap();
+
+        assert!(state.hosted_spine_readiness_required());
+        assert!(!state.hosted_persistent_spine_blocked());
+        assert_eq!(state.spine_backend_constructions.load(Ordering::SeqCst), 0);
+        state
+            .ensure_hosted_spine_backend_constructed()
+            .expect("gcs+firestore production bytes must construct the durable backend");
+        assert_eq!(state.spine_backend_constructions.load(Ordering::SeqCst), 1);
     }
 
     #[test]

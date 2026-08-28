@@ -250,6 +250,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_GCS_ENDPOINT` | url | *(unset)* | correctness | custom GCS endpoint for the daemon's graph-snapshot storage, e.g. a local fake-gcs-server; takes precedence over STORAGE_EMULATOR_HOST, sends unsigned requests, and fails daemon startup when unreachable rather than falling back to real Google Cloud Storage |
 | `KIN_GCS_PREFIX` | string | *(unset)* | operational | GCS key prefix for remote storage |
 | `KIN_RELEASE_DAEMON_DIGEST_INTERNAL` | string | *(unset)* | correctness | exact sha256 image identity required by hosted graph reader admission and publication fencing |
+| `KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL` | string | *(unset)* | correctness | deployment-controller attestation digest proving every cursorless legacy spine writer revision is drained before the durable one-way migration seal is created |
 
 ## Session & projection
 

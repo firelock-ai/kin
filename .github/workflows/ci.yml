@@ -2076,25 +2076,30 @@ jobs:
         with:
           tool: nextest
 
-      # `gcs` and `firestore` are non-default features, so the default-feature
-      # passes in Check & Test never execute the hosted-storage code they gate, and the
-      # `--all-features` Clippy pass there only type-checks it. Without this
-      # step, a behavioral regression in the exact hosted production feature
-      # shape compiles clean and reaches main with a green required context. The
-      # whole package runs rather than just the binary target. No companion
-      # doctest pass belongs here because
-      # kin-daemon declares `doctest = false`.
+      # Keep the former gcs-only gate even though production now adds Firestore.
+      # It proves hosted bytes compiled without the durable dependency still
+      # fail closed instead of silently selecting the in-memory backend.
+      - name: Test gcs feature
+        run: cargo nextest run -p kin-daemon --features gcs --locked
+
+      - name: Test hosted gcs spine cursor hold
+        if: matrix.os == 'ubuntu-latest'
+        run: >-
+          cargo test -p kin-daemon --features gcs --locked
+          state::tests::hosted_spine_refuses_persistence_without_cursor_cas
+          -- --exact --nocapture --test-threads=1
+
+      # The actual daemon container enables both non-default hosted features.
+      # Default and all-features checks do not execute this exact deployed
+      # configuration, so keep a complete package pass for the production bytes.
       - name: Test hosted production features
         run: cargo nextest run -p kin-daemon --features gcs,firestore --locked
 
-      # Keep the focused durable cursor-authority check beside the package pass.
-      # The exact deployed feature pair, not either partial backend and not an
-      # all-features surrogate, owns the fail-closed contract.
-      - name: Test hosted production spine cursor authority
+      - name: Test hosted production durable spine selection
         if: matrix.os == 'ubuntu-latest'
         run: >-
           cargo test -p kin-daemon --features gcs,firestore --locked
-          state::tests::hosted_spine_refuses_persistence_without_cursor_cas
+          state::tests::hosted_production_feature_pair_selects_durable_backend
           -- --exact --nocapture --test-threads=1
 
       # Nothing else on these legs resolves kin-cli without its default

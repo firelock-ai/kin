@@ -73,6 +73,12 @@ const CLEANUP_CONTINUATION_PASS_LIMIT: usize = 64;
 const CLEANUP_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
 
 #[cfg(feature = "firestore")]
+const FIRESTORE_MAX_WRITES_PER_COMMIT: usize = 100;
+
+#[cfg(feature = "firestore")]
+const FIRESTORE_MAX_COMMIT_JSON_BYTES: usize = 8 * 1024 * 1024;
+
+#[cfg(feature = "firestore")]
 const STAGE_MARKER_REVISION_HASH_DOMAIN: &[u8] = b"kin.spine-stage-marker-revision.v1\0";
 
 #[cfg(feature = "firestore")]
@@ -81,6 +87,12 @@ const LEGACY_MIGRATION_HEAD_SET_HASH_DOMAIN: &[u8] =
 
 #[cfg(feature = "firestore")]
 const LEGACY_MIGRATION_SEAL_SCHEMA: &str = "kin.spine-legacy-migration-seal.v1";
+
+#[cfg(feature = "firestore")]
+const LEGACY_MIGRATION_MARKER_DOCUMENT_ID: &str = "legacy_migration";
+
+#[cfg(feature = "firestore")]
+const LEGACY_MIGRATION_SEAL_DOCUMENT_ID: &str = "legacy_migration_seal_v1";
 
 #[cfg(feature = "firestore")]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +112,17 @@ struct LegacyMigrationSeal {
     writer_drain: LegacySpineWriterDrainAttestation,
     sealed_heads: Vec<RepoPublicationHead>,
     head_set_sha256: String,
+}
+
+#[cfg(feature = "firestore")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LegacyMigrationMarker {
+    Absent,
+    Predecessor {
+        fields: serde_json::Value,
+        update_time: String,
+    },
+    CanonicalSeal { seal: LegacyMigrationSeal },
 }
 
 #[cfg(feature = "firestore")]
@@ -138,6 +161,9 @@ impl LegacyMigrationSeal {
             ));
         }
         sealed_heads.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+        for head in &sealed_heads {
+            head.validate()?;
+        }
         let repository_ids = active
             .fence
             .repositories
@@ -216,6 +242,9 @@ impl LegacyMigrationSeal {
             .iter()
             .map(|head| head.repo_id.clone())
             .collect::<Vec<_>>();
+        for head in &self.sealed_heads {
+            head.validate()?;
+        }
         if observed_ids != self.repository_ids
             || self.head_set_sha256
                 != legacy_migration_head_set_sha256(
@@ -229,6 +258,160 @@ impl LegacyMigrationSeal {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(feature = "firestore")]
+fn firestore_legacy_migration_seal_fields(
+    seal: &LegacyMigrationSeal,
+) -> Result<serde_json::Value, SpineError> {
+    let payload = serde_json::to_string(seal).map_err(|error| {
+        SpineError::Serialization(format!(
+            "failed to serialize legacy migration seal: {error}"
+        ))
+    })?;
+    Ok(serde_json::json!({
+        "schema": { "stringValue": LEGACY_MIGRATION_SEAL_SCHEMA },
+        "state": { "stringValue": "complete" },
+        "head_set_sha256": { "stringValue": seal.head_set_sha256 },
+        "payload": { "stringValue": payload }
+    }))
+}
+
+#[cfg(feature = "firestore")]
+fn document_update_time(
+    document: &serde_json::Value,
+    what: &str,
+) -> Result<String, SpineError> {
+    document
+        .get("updateTime")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            SpineError::Serialization(format!(
+                "{what} document is missing Firestore updateTime"
+            ))
+        })
+}
+
+#[cfg(feature = "firestore")]
+fn parse_legacy_migration_seal_document(
+    document: &serde_json::Value,
+    expected_name: &str,
+) -> Result<(LegacyMigrationSeal, String), SpineError> {
+    if document.get("name").and_then(serde_json::Value::as_str) != Some(expected_name) {
+        return Err(SpineError::Serialization(
+            "legacy migration seal is stored under the wrong document identity".to_string(),
+        ));
+    }
+    let seal: LegacyMigrationSeal = doc_payload(document, "legacy migration seal")?;
+    let expected_fields = firestore_legacy_migration_seal_fields(&seal)?;
+    if document.get("fields") != Some(&expected_fields) {
+        return Err(SpineError::Serialization(
+            "legacy migration seal sibling fields do not exactly match its canonical payload"
+                .to_string(),
+        ));
+    }
+    Ok((
+        seal,
+        document_update_time(document, "legacy migration seal")?,
+    ))
+}
+
+#[cfg(feature = "firestore")]
+fn parse_legacy_migration_marker_document(
+    document: Option<&serde_json::Value>,
+    expected_name: &str,
+) -> Result<LegacyMigrationMarker, SpineError> {
+    let Some(document) = document else {
+        return Ok(LegacyMigrationMarker::Absent);
+    };
+    if document.get("name").and_then(serde_json::Value::as_str) != Some(expected_name) {
+        return Err(SpineError::Serialization(
+            "legacy migration marker is stored under the wrong document identity".to_string(),
+        ));
+    }
+    let update_time = document_update_time(document, "legacy migration marker")?;
+    let fields = document.get("fields").ok_or_else(|| {
+        SpineError::Serialization("legacy migration marker has no fields".to_string())
+    })?;
+
+    let predecessor_two_fields = serde_json::json!({
+        "schema_version": { "integerValue": "2" },
+        "state": { "stringValue": "complete" }
+    });
+    if fields == &predecessor_two_fields {
+        return Ok(LegacyMigrationMarker::Predecessor {
+            fields: fields.clone(),
+            update_time,
+        });
+    }
+
+    let rollout_fence = fields
+        .get("rollout_fence")
+        .and_then(|value| value.get("integerValue"))
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok());
+    let rollout_payload_sha256 = fields
+        .get("rollout_payload_sha256")
+        .and_then(|value| value.get("stringValue"))
+        .and_then(serde_json::Value::as_str);
+    let rollout_update_time = fields
+        .get("rollout_update_time")
+        .and_then(|value| value.get("stringValue"))
+        .and_then(serde_json::Value::as_str);
+    if let (Some(rollout_fence), Some(rollout_payload_sha256), Some(rollout_update_time)) =
+        (rollout_fence, rollout_payload_sha256, rollout_update_time)
+    {
+        let canonical_digest = rollout_payload_sha256
+            .strip_prefix("sha256:")
+            .is_some_and(|digest| {
+                digest.len() == 64
+                    && digest.bytes().all(|byte| {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+                    })
+            });
+        let predecessor_five_fields = serde_json::json!({
+            "schema_version": { "integerValue": "2" },
+            "state": { "stringValue": "complete" },
+            "rollout_fence": { "integerValue": rollout_fence.to_string() },
+            "rollout_payload_sha256": { "stringValue": rollout_payload_sha256 },
+            "rollout_update_time": { "stringValue": rollout_update_time }
+        });
+        if rollout_fence > 0
+            && canonical_digest
+            && !rollout_update_time.is_empty()
+            && fields == &predecessor_five_fields
+        {
+            return Ok(LegacyMigrationMarker::Predecessor {
+                fields: fields.clone(),
+                update_time,
+            });
+        }
+    }
+
+    if fields.get("payload").is_some() {
+        let (seal, _) = parse_legacy_migration_seal_document(document, expected_name)?;
+        return Ok(LegacyMigrationMarker::CanonicalSeal { seal });
+    }
+
+    Err(SpineError::Serialization(
+        "legacy migration marker has unsupported or mixed contents".to_string(),
+    ))
+}
+
+#[cfg(feature = "firestore")]
+fn require_exact_legacy_migration_seal(
+    attempted: &LegacyMigrationSeal,
+    observed: &LegacyMigrationSeal,
+) -> Result<(), SpineError> {
+    if attempted == observed {
+        Ok(())
+    } else {
+        Err(SpineError::Backend(
+            "a different immutable legacy migration seal already exists".to_string(),
+        ))
     }
 }
 
@@ -1290,9 +1473,6 @@ impl FirestoreStore {
         writes: Vec<serde_json::Value>,
         operation: &str,
     ) -> Result<(), SpineError> {
-        const MAX_WRITES: usize = 100;
-        const MAX_JSON_BYTES: usize = 8 * 1024 * 1024;
-
         let token = self.get_access_token()?;
         let url = format!("{}:commit", self.base_url());
         let mut batch = Vec::new();
@@ -1305,14 +1485,15 @@ impl FirestoreStore {
                     ))
                 })?
                 .len();
-            if write_bytes > MAX_JSON_BYTES {
+            if write_bytes > FIRESTORE_MAX_COMMIT_JSON_BYTES {
                 return Err(SpineError::Serialization(format!(
                     "one {operation} document exceeds the bounded Firestore request envelope"
                 )));
             }
             if !batch.is_empty()
-                && (batch.len() >= MAX_WRITES
-                    || estimated_bytes.saturating_add(write_bytes) > MAX_JSON_BYTES)
+                && (batch.len() >= FIRESTORE_MAX_WRITES_PER_COMMIT
+                    || estimated_bytes.saturating_add(write_bytes)
+                        > FIRESTORE_MAX_COMMIT_JSON_BYTES)
             {
                 self.commit_write_batch(&token, &url, &batch, operation)?;
                 batch.clear();
@@ -1325,6 +1506,20 @@ impl FirestoreStore {
             self.commit_write_batch(&token, &url, &batch, operation)?;
         }
         Ok(())
+    }
+
+    /// Commit an authority transition that is correct only when every guard
+    /// and winner write shares one Firestore Commit. Unlike bulk staging and
+    /// cleanup, this helper refuses rather than chunking.
+    fn commit_atomic_write_set(
+        &self,
+        writes: Vec<serde_json::Value>,
+        operation: &str,
+    ) -> Result<(), SpineError> {
+        validate_single_commit_envelope(&writes, operation)?;
+        let token = self.get_access_token()?;
+        let url = format!("{}:commit", self.base_url());
+        self.commit_write_batch(&token, &url, &writes, operation)
     }
 
     fn commit_write_batch(
@@ -2606,6 +2801,56 @@ fn firestore_rollout_fence_write(
 }
 
 #[cfg(feature = "firestore")]
+fn firestore_legacy_migration_marker_guard_write(
+    document_name: String,
+    marker: &LegacyMigrationMarker,
+    seal: &LegacyMigrationSeal,
+) -> Result<serde_json::Value, SpineError> {
+    match marker {
+        LegacyMigrationMarker::Absent => Ok(serde_json::json!({
+            "update": {
+                "name": document_name,
+                "fields": firestore_legacy_migration_seal_fields(seal)?
+            },
+            "currentDocument": { "exists": false }
+        })),
+        LegacyMigrationMarker::Predecessor {
+            fields,
+            update_time,
+        } => Ok(serde_json::json!({
+            "update": {
+                "name": document_name,
+                "fields": fields
+            },
+            "currentDocument": { "updateTime": update_time }
+        })),
+        LegacyMigrationMarker::CanonicalSeal { .. } => Err(SpineError::Backend(
+            "a canonical legacy migration seal must be reconciled before finalizing an upgrade"
+                .to_string(),
+        )),
+    }
+}
+
+#[cfg(feature = "firestore")]
+fn firestore_legacy_migration_finalize_writes(
+    marker_document_name: String,
+    marker: &LegacyMigrationMarker,
+    seal_document_name: String,
+    seal: &LegacyMigrationSeal,
+) -> Result<[serde_json::Value; 2], SpineError> {
+    Ok([
+        firestore_legacy_migration_marker_guard_write(marker_document_name, marker, seal)?,
+        serde_json::json!({
+            "update": {
+                "name": seal_document_name,
+                "fields": firestore_legacy_migration_seal_fields(seal)?
+            },
+            "currentDocument": { "exists": false }
+        }),
+    ])
+}
+
+#[cfg(feature = "firestore")]
 fn firestore_rollout_fence_fields(
     fence: &SpineRolloutFence,
 ) -> Result<serde_json::Value, SpineError> {
@@ -2619,6 +2864,46 @@ fn firestore_rollout_fence_fields(
         "payload_sha256": { "stringValue": fence.payload_sha256 },
         "payload": { "stringValue": payload }
     }))
+}
+
+#[cfg(feature = "firestore")]
+fn validate_single_commit_envelope(
+    writes: &[serde_json::Value],
+    operation: &str,
+) -> Result<(), SpineError> {
+    if writes.is_empty() {
+        return Err(SpineError::Serialization(format!(
+            "{operation} requires at least one Firestore write"
+        )));
+    }
+    if writes.len() > FIRESTORE_MAX_WRITES_PER_COMMIT {
+        return Err(SpineError::Serialization(format!(
+            "{operation} requires {} Firestore writes, above the one-Commit limit {}",
+            writes.len(),
+            FIRESTORE_MAX_WRITES_PER_COMMIT
+        )));
+    }
+    let mut encoded_bytes = 0usize;
+    for write in writes {
+        let write_bytes = serde_json::to_vec(write)
+            .map_err(|error| {
+                SpineError::Serialization(format!(
+                    "failed to size {operation} write: {error}"
+                ))
+            })?
+            .len();
+        encoded_bytes = encoded_bytes.checked_add(write_bytes).ok_or_else(|| {
+            SpineError::Serialization(format!(
+                "{operation} Firestore request size overflowed"
+            ))
+        })?;
+    }
+    if encoded_bytes > FIRESTORE_MAX_COMMIT_JSON_BYTES {
+        return Err(SpineError::Serialization(format!(
+            "{operation} requires {encoded_bytes} encoded bytes, above the one-Commit limit {FIRESTORE_MAX_COMMIT_JSON_BYTES}"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(feature = "firestore")]
@@ -2803,25 +3088,41 @@ impl SpineStore for FirestoreStore {
     }
 
     fn legacy_migration_complete(&self) -> Result<bool, SpineError> {
-        let Some(document) = self.get_document("spine_metadata_v2", "legacy_migration")? else {
-            return Ok(false);
-        };
-        let expected_name = self.document_name("spine_metadata_v2", "legacy_migration");
-        if document.get("name").and_then(serde_json::Value::as_str)
-            != Some(expected_name.as_str())
-        {
-            return Err(SpineError::Serialization(
-                "legacy migration marker is stored under the wrong document identity".to_string(),
-            ));
-        }
-        let seal: LegacyMigrationSeal = doc_payload(&document, "legacy migration seal")?;
         let active = self.read_rollout_fence()?.ok_or_else(|| {
             SpineError::Backend(
-                "legacy migration seal exists without an active rollout fence".to_string(),
+                "legacy migration state cannot be validated without an active rollout fence"
+                    .to_string(),
             )
         })?;
-        seal.validate_against_active(&active)?;
-        Ok(true)
+        if let Some(document) = self.get_document(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_SEAL_DOCUMENT_ID,
+        )? {
+            let expected_name = self.document_name(
+                "spine_metadata_v2",
+                LEGACY_MIGRATION_SEAL_DOCUMENT_ID,
+            );
+            let (seal, _) =
+                parse_legacy_migration_seal_document(&document, &expected_name)?;
+            seal.validate_against_active(&active)?;
+            return Ok(true);
+        }
+
+        let document = self.get_document(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_MARKER_DOCUMENT_ID,
+        )?;
+        let expected_name = self.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_MARKER_DOCUMENT_ID,
+        );
+        match parse_legacy_migration_marker_document(document.as_ref(), &expected_name)? {
+            LegacyMigrationMarker::Absent | LegacyMigrationMarker::Predecessor { .. } => Ok(false),
+            LegacyMigrationMarker::CanonicalSeal { seal, .. } => {
+                seal.validate_against_active(&active)?;
+                Ok(true)
+            }
+        }
     }
 
     fn complete_legacy_migration(
@@ -2829,9 +3130,6 @@ impl SpineStore for FirestoreStore {
         rollout_fence: &LoadedSpineRolloutFence,
         writer_drain: &LegacySpineWriterDrainAttestation,
     ) -> Result<(), SpineError> {
-        if self.legacy_migration_complete()? {
-            return Ok(());
-        }
         writer_drain.validate()?;
         if writer_drain.rollout_fence_evidence != rollout_fence.evidence() {
             return Err(SpineError::Backend(
@@ -2855,6 +3153,38 @@ impl SpineStore for FirestoreStore {
             writer_drain.clone(),
             heads.clone(),
         )?;
+
+        let seal_document_name = self.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_SEAL_DOCUMENT_ID,
+        );
+        if let Some(document) = self.get_document(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_SEAL_DOCUMENT_ID,
+        )? {
+            let (observed, _) =
+                parse_legacy_migration_seal_document(&document, &seal_document_name)?;
+            observed.validate_against_active(rollout_fence)?;
+            return require_exact_legacy_migration_seal(&seal, &observed);
+        }
+
+        let marker_document = self.get_document(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_MARKER_DOCUMENT_ID,
+        )?;
+        let marker_document_name = self.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_MARKER_DOCUMENT_ID,
+        );
+        let marker = parse_legacy_migration_marker_document(
+            marker_document.as_ref(),
+            &marker_document_name,
+        )?;
+        if let LegacyMigrationMarker::CanonicalSeal { seal: observed, .. } = &marker {
+            observed.validate_against_active(rollout_fence)?;
+            return require_exact_legacy_migration_seal(&seal, observed);
+        }
+
         let mut writes = vec![firestore_rollout_fence_write(
             self.document_name("spine_control_v2", "rollout_fence"),
             &rollout_fence.fence,
@@ -2877,39 +3207,31 @@ impl SpineStore for FirestoreStore {
                 &precondition,
             )?);
         }
-        let payload = serde_json::to_string(&seal).map_err(|error| {
-            SpineError::Serialization(format!(
-                "failed to serialize legacy migration seal: {error}"
-            ))
-        })?;
-        writes.push(self.immutable_update_write(
-            self.document_name("spine_metadata_v2", "legacy_migration"),
-            serde_json::json!({
-                "schema": { "stringValue": LEGACY_MIGRATION_SEAL_SCHEMA },
-                "state": { "stringValue": "complete" },
-                "head_set_sha256": { "stringValue": seal.head_set_sha256 },
-                "payload": { "stringValue": payload }
-            }),
-        ));
-        match self.commit_write_batches(writes, "complete legacy spine migration") {
+        writes.extend(firestore_legacy_migration_finalize_writes(
+            marker_document_name,
+            &marker,
+            seal_document_name.clone(),
+            &seal,
+        )?);
+        match self.commit_atomic_write_set(writes, "complete legacy spine migration") {
             Ok(()) => Ok(()),
             Err(commit_error) => {
-                let Some(document) =
-                    self.get_document("spine_metadata_v2", "legacy_migration")?
+                let Some(document) = self.get_document(
+                    "spine_metadata_v2",
+                    LEGACY_MIGRATION_SEAL_DOCUMENT_ID,
+                )?
                 else {
                     return Err(SpineError::Backend(format!(
                         "{commit_error}; legacy migration seal was not durably created"
                     )));
                 };
-                let observed: LegacyMigrationSeal =
-                    doc_payload(&document, "legacy migration seal")?;
-                if observed == seal {
-                    Ok(())
-                } else {
-                    Err(SpineError::Backend(format!(
+                let (observed, _) =
+                    parse_legacy_migration_seal_document(&document, &seal_document_name)?;
+                require_exact_legacy_migration_seal(&seal, &observed).map_err(|_| {
+                    SpineError::Backend(format!(
                         "{commit_error}; a different legacy migration seal won"
-                    )))
-                }
+                    ))
+                })
             }
         }
     }
@@ -3455,6 +3777,26 @@ mod tests {
             daemon_image_sha256: format!("sha256:{}", "a".repeat(64)),
             drain_proof_sha256: format!("sha256:{}", "b".repeat(64)),
         }
+    }
+
+    #[cfg(feature = "firestore")]
+    fn legacy_migration_fixture() -> (LoadedSpineRolloutFence, LegacyMigrationSeal) {
+        let loaded = LoadedSpineRolloutFence {
+            fence: test_rollout_fence(7, "legacy-fixture-rollout", &["repo"]),
+            update_time: "2026-08-27T12:00:00.000000Z".to_string(),
+        };
+        let writer_drain = LegacySpineWriterDrainAttestation {
+            schema: crate::publication::LEGACY_SPINE_WRITER_DRAIN_SCHEMA.to_string(),
+            rollout_fence_evidence: loaded.evidence(),
+            daemon_image_sha256: format!("sha256:{}", "a".repeat(64)),
+            drain_proof_sha256: format!("sha256:{}", "b".repeat(64)),
+        };
+        let head = metadata_publication("repo", 41, "fixture-root", Vec::new())
+            .canonicalize()
+            .unwrap()
+            .head;
+        let seal = LegacyMigrationSeal::build(&loaded, writer_drain, vec![head]).unwrap();
+        (loaded, seal)
     }
 
     fn seal_fake_for_current_heads(store: &FakeSpineStore) {
@@ -6448,6 +6790,227 @@ mod tests {
                 .and_then(serde_json::Value::as_bool),
             Some(false)
         );
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn released_legacy_marker_shapes_require_an_attested_upgrade() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let marker_name = store.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_MARKER_DOCUMENT_ID,
+        );
+        let two_field = serde_json::json!({
+            "name": marker_name,
+            "updateTime": "2026-08-27T10:00:00Z",
+            "fields": {
+                "schema_version": { "integerValue": "2" },
+                "state": { "stringValue": "complete" }
+            }
+        });
+        assert!(matches!(
+            parse_legacy_migration_marker_document(Some(&two_field), &marker_name).unwrap(),
+            LegacyMigrationMarker::Predecessor { fields, update_time }
+                if fields == two_field["fields"]
+                    && update_time == "2026-08-27T10:00:00Z"
+        ));
+
+        let five_field = serde_json::json!({
+            "name": marker_name,
+            "updateTime": "2026-08-27T11:00:00Z",
+            "fields": {
+                "schema_version": { "integerValue": "2" },
+                "state": { "stringValue": "complete" },
+                "rollout_fence": { "integerValue": "6" },
+                "rollout_payload_sha256": { "stringValue": format!("sha256:{}", "c".repeat(64)) },
+                "rollout_update_time": { "stringValue": "2026-08-27T10:59:59Z" }
+            }
+        });
+        assert!(matches!(
+            parse_legacy_migration_marker_document(Some(&five_field), &marker_name).unwrap(),
+            LegacyMigrationMarker::Predecessor { fields, update_time }
+                if fields == five_field["fields"]
+                    && update_time == "2026-08-27T11:00:00Z"
+        ));
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn legacy_marker_parser_rejects_mixed_extra_or_malformed_fields() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let marker_name = store.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_MARKER_DOCUMENT_ID,
+        );
+        let mut extra = serde_json::json!({
+            "name": marker_name,
+            "updateTime": "2026-08-27T10:00:00Z",
+            "fields": {
+                "schema_version": { "integerValue": "2" },
+                "state": { "stringValue": "complete" },
+                "unexpected": { "stringValue": "must-fail" }
+            }
+        });
+        assert!(parse_legacy_migration_marker_document(Some(&extra), &marker_name).is_err());
+
+        extra["fields"] = serde_json::json!({
+            "schema_version": { "integerValue": "2" },
+            "state": { "stringValue": "complete" },
+            "rollout_fence": { "integerValue": "0" },
+            "rollout_payload_sha256": { "stringValue": format!("sha256:{}", "c".repeat(64)) },
+            "rollout_update_time": { "stringValue": "2026-08-27T10:00:00Z" }
+        });
+        assert!(parse_legacy_migration_marker_document(Some(&extra), &marker_name).is_err());
+
+        extra["fields"]["rollout_fence"] = serde_json::json!({ "integerValue": "6" });
+        extra["fields"]["rollout_payload_sha256"] =
+            serde_json::json!({ "stringValue": format!("sha256:{}", "C".repeat(64)) });
+        assert!(parse_legacy_migration_marker_document(Some(&extra), &marker_name).is_err());
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn canonical_legacy_seal_requires_exact_identity_and_sibling_fields() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let (_, seal) = legacy_migration_fixture();
+        let seal_name = store.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_SEAL_DOCUMENT_ID,
+        );
+        let document = serde_json::json!({
+            "name": seal_name,
+            "updateTime": "2026-08-27T12:01:00Z",
+            "fields": firestore_legacy_migration_seal_fields(&seal).unwrap()
+        });
+        let (parsed, update_time) =
+            parse_legacy_migration_seal_document(&document, &seal_name).unwrap();
+        assert_eq!(parsed, seal);
+        assert_eq!(update_time, "2026-08-27T12:01:00Z");
+
+        let mut wrong_sibling = document.clone();
+        wrong_sibling["fields"]["state"] =
+            serde_json::json!({ "stringValue": "incomplete" });
+        assert!(parse_legacy_migration_seal_document(&wrong_sibling, &seal_name).is_err());
+
+        let wrong_name = store.document_name("spine_metadata_v2", "sibling_only");
+        assert!(parse_legacy_migration_seal_document(&document, &wrong_name).is_err());
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn canonical_seal_under_released_identity_remains_readable_but_immutable() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let (_, seal) = legacy_migration_fixture();
+        let marker_name = store.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_MARKER_DOCUMENT_ID,
+        );
+        let document = serde_json::json!({
+            "name": marker_name,
+            "updateTime": "2026-08-27T12:01:00Z",
+            "fields": firestore_legacy_migration_seal_fields(&seal).unwrap()
+        });
+        assert!(matches!(
+            parse_legacy_migration_marker_document(Some(&document), &marker_name).unwrap(),
+            LegacyMigrationMarker::CanonicalSeal { seal: observed, .. } if observed == seal
+        ));
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn legacy_upgrade_atomically_verifies_marker_and_creates_new_seal() {
+        let store = FirestoreStore::new("project".to_string(), None);
+        let (_, seal) = legacy_migration_fixture();
+        let marker_name = store.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_MARKER_DOCUMENT_ID,
+        );
+        let seal_name = store.document_name(
+            "spine_metadata_v2",
+            LEGACY_MIGRATION_SEAL_DOCUMENT_ID,
+        );
+        let writes = firestore_legacy_migration_finalize_writes(
+            marker_name.clone(),
+            &LegacyMigrationMarker::Predecessor {
+                fields: serde_json::json!({
+                    "schema_version": { "integerValue": "2" },
+                    "state": { "stringValue": "complete" }
+                }),
+                update_time: "marker-revision".to_string(),
+            },
+            seal_name.clone(),
+            &seal,
+        )
+        .unwrap();
+        assert_eq!(
+            writes[0]
+                .pointer("/update/name")
+                .and_then(serde_json::Value::as_str),
+            Some(marker_name.as_str())
+        );
+        assert_eq!(
+            writes[0]
+                .pointer("/currentDocument/updateTime")
+                .and_then(serde_json::Value::as_str),
+            Some("marker-revision")
+        );
+        assert!(writes[0].get("verify").is_none());
+        assert!(writes[0].get("delete").is_none());
+        assert_eq!(
+            writes[1]
+                .pointer("/update/name")
+                .and_then(serde_json::Value::as_str),
+            Some(seal_name.as_str())
+        );
+        assert_eq!(
+            writes[1]
+                .pointer("/currentDocument/exists")
+                .and_then(serde_json::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            writes[1].pointer("/update/fields"),
+            Some(&firestore_legacy_migration_seal_fields(&seal).unwrap())
+        );
+
+        let absent = firestore_legacy_migration_finalize_writes(
+            marker_name,
+            &LegacyMigrationMarker::Absent,
+            seal_name,
+            &seal,
+        )
+        .unwrap();
+        assert!(absent[0].get("verify").is_none());
+        assert!(absent[0].get("delete").is_none());
+        assert_eq!(
+            absent[0]
+                .pointer("/currentDocument/exists")
+                .and_then(serde_json::Value::as_bool),
+            Some(false),
+            "an old marker appearing after an absent read must fail the atomic create"
+        );
+        assert_eq!(
+            absent[0].pointer("/update/fields"),
+            Some(&firestore_legacy_migration_seal_fields(&seal).unwrap()),
+            "an absent predecessor identity is sealed in the same commit as the new identity"
+        );
+    }
+
+    #[cfg(feature = "firestore")]
+    #[test]
+    fn legacy_seal_replay_requires_the_exact_attestation() {
+        let (active, seal) = legacy_migration_fixture();
+        require_exact_legacy_migration_seal(&seal, &seal).unwrap();
+
+        let mut different_drain = seal.writer_drain.clone();
+        different_drain.drain_proof_sha256 = format!("sha256:{}", "d".repeat(64));
+        let different = LegacyMigrationSeal::build(
+            &active,
+            different_drain,
+            seal.sealed_heads.clone(),
+        )
+        .unwrap();
+        assert!(require_exact_legacy_migration_seal(&different, &seal).is_err());
     }
 
     #[cfg(feature = "firestore")]

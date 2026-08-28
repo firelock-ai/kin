@@ -2937,6 +2937,12 @@ where
     // Initialize once outside the stamped interval: lazy spine hydration and
     // registration can be expensive, but it is not part of the graph read.
     let spine_authority = state.acquire_spine_read_authority().await;
+    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            state.spine_unavailable_reason(),
+        ));
+    }
     let spine = spine_authority.as_ref().map(|authority| authority.backend());
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
@@ -3001,6 +3007,11 @@ where
         ));
     }
     let spine_authority = state.acquire_spine_read_authority().await;
+    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+        return Err(kin_mcp::McpError::Other(
+            state.spine_unavailable_reason(),
+        ));
+    }
     let spine = spine_authority.as_ref().map(|authority| authority.backend());
     let repository_authority = mcp_repository_authority_source(state)?;
     let mut superseded = None;
@@ -3156,6 +3167,11 @@ where
     F: FnMut(usize),
 {
     let spine_authority = state.acquire_spine_read_authority().await;
+    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+        return Err(kin_mcp::McpError::Other(
+            state.spine_unavailable_reason(),
+        ));
+    }
     let spine = spine_authority.as_ref().map(|authority| authority.backend());
     let mut superseded = None;
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
@@ -12015,8 +12031,26 @@ async fn publication_control_acquire_rollout(
     Json(request): Json<crate::publication_lease::AcquireRolloutLeaseRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let control = publication_control(&state)?;
-    let lease = control
+    let pending = control
         .acquire_rollout(request)
+        .map_err(publication_control_error)?;
+    let proof = crate::publication_lease::LeaseProof {
+        scope: control.scope().to_string(),
+        token: pending.token.clone(),
+        fence: pending.fence,
+    };
+    let fence = control
+        .spine_rollout_fence(&proof)
+        .map_err(publication_control_error)?;
+    let evidence = state
+        .advance_hosted_spine_rollout_fence(fence)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    control
+        .checkpoint_spine_rollout_fence(&proof, &evidence)
+        .map_err(publication_control_error)?;
+    let lease = control
+        .complete_rollout_acquisition(&proof)
         .map_err(publication_control_error)?;
     let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
     Ok(Json(lease))
@@ -12039,9 +12073,14 @@ async fn publication_control_admit_reader(
     Json(request): Json<crate::publication_lease::AdmitReaderRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let control = publication_control(&state)?;
-    let record = control
-        .admit_reader(request)
-        .map_err(publication_control_error)?;
+    state
+        .prepare_hosted_spine_rollout(&request)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let record = state
+        .admit_hosted_spine_rollout_fence(request)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
     let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
     Ok(Json(record))
 }
@@ -12051,9 +12090,22 @@ async fn publication_control_release_rollout(
     Json(request): Json<crate::publication_lease::ReleaseRolloutLeaseRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let control = publication_control(&state)?;
-    control
-        .release_rollout(request)
-        .map_err(publication_control_error)?;
+    match control
+        .classify_rollout_release(&request.lease)
+        .map_err(publication_control_error)?
+    {
+        crate::publication_lease::RolloutReleaseDisposition::Active => {
+            state
+                .release_hosted_spine_rollout(request)
+                .await
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+        }
+        crate::publication_lease::RolloutReleaseDisposition::CompletedExact => {
+            control
+                .release_rollout(request)
+                .map_err(publication_control_error)?;
+        }
+    }
     let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
     // A lost-response retry can race a later unrelated rollout. Returning the
     // raw ordered record here would disclose that rollout's live capability
@@ -12084,12 +12136,11 @@ async fn spine_health(
     // This route is intentionally public diagnostics. Never let an
     // unauthenticated health read initialize or re-register hosted Firestore
     // authority; mutating routes own that transition under publication guard.
-    let spine = state.spine().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "spine is disabled or has not been initialized".to_string(),
-        )
-    })?;
+    let authority = state
+        .acquire_initialized_spine_read_authority()
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let spine = authority.backend();
 
     // Two completeness readings, never one. `cross_repo_edges: 0` beside nothing
     // else is a bare zero: it reads as "this install has no cross-repo edges"
@@ -23112,15 +23163,13 @@ mod tests {
     }
 
     /// The direct server API is the bypass the invoking shell cannot close.
-    /// Drive bootstrap, retry, admission switch, release, and the actual spine
-    /// ingest route through one router so missing and mismatched reader identity
-    /// cannot be hidden behind the PR192 script's own checks.
+    /// A hosted daemon built without a usable durable spine must leave the GCS
+    /// rollout active and refuse both admission and direct ingest. A test-only
+    /// local backend must never make the production control route look green.
     #[tokio::test]
-    async fn publication_control_api_fences_direct_spine_ingest() {
+    async fn publication_control_api_fails_closed_without_durable_spine() {
         const READER_A: &str =
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        const READER_B: &str =
-            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         const SCOPE: &str = "gcs://fixture/v2";
         let fleet = vec![
             "kin".to_string(),
@@ -23253,27 +23302,25 @@ mod tests {
             acquire.clone(),
         )
         .await;
-        assert_eq!(status, StatusCode::OK, "{lease}");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{lease}");
+        let first_error = lease
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            first_error.contains("GOOGLE_CLOUD_PROJECT")
+                || first_error.contains("durable spine"),
+            "the production route must name its missing durable authority: {lease}"
+        );
         let (retry_status, retry) = publication_post(
             app.clone(),
             "/authority/publication-control/rollout/acquire",
             acquire,
         )
         .await;
-        assert_eq!(retry_status, StatusCode::OK, "{retry}");
-        assert_eq!(retry["token"], lease["token"]);
-        assert_eq!(retry["fence"], lease["fence"]);
-        assert!(lease["authority_fenced_at"].is_string(), "{lease}");
-        assert_eq!(lease["authority_fence"].as_array().unwrap().len(), 5);
-        assert_eq!(lease["authority_fence"][0]["repo_id"], "kin");
-        assert_eq!(lease["authority_fence"][0]["pre_fence_generation"], 1);
-        assert_eq!(lease["authority_fence"][0]["fenced_generation"], 2);
-        assert_eq!(
-            lease["authority_fence"][0]["snapshot_schema"],
-            kin_db::GraphSnapshot::CURRENT_VERSION
-        );
+        assert_eq!(retry_status, StatusCode::SERVICE_UNAVAILABLE, "{retry}");
 
-        let status = app
+        let control_status = app
             .clone()
             .oneshot(
                 Request::get("/authority/publication-control")
@@ -23283,16 +23330,15 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(status.status(), StatusCode::OK);
-        let status_body = axum::body::to_bytes(status.into_body(), 256 * 1024)
+        assert_eq!(control_status.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(control_status.into_body(), 256 * 1024)
             .await
             .unwrap();
         let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
         let status_text = String::from_utf8(status_body.to_vec()).unwrap();
-        let lease_token = lease["token"].as_str().unwrap();
-        assert!(status_json["active_lease"]["authority_fencing_in_progress"].is_boolean());
+        assert!(status_json["active_lease"].is_object());
         assert!(
-            !status_text.contains("\"token\"") && !status_text.contains(lease_token),
+            !status_text.contains("\"token\""),
             "read-only publication status must not disclose live lease capability: {status_text}"
         );
 
@@ -23301,104 +23347,6 @@ mod tests {
         assert_eq!(blocked_status, StatusCode::SERVICE_UNAVAILABLE);
         let blocked_body = String::from_utf8_lossy(&blocked_body);
         assert!(blocked_body.contains("rollout fence"), "{blocked_body}");
-
-        let proof = serde_json::json!({
-            "scope": SCOPE,
-            "token": lease["token"],
-            "fence": lease["fence"]
-        });
-        let (status, admitted) = publication_post(
-            app.clone(),
-            "/authority/publication-control/rollout/admit-reader",
-            serde_json::json!({
-                "scope": proof["scope"],
-                "token": proof["token"],
-                "fence": proof["fence"],
-                "repositories": ["kin", "kin-db", "kin-vfs", "kinlab", "kin-editor"],
-                "reader": {
-                    "identity": READER_B,
-                    "min_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
-                    "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
-                    "valid_for_seconds": 3600
-                }
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{admitted}");
-
-        let fenced_health = app
-            .clone()
-            .oneshot(
-                Request::get("/health")
-                    .header("authorization", "Bearer daemon-test-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(fenced_health.status(), StatusCode::OK);
-        let fenced_body = axum::body::to_bytes(fenced_health.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let fenced_body: HealthResponse = serde_json::from_slice(&fenced_body).unwrap();
-        assert!(
-            !fenced_body.reader_admitted
-                && fenced_body
-                    .reader_admission_error
-                    .as_deref()
-                    .is_some_and(|error| error.contains("rollout fence")),
-            "{fenced_body:?}"
-        );
-        let fenced_readiness = app
-            .clone()
-            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(fenced_readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
-
-        let (status, body) = publication_spine_ingest(app.clone(), "kin").await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("rollout fence"), "{body}");
-
-        let (status, released) = publication_post(
-            app.clone(),
-            "/authority/publication-control/rollout/release",
-            proof.clone(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{released}");
-        assert!(released["active_lease"].is_null());
-
-        let (status, later) = publication_post(
-            app.clone(),
-            "/authority/publication-control/rollout/acquire",
-            serde_json::json!({
-                "scope": SCOPE,
-                "repositories": ["kin", "kin-db", "kin-vfs", "kinlab", "kin-editor"],
-                "holder": "staging-promotion",
-                "request_id": "run-456",
-                "ttl_seconds": 300
-            }),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{later}");
-        let later_token = later["token"].as_str().unwrap().to_string();
-
-        let (status, old_release_retry) = publication_post(
-            app,
-            "/authority/publication-control/rollout/release",
-            proof,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{old_release_retry}");
-        let old_release_retry_text = serde_json::to_string(&old_release_retry).unwrap();
-        assert!(old_release_retry["active_lease"].is_object());
-        assert!(
-            !old_release_retry_text.contains("\"token\"")
-                && !old_release_retry_text.contains(&later_token),
-            "an old completed proof must not recover a later rollout capability: {old_release_retry_text}"
-        );
     }
 
     /// The identity contract a client depends on: read `repo_id` off `/health`

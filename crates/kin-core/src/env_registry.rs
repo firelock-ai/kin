@@ -269,6 +269,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_GCS_BUCKET", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "GCS bucket for remote storage" },
     EnvVarSpec { name: "KIN_GCS_PREFIX", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "GCS key prefix for remote storage" },
     EnvVarSpec { name: "KIN_RELEASE_DAEMON_DIGEST_INTERNAL", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "exact sha256 image identity required by hosted graph reader admission and publication fencing" },
+    EnvVarSpec { name: "KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "deployment-controller attestation digest proving every cursorless legacy spine writer revision is drained before the durable one-way migration seal is created" },
     // Correctness rather than Operational, unlike the bucket and prefix beside
     // it: this one redirects every storage request to a different server, so a
     // wrong value serves and persists graph truth somewhere other than where the
@@ -897,6 +898,7 @@ fn doc_group(name: &str) -> &'static str {
         ("KIN_INIT_", "Init"),
         ("KIN_GCS_", "Storage"),
         ("KIN_RELEASE_DAEMON_DIGEST_INTERNAL", "Storage"),
+        ("KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL", "Storage"),
         ("KIN_CONTEXTBENCH_", "Benchmarking"),
         ("KIN_HYDRATE_", "Diagnostics"),
         ("KIN_PROFILE_", "Diagnostics"),

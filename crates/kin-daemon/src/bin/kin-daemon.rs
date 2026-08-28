@@ -202,6 +202,7 @@ fn create_state(
     layout: KinLayout,
     storage: &StorageMode,
     repo_id: &str,
+    #[cfg_attr(not(feature = "gcs"), allow(unused_variables))] runtime: &tokio::runtime::Handle,
     #[cfg_attr(not(feature = "gcs"), allow(unused_variables))] allowed_repo_ids: Option<
         HashSet<String>,
     >,
@@ -269,14 +270,101 @@ fn create_state(
                     control_store,
                 )?,
             );
-            publication_control.bootstrap_runtime_if_absent()?;
-            Ok(DaemonState::open_with_backend_and_publication_control(
+            let bootstrap = match publication_control.bootstrap_runtime_if_absent() {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    let reason = format!(
+                        "bootstrap hosted publication control before Firestore spine recovery: {error}"
+                    );
+                    // This state is recovery-only until durable admission is
+                    // re-established. Hosted middleware exposes the admin
+                    // control route and process liveness, while refusing every
+                    // graph authority route. A successful bootstrap never opens
+                    // the primary graph until the GCS fence has completed.
+                    let state = DaemonState::open_with_backend_and_publication_control(
+                        layout,
+                        Box::new(backend),
+                        repo_id,
+                        allowed_repo_ids,
+                        Arc::clone(&publication_control),
+                    )?;
+                    state.require_hosted_restart_after_recovery(reason.clone());
+                    eprintln!(
+                        "kin-daemon: hosted spine remains unready while publication control recovers: {reason}"
+                    );
+                    return Ok(state);
+                }
+            };
+            let state = DaemonState::open_with_backend_and_publication_control(
                 layout,
                 Box::new(backend),
                 repo_id,
                 allowed_repo_ids,
-                publication_control,
-            )?)
+                Arc::clone(&publication_control),
+            )?;
+            let spine_startup = if let Some(pending) = bootstrap {
+                (|| -> std::result::Result<(), String> {
+                    let proof = kin_daemon::publication_lease::LeaseProof {
+                        scope: publication_control.scope().to_string(),
+                        token: pending.token,
+                        fence: pending.fence,
+                    };
+                    let fence = publication_control
+                        .spine_rollout_fence(&proof)
+                        .map_err(|error| error.to_string())?;
+                    let evidence = runtime
+                        .block_on(state.advance_hosted_spine_rollout_fence(fence))?;
+                    publication_control
+                        .checkpoint_spine_rollout_fence(&proof, &evidence)
+                        .map_err(|error| error.to_string())?;
+                    publication_control
+                        .complete_rollout_acquisition(&proof)
+                        .map_err(|error| error.to_string())?;
+                    let legacy_writer_drain_proof_sha256 = env::var(
+                        "KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL",
+                    )
+                    .ok()
+                    .map(|digest| digest.trim().to_string())
+                    .filter(|digest| !digest.is_empty());
+                    let admission = kin_daemon::publication_lease::AdmitReaderRequest {
+                        lease: proof.clone(),
+                        repositories: publication_control.fleet_repositories().to_vec(),
+                        reader: kin_daemon::publication_lease::ReaderAdmissionInput {
+                            identity: publication_control.runtime_reader_identity().to_string(),
+                            min_snapshot_schema: kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                            max_snapshot_schema: kin_db::GraphSnapshot::CURRENT_VERSION,
+                            valid_for_seconds:
+                                kin_daemon::publication_lease::MAX_READER_ADMISSION_SECONDS,
+                        },
+                        legacy_writer_drain_proof_sha256,
+                    };
+                    runtime.block_on(state.prepare_hosted_spine_rollout(&admission))?;
+                    runtime.block_on(state.admit_hosted_spine_rollout_fence(admission))?;
+                    runtime.block_on(state.release_hosted_spine_rollout(
+                        kin_daemon::publication_lease::ReleaseRolloutLeaseRequest {
+                            lease: proof,
+                        },
+                    ))?;
+                    Ok(())
+                })()
+            } else {
+                match publication_control.runtime_spine_authority() {
+                    Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::Completed(
+                        evidence,
+                    )) => runtime.block_on(state.adopt_hosted_spine_rollout_fence(evidence)),
+                    Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::RolloutActive) => {
+                        Err("a hosted rollout remains active; semantic readiness stays closed while the authenticated publication-control API resumes or replaces it".to_string())
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            };
+            if let Err(error) = spine_startup {
+                state.record_hosted_spine_startup_failure(error.clone());
+                eprintln!(
+                    "kin-daemon: hosted spine remains unready while publication control recovers: {error}"
+                );
+            }
+            Ok(state)
         }
     }
 }
@@ -688,7 +776,13 @@ async fn async_main() -> i32 {
             ));
             // A failed open drops both handles here, which closes the socket. No
             // endpoint was published for it, so nothing outlives the failure.
-            let state = create_state(bind_layout, &storage, &repo_id, allowed_repo_ids)?;
+            let state = create_state(
+                bind_layout,
+                &storage,
+                &repo_id,
+                &runtime,
+                allowed_repo_ids,
+            )?;
             Ok((state, api_listener, bound_port, ready_tx))
         })
         // The boxed startup error is not `Send`, and this result crosses back
@@ -946,10 +1040,12 @@ mod tests {
         environment.apply("KIN_DAEMON_AUTH_TOKEN", None);
         let repo = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(repo.path().join(".kin"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let result = create_state(
             layout,
             &StorageMode::Gcs,
             "kin",
+            runtime.handle(),
             Some(["kin".to_string(), "kin-db".to_string()].into_iter().collect()),
         );
         let Err(error) = result else {
@@ -978,10 +1074,12 @@ mod tests {
         environment.apply("KIN_PUBLICATION_CONTROL_AUTH_TOKEN", None);
         let repo = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(repo.path().join(".kin"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let result = create_state(
             layout,
             &StorageMode::Gcs,
             "kin",
+            runtime.handle(),
             Some(["kin".to_string(), "kin-db".to_string()].into_iter().collect()),
         );
         let Err(error) = result else {
@@ -1012,10 +1110,12 @@ mod tests {
         environment.apply("KIN_PUBLICATION_CONTROL_AUTH_TOKEN", Some("shared-token"));
         let repo = tempfile::tempdir().unwrap();
         let layout = KinLayout::new(repo.path().join(".kin"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let result = create_state(
             layout,
             &StorageMode::Gcs,
             "kin",
+            runtime.handle(),
             Some(["kin".to_string(), "kin-db".to_string()].into_iter().collect()),
         );
         let Err(error) = result else {
