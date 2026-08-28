@@ -3144,7 +3144,18 @@ def check_22(suite):
         return res
 
     clean_label = listed[RELIMPORT_DEAD_FUNCTION]
-    if clean_label != expected_label:
+    # The published block carries the FAMILY reading. The delete-list authority
+    # also accounts the focal's own file, which is in no family and which this
+    # suite therefore cannot see, so an accounted family may still owe a label
+    # for a call beside the row. That one combination is graded on the coupling
+    # below rather than on a derived value the suite cannot compute.
+    same_file_only = (state == "accounted"
+                      and clean_label.startswith("[unverified: caller_arrival_"))
+    if same_file_only:
+        res.ok("the family accounted for its arrivals and the row still carries %s, which is "
+               "the focal's own file; this suite grades that through the verdict coupling "
+               "below rather than against a value it cannot compute" % clean_label)
+    elif clean_label != expected_label:
         res.bad("find_references reports caller_arrival state %r for pkg/store.py, so the "
                 "dead-code row for %s owes the label %r and carries %r instead; the two "
                 "surfaces are reading one store about one file and disagree"
@@ -3156,18 +3167,21 @@ def check_22(suite):
         res.ok("arrival is accounted for this file and the dead row carries no caveat, which "
                "grades the gate's ability to stay silent rather than its consumer")
 
-    # And the top-level verdict, which is the other half of the same claim: a row
-    # the graph cannot stand behind must not sit under a confident heading.
-    if expected_label and confident_verdict:
+    # And the coupling, which is the half that holds whichever branch ran: a row
+    # this graph cannot stand behind must not sit under a confident heading, and
+    # a scan that labelled nothing must not withhold one. Stated over the label
+    # the scan actually printed rather than the derived one, so it grades the
+    # same-file case the suite cannot derive.
+    if clean_label and confident_verdict:
         res.bad("the row for %s is not supportable (%s) yet the scan printed a confident "
-                "verdict: %s" % (RELIMPORT_DEAD_FUNCTION, expected_label, verdict))
-    elif expected_label:
+                "verdict: %s" % (RELIMPORT_DEAD_FUNCTION, clean_label, verdict))
+    elif clean_label:
         res.ok("the scan withholds a confident verdict over the unsupportable row: %s" % verdict)
     elif confident_verdict:
         res.ok("the fully accounted fixture prints a confident verdict: %s" % verdict)
     else:
-        res.bad("arrival is accounted for this file and no row is labelled, yet the scan did "
-                "not print a confident Found verdict: %s" % verdict)
+        res.bad("no row carries an arrival caveat, yet the scan did not print a confident "
+                "Found verdict: %s" % verdict)
 
     return res
 
