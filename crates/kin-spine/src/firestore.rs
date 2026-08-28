@@ -5416,6 +5416,184 @@ mod tests {
         assert_eq!(backend.root_hash("repo").as_deref(), Some("root-at-8"));
     }
 
+    /// Stage a newer cursor, never commit it, and watch the TTL decide.
+    ///
+    /// Both arms are one fixture differing only in the marker's age, which is
+    /// the only input the rule reads. Without the young arm the aged arm would
+    /// pass on a cleanup that reclaimed everything above the cursor, which is
+    /// exactly the behaviour that races a live writer.
+    #[test]
+    fn a_stage_above_the_cursor_survives_until_stage_ttl_then_drains() {
+        let store = Arc::new(FakeSpineStore::default());
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+        publish_success(
+            &backend,
+            metadata_publication("repo", 5, "root-5", Vec::new()),
+        );
+        let active = committed_head(&store, "repo");
+
+        // A writer stages a NEWER cursor and never commits.
+        let paused = backend
+            .prepare_repo_publication(metadata_publication(
+                "repo",
+                6,
+                "root-6",
+                vec![test_entry("repo", "later", EntityKind::Function)],
+            ))
+            .expect("a newer stage prepares");
+        let staged_id = paused.candidate_head().publication_id.clone();
+        assert!(
+            store
+                .publication_state
+                .lock()
+                .unwrap()
+                .stages
+                .contains_key(&staged_id),
+            "the fixture must actually leave a stage above the cursor"
+        );
+
+        let young = store
+            .cleanup_repo_publications(&active, 100)
+            .expect("cleanup runs against the committed head");
+        assert_eq!(
+            young.deleted, 0,
+            "a stage above the cursor younger than STAGE_TTL belongs to a writer that may be \
+             paused, and reclaiming it races a live writer"
+        );
+        assert!(
+            store
+                .publication_state
+                .lock()
+                .unwrap()
+                .stages
+                .contains_key(&staged_id),
+            "the young stage must still be there"
+        );
+
+        store.age_stage(&staged_id, STAGE_TTL);
+        let mut drained = 0usize;
+        for _ in 0..8 {
+            let progress = store
+                .cleanup_repo_publications(&active, 100)
+                .expect("cleanup runs against the committed head");
+            drained += progress.deleted;
+            if !progress.more {
+                break;
+            }
+        }
+        assert!(
+            drained > 0,
+            "a stage older than STAGE_TTL is a dead writer's and must drain"
+        );
+        assert!(
+            !store
+                .publication_state
+                .lock()
+                .unwrap()
+                .stages
+                .contains_key(&staged_id),
+            "the aged stage's marker must be gone once it has drained"
+        );
+    }
+
+    /// A writer that comes back after its stage was reclaimed must lose.
+    ///
+    /// Two refusals, because they are different guards and either alone would
+    /// let the other regress: the stage precondition refuses a writer whose
+    /// marker no longer exists, and the rollout fence refuses one whose fence
+    /// moved under it. The TTL is only safe because both hold.
+    #[test]
+    fn a_writer_returning_after_its_stage_drained_is_refused() {
+        let fleet = ["repo"];
+        let store = Arc::new(FakeSpineStore::default());
+        *store.rollout_fence_state.lock().unwrap() =
+            Some((1, test_rollout_fence(1, "ttl-rollout-1", &fleet)));
+        let backend = FirestoreSpineBackend::with_store(store.clone());
+        publish_success(
+            &backend,
+            metadata_publication("repo", 5, "root-5", Vec::new()),
+        );
+        let active = committed_head(&store, "repo");
+
+        let paused = backend
+            .prepare_repo_publication(metadata_publication(
+                "repo",
+                6,
+                "root-6",
+                vec![test_entry("repo", "later", EntityKind::Function)],
+            ))
+            .expect("a newer stage prepares");
+        let staged_id = paused.candidate_head().publication_id.clone();
+        store.age_stage(&staged_id, STAGE_TTL);
+        for _ in 0..8 {
+            let progress = store
+                .cleanup_repo_publications(&active, 100)
+                .expect("cleanup runs against the committed head");
+            if !progress.more {
+                break;
+            }
+        }
+        assert!(
+            !store
+                .publication_state
+                .lock()
+                .unwrap()
+                .stages
+                .contains_key(&staged_id),
+            "the fixture must reclaim the stage before the writer returns"
+        );
+
+        let refused = backend
+            .commit_repo_publication(paused)
+            .expect("a returning writer is classified, not an error");
+        assert!(
+            matches!(refused, RepoPublicationCommit::Conflict(_)),
+            "a writer whose stage marker was reclaimed must lose its precondition, got \
+             {refused:?}"
+        );
+
+        // The fence half, on the same shape: a returning writer whose rollout
+        // fence advanced under it loses on the fence, and says so.
+        let fenced_store = Arc::new(FakeSpineStore::default());
+        *fenced_store.rollout_fence_state.lock().unwrap() =
+            Some((1, test_rollout_fence(1, "ttl-rollout-1", &fleet)));
+        let fenced_backend = FirestoreSpineBackend::with_store(fenced_store.clone());
+        publish_success(
+            &fenced_backend,
+            metadata_publication("repo", 5, "root-5", Vec::new()),
+        );
+        let fenced_paused = fenced_backend
+            .prepare_repo_publication(metadata_publication(
+                "repo",
+                6,
+                "root-6",
+                vec![test_entry("repo", "later", EntityKind::Function)],
+            ))
+            .expect("a newer stage prepares");
+        assert!(
+            matches!(
+                fenced_backend
+                    .advance_rollout_fence(test_rollout_fence(2, "ttl-rollout-2", &fleet))
+                    .unwrap(),
+                SpineRolloutFenceCommit::Advanced(_)
+            ),
+            "the fence this writer is paused behind must actually advance"
+        );
+        let fence_refused = fenced_backend
+            .commit_repo_publication(fenced_paused)
+            .expect("a fence-losing writer is classified, not an error");
+        assert!(
+            matches!(
+                fence_refused,
+                RepoPublicationCommit::Conflict(RepoPublicationConflict {
+                    attempted_rollout_fence: Some(1),
+                    ..
+                })
+            ),
+            "the fence refusal must name the fence the writer attempted, got {fence_refused:?}"
+        );
+    }
+
     #[test]
     fn unavailable_atomicity_blocks_prepare_and_hydration() {
         let store = Arc::new(FakeSpineStore::default());
