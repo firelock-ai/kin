@@ -1117,16 +1117,24 @@ mod tests {
             }))
         }
 
+        // Both carry the untracked measurement stamp, because a zero with no
+        // stamp is now its own disclosure and `behind` is present for it. These
+        // two are about the ADMISSION clock, which is a different reading, so
+        // they say plainly that the working copy was measured and level.
         fn with_clock() -> Envelope {
             envelope_with(json!({
                 "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
                 "last_admission_success_at": "2026-08-26T00:00:00Z",
                 "last_admission_success_age_seconds": 12,
             }))
         }
 
         fn without_clock() -> Envelope {
-            envelope_with(json!({ "untracked_path_count": 0 }))
+            envelope_with(json!({
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+            }))
         }
 
         /// The disclosure, which is what step 1 actually delivers. Both stores

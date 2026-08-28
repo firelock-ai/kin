@@ -75,10 +75,11 @@ pub use repository::{
     canonicalize_host_parent_preserving_leaf, host_path_from_repo_path, is_repository_control_path,
     read_verified_scanned_entry, repo_path_from_host_relative, scan_repository,
     scan_repository_modified_since, scan_repository_preserving_graph_only,
-    should_track_host_relative_path, tracked_paths_covered_by_ignore,
-    tracked_paths_retracted_by_ignore, CompleteRepositoryScan, CompleteScanToken,
-    IgnoredTrackedPaths, IncompleteRepositoryScan, RepositoryIgnore, RepositoryScanDiagnostics,
-    ScannedEntryKind, ScannedRepositoryEntry, DEFAULT_IGNORED_NAMES, PYTHON_VIRTUALENV_MARKER,
+    scan_repository_untracked_paths, should_track_host_relative_path,
+    tracked_paths_covered_by_ignore, tracked_paths_retracted_by_ignore, CompleteRepositoryScan,
+    CompleteScanToken, IgnoredTrackedPaths, IncompleteRepositoryScan, RepositoryIgnore,
+    RepositoryScanDiagnostics, ScannedEntryKind, ScannedRepositoryEntry, DEFAULT_IGNORED_NAMES,
+    PYTHON_VIRTUALENV_MARKER,
 };
 pub use resolution::{RelationResolution, RESOLUTION_FIELD, RESOLUTION_TIER_LADDER};
 pub use support::{compute_coverage_report, CoverageReport};

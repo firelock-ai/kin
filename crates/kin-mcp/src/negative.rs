@@ -2750,6 +2750,18 @@ pub fn resolution_miss_for(tool: &str, message: &str, envelope: &Envelope) -> Op
         );
     }
 
+    // Host content the graph never met answers every name inside it identically,
+    // for the same reason an empty graph does one gate up. This is the purest
+    // absence claim the product makes, and it was the one that never asked: the
+    // retrieval builder scopes this gap to answers that claim an absence, which
+    // is every answer here, and a focal miss took a different route and skipped
+    // it. So a constant declared and used in an unadmitted module came back
+    // `safe_to_conclude_absent: true`, `structural_authoritative`, beside a
+    // `behind` object in the same envelope naming the file it was in (FIR-2820).
+    if let Some(gap) = unadmitted_host_content_gap(envelope) {
+        push_gap(&mut trustworthy, &mut trust_reason, gap);
+    }
+
     let consequence = if trustworthy {
         "The name is authoritatively absent from this graph: no entity carries it. That is a fact about the name and not about the symbol's usage, because nothing was looked up.".to_string()
     } else {
@@ -3926,6 +3938,7 @@ mod tests {
             "reconcile": {
                 "untracked_path_count": unadmitted_paths,
                 "untracked_paths_sample": ["notekeeper/search.py"],
+                "untracked_observed_age_seconds": 0,
                 "last_admission_success_at": "2026-08-20T13:00:00Z",
             },
         }))
@@ -6268,6 +6281,130 @@ mod tests {
             assert_eq!(negative["safe_to_conclude_absent"], json!(true));
             assert_eq!(negative["trust"], json!("authoritative"));
         }
+    }
+
+    /// FIR-2820. The purest absence claim the product makes, over a store the
+    /// working copy has outrun.
+    ///
+    /// The v0.6.1 yardstick run asked `find_references` about a constant
+    /// declared and used twice in a module on disk that no admission had taken.
+    /// It came back `safe_to_conclude_absent: true`, `structural_authoritative`,
+    /// beside a `behind` object in the same envelope naming that very file. The
+    /// retrieval builder had this gate and scopes it to answers claiming an
+    /// absence, which is every answer on this path; a focal miss took a
+    /// different route and never asked.
+    #[test]
+    fn resolution_miss_over_unadmitted_host_content_is_inconclusive() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["notekeeper/linkgraph.py"],
+                "last_admission_success_at": "2026-08-27T03:14:08Z",
+            },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a name may be absent from the graph and present in the repository while a module \
+             the graph never read sits on disk"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("graph_behind_working_tree"),
+            "an answer withheld for an unnamed reason sends the reader to the wrong lever: \
+             {reason}"
+        );
+        let advice = negative["advice"].as_str().unwrap();
+        assert!(
+            !advice.contains("authoritatively absent"),
+            "the advice cannot still read as settled: {advice}"
+        );
+    }
+
+    /// The control for the case above, on the same builder. A store with nothing
+    /// unadmitted certifies exactly as it did, because a gate that fires on
+    /// every working copy is one an agent learns to skip.
+    #[test]
+    fn resolution_miss_over_a_level_working_copy_still_certifies() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            // Stamped. An unstamped zero is a different fact and the two tests
+            // below this one are what separate them.
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+            },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+        assert!(!negative["trust_reason"]
+            .as_str()
+            .unwrap()
+            .contains("graph_behind_working_tree"));
+    }
+
+    /// FIR-2820, the review's second finding, on the surface a caller acts on.
+    ///
+    /// A walk that errored is logged at debug and swallowed, and a daemon that
+    /// has not walked yet has taken no reading at all. Both leave the count at
+    /// its `u64` default with no stamp, and `kin status` on the same daemon at
+    /// the same instant says "not measured" while this builder certified.
+    #[test]
+    fn resolution_miss_over_an_unmeasured_working_copy_is_inconclusive() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            "reconcile": { "untracked_path_count": 0 },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(
+            negative["safe_to_conclude_absent"],
+            json!(false),
+            "a zero nobody measured is not a zero, and certifying on it is the whole ticket"
+        );
+        assert_eq!(negative["trust"], json!("inconclusive"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("working_copy_unmeasured"),
+            "the reason has to name the lever, and it is not `kin admit` here: {reason}"
+        );
+    }
+
+    /// The control for the case above. A daemon that admits nothing from the
+    /// filesystem has no walk to miss, so a gate keyed on the stamp alone would
+    /// refuse every absence it ever answers.
+    #[test]
+    fn resolution_miss_over_a_daemon_that_admits_nothing_from_disk_certifies() {
+        let envelope = Envelope::daemon().with_health(&json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 38,
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observation_not_applicable": true,
+            },
+        }));
+        let negative = resolution_miss_for("find_references", "Entity not found", &envelope)
+            .expect("a miss is still qualified");
+        assert_eq!(negative["safe_to_conclude_absent"], json!(true));
+        assert_eq!(negative["trust"], json!("authoritative"));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("working_copy_unmeasured"),
+            "there is no working copy to measure here: {reason}"
+        );
     }
 
     #[test]
