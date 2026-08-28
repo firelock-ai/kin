@@ -455,13 +455,63 @@ pub(crate) fn classify_rollout_fence_reconciliation(
     RolloutFenceReconciliation::Retry
 }
 
+/// How long a stage above the active cursor is protected from cleanup.
+///
+/// A stage above the active cursor belongs to a writer that may be paused
+/// rather than dead, so reclaiming it on sight races a live writer and can
+/// delete rows a durable head is about to name. But nothing else reclaimed it
+/// either: before this constant existed, a writer that staged a newer cursor
+/// and died left its rows for good, while the cleanup sweep's own doc comment
+/// claimed to recover exactly that case.
+///
+/// One hour. A prepare-to-commit window is seconds and a paused writer is
+/// minutes, so an hour is a dead writer with margin. The cost of being wrong in
+/// the safe direction is one stage's storage for an hour; the cost of being
+/// wrong in the other direction is a committed head naming deleted rows, which
+/// is why the margin is generous rather than tight.
+#[cfg(any(feature = "firestore", test))]
+pub(crate) const STAGE_TTL: Duration = Duration::from_secs(3600);
+
+/// Whether cleanup may reclaim `staged`, given the active head and how old the
+/// stage marker is.
+///
+/// At or below the active cursor the stage is a terminal loser and reclaiming
+/// it cannot race anything: its captured precondition can no longer win.
+/// ABOVE the active cursor it belongs to a writer that has not committed yet,
+/// and only its age separates a paused writer from a dead one, so the TTL is
+/// the whole test there.
+///
+/// An absent or unreadable age counts as young. Reclaiming on a missing
+/// timestamp would be reclaiming on no evidence, and the direction to fail in
+/// is the one that keeps a live writer's rows.
 #[cfg(any(feature = "firestore", test))]
 pub(crate) fn publication_stage_is_cleanup_safe(
     staged: &RepoPublicationHead,
     active: &RepoPublicationHead,
+    marker_age: Option<Duration>,
 ) -> bool {
-    staged.source_cursor < active.source_cursor
+    if staged.source_cursor < active.source_cursor
         || (staged.source_cursor == active.source_cursor && staged.phase <= active.phase)
+    {
+        return true;
+    }
+    marker_age.is_some_and(|age| age >= STAGE_TTL)
+}
+
+/// How long ago Firestore last changed this document, from its own `updateTime`.
+///
+/// `None` when the field is absent or unparseable, or when the stamp is in the
+/// future, which a caller must read as "young" rather than as "unknown, so
+/// reclaim".
+#[cfg(feature = "firestore")]
+fn firestore_document_age(document: &serde_json::Value) -> Option<Duration> {
+    let raw = document
+        .get("updateTime")
+        .and_then(serde_json::Value::as_str)?;
+    let stamped = chrono::DateTime::parse_from_rfc3339(raw).ok()?;
+    (chrono::Utc::now() - stamped.with_timezone(&chrono::Utc))
+        .to_std()
+        .ok()
 }
 
 /// Spine backend that reads from an in-memory cache and publishes through a
@@ -702,6 +752,13 @@ impl FirestoreSpineBackend {
     /// store result says `more`. Publication commits schedule known pending work
     /// directly, so this scan exists only to recover abandoned stages after a
     /// writer process dies.
+    ///
+    /// It can now actually do that. A dead writer's stage sits ABOVE the active
+    /// cursor, and cleanup preserved every such stage unconditionally, so this
+    /// comment described a recovery that never happened: the rows stayed for
+    /// good. Reclamation above the cursor is gated on [`STAGE_TTL`] instead, so
+    /// the sweep drains a dead writer's stage once its marker is older than
+    /// that and leaves a paused writer's alone before it.
     fn schedule_cleanup_sweep(&self, active_heads: Vec<RepoPublicationHead>) {
         if active_heads.is_empty() {
             return;
@@ -3329,7 +3386,11 @@ impl SpineStore for FirestoreStore {
             if head.publication_id == active_head.publication_id {
                 continue;
             }
-            let safe = publication_stage_is_cleanup_safe(&head, active_head);
+            let safe = publication_stage_is_cleanup_safe(
+                &head,
+                active_head,
+                firestore_document_age(&document),
+            );
             if safe {
                 stale.push((head, document, progress));
             }

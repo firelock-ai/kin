@@ -168,6 +168,14 @@ pub struct FakePublicationState {
     pub edge_rows: HashMap<String, Vec<CrossRepoEdge>>,
     pub stage_marker_values: HashMap<String, FakeStageMarkerValue>,
     pub stage_revisions: HashMap<String, u64>,
+    /// When each stage marker was last changed, which is Firestore's own
+    /// `updateTime` and the only thing `STAGE_TTL` is measured from.
+    pub stage_update_times: HashMap<String, std::time::Instant>,
+    /// Extra age a test has added to a stage, so the TTL can be exercised
+    /// without sleeping for an hour. Added to the elapsed time rather than
+    /// subtracted from the stamp, because `Instant` has no guaranteed epoch and
+    /// backdating one can underflow on a freshly booted host.
+    pub stage_extra_age: HashMap<String, std::time::Duration>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +183,25 @@ pub struct FakeStageMarkerValue {
     pub stage_sequence: u64,
     pub revision_kind: &'static str,
     pub revision_nonce: String,
+}
+
+/// A stage marker's age, from the same stamp Firestore's `updateTime` carries.
+///
+/// `None` when the marker has never been written, which the cleanup predicate
+/// reads as young: reclaiming a stage whose age is unknown would be reclaiming
+/// on no evidence.
+pub fn fake_stage_age(
+    state: &FakePublicationState,
+    publication_id: &str,
+) -> Option<std::time::Duration> {
+    state.stage_update_times.get(publication_id).map(|stamped| {
+        stamped.elapsed()
+            + state
+                .stage_extra_age
+                .get(publication_id)
+                .copied()
+                .unwrap_or_default()
+    })
 }
 
 pub fn apply_fake_stage_marker(
@@ -189,6 +216,9 @@ pub fn apply_fake_stage_marker(
     state
         .stage_marker_values
         .insert(publication_id.to_string(), marker);
+    state
+        .stage_update_times
+        .insert(publication_id.to_string(), std::time::Instant::now());
     match state.stage_revisions.get_mut(publication_id) {
         Some(revision) => *revision += 1,
         None => {
@@ -244,6 +274,26 @@ pub fn merge_fake_immutable_rows<T: Clone + PartialEq>(
     }
     rows.insert(publication_id.to_string(), candidate);
     Ok(())
+}
+
+impl FakeSpineStore {
+    /// Age a stage marker so the TTL reads it as a dead writer's.
+    ///
+    /// Waiting an hour is not a test. This moves the one input the TTL reads,
+    /// and nothing else, so a test that ages a stage and then sees it reclaimed
+    /// has shown the age is what did it.
+    pub fn age_stage(&self, publication_id: &str, by: std::time::Duration) {
+        let mut state = self.publication_state.lock().unwrap();
+        assert!(
+            state.stage_update_times.contains_key(publication_id),
+            "aging stage {publication_id}, which has no marker stamp: the TTL reads no age \
+             for it and the test would prove nothing"
+        );
+        *state
+            .stage_extra_age
+            .entry(publication_id.to_string())
+            .or_default() += by;
+    }
 }
 
 impl SpineStore for FakeSpineStore {
@@ -899,7 +949,11 @@ impl SpineStore for FakeSpineStore {
                 .filter(|head| {
                     head.repo_id == durable_head.repo_id
                         && head.publication_id != durable_head.publication_id
-                        && publication_stage_is_cleanup_safe(head, &durable_head)
+                        && publication_stage_is_cleanup_safe(
+                            head,
+                            &durable_head,
+                            fake_stage_age(&state, &head.publication_id),
+                        )
                 })
                 .cloned()
                 .collect::<Vec<_>>();
@@ -1014,7 +1068,11 @@ impl SpineStore for FakeSpineStore {
         let more = state.stages.values().any(|head| {
             head.repo_id == durable_head.repo_id
                 && head.publication_id != durable_head.publication_id
-                && publication_stage_is_cleanup_safe(head, durable_head)
+                && publication_stage_is_cleanup_safe(
+                    head,
+                    durable_head,
+                    fake_stage_age(&state, &head.publication_id),
+                )
         });
         Ok(RepoPublicationCleanupProgress { deleted, more })
     }
