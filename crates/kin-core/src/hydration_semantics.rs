@@ -749,7 +749,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let layout = layout_in(dir.path());
         stamp_staged(&layout).unwrap();
-        assert!(!standing(&layout).is_gap(), "the fixture did not start current");
+        assert!(
+            !standing(&layout).is_gap(),
+            "the fixture did not start current"
+        );
 
         let capability = HydrationStampCapability::open(&layout.kindb_dir()).unwrap();
         capability.invalidate_for_unversioned_transfer().unwrap();

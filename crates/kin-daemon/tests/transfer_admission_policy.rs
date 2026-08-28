@@ -96,7 +96,8 @@ fn only_the_admission_wrapper_names_the_hooked_transfer_apply() {
 #[test]
 fn both_native_receivers_admit_through_the_wrapper() {
     let definition = 1;
-    let call_sites = occurrences(API_SOURCE, "apply_received_repository_transfer_pack(") - definition;
+    let call_sites =
+        occurrences(API_SOURCE, "apply_received_repository_transfer_pack(") - definition;
     assert!(
         call_sites >= 2,
         "expected the inbound receive route and pull_into_replica to admit through the wrapper, \

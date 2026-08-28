@@ -4048,14 +4048,12 @@ mod tests {
     fn the_observation_and_the_compatibility_flag_serialize_under_their_own_names() {
         use kin_core::hydration_semantics::HydrationStanding;
 
-        let gap = serde_json::to_value(
-            Envelope::daemon().with_hydration_semantics_observation(Some(
-                &HydrationStanding::Unreadable {
-                    reason: "truncated".to_string(),
-                    derives: 10,
-                },
-            )),
-        )
+        let gap = serde_json::to_value(Envelope::daemon().with_hydration_semantics_observation(
+            Some(&HydrationStanding::Unreadable {
+                reason: "truncated".to_string(),
+                derives: 10,
+            }),
+        ))
         .expect("the envelope serializes");
         assert_eq!(gap["hydration_semantics"]["standing"], "unreadable");
         assert_eq!(gap["hydration_semantics"]["derives"], 10);
@@ -4067,10 +4065,9 @@ mod tests {
         assert_eq!(gap["degraded"]["hydration_semantics_stale"], true);
 
         let current = serde_json::to_value(
-            Envelope::daemon()
-                .with_hydration_semantics_observation(Some(&HydrationStanding::Current {
-                    version: 10,
-                })),
+            Envelope::daemon().with_hydration_semantics_observation(Some(
+                &HydrationStanding::Current { version: 10 },
+            )),
         )
         .expect("the envelope serializes");
         assert_eq!(current["hydration_semantics"]["standing"], "current");
@@ -4080,14 +4077,15 @@ mod tests {
             "a current store must publish no remedy: {current}"
         );
         assert!(
-            current["degraded"].get("hydration_semantics_stale").is_none(),
+            current["degraded"]
+                .get("hydration_semantics_stale")
+                .is_none(),
             "a current store must not carry the gap flag: {current}"
         );
 
-        let outside = serde_json::to_value(
-            Envelope::daemon().with_hydration_semantics_observation(None),
-        )
-        .expect("the envelope serializes");
+        let outside =
+            serde_json::to_value(Envelope::daemon().with_hydration_semantics_observation(None))
+                .expect("the envelope serializes");
         assert!(
             outside.get("hydration_semantics").is_none(),
             "a call that compared nothing must claim nothing: {outside}"

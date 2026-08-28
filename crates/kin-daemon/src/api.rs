@@ -18785,7 +18785,10 @@ mod tests {
                 },
                 "{what} left the store claiming a creation-time version it can no longer speak for"
             );
-            assert!(standing.is_gap(), "{what}: an unstamped store must read as a gap");
+            assert!(
+                standing.is_gap(),
+                "{what}: an unstamped store must read as a gap"
+            );
         }
 
         /// A pack aimed at one exact local destination, built from its live
@@ -18812,7 +18815,9 @@ mod tests {
             .unwrap();
             let destination = RepositoryAuthorityManager::open(
                 repository_id.clone(),
-                Arc::new(kin_db::LocalFileBackend::new(destination_kindb.to_path_buf())),
+                Arc::new(kin_db::LocalFileBackend::new(
+                    destination_kindb.to_path_buf(),
+                )),
             )
             .unwrap();
             let destination_ref = kin_model::RefName::branch(b"main").unwrap();
@@ -18831,7 +18836,10 @@ mod tests {
                 &expectation,
             )
             .unwrap();
-            assert!(segment.is_final(), "the one-change fixture fits one segment");
+            assert!(
+                segment.is_final(),
+                "the one-change fixture fits one segment"
+            );
             assert_eq!(segment.pack.source_head, source_head);
             segment.pack
         }
@@ -18868,8 +18876,7 @@ mod tests {
             install_test_registry_override();
             let working = tempfile::tempdir().unwrap();
             let layout = kin_core::init(working.path()).unwrap().layout;
-            let state =
-                Arc::new(DaemonState::open_with_repo_id(layout.clone(), None).unwrap());
+            let state = Arc::new(DaemonState::open_with_repo_id(layout.clone(), None).unwrap());
             (state, layout, working)
         }
 

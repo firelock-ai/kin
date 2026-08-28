@@ -2813,7 +2813,9 @@ mod tests {
             .layout;
 
         let adopting = tempfile::tempdir().unwrap();
-        let adopting_layout = crate::init_adopting(adopting.path(), &adopted).unwrap().layout;
+        let adopting_layout = crate::init_adopting(adopting.path(), &adopted)
+            .unwrap()
+            .layout;
 
         // The door a native clone takes: the empty receiver it creates before
         // pulling the remote's history into it.
@@ -2825,7 +2827,11 @@ mod tests {
 
         let git_source = tempfile::tempdir().unwrap();
         initialize_git(git_source.path());
-        std::fs::write(git_source.path().join("lib.py"), b"def door():\n    return 1\n").unwrap();
+        std::fs::write(
+            git_source.path().join("lib.py"),
+            b"def door():\n    return 1\n",
+        )
+        .unwrap();
         git(git_source.path(), ["add", "--all"]);
         git(git_source.path(), ["commit", "-m", "creation door"]);
         let git_layout = init_from_git(git_source.path()).unwrap().layout;
@@ -2839,10 +2845,9 @@ mod tests {
         .unwrap();
         git(git_adopting_source.path(), ["add", "--all"]);
         git(git_adopting_source.path(), ["commit", "-m", "adopted door"]);
-        let git_adopting_layout =
-            init_from_git_adopting(git_adopting_source.path(), &adopted)
-                .unwrap()
-                .layout;
+        let git_adopting_layout = init_from_git_adopting(git_adopting_source.path(), &adopted)
+            .unwrap()
+            .layout;
 
         let doors = [
             ("init", &bare_layout),
