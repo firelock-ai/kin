@@ -862,16 +862,17 @@ class Suite(object):
             raise RuntimeError("kin pull printed no JSON object: %s (%s)" % (error, tail(out)))
         receipts = ((pulled.get("outcome") or {}).get("receipts")) or []
 
-        status = self.kin_in(destination, ["graph", "status"])[1]
+        status_rc, status = self.kin_in(destination, ["graph", "status"])
         doctor_rc, doctor_out = self.kin_in(destination, ["doctor", "--json"])
         try:
             doctor = parse_json_object(doctor_out)
         except (ValueError, json.JSONDecodeError):
             doctor = None
+        envelope_error = None
         try:
             envelope = self.mcp("kin_graph_status", {}, repo=destination)
-        except (RuntimeError, ValueError, json.JSONDecodeError):
-            envelope = None
+        except (RuntimeError, ValueError, json.JSONDecodeError) as error:
+            envelope, envelope_error = None, str(error)
 
         # The no-admission control, on the same receiver: put the record back and
         # pull again, now that both replicas hold the same head.
@@ -898,6 +899,8 @@ class Suite(object):
             "moved_history": bool(receipts),
             "pull_output": out,
             "status": status,
+            "status_rc": status_rc,
+            "envelope_error": envelope_error,
             "doctor": doctor,
             "envelope": envelope,
             "control_moved_history": bool(control_receipts),
@@ -1149,18 +1152,38 @@ def check_native_transfer(suite):
     else:
         result.ok("the receiver's creation record is gone (%s)" % why)
 
-    for surface, problems in (
-        ("status", status_problems(transfer["status"], "absent", None, suite.derives)),
-        ("doctor", doctor_problems(transfer["doctor"], "absent", None, suite.derives)),
-        (
-            "envelope",
-            envelope_problems(transfer["envelope"], "absent", None, suite.derives),
-        ),
-    ):
+    # An unreadable surface is UNREADABLE, never a FAIL. A doctor report that
+    # would not parse and a doctor report with no hydration row are different
+    # facts, and the graders below cannot tell them apart on their own.
+    if transfer["status_rc"] != 0:
+        result.unknown(
+            "graph status exited %d on the receiver: %s"
+            % (transfer["status_rc"], tail(transfer["status"]))
+        )
+    else:
+        problems = status_problems(transfer["status"], "absent", None, suite.derives)
         if problems:
-            result.bad("%s does not disclose the transported-history gap: %s" % (surface, "; ".join(problems)))
+            result.bad("status does not disclose the transported-history gap: %s" % "; ".join(problems))
         else:
-            result.ok("%s discloses the gap" % surface)
+            result.ok("status discloses the gap")
+
+    if transfer["doctor"] is None:
+        result.unknown("the receiver's doctor output was unreadable (rc=%d)" % transfer["doctor_rc"])
+    else:
+        problems = doctor_problems(transfer["doctor"], "absent", None, suite.derives)
+        if problems:
+            result.bad("doctor does not disclose the transported-history gap: %s" % "; ".join(problems))
+        else:
+            result.ok("doctor discloses the gap")
+
+    if transfer["envelope"] is None:
+        result.unknown("the receiver's MCP envelope was unreadable: %s" % transfer["envelope_error"])
+    else:
+        problems = envelope_problems(transfer["envelope"], "absent", None, suite.derives)
+        if problems:
+            result.bad("the MCP envelope does not disclose the transported-history gap: %s" % "; ".join(problems))
+        else:
+            result.ok("the MCP envelope discloses the gap")
 
     # The control. A receiver that discarded its record on every pull, rather
     # than on every admission, would pass everything above and degrade a healthy
