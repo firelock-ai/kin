@@ -1305,20 +1305,35 @@ async fn handle_tools_call_daemon(
     // borrowing its entity count or generation here would mix two authorities
     // in one response. Build the standard `_kin` envelope from the report
     // itself and validate the fully annotated stdio payload instead.
+    // Enrich the envelope with honest degraded/freshness signals from the daemon
+    // `/health` body when the daemon is actually reachable. When it was already
+    // determined unreachable, skip the probe — there is nothing to ask.
+    //
+    // Fetched before the graph-status branch below, not after it. That branch
+    // used to return first and so never reached this probe at all, which took
+    // the working-copy reading away from it along with the counts it is right to
+    // refuse, and left it publishing "0 uncommitted" over a repository holding a
+    // module the graph had never met (FIR-2820).
+    let health = if base_env.degraded.daemon_unreachable == Some(true) {
+        None
+    } else {
+        daemon_delegate::fetch_health_snapshot().await
+    };
+
     if call_params.name == "kin_graph_status" {
-        // The vector-persistence capability is a property of this daemon's
-        // storage backend, not a HEAD graph observation. Fold only that one
-        // health field here; selected-graph finalization below qualifies it by
-        // the report's own exact embedding coverage and replaces every graph
+        // Two narrow lifts off the one health probe above, and nothing else
+        // from it. Vector persistence is a property of this daemon's storage
+        // backend rather than a HEAD graph observation, and the working-copy
+        // reading is a fact about the disk rather than about the selected
+        // graph; selected-graph finalization below still replaces every graph
         // field from the report itself.
-        if base_env.degraded.daemon_unreachable != Some(true) {
-            if let Some(health) = daemon_delegate::fetch_health_snapshot().await {
-                if let Some(unavailable) = health
-                    .get("embed_persistence_unavailable")
-                    .and_then(serde_json::Value::as_bool)
-                {
-                    base_env = base_env.with_embed_persistence_unavailable(unavailable);
-                }
+        if let Some(health) = health.as_ref() {
+            base_env = base_env.with_working_copy_health(health);
+            if let Some(unavailable) = health
+                .get("embed_persistence_unavailable")
+                .and_then(serde_json::Value::as_bool)
+            {
+                base_env = base_env.with_embed_persistence_unavailable(unavailable);
             }
         }
         let pressure_refusals = daemon_delegate::recorded_memory_pressure_refusals();
@@ -1332,13 +1347,8 @@ async fn handle_tools_call_daemon(
         return JsonRpcResponse::success(id, serde_json::to_value(&enveloped).unwrap_or_default());
     }
 
-    // Enrich the envelope with honest degraded/freshness signals from the daemon
-    // `/health` body when the daemon is actually reachable. When it was already
-    // determined unreachable, skip the probe — there is nothing to ask.
-    if base_env.degraded.daemon_unreachable != Some(true) {
-        if let Some(health) = daemon_delegate::fetch_health_snapshot().await {
-            base_env = base_env.with_health(&health);
-        }
+    if let Some(health) = health.as_ref() {
+        base_env = base_env.with_health(health);
     }
 
     let enveloped = envelope::finalize_bounded(result, base_env, &call_params.name, &budget);

@@ -530,6 +530,67 @@ pub(crate) fn current_authority_admission(
     Ok((roots, policy))
 }
 
+/// Measure host content graph truth does not carry, right now.
+///
+/// The reconcile loop records this set as a side effect of a pass, and an
+/// explicit seam records it empty because the seam admitted everything. Both
+/// are true when written and neither expires, so between a host write and the
+/// pass that observes it every surface reading the record is told zero over a
+/// working copy holding a module the graph has never met. Three of them then
+/// agree on an absence a one-line grep refutes: the durability block reports
+/// "0 uncommitted", `kin status` reports a tree matching its base, and
+/// `find_references` certifies the name authoritatively absent (FIR-2820).
+///
+/// So the reading is taken when a surface is about to state it, not inherited
+/// from whatever ran last. The walk opens nothing and hashes nothing, which is
+/// what makes that affordable: it is strictly cheaper than the complete content
+/// scan this loop already runs on every batch of watcher events.
+///
+/// Returns whether a measurement was taken. `false` is not a failure; it is the
+/// reading still being current enough, or a daemon whose graph is its own write
+/// authority and whose checkout is therefore not evidence about anything.
+pub(crate) fn refresh_untracked_reading(state: &DaemonState) -> Result<bool> {
+    // A graph-authority daemon does not scan a projected checkout in the first
+    // place, so host paths there are not content anything failed to admit and
+    // counting them would manufacture a disclosure out of the projection.
+    //
+    // Recorded rather than merely returned, because every consumer downstream
+    // gates on whether a reading was taken, and "no reading" here has to be
+    // told apart from "a reading that should exist and does not". Silence on
+    // its own reads as the second, which would leave every daemon with
+    // ingestion off refusing to certify any absence for the life of the
+    // process.
+    let probes = state.background_work.reconcile();
+    if state.filesystem_reconcile_disabled() {
+        probes.record_untracked_not_applicable();
+        return Ok(false);
+    }
+    if !probes.untracked_refresh_due(Instant::now()) {
+        return Ok(false);
+    }
+    let working_dir = state.layout.working_dir();
+    let (_roots, policy) = current_authority_admission(state)?;
+    let previous = state.graph.resolved_tree();
+    let tracked_paths = previous
+        .artifacts_by_path()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    let graph_only_paths = crate::graph_only_members::members_of(&previous)?;
+    let ignore =
+        kin_index::RepositoryIgnore::load(working_dir).map_err(kin_index::IndexError::from)?;
+    let started = Instant::now();
+    let untracked = kin_index::scan_repository_untracked_paths(
+        working_dir,
+        &ignore,
+        policy.as_ref(),
+        tracked_paths.iter(),
+        graph_only_paths.iter(),
+    )
+    .map_err(kin_index::IndexError::from)?;
+    probes.record_untracked_measurement(untracked.iter(), started.elapsed());
+    Ok(true)
+}
+
 /// What one complete walk declined to observe, taken from its own diagnostics.
 ///
 /// Read off the scan rather than recomputed, so the counts a surface prints and
@@ -4106,6 +4167,56 @@ mod tests {
                 .any(|notice| notice.contains("unobserved.rs") && notice.contains("kin admit")),
             "the notice must name the path and the command that recovers it: {:?}",
             report.notices()
+        );
+    }
+
+    /// FIR-2820. The wiring itself, which nothing else covers.
+    ///
+    /// `refresh_untracked_reading` has two early returns and the unit tests
+    /// beside the probes cannot see either of them, because they call the probe
+    /// directly. This one drives the function on a daemon whose filesystem
+    /// ingestion is ON, which is every ordinary daemon, and requires it to take
+    /// a reading rather than declare the question inapplicable. Without it a
+    /// flag stuck true would silence every disclosure this fix exists to make
+    /// and no test would notice.
+    #[test]
+    fn an_ingesting_daemon_measures_rather_than_calling_the_question_inapplicable() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        std::fs::write(
+            repo.path().join("unadmitted.rs"),
+            b"pub fn unadmitted() -> u32 { 1 }\n",
+        )
+        .unwrap();
+
+        assert!(
+            !state.filesystem_reconcile_disabled(),
+            "this test is about the ordinary daemon and says so rather than assuming it"
+        );
+        let measured = refresh_untracked_reading(&state).expect("the walk runs");
+        assert!(
+            measured,
+            "a reading nothing has ever taken is due the first time anyone asks"
+        );
+
+        let report = state
+            .background_work
+            .reconcile()
+            .report(std::time::Instant::now());
+        assert!(
+            !report.untracked_observation_not_applicable,
+            "a daemon that admits from disk has a working copy worth measuring: {report:?}"
+        );
+        assert!(
+            report.untracked_observed_age_seconds.is_some(),
+            "the walk ran, so it stamped: {report:?}"
+        );
+        assert!(
+            report
+                .untracked_paths_sample
+                .iter()
+                .any(|path| path == "unadmitted.rs"),
+            "the reading names the file nothing admitted: {report:?}"
         );
     }
 
