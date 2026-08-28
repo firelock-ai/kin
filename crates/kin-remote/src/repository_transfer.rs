@@ -1167,6 +1167,12 @@ fn resolved_tree_body_identities(tree: &kin_model::ResolvedTree) -> Result<BTree
 /// nobody remembered to route. Out-of-crate callers take
 /// [`apply_repository_transfer_pack_with_pre_commit`] and say what their policy
 /// is, including when it is nothing.
+///
+/// Test-only, because after the daemon and the negotiation convenience both
+/// state their policy there is no production caller left. Keeping it compiled
+/// into the product would leave a policy-free admission one `use` away from
+/// being reachable again.
+#[cfg(test)]
 pub(crate) fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'static>(
     authority: &RepositoryAuthorityManager<B>,
     expected_repository_id: &RepositoryId,

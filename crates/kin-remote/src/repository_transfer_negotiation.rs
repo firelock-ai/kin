@@ -28,8 +28,7 @@ use kin_model::{AuthorId, RefName, RepositoryId, RootBundle, SemanticChange, Sem
 use serde::{Deserialize, Serialize};
 
 use crate::repository_transfer::{
-    apply_repository_transfer_pack, apply_repository_transfer_pack_with_pre_commit,
-    build_repository_transfer_segment,
+    apply_repository_transfer_pack_with_pre_commit, build_repository_transfer_segment,
     count_repository_transfer_packs, model, repository_transfer_status,
     require_negotiated_features, validate_limits, verify_transfer_source_readiness,
     RepositoryAuthorityMetadata, RepositoryRefAdvertisement, RepositoryTransferError,
@@ -975,6 +974,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::repository_transfer::apply_repository_transfer_pack;
+
     use std::cell::RefCell;
     use std::sync::Arc;
 
