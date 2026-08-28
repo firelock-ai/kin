@@ -223,6 +223,30 @@ pub struct BudgetAccounting {
     pub bounded: bool,
     /// True when explanation and per-signal breakdowns were shed.
     pub compact: bool,
+    /// The literal key of the collection this response answers with: the one a
+    /// `next_cursor` advances and the one a reader counts. `entities` on a
+    /// fused locate page, `results` on a cosine one, `files` at file
+    /// granularity, and the tool's own ranked list everywhere else.
+    ///
+    /// Published because presence cannot identify it. `LocateResult` skips its
+    /// `entities` array when empty while the secondary `files` roll-up
+    /// serializes whatever it holds, so on the one page that most needs
+    /// qualifying the first present array is the wrong one. A reader that has
+    /// to re-derive this from `granularity` and `routing` is a second copy of
+    /// the rule, and two copies is how the block beside this one came to count
+    /// a different collection from the one the ladder cut.
+    ///
+    /// Absent only on a response whose shape declares no primary and carries
+    /// none, because naming a collection that is not there would be worse than
+    /// saying nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_collection: Option<String>,
+    /// Rows the response ships in [`Self::primary_collection`].
+    ///
+    /// Zero is an answer here, not a missing field: it says the primary is
+    /// empty, which no secondary collection beside it can soften.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary_rows: Option<usize>,
 }
 
 impl BudgetAccounting {
@@ -787,21 +811,88 @@ fn shape_for(tool: &str) -> Option<ResponseShape> {
 /// granularity. Prefer the response's declared arm and granularity; retain the
 /// presence fallback for older/test payloads that predate those fields.
 fn primary_collection(payload: &Value, tool: &str, shape: &ResponseShape) -> Option<&'static str> {
-    if tool == "semantic_locate" {
-        if payload.get("granularity").and_then(Value::as_str) == Some("file") {
-            return Some("files");
-        }
-        match payload.get("routing").and_then(Value::as_str) {
-            Some("cosine-v0") => return Some("results"),
-            Some("fused-v1") => return Some("entities"),
-            _ => {}
+    declared_primary_collection(payload, tool).or_else(|| {
+        shape
+            .collections
+            .iter()
+            .copied()
+            .find(|key| payload.get(*key).is_some_and(Value::is_array))
+    })
+}
+
+/// The primary a response DECLARES, from the fields it publishes about itself,
+/// with no appeal to which arrays happen to be present.
+///
+/// Split out from the presence fallback because the two answer different
+/// questions. This one asks what the response said it is; the fallback guesses
+/// from what it carries, and a guess is exactly what relabels an empty entity
+/// page as a file one.
+///
+/// The last arm is the one worth reading twice. A response that echoed a
+/// granularity other than `file` has already ruled the secondary roll-up out,
+/// whether or not it named an arm: an entity answer's primary is `results` when
+/// it carries that array and `entities` otherwise, and a page carrying neither
+/// is an empty entity page rather than a file one. Only a payload that named no
+/// granularity at all is left to the fallback.
+fn declared_primary_collection(payload: &Value, tool: &str) -> Option<&'static str> {
+    if tool != "semantic_locate" {
+        return None;
+    }
+    let granularity = payload.get("granularity").and_then(Value::as_str);
+    if granularity == Some("file") {
+        return Some("files");
+    }
+    match payload.get("routing").and_then(Value::as_str) {
+        Some("cosine-v0") => Some("results"),
+        Some("fused-v1") => Some("entities"),
+        _ => granularity.map(|_| {
+            if payload.get("results").is_some_and(Value::is_array) {
+                "results"
+            } else {
+                "entities"
+            }
+        }),
+    }
+}
+
+/// The collection one budgeted response answers with, for a caller outside this
+/// module.
+///
+/// Public because it is the ONE rule. [`crate::negative`] counts a locate page's
+/// rows through this function rather than through a copy of it: two derivations
+/// of "which array is the answer" is how one response came to carry a ladder
+/// that cut `entities` beside a negative block that had counted `files`.
+pub fn primary_collection_for(payload: &Value, tool: &str) -> Option<&'static str> {
+    let shape = shape_for(tool)?;
+    primary_collection(payload, tool, &shape)
+}
+
+/// Name this response's primary collection, and make the response carry it.
+///
+/// A declared primary the producer omitted is materialized as an empty array.
+/// That is the whole of the disguise this fixes: `LocateResult` skips an empty
+/// `entities` while the secondary `files` roll-up serializes whatever it holds,
+/// so a fused entity page that ranked nothing shipped no primary key at all
+/// beside a populated roll-up, and a reader taking the first present array read
+/// an empty answer as a file answer.
+///
+/// Materialized only for a primary the response DECLARED. Inventing a key from
+/// the presence fallback would fabricate a collection rather than disclose an
+/// empty one, and a key that was never absent needs nothing done to it.
+fn declare_primary_collection(
+    payload: &mut Value,
+    tool: &str,
+    shape: &ResponseShape,
+) -> Option<&'static str> {
+    let Some(declared) = declared_primary_collection(payload, tool) else {
+        return primary_collection(payload, tool, shape);
+    };
+    if payload.get(declared).is_none() {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert(declared.to_string(), Value::Array(Vec::new()));
         }
     }
-    shape
-        .collections
-        .iter()
-        .copied()
-        .find(|key| payload.get(*key).is_some_and(Value::is_array))
+    Some(declared)
 }
 
 /// Whether this tool's response is governed by the budget.
@@ -832,6 +923,10 @@ pub fn enforce(
     budget: &ResponseBudget,
 ) -> Option<BudgetAccounting> {
     let shape = shape_for(tool)?;
+    // Named and materialized BEFORE anything is measured. Adding an omitted
+    // empty primary changes the size the accounting reports, and the accounting
+    // has to describe the response that ships.
+    let primary = declare_primary_collection(payload, tool, &shape);
     let chars_before = measure(payload);
 
     // Two arms bound one response. The daemon's `/mcp/tools/call` route cuts
@@ -853,8 +948,11 @@ pub fn enforce(
         chars_after: chars_before,
         bounded: prior.is_some(),
         compact: budget.compact,
+        primary_collection: primary.map(str::to_string),
+        // Solved after the ladder, which is the only thing that can change it.
+        primary_rows: None,
     };
-    run_ladder(payload, tool, &shape, budget, &mut accounting);
+    run_ladder(payload, tool, &shape, budget, primary, &mut accounting);
     accounting.chars_after = measure(payload);
 
     // A response the ladder could not bring under its ceiling is the case
@@ -864,7 +962,17 @@ pub fn enforce(
     // but the caller has to be told which of the two it is holding.
     reconcile_residual(payload, budget);
     accounting.chars_after = measure(payload);
+    accounting.primary_rows = primary.map(|key| collection_rows(payload, key));
     Some(accounting)
+}
+
+/// Rows one collection carries in a payload. A key that is absent or is not an
+/// array carries none, which is the same reading a caller gets from the JSON.
+fn collection_rows(payload: &Value, key: &str) -> usize {
+    payload
+        .get(key)
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 /// Run the ladder over one payload, recording what it cost in `accounting`.
@@ -877,17 +985,15 @@ fn run_ladder(
     tool: &str,
     shape: &ResponseShape,
     budget: &ResponseBudget,
+    // Resolved once by [`enforce`] and passed in rather than derived again
+    // here. The ladder and the accounting must name the same collection, and a
+    // second derivation is what would let them drift apart.
+    primary: Option<&'static str>,
     accounting: &mut BudgetAccounting,
 ) {
     let started_at = measure(payload);
     let mut cuts: Vec<String> = Vec::new();
     let mut remediations: Vec<String> = Vec::new();
-    // `semantic_locate` declares its primary through routing and granularity:
-    // `entities` for fused entity pages, `results` for cosine entity pages, and
-    // `files` for either file arm. Other tools retain the first-present rule.
-    // Presence alone is not authoritative here because an empty fused entity
-    // array is omitted while its secondary file roll-up remains serialized.
-    let primary = primary_collection(payload, tool, shape);
 
     // Compact by default, whether or not the payload is over budget: the
     // breakdowns are diagnostics a caller did not ask for, and shipping them
@@ -3129,5 +3235,148 @@ mod tests {
             !accounting.bounded,
             "nothing was carried, so nothing was cut: {payload}"
         );
+    }
+
+    /// One fused entity page in the shape the daemon's serializer produces:
+    /// `entities` omitted when the ranking held none, `files` present whatever
+    /// it holds. That asymmetry is where the relabelling lives, so the fixture
+    /// reproduces it rather than writing both keys out.
+    fn fused_entity_page(entities: usize, files: usize) -> Value {
+        let mut payload = json!({
+            "query": "where redirects are resolved",
+            "granularity": "entity",
+            "routing": "fused-v1",
+            "page": 0,
+            "files": (0..files)
+                .map(|index| json!({ "path": format!("src/f{index}.rs"), "score": 0.5 }))
+                .collect::<Vec<_>>(),
+        });
+        if entities > 0 {
+            payload["entities"] = json!((0..entities)
+                .map(|index| json!({
+                    "entity_id": format!("00000000-0000-0000-0000-{index:012}"),
+                    "name": format!("handler_{index}"),
+                    "kind": "function",
+                    "score": 0.5,
+                }))
+                .collect::<Vec<_>>());
+        }
+        payload
+    }
+
+    #[test]
+    fn entity_and_file_granularity_each_name_their_literal_primary() {
+        let budget = ResponseBudget::default();
+
+        let mut entity = fused_entity_page(3, 2);
+        let fused = enforce(&mut entity, "semantic_locate", &budget).expect("budgeted");
+        assert_eq!(fused.primary_collection.as_deref(), Some("entities"));
+        assert_eq!(fused.primary_rows, Some(3));
+
+        let mut cosine_payload = cosine_locate_payload(4);
+        let cosine = enforce(&mut cosine_payload, "semantic_locate", &budget).expect("budgeted");
+        assert_eq!(cosine.primary_collection.as_deref(), Some("results"));
+        assert_eq!(cosine.primary_rows, Some(4));
+
+        let mut file_payload = file_locate_payload(5, 2);
+        let files = enforce(&mut file_payload, "semantic_locate", &budget).expect("budgeted");
+        assert_eq!(files.primary_collection.as_deref(), Some("files"));
+        assert_eq!(files.primary_rows, Some(5));
+
+        // The three together, because a rule answering `files` to everything
+        // satisfies the file case on its own and one answering `entities` to
+        // everything satisfies the entity case on its own.
+        assert_ne!(fused.primary_collection, files.primary_collection);
+        assert_ne!(fused.primary_collection, cosine.primary_collection);
+    }
+
+    #[test]
+    fn an_empty_entity_page_ships_its_primary_rather_than_a_file_roll_up() {
+        let mut payload = fused_entity_page(0, 3);
+        assert!(
+            payload.get("entities").is_none(),
+            "the fixture must reproduce the omission this fixes: {payload}"
+        );
+
+        let accounting =
+            enforce(&mut payload, "semantic_locate", &ResponseBudget::default()).expect("budgeted");
+
+        assert_eq!(accounting.primary_collection.as_deref(), Some("entities"));
+        assert_eq!(accounting.primary_rows, Some(0));
+        assert_eq!(
+            payload.get("entities"),
+            Some(&json!([])),
+            "an empty primary is disclosed as empty, never omitted: {payload}"
+        );
+        assert_eq!(
+            payload["files"].as_array().map(Vec::len),
+            Some(3),
+            "the secondary roll-up is untouched; it is only no longer the answer: {payload}"
+        );
+    }
+
+    #[test]
+    fn an_entity_page_that_named_no_arm_never_names_the_file_roll_up() {
+        // Older and hand-built payloads carry a granularity and no routing. The
+        // presence fallback would pick `files` here, which is the exact
+        // relabelling the declared rule exists to refuse.
+        let mut payload = json!({
+            "query": "where redirects are resolved",
+            "granularity": "entity",
+            "files": [{ "path": "src/secondary.rs", "score": 0.4 }],
+        });
+        let accounting =
+            enforce(&mut payload, "semantic_locate", &ResponseBudget::default()).expect("budgeted");
+        assert_eq!(accounting.primary_collection.as_deref(), Some("entities"));
+        assert_eq!(accounting.primary_rows, Some(0));
+        assert_eq!(payload.get("entities"), Some(&json!([])));
+        assert_eq!(payload["files"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn a_response_that_declares_no_primary_has_none_invented_for_it() {
+        // The known-absent control. `semantic_search` declares nothing about its
+        // collection, so a response carrying none must be reported as naming
+        // none rather than having `results` fabricated for it.
+        let mut absent = json!({ "query": "where redirects are resolved" });
+        let accounting =
+            enforce(&mut absent, "semantic_search", &ResponseBudget::default()).expect("budgeted");
+        assert_eq!(accounting.primary_collection, None);
+        assert_eq!(accounting.primary_rows, None);
+        assert_eq!(
+            absent.get("results"),
+            None,
+            "no collection was invented: {absent}"
+        );
+
+        // The positive control beside it, so the assertion above cannot pass by
+        // the accounting never naming anything at all.
+        let mut present = json!({ "query": "q", "results": [{ "name": "a" }] });
+        let accounting =
+            enforce(&mut present, "semantic_search", &ResponseBudget::default()).expect("budgeted");
+        assert_eq!(accounting.primary_collection.as_deref(), Some("results"));
+        assert_eq!(accounting.primary_rows, Some(1));
+    }
+
+    #[test]
+    fn the_primary_row_count_is_what_the_response_ships_after_a_cut() {
+        // `primary_rows` describes the response, not the ranking behind it. A
+        // count taken before the ladder would tell a caller it holds rows the
+        // budget had already withheld, which is the reading `total_ranked` is
+        // for.
+        let mut payload = locate_payload(60, 2_000);
+        let budget = ResponseBudget {
+            max_chars: RESPONSE_MIN_MAX_CHARS,
+            ..ResponseBudget::default()
+        };
+        let accounting = enforce(&mut payload, "semantic_locate", &budget).expect("budgeted");
+        assert!(accounting.bounded, "the fixture must be cut: {payload}");
+        let shipped = payload["entities"].as_array().expect("entities").len();
+        assert!(
+            shipped < 60,
+            "the fixture must lose rows: shipped {shipped}"
+        );
+        assert_eq!(accounting.primary_rows, Some(shipped));
+        assert_eq!(payload["total_ranked"], json!(60));
     }
 }

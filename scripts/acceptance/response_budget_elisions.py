@@ -1486,10 +1486,14 @@ def check_10(suite):
     # reaches two files is a property of the fixture rather than of the rule
     # under test. So the query is chosen by measuring, and the sizes each one
     # reached are reported when none of them does.
+    # `return` is measured rather than guessed: on this fixture it is the one
+    # token both source modules carry, so it ranks two files where every other
+    # candidate ranks one. The others stay as fallbacks in case the fixture
+    # grows.
     seen = []
     first = None
     query = None
-    for candidate in ("hop", "value", "def"):
+    for candidate in ("return", "hop", "value"):
         try:
             probe = suite.mcp(
                 "semantic_locate",
@@ -1546,16 +1550,30 @@ def check_11(suite):
     res = Result(
         "11", "FIR-2814", "an entity page that ranked nothing ships its empty primary"
     )
+    # Which query empties the ranking is a property of the fixture, not of the
+    # rule under test, so it is measured rather than guessed. A multi-token
+    # absent symbol does NOT empty it: fused retrieval returns its best
+    # candidates and flags `all_fallback`, which is the documented behaviour
+    # rather than a defect. A single unmatched token does.
+    seen = []
+    empty = None
     try:
-        empty = suite.mcp(
-            "semantic_locate",
-            {
-                "query": "zzqqxx_nonexistent_symbol_9f3a",
-                "granularity": "entity",
-                "limit": 5,
-                "include_snippet": False,
-            },
-        )
+        for candidate in ("zzz", "quaternion sedimentation", "a0"):
+            probe = suite.mcp(
+                "semantic_locate",
+                {
+                    "query": candidate,
+                    "granularity": "entity",
+                    "limit": 5,
+                    "include_snippet": False,
+                },
+            )
+            named = declared_primary(probe)
+            rows = probe.get(named) if isinstance(named, str) else None
+            seen.append((candidate, named, len(rows) if isinstance(rows, list) else rows))
+            if isinstance(rows, list) and not rows:
+                empty = probe
+                break
         populated = suite.mcp(
             "semantic_locate",
             {"query": "hop", "granularity": "entity", "limit": 5, "include_snippet": False},
@@ -1563,12 +1581,10 @@ def check_11(suite):
     except McpError as exc:
         res.unknown("semantic_locate unreadable: %s" % exc)
         return res
-    named = declared_primary(empty)
-    rows = empty.get(named) if isinstance(named, str) else None
-    if isinstance(rows, list) and rows:
+    if empty is None:
         res.unknown(
-            "the absent-symbol query ranked %d row(s) in `%s`, so the empty-primary case "
-            "was not reached" % (len(rows), named)
+            "no fixture query emptied the primary collection, so the empty-primary case "
+            "was not reached: %r" % (seen,)
         )
         return res
     for problem in grade_empty_primary(empty):

@@ -2536,6 +2536,17 @@ fn apply_response_budget(annotated: &mut Value, tool_name: &str, budget: &Respon
         chars_after: chars_before,
         bounded: false,
         compact: budget.compact,
+        // Seeded with the real values for the same reason the size placeholder
+        // is: the stanza written first has to be the width of the stanza that
+        // ships, or the ladder charges the budget for the wrong bytes.
+        primary_collection: crate::budget::primary_collection_for(annotated, tool_name)
+            .map(str::to_string),
+        primary_rows: crate::budget::primary_collection_for(annotated, tool_name).map(|key| {
+            annotated
+                .get(key)
+                .and_then(Value::as_array)
+                .map_or(0, Vec::len)
+        }),
     };
     write_response_accounting(annotated, &accounting);
     let mut bounded = false;
