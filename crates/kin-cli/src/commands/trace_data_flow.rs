@@ -3419,7 +3419,22 @@ mod tests {
         let caller = make_entity("caller", "src/caller.rs");
         let missing = make_entity("missing_site", "src/missing.rs");
         let outside = make_entity("outside_site", "src/outside.rs");
-        for entity in [&focal, &callee, &caller, &missing, &outside] {
+        // An incoming edge whose span names a THIRD file, which is what makes the
+        // caller arm's filter falsifiable. Every other incoming span already
+        // sits in the caller's own file, so passing `None` for the filter and
+        // passing the caller's file admit the same set, and the mutation that
+        // disables the filter outright produces identical output. Only a span
+        // the filter must reject separates "admitted because it matched" from
+        // "admitted because nothing filtered".
+        let caller_outside = make_entity("caller_outside_site", "src/caller-outside.rs");
+        for entity in [
+            &focal,
+            &callee,
+            &caller,
+            &missing,
+            &outside,
+            &caller_outside,
+        ] {
             graph.upsert_entity(entity).unwrap();
         }
 
@@ -3476,6 +3491,15 @@ mod tests {
                 19,
             ))
             .unwrap();
+        graph
+            .upsert_relation(&make_relation_with_site(
+                caller_outside.id,
+                focal.id,
+                RelationKind::Calls,
+                "src/third-party.rs",
+                19,
+            ))
+            .unwrap();
 
         let mut request = trace_request(&focal.id, 1, TraceDirection::Both, 25);
         request.include_body = Some(false);
@@ -3502,6 +3526,16 @@ mod tests {
         assert!(step("outside_site").reference_lines.is_empty());
         assert_eq!(
             step("outside_site")
+                .reference_lines_absent_reason
+                .as_deref(),
+            Some("span_outside_caller_file")
+        );
+        // The caller arm filters against the CHILD's own file, not the focal's.
+        // This span names neither, so a row that carries lines here means the
+        // filter is not running rather than that it chose the wrong file.
+        assert!(step("caller_outside_site").reference_lines.is_empty());
+        assert_eq!(
+            step("caller_outside_site")
                 .reference_lines_absent_reason
                 .as_deref(),
             Some("span_outside_caller_file")
