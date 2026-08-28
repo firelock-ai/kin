@@ -76,7 +76,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_REMOTE_HTTP_TIMEOUT_SECS` | seconds>=0 | 600 | operational | HTTP timeout for native Kin remote repository transfer endpoints, in whole seconds; defaults to 600 |
 | `KIN_REMOTE_URL` | url | *(unset)* | operational | native remote endpoint URL |
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |
-| `KIN_REPO_IDS` | string | *(unset)* | operational | comma-separated repo ids the daemon should serve |
+| `KIN_REPO_IDS` | string | *(unset)* | correctness | exact comma-separated hosted fleet membership; required by GCS publication fencing |
 | `KIN_REQUIRE_COMPLETE_EMBEDDINGS` | bool | false | correctness | require full embedding coverage before answering locate/search |
 | `KIN_RESOURCE_PROFILE` | enum | interactive | correctness | runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset, the kin binaries select interactive at startup (value-preserving Metal kernels, proof's embedding budgets), while a library caller that never selects still resolves to proof; throughput additionally scales the batch budgets, may engage CPU/GPU hybrid embedding and overlaps persist with compute, and is non-citable |
 | `KIN_RESOURCE_PROFILE_PRODUCT_DEFAULT` | string | *(unset)* | operational | provenance marker written beside KIN_RESOURCE_PROFILE by whichever kin binary selected the default; never set by an operator. A binary that selects the ship default writes it into its own environment, and every process it spawns inherits a set variable indistinguishable from an operator's export, which is how a daemon reported the ship default as an operator override. This carries the VALUE the default was written for, so a child trusts it only when it names the profile actually in effect and an overridden profile is not mistaken for kin's own choice |
@@ -105,7 +105,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
-| `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests |
+| `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests; required for hosted GCS publication control |
+| `KIN_PUBLICATION_CONTROL_AUTH_TOKEN` | secret | *(unset)* | secret | distinct operator bearer token for hosted rollout and publication-control administration |
 | `KIN_DAEMON_AUTO_EMBED` | bool | true | operational | let the daemon start background embedding on its own; set falsy to defer until an explicit embed request. Read by the daemon at process start, so it takes effect on the command that starts one; a command reaching an already-running daemon cannot change it and is warned that it diverged |
 | `KIN_DAEMON_BIN` | path | *(unset)* | operational | override path to the kin-daemon binary |
 | `KIN_DAEMON_BIND_HOST` | string | *(unset)* | operational | host/interface the daemon binds its HTTP endpoint to |
@@ -248,6 +249,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_GCS_BUCKET` | string | *(unset)* | operational | GCS bucket for remote storage |
 | `KIN_GCS_ENDPOINT` | url | *(unset)* | correctness | custom GCS endpoint for the daemon's graph-snapshot storage, e.g. a local fake-gcs-server; takes precedence over STORAGE_EMULATOR_HOST, sends unsigned requests, and fails daemon startup when unreachable rather than falling back to real Google Cloud Storage |
 | `KIN_GCS_PREFIX` | string | *(unset)* | operational | GCS key prefix for remote storage |
+| `KIN_RELEASE_DAEMON_DIGEST_INTERNAL` | string | *(unset)* | correctness | exact sha256 image identity required by hosted graph reader admission and publication fencing |
 
 ## Session & projection
 

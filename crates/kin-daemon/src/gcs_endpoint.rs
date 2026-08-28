@@ -241,23 +241,38 @@ pub fn backend_for(
     bucket: &str,
     prefix: String,
 ) -> Result<kin_db::GcsBackend, String> {
+    let store = object_store_for(Some(endpoint), bucket)?;
+    Ok(kin_db::GcsBackend::from_store(Box::new(store), prefix))
+}
+
+/// Build the exact object-store client shared by graph authority and the
+/// publication-control record. Sharing configuration is correctness-critical:
+/// an emulator override must never send the lease to one service and graph
+/// bytes to another.
+#[cfg(feature = "gcs")]
+pub fn object_store_for(
+    endpoint: Option<&ResolvedEndpoint>,
+    bucket: &str,
+) -> Result<std::sync::Arc<dyn object_store::ObjectStore>, String> {
     use object_store::gcp::GoogleCloudStorageBuilder;
 
-    let store = GoogleCloudStorageBuilder::new()
-        .with_bucket_name(bucket)
-        .with_base_url(&endpoint.url)
-        // An emulator has no credentials to sign with, and unsigned requests to
-        // the real service are rejected rather than silently authorized.
-        .with_skip_signature(true)
-        .build()
-        .map_err(|error| {
-            format!(
-                "failed to create a GCS client for {} (from {}): {error}",
-                endpoint.url, endpoint.source
-            )
-        })?;
-
-    Ok(kin_db::GcsBackend::from_store(Box::new(store), prefix))
+    let mut builder = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
+    if let Some(endpoint) = endpoint {
+        builder = builder
+            .with_base_url(&endpoint.url)
+            // An emulator has no credentials to sign with, and unsigned
+            // requests to the real service are rejected rather than silently
+            // authorized.
+            .with_skip_signature(true);
+    }
+    let store = builder.build().map_err(|error| match endpoint {
+        Some(endpoint) => format!(
+            "failed to create a GCS client for {} (from {}): {error}",
+            endpoint.url, endpoint.source
+        ),
+        None => format!("failed to create a GCS client for bucket {bucket}: {error}"),
+    })?;
+    Ok(std::sync::Arc::new(store))
 }
 
 #[cfg(test)]

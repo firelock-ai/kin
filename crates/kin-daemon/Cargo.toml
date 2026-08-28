@@ -93,7 +93,9 @@ kin-db = { workspace = true, features = ["metal", "accelerate"] }
 kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 
 [dev-dependencies]
+async-trait = "0.1"
 base64 = "0.23"
+futures-util = "0.3"
 kin-core = { workspace = true, features = ["test-support"] }
 kin-git = { workspace = true, features = ["test-support"] }
 kin-migrate = { workspace = true }

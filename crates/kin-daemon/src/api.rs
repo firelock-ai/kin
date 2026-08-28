@@ -658,6 +658,14 @@ fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct HealthResponse {
     pub status: String,
+    /// Last hosted-reader admission verdict observed by this process. This is
+    /// diagnostic only: `/ready` and `/readiness` re-read durable authority and
+    /// are the fail-closed admission gates. `/health` remains process liveness
+    /// even when this is false.
+    #[serde(default)]
+    pub reader_admitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_admission_error: Option<String>,
     pub version: String,
     pub uptime_seconds: u64,
     pub graph_entity_count: Option<usize>,
@@ -1232,6 +1240,7 @@ fn current_build_response() -> BuildResponse {
 #[derive(Clone)]
 struct DaemonAuthState {
     auth_token: Option<String>,
+    publication_control_auth_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1290,11 +1299,6 @@ async fn daemon_auth(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> impl IntoResponse {
-    if auth_state.auth_token.is_none() || is_public_route(request.uri().path()) {
-        return next.run(request).await;
-    }
-
-    let expected_token = auth_state.auth_token.as_deref().unwrap_or_default();
     let provided = request
         .headers()
         .get(header::AUTHORIZATION)
@@ -1302,6 +1306,31 @@ async fn daemon_auth(
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim);
 
+    if is_publication_control_route(request.uri().path()) {
+        let Some(expected_admin_token) = auth_state.publication_control_auth_token.as_deref()
+        else {
+            return auth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Publication control authentication is unavailable",
+            );
+        };
+        if provided == Some(expected_admin_token) {
+            return next.run(request).await;
+        }
+        if provided == auth_state.auth_token.as_deref() {
+            return auth_error(
+                StatusCode::FORBIDDEN,
+                "Publication control administrator authentication required",
+            );
+        }
+        return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+
+    if auth_state.auth_token.is_none() || is_public_route(request.uri().path()) {
+        return next.run(request).await;
+    }
+
+    let expected_token = auth_state.auth_token.as_deref().unwrap_or_default();
     if provided != Some(expected_token) {
         return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
     }
@@ -1324,6 +1353,48 @@ async fn daemon_activity(
 
     state.begin_request();
     let _guard = RequestActivityGuard(state);
+    next.run(request).await
+}
+
+fn is_publication_control_route(path: &str) -> bool {
+    let path = path.strip_prefix("/v2").unwrap_or(path);
+    path == "/authority/publication-control"
+        || path.starts_with("/authority/publication-control/")
+}
+
+fn is_process_liveness_route(path: &str) -> bool {
+    let path = path.strip_prefix("/v2").unwrap_or(path);
+    path == "/health"
+}
+
+/// A hosted daemon may expose the authenticated rollout surface while its
+/// reader admission is absent or moving, but it must not serve graph authority
+/// under an unadmitted image. This keeps first bootstrap and recovery possible
+/// without turning a successfully opened process into an implicitly admitted
+/// reader.
+async fn hosted_reader_admission(
+    State(state): State<Arc<DaemonState>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if is_publication_control_route(request.uri().path())
+        || is_process_liveness_route(request.uri().path())
+    {
+        return next.run(request).await;
+    }
+    if let Some(control) = state.publication_control.as_ref() {
+        if let Err(error) =
+            control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": format!("hosted graph reader admission refused: {error}")
+                })),
+            )
+                .into_response();
+        }
+    }
     next.run(request).await
 }
 
@@ -1584,6 +1655,29 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/vfs/blob/{hash}", get(vfs_blob))
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
         .route("/vfs/subscribe", get(vfs_subscribe))
+        // Fleet-wide hosted authority admission. These protected routes and
+        // every server-side publisher share one CAS record beneath the GCS
+        // backend, so rollout checks cannot race a graph writer.
+        .route(
+            "/authority/publication-control",
+            get(publication_control_status),
+        )
+        .route(
+            "/authority/publication-control/rollout/acquire",
+            post(publication_control_acquire_rollout),
+        )
+        .route(
+            "/authority/publication-control/rollout/renew",
+            post(publication_control_renew_rollout),
+        )
+        .route(
+            "/authority/publication-control/rollout/admit-reader",
+            post(publication_control_admit_reader),
+        )
+        .route(
+            "/authority/publication-control/rollout/release",
+            post(publication_control_release_rollout),
+        )
         // Spine endpoints — cross-repo federation queries
         .route("/spine/health", get(spine_health))
         .route("/spine/repos", get(spine_repos))
@@ -1808,6 +1902,10 @@ fn npm_registry_auth_error(status: StatusCode, message: &str) -> Response {
 /// authority contract. All responses identify the effective API contract in
 /// the `X-Kin-API-Version` header.
 pub fn router(state: Arc<DaemonState>) -> Router {
+    assert!(
+        state.publication_control.is_none(),
+        "hosted graph publication control requires an authenticated serving router"
+    );
     router_with_auth(state, None)
 }
 
@@ -1815,11 +1913,47 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     router_with_auth_and_shutdown(state, auth_token, None)
 }
 
+fn router_with_publication_control_auth(
+    state: Arc<DaemonState>,
+    auth_token: Option<String>,
+    publication_control_auth_token: Option<String>,
+) -> Router {
+    router_with_auth_and_shutdown_internal(
+        state,
+        auth_token,
+        publication_control_auth_token,
+        None,
+    )
+}
+
 fn router_with_auth_and_shutdown(
     state: Arc<DaemonState>,
     auth_token: Option<String>,
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Router {
+    router_with_auth_and_shutdown_internal(state, auth_token, None, shutdown)
+}
+
+fn router_with_auth_and_shutdown_internal(
+    state: Arc<DaemonState>,
+    auth_token: Option<String>,
+    publication_control_auth_token: Option<String>,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+) -> Router {
+    if state.publication_control.is_some() {
+        assert!(
+            auth_token.is_some(),
+            "hosted graph publication control requires daemon authentication"
+        );
+        assert!(
+            publication_control_auth_token.is_some(),
+            "hosted graph publication control requires administrator authentication"
+        );
+        assert_ne!(
+            auth_token, publication_control_auth_token,
+            "hosted graph publication control administrator authentication must be distinct from ordinary daemon authentication"
+        );
+    }
     let routes = api_routes();
     let activity_state = Arc::clone(&state);
 
@@ -1913,12 +2047,20 @@ fn router_with_auth_and_shutdown(
     //
     // The outer layers below (`daemon_activity`, `api_version_header`,
     // `validate_host_and_origin`) still apply to EVERYTHING, registry included.
+    let admission_state = Arc::clone(&state);
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v2", routes)
         .layer(Extension(DaemonShutdownControl(shutdown)))
         .layer(middleware::from_fn_with_state(
-            DaemonAuthState { auth_token },
+            admission_state,
+            hosted_reader_admission,
+        ))
+        .layer(middleware::from_fn_with_state(
+            DaemonAuthState {
+                auth_token,
+                publication_control_auth_token,
+            },
             daemon_auth,
         ))
         .with_state(state);
@@ -3200,7 +3342,17 @@ async fn health(
     // every admission satisfies perfectly well, so this endpoint answered `ok`
     // for a daemon that had admitted nothing in days. That field stays as it is,
     // and the verdict now also reads what those passes achieved.
-    let status = if mass_deletion_blocked
+    let runtime_admission = state
+        .publication_control
+        .as_ref()
+        .map(|control| control.runtime_admission_status());
+    let reader_admitted = runtime_admission
+        .as_ref()
+        .map(|diagnostic| diagnostic.admitted)
+        .unwrap_or(true);
+    let reader_admission_error = runtime_admission.and_then(|diagnostic| diagnostic.error);
+    let status = if !reader_admitted
+        || mass_deletion_blocked
         || embed_worker_failed
         || embed_persistence_unavailable
         || vector_index_discarded.is_some()
@@ -3217,6 +3369,8 @@ async fn health(
 
     Ok(Json(HealthResponse {
         status: status.to_string(),
+        reader_admitted,
+        reader_admission_error,
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds,
         graph_entity_count: Some(entity_count),
@@ -11822,6 +11976,94 @@ struct SpineXrefParams {
     entity: String,
 }
 
+fn publication_control(
+    state: &DaemonState,
+) -> Result<&Arc<crate::publication_lease::PublicationControl>, (StatusCode, String)> {
+    state.publication_control.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "graph publication control is unavailable outside the hosted GCS authority path"
+                .to_string(),
+        )
+    })
+}
+
+fn publication_control_error(
+    error: crate::publication_lease::PublicationControlError,
+) -> (StatusCode, String) {
+    let status = if error.is_request_error() {
+        StatusCode::BAD_REQUEST
+    } else if error.is_conflict() {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, error.to_string())
+}
+
+async fn publication_control_status(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let record = publication_control(&state)?
+        .redacted_status()
+        .map_err(publication_control_error)?;
+    Ok(Json(record))
+}
+
+async fn publication_control_acquire_rollout(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::AcquireRolloutLeaseRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let control = publication_control(&state)?;
+    let lease = control
+        .acquire_rollout(request)
+        .map_err(publication_control_error)?;
+    let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
+    Ok(Json(lease))
+}
+
+async fn publication_control_renew_rollout(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::RenewRolloutLeaseRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let control = publication_control(&state)?;
+    let lease = control
+        .renew_rollout(request)
+        .map_err(publication_control_error)?;
+    let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
+    Ok(Json(lease))
+}
+
+async fn publication_control_admit_reader(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::AdmitReaderRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let control = publication_control(&state)?;
+    let record = control
+        .admit_reader(request)
+        .map_err(publication_control_error)?;
+    let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
+    Ok(Json(record))
+}
+
+async fn publication_control_release_rollout(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::ReleaseRolloutLeaseRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let control = publication_control(&state)?;
+    control
+        .release_rollout(request)
+        .map_err(publication_control_error)?;
+    let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
+    // A lost-response retry can race a later unrelated rollout. Returning the
+    // raw ordered record here would disclose that rollout's live capability
+    // token to a caller holding only an old completed proof.
+    let status = control
+        .redacted_status()
+        .map_err(publication_control_error)?;
+    Ok(Json(status))
+}
+
 /// Stable wire response for the canonical `GET /spine/edges` bulk read.
 /// Field order plus the snapshot's canonical collections make identical graph
 /// authority serialize to identical response bytes.
@@ -11839,13 +12081,15 @@ struct SpineEdgesResponse {
 async fn spine_health(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
+    // This route is intentionally public diagnostics. Never let an
+    // unauthenticated health read initialize or re-register hosted Firestore
+    // authority; mutating routes own that transition under publication guard.
+    let spine = state.spine().ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            state.spine_unavailable_reason().to_string(),
+            "spine is disabled or has not been initialized".to_string(),
         )
     })?;
-    let spine = spine_authority.backend();
 
     // Two completeness readings, never one. `cross_repo_edges: 0` beside nothing
     // else is a bare zero: it reads as "this install has no cross-repo edges"
@@ -12035,6 +12279,12 @@ async fn spine_ingest_repo(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let Json(body) = body.unwrap_or_default();
 
+    if let Some(control) = state.publication_control.as_ref() {
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .map_err(publication_control_error)?;
+    }
+
     // The path `repo_id` is authoritative; reject a body `repo` that disagrees
     // so an orchestrator wiring bug can't ingest the wrong repo silently.
     if let Some(repo) = body.repo.as_deref() {
@@ -12072,6 +12322,11 @@ async fn spine_ingest_repo(
 async fn spine_refresh_cross_repo_edges(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(control) = state.publication_control.as_ref() {
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .map_err(publication_control_error)?;
+    }
     let outcome = state
         .refresh_all_cross_repo_edges()
         .await
@@ -13166,20 +13421,18 @@ pub fn bind_api_listener_pair(
 /// correctly and kills it -- the failure `state.rs` already documents in its own
 /// words. So this answers, immediately, every time.
 ///
-/// Every answer is a REFUSAL status, and that is the load-bearing detail. The
-/// clients that can retire an endpoint do so on a verdict about repository
-/// identity, and they reach that verdict only from a body they successfully
-/// parsed: a non-2xx answer is classified as silence about identity, which is
-/// explicitly not allowed to authorize deleting the endpoint. A 200 carrying a
-/// fabricated status would instead be read as a live daemon whose repository
-/// could not be matched, which is the reading that wipes endpoint files and
-/// respawns into the same state. Refusing is what keeps a warming daemon
-/// alive-and-waiting rather than dead.
+/// Readiness refuses until authority opens, while `/health` answers process
+/// liveness with an explicit warming, unadmitted diagnostic. Kubernetes uses
+/// these as different decisions: a slow or intentionally fenced reader stays
+/// alive for recovery traffic but cannot receive authority traffic.
 pub async fn serve_warming_until(
     listener: tokio::net::TcpListener,
     mut ready_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let app = Router::new()
+        .route("/health", get(warming_health))
+        .route("/v2/health", get(warming_health))
+        .route("/ready", get(warming_readiness))
         .route("/readiness", get(warming_readiness))
         .fallback(warming_unavailable);
     let served = axum::serve(listener, app)
@@ -13210,6 +13463,19 @@ async fn warming_readiness() -> impl IntoResponse {
     )
 }
 
+async fn warming_health() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "warming",
+            "process_alive": true,
+            "reader_admitted": false,
+            "ready": false,
+            "warming": true,
+        })),
+    )
+}
+
 async fn warming_unavailable() -> impl IntoResponse {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -13234,7 +13500,13 @@ pub async fn serve_bound_with_shutdown(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let auth_token = resolve_serve_auth_token(&state.layout);
-    let app = router_with_auth_and_shutdown(state, auth_token, shutdown_tx);
+    let publication_control_auth_token = publication_control_auth_token_from_env();
+    let app = router_with_auth_and_shutdown_internal(
+        state,
+        auth_token,
+        publication_control_auth_token,
+        shutdown_tx,
+    );
     let port = listener
         .local_addr()
         .map(|addr| addr.port())
@@ -13282,6 +13554,10 @@ fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
 
 fn auth_token_from_env() -> Option<String> {
     resolve_auth_token(std::env::var("KIN_DAEMON_AUTH_TOKEN").ok())
+}
+
+fn publication_control_auth_token_from_env() -> Option<String> {
+    resolve_auth_token(std::env::var("KIN_PUBLICATION_CONTROL_AUTH_TOKEN").ok())
 }
 
 /// `.kin/daemon.token` — auto-provisioned per-install loopback token.
@@ -19489,10 +19765,8 @@ mod tests {
     ///
     /// The assertions are on the exact statuses a client acts on, because the
     /// statuses are the contract. `/readiness` must be the 503 the spawn-wait
-    /// loop already polls, and `/health` must be a refusal rather than a 200
-    /// carrying an invented status: a parsed 200 whose repository cannot be
-    /// matched is what authorizes a client to retire the endpoint and respawn,
-    /// while a non-2xx is classified as silence about identity and keeps it.
+    /// loop already polls, while `/health` must remain 200 process liveness and
+    /// explicitly say that no reader authority is admitted yet.
     #[tokio::test]
     async fn a_daemon_answers_while_it_is_still_opening_state() {
         let state = test_state();
@@ -19528,10 +19802,14 @@ mod tests {
             .expect("health must answer during the open window");
         assert_eq!(
             health.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "health must REFUSE while opening; a 200 with an invented status is what makes a \
-             client retire the endpoint and respawn into the same state"
+            StatusCode::OK,
+            "process liveness must not kill a daemon while it opens authority"
         );
+        let health: serde_json::Value = health.json().await.expect("warming health body");
+        assert_eq!(health["status"], "warming");
+        assert_eq!(health["process_alive"], true);
+        assert_eq!(health["reader_admitted"], false);
+        assert_eq!(health["ready"], false);
 
         // Handing over must not rebind. Both handles accept from one listen
         // queue, so after the readiness surface stops, the same port is still
@@ -22783,6 +23061,344 @@ mod tests {
             .await
             .unwrap();
         (status, body.to_vec())
+    }
+
+    async fn publication_post(
+        app: Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer publication-test-token")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({"text": String::from_utf8_lossy(&bytes)}))
+        };
+        (status, body)
+    }
+
+    async fn publication_spine_ingest(app: Router, repo_id: &str) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .oneshot(
+                Request::post(format!("/spine/repos/{repo_id}/ingest"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer daemon-test-token")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "repo": repo_id })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    /// The direct server API is the bypass the invoking shell cannot close.
+    /// Drive bootstrap, retry, admission switch, release, and the actual spine
+    /// ingest route through one router so missing and mismatched reader identity
+    /// cannot be hidden behind the PR192 script's own checks.
+    #[tokio::test]
+    async fn publication_control_api_fences_direct_spine_ingest() {
+        const READER_A: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const READER_B: &str =
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        const SCOPE: &str = "gcs://fixture/v2";
+        let fleet = vec![
+            "kin".to_string(),
+            "kin-db".to_string(),
+            "kin-vfs".to_string(),
+            "kinlab".to_string(),
+            "kin-editor".to_string(),
+        ];
+
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let backend_root = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            crate::publication_lease::InMemoryPublicationControlStore::default(),
+        );
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(
+                SCOPE,
+                READER_A,
+                fleet.clone(),
+                store,
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                "kin",
+                Some(fleet.iter().cloned().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        let unauthenticated_embedded = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            move || router(state)
+        }));
+        assert!(
+            unauthenticated_embedded.is_err(),
+            "the public embedded router must not expose hosted rollout mutation without auth"
+        );
+        let app = router_with_publication_control_auth(
+            Arc::clone(&state),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        );
+
+        let ordinary_cannot_read_control = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer daemon-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_cannot_read_control.status(), StatusCode::FORBIDDEN);
+        let unauthenticated_cannot_read_control = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unauthenticated_cannot_read_control.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer publication-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let missing_health = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .header("authorization", "Bearer daemon-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_health.status(), StatusCode::OK);
+        let missing_health_body =
+            axum::body::to_bytes(missing_health.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+        let missing_health: HealthResponse =
+            serde_json::from_slice(&missing_health_body).unwrap();
+        assert!(!missing_health.reader_admitted);
+        assert_eq!(missing_health.status, "attention");
+        let missing_readiness = app
+            .clone()
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing_readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (status, body) = publication_spine_ingest(app.clone(), "kin").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(String::from_utf8_lossy(&body).contains("record is absent"));
+
+        let acquire = serde_json::json!({
+            "scope": SCOPE,
+            "repositories": ["kin", "kin-db", "kin-vfs", "kinlab", "kin-editor"],
+            "holder": "staging-promotion",
+            "request_id": "run-123",
+            "ttl_seconds": 300,
+            "bootstrap_reader": {
+                "identity": READER_A,
+                "min_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "valid_for_seconds": 3600
+            }
+        });
+        let (status, lease) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/acquire",
+            acquire.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{lease}");
+        let (retry_status, retry) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/acquire",
+            acquire,
+        )
+        .await;
+        assert_eq!(retry_status, StatusCode::OK, "{retry}");
+        assert_eq!(retry["token"], lease["token"]);
+        assert_eq!(retry["fence"], lease["fence"]);
+        assert!(lease["authority_fenced_at"].is_string(), "{lease}");
+        assert_eq!(lease["authority_fence"].as_array().unwrap().len(), 5);
+        assert_eq!(lease["authority_fence"][0]["repo_id"], "kin");
+        assert_eq!(lease["authority_fence"][0]["pre_fence_generation"], 1);
+        assert_eq!(lease["authority_fence"][0]["fenced_generation"], 2);
+        assert_eq!(
+            lease["authority_fence"][0]["snapshot_schema"],
+            kin_db::GraphSnapshot::CURRENT_VERSION
+        );
+
+        let status = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer publication-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(status.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        let status_text = String::from_utf8(status_body.to_vec()).unwrap();
+        let lease_token = lease["token"].as_str().unwrap();
+        assert!(status_json["active_lease"]["authority_fencing_in_progress"].is_boolean());
+        assert!(
+            !status_text.contains("\"token\"") && !status_text.contains(lease_token),
+            "read-only publication status must not disclose live lease capability: {status_text}"
+        );
+
+        let (blocked_status, blocked_body) =
+            publication_spine_ingest(app.clone(), "kin").await;
+        assert_eq!(blocked_status, StatusCode::SERVICE_UNAVAILABLE);
+        let blocked_body = String::from_utf8_lossy(&blocked_body);
+        assert!(blocked_body.contains("rollout fence"), "{blocked_body}");
+
+        let proof = serde_json::json!({
+            "scope": SCOPE,
+            "token": lease["token"],
+            "fence": lease["fence"]
+        });
+        let (status, admitted) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/admit-reader",
+            serde_json::json!({
+                "scope": proof["scope"],
+                "token": proof["token"],
+                "fence": proof["fence"],
+                "repositories": ["kin", "kin-db", "kin-vfs", "kinlab", "kin-editor"],
+                "reader": {
+                    "identity": READER_B,
+                    "min_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                    "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                    "valid_for_seconds": 3600
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{admitted}");
+
+        let fenced_health = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .header("authorization", "Bearer daemon-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fenced_health.status(), StatusCode::OK);
+        let fenced_body = axum::body::to_bytes(fenced_health.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let fenced_body: HealthResponse = serde_json::from_slice(&fenced_body).unwrap();
+        assert!(
+            !fenced_body.reader_admitted
+                && fenced_body
+                    .reader_admission_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("rollout fence")),
+            "{fenced_body:?}"
+        );
+        let fenced_readiness = app
+            .clone()
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(fenced_readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, body) = publication_spine_ingest(app.clone(), "kin").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("rollout fence"), "{body}");
+
+        let (status, released) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/release",
+            proof.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{released}");
+        assert!(released["active_lease"].is_null());
+
+        let (status, later) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/acquire",
+            serde_json::json!({
+                "scope": SCOPE,
+                "repositories": ["kin", "kin-db", "kin-vfs", "kinlab", "kin-editor"],
+                "holder": "staging-promotion",
+                "request_id": "run-456",
+                "ttl_seconds": 300
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{later}");
+        let later_token = later["token"].as_str().unwrap().to_string();
+
+        let (status, old_release_retry) = publication_post(
+            app,
+            "/authority/publication-control/rollout/release",
+            proof,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{old_release_retry}");
+        let old_release_retry_text = serde_json::to_string(&old_release_retry).unwrap();
+        assert!(old_release_retry["active_lease"].is_object());
+        assert!(
+            !old_release_retry_text.contains("\"token\"")
+                && !old_release_retry_text.contains(&later_token),
+            "an old completed proof must not recover a later rollout capability: {old_release_retry_text}"
+        );
     }
 
     /// The identity contract a client depends on: read `repo_id` off `/health`
@@ -32251,14 +32867,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn spine_health_returns_ok() {
+    async fn spine_health_is_side_effect_free_and_reports_initialized_state() {
         let state = test_state();
+        assert!(state.spine().is_none());
+        let app = router(Arc::clone(&state));
+        let uninitialized = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(uninitialized.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            state.spine().is_none(),
+            "public spine health must not initialize or publish spine authority"
+        );
+
+        state.ensure_spine().expect("spine enabled in test");
         let app = router(state);
         let response = app
             .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        // Spine should be initialized on DaemonState::open
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
@@ -32292,6 +32920,7 @@ mod tests {
     async fn spine_health_reports_both_completeness_readings_beside_the_edge_count() {
         let state = test_state();
         let startup_complete = state.startup_authority_complete();
+        state.ensure_spine().expect("spine enabled in test");
         let app = router(state);
         let response = app
             .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
@@ -32347,6 +32976,7 @@ mod tests {
     #[serial_test::serial]
     async fn spine_health_reports_a_bounded_sibling_capture_as_its_own_state() {
         let state = test_state();
+        state.ensure_spine().expect("spine enabled in test");
         let app = router(state);
         let response = app
             .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
@@ -32460,6 +33090,7 @@ mod tests {
              test proves nothing about reporting one"
         );
 
+        state.ensure_spine().expect("spine enabled in test");
         let app = router(state);
         let response = app
             .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())

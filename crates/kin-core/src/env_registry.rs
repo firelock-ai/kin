@@ -191,7 +191,8 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_PHASE_SCORING_SECS", kind: Kind::SecsBound, default: "10", sensitivity: Sensitivity::Correctness, summary: "locate phase budget: scoring; 0 = unbounded" },
 
     // ---- secrets --------------------------------------------------------------
-    EnvVarSpec { name: "KIN_DAEMON_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated daemon requests" },
+    EnvVarSpec { name: "KIN_DAEMON_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated daemon requests; required for hosted GCS publication control" },
+    EnvVarSpec { name: "KIN_PUBLICATION_CONTROL_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "distinct operator bearer token for hosted rollout and publication-control administration" },
     EnvVarSpec { name: "KIN_SUPERVISOR_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated supervisor requests" },
     EnvVarSpec { name: "KIN_REGISTRY_CARGO_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "cargo registry auth token for publish" },
     EnvVarSpec { name: "KIN_REGISTRY_OCI_WRITE_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "OCI registry auth token for mutations" },
@@ -267,6 +268,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_STORAGE", kind: Kind::Str, default: "local", sensitivity: Sensitivity::Operational, summary: "daemon storage backend selector (e.g. local, gcs)" },
     EnvVarSpec { name: "KIN_GCS_BUCKET", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "GCS bucket for remote storage" },
     EnvVarSpec { name: "KIN_GCS_PREFIX", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "GCS key prefix for remote storage" },
+    EnvVarSpec { name: "KIN_RELEASE_DAEMON_DIGEST_INTERNAL", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "exact sha256 image identity required by hosted graph reader admission and publication fencing" },
     // Correctness rather than Operational, unlike the bucket and prefix beside
     // it: this one redirects every storage request to a different server, so a
     // wrong value serves and persists graph truth somewhere other than where the
@@ -281,7 +283,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_ACTOR", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "actor identity recorded in provenance" },
     EnvVarSpec { name: "KIN_ORG_ID", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "organization id for federation/remote" },
     EnvVarSpec { name: "KIN_REPO_ID", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "active repo id override" },
-    EnvVarSpec { name: "KIN_REPO_IDS", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "comma-separated repo ids the daemon should serve" },
+    EnvVarSpec { name: "KIN_REPO_IDS", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "exact comma-separated hosted fleet membership; required by GCS publication fencing" },
     EnvVarSpec { name: "KIN_PRIMARY_REPO_ID", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "primary repo id for a multi-repo daemon" },
     EnvVarSpec { name: "KIN_SESSION", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "session id propagated to a child shell/exec" },
     EnvVarSpec { name: "KIN_SESSION_ID", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "session id used by daemon-delegated commands" },
@@ -894,9 +896,11 @@ fn doc_group(name: &str) -> &'static str {
         ("KIN_INFER_", "Inference"),
         ("KIN_INIT_", "Init"),
         ("KIN_GCS_", "Storage"),
+        ("KIN_RELEASE_DAEMON_DIGEST_INTERNAL", "Storage"),
         ("KIN_CONTEXTBENCH_", "Benchmarking"),
         ("KIN_HYDRATE_", "Diagnostics"),
         ("KIN_PROFILE_", "Diagnostics"),
+        ("KIN_PUBLICATION_CONTROL_", "Daemon"),
         ("KIN_SESSION", "Session & projection"),
         ("KIN_SOURCE_ROOT", "Session & projection"),
         ("KIN_DISCOVERY_MODE", "Session & projection"),
