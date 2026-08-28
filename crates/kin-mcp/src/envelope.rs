@@ -548,10 +548,13 @@ pub struct Durability {
 /// clock cannot say whether the store fell behind a second ago or a month ago,
 /// and a clock with no count cannot say whether anything is actually missing.
 ///
-/// Present only when the store IS behind. An absent object is not a claim that
-/// it is current: a runtime that reported no reconcile reading has nothing to
-/// say here, and reporting a zero it never verified is the shape of wrong
-/// answer this object exists to stop.
+/// Present when there is something to say, which is two cases and not one:
+/// the store is behind by a measured count, or NOTHING MEASURED the working
+/// copy, so whether it is behind is unknown. An absent object is a measured
+/// all-clear and only that. The second case exists because the first version of
+/// this object gated on the count alone, so a zero nobody had measured read
+/// exactly like a zero somebody had, and reporting a zero it never verified is
+/// the shape of wrong answer this object exists to stop (FIR-2820).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GraphBehind {
     /// Host paths on disk that no admission has taken.
@@ -563,22 +566,58 @@ pub struct GraphBehind {
     /// you just wrote.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sample: Vec<String>,
+    /// Seconds since the walk that produced `unadmitted_paths` ran.
+    ///
+    /// `None` is the whole reason this object can be present with a count of
+    /// zero: it means no walk has stamped a reading, so the count above is a
+    /// default rather than an observation and nothing here is a statement about
+    /// the working copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_age_seconds: Option<u64>,
+    /// Whether a walk produced `unadmitted_paths`.
+    ///
+    /// Always on the wire, unlike the age beside it, and that is the point. The
+    /// unmeasured disclosure reaches a machine consumer as
+    /// `unadmitted_paths: 0`, which is the exact number the object exists to say
+    /// means nothing, and the only other tell was the ABSENCE of the age above,
+    /// which is an inference from an absence rather than a reading. That is the
+    /// field-versus-prose split this whole ticket is about, one object over from
+    /// where it was fixed, so the block now states it positively.
+    pub measured: bool,
     /// One line an agent can act on without reading the counts.
     pub note: String,
 }
 
 impl GraphBehind {
-    /// Read the two halves out of a daemon `/health` body.
+    /// Read the reading, and the basis for it, out of a daemon `/health` body.
     ///
-    /// `None` when the body carries no reconcile reading at all, and `None`
-    /// again when it reports nothing unadmitted. The two are different facts and
-    /// both are correctly silent here: this object speaks only when the store is
-    /// behind, and the gates that consume it treat its silence as no reading
-    /// rather than as an all-clear.
+    /// `None` when the body carries no reconcile block at all, because there is
+    /// then nothing to read rather than something to report.
+    ///
+    /// Otherwise the count alone does not decide this, and that is the fix. A
+    /// zero has three producers and only one of them is an all-clear: a walk
+    /// measured it, this daemon admits nothing from the filesystem so the
+    /// question does not apply, or a walk should have measured it and none has.
+    /// The first two are silence. The third is a disclosure, because a zero
+    /// nobody measured is not a zero, and gating on the count alone published it
+    /// as one on every surface built from this object while `kin status` on the
+    /// same daemon at the same instant correctly answered "not measured"
+    /// (FIR-2820).
     pub fn from_health(health: &Value) -> Option<Self> {
         let reconcile = health.get("reconcile")?;
         let unadmitted_paths = reconcile.get("untracked_path_count")?.as_u64()?;
-        if unadmitted_paths == 0 {
+        let measured_age_seconds = reconcile
+            .get("untracked_observed_age_seconds")
+            .and_then(Value::as_u64);
+        // Named by the daemon, not inferred here. A projected checkout on a
+        // daemon whose graph is its own write authority holds no content
+        // anything failed to admit, so an unstamped zero there is the question
+        // not applying rather than a walk that went missing.
+        let observation_not_applicable = reconcile
+            .get("untracked_observation_not_applicable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if unadmitted_paths == 0 && (measured_age_seconds.is_some() || observation_not_applicable) {
             return None;
         }
         let since = reconcile
@@ -596,26 +635,58 @@ impl GraphBehind {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let note = Self::describe(unadmitted_paths, since.as_deref());
+        let note = Self::describe(unadmitted_paths, since.as_deref(), measured_age_seconds);
         Some(Self {
             unadmitted_paths,
             since,
             sample,
+            measured_age_seconds,
+            measured: measured_age_seconds.is_some(),
             note,
         })
     }
 
-    fn describe(unadmitted_paths: u64, since: Option<&str>) -> String {
+    /// Whether this object is the no-measurement disclosure rather than a count.
+    ///
+    /// Both halves, because they are two facts. [`Self::from_health`] emits a
+    /// zero only when nothing measured the working copy and returns `None` for
+    /// every zero that something did, so the pair is exactly the unmeasured
+    /// shape; a count with no stamp is still a count and still sends a reader to
+    /// `kin admit`. A consumer asks this before naming that remedy, because on
+    /// the unmeasured shape there is no path to admit.
+    pub fn unmeasured(&self) -> bool {
+        !self.measured && self.unadmitted_paths == 0
+    }
+
+    fn describe(
+        unadmitted_paths: u64,
+        since: Option<&str>,
+        measured_age_seconds: Option<u64>,
+    ) -> String {
         let clock = match since {
             Some(since) => format!("the last complete admission was at {since}"),
             None => {
                 "this daemon has not reported when a complete admission last succeeded".to_string()
             }
         };
+        if unadmitted_paths == 0 {
+            return format!(
+                "nothing has measured this working copy, so whether graph truth is level with it \
+                 is unknown, and {clock}. Answers here cover admitted content only. `kin status` \
+                 reports the same, and a commit takes any unadmitted path anyway."
+            );
+        }
+        // The age rides in the sentence as well as the field, because a count
+        // with no clock cannot say whether the store fell behind a second ago
+        // or a month ago, and a reader of the note gets only the sentence.
+        let measured = match measured_age_seconds {
+            Some(age) => format!(", measured {age}s ago,"),
+            None => String::new(),
+        };
         format!(
-            "{unadmitted_paths} host path(s) are on disk that graph truth does not carry, and \
-             {clock}. Answers here cover admitted content only. `kin admit` takes those paths \
-             now, and a commit takes them anyway."
+            "{unadmitted_paths} host path(s) are on disk that graph truth does not carry\
+             {measured} and {clock}. Answers here cover admitted content only. `kin admit` takes \
+             those paths now, and a commit takes them anyway."
         )
     }
 
@@ -631,6 +702,17 @@ impl GraphBehind {
             Some(since) => format!("the last complete admission was at {since}"),
             None => "no complete admission has been reported".to_string(),
         };
+        // Two readings, two reasons, and the reader is sent to a different
+        // lever by each. One says the graph is behind by a known amount; the
+        // other says nobody knows, which is not the same news and must not
+        // borrow the first one's words.
+        if self.unmeasured() {
+            return format!(
+                "working_copy_unmeasured: nothing has measured this working copy, so whether \
+                 graph truth is level with it is unknown and {clock}; an absence here cannot be \
+                 told apart from content the graph has not taken yet"
+            );
+        }
         format!(
             "graph_behind_working_tree: {} host path(s) on disk have never been admitted and \
              {clock}, so an absence here cannot be told apart from content the graph has not \
@@ -799,18 +881,47 @@ impl Durability {
     /// the graph had never met (FIR-2499). The counts are left exactly as
     /// observed, because they were never the wrong part; what changes is the
     /// claim made from them.
+    ///
+    /// The claim is three things and only the prose was withdrawn. `state` kept
+    /// reading `recorded` and `live_only_entities` kept reading zero beside a
+    /// note explaining that neither could be relied on, so a caller keying on
+    /// the fields, which is what fields are for, was told the all-clear the
+    /// sentence had just taken back (FIR-2820). Both move here. The derived
+    /// number goes rather than growing: how many entities an unadmitted file
+    /// holds is not knowable from a graph that never parsed it, and inventing a
+    /// figure is the one thing this object promises never to do.
+    ///
+    /// So the sentence does not state one either. The first version of this
+    /// composed its lead from `live_only_entities` and then withdrew the field,
+    /// which is the FIR-2499 failure with the halves swapped: a reader grepping
+    /// the payload for "0 uncommitted" over an unadmitted module still found it,
+    /// one clause before the note explained that no such number was derivable.
+    /// The lead now states the live count, which is a fact, and nothing else.
     pub fn qualified_by(mut self, behind: &GraphBehind) -> Self {
-        let counts = match (self.live_entities, self.live_only_entities) {
-            (Some(live), Some(live_only)) => format!("{live} entities, {live_only} uncommitted"),
-            (Some(live), None) => format!("{live} entities"),
-            _ => "this graph".to_string(),
+        let counts = match self.live_entities {
+            Some(live) => format!("{live} entities answered here"),
+            None => "this graph answered".to_string(),
         };
-        self.note = format!(
-            "{counts}, and {} host path(s) on disk that no admission has taken; this reading \
-             covers admitted content only. `kin admit` takes those paths now, and a commit takes \
-             them anyway.",
-            behind.unadmitted_paths
-        );
+        // Two readings and two sentences, for the same reason the limiting
+        // factor carries two: a measured count and no measurement at all send a
+        // reader to different levers, and one of them is `kin admit`.
+        self.note = if behind.unmeasured() {
+            format!(
+                "{counts}, and nothing has measured this working copy, so how much of it is \
+                 recorded is unknown; this reading covers admitted content only. `kin status` \
+                 reports the same, and a commit takes any unadmitted path anyway."
+            )
+        } else {
+            format!(
+                "{counts}, and {} host path(s) on disk that no admission has taken, so how much \
+                 of this working copy is recorded is unknown; this reading covers admitted \
+                 content only. `kin admit` takes those paths now, and a commit takes them \
+                 anyway.",
+                behind.unadmitted_paths
+            )
+        };
+        self.state = DURABILITY_UNKNOWN.to_string();
+        self.live_only_entities = None;
         self
     }
 
@@ -1892,6 +2003,34 @@ impl Envelope {
         self
     }
 
+    /// Read only what the daemon's health body says about the WORKING COPY,
+    /// leaving every count it carries alone.
+    ///
+    /// For the one answer that may not take the rest. `kin_graph_status` reports
+    /// the exact graph view the daemon selected, so borrowing `/health`'s entity
+    /// count or generation would put two authorities for one number in one
+    /// response, and the stdio path therefore skipped the health lift outright.
+    /// It skipped the reconcile block with it, so a graph-status answer could
+    /// never learn that the host holds content the graph has never met, and it
+    /// published "0 uncommitted" over exactly that working copy (FIR-2820).
+    ///
+    /// There is no second authority for these two. Neither describes the
+    /// selected graph: one counts host paths outside it and the other is a clock
+    /// about admissions. Durability is requalified if it is already set, and
+    /// [`Self::with_selected_graph_observation`] requalifies from `behind` when
+    /// it runs after this, so either order reaches the same reading.
+    pub fn with_working_copy_health(mut self, health: &Value) -> Self {
+        self.behind = GraphBehind::from_health(health);
+        self.freshness = GraphFreshness::from_health(health);
+        if let Some(behind) = self.behind.as_ref() {
+            self.durability = self
+                .durability
+                .take()
+                .map(|durability| durability.qualified_by(behind));
+        }
+        self
+    }
+
     /// Stamp the daemon storage capability without importing HEAD-scoped
     /// graph observations from `/health`.
     ///
@@ -2686,6 +2825,7 @@ mod tests {
             "reconcile": {
                 "untracked_path_count": 1,
                 "untracked_paths_sample": ["notekeeper/search.py"],
+                "untracked_observed_age_seconds": 0,
                 "last_admission_success_at": "2026-08-20T13:00:00Z",
             },
         }));
@@ -2717,6 +2857,19 @@ mod tests {
                 .contains("host path(s) on disk that no admission has taken"),
             "the note has to name what it does not cover: {}",
             durability.note
+        );
+        // FIR-2820. The half a caller keys on. Withdrawing the sentence and
+        // leaving `recorded` and a zero standing is telling a reader of the
+        // prose one thing and a reader of the fields the opposite, and the
+        // fields are what an agent branches on.
+        assert_eq!(
+            durability.state, DURABILITY_UNKNOWN,
+            "a store the working copy has outrun cannot report its work recorded"
+        );
+        assert_eq!(
+            durability.live_only_entities, None,
+            "how much of an unadmitted file is uncommitted is not derivable from a graph that \
+             never parsed it, so the number goes rather than growing"
         );
     }
 
@@ -2757,6 +2910,295 @@ mod tests {
             "the note has to keep naming what it does not cover: {}",
             durability.note
         );
+        // FIR-2820, on the second path for the same reason it is asserted on
+        // the first: this call requalifies rather than assigns, so a state that
+        // moved on one path and not the other is exactly the shape that stays
+        // green while shipping the defect.
+        assert_eq!(durability.state, DURABILITY_UNKNOWN, "{}", durability.note);
+        assert_eq!(durability.live_only_entities, None, "{}", durability.note);
+    }
+
+    /// FIR-2820. The one answer that may not take the counts still has to take
+    /// the working copy.
+    ///
+    /// `kin_graph_status` reports the graph view the daemon selected, so
+    /// borrowing `/health`'s entity count would put two authorities for one
+    /// number in one response, and the stdio path skipped the health lift
+    /// outright rather than pick. It skipped the reconcile block with it, and
+    /// published "0 uncommitted" over a working copy holding a module the graph
+    /// had never met.
+    #[test]
+    fn the_working_copy_lift_takes_the_reconcile_block_and_none_of_the_counts() {
+        let health = serde_json::json!({
+            "graph_entity_count": 900,
+            "durable_entity_count": 900,
+            "graph_generation": 77,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["linkgraph/predicates.py"],
+                "last_admission_success_at": "2026-08-27T09:00:00Z",
+            },
+        });
+        let env = Envelope::daemon()
+            .with_working_copy_health(&health)
+            .with_selected_graph_observation(6, 6, 0, 6, Some(6));
+
+        assert_eq!(
+            env.graph_state.entity_count,
+            Some(6),
+            "the selected graph's own count answers, never the health body's 900"
+        );
+        let behind = env.behind.as_ref().expect("the working copy was read");
+        assert_eq!(behind.unadmitted_paths, 1);
+        let durability = env.durability.expect("graph status reports the counts");
+        assert_eq!(
+            durability.state, DURABILITY_UNKNOWN,
+            "the reading has to move, or this lift changed nothing: {}",
+            durability.note
+        );
+        assert_eq!(durability.live_only_entities, None);
+        assert!(
+            durability
+                .note
+                .contains("host path(s) on disk that no admission has taken"),
+            "{}",
+            durability.note
+        );
+
+        // The order the stdio path does not use, asserted because either order
+        // has to reach the same reading or the fix depends on a call sequence
+        // nobody is holding still.
+        let reversed = Envelope::daemon()
+            .with_selected_graph_observation(6, 6, 0, 6, Some(6))
+            .with_working_copy_health(&health)
+            .durability
+            .expect("graph status reports the counts");
+        assert_eq!(reversed.state, DURABILITY_UNKNOWN);
+        assert_eq!(reversed.live_only_entities, None);
+    }
+
+    /// The control for the lift above: a store with nothing unadmitted keeps the
+    /// clean graph-status reading, so this cannot qualify every answer.
+    #[test]
+    fn the_working_copy_lift_leaves_a_level_store_alone() {
+        let env = Envelope::daemon()
+            .with_working_copy_health(&serde_json::json!({
+                // Stamped, which is what makes the zero an all-clear rather
+                // than a default nothing measured.
+                "reconcile": {
+                    "untracked_path_count": 0,
+                    "untracked_observed_age_seconds": 0,
+                },
+            }))
+            .with_selected_graph_observation(6, 6, 0, 6, Some(6));
+
+        assert!(env.behind.is_none(), "nothing unadmitted is nothing to say");
+        let durability = env.durability.expect("graph status reports the counts");
+        assert_eq!(durability.state, DURABILITY_RECORDED);
+        assert_eq!(durability.live_only_entities, Some(0));
+    }
+
+    /// FIR-2820, the review's second finding. A zero nobody measured is not a
+    /// zero, and the first version of this gated on the count alone.
+    ///
+    /// Two routes reach an unstamped zero on a daemon that should have measured:
+    /// a walk that errored, which is logged and swallowed so the previous
+    /// reading stands, and a daemon that has not walked yet. On both,
+    /// `kin status` correctly answered "not measured" while durability, behind
+    /// and negative on the same daemon at the same instant answered
+    /// "0 uncommitted", `recorded` and `authoritative`. That is the ticket's own
+    /// two-readers-disagreeing shape, inverted: the field existed and three of
+    /// its four readers ignored it.
+    #[test]
+    fn an_unmeasured_working_copy_is_a_disclosure_rather_than_a_zero() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": { "untracked_path_count": 0 },
+        }));
+
+        let behind = env
+            .behind
+            .as_ref()
+            .expect("a zero with no measurement behind it is a disclosure");
+        assert!(behind.unmeasured());
+        assert_eq!(behind.measured_age_seconds, None);
+        assert!(
+            behind.limiting_factor().contains("working_copy_unmeasured"),
+            "an unmeasured reading must not borrow the behind-by-a-count words, which send a \
+             reader to `kin admit` for a path that does not exist: {}",
+            behind.limiting_factor()
+        );
+
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(
+            durability.state, DURABILITY_UNKNOWN,
+            "a working copy nobody measured cannot report its work recorded: {}",
+            durability.note
+        );
+        assert_eq!(durability.live_only_entities, None);
+        assert!(
+            durability
+                .note
+                .contains("nothing has measured this working copy"),
+            "{}",
+            durability.note
+        );
+    }
+
+    /// The predicate reads both halves, and this asserts the predicate rather
+    /// than the producer's invariant.
+    ///
+    /// `from_health` never emits a stamped zero, so within that one producer the
+    /// count would be discriminator enough and the `measured` half of the
+    /// conjunct would be a clause no mutation could kill. The clause is there
+    /// for a caller that builds one of these itself, and a check that cannot
+    /// fail is worth nothing, so the object is built here by hand.
+    #[test]
+    fn a_stamped_zero_is_not_the_unmeasured_shape() {
+        let stamped = GraphBehind {
+            unadmitted_paths: 0,
+            since: None,
+            sample: Vec::new(),
+            measured_age_seconds: Some(9),
+            measured: true,
+            note: String::new(),
+        };
+        assert!(
+            !stamped.unmeasured(),
+            "a walk ran and found nothing, which is an all-clear and not an absence of one"
+        );
+
+        let unstamped = GraphBehind {
+            measured_age_seconds: None,
+            measured: false,
+            ..stamped.clone()
+        };
+        assert!(
+            unstamped.unmeasured(),
+            "the same zero with nothing behind it is the disclosure"
+        );
+
+        let counted = GraphBehind {
+            unadmitted_paths: 3,
+            measured_age_seconds: None,
+            measured: false,
+            ..stamped
+        };
+        assert!(
+            !counted.unmeasured(),
+            "a count with no stamp is still a count, and `kin admit` is still the remedy"
+        );
+    }
+
+    /// FIR-2820, the delta review's finding 12. The disclosure has to be honest
+    /// on the wire, not only in Rust.
+    ///
+    /// The unmeasured shape reaches a machine consumer as `unadmitted_paths: 0`,
+    /// which is the exact number it exists to say means nothing, and the only
+    /// other tell was the ABSENCE of `measured_age_seconds`, which
+    /// `skip_serializing_if` drops. Inferring from an absence is what this whole
+    /// ticket is about, so the block states it positively and the serialized
+    /// form is what this test reads.
+    #[test]
+    fn the_serialized_behind_block_says_whether_anything_measured_it() {
+        let unmeasured = GraphBehind::from_health(&serde_json::json!({
+            "reconcile": { "untracked_path_count": 0 },
+        }))
+        .expect("an unstamped zero is a disclosure");
+        let wire = serde_json::to_value(&unmeasured).expect("the block serializes");
+        assert_eq!(
+            wire.get("measured"),
+            Some(&serde_json::json!(false)),
+            "a consumer branching on the count alone reads 0 here: {wire}"
+        );
+        assert_eq!(
+            wire.get("unadmitted_paths"),
+            Some(&serde_json::json!(0)),
+            "and that zero is still what it reads, which is why the flag is beside it: {wire}"
+        );
+        assert!(
+            wire.get("measured_age_seconds").is_none(),
+            "the age is absent on this shape, which is the inference the flag replaces: {wire}"
+        );
+
+        let measured = GraphBehind::from_health(&serde_json::json!({
+            "reconcile": {
+                "untracked_path_count": 2,
+                "untracked_observed_age_seconds": 4,
+            },
+        }))
+        .expect("a nonzero count is a disclosure");
+        let wire = serde_json::to_value(&measured).expect("the block serializes");
+        assert_eq!(
+            wire.get("measured"),
+            Some(&serde_json::json!(true)),
+            "the control: a walk did produce this count: {wire}"
+        );
+        assert_eq!(
+            wire.get("measured_age_seconds"),
+            Some(&serde_json::json!(4))
+        );
+    }
+
+    /// The control that keeps the gate above from firing on every daemon whose
+    /// graph is its own write authority.
+    ///
+    /// Filesystem ingestion off means nothing on disk is ever admitted, so host
+    /// content is not a gap the graph failed to close and there is no walk to
+    /// miss. Gating on the stamp alone would turn every such daemon into a
+    /// permanent disclosure, which is why the daemon names this case rather than
+    /// leaving the envelope to infer it.
+    #[test]
+    fn a_daemon_that_admits_nothing_from_the_filesystem_stays_silent() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 51,
+            "durable_entity_count": 51,
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observation_not_applicable": true,
+            },
+        }));
+
+        assert!(
+            env.behind.is_none(),
+            "a projected checkout is not evidence about what the graph failed to admit: {:?}",
+            env.behind
+        );
+        let durability = env.durability.expect("the counts still answer");
+        assert_eq!(durability.state, DURABILITY_RECORDED);
+        assert_eq!(durability.live_only_entities, Some(0));
+    }
+
+    /// The note the fields withdrew must not survive in the sentence.
+    ///
+    /// FIR-2499 withdrew the prose and left the fields; the first version of
+    /// this fix withdrew the fields and left the prose, composing its own lead
+    /// out of `live_only_entities` one statement before setting it to `None`. A
+    /// stranger grepping the payload for "0 uncommitted" over an unadmitted
+    /// module still found it.
+    #[test]
+    fn a_qualified_durability_note_states_no_uncommitted_count() {
+        let env = Envelope::daemon().with_health(&serde_json::json!({
+            "graph_entity_count": 6,
+            "durable_entity_count": 6,
+            "reconcile": {
+                "untracked_path_count": 1,
+                "untracked_paths_sample": ["linkgraph/predicates.py"],
+                "untracked_observed_age_seconds": 0,
+            },
+        }));
+        let durability = env.durability.expect("the counts still answer");
+        assert!(
+            !durability.note.contains("uncommitted"),
+            "the field is gone and the sentence has to go with it: {}",
+            durability.note
+        );
+        assert!(
+            durability.note.contains("6 entities answered here"),
+            "the live count is a fact and stays: {}",
+            durability.note
+        );
     }
 
     /// The control for the case above, and the one that keeps this from
@@ -2767,7 +3209,12 @@ mod tests {
         let env = Envelope::daemon().with_health(&serde_json::json!({
             "graph_entity_count": 51,
             "durable_entity_count": 51,
-            "reconcile": { "untracked_path_count": 0 },
+            // Stamped: a measured zero is the all-clear, an unstamped one is the
+            // disclosure the test below this asserts.
+            "reconcile": {
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 3,
+            },
         }));
 
         assert!(env.behind.is_none(), "nothing unadmitted is nothing to say");

@@ -955,6 +955,18 @@ enum ScanMode {
     /// [`ScanMode::Content`] by two rules: a tracked path is never kept, and
     /// neither is a leaf inside a directory graph truth has never met.
     ModifiedSince(SystemTime),
+    /// Keep the path of every admissible leaf graph truth does not track, and
+    /// nothing else. Opens nothing, hashes nothing, stats nothing beyond the
+    /// directory entry the walk already read, and produces no completion proof.
+    ///
+    /// This is the measurement [`ScanMode::ModifiedSince`] is deliberately not.
+    /// That mode proposes work to admit with no operator in the loop, so it
+    /// declines a whole directory graph truth has never met, on the grounds
+    /// that modification times cannot tell a clone from authored work. Naming
+    /// content is the opposite obligation: a reader asking whether the graph is
+    /// level with the working copy has to be told about that directory, and its
+    /// own comment says the behind disclosure is what counts and names it.
+    Untracked,
 }
 
 /// Repository paths whose host entry was last modified at or after `since`.
@@ -1003,6 +1015,47 @@ pub fn scan_repository_modified_since<'a>(
     Ok(scanner.modified)
 }
 
+/// Repository paths on the host that graph truth does not carry.
+///
+/// The measurement behind every "is the graph level with the working copy"
+/// claim the product makes. It walks with the content scan's own rules, through
+/// the same [`Scanner`], and keeps a path rather than reading a byte, so it can
+/// answer that question at the moment it is asked instead of from whatever a
+/// previous pass happened to record.
+///
+/// That distinction is the whole reason it exists. The reconcile loop records
+/// this set as a side effect of a pass, and an explicit seam records it empty
+/// because the seam admitted everything. Both records are true when written and
+/// neither expires, so between a host write and the pass that observes it the
+/// recorded answer is zero while the working copy holds a module the graph has
+/// never met. Three surfaces read that zero as a verified all-clear (FIR-2820).
+///
+/// Produces no [`CompleteScanToken`], which is deliberate: this walk observed no
+/// content and must never be mistaken for one that did.
+pub fn scan_repository_untracked_paths<'a>(
+    root: &Path,
+    ignore: &RepositoryIgnore,
+    policy: Option<&ResolvedAdmissionMatcher>,
+    tracked_paths: impl IntoIterator<Item = &'a RepoPath>,
+    graph_only_paths: impl IntoIterator<Item = &'a RepoPath>,
+) -> Result<Vec<RepoPath>, IncompleteRepositoryScan> {
+    let mut scanner = prepare_scanner(
+        root,
+        ignore,
+        policy,
+        tracked_paths,
+        graph_only_paths,
+        ScanMode::Untracked,
+    )?;
+    scanner.walk(root, false, true)?;
+    // Sorted, because the bounded sample a disclosure prints is the head of
+    // this list and directory order is whatever the host hands back. A sample
+    // that reshuffles between two readings of one unchanged working copy reads
+    // as the set having changed.
+    scanner.modified.sort();
+    Ok(scanner.modified)
+}
+
 /// Was this directory entry last modified at or after `since`?
 ///
 /// `None` means the entry is no longer there. An unreadable modification time
@@ -1028,7 +1081,7 @@ struct Scanner<'a> {
     entries: BTreeMap<RepoPath, ScannedRepositoryEntry>,
     diagnostics: RepositoryScanDiagnostics,
     mode: ScanMode,
-    /// Paths [`ScanMode::ModifiedSince`] kept. Empty in every other mode.
+    /// Paths a stat-only mode kept. Empty under [`ScanMode::Content`].
     modified: Vec<RepoPath>,
 }
 
@@ -1197,6 +1250,21 @@ impl Scanner<'_> {
             if !self.tracked_paths.contains(&repo_path)
                 && self.policy_excludes_untracked(&repo_path, false)
             {
+                continue;
+            }
+
+            // A measurement pass stops here, one exclusion earlier than the
+            // proposing one below, because it proposes nothing. Every rule
+            // above has already run, so what it keeps is exactly the set a
+            // content walk would have admitted and graph truth does not carry,
+            // minus every read. Restricted to the two leaf kinds the content
+            // walk admits so this mode invents no membership of its own.
+            if matches!(self.mode, ScanMode::Untracked) {
+                if !self.tracked_paths.contains(&repo_path)
+                    && (file_type.is_file() || file_type.is_symlink())
+                {
+                    self.modified.push(repo_path);
+                }
                 continue;
             }
 
@@ -1545,6 +1613,125 @@ mod tests {
             )],
         )
         .unwrap()
+    }
+
+    /// FIR-2820. The measurement every "is the graph level with the working
+    /// copy" claim rests on, and the two rules that decide what it may name.
+    ///
+    /// A tracked path is not untracked and never appears. A leaf inside a
+    /// directory graph truth has never met DOES appear, which is where this
+    /// parts company with [`scan_repository_modified_since`]: that mode
+    /// proposes work to admit with no operator in the loop and declines a whole
+    /// unmet directory on the grounds that a clone looks like authored work,
+    /// and its own comment says this reading is what counts and names that
+    /// content instead.
+    #[test]
+    fn the_untracked_measurement_names_host_content_graph_truth_does_not_carry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::create_dir_all(root.join("known")).unwrap();
+        std::fs::write(root.join("known/tracked.py"), "TRACKED = 1\n").unwrap();
+        std::fs::write(root.join("known/fresh.py"), "FRESH = 2\n").unwrap();
+        // A directory nothing has ever admitted, arriving whole.
+        std::fs::create_dir_all(root.join("brand_new")).unwrap();
+        std::fs::write(root.join("brand_new/module.py"), "NEW = 3\n").unwrap();
+
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let tracked = [path("known/tracked.py")];
+        let untracked = scan_repository_untracked_paths(
+            root,
+            &ignore,
+            None,
+            tracked.iter(),
+            std::iter::empty::<&RepoPath>(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            untracked,
+            vec![path("brand_new/module.py"), path("known/fresh.py")],
+            "the measurement names every admissible leaf authority does not carry, in a \
+             directory it knows and one it has never met"
+        );
+
+        // The control that keeps this from naming everything: a working copy
+        // whose every leaf is tracked measures nothing, which is what makes a
+        // count of zero worth reporting rather than noise.
+        let all_tracked = [
+            path("brand_new/module.py"),
+            path("known/fresh.py"),
+            path("known/tracked.py"),
+        ];
+        assert!(
+            scan_repository_untracked_paths(
+                root,
+                &ignore,
+                None,
+                all_tracked.iter(),
+                std::iter::empty::<&RepoPath>(),
+            )
+            .unwrap()
+            .is_empty(),
+            "a fully admitted working copy has nothing untracked to name"
+        );
+    }
+
+    /// FIR-2820. The measurement shares the content walk's exclusion rules,
+    /// through the same scanner, so the two can never disagree about what the
+    /// repository holds.
+    ///
+    /// This is the failure a second traversal written beside the first would
+    /// have: a path the content walk refuses to admit, reported as content
+    /// nothing has admitted yet, sends a reader to `kin admit` for a file no
+    /// admission will ever take.
+    #[test]
+    fn the_untracked_measurement_excludes_exactly_what_the_content_walk_excludes() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        std::fs::write(root.join(".kinignore"), "ignored.py\n").unwrap();
+        std::fs::write(root.join("ignored.py"), "IGNORED = 1\n").unwrap();
+        std::fs::write(root.join("excluded.py"), "EXCLUDED = 2\n").unwrap();
+        std::fs::write(root.join("kept.py"), "KEPT = 3\n").unwrap();
+
+        let ignore = RepositoryIgnore::load(root).unwrap();
+        let policy = graph_owned_policy("excluded.py\n");
+        let untracked = scan_repository_untracked_paths(
+            root,
+            &ignore,
+            Some(&policy),
+            std::iter::empty::<&RepoPath>(),
+            std::iter::empty::<&RepoPath>(),
+        )
+        .unwrap();
+
+        let content = scan_repository_preserving_graph_only(
+            root,
+            &ignore,
+            Some(&policy),
+            std::iter::empty::<&RepoPath>(),
+            std::iter::empty::<&RepoPath>(),
+        )
+        .unwrap();
+        let admitted = content.paths().cloned().collect::<Vec<_>>();
+
+        assert_eq!(
+            untracked, admitted,
+            "with nothing tracked, what the measurement names and what the content walk would \
+             admit are the same set: measured {untracked:?}, admissible {admitted:?}"
+        );
+        assert!(
+            !untracked.contains(&path("ignored.py")),
+            "the ignore rules bind the measurement: {untracked:?}"
+        );
+        assert!(
+            !untracked.contains(&path("excluded.py")),
+            "the graph-owned policy binds it too: {untracked:?}"
+        );
+        assert!(
+            untracked.contains(&path("kept.py")),
+            "and the positive control has to survive both, or this proves only that the walk \
+             refuses everything: {untracked:?}"
+        );
     }
 
     /// The walk skips what the graph-owned policy excludes, and does not read

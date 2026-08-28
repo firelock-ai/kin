@@ -3160,6 +3160,7 @@ async fn health(
     let coordination_event_persist_failures = state
         .coordination_event_persist_failures
         .load(std::sync::atomic::Ordering::Relaxed);
+    measure_untracked_host_content(&state).await;
     let sampled_at = std::time::Instant::now();
     let background_passes = state.background_work.reports(sampled_at);
     let background_pass_stopped = state.background_work.any_stopped();
@@ -4204,7 +4205,7 @@ async fn command_dead_code(
     // daemon holds it (FIR-2524). A clean "No dead code found." off a degraded
     // daemon is the one way that line can lie, and a thinner envelope is exactly
     // what would hide it.
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
     let response = kin_cli::commands::dead_code::build_dead_code_response(
         Some(&repository_authority),
         graph.as_ref(),
@@ -4237,7 +4238,7 @@ async fn command_dead_code_seeded(
 
     let session_id = extract_session_id_from_headers(&headers)?;
     let graph = resolve_session_graph(&state, session_id.as_ref()).await;
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
     let response = kin_cli::commands::dead_code::build_dead_code_seeded_response(
         graph.as_ref(),
         &request,
@@ -4375,7 +4376,7 @@ async fn command_refs(
     // impact route builds one (FIR-2524): only the daemon holds it, and a
     // thinner envelope is the shortcut that makes the CLI MORE confident than
     // MCP on exactly the degraded daemon nobody exercises.
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
     let response = kin_cli::commands::refs::build_refs_response(
         &state.layout,
         graph.as_ref(),
@@ -6937,7 +6938,7 @@ async fn search(
         // Same substrate reading the impact and trace routes supply, from the
         // same helper, so no CLI surface can be more confident than its MCP
         // counterpart about one daemon at one instant (FIR-2524).
-        &kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state)),
+        &kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await),
     )
     .map_err(internal_error)?;
     if req.show_body {
@@ -6993,7 +6994,7 @@ async fn trace(
     // Same substrate reading the impact route supplies, from the same helper, so
     // `kin trace` and `get_context_pack` cannot disagree about one daemon at one
     // instant (FIR-2524).
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
     let result = kin_cli::commands::trace::build_trace_response(
         &state.layout,
         &repository_authority,
@@ -7016,7 +7017,44 @@ async fn trace(
 ///
 /// `graph_loaded` is derived from a nonzero entity count exactly as `/health`
 /// derives it, rather than asserted.
-fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
+/// Read host content graph truth does not carry, before anything states that it
+/// does.
+///
+/// A recorded zero does not expire, so a reading inherited from whatever pass
+/// ran last states an all-clear measured at the previous commit over a working
+/// copy that has moved since (FIR-2820). The walk rate-limits itself and runs
+/// off the runtime's worker threads. A failure leaves the previous reading
+/// standing with its own age rather than clearing it, which is the honest
+/// fallback because the age is what every surface judges the count by.
+async fn measure_untracked_host_content(state: &Arc<DaemonState>) {
+    let probing = Arc::clone(state);
+    match tokio::task::spawn_blocking(move || {
+        crate::loop_runner::refresh_untracked_reading(&probing)
+    })
+    .await
+    {
+        Ok(Ok(_)) => {}
+        Ok(Err(error)) => {
+            tracing::debug!(%error, "could not measure untracked host content")
+        }
+        Err(error) => {
+            tracing::debug!(%error, "the untracked host-content measurement did not run")
+        }
+    }
+}
+
+/// The health an answer's own envelope is built from.
+///
+/// Async and measuring, because the alternative is a second authority for one
+/// fact. This snapshot carried `initialized`, `graph_loaded` and two degraded
+/// flags, so every envelope built from it reached the negative gates with no
+/// reconcile reading at all, and `graph_behind_working_tree` could not fire on
+/// any daemon-built answer however far behind the store was: the stdio shim
+/// decorated `_kin.behind` from its own `/health` probe afterwards, while the
+/// `negative` block a caller acts on had already certified the absence from
+/// this thinner body (FIR-2820). The two now read one snapshot.
+async fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
+    measure_untracked_host_content(state).await;
     let entity_count = state.graph.entity_count();
     serde_json::json!({
         "initialized": state
@@ -7024,6 +7062,7 @@ fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
             .load(std::sync::atomic::Ordering::Relaxed),
         "graph_loaded": entity_count > 0,
         "graph_entity_count": entity_count as u64,
+        "durable_entity_count": state.durable_entity_count(),
         "graph_generation": state
             .snapshot_generation
             .load(std::sync::atomic::Ordering::Relaxed),
@@ -7033,6 +7072,9 @@ fn daemon_health_snapshot(state: &Arc<DaemonState>) -> serde_json::Value {
         "mass_deletion_blocked": state
             .mass_deletion_blocked
             .load(std::sync::atomic::Ordering::Relaxed),
+        "reconcile": state
+            .background_work
+            .reconcile_report(std::time::Instant::now()),
     })
 }
 
@@ -7064,7 +7106,7 @@ async fn impact(
     // degraded signal makes the CLI MORE confident than MCP on exactly the
     // degraded daemon nobody exercises, and every test written against a healthy
     // one would pass.
-    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
     let result = kin_cli::commands::impact::build_impact_response(
         &state.layout,
         graph.as_ref(),
@@ -10184,7 +10226,8 @@ async fn mcp_tools_call_inner(
         };
         // Same substrate reading the CLI route gets, so this MCP path and
         // `kin dead-code <query>` cannot reach different verdicts on one store.
-        let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state));
+        let envelope =
+            kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
         let result = match kin_cli::commands::dead_code::build_dead_code_seeded_response(
             graph.as_ref(),
             &req,

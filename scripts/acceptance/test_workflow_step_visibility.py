@@ -112,6 +112,11 @@ EXPECTED_SUITES = (
         "verdict_limits",
         "acceptance/verdict_limits.json",
     ),
+    ExpectedSuite(
+        "scripts/acceptance/working_copy_freshness_repro.py",
+        "working_copy_freshness",
+        "acceptance/working_copy_freshness.json",
+    ),
 )
 
 
@@ -1007,6 +1012,9 @@ def main() -> int:
         print("VIOLATION: %s" % problem)
     if problems:
         return 1
+    # Counted from the reviewed inventory rather than written out. A hardcoded
+    # total drifts the moment a suite is added, and it drifts downward silently:
+    # the guard keeps passing while its own summary understates what it graded.
     print(
         "workflow authority holds: %d suite reports reach one always-running verdict in order"
         % len(EXPECTED_SUITES)
