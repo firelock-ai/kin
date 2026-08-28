@@ -1025,15 +1025,26 @@ impl SpineStore for FakeSpineStore {
             });
         }
         let mut deleted = 0usize;
+        // Drop the whole entry once its last row goes. Firestore has no
+        // concept of an emptied collection: deleting every document leaves
+        // nothing to find, so a key surviving with an empty vector is a
+        // phantom the real store cannot produce, and a caller asking whether
+        // any rows remain gets the wrong answer from it.
         if let Some(rows) = state.entity_rows.get_mut(&publication_id) {
             let take = entity_take.min(rows.len());
             rows.drain(..take);
             deleted += take;
+            if rows.is_empty() {
+                state.entity_rows.remove(&publication_id);
+            }
         }
         if let Some(rows) = state.edge_rows.get_mut(&publication_id) {
             let take = edge_take.min(rows.len());
             rows.drain(..take);
             deleted += take;
+            if rows.is_empty() {
+                state.edge_rows.remove(&publication_id);
+            }
         }
         if remove_manifest && state.manifests.remove(&publication_id).is_some() {
             deleted += 1;
@@ -1041,6 +1052,8 @@ impl SpineStore for FakeSpineStore {
         if remove_stage && state.stages.remove(&publication_id).is_some() {
             state.stage_marker_values.remove(&publication_id);
             state.stage_revisions.remove(&publication_id);
+            state.stage_update_times.remove(&publication_id);
+            state.stage_extra_age.remove(&publication_id);
             deleted += 1;
         } else {
             let stage_sequence = state
