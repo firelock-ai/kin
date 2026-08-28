@@ -1917,9 +1917,10 @@ pub struct DaemonState {
     /// separate HTTP calls) must live here to survive between calls; sessions and
     /// intents persist through the graph, but transactions have no graph backing.
     pub mcp_transactions: Mutex<HashMap<String, kin_mcp::McpTransaction>>,
-    /// Cached locate entity-rankings keyed by paging-cursor key, so `kin locate
-    /// --next` (and `semantic_locate` cursors) page a held ranking without
-    /// re-running retrieval. Bounded by [`LOCATE_RANKING_CACHE_CAP`].
+    /// Cached locate rankings keyed by paging-cursor key, so `kin locate
+    /// --next` (and fused `semantic_locate` cursors) page the held entity or file
+    /// primary without re-running retrieval. Bounded by
+    /// [`LOCATE_RANKING_CACHE_CAP`].
     pub locate_rankings: Mutex<HashMap<String, CachedLocateRanking>>,
     /// Cached `semantic_locate` result pages keyed by paging-cursor key.
     pub semantic_locate_pages: Mutex<HashMap<String, CachedSemanticPage>>,
@@ -1967,13 +1968,22 @@ fn new_repo_semantic_cursor_secret() -> [u8; 32] {
     secret
 }
 
-/// Cached full locate entity-ranking for cursor paging. The daemon caches the
-/// FULL ranked entity list once per (query, ref/scope, graph-version, body-mode)
-/// so a follow-up page (`kin locate --next`) windows the next slice with no
-/// retrieval re-run. `graph_version` is checked on lookup so a stale page (the
-/// graph moved under the cursor) is rejected rather than served.
+/// Cached full locate ranking for cursor paging. The daemon holds both entity
+/// and file projections; the cursor's recorded granularity chooses which one is
+/// primary. A follow-up windows that same collection with no retrieval re-run.
+/// `graph_version` is checked on lookup so a stale page is rejected rather than
+/// served after the graph moves.
 pub struct CachedLocateRanking {
+    /// The primary query this ranking answered. Cursor-only continuations carry
+    /// no query text of their own, and response evidence must still be derived
+    /// against the same query that produced page zero.
+    pub query: String,
     pub entities: Vec<kin_cli::commands::locate::LocateEntity>,
+    /// File-level ranking and diagnostics describe the same held query. File
+    /// granularity reads `files[]` as its answer, so dropping it on a cursor
+    /// page turns a populated page zero into an empty continuation.
+    pub files: Vec<kin_cli::commands::locate::LocateFileEntry>,
+    pub debug: Option<kin_cli::commands::locate::LocateDebugInfo>,
     /// The fused query variants this ranking was built from, primary first, or
     /// empty when nothing was fused.
     ///
@@ -1982,6 +1992,38 @@ pub struct CachedLocateRanking {
     /// variant echo while its hits still named variants one by one, which is why
     /// per-hit attribution could not simply index the response's own list.
     pub queries: Vec<String>,
+    /// Additional variants the caller explicitly supplied. Omitted cursor
+    /// fields inherit this shape; an explicitly repeated list must match it.
+    /// Kept separately from `queries`, which is the effective fused echo and
+    /// can also contain an automatically generated sharp variant.
+    pub requested_queries: Vec<String>,
+    /// Whether test-role entities participated in the held ranking.
+    pub include_tests: bool,
+    /// Explicit ref used to build this ranking, if any. A continuation may omit
+    /// it and inherit the held scope, but cannot name a different ref.
+    pub reference: Option<String>,
+    /// Retrieval breadth used for the held ranking. A cursor can change its
+    /// page width, not retroactively widen or narrow candidate discovery.
+    pub max_files: usize,
+    /// Whether retrieval constructed the full explanation/debug shape. A
+    /// continuation cannot synthesize this when page zero did not build it.
+    pub explain: bool,
+    /// Query-time coverage and degradations apply to the whole held ranking,
+    /// not only its first window. Keep them beside the entities so a cursor page
+    /// cannot silently look healthier than page zero.
+    pub semantic_coverage: Option<kin_cli::commands::locate::SemanticCoverage>,
+    pub degradations: Vec<kin_cli::commands::locate::RetrievalDegradation>,
+    /// Which public result surface page zero used. A cursor supplies the cache
+    /// key directly, so the continuation must not reinterpret a held file
+    /// ranking as entity granularity, or vice versa.
+    pub file_granularity: bool,
+    /// Whether the fused serializer duplicated `body` as `snippet` on page
+    /// zero. A bare cursor continuation reuses the same response projection.
+    pub snippet_alias: bool,
+    /// Width used to mint the first cursor. A continuation with no explicit
+    /// override keeps this width; an explicit override remains authoritative so
+    /// the response-budget remediation can recover rows withheld from page zero.
+    pub page_size: usize,
     pub graph_version: u64,
     /// Which entity projection this ranking was built in
     /// ([`kin_cli::commands::locate::projection_mode`]).
@@ -2002,11 +2044,26 @@ pub struct CachedLocateRanking {
     pub created: Instant,
 }
 
-/// Cached full `semantic_locate` result rows for cursor paging — the entity-
-/// granularity analogue of [`CachedLocateRanking`], holding the already-projected
-/// per-entity JSON rows so a follow-up page is a pure window.
+/// Cached full cosine `semantic_locate` result rows for cursor paging, holding
+/// already-projected entity rows or one representative row per file so a
+/// follow-up page is a pure window over the same declared primary collection.
 pub struct CachedSemanticPage {
+    /// The primary query this ranking answered. Used on cursor-only pages for
+    /// the query echo and name-match evidence.
+    pub query: String,
     pub rows: Vec<serde_json::Value>,
+    /// Coverage observed when this ranking was computed. A later page is a
+    /// window over that held result, so reporting a newer live coverage state
+    /// would describe work that did not produce the cached rows.
+    pub semantic_coverage: kin_cli::commands::locate::SemanticCoverage,
+    /// Query-time retrieval degradations apply to every page of these rows.
+    pub degradations: Vec<kin_cli::commands::locate::RetrievalDegradation>,
+    /// The granularity page zero serialized these rows under.
+    pub file_granularity: bool,
+    /// Whether explicit test-role inclusion shaped this held cosine ranking.
+    pub include_tests: bool,
+    /// Original page width, used only when the continuation omits one.
+    pub page_size: usize,
     pub graph_version: u64,
     /// Which projection these rows were built in. Same reason as
     /// [`CachedLocateRanking::mode`]: the cursor supplies the key, so the mode has

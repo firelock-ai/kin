@@ -996,25 +996,22 @@ fn render_human_result(
     // only trace an unwatched kill leaves, and this is the summary a reader is
     // already looking at when they need it.
     let daemon_death = crate::daemon_death::recorded_for_store(result.layout.root());
-    writeln!(
-        out,
-        "  Semantic enrichment: {}",
-        render_semantic_enrichment(semantic_enrichment, daemon_death.as_ref(), cross_file)
-    )?;
-    if let Some(warning) = enrichment_kill_warning(daemon_death.as_ref()) {
-        writeln!(out, "{warning}")?;
+    let guidance = ordered_init_guidance_lines(
+        format!(
+            "  Semantic enrichment: {}",
+            render_semantic_enrichment(semantic_enrichment, daemon_death.as_ref(), cross_file)
+        ),
+        enrichment_kill_warning(daemon_death.as_ref()),
+        cross_file_pending_notice(semantic_enrichment, cross_file),
+        semantic_absence_notice(semantic_enrichment),
+        format!(
+            "  {}",
+            embedding_model_notice(&crate::embed_model::EmbedModelFetch::probe(false))
+        ),
+    );
+    for line in guidance {
+        writeln!(out, "{line}")?;
     }
-    if let Some(notice) = cross_file_pending_notice(semantic_enrichment, cross_file) {
-        writeln!(out, "{notice}")?;
-    }
-    if let Some(notice) = semantic_absence_notice(semantic_enrichment) {
-        writeln!(out, "{notice}")?;
-    }
-    writeln!(
-        out,
-        "  {}",
-        embedding_model_notice(&crate::embed_model::EmbedModelFetch::probe(false))
-    )?;
     writeln!(
         out,
         "  Store size: {}",
@@ -1025,6 +1022,27 @@ fn render_human_result(
         writeln!(out, "{line}")?;
     }
     Ok(out)
+}
+
+/// Keep language-server and cross-file guidance before the embedding notice.
+///
+/// The inputs are already-rendered lines so the ordering contract is pure and
+/// can be tested without probing a host or mutating an environment. `kin init`
+/// measured LSP enrichment as the material contributor on the reported stores;
+/// embedding advice must not lead the section while that guidance follows it.
+fn ordered_init_guidance_lines(
+    semantic_enrichment: String,
+    enrichment_kill: Option<String>,
+    cross_file_pending: Option<String>,
+    semantic_absence: Option<String>,
+    embedding_model: String,
+) -> Vec<String> {
+    let mut lines = vec![semantic_enrichment];
+    lines.extend(enrichment_kill);
+    lines.extend(cross_file_pending);
+    lines.extend(semantic_absence);
+    lines.push(embedding_model);
+    lines
 }
 
 /// What this command owes a reader about the embedding model.
@@ -1263,6 +1281,30 @@ fn initialized_raw_git_head(result: &kin_core::InitResult) -> Option<&kin_model:
 mod tests {
     use super::*;
     use crate::commands::status::SemanticEnrichmentView;
+
+    /// Pin the LSP-first output contract so an embedding notice cannot drift
+    /// ahead of the materially stronger cross-file guidance.
+    #[test]
+    fn init_places_semantic_enrichment_guidance_before_embedding_advice() {
+        let lines = ordered_init_guidance_lines(
+            "  Semantic enrichment: partial".to_string(),
+            Some("language-server sweep was killed".to_string()),
+            Some("cross-file relations are pending".to_string()),
+            Some("no cross-file edge was produced".to_string()),
+            "  Embedding model: fetch pending".to_string(),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "  Semantic enrichment: partial",
+                "language-server sweep was killed",
+                "cross-file relations are pending",
+                "no cross-file edge was produced",
+                "  Embedding model: fetch pending",
+            ],
+            "every LSP and cross-file line must precede the embedding notice"
+        );
+    }
 
     /// `--adopt-repository-id` and no flag at all mean opposite things, so a
     /// blank value must not quietly become the second one.

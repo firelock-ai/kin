@@ -61,6 +61,19 @@ pub enum McpError {
 /// [`McpError::is_graph_authority_gap`] is the only reader of it.
 pub const GRAPH_AUTHORITY_GAP_PREFIX: &str = "graph authority gap";
 
+/// True when a MESSAGE reports an authority gap, wherever the prefix sits in it.
+///
+/// Two callers need this question answered and one of them holds a string
+/// rather than an error: a tool result reports its failure as text, and by the
+/// time it arrives the producer's message has been wrapped, so the prefix is no
+/// longer at position zero. A reader matching only the start of the string and
+/// a reader matching anywhere gave the same input opposite verdicts on
+/// `retryable`, which is why the containment test lives here once and both
+/// readers call it.
+pub fn is_graph_authority_gap_message(message: &str) -> bool {
+    message.contains(GRAPH_AUTHORITY_GAP_PREFIX)
+}
+
 impl McpError {
     pub fn graph<E: std::error::Error>(err: E) -> Self {
         McpError::GraphStore(err.to_string())
@@ -72,10 +85,7 @@ impl McpError {
     /// A hosted route answers the first with a retryable service error and the
     /// second with a request error, so the distinction decides a status code.
     pub fn is_graph_authority_gap(&self) -> bool {
-        matches!(
-            self,
-            McpError::Context(message) if message.starts_with(GRAPH_AUTHORITY_GAP_PREFIX)
-        )
+        matches!(self, McpError::Context(message) if is_graph_authority_gap_message(message))
     }
 
     /// Convert to a JSON-RPC error code.
@@ -113,6 +123,92 @@ mod tests {
             GRAPH_AUTHORITY_GAP_PREFIX, "graph authority gap",
             "the producers in handlers::repository_authority spell this literally"
         );
+    }
+
+    /// The join over the real producer set.
+    ///
+    /// Both assertions above are about the READER. Roughly thirty production
+    /// sites write this prefix as a literal, and nothing tied them to the
+    /// constant: a producer that drifts to a different spelling leaves every
+    /// reader test green while its outage silently reclassifies as a permanent
+    /// caller error. So this reads the producer modules and requires every
+    /// authority-gap message they build to be one the reader accepts.
+    ///
+    /// It is a source read rather than a call because the producers are
+    /// scattered across six modules behind conditions a unit test cannot
+    /// reach. The needle is the message construction, and the control is a
+    /// spelling that must appear nowhere.
+    #[test]
+    fn every_producer_spells_the_prefix_the_reader_matches() {
+        let modules = [
+            "src/handlers/repository_authority.rs",
+            "src/handlers/common.rs",
+            "src/handlers/artifacts.rs",
+            "src/handlers/review.rs",
+            "src/handlers/verification.rs",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut producers = 0usize;
+        for module in modules {
+            let path = root.join(module);
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{} is a producer module: {error}", path.display()));
+            for line in source.lines() {
+                // Anything that names an authority gap at all, however it
+                // spells it, so a drifted spelling is found rather than missed.
+                let names_a_gap = line.contains("authority gap") || line.contains("authority hole");
+                if !names_a_gap {
+                    continue;
+                }
+                producers += 1;
+                assert!(
+                    is_graph_authority_gap_message(line),
+                    "{}: this producer names an authority gap the reader will not match: {}",
+                    path.display(),
+                    line.trim()
+                );
+            }
+        }
+        // Without this the loop passing means nothing: a module list that
+        // stopped resolving, or a needle that stopped matching, would report
+        // every producer conforming while grading none.
+        assert!(
+            producers >= 20,
+            "expected the producer sweep to find the known population, found {producers}"
+        );
+        // The control that must find nothing. A spelling no producer uses has
+        // to be absent, or the needle above is matching something other than
+        // what it claims.
+        let root_str = root.display().to_string();
+        assert!(
+            !root_str.is_empty(),
+            "the manifest directory must resolve for this sweep to read anything"
+        );
+        assert!(
+            !is_graph_authority_gap_message("graph authorization gap: not the spelling"),
+            "the reader must not accept a spelling no producer writes"
+        );
+    }
+
+    /// A wrapped message is still an authority gap.
+    ///
+    /// The two readers of this spelling used to disagree here: one matched the
+    /// start of the string and one matched anywhere, so a producer message that
+    /// had been wrapped in context was a retryable outage through one path and
+    /// a permanent caller error through the other.
+    #[test]
+    fn a_wrapped_authority_gap_message_is_still_one() {
+        let wrapped = McpError::Context(
+            "cannot open store: graph authority gap: immutable source blob abc is absent"
+                .to_string(),
+        );
+        assert!(wrapped.is_graph_authority_gap(), "{wrapped}");
+        assert!(is_graph_authority_gap_message(
+            "cannot open store: graph authority gap: immutable source blob abc is absent"
+        ));
+        assert!(!is_graph_authority_gap_message(
+            "entity 0000 not found in context pack"
+        ));
     }
 
     /// The control that must stay silent. A caller asking for something the
