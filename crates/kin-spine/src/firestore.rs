@@ -5273,6 +5273,19 @@ mod tests {
         );
         let first_prepared = first.prepare_repo_publication(publication.clone()).unwrap();
         let second_prepared = second.prepare_repo_publication(publication).unwrap();
+        // Confirm the premise before grading the outcome. Convergence here rests
+        // entirely on the publication id being a function of content alone, so
+        // if two backends given identical input disagree on it, the conflict
+        // below is the symptom and this is the defect. Asserting it separately
+        // is what tells those two apart; the conflict payload carries only the
+        // observed id, so it cannot.
+        let first_id = first_prepared.candidate_head().publication_id.clone();
+        let second_id = second_prepared.candidate_head().publication_id.clone();
+        assert_eq!(
+            first_id, second_id,
+            "two backends preparing identical content must derive the same \
+             content-addressed publication id"
+        );
         assert!(matches!(
             first.commit_repo_publication(first_prepared).unwrap(),
             RepoPublicationCommit::Committed { .. }
