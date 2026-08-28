@@ -1079,7 +1079,7 @@ fn run_ladder(
             // larger ceiling and a narrower question, and the caller owns both.
             remediations.push(format!(
                 "raise `max_chars`, or narrow the request with `{}`; this page has no \
-                 `next_cursor`, so the withheld entries cannot be reached by paging",
+                 `next_cursor`, so the withheld entries are unrecoverable by further requests",
                 shape.narrow_param
             ));
         } else {
