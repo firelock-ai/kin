@@ -68,6 +68,43 @@ gap arms must disclose on all three surfaces with direction-safe advice. The
 current-store control is what prevents an always-warning comparator or a
 missing writer from satisfying the suite.
 
+Advice is compared against the canonical `HydrationStanding::remedy` text
+exactly, on `kin graph status` and on the doctor row's `manual_fix`. A prefix or
+substring check accepts correct advice followed by advice that destroys the
+store, and the self-test carries a safe-plus-unsafe mutant for every direction
+to prove the comparison rejects it. The MCP arm grades the structured
+`_kin.hydration_semantics` observation, not only the compatibility boolean: the
+standing label, both versions where known, the read failure on an unreadable
+record, and the direction-safe remedy. A boolean named `stale` is wrong for
+three of the four gaps, so a grader that read only the flag could not tell an
+agent which action is safe.
+
+Three checks go beyond the three surfaces. `verdict` drives a real
+negative-capable `find_references` call over the suite's Python fixture and
+requires that the identical answer certifies on a current store and is
+inconclusive under every gap, down to `negative.trust`, `_kin.verdict.state`,
+the absence gate, the limiting factor and the completeness limits.
+`kin_graph_status` is not in the negative registry, so grading its flag could
+never have shown that a successful answer stops being authoritative; a break
+between the flag and the retrieval verdict would have left the suite green. If
+the current control cannot certify, that arm reports `UNREADABLE` and names what
+stopped it rather than weakening the bar.
+
+`creation_doors` builds a store through every creation door the shipped
+binaries expose (`kin init` on a bare directory, `kin init` over a Git checkout,
+`kin init --adopt-repository-id`, and `kin clone` over Git transport) and reads
+the published record back through the product's own path. One door proved
+nothing about the others.
+
+`native_transfer` creates a receiver with `kin init --adopt-repository-id`,
+moves real history into it with `kin pull --url`, and requires the receiver's
+creation record to be gone afterwards, with all three surfaces disclosing the
+gap. The transfer protocol carries no authoring version, so a receiver that kept
+its own creation stamp would certify replay semantics for deltas authored on
+another host by another build. Its control is a second pull that admits nothing,
+which must leave the record alone, and it also asserts the source's own record
+was never touched.
+
 `brownfield_repro.py` covers reference enrichment on two pinned upstream trees,
 `psf/requests` and `expressjs/express`, replayed as single-commit repositories
 holding the exact pinned tree object. Check 0 asserts the run stayed off the GPU
