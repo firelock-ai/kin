@@ -439,6 +439,17 @@ pub fn invalidate_for_unversioned_transfer(layout: &KinLayout) -> std::io::Resul
 #[derive(Debug)]
 pub struct HydrationStampCapability {
     kindb: cap_std::fs::Dir,
+    /// A second handle to the same directory, retained for the durability half.
+    ///
+    /// The removal goes through `kindb`, which is the capability that matters.
+    /// The `fsync` cannot: on Linux the descriptor behind a `cap_std` directory
+    /// refuses `fsync` with `EBADF`, which macOS accepts, so a run that is green
+    /// on this host is red on the Linux leg. This is the same
+    /// `File::open(dir).sync_all()` shape the record's writer already uses on
+    /// both platforms, opened once beside the capability rather than resolved
+    /// again at request time.
+    #[cfg(unix)]
+    sync_handle: std::fs::File,
 }
 
 impl HydrationStampCapability {
@@ -446,6 +457,8 @@ impl HydrationStampCapability {
     pub fn open(kindb_dir: &std::path::Path) -> std::io::Result<Self> {
         Ok(Self {
             kindb: cap_std::fs::Dir::open_ambient_dir(kindb_dir, cap_std::ambient_authority())?,
+            #[cfg(unix)]
+            sync_handle: std::fs::File::open(kindb_dir)?,
         })
     }
 
@@ -460,7 +473,7 @@ impl HydrationStampCapability {
     /// Make the unlink itself durable before a caller commits over it.
     #[cfg(unix)]
     fn sync_kindb_metadata(&self) -> std::io::Result<()> {
-        rustix::fs::fsync(&self.kindb).map_err(std::io::Error::from)
+        self.sync_handle.sync_all()
     }
 
     /// Same durability boundary the record's writer states for this platform:
