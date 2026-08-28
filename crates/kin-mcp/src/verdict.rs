@@ -864,6 +864,7 @@ pub fn mark_response_bounded(annotated: &mut Value) {
         // follow, the same way the absence object below keeps its own; a factor
         // that was replaced outright lost every other reason the answer had.
         let factor = match verdict.get("limiting_factor").and_then(Value::as_str) {
+            Some(existing) if existing.contains(RESPONSE_BOUNDED_FACTOR) => existing.to_string(),
             Some(existing) if !existing.is_empty() => {
                 format!("{RESPONSE_BOUNDED_FACTOR}; {existing}")
             }
@@ -888,6 +889,7 @@ pub fn mark_response_bounded(annotated: &mut Value) {
         negative.insert("safe_to_conclude_absent".to_string(), json!(false));
         negative.insert("trust".to_string(), json!(INCONCLUSIVE));
         let reason = match negative.get("trust_reason").and_then(Value::as_str) {
+            Some(existing) if existing.contains(RESPONSE_BOUNDED_FACTOR) => existing.to_string(),
             Some(existing) if !existing.is_empty() => {
                 format!("{RESPONSE_BOUNDED_FACTOR}; {existing}")
             }
@@ -1115,16 +1117,24 @@ mod tests {
             }))
         }
 
+        // Both carry the untracked measurement stamp, because a zero with no
+        // stamp is now its own disclosure and `behind` is present for it. These
+        // two are about the ADMISSION clock, which is a different reading, so
+        // they say plainly that the working copy was measured and level.
         fn with_clock() -> Envelope {
             envelope_with(json!({
                 "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
                 "last_admission_success_at": "2026-08-26T00:00:00Z",
                 "last_admission_success_age_seconds": 12,
             }))
         }
 
         fn without_clock() -> Envelope {
-            envelope_with(json!({ "untracked_path_count": 0 }))
+            envelope_with(json!({
+                "untracked_path_count": 0,
+                "untracked_observed_age_seconds": 0,
+            }))
         }
 
         /// The disclosure, which is what step 1 actually delivers. Both stores
@@ -2343,6 +2353,7 @@ mod tests {
         let mut response = agreeing_response();
         response["negative"]["trust_reason"] = json!("structural_authoritative");
         mark_response_bounded(&mut response);
+        mark_response_bounded(&mut response);
 
         assert_eq!(response["_kin"]["verdict"]["state"], json!(INCONCLUSIVE));
         assert_eq!(
@@ -2362,5 +2373,23 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Limiting factor: response_bounded"));
+        assert_eq!(
+            response["_kin"]["verdict"]["limiting_factor"]
+                .as_str()
+                .unwrap()
+                .matches("response_bounded:")
+                .count(),
+            1,
+            "the convergence loop may reapply the downgrade without repeating its factor"
+        );
+        assert_eq!(
+            response["negative"]["trust_reason"]
+                .as_str()
+                .unwrap()
+                .matches("response_bounded:")
+                .count(),
+            1,
+            "the absence reason is idempotent too"
+        );
     }
 }

@@ -8,6 +8,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened]
   merge_group:
   repository_dispatch:
     types: [dependency-updated]
@@ -123,6 +124,7 @@ jobs:
       - name: Test release ordering and npm provenance policy
         run: |
           python3 ./scripts/test-release-workflow-authority.py
+          python3 ./scripts/test-kin-registry-release-receiver.py
           python3 ./scripts/test_install_optional_vfs.py
           python3 ./scripts/test_installer_parity.py
           # Every install surface builds a release asset name; the release
@@ -874,8 +876,28 @@ jobs:
     name: Fast gate lint and policy
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      actions: read
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Verify registry dependency-wave admission
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/verify-kin-registry-wave-head.py \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --event-name "$GITHUB_EVENT_NAME" \
+            --repository "$GITHUB_REPOSITORY" \
+            --ref "$GITHUB_REF" \
+            --workflow-sha "$GITHUB_SHA" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --attestation-wait-seconds 300
 
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain

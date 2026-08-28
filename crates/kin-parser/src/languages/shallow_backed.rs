@@ -96,6 +96,7 @@ fn extract_csharp_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pa
         imports,
         tests: Vec::new(),
         parse_state,
+        parsed_call_sites: None,
     }
 }
 
@@ -530,6 +531,7 @@ fn extract_ruby_output(tree: &Tree, source: &[u8], file_id: &FilePathId) -> Pars
         imports,
         tests: Vec::new(),
         parse_state,
+        parsed_call_sites: None,
     }
 }
 

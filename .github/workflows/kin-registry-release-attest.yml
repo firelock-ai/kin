@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+name: Kin Registry Release Admission Attester
+
+on:
+  workflow_run:
+    workflows: [Kin Registry Release Receiver]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  attest-completed-receiver:
+    name: Attest completed Kin registry receiver
+    if: >-
+      github.event.workflow_run.status == 'completed' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.event == 'repository_dispatch' ||
+       github.event.workflow_run.event == 'schedule') &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    concurrency:
+      group: kin-registry-admission-${{ github.repository }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: release-tag
+    env:
+      SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+      SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+      SOURCE_POLICY_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Checkout the exact completed receiver policy
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ env.SOURCE_POLICY_SHA }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download the exact completed-run admission
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.0
+        with:
+          name: kin-registry-result-${{ env.SOURCE_RUN_ID }}-${{ env.SOURCE_RUN_ATTEMPT }}
+          path: ${{ runner.temp }}/kin-registry-result
+          github-token: ${{ github.token }}
+          run-id: ${{ env.SOURCE_RUN_ID }}
+
+      - name: Validate terminal server authority and live admitted head
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          result="$(python3 scripts/attest-kin-registry-wave.py validate \
+            --event-file "$GITHUB_EVENT_PATH" \
+            --admission-file "$RUNNER_TEMP/kin-registry-result/result.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_REPOSITORY")"
+          echo "changed=$(jq -r .changed <<<"$result")" >> "$GITHUB_OUTPUT"
+          echo "needs_attestation=$(jq -r .needs_attestation <<<"$result")" >> "$GITHUB_OUTPUT"
+
+      - name: Mint repository-scoped attestation token
+        id: app-token
+        if: steps.validate.outputs.changed == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.KIN_RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.KIN_RELEASE_BOT_PRIVATE_KEY }}
+          owner: firelock-ai
+          repositories: kin
+          permission-contents: read
+          permission-pull-requests: write
+          permission-issues: write
+
+      - name: Verify exact attestation App identity and scope
+        if: steps.validate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-kin-release-app-token.py \
+            --app-slug "$APP_SLUG" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Persist exact post-completion admission attestation
+        if: >-
+          steps.validate.outputs.changed == 'true' &&
+          steps.validate.outputs.needs_attestation == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/attest-kin-registry-wave.py post \
+            --admission-file "$RUNNER_TEMP/kin-registry-result/result.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Inspect exact-head CI after the persisted attestation
+        id: recheck
+        if: steps.validate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          result="$(python3 scripts/attest-kin-registry-wave.py recheck-status \
+            --admission-file "$RUNNER_TEMP/kin-registry-result/result.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_REPOSITORY")"
+          echo "needs_retrigger=$(jq -r .needs_retrigger <<<"$result")" >> "$GITHUB_OUTPUT"
+
+      - name: Retrigger exact-head CI when the attestation arrived late
+        if: >-
+          steps.validate.outputs.changed == 'true' &&
+          steps.recheck.outputs.needs_retrigger == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/attest-kin-registry-wave.py retrigger \
+            --admission-file "$RUNNER_TEMP/kin-registry-result/result.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_REPOSITORY"
+
+      - name: Verify a required exact-head CI recheck materialized
+        if: steps.validate.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python3 scripts/attest-kin-registry-wave.py recheck-status \
+            --admission-file "$RUNNER_TEMP/kin-registry-result/result.json" \
+            --workspace "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_REPOSITORY" \
+            --wait-seconds 120 \
+            --require-recheck
