@@ -42515,13 +42515,17 @@ mod tests {
     async fn reviewer_the_serve_path_refuses_an_admin_token_equal_to_the_daemon_token() {
         let (_repo, _backend, mut environment, state) = reviewer_hosted_state();
         environment.apply(DAEMON_AUTH_TOKEN_ENV, Some("one-and-the-same"));
-        environment.apply("KIN_PUBLICATION_CONTROL_AUTH_TOKEN", Some("one-and-the-same"));
+        environment.apply(
+            "KIN_PUBLICATION_CONTROL_AUTH_TOKEN",
+            Some("one-and-the-same"),
+        );
         environment.apply::<_, &str>(DAEMON_AUTH_TOKEN_PREVIOUS_ENV, None);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let served = tokio::spawn(async move {
-            let _ = serve_bound_with_shutdown(state, listener, Some(shutdown_tx), shutdown_rx).await;
+            let _ =
+                serve_bound_with_shutdown(state, listener, Some(shutdown_tx), shutdown_rx).await;
         });
         let joined = tokio::time::timeout(std::time::Duration::from_secs(20), served).await;
         let outcome = joined.expect(
