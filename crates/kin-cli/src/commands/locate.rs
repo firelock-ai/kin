@@ -18090,13 +18090,8 @@ fn output_result(result: &LocateResult, json: bool, explain: bool, query: &str) 
 /// `--explain`, where it is one diagnostic among the per-signal and per-stage
 /// breakdowns rather than an implied ordering.
 fn output_text(result: &LocateResult, explain: bool, query: &str) {
-    let notes = coverage_notes(result);
-    if explain {
-        for note in &notes {
-            eprintln!("⚠ {}", note.full);
-        }
-    } else if let Some(summary) = collapsed_notes_line(&notes) {
-        eprintln!("⚠ {summary}");
+    for line in coverage_note_lines(result, explain) {
+        eprintln!("⚠ {line}");
     }
     if result.files.is_empty() {
         println!("No relevant files found.");
@@ -18117,6 +18112,20 @@ and are not comparable between rows"
     if let Some(floor) = answer_floor_note(result, query) {
         eprintln!("⚠ {floor}");
     }
+}
+
+/// The note lines this surface writes to stderr, in order.
+///
+/// Split from the writing so the choice between the two lengths is testable.
+/// Asserting on `coverage_notes` and `collapsed_notes_line` alone graded the
+/// two halves and not the decision between them, and a mutation that deleted
+/// the collapse from the printing left both of those green.
+fn coverage_note_lines(result: &LocateResult, explain: bool) -> Vec<String> {
+    let notes = coverage_notes(result);
+    if explain {
+        return notes.into_iter().map(|note| note.full).collect();
+    }
+    collapsed_notes_line(&notes).into_iter().collect()
 }
 
 /// One note about how the answer was produced, in both the lengths a surface
@@ -20019,6 +20028,37 @@ mod tests {
                 && notes[1].full.contains("pass include_tests"),
             "detail and remediation both survive into the explain form: {}",
             notes[1].full
+        );
+
+        // The decision between the two lengths, which is what the printing
+        // actually calls. Grading the two halves alone left a mutation that
+        // deleted the collapse from the default path green in both of them.
+        let default_lines = coverage_note_lines(&result, false);
+        assert_eq!(
+            default_lines.len(),
+            1,
+            "the default path emits exactly one line, not one per note: {default_lines:?}"
+        );
+        assert!(
+            default_lines[0].contains("2 notes") && default_lines[0].contains("--explain"),
+            "and that line is the summary: {}",
+            default_lines[0]
+        );
+        let explained_lines = coverage_note_lines(&result, true);
+        assert_eq!(
+            explained_lines.len(),
+            2,
+            "--explain emits every note: {explained_lines:?}"
+        );
+        assert!(
+            explained_lines[1].contains("134 test-role source path(s)"),
+            "in full: {}",
+            explained_lines[1]
+        );
+        assert!(
+            coverage_note_lines(&LocateResult::default(), false).is_empty()
+                && coverage_note_lines(&LocateResult::default(), true).is_empty(),
+            "a clean answer emits nothing on either path"
         );
 
         assert!(
