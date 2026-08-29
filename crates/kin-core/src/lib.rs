@@ -27,6 +27,7 @@ pub mod hydration_semantics;
 pub mod identity;
 pub mod init;
 pub mod init_attempt;
+pub mod init_budget;
 mod init_progress;
 pub use init_progress::report_admission_progress;
 mod init_staging;
@@ -50,6 +51,7 @@ pub mod sync_state;
 /// `test-support` feature from a dev-dependency, so no product build carries it.
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
+pub mod tool_prefix;
 pub mod tree;
 pub mod vector_producer_policy;
 pub mod workspace_carry;

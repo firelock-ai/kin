@@ -134,6 +134,16 @@ jobs:
       - name: Falsify the same-owner call graders
         run: python3 scripts/acceptance/same_owner_call_repro.py --self-test
 
+      # The 2026-08-28 cold walk. A stranger followed the documented install,
+      # initialized a Rust repository, got imports 0/1085, ran the repair the
+      # product named, and was told to install rustup. The grader is handed that
+      # exact refusal and has to fail on it. Its two failing branches carry
+      # different sentences and each gets an input only it can catch, because
+      # the text that shipped trips both and two branches that overlap hide each
+      # other's absence.
+      - name: Falsify the toolchain-free repair grader
+        run: python3 scripts/acceptance/first_contact_honesty.py --self-test
+
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
@@ -249,6 +259,14 @@ jobs:
       # fields a caller branches on.
       - name: Falsify the working-copy freshness graders
         run: python3 scripts/acceptance/working_copy_freshness_repro.py --self-test
+
+      # The graders here decide two verdicts that read alike from outside: a
+      # refusal that fires with no remedy behind it, and a conversion with room
+      # that narrates its memory anyway. Both are driven against their inverse,
+      # including the mutation that matters, a refusal that states its numbers
+      # and never says what to do next.
+      - name: Falsify the init budget graders
+        run: python3 scripts/acceptance/init_budget_refusal.py --self-test
 
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
@@ -836,6 +854,30 @@ jobs:
             echo "::warning title=Working-copy freshness acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Init budget acceptance suite (verdict comes from the gate step)
+        id: initbudget
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/init_budget_refusal.py \
+            --kin target/release/kin \
+            --json acceptance/init_budget.json \
+            --verbose >acceptance/init_budget.log 2>&1 || rc=$?
+          cat acceptance/init_budget.log
+          {
+            echo "### Init budget acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/init_budget.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Init budget acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -882,4 +924,5 @@ jobs:
             --report first_query=acceptance/first_query.json \
             --report verdict_limits=acceptance/verdict_limits.json \
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
+            --report init_budget=acceptance/init_budget.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'
