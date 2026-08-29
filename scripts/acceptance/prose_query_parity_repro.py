@@ -327,11 +327,24 @@ class Suite(object):
         self.daemon = daemon
         self.verbose = verbose
         self.repo = os.path.join(workdir, "repo")
+        home = os.path.join(workdir, "home")
+        os.makedirs(home, exist_ok=True)
+        # kin refuses to invent an author, which is correct product behaviour and
+        # not an obstacle. This suite isolates HOME so it cannot read the
+        # machine's identity, so it brings one of its own; measured without it,
+        # the first `kin commit` exits 1 on "kin has no author identity to record
+        # for this change" and the whole suite grades nothing.
+        with open(os.path.join(home, ".gitconfig"), "w") as handle:
+            handle.write("[user]\n\tname = kin-prose-parity-repro\n"
+                         "\temail = prose-parity@example.invalid\n"
+                         "[commit]\n\tgpgsign = false\n")
         self.env = dict(os.environ)
-        # Scratch HOME and KIN_HOME, so this suite can never touch a developer's
-        # real store and two concurrent runs cannot share one.
-        self.env["HOME"] = os.path.join(workdir, "home")
+        # Scratch HOME, KIN_HOME and registry, so this suite can never touch a
+        # developer's real store and two concurrent runs cannot share one.
+        self.env["HOME"] = home
+        self.env["USERPROFILE"] = home
         self.env["KIN_HOME"] = os.path.join(workdir, "kin-home")
+        self.env["KIN_REGISTRY_PATH"] = os.path.join(home, "registry.toml")
         # No vector index, like every sibling here. That is deliberate: with no
         # embeddings, retrieval for a prose term is lexical and graph only, so
         # the arm cannot be answered by a semantic signal standing in for the
@@ -349,7 +362,7 @@ class Suite(object):
         self.env.pop("KIN_DAEMON_URL", None)
         if daemon:
             self.env["KIN_DAEMON_BIN"] = daemon
-        for path in (self.env["HOME"], self.env["KIN_HOME"], self.repo):
+        for path in (self.env["KIN_HOME"], self.repo):
             os.makedirs(path, exist_ok=True)
         self._arms = None
         self._setup_error = None
