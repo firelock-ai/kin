@@ -42415,6 +42415,79 @@ mod tests {
         .unwrap()
     }
 
+    /// The join this merge created, which nothing else covers.
+    ///
+    /// The publication-control branch and the rotation window were written by
+    /// two changes that never saw each other. Every rotation test builds a
+    /// router with no administrator token, so that branch is never entered;
+    /// every publication-control test builds one through `primary_only`, so the
+    /// window is always closed. Both sides stay green while the composition is
+    /// wrong, which is the shape that needs its own test rather than more tests
+    /// of either side.
+    #[tokio::test]
+    async fn a_superseded_token_is_forbidden_rather_than_unauthorized_on_publication_control() {
+        let window = tempfile::tempdir().expect("tempdir");
+        let tokens = open_rotation_window(&window, 3_600, 1_000);
+        let app = router_with_rotation_tokens(
+            test_state(),
+            tokens.clone(),
+            Some("publication-test-token".to_string()),
+            None,
+        );
+
+        let control = |app: Router, token: &'static str| async move {
+            app.oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+
+        // A superseded token is a valid daemon credential, so it is
+        // authenticated and unauthorized here: 403, not 401. The other way round
+        // would tell a caller holding a live credential that it holds none.
+        assert_eq!(
+            control(app.clone(), "retired-token").await,
+            StatusCode::FORBIDDEN
+        );
+        // And the accept is counted, because a retired credential reaching an
+        // administrative route is real traffic on that credential, and the count
+        // is what an operator reads to decide the window can close.
+        assert_eq!(
+            tokens.previous_accepted_count(),
+            1,
+            "a superseded token refused on authorization is still an accept on the window"
+        );
+
+        // The primary is authenticated and equally unauthorized here, and it
+        // must not move the superseded counter.
+        assert_eq!(
+            control(app.clone(), "current-token").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(tokens.previous_accepted_count(), 1);
+
+        // Neither accepted token is refused as unauthenticated, and that refusal
+        // is not an accept.
+        assert_eq!(
+            control(app.clone(), "neither-token").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(tokens.previous_accepted_count(), 1);
+
+        // The administrator token passes the guard. What the route answers past
+        // it is not this test's business, only that it is neither refusal.
+        let admin = control(app, "publication-test-token").await;
+        assert!(
+            admin != StatusCode::UNAUTHORIZED && admin != StatusCode::FORBIDDEN,
+            "the administrator token must pass the auth guard, got {admin}"
+        );
+    }
+
     /// The rotation window, exercised through the real router rather than
     /// through `RotationTokens` alone.
     ///
