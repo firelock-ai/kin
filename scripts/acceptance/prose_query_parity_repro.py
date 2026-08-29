@@ -35,9 +35,11 @@ Two checks, and the second is underneath the first.
   `lexical_index_parity` asks the mechanism question the behaviour rests on.
   `kin support --json` is served by the daemon out of its own live graph, so
   `text_indexed_entity_count` is what the process answering the query can
-  actually see. Both daemon states must report the derived text index carrying
-  documents, and the check reports both numbers whatever it decides, because a
-  number in a detail line is evidence and a verdict alone is not.
+  actually see. It is read after that daemon has answered, because the question
+  is what the process serving queries holds, not what it held before anything
+  asked it anything. Both daemon states must report the derived text index
+  carrying documents, and the check reports both numbers whatever it decides,
+  because a number in a detail line is evidence and a verdict alone is not.
 
 Output shape matches the siblings:
 
@@ -460,10 +462,17 @@ class Suite(object):
         return pid if isinstance(pid, int) else None
 
     def read_arm(self, label):
-        arm = {"label": label, "pid": self.daemon_pid(),
-               "support": self.support_json(), "answers": {}}
+        """One daemon state: which process, what it answered, what it then held.
+
+        The support read comes AFTER the queries on purpose. The question check 2
+        asks is whether the daemon that just answered holds a populated lexical
+        index, not what it held before anything asked it anything, and reading it
+        first would grade a moment no caller ever observes.
+        """
+        arm = {"label": label, "pid": self.daemon_pid(), "answers": {}}
         for query in (PROSE_QUERY, SYMBOL_QUERY, ABSENT_QUERY):
             arm["answers"][query] = self.locate_json(query)
+        arm["support"] = self.support_json()
         return arm
 
     def arms(self):
@@ -594,7 +603,7 @@ def check_lexical_index_parity(suite):
     holding none of them is the state a prose query cannot be answered from, and
     it is invisible from the answer alone.
     """
-    res = Result("2", "both daemon states hold a populated derived text index")
+    res = Result("2", "a daemon that just answered holds a populated derived text index")
     warm, cold = suite.arms()
 
     warm_total = support_total_entities(warm["support"])
