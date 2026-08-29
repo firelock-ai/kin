@@ -30104,6 +30104,16 @@ mod tests {
                 })
         }
 
+        /// Names both the armed backend and the specific read that failed.
+        ///
+        /// `BACKEND_FAULT_TEXT` is what a caller asserts to prove the armed
+        /// backend was reached at all. On the repo-scoped route the cursor
+        /// probe is the FIRST backend read (`load_hosted_repository_mcp_view`
+        /// calls `hosted_snapshot_cursor` before any authority load), so a
+        /// message carrying only the cursor text makes that proof fail on a
+        /// fault that did happen. `CURSOR_FAULT_TEXT` stays beside it so a test
+        /// can still tell a cursor fault from an authority one, because only
+        /// this path emits it.
         fn cursor_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
             self.0
                 .lock()
@@ -30112,7 +30122,7 @@ mod tests {
                 .contains(repo_id)
                 .then(|| {
                     kin_db::KinDbError::StorageError(format!(
-                        "{CURSOR_FAULT_TEXT} while reading {repo_id}"
+                        "{BACKEND_FAULT_TEXT}: {CURSOR_FAULT_TEXT} while reading {repo_id}"
                     ))
                 })
         }
