@@ -24,3 +24,17 @@ crates/kin-cli/src/commands/mcp.rs
 # caches its answer, and the precedence rule itself is a pure function
 # (`product_default_for`) that tests exercise without touching the environment.
 crates/kin-cli/src/resource_profile.rs
+
+# `kin` and `kin-daemon` put Kin's own tool directories on `PATH` in the same
+# single-threaded prologue, immediately after the `resource_profile` calls
+# above. Language-server discovery is `which` over `PATH` and nothing else, so a
+# server Kin downloaded and verified into its managed tool directory is
+# reachable only if that directory is on the `PATH` of the process that starts
+# enrichment, and the repo daemon inherits that environment from whichever `kin`
+# command spawned it. `PATH` is the interface every `which` and every spawned
+# tool already reads, so writing it IS how a binary publishes the tools it
+# provisioned; there is no argument to pass it by across a process boundary. The
+# managed directories are appended rather than prepended, so an operator's own
+# toolchain still wins, and a second call is a no-op so a re-exec cannot grow
+# `PATH` without end.
+crates/kin-core/src/tool_prefix.rs

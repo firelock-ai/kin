@@ -42,6 +42,10 @@ on a setup error, 0 only when every selected check passes.
 """
 
 import argparse
+import gzip
+import hashlib
+import io
+import threading
 import json
 import os
 import re
@@ -49,6 +53,7 @@ import shutil
 import stat
 import subprocess
 import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import tempfile
 
 PASS = "PASS"
@@ -568,6 +573,68 @@ def doctor_rows(suite, extra_env=None):
     return {row.get("id"): row for row in report.get("checks", [])}, ""
 
 
+# --------------------------------------------------------- toolchain-free repair
+#
+# The 2026-08-28 walkthrough's finding 2. A stranger followed the documented
+# install, initialized a Rust repository, and got imports 0/1085 with "no
+# language server found". The product named its own repair and the repair
+# refused because `rustup` was absent. Nothing in that chain lied; the outcome
+# was that a developer who is not a Rust developer could not get reference edges
+# for a Rust repository by following the product's own instructions.
+#
+# What this grades is one question: did the repair need a toolchain this host
+# does not have. It does NOT grade whether the installed server works, because
+# the fixture served here is a stub and a stub cannot complete an LSP handshake.
+# A run that gets as far as "installed and did not start" has answered this
+# check's question and is a PASS, which is why the two are told apart below
+# rather than collapsed into "did the row go green".
+#
+# The two failing branches carry DIFFERENT sentences on purpose, and the
+# self-test asserts which one answered. They overlap on the text 0.6.0 actually
+# shipped, which carried both the refusal and the remedy, and two branches that
+# can each catch one input hide each other's absence: a mutation that merely
+# redirects between them leaves the verdict unchanged and reads as a surviving
+# check. Each branch therefore also gets an input only it can catch.
+
+TOOLCHAIN_REFUSAL = "is not installed on this host"
+TOOLCHAIN_REMEDY = "install 'rustup'"
+PRESCRIBES_TOOLCHAIN = "prescribes a toolchain install"
+ENDED_ON_ABSENCE = "ended on rustup being absent"
+DOWNLOAD_EVIDENCE = "sha256:"
+
+
+def grade_toolchain_free_repair(output):
+    """(ok, detail) for a language-server repair run on a host with no rustup."""
+    flat = flatten(output)
+    if not flat:
+        return None, "the run produced no output, so nothing could be graded"
+    if "rust" not in flat.lower():
+        return None, (
+            "the run never mentioned the rust language server, so it did not "
+            "reach the question this check is about"
+        )
+    if TOOLCHAIN_REMEDY in flat:
+        return False, (
+            "the repair %s, telling a reader to install a toolchain in order to "
+            "read somebody else's code: %s"
+            % (PRESCRIBES_TOOLCHAIN, flat[flat.find(TOOLCHAIN_REMEDY):][:180])
+        )
+    if "rustup" in flat and TOOLCHAIN_REFUSAL in flat:
+        return False, (
+            "the repair %s, so a host without the toolchain still gets no route "
+            "to a server" % ENDED_ON_ABSENCE
+        )
+    if DOWNLOAD_EVIDENCE not in flat:
+        return None, (
+            "no route was taken and no toolchain refusal was reported either, "
+            "so this run establishes nothing either way: %s" % flat[:220]
+        )
+    return True, (
+        "the repair took a route that needs no toolchain and disclosed the "
+        "digest it verified"
+    )
+
+
 def check_3(suite):
     """FIR-2787: the memory this box affords is on the page before `kin init` runs.
 
@@ -672,7 +739,119 @@ def check_3(suite):
     return res
 
 
-CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3)]
+def check_4(suite):
+    """The language-server repair works on a host with no rustup.
+
+    Driven against a fixture the suite serves itself, so the check needs no
+    network and cannot fail on a bad morning at a release host. What the fixture
+    replaces is the URL and the digest, both taken as arguments by the install;
+    the download, the verification, the unpack, the executable bit and the
+    registration are the shipped code on both paths.
+
+    `rustup` is scrubbed from PATH rather than assumed absent, because the
+    runner that builds this suite installs a Rust toolchain and a check that
+    merely hoped for its absence would silently grade the rustup route instead.
+    The scrub is asserted before the repair runs.
+    """
+    res = Result("4", "cold-walk-2026-08-28",
+                 "kin doctor --fix --install-language-servers needs no toolchain the host lacks")
+
+    stub = b"#!/bin/sh\necho 'rust-analyzer 0.0.0-fixture'\n"
+    archive = io.BytesIO()
+    with gzip.GzipFile(fileobj=archive, mode="wb", mtime=0) as raw:
+        raw.write(stub)
+    body = archive.getvalue()
+    digest = hashlib.sha256(body).hexdigest()
+
+    served = _serve_asset(body)
+    if served is None:
+        res.unknown("could not bind a loopback port for the fixture asset")
+        return res
+    base, httpd, thread = served
+    try:
+        home = suite.scratch("toolchain-free-home")
+        env = suite.base_env()
+        env["HOME"] = home
+        env["KIN_HOME"] = os.path.join(home, ".kin")
+        env["KIN_LANGUAGE_SERVER_ASSET_BASE"] = base
+        env["KIN_LANGUAGE_SERVER_ASSET_SHA256"] = digest
+        # Every PATH entry carrying rustup is dropped, then the drop is checked.
+        # A scrub that missed one would grade the route this check exists to
+        # avoid, and would do it silently.
+        kept = [entry for entry in env.get("PATH", "").split(os.pathsep)
+                if entry and not os.path.exists(os.path.join(entry, "rustup"))]
+        env["PATH"] = os.pathsep.join(kept)
+        still_there = [entry for entry in kept
+                       if os.path.exists(os.path.join(entry, "rustup"))]
+        if still_there:
+            res.unknown("the PATH scrub left rustup reachable at %s" % still_there[0])
+            return res
+
+        work = suite.scratch("toolchain-free-repo")
+        rc, out, err = run([suite.kin, "init", "."], cwd=work, env=env, timeout=900)
+        if rc != 0:
+            res.unknown("kin init exited %d in the fixture repository: %s"
+                        % (rc, flatten(err)[:220]))
+            return res
+        rc, out, err = run(
+            [suite.kin, "doctor", "--fix", "--install-language-servers"],
+            cwd=work, env=env, timeout=900)
+        combined = (out or "") + "\n" + (err or "")
+
+        ok, detail = grade_toolchain_free_repair(combined)
+        if ok is None:
+            res.unknown(detail)
+            return res
+        if not ok:
+            res.bad(detail)
+            return res
+
+        installed = os.path.join(env["KIN_HOME"], "tools", "bin", "rust-analyzer")
+        if not os.path.exists(installed):
+            res.bad("the run disclosed a digest and wrote no binary to %s" % installed)
+            return res
+        if not os.access(installed, os.X_OK):
+            res.bad("the binary at %s is not executable, so `which` walks past it"
+                    % installed)
+            return res
+        on_disk = hashlib.sha256(open(installed, "rb").read()).hexdigest()
+        if on_disk != hashlib.sha256(stub).hexdigest():
+            res.bad("the installed bytes are not the unpacked asset")
+            return res
+        res.ok("%s, and the unpacked binary is executable at %s" % (detail, installed))
+    finally:
+        httpd.shutdown()
+        thread.join(timeout=5)
+    return res
+
+
+def _serve_asset(body):
+    """A loopback HTTP server answering any path with `body`.
+
+    Returns (base_url, httpd, thread), or None when no port could be bound.
+    """
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            return
+
+    try:
+        httpd = HTTPServer(("127.0.0.1", 0), Handler)
+    except OSError:
+        return None
+    thread = threading.Thread(target=httpd.serve_forever)
+    thread.daemon = True
+    thread.start()
+    return "http://127.0.0.1:%d" % httpd.server_address[1], httpd, thread
+
+
+CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
+          ("4", check_4)]
 
 
 # ----------------------------------------------------------------------- suite
@@ -840,6 +1019,52 @@ def self_test():
            ["npx -y @kinlab/kin --version",
             "export PATH=\"$HOME/.kin/bin:$PATH\"",
             "kin --version"])
+
+
+    # The 0.6.0 refusal, verbatim from the walkthrough, and its inverse. The
+    # shipped text trips BOTH failing branches, so it cannot tell them apart on
+    # its own; the two inputs after it can, and the detail is asserted rather
+    # than only the verdict.
+    shipped_refusal = (
+        "  x install the rust language server: 'rustup' is not installed on this host\n"
+        "      install 'rustup', then run 'rustup component add rust-analyzer'\n"
+    )
+    only_remedy = (
+        "  x install the rust language server: run `rustup component add rust-analyzer`\n"
+        "      install 'rustup', then run 'rustup component add rust-analyzer'\n"
+    )
+    only_absence = (
+        "  x install the rust language server: rustup is not installed on this host\n"
+    )
+    routed = (
+        "  v installed the rust language server (`download rust-analyzer 2026-08-24 from the "
+        "rust-lang/rust-analyzer release binaries`)\n"
+        "      source:   http://127.0.0.1:9/2026-08-24/rust-analyzer-fixture.gz\n"
+        "      sha256:   " + ("a" * 64) + " (verified before install)\n"
+        "      installed to: /root/.kin/tools/bin/rust-analyzer\n"
+    )
+    expect("the shipped 0.6.0 refusal must FAIL",
+           grade_toolchain_free_repair(shipped_refusal)[0], False)
+    expect("a routed install must PASS", grade_toolchain_free_repair(routed)[0], True)
+    expect("no output is UNREADABLE", grade_toolchain_free_repair("")[0], None)
+    expect("a run that never mentioned rust is UNREADABLE",
+           grade_toolchain_free_repair("Summary: 9 passed")[0], None)
+    expect("a silent no-op is UNREADABLE",
+           grade_toolchain_free_repair("  - skipped the rust language server\n")[0], None)
+    expect("installed-but-unusable still PASSes",
+           grade_toolchain_free_repair(
+               routed + "  x the rust language server installed but did not start\n")[0], True)
+    # Only the remedy branch can catch this one: it prescribes rustup without
+    # ever saying rustup is absent.
+    expect("a prescription with no refusal must FAIL",
+           grade_toolchain_free_repair(only_remedy)[0], False)
+    expect("and it must be the prescription branch that answered",
+           PRESCRIBES_TOOLCHAIN in grade_toolchain_free_repair(only_remedy)[1], True)
+    # Only the absence branch can catch this one: it reports rustup absent with
+    # no remedy sentence at all.
+    expect("a bare absence must FAIL", grade_toolchain_free_repair(only_absence)[0], False)
+    expect("and it must be the absence branch that answered",
+           ENDED_ON_ABSENCE in grade_toolchain_free_repair(only_absence)[1], True)
 
     for line in failures:
         print("SELF-TEST FAIL %s" % line)
