@@ -6136,6 +6136,11 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(stale, object_store::Error::Precondition { .. }));
+        // Complete the acquisition first. An uncompleted lease is refused for
+        // its incomplete fence, which is a different refusal from the schema
+        // incompatibility this test is about, and taking the first one would
+        // pass the assertion below while proving nothing about compatibility.
+        let rollout = checkpoint_rollout_for_test(&control, &rollout);
         assert!(matches!(
             control.admit_reader(AdmitReaderRequest {
                 lease: proof(&rollout),
