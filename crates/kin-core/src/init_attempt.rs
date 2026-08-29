@@ -590,7 +590,12 @@ pub fn post_mortem_lines(
 /// different repositories. Silent when they are the same, because repeating one
 /// path twice in one sentence is noise.
 fn elsewhere_clause(attempt: &AbandonedInit, initializing: &Path) -> String {
-    if attempt.converted(initializing) {
+    // `converted` is false for two different reasons and only one of them is a
+    // difference. With no record there is no source path to compare, so the
+    // abandoned staging may well belong to this same repository, and saying it
+    // does not is a claim from no evidence. Silent there, exactly as it is
+    // silent when the two paths match.
+    if attempt.record.is_none() || attempt.converted(initializing) {
         return String::new();
     }
     format!(
@@ -1107,6 +1112,32 @@ mod tests {
         assert!(
             !rendered.contains("phase 0"),
             "an absent record must never render as a phase number: {rendered}"
+        );
+    }
+
+    /// With no record there is no source path to compare, so the orphan branch
+    /// cannot know whether the staging belongs to this repository or another
+    /// one. It used to say it was another one, because `converted` is
+    /// `is_some_and` and a missing record makes it false for a reason that is
+    /// not a difference.
+    #[test]
+    fn staging_without_a_record_claims_no_difference_it_cannot_see() {
+        let mut orphan = attempt(None);
+        orphan.record_unreadable = Some("it carries no phase record".to_string());
+        let rendered = post_mortem_lines(&orphan, None, Path::new("/work/shallow")).join("\n");
+        assert!(
+            !rendered.contains("a different repository"),
+            "with no record there is nothing to compare, so nothing is claimed: {rendered}"
+        );
+
+        // The control, so the clause was made honest rather than deleted: with
+        // a record naming another source, the difference is still named.
+        let known = post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/shallow"))
+            .join("\n");
+        assert!(
+            known.contains("a different repository from the /work/shallow this run is \
+                            initializing"),
+            "a record that names another source still reports the difference: {known}"
         );
     }
 
