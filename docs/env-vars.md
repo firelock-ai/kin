@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (509 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (512 total, 342 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -78,7 +78,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_REMOTE_HTTP_TIMEOUT_SECS` | seconds>=0 | 600 | operational | HTTP timeout for native Kin remote repository transfer endpoints, in whole seconds; defaults to 600 |
 | `KIN_REMOTE_URL` | url | *(unset)* | operational | native remote endpoint URL |
 | `KIN_REPO_ID` | string | *(unset)* | operational | active repo id override |
-| `KIN_REPO_IDS` | string | *(unset)* | operational | comma-separated repo ids the daemon should serve |
+| `KIN_REPO_IDS` | string | *(unset)* | correctness | exact comma-separated hosted fleet membership; required by GCS publication fencing |
 | `KIN_REQUIRE_COMPLETE_EMBEDDINGS` | bool | false | correctness | require full embedding coverage before answering locate/search |
 | `KIN_RESOURCE_PROFILE` | enum | interactive | correctness | runtime resource profile (kin-cli/kin-daemon/kin-infer/kin-db): proof/interactive/throughput/ci; unset, the kin binaries select interactive at startup (value-preserving Metal kernels, proof's embedding budgets), while a library caller that never selects still resolves to proof; throughput additionally scales the batch budgets, may engage CPU/GPU hybrid embedding and overlaps persist with compute, and is non-citable |
 | `KIN_RESOURCE_PROFILE_PRODUCT_DEFAULT` | string | *(unset)* | operational | provenance marker written beside KIN_RESOURCE_PROFILE by whichever kin binary selected the default; never set by an operator. A binary that selects the ship default writes it into its own environment, and every process it spawns inherits a set variable indistinguishable from an operator's export, which is how a daemon reported the ship default as an operator override. This carries the VALUE the default was written for, so a child trusts it only when it names the profile actually in effect and an overridden profile is not mistaken for kin's own choice |
@@ -109,7 +109,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | --- | --- | --- | --- | --- |
 | `KIN_DAEMON_AUTH_ROTATION_MAX_ACCEPTS` | usize | 10000 | operational | how many requests a daemon rotation overlap window accepts on the superseded token before closing, counted durably across restarts. Subject to the same refusal of zero and of unparseable values as KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS; whichever bound is reached first closes the window |
 | `KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS` | usize | 86400 | operational | how long, in seconds, a daemon rotation overlap window keeps accepting the superseded token, measured from the instant the window opened and persisted so it survives a restart. Must be a whole number greater than zero: a zero or unparseable value is refused at startup rather than read as unbounded, because an unbounded window is the state this bound exists to prevent |
-| `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests |
+| `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests; required for hosted GCS publication control |
 | `KIN_DAEMON_AUTH_TOKEN_PREVIOUS` | secret | *(unset)* | secret | a superseded daemon bearer token this process still accepts, so a credential rotation across several containers does not have to be atomic. Set it during a rotation window and unset it once /auth/rotation reports the superseded token is no longer carrying traffic. Setting it with KIN_DAEMON_AUTH_TOKEN unset, or to the same value, is refused at startup: neither is an overlap window and both would read as one |
 | `KIN_DAEMON_AUTO_EMBED` | bool | true | operational | let the daemon start background embedding on its own; set falsy to defer until an explicit embed request. Read by the daemon at process start, so it takes effect on the command that starts one; a command reaching an already-running daemon cannot change it and is warned that it diverged |
 | `KIN_DAEMON_BIN` | path | *(unset)* | operational | override path to the kin-daemon binary |
@@ -137,6 +137,7 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_DAEMON_TEST_STARTUP_HOLD_SECS` | seconds>=0 | *(unset)* | diagnostic | kin-daemon fault injection: hold the endpoint unpublished for N seconds at startup, so a client's startup binding stays PENDING past the tools/call grace and the still-starting disclosure is reachable; unset or zero disarms it |
 | `KIN_DAEMON_URL` | url | *(unset)* | operational | explicit daemon endpoint URL (skip local discovery) |
 | `KIN_DAEMON_WATCH_PID` | usize | *(unset)* | operational | pid the daemon watches; it exits when that process dies |
+| `KIN_PUBLICATION_CONTROL_AUTH_TOKEN` | secret | *(unset)* | secret | distinct operator bearer token for hosted rollout and publication-control administration |
 
 ## Supervisor
 
@@ -262,6 +263,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_GCS_BUCKET` | string | *(unset)* | operational | GCS bucket for remote storage |
 | `KIN_GCS_ENDPOINT` | url | *(unset)* | correctness | custom GCS endpoint for the daemon's graph-snapshot storage, e.g. a local fake-gcs-server; takes precedence over STORAGE_EMULATOR_HOST, sends unsigned requests, and fails daemon startup when unreachable rather than falling back to real Google Cloud Storage |
 | `KIN_GCS_PREFIX` | string | *(unset)* | operational | GCS key prefix for remote storage |
+| `KIN_RELEASE_DAEMON_DIGEST_INTERNAL` | string | *(unset)* | correctness | exact sha256 image identity required by hosted graph reader admission and publication fencing |
+| `KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL` | string | *(unset)* | correctness | deployment-controller attestation digest proving every cursorless legacy spine writer revision is drained before the durable one-way migration seal is created |
 
 ## Session & projection
 

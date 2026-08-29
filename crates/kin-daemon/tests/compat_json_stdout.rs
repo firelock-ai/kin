@@ -51,6 +51,16 @@ async fn compat_json_stdout_is_pure_json_under_env_overrides() {
         parsed["graph_snapshot_version"].is_number(),
         "compat payload must carry a numeric graph_snapshot_version"
     );
+    assert_eq!(
+        parsed["graph_snapshot_min_supported_version"],
+        kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+        "compat payload must expose the compiled minimum reader schema"
+    );
+    assert_eq!(
+        parsed["graph_snapshot_max_supported_version"],
+        kin_db::GraphSnapshot::CURRENT_VERSION,
+        "compat payload must expose the compiled maximum reader schema"
+    );
     assert_eq!(parsed["supervisor_startup_protocol"], 2);
     let capabilities = parsed["supervisor_startup_capabilities"]
         .as_array()

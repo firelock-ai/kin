@@ -68,11 +68,14 @@ RUN test -f .cargo/config.toml && grep -q '^\[registries\.kin\]' .cargo/config.t
 # build below, or the cooked artifacts are keyed differently and the workspace
 # build recompiles them anyway.
 COPY --from=planner /recipe.json /recipe.json
-RUN cargo chef cook --locked --release --features gcs --recipe-path /recipe.json
+RUN cargo chef cook --locked --release --features kin-daemon/gcs,kin-daemon/firestore --recipe-path /recipe.json
 
 # Copy kin source (this repository)
 COPY . /build/kin
-# kin-daemon needs --features gcs for GCS StorageBackend in cloud deployment.
+# kin-daemon needs GCS graph storage and the Firestore durable spine backend in
+# the same production bytes. `scripts/check-docker-daemon-features.sh` guards
+# every recipe and build invocation so hosted mode cannot silently compile the
+# persistent spine out and fall back to process memory.
 # `.dockerignore` deliberately excludes `.git`, so hosted image builders pass
 # the exact source identity as an atomic three-value override. A local image
 # build may omit all three and remains explicitly unknown/dirty; supplying only
@@ -81,9 +84,9 @@ RUN if [ -n "$KIN_BUILD_GIT_SHA" ] || [ -n "$KIN_BUILD_DIRTY" ] || [ -n "$KIN_BU
       KIN_BUILD_GIT_SHA_OVERRIDE="$KIN_BUILD_GIT_SHA" \
       KIN_BUILD_DIRTY_OVERRIDE="$KIN_BUILD_DIRTY" \
       KIN_BUILD_BRANCH_OVERRIDE="$KIN_BUILD_BRANCH" \
-      cargo build --locked --release --features gcs --bin kin-daemon --bin kin; \
+      cargo build --locked --release --features kin-daemon/gcs,kin-daemon/firestore --bin kin-daemon --bin kin; \
     else \
-      cargo build --locked --release --features gcs --bin kin-daemon --bin kin; \
+      cargo build --locked --release --features kin-daemon/gcs,kin-daemon/firestore --bin kin-daemon --bin kin; \
     fi
 
 # Alternate image: Kin's MCP stdio server instead of the daemon. Select it

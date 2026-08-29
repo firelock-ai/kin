@@ -14,6 +14,8 @@ use kin_model::{Entity, EntityId, EntityKind, EntityRole, Relation, SemanticFing
 use parking_lot::{Mutex, RwLock};
 use sha2::{Digest, Sha256};
 
+use crate::publication::SpineSourceCursor;
+
 /// A repo identifier (matches registry.toml entries).
 pub type RepoId = String;
 
@@ -32,6 +34,18 @@ pub struct EntityEntry {
     /// filtering in federated queries without loading the full entity.
     #[serde(default)]
     pub role: Option<EntityRole>,
+}
+
+/// One fully validated durable repository publication ready for an atomic
+/// cache-generation replacement.
+#[derive(Debug, Clone)]
+pub(crate) struct CommittedRepoIndexPublication {
+    pub repo_id: String,
+    pub entries: Vec<EntityEntry>,
+    pub root_hash: String,
+    pub source_cursor: SpineSourceCursor,
+    pub outgoing_edges: Option<Vec<CrossRepoEdge>>,
+    pub resolution_roots: Option<BTreeMap<String, String>>,
 }
 
 impl PartialEq for EntityEntry {
@@ -431,6 +445,10 @@ struct SpineInner {
     /// Graph root hash per repo (for cache coherence).
     root_hashes: HashMap<RepoId, String>,
 
+    /// Source publication cursor installed atomically with each durable repo
+    /// head. Legacy/local registrations deliberately have no cursor.
+    source_cursors: HashMap<RepoId, SpineSourceCursor>,
+
     /// Repos whose registered entity/root authority has changed since their
     /// outgoing cross-repo edges were last fully materialized.
     dirty_edge_repos: HashSet<RepoId>,
@@ -487,23 +505,84 @@ impl Default for SpineIndex {
 }
 
 impl SpineIndex {
+    fn empty_inner() -> SpineInner {
+        SpineInner {
+            by_name: HashMap::new(),
+            by_id: HashMap::new(),
+            cross_repo_edges: Vec::new(),
+            cross_repo_edges_by_anchor: HashMap::new(),
+            edge_authority_is_closed: true,
+            authority_revision: cross_repo_snapshot_revision(&BTreeMap::new(), &[]),
+            root_hashes: HashMap::new(),
+            source_cursors: HashMap::new(),
+            dirty_edge_repos: HashSet::new(),
+            authority_epoch: 0,
+            active_edge_refreshes: 0,
+            active_full_refresh_epoch: None,
+        }
+    }
+
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(SpineInner {
-                by_name: HashMap::new(),
-                by_id: HashMap::new(),
-                cross_repo_edges: Vec::new(),
-                cross_repo_edges_by_anchor: HashMap::new(),
-                edge_authority_is_closed: true,
-                authority_revision: cross_repo_snapshot_revision(&BTreeMap::new(), &[]),
-                root_hashes: HashMap::new(),
-                dirty_edge_repos: HashSet::new(),
-                authority_epoch: 0,
-                active_edge_refreshes: 0,
-                active_full_refresh_epoch: None,
-            }),
+            inner: RwLock::new(Self::empty_inner()),
             edge_refresh_serialization: Mutex::new(()),
         }
+    }
+
+    /// Replace a complete durable head set as one reader-visible generation.
+    ///
+    /// All maps and edge completeness metadata are built off-lock. The final
+    /// swap takes the index write lock once, so resolve/xref readers observe
+    /// either the prior stable committed fleet or the complete replacement,
+    /// never a prefix installed repo by repo.
+    pub(crate) fn replace_committed_repo_publications<F>(
+        &self,
+        publications: Vec<CommittedRepoIndexPublication>,
+        mut after_staged_repo: F,
+    ) where
+        F: FnMut(usize),
+    {
+        let mut next = Self::empty_inner();
+        let complete_roots = publications
+            .iter()
+            .map(|publication| (publication.repo_id.clone(), publication.root_hash.clone()))
+            .collect::<BTreeMap<_, _>>();
+
+        for (index, publication) in publications.iter().enumerate() {
+            for entry in &publication.entries {
+                let key = (entry.name.to_lowercase(), entry.kind);
+                next.by_name.entry(key).or_default().push(entry.clone());
+                next.by_id
+                    .insert((entry.repo_id.clone(), entry.entity_id), entry.clone());
+            }
+            next.root_hashes
+                .insert(publication.repo_id.clone(), publication.root_hash.clone());
+            next.source_cursors
+                .insert(publication.repo_id.clone(), publication.source_cursor);
+            after_staged_repo(index + 1);
+        }
+
+        for publication in publications {
+            let complete_edge_head = publication.outgoing_edges.is_some()
+                && publication.resolution_roots.as_ref() == Some(&complete_roots);
+            if let Some(edges) = publication.outgoing_edges {
+                next.cross_repo_edges
+                    .extend(edges.into_iter().filter(|edge| {
+                        edge.src_repo == publication.repo_id && edge.src_repo != edge.dst_repo
+                    }));
+            }
+            if !complete_edge_head {
+                next.dirty_edge_repos.insert(publication.repo_id);
+            }
+        }
+        Self::recompute_cross_repo_metadata(&mut next);
+
+        let mut current = self.inner.write();
+        next.authority_epoch = current
+            .authority_epoch
+            .checked_add(1)
+            .expect("spine authority epoch exhausted");
+        *current = next;
     }
 
     /// Register entities from a repo into the index.
@@ -511,6 +590,78 @@ impl SpineIndex {
         let mut inner = self.inner.write();
 
         Self::register_repo_locked(&mut inner, repo_id, entities, root_hash);
+        inner.source_cursors.remove(repo_id);
+    }
+
+    /// Install one committed durable publication under a single write lock.
+    ///
+    /// Metadata, root, cursor and the complete outgoing-edge replacement are
+    /// one reader-visible fact. A metadata-only head removes older outgoing
+    /// edges and stays dirty; an edge head may clear its source dirty bit only
+    /// when it was resolved against the exact roots currently resident.
+    pub(crate) fn install_repo_publication(
+        &self,
+        repo_id: &str,
+        entities: Vec<EntityEntry>,
+        root_hash: &str,
+        source_cursor: SpineSourceCursor,
+        outgoing_edges: Option<Vec<CrossRepoEdge>>,
+        resolution_roots: Option<&BTreeMap<String, String>>,
+    ) {
+        let mut inner = self.inner.write();
+        let root_changed = inner.root_hashes.get(repo_id).map(String::as_str) != Some(root_hash);
+        let has_edge_publication = outgoing_edges.is_some();
+
+        inner.by_name.values_mut().for_each(|entries| {
+            entries.retain(|entry| entry.repo_id != repo_id);
+        });
+        inner.by_id.retain(|(owner, _), _| owner != repo_id);
+        for entry in entities {
+            let key = (entry.name.to_lowercase(), entry.kind);
+            inner.by_name.entry(key).or_default().push(entry.clone());
+            inner
+                .by_id
+                .insert((entry.repo_id.clone(), entry.entity_id), entry);
+        }
+        inner
+            .root_hashes
+            .insert(repo_id.to_string(), root_hash.to_string());
+        inner
+            .source_cursors
+            .insert(repo_id.to_string(), source_cursor);
+        inner
+            .cross_repo_edges
+            .retain(|edge| edge.src_repo != repo_id);
+        if let Some(edges) = outgoing_edges {
+            inner.cross_repo_edges.extend(
+                edges
+                    .into_iter()
+                    .filter(|edge| edge.src_repo == repo_id && edge.src_repo != edge.dst_repo),
+            );
+        }
+
+        inner.authority_epoch = inner
+            .authority_epoch
+            .checked_add(1)
+            .expect("spine authority epoch exhausted");
+        if root_changed {
+            inner.dirty_edge_repos = inner.root_hashes.keys().cloned().collect();
+        }
+        let resolved_against_current_roots = has_edge_publication
+            && resolution_roots.is_some_and(|expected| {
+                inner
+                    .root_hashes
+                    .iter()
+                    .map(|(repo, root)| (repo.clone(), root.clone()))
+                    .collect::<BTreeMap<_, _>>()
+                    == *expected
+            });
+        if resolved_against_current_roots {
+            inner.dirty_edge_repos.remove(repo_id);
+        } else {
+            inner.dirty_edge_repos.insert(repo_id.to_string());
+        }
+        Self::recompute_cross_repo_metadata(&mut inner);
     }
 
     fn register_repo_locked(
@@ -605,6 +756,18 @@ impl SpineIndex {
     /// refresh in flight as readily as for an authority that is genuinely short,
     /// so a caller reporting WHY cross-repo answers are empty needs the startup
     /// pin's own reading beside it, not this alone.
+    ///
+    /// It requires a CURRENT edge publication from every registered repository.
+    /// A repository whose latest publication is metadata-only holds this false
+    /// for as long as that is true, and hydration does not clear it either.
+    /// That follows from what the phase means:
+    /// [`RepoPublicationPhase`](crate::publication::RepoPublicationPhase)
+    /// documents that Metadata "keeps cross-repo topology incomplete", so such
+    /// a repository's outgoing edges are unresolved rather than known-empty.
+    /// Certifying that fleet would answer "what does this repository reference"
+    /// with an empty set and call the empty set authoritative, which is the
+    /// false negative wearing an authoritative verdict that the health route's
+    /// three readings exist to prevent.
     pub fn authority_is_complete(&self) -> bool {
         let inner = self.inner.read();
         let roots = inner
@@ -613,6 +776,19 @@ impl SpineIndex {
             .map(|(repo, root)| (repo.clone(), root.clone()))
             .collect::<BTreeMap<_, _>>();
         Self::authority_complete(&inner, &roots)
+    }
+
+    /// The exact set holding [`Self::authority_is_complete`] false, for
+    /// diagnosis.
+    ///
+    /// The boolean says only that something is dirty; whether that is a
+    /// repository with a pending edge publication or one that never publishes
+    /// edges at all needs the set, and only the first is a transient.
+    /// Test-only: it clones, and a product caller wanting this is asking the
+    /// wrong question.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn dirty_edge_repos(&self) -> std::collections::BTreeSet<RepoId> {
+        self.inner.read().dirty_edge_repos.iter().cloned().collect()
     }
 
     fn authority_complete(inner: &SpineInner, roots: &BTreeMap<RepoId, String>) -> bool {
@@ -854,6 +1030,7 @@ impl SpineIndex {
             if edge.src_repo == edge.dst_repo {
                 continue;
             }
+            inner.source_cursors.remove(&edge.src_repo);
             inner.cross_repo_edges.push(edge);
             accepted += 1;
         }
@@ -950,6 +1127,12 @@ impl SpineIndex {
         inner.root_hashes.get(repo_id).cloned()
     }
 
+    /// Exact durable source cursor installed with this repo's committed head.
+    pub fn source_cursor(&self, repo_id: &str) -> Option<SpineSourceCursor> {
+        let inner = self.inner.read();
+        inner.source_cursors.get(repo_id).copied()
+    }
+
     /// Total number of indexed entities across all repos.
     pub fn entity_count(&self) -> usize {
         let inner = self.inner.read();
@@ -994,6 +1177,30 @@ impl SpineIndex {
         );
     }
 
+    /// Resolve one repository's complete outgoing cross-repo edge set without
+    /// mutating the index.
+    ///
+    /// Durable publishers use this between metadata and edge phases: all
+    /// candidate rows remain detached until the repository head CAS commits
+    /// them, so readers continue to observe only the previous committed head.
+    pub fn derive_cross_repo_edges(
+        &self,
+        repo_id: &str,
+        entities: &[Entity],
+        relations: &[Relation],
+        registry_repo_ids: &[String],
+    ) -> Vec<CrossRepoEdge> {
+        use crate::xref::{collect_unresolved_imports, materialized_edges, resolve_imports};
+
+        let unresolved =
+            collect_unresolved_imports(entities, relations, repo_id, registry_repo_ids);
+        if unresolved.is_empty() {
+            return Vec::new();
+        }
+        let resolutions = resolve_imports(self, &unresolved);
+        materialized_edges(&unresolved, &resolutions)
+    }
+
     fn refresh_cross_repo_edges_with_hook<F>(
         &self,
         repo_id: &str,
@@ -1004,8 +1211,6 @@ impl SpineIndex {
     ) where
         F: FnOnce(),
     {
-        use crate::xref::{collect_unresolved_imports, materialized_edges, resolve_imports};
-
         let _serialized = self.edge_refresh_serialization.lock();
         let mut refresh = self.begin_edge_refresh(repo_id, entities);
         after_start();
@@ -1013,17 +1218,12 @@ impl SpineIndex {
         // Resolve into a detached replacement before taking the mutation lock.
         // Installing the full outgoing set in one write prevents readers from
         // seeing a partial or interleaved union.
-        let unresolved =
-            collect_unresolved_imports(entities, relations, repo_id, registry_repo_ids);
-        let replacement = if unresolved.is_empty() {
-            Vec::new()
-        } else {
-            let resolutions = resolve_imports(self, &unresolved);
-            materialized_edges(&unresolved, &resolutions)
-        };
+        let replacement =
+            self.derive_cross_repo_edges(repo_id, entities, relations, registry_repo_ids);
         let mut inner = self.inner.write();
         inner.cross_repo_edges.retain(|e| e.src_repo != repo_id);
         inner.cross_repo_edges.extend(replacement);
+        inner.source_cursors.remove(repo_id);
         Self::recompute_cross_repo_metadata(&mut inner);
         drop(inner);
         refresh.mark_succeeded();
@@ -1218,6 +1418,101 @@ mod tests {
         let mut entry = test_entry(repo, name, EntityKind::Function);
         entry.entity_id = id;
         entry
+    }
+
+    fn committed_pair(version: &str, cursor: u64) -> Vec<CommittedRepoIndexPublication> {
+        let roots = [
+            ("alpha".to_string(), format!("alpha-{version}")),
+            ("beta".to_string(), format!("beta-{version}")),
+        ]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        ["alpha", "beta"]
+            .into_iter()
+            .map(|repo_id| CommittedRepoIndexPublication {
+                repo_id: repo_id.to_string(),
+                entries: vec![test_entry(
+                    repo_id,
+                    &format!("{repo_id}_{version}"),
+                    EntityKind::Function,
+                )],
+                root_hash: roots[repo_id].clone(),
+                source_cursor: SpineSourceCursor::from_backend_generation(cursor),
+                outgoing_edges: Some(Vec::new()),
+                resolution_roots: Some(roots.clone()),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn committed_fleet_replacement_is_one_reader_visible_generation() {
+        let index = Arc::new(SpineIndex::new());
+        index.replace_committed_repo_publications(committed_pair("old", 1), |_| {});
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_index = Arc::clone(&index);
+        let worker_barrier = Arc::clone(&barrier);
+        let worker = thread::spawn(move || {
+            worker_index.replace_committed_repo_publications(committed_pair("new", 2), |staged| {
+                if staged == 1 {
+                    worker_barrier.wait();
+                    worker_barrier.wait();
+                }
+            });
+        });
+
+        barrier.wait();
+        assert_eq!(index.root_hash("alpha").as_deref(), Some("alpha-old"));
+        assert_eq!(index.root_hash("beta").as_deref(), Some("beta-old"));
+        assert_eq!(index.resolve("alpha_old", None, None).len(), 1);
+        assert!(index.resolve("alpha_new", None, None).is_empty());
+        barrier.wait();
+        worker.join().unwrap();
+
+        assert_eq!(index.root_hash("alpha").as_deref(), Some("alpha-new"));
+        assert_eq!(index.root_hash("beta").as_deref(), Some("beta-new"));
+        assert_eq!(index.resolve("alpha_new", None, None).len(), 1);
+        assert!(index.resolve("alpha_old", None, None).is_empty());
+        assert!(index.authority_is_complete());
+    }
+
+    #[test]
+    fn sequential_hydration_falsification_exposes_a_mixed_fleet() {
+        let index = Arc::new(SpineIndex::new());
+        index.replace_committed_repo_publications(committed_pair("old", 1), |_| {});
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let worker_index = Arc::clone(&index);
+        let worker_barrier = Arc::clone(&barrier);
+        let worker = thread::spawn(move || {
+            let mut replacements = committed_pair("new", 2).into_iter();
+            let alpha = replacements.next().unwrap();
+            worker_index.install_repo_publication(
+                &alpha.repo_id,
+                alpha.entries,
+                &alpha.root_hash,
+                alpha.source_cursor,
+                alpha.outgoing_edges,
+                alpha.resolution_roots.as_ref(),
+            );
+            worker_barrier.wait();
+            worker_barrier.wait();
+            let beta = replacements.next().unwrap();
+            worker_index.install_repo_publication(
+                &beta.repo_id,
+                beta.entries,
+                &beta.root_hash,
+                beta.source_cursor,
+                beta.outgoing_edges,
+                beta.resolution_roots.as_ref(),
+            );
+        });
+
+        barrier.wait();
+        assert_eq!(index.root_hash("alpha").as_deref(), Some("alpha-new"));
+        assert_eq!(index.root_hash("beta").as_deref(), Some("beta-old"));
+        assert_eq!(index.resolve("alpha_new", None, None).len(), 1);
+        assert_eq!(index.resolve("beta_old", None, None).len(), 1);
+        barrier.wait();
+        worker.join().unwrap();
     }
 
     #[test]

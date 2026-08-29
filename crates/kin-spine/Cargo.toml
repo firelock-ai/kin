@@ -15,6 +15,11 @@ doctest = false
 [features]
 default = []
 firestore = ["reqwest"]
+# Exposes the in-memory durable spine store so another crate can drive the real
+# FirestoreSpineBackend over a fake transport. Without it a consumer wanting
+# that has to write a second implementation of the CAS semantics, and two fakes
+# drift in exactly the direction that keeps both suites green.
+test-support = []
 
 [dependencies]
 kin-model = { workspace = true }

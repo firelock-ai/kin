@@ -426,6 +426,17 @@ impl TokenDigest {
     }
 }
 
+/// Constant-time equality for a presented token against an expected one.
+///
+/// Exported because the publication-control administrator token is compared
+/// outside this module. A `==` on two `&str` returns as soon as it finds a
+/// differing byte, which is exactly the timing signal `TokenDigest::ct_eq`
+/// exists to remove, and a comparison a few lines away from a deliberate
+/// constant-time one is worse than no comment at all.
+pub fn tokens_match(presented: &str, expected: &str) -> bool {
+    TokenDigest::of(presented).ct_eq(&TokenDigest::of(expected))
+}
+
 /// The durable half of a rotation overlap window.
 ///
 /// Two numbers and no token material: a start instant and a count are all the
@@ -747,6 +758,86 @@ impl RotationTokens {
             };
         }
         TokenVerdict::Rejected
+    }
+
+    /// Whether this token is one of the configured daemon credentials, primary
+    /// or superseded, whatever the window would do with it.
+    ///
+    /// The window's bounds are about whether a retired credential may still be
+    /// SERVED. They say nothing about whether the same string is safe to hand
+    /// to another surface as a different credential, which is the question a
+    /// distinctness check asks, so this one deliberately ignores them.
+    pub fn matches_any_configured(&self, token: &str) -> bool {
+        let presented = TokenDigest::of(token);
+        let primary = self
+            .primary
+            .as_ref()
+            .map(|configured| presented.ct_eq(configured))
+            .unwrap_or(false);
+        let previous = self
+            .previous
+            .as_ref()
+            .map(|retired| presented.ct_eq(retired))
+            .unwrap_or(false);
+        primary || previous
+    }
+
+    /// Classify without claiming a slot against the accept cap.
+    ///
+    /// `classify` is the serve path's question and it SPENDS, because the cap is
+    /// a ceiling on how much traffic the retired credential carries and serving
+    /// a request is that traffic. A surface that is going to refuse the request
+    /// anyway must not spend: the count is what closes the window, and closing
+    /// it means 401ing traffic, which a request already being refused cannot be.
+    ///
+    /// `WindowClosed` still separates from `Rejected` so a caller can tell a
+    /// retired credential from an unknown one, but nothing is recorded either
+    /// way.
+    pub fn accepts_without_spending(&self, provided: Option<&str>) -> TokenVerdict {
+        let Some(primary) = self.primary.as_ref() else {
+            return TokenVerdict::NotEnforced;
+        };
+        let Some(provided) = provided else {
+            return TokenVerdict::Rejected;
+        };
+        let presented = TokenDigest::of(provided);
+
+        let matches_primary = presented.ct_eq(primary);
+        let matches_previous = self
+            .previous
+            .as_ref()
+            .map(|retired| presented.ct_eq(retired))
+            .unwrap_or(false);
+
+        if matches_primary {
+            return TokenVerdict::Primary;
+        }
+        if matches_previous {
+            return match self.window_admits_now() {
+                Ok(()) => TokenVerdict::Previous,
+                Err(closure) => TokenVerdict::WindowClosed(closure),
+            };
+        }
+        TokenVerdict::Rejected
+    }
+
+    /// The same two bounds `admit_previous` enforces, read rather than taken.
+    fn window_admits_now(&self) -> Result<(), WindowClosure> {
+        let Some(window) = self.window.as_ref() else {
+            return Err(WindowClosure::Expired {
+                max_age_secs: 0,
+                age_secs: 0,
+                env: "unknown",
+            });
+        };
+        if let Some(closure) = window.age_closure(chrono::Utc::now().timestamp()) {
+            return Err(closure);
+        }
+        let observed = self.counters.previous_accepted.load(Ordering::Acquire);
+        if let Some(closure) = window.accepts_closure(observed) {
+            return Err(closure);
+        }
+        Ok(())
     }
 
     /// Take one accept against the window's two bounds, or say which bound
