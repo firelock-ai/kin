@@ -1011,7 +1011,11 @@ mod tests {
 
     #[test]
     fn a_post_mortem_names_the_phase_the_ceiling_and_the_staging() {
-        let lines = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(1))), Path::new("/work/requests"));
+        let lines = post_mortem_lines(
+            &attempt(Some(record())),
+            Some(&reading(Some(1))),
+            Path::new("/work/requests"),
+        );
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("phase 13 of 17, commit bootstrap transaction"),
@@ -1045,17 +1049,29 @@ mod tests {
     /// covers a conversion an operator killed by hand.
     #[test]
     fn a_cgroup_with_no_kills_is_never_told_it_had_one() {
-        let quiet = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(0))), Path::new("/work/requests"));
+        let quiet = post_mortem_lines(
+            &attempt(Some(record())),
+            Some(&reading(Some(0))),
+            Path::new("/work/requests"),
+        );
         assert!(
             !quiet.join("\n").contains("out-of-memory"),
             "zero recorded kills must produce no kill sentence: {quiet:?}"
         );
-        let unknown = post_mortem_lines(&attempt(Some(record())), Some(&reading(None)), Path::new("/work/requests"));
+        let unknown = post_mortem_lines(
+            &attempt(Some(record())),
+            Some(&reading(None)),
+            Path::new("/work/requests"),
+        );
         assert!(
             !unknown.join("\n").contains("out-of-memory"),
             "an unreadable kill counter is not evidence of a kill: {unknown:?}"
         );
-        let some = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(2))), Path::new("/work/requests"));
+        let some = post_mortem_lines(
+            &attempt(Some(record())),
+            Some(&reading(Some(2))),
+            Path::new("/work/requests"),
+        );
         assert!(
             some.join("\n").contains("2 kernel out-of-memory kills"),
             "more than one kill pluralizes: {some:?}"
@@ -1092,7 +1108,12 @@ mod tests {
         let mut unmeasured = record();
         unmeasured.memory_limit_bytes = None;
         unmeasured.memory_source = None;
-        let rendered = post_mortem_lines(&attempt(Some(unmeasured.clone())), None, Path::new("/work/requests")).join("\n");
+        let rendered = post_mortem_lines(
+            &attempt(Some(unmeasured.clone())),
+            None,
+            Path::new("/work/requests"),
+        )
+        .join("\n");
         assert!(
             rendered.contains("could not read a memory ceiling"),
             "an unmeasured ceiling must be disclosed: {rendered}"
@@ -1491,7 +1512,9 @@ mod tests {
         let mut unopened = record();
         unopened.phase_index = 0;
         unopened.phase_label = String::new();
-        let rendered = post_mortem_lines(&attempt(Some(unopened)), None, Path::new("/work/requests")).join("\n");
+        let rendered =
+            post_mortem_lines(&attempt(Some(unopened)), None, Path::new("/work/requests"))
+                .join("\n");
         assert!(
             rendered.contains("phase 1 of 17, before the first phase opened"),
             "{rendered}"
@@ -1519,25 +1542,23 @@ mod tests {
     /// standing in.
     #[test]
     fn the_post_mortem_names_the_repository_it_is_about_and_the_one_being_initialized() {
-        let elsewhere = post_mortem_lines(
-            &attempt(Some(record())),
-            None,
-            Path::new("/work/shallow"),
-        )
-        .join("\n");
+        let elsewhere =
+            post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/shallow"))
+                .join("\n");
         assert!(
             elsewhere.contains("a previous kin init of /work/requests did not finish"),
             "the corpse is still named: {elsewhere}"
         );
         assert!(
-            elsewhere.contains("a different repository from the /work/shallow this run is \
-                                initializing"),
+            elsewhere.contains(
+                "a different repository from the /work/shallow this run is \
+                                initializing"
+            ),
             "and so is the repository this run is converting: {elsewhere}"
         );
 
-        let ours =
-            post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/requests"))
-                .join("\n");
+        let ours = post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/requests"))
+            .join("\n");
         assert!(
             ours.contains("a previous kin init of /work/requests did not finish"),
             "the same-repository case still opens the same way: {ours}"
@@ -1553,8 +1574,7 @@ mod tests {
             record: None,
             ..attempt(None)
         };
-        let orphan_lines =
-            post_mortem_lines(&orphan, None, Path::new("/work/shallow")).join("\n");
+        let orphan_lines = post_mortem_lines(&orphan, None, Path::new("/work/shallow")).join("\n");
         assert!(
             orphan_lines.contains("/work/shallow this run is initializing"),
             "an unreadable record still says which repository this run is about: {orphan_lines}"

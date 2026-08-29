@@ -18138,6 +18138,9 @@ struct CoverageNote {
     full: String,
 }
 
+/// What the coverage banner is called where notes are named by component.
+const SEMANTIC_COVERAGE_COMPONENT: &str = "semantic_coverage";
+
 /// Every note this answer owes a reader about its own coverage, longest form.
 ///
 /// The coverage banner and the degradation ledger answer different questions
@@ -18147,9 +18150,14 @@ struct CoverageNote {
 fn coverage_notes(result: &LocateResult) -> Vec<CoverageNote> {
     let mut notes = Vec::new();
     if let Some(banner) = result.semantic_coverage.as_ref().and_then(coverage_banner) {
+        // Prefixed with its component the way a degradation is. The summary
+        // line names components so a reader can tell whether the note they care
+        // about is in there; a component the summary names and the full text
+        // never mentions makes that promise unkeepable, and the acceptance
+        // check that reads both forms is what caught it.
         notes.push(CoverageNote {
-            component: "semantic_coverage".to_string(),
-            full: banner,
+            component: SEMANTIC_COVERAGE_COMPONENT.to_string(),
+            full: format!("{SEMANTIC_COVERAGE_COMPONENT}: {banner}"),
         });
     }
     for degradation in &result.degradations {
@@ -18217,9 +18225,7 @@ fn file_row_match_kind(entry: &LocateFileEntry, query: &str) -> LocateMatchKind 
     entry
         .symbols
         .iter()
-        .map(|symbol| {
-            classify_locate_match(query, &symbol.name, &symbol.origin, symbol.cosine)
-        })
+        .map(|symbol| classify_locate_match(query, &symbol.name, &symbol.origin, symbol.cosine))
         .max_by_key(|kind| locate_match_kind_strength(*kind))
         .unwrap_or(LocateMatchKind::TextFallback)
 }
@@ -20055,6 +20061,36 @@ mod tests {
             "in full: {}",
             explained_lines[1]
         );
+        // The join, over the real set rather than the two ends. Every component
+        // the summary names has to appear in the text --explain prints, or the
+        // summary is pointing at something a reader cannot find.
+        let mut covered = LocateResult::default();
+        covered.semantic_coverage = Some(
+            serde_json::from_value(serde_json::json!({
+                "complete": false,
+                "note": "no vector index is attached",
+                "indexed": 0,
+                "total": 7790,
+                "pending": 0,
+            }))
+            .expect("minimal coverage deserializes"),
+        );
+        covered.degradations = result.degradations.clone();
+        let summary = collapsed_notes_line(&coverage_notes(&covered))
+            .expect("three notes collapse to a line");
+        let explained = coverage_note_lines(&covered, true).join("\n");
+        for note in coverage_notes(&covered) {
+            assert!(
+                summary.contains(&note.component),
+                "the summary names every note: {summary} is missing {}",
+                note.component
+            );
+            assert!(
+                explained.contains(&note.component),
+                "and --explain carries every name the summary used: {explained} is missing {}",
+                note.component
+            );
+        }
         assert!(
             coverage_note_lines(&LocateResult::default(), false).is_empty()
                 && coverage_note_lines(&LocateResult::default(), true).is_empty(),

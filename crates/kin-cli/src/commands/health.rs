@@ -10697,7 +10697,9 @@ mod tests {
             at_unix: 76_440, // 21:14Z
         };
         let refusal = kin_core::memory_pressure::PressureRefusal {
-            work: kin_core::memory_pressure::HeavyWork::LspSweep.id().to_string(),
+            work: kin_core::memory_pressure::HeavyWork::LspSweep
+                .id()
+                .to_string(),
             level: "critical".to_string(),
             reason: "this repository's daemon and the 11 process(es) it started hold 3.7 GiB \
                      of the 4.0 GiB it is allowed"
@@ -10749,7 +10751,9 @@ mod tests {
         // reader cannot resolve, and an unresolvable row stops being read.
         assert!(
             standing.detail.contains("3.0 GiB past the allowance")
-                && standing.detail.contains("rather than one the kernel imposes"),
+                && standing
+                    .detail
+                    .contains("rather than one the kernel imposes"),
             "the overrun is named and explained: {}",
             standing.detail
         );

@@ -235,7 +235,13 @@ pub async fn run(
     if json {
         print_json_result(&result, boundary, enrichment)?;
     } else {
-        print_human_result(&result, boundary, &enrichment, &cross_file, model_present_before)?;
+        print_human_result(
+            &result,
+            boundary,
+            &enrichment,
+            &cross_file,
+            model_present_before,
+        )?;
     }
     Ok(())
 }
@@ -2221,7 +2227,9 @@ mod tests {
         // the difference between "this did not happen" and "this did not
         // happen, and here is the machine that decided".
         let refusal = kin_core::memory_pressure::PressureRefusal {
-            work: kin_core::memory_pressure::HeavyWork::EmbedBatch.id().to_string(),
+            work: kin_core::memory_pressure::HeavyWork::EmbedBatch
+                .id()
+                .to_string(),
             level: "critical".to_string(),
             reason: "the host had no room for the embed pass".to_string(),
             at_unix: 4_800,
