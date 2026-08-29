@@ -632,6 +632,11 @@ test('the hosted transfer seam is one contract three implementations read', asyn
   // The two request members that carry a shape of their own.
   const expectation = rustStructFields(transferSource, 'RepositoryTransferExpectation');
   assert.deepEqual(expectation.fields, seam.expectationKeys);
+  assert.deepEqual(
+    declaredInterfaceFields(declarations, 'RepositoryTransferExpectation'),
+    seam.expectationKeys,
+    'the expectation an export request carries must be declared with the contract keys'
+  );
   const limits = rustStructFields(transferSource, 'RepositoryTransferLimits');
   assert.deepEqual(limits.fields, seam.limitsKeys);
   const entry = rustStructFields(transferSource, 'RepositoryRefAdvertisementEntry');
@@ -662,6 +667,10 @@ test('the hosted transfer route is built from the contract, and refuses what it 
   const seam = await hostedRepositoryTransferSeam();
   assert.equal(seam.orgScoped, true);
   assert.equal(seam.authorizationScheme, 'Bearer');
+  // The peer protocol carries no remote name, so the server records one. The
+  // founder's decision of 2026-08-29 is that a push naming no remote lands on
+  // origin, and this is the one place that name is written.
+  assert.equal(seam.remoteName, 'origin');
   assert.equal(
     seam.routeTemplate,
     '/api/v1/orgs/{orgId}/repos/{repoId}/transfer/{leaf}',

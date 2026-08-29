@@ -659,6 +659,25 @@ export interface RepositoryRefAdvertisement {
   limits: RepositoryTransferLimits;
 }
 
+/**
+ * What a sender must satisfy for the receiver to admit its pack.
+ *
+ * Derived from a transfer status by bounding the peer's declared limits with
+ * the local ones, so neither side can be made to build an envelope the other
+ * would refuse. It travels as the `expectation` member of an export request.
+ */
+export interface RepositoryTransferExpectation {
+  repository_id: string;
+  destination_ref: RepositoryTransferRefName;
+  destination_target: RepositoryTransferRefTarget | null;
+  destination_head: string | null;
+  roots: RepositoryTransferRootBundle;
+  default_ref: RepositoryTransferRefName | null;
+  git_authority_hash: string | null;
+  supported_features: string[];
+  limits: RepositoryTransferLimits;
+}
+
 export interface RepositoryTransferBody {
   hash: string;
   byte_len: number;

@@ -11,6 +11,7 @@
         "routeTemplate": "/api/v1/orgs/{orgId}/repos/{repoId}/transfer/{leaf}",
         "authorizationScheme": "Bearer",
         "orgScoped": true,
+        "remoteName": "origin",
         "leaves": [
           {
             "leaf": "advertise",
