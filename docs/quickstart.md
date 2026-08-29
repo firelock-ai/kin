@@ -152,9 +152,11 @@ When the wizard finishes, it prints the **health checklist** (the same engine as
 
 > **Hosted / KinLab.** The wizard reads the credential this machine already holds and
 > reports it: signed in as an account with its expiry, present but encrypted, or not
-> signed in. Connecting is `kin auth login` (`--base-url <url>`, or `KINLAB_URL`, for a
-> workspace other than the default), and `kin auth whoami` confirms the account the
-> workspace sees. Local setup does not depend on any of it.
+> signed in. Connecting is `kin auth login --provider github` if you have a GitHub
+> account, or `kin auth login` for the Google sign-in, which is the default
+> (`--base-url <url>`, or `KINLAB_URL`, for a workspace other than the default).
+> `kin auth whoami` confirms the account the workspace sees, and `kin auth status`
+> names the provider the login asked for. Local setup does not depend on any of it.
 
 ---
 
@@ -519,7 +521,7 @@ The checks (IDs as emitted in `--json`):
 | `shell_path` | The `kin-vfs` shell hook is installed and sourced from your rc, and the managed `~/.kin/bin` directory is on PATH now or will be after shell restart. On an install that does not create `~/.kin/bin`, such as an archive or Homebrew one, no PATH line is written and the row says so. |
 | `mcp_client_*` (e.g. `mcp_client_claude`) | A detected AI client has the `kin` MCP server with the `agent-default` profile. With no client configs present, a single `mcp_clients` check reports ok when no client is installed either, and **n/a** naming the detected clients that `kin setup` would configure. |
 | `editor` | The `kin-editor` VS Code extension is detected in `~/.vscode/extensions`. **n/a** if not found / non-VS Code. |
-| `kinlab_connect` | A stored KinLab credential is present. **n/a** when nothing is stored; `kin auth login` connects this machine. |
+| `kinlab_connect` | A stored KinLab credential is present, and the provider its login asked for when the credential records one. **n/a** when nothing is stored; `kin auth login` connects this machine. A credential minted before `--provider` existed, or one this row cannot read without a prompt, names no provider and the row says nothing rather than guessing. |
 | `semantic_query_readiness` | The daemon is reachable and the vector index exists. **yellow/STALE** until you run `kin embed`; **MISSING** if the daemon isn't running. |
 
 ### When a check is yellow or red
