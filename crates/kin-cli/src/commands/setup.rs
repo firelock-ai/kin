@@ -13306,6 +13306,34 @@ async fn apply_language_server_provisioning(
                 for line in evidence {
                     applied.push(format!("    {line}"));
                 }
+                // Installed is not the same as able to answer. On a host with
+                // no Rust toolchain the server Kin just installed starts,
+                // reports itself available, and loads no project, so a run that
+                // stopped at the tick would be telling a reader their reference
+                // edges are coming when they are not.
+                if let Some(recipe) = recipe {
+                    if let Some(gap) =
+                        language_servers::unmet_runtime_dependency(recipe, |program| {
+                            which::which(program).is_ok()
+                        })
+                    {
+                        println!("  {} {gap}", style("!").yellow());
+                        unfinished.push(UnfinishedRepair {
+                            what: format!(
+                                "produce cross-file reference edges for {}",
+                                report.language
+                            ),
+                            reason: gap,
+                            remediation: language_servers::runtime_dependency_remedy(),
+                            // The repair that was asked for did happen: the
+                            // server is installed. This is the separate gap it
+                            // left standing, so it is reported loudly and does
+                            // not flip the exit code of a request that
+                            // completed.
+                            requested: false,
+                        });
+                    }
+                }
             }
             // Its own arm, above `Failed`, because the two need different
             // words. A network error is worth retrying and a digest that did

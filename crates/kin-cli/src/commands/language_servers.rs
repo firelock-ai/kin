@@ -1172,6 +1172,54 @@ fn run_program(
     }
 }
 
+/// A dependency the installed server itself needs, which Kin did not install.
+///
+/// Installing the server is not the same as the server being able to answer,
+/// and for Rust the difference is total. rust-analyzer loads a workspace by
+/// running `cargo metadata`; with no `cargo` on PATH it starts, completes a
+/// handshake, reports itself available, and loads no project at all, so every
+/// reference query comes back empty from a server that is running. Its own
+/// words on such a host are "Failed to load the project at Cargo.toml", caused
+/// by `cargo locate-project` failing.
+///
+/// Measured on 2026-08-28 in a Debian 12 container on `tokio-rs/axum` at
+/// `8f6bb9ce`, twice from a fresh store with only this variable changed. With
+/// cargo: `calls 3498/11883 (29%)`, `cross-file 5345`, and `find_references`
+/// on `Router` answers. Without it: `calls 2191/11883 (18%)`, `cross-file
+/// 1557`, and the same query answers zero.
+///
+/// Kin does not install a language toolchain on a user's machine, so the only
+/// honest move is to name the gap beside the install that did not close it.
+/// `present` is taken as an argument so a test states the host it asserts
+/// against rather than inheriting whichever machine ran it.
+pub(crate) fn unmet_runtime_dependency(
+    recipe: &LanguageServerRecipe,
+    present: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if recipe.language != LanguageId::Rust || present("cargo") {
+        return None;
+    }
+    Some(
+        "the rust language server is installed and cannot resolve this project yet: \
+         rust-analyzer loads a Rust workspace by running `cargo metadata`, and no `cargo` is \
+         on PATH. Cross-file Rust reference edges stay parse-derived until a Rust toolchain is \
+         installed, so `find_references` on a Rust symbol will keep answering empty and Kin \
+         will keep reporting that answer as inconclusive rather than as an absence."
+            .to_string(),
+    )
+}
+
+/// The remedy for the gap [`unmet_runtime_dependency`] names.
+pub(crate) fn runtime_dependency_remedy() -> Vec<String> {
+    vec![
+        "install a Rust toolchain, which is what rust-analyzer reads the project through:"
+            .to_string(),
+        "    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh".to_string(),
+        format!("then {RESTART_AFTER_INSTALL}"),
+        WORKS_WITHOUT_LANGUAGE_SERVERS.to_string(),
+    ]
+}
+
 /// Whether a newly installed server reaches a daemon that is already running.
 ///
 /// It does not, when the daemon started on a host with no server at all.
@@ -1839,6 +1887,62 @@ mod tests {
                 .all(|r| r.outcome == InstallOutcome::AlreadyPresent),
             "{reports:?}"
         );
+    }
+
+    // ---- the dependency the installed server itself needs ------------------
+
+    /// Rust with no cargo is named; Rust with cargo is silent.
+    ///
+    /// The container proof is what this encodes. Installing rust-analyzer on a
+    /// host with no toolchain leaves a server that starts and loads nothing, and
+    /// a run that reported only "installed" would be telling a reader their
+    /// reference edges are coming.
+    #[test]
+    fn rust_without_cargo_is_named_and_rust_with_cargo_is_not() {
+        let rust = recipe_for(LanguageId::Rust).expect("rust must have a recipe");
+        let gap = unmet_runtime_dependency(rust, |_| false)
+            .expect("a host with no cargo must be told what the server still cannot do");
+        assert!(gap.contains("cargo metadata"), "{gap}");
+        assert!(
+            gap.contains("parse-derived"),
+            "the reader must be told what they still have: {gap}"
+        );
+        assert_eq!(
+            unmet_runtime_dependency(rust, |program| program == "cargo"),
+            None,
+            "a host with cargo has no gap to name"
+        );
+    }
+
+    /// No other language claims a toolchain dependency it does not have.
+    ///
+    /// The control. A check that named a gap for every language would fire on
+    /// every host and be wallpaper, and the npm-served servers genuinely need
+    /// nothing beyond Node, which installing them already proved present.
+    #[test]
+    fn the_npm_served_languages_name_no_toolchain_gap() {
+        for language in [
+            LanguageId::Python,
+            LanguageId::TypeScript,
+            LanguageId::JavaScript,
+        ] {
+            let recipe = recipe_for(language).expect("recipe must exist");
+            assert_eq!(
+                unmet_runtime_dependency(recipe, |_| false),
+                None,
+                "{language}: no toolchain gap exists for an npm-served server"
+            );
+        }
+    }
+
+    /// The remedy names the toolchain installer and the restart, and says what
+    /// still works.
+    #[test]
+    fn the_toolchain_remedy_names_the_installer_and_the_restart() {
+        let lines = runtime_dependency_remedy().join("\n");
+        assert!(lines.contains("sh.rustup.rs"), "{lines}");
+        assert!(lines.contains("kin daemon stop"), "{lines}");
+        assert!(lines.contains("Kin runs without this server"), "{lines}");
     }
 
     // ---- route selection --------------------------------------------------
