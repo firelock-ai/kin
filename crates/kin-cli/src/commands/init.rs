@@ -419,6 +419,130 @@ impl CrossFileEnrichment {
     }
 }
 
+/// One language a cold sweep could not serve, as `/lsp/sweep/status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedLanguage {
+    language: String,
+    files: u64,
+    reason: String,
+}
+
+/// The languages `/lsp/sweep/status` says this sweep could not serve.
+///
+/// A row missing either half is dropped rather than defaulted. A language with
+/// no reason would print a skip nothing explains, and a reason with no language
+/// names nothing; both are worse than a shorter list, because the caller below
+/// keys its whole verdict on whether this comes back empty. A daemon too old to
+/// send the field reads as nothing skipped, which is the same conservative
+/// reading an unpublished readiness map already gets.
+fn skipped_languages_from_status(status: &serde_json::Value) -> Vec<SkippedLanguage> {
+    let Some(rows) = status.get("languages_skipped").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let language = row.get("language")?.as_str()?.to_string();
+            let reason = row.get("reason")?.as_str()?.to_string();
+            if language.is_empty() || reason.is_empty() {
+                return None;
+            }
+            Some(SkippedLanguage {
+                language,
+                files: row.get("files").and_then(|v| v.as_u64()).unwrap_or(0),
+                reason,
+            })
+        })
+        .collect()
+}
+
+/// `1 file` and `2 files`, so a count never reads `1 files`.
+fn plural_count(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("{n} {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// What a FINISHED sweep amounts to: the line to print and the verdict to carry.
+///
+/// One function rather than a wording helper beside a branch, because the two
+/// are the same claim and a test that reaches only one of them proves nothing
+/// about the other: a renderer test stays green when the branch that calls it is
+/// deleted.
+///
+/// The middle arm is coldwalk finding 6. A macOS pass on `tokio-rs/axum`, on a
+/// host that DID carry rustup and rust-analyzer, printed
+/// `cross-file enrichment complete (5/303 files)`, and the same store's next
+/// `kin graph status` read `imports 0/1085 (0%)` and `cross-file reference and
+/// override edges unavailable for rust: no language server found`, numbers
+/// byte-identical to a container with no language server at all. The five files
+/// were JavaScript. One store cannot say both things. The zero-file guard could
+/// not catch it, because `done` was five rather than zero, and the count alone
+/// never could: `files_blocked` counts files and cannot name a language.
+fn cross_file_enrichment_outcome(
+    done: u64,
+    total: u64,
+    blocked: u64,
+    skipped: &[SkippedLanguage],
+) -> (String, CrossFileEnrichment) {
+    // A sweep that enriched nothing reported the same sentence as one that had
+    // nothing left to do, and on a JavaScript repository with 66 admitted files
+    // that sentence was "complete (0/66 files)".
+    if done == 0 && total > 0 {
+        return (
+            format!(
+                "note: cross-file enrichment finished without enriching any of the {total} files \
+                 it walked ({blocked} blocked); reference and import edges will be missing until \
+                 it can run"
+            ),
+            CrossFileEnrichment::Withheld {
+                pending: format!(
+                    "the sweep walked {total} files and enriched none of them, so cross-file \
+                     reference and override edges are not in this graph; `kin daemon sweep` \
+                     retries it"
+                ),
+            },
+        );
+    }
+    if !skipped.is_empty() {
+        let mut lines = vec![format!(
+            "  cross-file enrichment ended having enriched {done} of {total} files, leaving {} \
+             unserved:",
+            plural_count(skipped.len() as u64, "language", "languages")
+        )];
+        for entry in skipped {
+            lines.push(format!(
+                "    {}: {} not enriched, because {}",
+                entry.language,
+                plural_count(entry.files, "file", "files"),
+                entry.reason
+            ));
+        }
+        let languages: Vec<&str> = skipped
+            .iter()
+            .map(|entry| entry.language.as_str())
+            .collect();
+        return (
+            lines.join("\n"),
+            CrossFileEnrichment::Withheld {
+                pending: format!(
+                    "the sweep enriched {done} of {total} files and could not serve {}, so \
+                     cross-file reference and override edges for {} are not in this graph; the \
+                     note above names what each one needs, and `kin daemon sweep` retries once \
+                     that is repaired",
+                    plural_count(skipped.len() as u64, "language", "languages"),
+                    languages.join(", ")
+                ),
+            },
+        );
+    }
+    (
+        format!("  cross-file enrichment complete ({done}/{total} files)"),
+        CrossFileEnrichment::Produced,
+    )
+}
+
 /// Run the conversion phase and ALWAYS clean up after it.
 ///
 /// The cleanup used to sit after the happy-path wait, so every early return
@@ -631,26 +755,10 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
                 .get("files_blocked")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            // A sweep that enriched nothing reported the same sentence as one
-            // that had nothing left to do, and on a JavaScript repository with
-            // 66 admitted files that sentence was "complete (0/66 files)". The
-            // conversion had not failed and nothing said the enrichment had.
-            if done == 0 && total > 0 {
-                note!(
-                    "note: cross-file enrichment finished without enriching any of the {total} \
-                     files it walked ({blocked} blocked); reference and import edges will be \
-                     missing until it can run"
-                );
-                return CrossFileEnrichment::Withheld {
-                    pending: format!(
-                        "the sweep walked {total} files and enriched none of them, so cross-file \
-                         reference and override edges are not in this graph; `kin daemon sweep` \
-                         retries it"
-                    ),
-                };
-            }
-            note!("  cross-file enrichment complete ({done}/{total} files)");
-            return CrossFileEnrichment::Produced;
+            let skipped = skipped_languages_from_status(&status);
+            let (line, outcome) = cross_file_enrichment_outcome(done, total, blocked, &skipped);
+            note!("{}", line);
+            return outcome;
         }
         if std::time::Instant::now() >= deadline {
             note!(
@@ -1405,6 +1513,150 @@ mod tests {
     /// other half, the sentence a user reads, because the defect this replaced
     /// lived in the sentence: the daemon computed the truth, logged the truth
     /// to itself, and handed the reader a fabrication.
+    /// Coldwalk finding 6, as its own module.
+    ///
+    /// Every fixture below is that walk's measurement rather than a shape
+    /// invented here: `tokio-rs/axum` on a macOS host carrying rustup and
+    /// rust-analyzer, `enriched 5/303 files`, the five JavaScript, and the same
+    /// store's next `kin graph status` reading `cross-file reference and
+    /// override edges unavailable for rust: no language server found`.
+    mod a_sweep_that_skipped_a_language {
+        use super::super::{
+            cross_file_enrichment_outcome, skipped_languages_from_status, CrossFileEnrichment,
+            SkippedLanguage,
+        };
+
+        const RUST_REASON: &str = "the `rust-analyzer` language server did not start (No such \
+                                   file or directory (os error 2)), so nothing in this language \
+                                   was enriched";
+
+        fn coldwalk_status() -> serde_json::Value {
+            serde_json::json!({
+                "running": false,
+                "files_done": 5,
+                "files_total": 303,
+                "files_blocked": 298,
+                "sweeps_completed": 1,
+                "enrichment_available": true,
+                "languages_skipped": [
+                    { "language": "rust", "files": 298, "reason": RUST_REASON }
+                ]
+            })
+        }
+
+        /// The sentence the walk caught, on the input that produced it.
+        ///
+        /// The ban on "complete" is the assertion rather than a style note. This
+        /// is the one place in that whole walkthrough where the product stated a
+        /// completion that did not happen, and it happened because `done` was 5
+        /// rather than 0, so the only guard on this branch could not fire.
+        #[test]
+        fn the_word_complete_is_not_used_and_the_gap_is_named() {
+            let skipped = skipped_languages_from_status(&coldwalk_status());
+            assert_eq!(skipped.len(), 1, "the fixture carries one skipped language");
+            let (line, outcome) = cross_file_enrichment_outcome(5, 303, 298, &skipped);
+
+            assert!(
+                !line.contains("complete"),
+                "a pass that could not serve a language must not report a completion: {line}"
+            );
+            assert!(
+                line.contains("enriched 5 of 303 files"),
+                "the line must say what WAS enriched: {line}"
+            );
+            assert!(
+                line.contains("rust"),
+                "the line must name the language that was skipped: {line}"
+            );
+            assert!(
+                line.contains("298 files"),
+                "the line must say how much was skipped: {line}"
+            );
+            assert!(
+                line.contains("rust-analyzer"),
+                "the line must say WHY, from what the daemon observed: {line}"
+            );
+            match outcome {
+                CrossFileEnrichment::Withheld { pending } => assert!(
+                    pending.contains("rust"),
+                    "the withheld reason must name the language still owed: {pending}"
+                ),
+                CrossFileEnrichment::Produced => {
+                    panic!("a sweep that skipped a whole language did not produce that language")
+                }
+            }
+        }
+
+        /// The control, and it is half of the test above.
+        ///
+        /// A ban on one word is satisfied by never saying anything, so the same
+        /// function on a sweep that skipped nothing must still reach the
+        /// completion line and `Produced`. Without this, deleting the word
+        /// everywhere would pass.
+        #[test]
+        fn a_sweep_that_skipped_nothing_still_reports_a_completion() {
+            let status = serde_json::json!({
+                "files_done": 303,
+                "files_total": 303,
+                "files_blocked": 0,
+                "languages_skipped": []
+            });
+            let skipped = skipped_languages_from_status(&status);
+            assert!(skipped.is_empty(), "no rows means nothing was skipped");
+
+            let (line, outcome) = cross_file_enrichment_outcome(303, 303, 0, &skipped);
+            assert!(
+                line.contains("cross-file enrichment complete (303/303 files)"),
+                "a sweep that served every language it met still completes: {line}"
+            );
+            assert_eq!(outcome, CrossFileEnrichment::Produced);
+        }
+
+        /// A daemon too old to send the field reads as nothing skipped, never as
+        /// an empty list dressed up as knowledge.
+        #[test]
+        fn a_status_without_the_field_reports_no_skipped_language() {
+            let status = serde_json::json!({ "files_done": 5, "files_total": 303 });
+            assert!(skipped_languages_from_status(&status).is_empty());
+        }
+
+        /// A row missing its reason is dropped rather than defaulted, because a
+        /// skip nothing explains sends its reader hunting a cause the daemon
+        /// never observed.
+        #[test]
+        fn a_row_missing_a_half_is_dropped_rather_than_defaulted() {
+            let status = serde_json::json!({
+                "languages_skipped": [
+                    { "language": "rust", "files": 298 },
+                    { "files": 12, "reason": "no language was named" },
+                    { "language": "python", "files": 12, "reason": "pyright did not start" }
+                ]
+            });
+            assert_eq!(
+                skipped_languages_from_status(&status),
+                vec![SkippedLanguage {
+                    language: "python".to_string(),
+                    files: 12,
+                    reason: "pyright did not start".to_string(),
+                }]
+            );
+        }
+
+        /// The zero-file case keeps its own sentence, which predates this and is
+        /// a different claim: nothing at all moved, rather than one language
+        /// moving while another could not.
+        #[test]
+        fn the_zero_file_case_keeps_its_own_sentence() {
+            let (line, outcome) = cross_file_enrichment_outcome(0, 66, 66, &[]);
+            assert!(
+                line.contains("without enriching any of the 66 files"),
+                "{line}"
+            );
+            assert!(!line.contains("complete"), "{line}");
+            assert!(matches!(outcome, CrossFileEnrichment::Withheld { .. }));
+        }
+    }
+
     mod enrichment_unavailable_notes {
         use super::super::enrichment_unavailable_note;
 
