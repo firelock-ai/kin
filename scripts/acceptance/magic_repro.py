@@ -3490,7 +3490,13 @@ def check_24(suite):
     if rc_o != 0:
         res.unknown("the off-topic control exited %d: %s" % (rc_o, off_notes[-200:]))
     elif not off_rows:
-        res.ok("the off-topic control returned no rows at all, which is its own honest state")
+        # Not a pass. "No relevant files found." is an honest answer, and it is
+        # also the one state in which this arm cannot grade the floor note it
+        # exists to grade. Reporting it as a pass would be a check that cannot
+        # fail; the floor note itself is pinned by `answer_floor_note`'s unit
+        # test in crates/kin-cli/src/commands/locate.rs.
+        res.unknown("the off-topic control returned no rows, so the answer-floor note had "
+                    "nothing to fire on and this arm graded nothing: %r" % off[:200])
     elif any("[named match]" in line for line in off_rows):
         res.unknown("the off-topic control named a symbol this fixture holds, so it is not "
                     "off-topic here: %s" % off[:300])
