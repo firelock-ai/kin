@@ -57,6 +57,26 @@ kin init [path] [options]
 | --- | --- | --- |
 | `--json` |  | Output machine-readable JSON status instead of human text |
 
+Before it captures anything, `kin init` counts the repository's commits and tracked files,
+forecasts what converting that much history holds in memory, and compares the forecast to the
+memory this machine or container allows. A conversion forecast well past that limit is refused
+there, in one sentence, with the numbers and what to do about it, rather than being killed by the
+kernel a minute later with no message at all. One forecast to spare and it says what it expects to
+hold and carries on; comfortably inside it and it says nothing. The forecast is a floor taken from
+measured conversions, so it understates rather than overstates, and it is a statement about memory
+and never about time.
+
+Set `KIN_INIT_MEMORY_CEILING_BYTES` to a byte count when Kin reads your machine's ceiling wrongly,
+or when you have judged the forecast wrong for your repository and want to convert anyway. A value
+that is not a positive whole number is refused rather than ignored, because a ceiling nobody set is
+how a conversion gets killed with no warning.
+
+Exit codes: `0` when the conversion finished and nothing died, and `7` when it produced a store but
+a daemon serving that store was killed during the run, which leaves the semantic enrichment
+unattested. `7` is not a failure. The store is real and answers questions; what nobody can attest is
+that its enrichment finished, and the summary says the same thing in words. A scripted or
+agent-driven setup should branch on it rather than treating the run as done.
+
 ### `kin clone`
 
 Clone a repository
