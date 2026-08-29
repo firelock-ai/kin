@@ -115,6 +115,7 @@
 //!   stream ineligible rather than reporting a misleading success.
 
 pub mod api;
+pub mod auth_rotation;
 pub mod background_work;
 pub mod commit_deltas;
 pub mod commit_liveness;
