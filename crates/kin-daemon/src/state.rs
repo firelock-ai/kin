@@ -2104,6 +2104,22 @@ fn salvage_from_sidecar_outcome(
     })
 }
 
+/// One language a cold sweep could not enrich, and the observation behind it.
+///
+/// The reason is what this process OBSERVED when it tried, never a cause
+/// derived from a count, which is the same discipline `enrichment_unavailable`
+/// already follows: a note that asserts a cause it did not measure tells a user
+/// with a working server that they have none.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SweepLanguageSkip {
+    /// The language, as `LanguageId` renders it.
+    pub language: String,
+    /// Files in that language the sweep walked past.
+    pub files: u64,
+    /// What this process saw when it tried to serve the language.
+    pub reason: String,
+}
+
 pub struct DaemonState {
     pub layout: KinLayout,
     pub graph: Arc<kin_db::InMemoryGraph>,
@@ -2474,6 +2490,22 @@ pub struct DaemonState {
     /// running/idle flag cannot: a waiter that polls before the worker picks the
     /// message up reads idle and concludes it is done.
     pub lsp_sweeps_completed: AtomicU64,
+    /// Which languages the last cold sweep could not enrich, and why.
+    ///
+    /// `files_blocked` counts the files and cannot name a language, so a caller
+    /// holding a nonzero blocked count still cannot say what a user lost. That
+    /// gap is what let `kin init` print "cross-file enrichment complete
+    /// (5/303 files)" over a pass whose Rust server never started: five
+    /// JavaScript files moved, `files_done` was above zero, and the completion
+    /// branch had nothing to consult about the other language.
+    ///
+    /// The sweep already computes this to avoid retrying a failed server once
+    /// per file. Recording it here is what makes it readable off
+    /// `/lsp/sweep/status` instead of only in a log line.
+    ///
+    /// Written once at the end of a sweep, replacing whatever the previous
+    /// sweep left, because a fresh answer supersedes an old one wholesale.
+    pub lsp_sweep_languages_skipped: std::sync::Mutex<Vec<SweepLanguageSkip>>,
     /// Set while a sweep is in flight.
     pub lsp_sweep_running: AtomicBool,
     /// Files a sweep has finished enriching, so a later pass can skip them.
@@ -4496,6 +4528,7 @@ impl DaemonState {
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweep_files_blocked: AtomicU64::new(0),
+            lsp_sweep_languages_skipped: std::sync::Mutex::new(Vec::new()),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -4775,6 +4808,7 @@ impl DaemonState {
             lsp_sweep_files_done: AtomicU64::new(0),
             lsp_sweep_files_total: AtomicU64::new(0),
             lsp_sweep_files_blocked: AtomicU64::new(0),
+            lsp_sweep_languages_skipped: std::sync::Mutex::new(Vec::new()),
             lsp_sweeps_completed: AtomicU64::new(0),
             lsp_sweep_running: AtomicBool::new(false),
             lsp_enriched_files: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -10099,6 +10133,45 @@ mod tests {
             .ingest_cas_dir()
             .join(&encoded[..2])
             .join(&encoded[2..])
+    }
+
+    /// The wire shape `/lsp/sweep/status` serves for a skipped language.
+    ///
+    /// `kin init` reads `language`, `files` and `reason` off each row to decide
+    /// whether a finished sweep may call itself complete, and it lives in
+    /// another crate that shares no type with this one. So a rename here is a
+    /// silent break there: the CLI's parser drops a row it cannot read, comes
+    /// back empty, and prints the completion sentence this whole record exists
+    /// to stop. Asserting the exact key set is what turns that into a red.
+    ///
+    /// What this does NOT close: that the handler still serves these rows under
+    /// `languages_skipped`, and that a real daemon reaches this branch at all.
+    /// Both need one language served while another is not, and the adapters'
+    /// server commands are constants in kin-lsp with no override, so no
+    /// hermetic fixture on an arbitrary host can arrange it yet.
+    #[test]
+    fn a_skipped_language_serializes_the_three_keys_kin_init_reads() {
+        let row = SweepLanguageSkip {
+            language: "rust".to_string(),
+            files: 298,
+            reason: "the `rust-analyzer` language server did not start".to_string(),
+        };
+        let value = serde_json::to_value(&row).expect("a skip row must serialize");
+        let object = value.as_object().expect("a skip row is a JSON object");
+        let mut keys: Vec<&str> = object.keys().map(|k| k.as_str()).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["files", "language", "reason"],
+            "kin init reads exactly these three; adding or renaming one breaks a crate this \
+             one shares no type with"
+        );
+        assert_eq!(object["language"], serde_json::json!("rust"));
+        assert_eq!(object["files"], serde_json::json!(298));
+        assert!(object["reason"]
+            .as_str()
+            .expect("reason is a string")
+            .contains("rust-analyzer"));
     }
 
     fn test_state(layout: KinLayout, working_dir: &std::path::Path) -> DaemonState {

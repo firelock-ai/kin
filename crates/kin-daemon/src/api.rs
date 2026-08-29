@@ -15358,6 +15358,15 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         // without it `kin init` printed "complete (0/66 files)" over a sweep
         // whose language server never started.
         "files_blocked": state.lsp_sweep_files_blocked.load(Ordering::SeqCst),
+        // Which languages the sweep could not serve, and what it saw. The count
+        // above cannot name a language, so a pass that enriched one language and
+        // skipped another reported a nonzero `files_done` and nothing else, and
+        // `kin init` called that complete. This is the half that names it.
+        "languages_skipped": state
+            .lsp_sweep_languages_skipped
+            .lock()
+            .map(|skipped| serde_json::to_value(&*skipped).unwrap_or(json!([])))
+            .unwrap_or_else(|_| json!([])),
         "sweeps_completed": state.lsp_sweeps_completed.load(Ordering::SeqCst),
         // Reported rather than left for the caller to infer from a zero total:
         // a daemon with no language server never sweeps, and a caller waiting
