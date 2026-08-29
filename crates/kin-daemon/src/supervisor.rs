@@ -1202,22 +1202,16 @@ fn router_with_auth_and_shutdown(
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Router {
     // A single token is a closed rotation window. Every existing caller keeps
-    // this signature; only the serve path resolves a superseded token too. No
-    // window is opened here, so the bounds are inert and taken from their
-    // defaults rather than from the environment, where an unusable value would
-    // refuse a path with no window to bound.
-    let tokens = crate::auth_rotation::RotationTokens::new(
-        auth_token,
-        None,
-        SUPERVISOR_AUTH_TOKEN_ENV,
-        SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
-        rotation_window_record_path(&supervisor_dir()),
-        crate::auth_rotation::RotationBounds::defaults(
-            SUPERVISOR_AUTH_ROTATION_WINDOW_SECS_ENV,
-            SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS_ENV,
-        ),
-    )
-    .expect("a primary-only token set cannot be an invalid rotation configuration");
+    // this signature; only the serve path resolves a superseded token too.
+    //
+    // `primary_only` rather than `new`, because `new` belongs to a serve path:
+    // told there is no superseded token, it REMOVES the window record, which is
+    // right when a process starts and wrong when a router is built. The
+    // supervisor's record lives under `supervisor_root()`, keyed on the real
+    // home rather than on `KIN_HOME`, so going through it here made building a
+    // router delete a live window's record out of that one global directory,
+    // including from a unit test that only wanted a router.
+    let tokens = crate::auth_rotation::RotationTokens::primary_only(auth_token);
     router_with_rotation_tokens(state, tokens, shutdown)
 }
 
@@ -3803,6 +3797,33 @@ mod tests {
         );
     }
 
+    /// An open supervisor rotation window whose durable record lives in a temp
+    /// directory. Mirrors `api::open_rotation_window`.
+    ///
+    /// The record path is per-test on purpose: a shared one would let two tests
+    /// resume each other's window and each other's accept count.
+    fn open_supervisor_rotation_window(
+        dir: &tempfile::TempDir,
+        max_age_secs: u64,
+        max_accepts: u64,
+    ) -> crate::auth_rotation::RotationTokens {
+        crate::auth_rotation::RotationTokens::new(
+            Some("current-token".to_string()),
+            Some("retired-token".to_string()),
+            SUPERVISOR_AUTH_TOKEN_ENV,
+            SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
+            rotation_window_record_path(dir.path()),
+            crate::auth_rotation::RotationBounds::new(
+                max_age_secs,
+                max_accepts,
+                SUPERVISOR_AUTH_ROTATION_WINDOW_SECS_ENV,
+                SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS_ENV,
+            )
+            .expect("positive bounds are usable"),
+        )
+        .expect("valid token configuration")
+    }
+
     #[tokio::test]
     async fn an_open_supervisor_rotation_window_accepts_both_tokens_over_http() {
         // The supervisor guard is a second copy of the daemon guard, and a
@@ -3811,21 +3832,7 @@ mod tests {
         // this proves the supervisor's wiring rather than assuming the shared
         // type covers it.
         let window = tempfile::tempdir().expect("tempdir");
-        let tokens = crate::auth_rotation::RotationTokens::new(
-            Some("current-token".to_string()),
-            Some("retired-token".to_string()),
-            SUPERVISOR_AUTH_TOKEN_ENV,
-            SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
-            window.path().join("supervisor-auth-rotation-window.json"),
-            crate::auth_rotation::RotationBounds::new(
-                3_600,
-                1_000,
-                SUPERVISOR_AUTH_ROTATION_WINDOW_SECS_ENV,
-                SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS_ENV,
-            )
-            .expect("positive bounds are usable"),
-        )
-        .unwrap();
+        let tokens = open_supervisor_rotation_window(&window, 3_600, 1_000);
         let app =
             router_with_rotation_tokens(Arc::new(SupervisorState::new()), tokens.clone(), None);
 
@@ -3878,6 +3885,149 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(retired.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// A window either bound has closed refuses the superseded token over the
+    /// real supervisor router, and refuses it exactly the way an unknown token
+    /// is refused.
+    ///
+    /// Mirrors `api::a_bound_closing_the_rotation_window_refuses_the_superseded_token_over_http`,
+    /// and the supervisor needs its own copy for the reason the module doc
+    /// gives: a second copy is only ever wrong in a way that looks like a
+    /// passing run. `auth_rotation`'s own tests grade the bounds and cannot see
+    /// whether `supervisor_auth` acts on the verdict, and neither can the two
+    /// supervisor tests above, because one drives an OPEN window and the other
+    /// has no superseded token at all. A guard treating `WindowClosed` as an
+    /// accept leaves every one of them green. This is the join for that branch.
+    #[tokio::test]
+    async fn a_bound_closing_the_supervisor_rotation_window_refuses_the_superseded_token_over_http()
+    {
+        let window = tempfile::tempdir().expect("tempdir");
+        // A cap of one, so the second superseded request is the first refused
+        // one and the two arms cannot be confused for each other.
+        let tokens = open_supervisor_rotation_window(&window, 3_600, 1);
+        let app =
+            router_with_rotation_tokens(Arc::new(SupervisorState::new()), tokens.clone(), None);
+
+        let retired = |app: Router| async move {
+            app.oneshot(
+                Request::get("/repos")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        let inside = retired(app.clone()).await;
+        assert_eq!(inside.status(), StatusCode::OK);
+        assert_eq!(tokens.previous_accepted_count(), 1);
+
+        let outside = retired(app.clone()).await;
+        assert_eq!(
+            outside.status(),
+            StatusCode::UNAUTHORIZED,
+            "the accept bound must close the window on the supervisor too"
+        );
+        // The refused request must not be counted as an accept.
+        assert_eq!(tokens.previous_accepted_count(), 1);
+        assert_eq!(tokens.previous_refused_since_start(), 1);
+        assert!(matches!(
+            tokens.window_closure(),
+            Some(crate::auth_rotation::WindowClosure::AcceptsExhausted { .. })
+        ));
+
+        // The refusal is the supervisor's own sentence, and it is byte-identical
+        // to the one an unknown token gets, or the response tells a caller that
+        // the value it presented used to authenticate here.
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::get("/repos")
+                    .header("authorization", "Bearer never-a-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), outside.status());
+        assert_eq!(
+            outside.headers().get(header::WWW_AUTHENTICATE),
+            unknown.headers().get(header::WWW_AUTHENTICATE)
+        );
+        let closed_body = axum::body::to_bytes(outside.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let unknown_body = axum::body::to_bytes(unknown.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&closed_body).unwrap(),
+            r#"{"error":"Authentication required"}"#
+        );
+        assert_eq!(closed_body, unknown_body);
+
+        // A closed window must not take the surface down: the primary keeps
+        // working, which is the whole reason the bound refuses one token rather
+        // than failing startup.
+        let current = app
+            .oneshot(
+                Request::get("/repos")
+                    .header("authorization", "Bearer current-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+    }
+
+    /// Building a supervisor router must not disturb an open window's durable
+    /// record, which lives in one directory shared by the whole machine.
+    ///
+    /// `router_with_auth_and_shutdown` once built its token set through
+    /// `RotationTokens::new`, which reads a primary-only configuration as a
+    /// finished rotation and removes the record. The supervisor's record sits
+    /// under `supervisor_root()`, keyed on the real home rather than on
+    /// `KIN_HOME`, so that was not confined to a test's own temp directory:
+    /// running any supervisor unit test on a machine with a live rotation
+    /// window deleted that window's state.
+    ///
+    /// Redirecting the environment is the only way to observe it, so this holds
+    /// the binary's env lock and the sanctioned guard, and it asserts the
+    /// redirect took effect BEFORE it asserts anything else. A seed written
+    /// where the code never looks would survive on the broken code too.
+    #[tokio::test]
+    async fn building_a_supervisor_router_leaves_the_rotation_window_record_intact() {
+        let _env = env_test_lock();
+        let home = tempfile::tempdir().expect("tempdir");
+        let _registry = kin_core::test_env::EnvVarGuard::set(
+            "KIN_REGISTRY_PATH",
+            home.path().join("registry.toml"),
+        );
+
+        let path = rotation_window_record_path(&supervisor_dir());
+        assert!(
+            path.starts_with(home.path()),
+            "the redirect must move the supervisor record under {}, got {}",
+            home.path().display(),
+            path.display()
+        );
+        let seeded = br#"{"opened_unix":1787900000,"previous_accepted":7}"#;
+        std::fs::write(&path, seeded).expect("seed a window record");
+
+        let _app = router_with_auth(
+            Arc::new(SupervisorState::new()),
+            Some("current-token".to_string()),
+        );
+
+        assert_eq!(
+            std::fs::read(&path).ok().as_deref(),
+            Some(seeded.as_slice()),
+            "building a supervisor router must leave the window record byte for byte at {}",
+            path.display()
+        );
     }
 
     #[tokio::test]

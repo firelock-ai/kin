@@ -504,8 +504,27 @@ impl std::fmt::Debug for RotationTokens {
 impl RotationTokens {
     /// A surface with no enforcement and no window.
     pub fn disabled() -> Self {
+        Self::primary_only(None)
+    }
+
+    /// A set holding one token and no rotation window, touching no filesystem.
+    ///
+    /// A primary-only configuration is a closed window, and on a serve path
+    /// [`RotationTokens::new`] says so by REMOVING any record it finds: a
+    /// process starting without a superseded token has finished its rotation,
+    /// so the next one should open a fresh window rather than inherit a spent
+    /// budget. Building a router makes no such statement. Routing every
+    /// primary-only construction through `new` therefore made building a router
+    /// delete the surface's live window record, from the real state directory,
+    /// which is what a unit test that only wanted a router did.
+    ///
+    /// So this is the primary-only case with the filesystem removed rather than
+    /// a second spelling of it: no path to resolve, no record to read or write,
+    /// and nothing that can fail, because every refusal `new` makes is about a
+    /// superseded token there is none of here.
+    pub fn primary_only(primary: Option<String>) -> Self {
         Self {
-            primary: None,
+            primary: normalize(primary).as_deref().map(TokenDigest::of),
             previous: None,
             window: None,
             counters: Arc::new(RotationCounters::default()),
@@ -523,6 +542,13 @@ impl RotationTokens {
     /// rather than derived here because the two surfaces keep their state in
     /// different directories, and a shared default would let a future change to
     /// either directory silently join their windows into one.
+    ///
+    /// This constructor WRITES to `record_path`: it opens or resumes a record
+    /// when a superseded token is configured, and removes one when none is. It
+    /// belongs to a serve path, which is the only caller entitled to say a
+    /// rotation has begun or finished. A caller that just wants a token set with
+    /// one token wants [`RotationTokens::primary_only`], which owns no durable
+    /// state at all.
     pub fn new(
         primary: Option<String>,
         previous: Option<String>,
@@ -552,10 +578,19 @@ impl RotationTokens {
 
         let counters = Arc::new(RotationCounters::default());
         let window = if previous.is_some() {
-            let record = open_or_resume_window(&record_path);
+            let (record, durable) = open_or_resume_window(&record_path);
             counters
                 .previous_accepted
                 .store(record.previous_accepted, Ordering::Relaxed);
+            // A record that could not be CREATED is already not surviving a
+            // restart, and the flag has to say so from this instant. Setting it
+            // only inside `persist` left `window_state_durable()` reporting true
+            // for the whole interval between process start and the first
+            // superseded accept, which is exactly the interval after a rollout
+            // when an operator reads the status route and sees a zero count.
+            if !durable {
+                counters.persist_failed.store(true, Ordering::Relaxed);
+            }
             Some(Arc::new(RotationWindow {
                 record_path,
                 opened_unix: record.opened_unix,
@@ -665,6 +700,12 @@ impl RotationTokens {
     /// the bounds have quietly become per-process again. Reported rather than
     /// fatal: refusing traffic because a disk write failed would be the outage
     /// the window exists to prevent.
+    ///
+    /// It covers the record's creation as well as the writes that follow it, so
+    /// a window whose record was never written reports `false` from the first
+    /// instant rather than from the first superseded accept. That interval is
+    /// the one right after a rollout, when the count is legitimately zero and an
+    /// operator has nothing else to read.
     pub fn window_state_durable(&self) -> bool {
         !self.counters.persist_failed.load(Ordering::Relaxed)
     }
@@ -823,23 +864,31 @@ impl RotationWindow {
 /// re-arms both bounds rather than assuming a budget that was already spent.
 /// A record claiming a start instant in 1970 is nonsense for the same reason
 /// the zero timestamp sentinel is safe: this daemon cannot be serving then.
-fn open_or_resume_window(record_path: &Path) -> WindowRecord {
+///
+/// Returns the record and whether it is durable. The caller needs the second
+/// half: a window whose record could not be created has already stopped
+/// surviving a restart, and the status route must say so from process start
+/// rather than from the first accept that fails to persist.
+fn open_or_resume_window(record_path: &Path) -> (WindowRecord, bool) {
     if let Some(existing) = read_window_record(record_path) {
-        return existing;
+        return (existing, true);
     }
     let opened = WindowRecord {
         opened_unix: chrono::Utc::now().timestamp(),
         previous_accepted: 0,
     };
-    if let Err(error) = write_window_record(record_path, &opened) {
-        tracing::warn!(
-            path = %record_path.display(),
-            error = %error,
-            "the rotation window record could not be created; the window's age and accept bounds \
-             will not survive a restart of this process"
-        );
+    match write_window_record(record_path, &opened) {
+        Ok(()) => (opened, true),
+        Err(error) => {
+            tracing::warn!(
+                path = %record_path.display(),
+                error = %error,
+                "the rotation window record could not be created; the window's age and accept \
+                 bounds will not survive a restart of this process"
+            );
+            (opened, false)
+        }
     }
-    opened
 }
 
 fn read_window_record(record_path: &Path) -> Option<WindowRecord> {
@@ -1418,6 +1467,104 @@ mod tests {
         // A later rotation therefore opens a fresh window rather than resuming.
         let reopened = tokens(dir.path(), Some("current"), Some("retired-again"));
         assert_eq!(reopened.previous_accepted_count(), 0);
+    }
+
+    /// A serve path with no superseded token clears the record; a caller that
+    /// only wants a token set must leave it alone.
+    ///
+    /// Both halves in one test, because the property is the DIFFERENCE between
+    /// them and either half alone can be satisfied by the wrong code. `new`
+    /// told there is no superseded token is a process saying its rotation has
+    /// finished, so clearing is right. `primary_only` says nothing about a
+    /// rotation, and routing it through `new` anyway made building a router
+    /// delete a live window's record out of the surface's real state directory.
+    #[test]
+    fn a_primary_only_set_leaves_the_record_a_serve_path_would_clear() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let seeded = WindowRecord {
+            opened_unix: 1_787_900_000,
+            previous_accepted: 7,
+        };
+        write_window_record(&record_path(dir.path()), &seeded).expect("seed a window record");
+
+        let router_side = RotationTokens::primary_only(Some("current".to_string()));
+        assert!(router_side.is_enforced());
+        assert!(!router_side.overlap_open());
+        assert_eq!(
+            read_window_record(&record_path(dir.path())),
+            Some(seeded),
+            "a primary-only token set must leave an open window's record exactly as it found it"
+        );
+
+        // The same primary-only configuration through the serve constructor,
+        // which does clear it. Without this arm the assertion above would also
+        // pass on a record that nothing could delete.
+        let serve_side = tokens(dir.path(), Some("current"), None);
+        assert!(!serve_side.overlap_open());
+        assert!(
+            !record_path(dir.path()).exists(),
+            "a serve path starting with no superseded token must still clear the record"
+        );
+    }
+
+    /// Whitespace-only handling is the same on both constructors, so a caller
+    /// cannot get an enforcing surface out of one and an open one out of the
+    /// other.
+    #[test]
+    fn a_primary_only_set_normalizes_its_token_the_way_the_serve_path_does() {
+        assert!(!RotationTokens::primary_only(Some("   ".to_string())).is_enforced());
+        assert!(!RotationTokens::primary_only(None).is_enforced());
+        let padded = RotationTokens::primary_only(Some("  current  ".to_string()));
+        assert!(padded.is_enforced());
+        assert_eq!(padded.classify(Some("current")), TokenVerdict::Primary);
+        assert_eq!(padded.classify(Some("retired")), TokenVerdict::Rejected);
+    }
+
+    #[test]
+    fn a_window_whose_record_cannot_be_created_is_not_reported_as_durable() {
+        // A regular file where the record's parent directory has to be, so
+        // `create_dir_all` fails and every write beneath it fails with it.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, b"a file, not a directory").expect("plant the blocker");
+
+        let set = RotationTokens::new(
+            Some("current".to_string()),
+            Some("retired".to_string()),
+            PRIMARY_ENV,
+            PREVIOUS_ENV,
+            record_path(&blocked),
+            bounds(3_600, 1_000),
+        )
+        .expect("an unwritable record must not refuse to serve");
+
+        assert!(
+            !record_path(&blocked).exists(),
+            "the blocker must make the record unwritable, or this test grades nothing"
+        );
+        assert!(
+            !set.window_state_durable(),
+            "a window whose record was never created has already stopped surviving a restart, \
+             and reporting it as durable tells an operator the bounds hold across restarts when \
+             they do not"
+        );
+        // Failing open is deliberate and documented on `persist`: a disk that
+        // cannot be written is not a reason to 401 a sender holding a valid
+        // superseded token. The flag is how that stays legible rather than
+        // silent.
+        assert_eq!(set.classify(Some("retired")), TokenVerdict::Previous);
+        assert!(!set.window_state_durable());
+
+        // Control: the same construction on a writable path reports durable, so
+        // the assertions above are about the failed write rather than about an
+        // accessor that answers false for everything.
+        let writable = tempfile::tempdir().expect("tempdir");
+        let healthy = tokens(writable.path(), Some("current"), Some("retired"));
+        assert!(
+            healthy.window_state_durable(),
+            "a window whose record was written is durable"
+        );
+        assert!(record_path(writable.path()).exists());
     }
 
     #[test]

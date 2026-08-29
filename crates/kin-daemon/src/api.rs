@@ -2048,23 +2048,14 @@ fn router_with_auth_and_shutdown(
 ) -> Router {
     // A single token is a closed rotation window, which is the ordinary state.
     // Every existing caller and test keeps this signature; only the serve path
-    // resolves a superseded token as well. No window is opened here, so the
-    // bounds are inert and taken from their defaults rather than from the
-    // environment, where an unusable value would refuse a path with no window
-    // to bound.
-    let record_path = rotation_window_record_path(&state.layout);
-    let tokens = crate::auth_rotation::RotationTokens::new(
-        auth_token,
-        None,
-        DAEMON_AUTH_TOKEN_ENV,
-        DAEMON_AUTH_TOKEN_PREVIOUS_ENV,
-        record_path,
-        crate::auth_rotation::RotationBounds::defaults(
-            DAEMON_AUTH_ROTATION_WINDOW_SECS_ENV,
-            DAEMON_AUTH_ROTATION_MAX_ACCEPTS_ENV,
-        ),
-    )
-    .expect("a primary-only token set cannot be an invalid rotation configuration");
+    // resolves a superseded token as well.
+    //
+    // `primary_only` rather than `new`, because `new` belongs to a serve path:
+    // told there is no superseded token, it REMOVES the window record, which is
+    // right when a process starts and wrong when a router is built. Going
+    // through it here made building a router delete a live window's durable
+    // record from the layout's own state directory.
+    let tokens = crate::auth_rotation::RotationTokens::primary_only(auth_token);
     router_with_rotation_tokens(state, tokens, shutdown)
 }
 
@@ -40601,6 +40592,37 @@ mod tests {
             .unwrap();
         assert_eq!(with_neither.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(tokens.previous_accepted_count(), 1);
+    }
+
+    /// Building a router must not disturb an open window's durable record.
+    ///
+    /// `router_with_auth` is not a serve path and says nothing about a
+    /// rotation, but it once built its token set through
+    /// `RotationTokens::new`, which reads a primary-only configuration as a
+    /// finished rotation and removes the record. So every caller of this
+    /// function, this test file included, deleted the surface's window state
+    /// out of the layout's own directory. `auth_rotation`'s own tests cannot
+    /// see it: they grade the constructor, and the constructor is behaving
+    /// exactly as designed.
+    #[tokio::test]
+    async fn building_a_router_leaves_the_rotation_window_record_intact() {
+        let state = test_state();
+        let path = rotation_window_record_path(&state.layout);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("record directory");
+        }
+        let seeded = br#"{"opened_unix":1787900000,"previous_accepted":7}"#;
+        std::fs::write(&path, seeded).expect("seed a window record");
+        assert!(path.exists(), "the seed must land where the router looks");
+
+        let _app = router_with_auth(Arc::clone(&state), Some("current-token".to_string()));
+
+        assert_eq!(
+            std::fs::read(&path).ok().as_deref(),
+            Some(seeded.as_slice()),
+            "building a router must leave the window record byte for byte at {}",
+            path.display()
+        );
     }
 
     /// A closed window is the ordinary state and must reject the old token.
