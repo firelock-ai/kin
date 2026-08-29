@@ -1449,15 +1449,31 @@ async fn daemon_auth(
                 "Publication control authentication is unavailable",
             );
         };
-        if provided == Some(expected_admin_token) {
+        // Constant time, like every other token compare on this path. A `==`
+        // here would return at the first differing byte, a few lines from a
+        // digest comparison written specifically to not do that.
+        if provided
+            .is_some_and(|token| crate::auth_rotation::tokens_match(token, expected_admin_token))
+        {
             return next.run(request).await;
         }
         // An ordinary daemon token, primary or superseded, is authenticated but
-        // not authorized here, so it is 403 rather than 401. `classify` is what
-        // knows both accepted tokens, and a superseded token presented to this
-        // route is real traffic on the retired credential, so counting it here
-        // is correct rather than incidental.
-        if auth_state.tokens.classify(provided).is_accepted() {
+        // not authorized here, so it is 403 rather than 401.
+        //
+        // Asked WITHOUT spending an accept, which reverses this branch's first
+        // version. Counting looked right, on the reasoning that a retired
+        // credential reaching an admin route is real traffic on it. The
+        // measurement says otherwise: with a cap of one, a single 403 here
+        // spends the only slot and the next `/session` on that same retired
+        // token gets 401. So requests this surface REFUSED close the window
+        // against serve traffic it never carried once, and the counter's own
+        // documentation says the count means dropping the credential would 401
+        // that traffic, which an already-refused request cannot be.
+        if auth_state
+            .tokens
+            .accepts_without_spending(provided)
+            .is_accepted()
+        {
             return auth_error(
                 StatusCode::FORBIDDEN,
                 "Publication control administrator authentication required",
@@ -2232,9 +2248,18 @@ fn router_with_rotation_tokens(
             tokens.is_enforced(),
             "hosted graph publication control requires daemon authentication"
         );
+        let Some(administrator) = publication_control_auth_token.as_deref() else {
+            panic!("hosted graph publication control requires administrator authentication");
+        };
+        // Against BOTH configured daemon tokens, not just the primary. The
+        // superseded token is a daemon credential every client still holding it
+        // can present, so letting it double as the administrator token makes
+        // each of them an administrator on this surface. Asked here rather than
+        // on the plaintext, because this is the one point every entry path
+        // passes through, and it needs only the digests.
         assert!(
-            publication_control_auth_token.is_some(),
-            "hosted graph publication control requires administrator authentication"
+            !tokens.matches_any_configured(administrator),
+            "hosted graph publication control administrator authentication must be distinct from ordinary daemon authentication, the superseded token included"
         );
     }
     let routes = api_routes();
@@ -42385,6 +42410,272 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::OK);
     }
 
+    // Adopted verbatim from lane review-1227auth. Deleting either
+    // `assert_publication_control_auth` call site leaves every other test in
+    // this file green; only these two arms catch it, and they catch different
+    // ones because the wrapper and the serve path reach the constructor by
+    // different routes.
+
+    /// A hosted state, so the publication-control constructor assertions are
+    /// reachable at all. Returns the tempdirs because dropping them removes the
+    /// layout out from under the state.
+    fn reviewer_hosted_state() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        kin_core::test_env::EnvVarGuard,
+        Arc<DaemonState>,
+    ) {
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        for name in [
+            "GOOGLE_CLOUD_PROJECT",
+            "FIRESTORE_DATABASE_ID",
+            "KIN_GCS_BUCKET",
+            "KIN_GCS_PREFIX",
+            "KIN_REPO_IDS",
+        ] {
+            environment.apply::<_, &str>(name, None);
+        }
+        let fleet = vec!["kin".to_string(), "kin-db".to_string()];
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let backend_root = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(
+                "gcs://reviewer-fixture/v2",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                fleet.clone(),
+                store,
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                "kin",
+                Some(fleet.into_iter().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        (repo, backend_root, environment, state)
+    }
+
+    /// DECISION 3, first call site. The internal router wrapper must refuse an
+    /// administrator token equal to the daemon token.
+    #[test]
+    fn reviewer_the_internal_router_refuses_an_admin_token_equal_to_the_daemon_token() {
+        let (_repo, _backend, _env, state) = reviewer_hosted_state();
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            move || {
+                router_with_publication_control_auth(
+                    state,
+                    Some("one-and-the-same".to_string()),
+                    Some("one-and-the-same".to_string()),
+                )
+            }
+        }));
+        let error = refused.err().expect(
+            "an administrator token equal to the daemon token must be refused by the internal \
+             router wrapper",
+        );
+        let message = error
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| error.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("must be distinct from ordinary daemon authentication"),
+            "the refusal must be the distinctness assertion and not some other panic; got \
+             {message}"
+        );
+
+        // Control: distinct tokens must BUILD, or the arm above would pass on a
+        // constructor that refuses everything.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            router_with_publication_control_auth(
+                state,
+                Some("daemon-token".to_string()),
+                Some("admin-token".to_string()),
+            )
+        }));
+        assert!(
+            built.is_ok(),
+            "distinct tokens must build, or the refusal above says nothing about distinctness"
+        );
+    }
+
+    /// DECISION 3, second call site. The SERVE path must refuse the same
+    /// pairing. It reaches the router through `router_with_rotation_tokens`
+    /// rather than through the internal wrapper, so the arm above cannot see
+    /// this one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_the_serve_path_refuses_an_admin_token_equal_to_the_daemon_token() {
+        let (_repo, _backend, mut environment, state) = reviewer_hosted_state();
+        environment.apply(DAEMON_AUTH_TOKEN_ENV, Some("one-and-the-same"));
+        environment.apply("KIN_PUBLICATION_CONTROL_AUTH_TOKEN", Some("one-and-the-same"));
+        environment.apply::<_, &str>(DAEMON_AUTH_TOKEN_PREVIOUS_ENV, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let served = tokio::spawn(async move {
+            let _ = serve_bound_with_shutdown(state, listener, Some(shutdown_tx), shutdown_rx).await;
+        });
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(20), served).await;
+        let outcome = joined.expect(
+            "the serve path must refuse an administrator token equal to the daemon token; it \
+             served instead",
+        );
+        assert!(
+            outcome.as_ref().err().is_some_and(|error| error.is_panic()),
+            "the serve path must refuse the pairing by panicking, and it returned instead"
+        );
+    }
+
+    /// The administrator token may not equal the SUPERSEDED daemon token
+    /// either, which the first version of the distinctness check missed.
+    ///
+    /// It compared the primary only, so handing the retired credential over as
+    /// the administrator token was allowed, and every client still holding that
+    /// retired credential became an administrator on this surface. The check now
+    /// asks the token set rather than one plaintext, so it covers both.
+    #[test]
+    fn the_administrator_token_may_not_equal_the_superseded_daemon_token() {
+        let (_repo, _backend, _env, state) = reviewer_hosted_state();
+        let window = tempfile::tempdir().expect("tempdir");
+        let tokens = open_rotation_window(&window, 3_600, 1_000);
+
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            let tokens = tokens.clone();
+            move || {
+                router_with_rotation_tokens(
+                    state,
+                    tokens,
+                    // `open_rotation_window`'s own superseded token.
+                    Some("retired-token".to_string()),
+                    None,
+                )
+            }
+        }));
+        let error = refused
+            .err()
+            .expect("the superseded daemon token must not be accepted as the administrator token");
+        let message = error
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| error.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains("must be distinct from ordinary daemon authentication"),
+            "the refusal must be the distinctness assertion rather than some other panic; got \
+             {message}"
+        );
+
+        // The primary is refused by the same check, so neither configured token
+        // can be handed over.
+        let primary_refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            let tokens = tokens.clone();
+            move || {
+                router_with_rotation_tokens(state, tokens, Some("current-token".to_string()), None)
+            }
+        }));
+        assert!(
+            primary_refused.is_err(),
+            "the primary daemon token must not be accepted as the administrator token either"
+        );
+
+        // Control: a token that is neither must BUILD, or the two refusals above
+        // say nothing about distinctness and only that the constructor refuses.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            router_with_rotation_tokens(state, tokens, Some("admin-token".to_string()), None)
+        }));
+        assert!(
+            built.is_ok(),
+            "a distinct administrator token must build, or the refusals above prove nothing"
+        );
+    }
+
+    /// The harm the accept-cap fix is actually about, measured end to end.
+    ///
+    /// The counter is a proxy. What the cap does is CLOSE the window, and a
+    /// closed window 401s the retired credential. So the claim worth asserting
+    /// is not "the count did not move" but "a request this surface refused did
+    /// not cost a request it would have served". A cap of one makes the two
+    /// separable: before the fix the 403 spent the only slot and the /session
+    /// that followed got 401.
+    #[tokio::test]
+    async fn a_refused_admin_request_does_not_close_the_window_against_served_traffic() {
+        let window = tempfile::tempdir().expect("tempdir");
+        let tokens = open_rotation_window(&window, 3_600, 1);
+        let app = router_with_rotation_tokens(
+            test_state(),
+            tokens.clone(),
+            Some("admin-token".to_string()),
+            None,
+        );
+
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            tokens.previous_accepted_count(),
+            0,
+            "the refused request must not have claimed the window's only slot"
+        );
+
+        // The slot is still there for traffic that is actually served.
+        let served = app
+            .clone()
+            .oneshot(
+                Request::get("/session")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            served.status(),
+            StatusCode::UNAUTHORIZED,
+            "the window must still admit the superseded token, because nothing it served has \
+             spent the cap yet"
+        );
+        assert_eq!(
+            tokens.previous_accepted_count(),
+            1,
+            "the SERVED request is what spends the slot"
+        );
+
+        // And the cap still closes on served traffic, so the fix did not simply
+        // stop the counter working.
+        let after_cap = app
+            .oneshot(
+                Request::get("/session")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after_cap.status(),
+            StatusCode::UNAUTHORIZED,
+            "a cap of one must still close the window after one served request"
+        );
+    }
+
     /// An open rotation window whose durable record lives in a temp directory.
     ///
     /// The record path is per-test on purpose: a shared one would let two tests
@@ -42450,13 +42741,15 @@ mod tests {
             control(app.clone(), "retired-token").await,
             StatusCode::FORBIDDEN
         );
-        // And the accept is counted, because a retired credential reaching an
-        // administrative route is real traffic on that credential, and the count
-        // is what an operator reads to decide the window can close.
+        // And the accept is NOT counted. The count is what closes the window,
+        // and closing it means 401ing traffic the retired credential is still
+        // carrying. A request this surface refused is not that traffic, so
+        // spending a slot on it closes the window early against requests that
+        // were actually served.
         assert_eq!(
             tokens.previous_accepted_count(),
-            1,
-            "a superseded token refused on authorization is still an accept on the window"
+            0,
+            "a request refused on authorization must not spend the window's accept cap"
         );
 
         // The primary is authenticated and equally unauthorized here, and it
@@ -42465,7 +42758,7 @@ mod tests {
             control(app.clone(), "current-token").await,
             StatusCode::FORBIDDEN
         );
-        assert_eq!(tokens.previous_accepted_count(), 1);
+        assert_eq!(tokens.previous_accepted_count(), 0);
 
         // Neither accepted token is refused as unauthenticated, and that refusal
         // is not an accept.
@@ -42473,7 +42766,7 @@ mod tests {
             control(app.clone(), "neither-token").await,
             StatusCode::UNAUTHORIZED
         );
-        assert_eq!(tokens.previous_accepted_count(), 1);
+        assert_eq!(tokens.previous_accepted_count(), 0);
 
         // The administrator token passes the guard. What the route answers past
         // it is not this test's business, only that it is neither refusal.
