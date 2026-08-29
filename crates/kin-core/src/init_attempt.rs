@@ -1135,8 +1135,10 @@ mod tests {
         let known = post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/shallow"))
             .join("\n");
         assert!(
-            known.contains("a different repository from the /work/shallow this run is \
-                            initializing"),
+            known.contains(
+                "a different repository from the /work/shallow this run is \
+                            initializing"
+            ),
             "a record that names another source still reports the difference: {known}"
         );
     }
