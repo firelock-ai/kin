@@ -1019,18 +1019,33 @@ async fn supervisor_auth(
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim);
 
-    match auth_state.tokens.classify(provided) {
-        crate::auth_rotation::TokenVerdict::Rejected => {
-            return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    let refuse = match auth_state.tokens.classify(provided) {
+        crate::auth_rotation::TokenVerdict::Rejected => true,
+        crate::auth_rotation::TokenVerdict::WindowClosed(closure) => {
+            tracing::warn!(
+                path = %request.uri().path(),
+                reason = closure.reason(),
+                "refused a superseded supervisor token: {}",
+                closure.message()
+            );
+            true
         }
         crate::auth_rotation::TokenVerdict::Previous => {
             tracing::debug!(
                 path = %request.uri().path(),
                 "request authenticated on the superseded supervisor token"
             );
+            false
         }
         crate::auth_rotation::TokenVerdict::Primary
-        | crate::auth_rotation::TokenVerdict::NotEnforced => {}
+        | crate::auth_rotation::TokenVerdict::NotEnforced => false,
+    };
+
+    // One refusal shape for both refusing verdicts, for the same reason as
+    // `api::daemon_auth`: a closed window must look to the caller exactly like
+    // an unrecognized token.
+    if refuse {
+        return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
     next.run(request).await
@@ -1041,11 +1056,21 @@ async fn supervisor_auth(
 async fn auth_rotation_status(
     Extension(tokens): Extension<crate::auth_rotation::RotationTokens>,
 ) -> impl IntoResponse {
+    let bounds = tokens.window_bounds();
     Json(serde_json::json!({
         "enforced": tokens.is_enforced(),
         "overlap_open": tokens.overlap_open(),
         "previous_accepted": tokens.previous_accepted_count(),
         "previous_last_accepted_unix": tokens.previous_last_accepted_unix(),
+        "window_opened_unix": tokens.window_opened_unix(),
+        "window_expires_unix": tokens.window_expires_unix(),
+        "window_max_age_secs": bounds.map(|bounds| bounds.max_age_secs()),
+        "window_max_accepts": bounds.map(|bounds| bounds.max_accepts()),
+        "window_closed_reason": tokens
+            .window_closure()
+            .map(crate::auth_rotation::WindowClosure::reason),
+        "window_state_durable": tokens.window_state_durable(),
+        "previous_refused_since_start": tokens.previous_refused_since_start(),
     }))
 }
 
@@ -1059,6 +1084,21 @@ fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
 pub(crate) const SUPERVISOR_AUTH_TOKEN_ENV: &str = "KIN_SUPERVISOR_AUTH_TOKEN";
 /// The variable carrying a superseded token still accepted during a rotation.
 pub(crate) const SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV: &str = "KIN_SUPERVISOR_AUTH_TOKEN_PREVIOUS";
+/// The variable bounding how long a rotation overlap window stays open.
+pub(crate) const SUPERVISOR_AUTH_ROTATION_WINDOW_SECS_ENV: &str =
+    "KIN_SUPERVISOR_AUTH_ROTATION_WINDOW_SECS";
+/// The variable bounding how many superseded-token requests a window accepts.
+pub(crate) const SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS_ENV: &str =
+    "KIN_SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS";
+
+/// The durable record of an open supervisor rotation overlap window.
+///
+/// Mirrors `api::rotation_window_record_path` and deliberately carries a
+/// different file name: the supervisor and the daemon rotate independently, and
+/// two surfaces sharing one record would share one window.
+fn rotation_window_record_path(dir: &Path) -> PathBuf {
+    dir.join("supervisor-auth-rotation-window.json")
+}
 
 fn auth_token_from_env() -> Option<String> {
     resolve_auth_token(std::env::var(SUPERVISOR_AUTH_TOKEN_ENV).ok())
@@ -1080,6 +1120,11 @@ fn resolve_serve_rotation_tokens(
         previous_auth_token_from_env(),
         SUPERVISOR_AUTH_TOKEN_ENV,
         SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
+        rotation_window_record_path(dir),
+        crate::auth_rotation::RotationBounds::from_env(
+            SUPERVISOR_AUTH_ROTATION_WINDOW_SECS_ENV,
+            SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS_ENV,
+        )?,
     )
 }
 
@@ -1157,12 +1202,20 @@ fn router_with_auth_and_shutdown(
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Router {
     // A single token is a closed rotation window. Every existing caller keeps
-    // this signature; only the serve path resolves a superseded token too.
+    // this signature; only the serve path resolves a superseded token too. No
+    // window is opened here, so the bounds are inert and taken from their
+    // defaults rather than from the environment, where an unusable value would
+    // refuse a path with no window to bound.
     let tokens = crate::auth_rotation::RotationTokens::new(
         auth_token,
         None,
         SUPERVISOR_AUTH_TOKEN_ENV,
         SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
+        rotation_window_record_path(&supervisor_dir()),
+        crate::auth_rotation::RotationBounds::defaults(
+            SUPERVISOR_AUTH_ROTATION_WINDOW_SECS_ENV,
+            SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS_ENV,
+        ),
     )
     .expect("a primary-only token set cannot be an invalid rotation configuration");
     router_with_rotation_tokens(state, tokens, shutdown)
@@ -3757,11 +3810,20 @@ mod tests {
         // run. Both are wired to one `auth_rotation` implementation now, and
         // this proves the supervisor's wiring rather than assuming the shared
         // type covers it.
+        let window = tempfile::tempdir().expect("tempdir");
         let tokens = crate::auth_rotation::RotationTokens::new(
             Some("current-token".to_string()),
             Some("retired-token".to_string()),
             SUPERVISOR_AUTH_TOKEN_ENV,
             SUPERVISOR_AUTH_TOKEN_PREVIOUS_ENV,
+            window.path().join("supervisor-auth-rotation-window.json"),
+            crate::auth_rotation::RotationBounds::new(
+                3_600,
+                1_000,
+                SUPERVISOR_AUTH_ROTATION_WINDOW_SECS_ENV,
+                SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS_ENV,
+            )
+            .expect("positive bounds are usable"),
         )
         .unwrap();
         let app =

@@ -783,12 +783,12 @@ pub const RECON_PARKED: u8 = 2;
 /// atomic rename on every platform; only the stronger parent-directory power-
 /// loss guarantee is Unix-specific.
 #[cfg(unix)]
-fn sync_directory_metadata(path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory_metadata(path: &std::path::Path) -> std::io::Result<()> {
     std::fs::File::open(path).and_then(|directory| directory.sync_all())
 }
 
 #[cfg(not(unix))]
-fn sync_directory_metadata(_path: &std::path::Path) -> std::io::Result<()> {
+pub(crate) fn sync_directory_metadata(_path: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 

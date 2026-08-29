@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (502 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (506 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -105,6 +105,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
+| `KIN_DAEMON_AUTH_ROTATION_MAX_ACCEPTS` | usize | 10000 | operational | how many requests a daemon rotation overlap window accepts on the superseded token before closing, counted durably across restarts. Subject to the same refusal of zero and of unparseable values as KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS; whichever bound is reached first closes the window |
+| `KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS` | usize | 86400 | operational | how long, in seconds, a daemon rotation overlap window keeps accepting the superseded token, measured from the instant the window opened and persisted so it survives a restart. Must be a whole number greater than zero: a zero or unparseable value is refused at startup rather than read as unbounded, because an unbounded window is the state this bound exists to prevent |
 | `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests |
 | `KIN_DAEMON_AUTH_TOKEN_PREVIOUS` | secret | *(unset)* | secret | a superseded daemon bearer token this process still accepts, so a credential rotation across several containers does not have to be atomic. Set it during a rotation window and unset it once /auth/rotation reports the superseded token is no longer carrying traffic. Setting it with KIN_DAEMON_AUTH_TOKEN unset, or to the same value, is refused at startup: neither is an overlap window and both would read as one |
 | `KIN_DAEMON_AUTO_EMBED` | bool | true | operational | let the daemon start background embedding on its own; set falsy to defer until an explicit embed request. Read by the daemon at process start, so it takes effect on the command that starts one; a command reaching an already-running daemon cannot change it and is warned that it diverged |
@@ -139,6 +141,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_SUPERVISOR_ADOPT_DISABLE` | bool | false | operational | disable supervisor adoption of an existing daemon |
+| `KIN_SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS` | usize | 10000 | operational | the supervisor counterpart of KIN_DAEMON_AUTH_ROTATION_MAX_ACCEPTS, bounding its own rotation overlap window with its own durable record |
+| `KIN_SUPERVISOR_AUTH_ROTATION_WINDOW_SECS` | usize | 86400 | operational | the supervisor counterpart of KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS, bounding its own rotation overlap window with its own durable record |
 | `KIN_SUPERVISOR_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated supervisor requests |
 | `KIN_SUPERVISOR_AUTH_TOKEN_PREVIOUS` | secret | *(unset)* | secret | a superseded supervisor bearer token this process still accepts, the supervisor counterpart of KIN_DAEMON_AUTH_TOKEN_PREVIOUS and subject to the same startup refusals |
 | `KIN_SUPERVISOR_BIND_HOST` | string | *(unset)* | operational | host/interface the supervisor binds to |

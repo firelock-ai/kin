@@ -1432,23 +1432,25 @@ async fn daemon_auth(
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim);
 
-    // Both configured tokens are compared, and a superseded accept is counted.
-    // See `auth_rotation` for why an overlap window exists and why closing it
-    // needs that count rather than a timer.
-    match auth_state.tokens.classify(provided) {
-        crate::auth_rotation::TokenVerdict::Rejected => {
-            if let Some(repo_id) = repo_scoped_semantic_repo_id_from_path(request.uri().path()) {
-                return repo_scoped_mcp_error(
-                    repo_id,
-                    RepoScopedMcpFailure::new(
-                        StatusCode::UNAUTHORIZED,
-                        "authentication_required",
-                        "Authentication required",
-                        false,
-                    ),
-                );
-            }
-            return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    // Both configured tokens are compared, a superseded accept is counted
+    // against the window's two bounds, and a window either bound has closed
+    // refuses. See `auth_rotation` for why the window exists, why the count is
+    // what says it can close early, and why the bounds say when it closes
+    // anyway.
+    let refuse = match auth_state.tokens.classify(provided) {
+        crate::auth_rotation::TokenVerdict::Rejected => true,
+        crate::auth_rotation::TokenVerdict::WindowClosed(closure) => {
+            // Warn, not debug: a bound refusing a token something is still
+            // presenting is the case that needs a human, and it is the only
+            // signal that says the window closed on live traffic rather than on
+            // nothing.
+            tracing::warn!(
+                path = %request.uri().path(),
+                reason = closure.reason(),
+                "refused a superseded daemon token: {}",
+                closure.message()
+            );
+            true
         }
         crate::auth_rotation::TokenVerdict::Previous => {
             // Debug, not warn: during a rotation this is the expected state and
@@ -1459,33 +1461,72 @@ async fn daemon_auth(
                 path = %request.uri().path(),
                 "request authenticated on the superseded daemon token"
             );
+            false
         }
         crate::auth_rotation::TokenVerdict::Primary
-        | crate::auth_rotation::TokenVerdict::NotEnforced => {}
+        | crate::auth_rotation::TokenVerdict::NotEnforced => false,
+    };
+
+    // One refusal shape for both refusing verdicts. A closed window must look
+    // to the caller exactly like an unrecognized token: telling it that the
+    // value it presented used to authenticate here is information a refusal
+    // should not hand out.
+    if refuse {
+        if let Some(repo_id) = repo_scoped_semantic_repo_id_from_path(request.uri().path()) {
+            return repo_scoped_mcp_error(
+                repo_id,
+                RepoScopedMcpFailure::new(
+                    StatusCode::UNAUTHORIZED,
+                    "authentication_required",
+                    "Authentication required",
+                    false,
+                ),
+            );
+        }
+        return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
     }
 
     next.run(request).await
 }
 
-/// Whether a token rotation overlap window is open, and whether it is still
-/// carrying traffic.
+/// Whether a token rotation overlap window is open, whether it is still
+/// carrying traffic, and when its own bounds close it.
 ///
-/// This is the reading that decides when the superseded token can be removed.
-/// A window whose `previous_accepted` is still climbing has traffic on the
-/// retired credential, and dropping it would 401 that traffic; a window whose
-/// count has stopped moving is safe to close. Closing on a timer instead is a
-/// guess, and the two ways of guessing wrong are not symmetric.
+/// This is the reading that decides when the superseded token can be removed
+/// early. A window whose `previous_accepted` is still climbing has traffic on
+/// the retired credential, and dropping it would 401 that traffic; a window
+/// whose count has stopped moving is safe to close. The count alone is a
+/// reading and not a bound, so the body also reports when the window opened,
+/// when its age bound closes it, what its accept cap is, and which bound has
+/// already closed it if either has.
 ///
-/// The body carries no token material, not even a prefix. It reports presence
-/// and counts only, which is everything the decision needs.
+/// `window_opened_unix` is what makes the count legible: a zero on a window
+/// that opened ninety seconds ago is not the same claim as a zero on one that
+/// opened yesterday, and the two are indistinguishable without it.
+/// `window_state_durable` says whether the count is still surviving a restart,
+/// and `previous_refused_since_start` is the alarm that says a bound closed the
+/// window while something was still presenting the retired token.
+///
+/// The body carries no token material, not even a prefix. It reports presence,
+/// counts and instants only, which is everything the decision needs.
 async fn auth_rotation_status(
     Extension(tokens): Extension<crate::auth_rotation::RotationTokens>,
 ) -> impl IntoResponse {
+    let bounds = tokens.window_bounds();
     Json(serde_json::json!({
         "enforced": tokens.is_enforced(),
         "overlap_open": tokens.overlap_open(),
         "previous_accepted": tokens.previous_accepted_count(),
         "previous_last_accepted_unix": tokens.previous_last_accepted_unix(),
+        "window_opened_unix": tokens.window_opened_unix(),
+        "window_expires_unix": tokens.window_expires_unix(),
+        "window_max_age_secs": bounds.map(|bounds| bounds.max_age_secs()),
+        "window_max_accepts": bounds.map(|bounds| bounds.max_accepts()),
+        "window_closed_reason": tokens
+            .window_closure()
+            .map(crate::auth_rotation::WindowClosure::reason),
+        "window_state_durable": tokens.window_state_durable(),
+        "previous_refused_since_start": tokens.previous_refused_since_start(),
     }))
 }
 
@@ -2007,12 +2048,21 @@ fn router_with_auth_and_shutdown(
 ) -> Router {
     // A single token is a closed rotation window, which is the ordinary state.
     // Every existing caller and test keeps this signature; only the serve path
-    // resolves a superseded token as well.
+    // resolves a superseded token as well. No window is opened here, so the
+    // bounds are inert and taken from their defaults rather than from the
+    // environment, where an unusable value would refuse a path with no window
+    // to bound.
+    let record_path = rotation_window_record_path(&state.layout);
     let tokens = crate::auth_rotation::RotationTokens::new(
         auth_token,
         None,
         DAEMON_AUTH_TOKEN_ENV,
         DAEMON_AUTH_TOKEN_PREVIOUS_ENV,
+        record_path,
+        crate::auth_rotation::RotationBounds::defaults(
+            DAEMON_AUTH_ROTATION_WINDOW_SECS_ENV,
+            DAEMON_AUTH_ROTATION_MAX_ACCEPTS_ENV,
+        ),
     )
     .expect("a primary-only token set cannot be an invalid rotation configuration");
     router_with_rotation_tokens(state, tokens, shutdown)
@@ -16355,6 +16405,12 @@ fn resolve_auth_token(auth_token: Option<String>) -> Option<String> {
 pub(crate) const DAEMON_AUTH_TOKEN_ENV: &str = "KIN_DAEMON_AUTH_TOKEN";
 /// The variable carrying a superseded token still accepted during a rotation.
 pub(crate) const DAEMON_AUTH_TOKEN_PREVIOUS_ENV: &str = "KIN_DAEMON_AUTH_TOKEN_PREVIOUS";
+/// The variable bounding how long a rotation overlap window stays open.
+pub(crate) const DAEMON_AUTH_ROTATION_WINDOW_SECS_ENV: &str =
+    "KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS";
+/// The variable bounding how many superseded-token requests a window accepts.
+pub(crate) const DAEMON_AUTH_ROTATION_MAX_ACCEPTS_ENV: &str =
+    "KIN_DAEMON_AUTH_ROTATION_MAX_ACCEPTS";
 
 fn auth_token_from_env() -> Option<String> {
     resolve_auth_token(std::env::var(DAEMON_AUTH_TOKEN_ENV).ok())
@@ -16367,6 +16423,17 @@ fn previous_auth_token_from_env() -> Option<String> {
 /// `.kin/daemon.token` — auto-provisioned per-install loopback token.
 fn loopback_token_path(layout: &kin_core::KinLayout) -> PathBuf {
     layout.root().join("daemon.token")
+}
+
+/// `.kin/daemon-auth-rotation-window.json` — the durable record of an open
+/// rotation overlap window.
+///
+/// Lives under `.kin/` beside the daemon's other durable state, so a restart
+/// resumes the window it was serving rather than reopening one. The supervisor
+/// keeps its own record under its own directory: two surfaces that shared a
+/// file would share a window, and the two rotate independently.
+fn rotation_window_record_path(layout: &kin_core::KinLayout) -> PathBuf {
+    layout.root().join("daemon-auth-rotation-window.json")
 }
 
 /// Load the per-install loopback token, generating and persisting one (mode
@@ -16454,6 +16521,11 @@ fn resolve_serve_rotation_tokens(
         previous_auth_token_from_env(),
         DAEMON_AUTH_TOKEN_ENV,
         DAEMON_AUTH_TOKEN_PREVIOUS_ENV,
+        rotation_window_record_path(layout),
+        crate::auth_rotation::RotationBounds::from_env(
+            DAEMON_AUTH_ROTATION_WINDOW_SECS_ENV,
+            DAEMON_AUTH_ROTATION_MAX_ACCEPTS_ENV,
+        )?,
     )
 }
 
@@ -40452,6 +40524,32 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::OK);
     }
 
+    /// An open rotation window whose durable record lives in a temp directory.
+    ///
+    /// The record path is per-test on purpose: a shared one would let two tests
+    /// resume each other's window and each other's accept count.
+    fn open_rotation_window(
+        dir: &tempfile::TempDir,
+        max_age_secs: u64,
+        max_accepts: u64,
+    ) -> crate::auth_rotation::RotationTokens {
+        crate::auth_rotation::RotationTokens::new(
+            Some("current-token".to_string()),
+            Some("retired-token".to_string()),
+            DAEMON_AUTH_TOKEN_ENV,
+            DAEMON_AUTH_TOKEN_PREVIOUS_ENV,
+            dir.path().join("daemon-auth-rotation-window.json"),
+            crate::auth_rotation::RotationBounds::new(
+                max_age_secs,
+                max_accepts,
+                DAEMON_AUTH_ROTATION_WINDOW_SECS_ENV,
+                DAEMON_AUTH_ROTATION_MAX_ACCEPTS_ENV,
+            )
+            .expect("positive bounds are usable"),
+        )
+        .unwrap()
+    }
+
     /// The rotation window, exercised through the real router rather than
     /// through `RotationTokens` alone.
     ///
@@ -40460,13 +40558,8 @@ mod tests {
     /// leave every one of them green. This is the join.
     #[tokio::test]
     async fn an_open_rotation_window_accepts_both_tokens_over_http() {
-        let tokens = crate::auth_rotation::RotationTokens::new(
-            Some("current-token".to_string()),
-            Some("retired-token".to_string()),
-            DAEMON_AUTH_TOKEN_ENV,
-            DAEMON_AUTH_TOKEN_PREVIOUS_ENV,
-        )
-        .unwrap();
+        let window = tempfile::tempdir().expect("tempdir");
+        let tokens = open_rotation_window(&window, 3_600, 1_000);
         let app = router_with_rotation_tokens(test_state(), tokens.clone(), None);
 
         let with_current = app
@@ -40542,17 +40635,85 @@ mod tests {
         assert_eq!(current.status(), StatusCode::OK);
     }
 
+    /// A window either bound has closed refuses the superseded token over the
+    /// real router, and refuses it exactly the way an unknown token is refused.
+    ///
+    /// `auth_rotation`'s own tests grade the bounds. They cannot see whether
+    /// `daemon_auth` acts on the verdict, and a guard that treated
+    /// `WindowClosed` as an accept would leave all of them green. This is the
+    /// join for that branch.
+    #[tokio::test]
+    async fn a_bound_closing_the_rotation_window_refuses_the_superseded_token_over_http() {
+        let window = tempfile::tempdir().expect("tempdir");
+        // A cap of one, so the second superseded request is the first refused
+        // one and the arms cannot be confused for each other.
+        let tokens = open_rotation_window(&window, 3_600, 1);
+        let app = router_with_rotation_tokens(test_state(), tokens.clone(), None);
+
+        let retired = |app: Router| async move {
+            app.oneshot(
+                Request::get("/session")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        };
+
+        let inside = retired(app.clone()).await;
+        assert_eq!(inside.status(), StatusCode::OK);
+        assert_eq!(tokens.previous_accepted_count(), 1);
+
+        let outside = retired(app.clone()).await;
+        assert_eq!(outside.status(), StatusCode::UNAUTHORIZED);
+        // The refused request must not be counted as an accept.
+        assert_eq!(tokens.previous_accepted_count(), 1);
+        assert_eq!(tokens.previous_refused_since_start(), 1);
+
+        // The refusal must be byte-identical to the one an unknown token gets,
+        // or the response tells a caller that the value it presented used to
+        // authenticate here.
+        let unknown = app
+            .clone()
+            .oneshot(
+                Request::get("/session")
+                    .header("authorization", "Bearer never-a-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown.status(), outside.status());
+        let closed_body = axum::body::to_bytes(outside.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let unknown_body = axum::body::to_bytes(unknown.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(closed_body, unknown_body);
+
+        // A closed window must not take the surface down: the primary keeps
+        // working, which is the whole reason the bound refuses one token rather
+        // than failing startup.
+        let current = app
+            .oneshot(
+                Request::get("/session")
+                    .header("authorization", "Bearer current-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.status(), StatusCode::OK);
+    }
+
     /// The reading the retention decision rests on, over HTTP, carrying no
     /// token material.
     #[tokio::test]
     async fn the_rotation_status_route_reports_the_counter_the_guard_increments() {
-        let tokens = crate::auth_rotation::RotationTokens::new(
-            Some("current-token".to_string()),
-            Some("retired-token".to_string()),
-            DAEMON_AUTH_TOKEN_ENV,
-            DAEMON_AUTH_TOKEN_PREVIOUS_ENV,
-        )
-        .unwrap();
+        let window = tempfile::tempdir().expect("tempdir");
+        let tokens = open_rotation_window(&window, 3_600, 1_000);
         let app = router_with_rotation_tokens(test_state(), tokens, None);
 
         let before = app
