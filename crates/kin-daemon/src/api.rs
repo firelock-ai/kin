@@ -42486,6 +42486,33 @@ mod tests {
             admin != StatusCode::UNAUTHORIZED && admin != StatusCode::FORBIDDEN,
             "the administrator token must pass the auth guard, got {admin}"
         );
+
+        // The ordering half of the same decision, and the reason the
+        // publication-control branch sits ABOVE the enforcement gate rather than
+        // below it. With no daemon token configured at all the gate would return
+        // early, so a daemon that enforces nothing would hand out its rollout
+        // surface to an unauthenticated caller. Every assertion above this one
+        // runs with an enforced window and stays green either way, so without
+        // this arm the ordering is untested.
+        let unenforced = router_with_rotation_tokens(
+            test_state(),
+            crate::auth_rotation::RotationTokens::primary_only(None),
+            Some("publication-test-token".to_string()),
+            None,
+        );
+        let no_daemon_auth = unenforced
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            no_daemon_auth.status(),
+            StatusCode::FORBIDDEN,
+            "an unenforced daemon must still refuse the publication-control surface"
+        );
     }
 
     /// The rotation window, exercised through the real router rather than
