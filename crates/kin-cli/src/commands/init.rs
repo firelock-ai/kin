@@ -165,6 +165,12 @@ pub async fn run(
     adopt_repository_id: Option<String>,
 ) -> Result<i32> {
     let _span = tracing::info_span!("kin.init").entered();
+    // Read before any work, so the closing summary can say what this run did
+    // rather than what a run of its shape usually does. The summary used to
+    // say the 523 MB download "happens during this command" unconditionally,
+    // and on a container under memory pressure the background embed pass never
+    // started, so nothing was fetched and the sentence was still printed.
+    let model_present_before = crate::embed_model::EmbedModelFetch::probe(false).present;
     let dir = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
@@ -272,6 +278,7 @@ pub async fn run(
             boundary,
             &enrichment,
             &cross_file,
+            model_present_before,
             daemon_death.as_ref(),
         )?;
     }
@@ -417,6 +424,204 @@ impl CrossFileEnrichment {
             Self::Produced => None,
         }
     }
+}
+
+/// One language a cold sweep could not serve, as `/lsp/sweep/status` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkippedLanguage {
+    language: String,
+    files: u64,
+    reason: String,
+}
+
+/// The languages `/lsp/sweep/status` says this sweep could not serve.
+///
+/// A row missing either half is dropped rather than defaulted. A language with
+/// no reason would print a skip nothing explains, and a reason with no language
+/// names nothing; both are worse than a shorter list, because the caller below
+/// keys its whole verdict on whether this comes back empty. A daemon too old to
+/// send the field reads as nothing skipped, which is the same conservative
+/// reading an unpublished readiness map already gets.
+pub(crate) fn skipped_languages_from_status(status: &serde_json::Value) -> Vec<SkippedLanguage> {
+    let Some(rows) = status.get("languages_skipped").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    rows.iter()
+        .filter_map(|row| {
+            let language = row.get("language")?.as_str()?.to_string();
+            let reason = row.get("reason")?.as_str()?.to_string();
+            if language.is_empty() || reason.is_empty() {
+                return None;
+            }
+            Some(SkippedLanguage {
+                language,
+                files: row.get("files").and_then(|v| v.as_u64()).unwrap_or(0),
+                reason,
+            })
+        })
+        .collect()
+}
+
+/// `1 file` and `2 files`, so a count never reads `1 files`.
+fn plural_count(n: u64, one: &str, many: &str) -> String {
+    if n == 1 {
+        format!("{n} {one}")
+    } else {
+        format!("{n} {many}")
+    }
+}
+
+/// The detail lines under a sweep outcome: one per language, plus the remainder.
+///
+/// `blocked` is the daemon's own total and the rows are the part of it the
+/// daemon could attribute to a language. They are not the same number. A file is
+/// also blocked when its extension maps to no language server this build wires,
+/// or when its source could not be read from graph authority, and neither of
+/// those paths records a row. Measured on a three-rust, three-typescript,
+/// two-ruby repository: `files_blocked` 5, rows accounting for 3, and a reader
+/// who added the sentence's own figures got six of eight with nowhere to go for
+/// the other two. So the remainder is stated rather than dropped, because a
+/// sentence whose whole purpose is to name what was lost cannot leave part of it
+/// out and stay honest.
+fn skipped_detail_lines(blocked: u64, skipped: &[SkippedLanguage]) -> Vec<String> {
+    let mut lines: Vec<String> = skipped
+        .iter()
+        .map(|entry| {
+            format!(
+                "    {}: {} not enriched, because {}",
+                entry.language,
+                plural_count(entry.files, "file", "files"),
+                entry.reason
+            )
+        })
+        .collect();
+    let named: u64 = skipped.iter().map(|entry| entry.files).sum();
+    let unattributed = blocked.saturating_sub(named);
+    if unattributed > 0 {
+        // `further` only when there are rows above for it to be further than.
+        let count = if skipped.is_empty() {
+            plural_count(unattributed, "file", "files")
+        } else {
+            plural_count(unattributed, "further file", "further files")
+        };
+        lines.push(format!(
+            "    {count} blocked for a reason this sweep did not attribute to a language: an \
+             extension no language server here serves, or source it could not read from graph \
+             authority; `.kin/daemon.log` records each one"
+        ));
+    }
+    lines
+}
+
+/// What a FINISHED sweep amounts to: the line to print and the verdict to carry.
+///
+/// One function rather than a wording helper beside a branch, because the two
+/// are the same claim and a test that reaches only one of them proves nothing
+/// about the other: a renderer test stays green when the branch that calls it is
+/// deleted. `kin daemon sweep` calls it too, for the same reason: it is the
+/// command the pending line below tells a reader to run next, and it printed
+/// `sweep complete (3/6 files)` off the same status object that named a language
+/// it could not serve.
+///
+/// The middle arm is coldwalk finding 6. A macOS pass on `tokio-rs/axum`, on a
+/// host that DID carry rustup and rust-analyzer, printed
+/// `cross-file enrichment complete (5/303 files)`, and the same store's next
+/// `kin graph status` read `imports 0/1085 (0%)` and `cross-file reference and
+/// override edges unavailable for rust: no language server found`, numbers
+/// byte-identical to a container with no language server at all. The five files
+/// were JavaScript. One store cannot say both things. The zero-file guard could
+/// not catch it, because `done` was five rather than zero, and the count alone
+/// never could: `files_blocked` counts files and cannot name a language.
+///
+/// Only one arm here is entitled to the word `complete`, and it is the one where
+/// nothing at all was blocked. `complete (6/8 files)` was measured live on a
+/// ruby fixture: its own two numbers disagree, and the two files between them
+/// were named by nothing.
+pub(crate) fn cross_file_enrichment_outcome(
+    done: u64,
+    total: u64,
+    blocked: u64,
+    skipped: &[SkippedLanguage],
+) -> (String, CrossFileEnrichment) {
+    let languages: Vec<&str> = skipped
+        .iter()
+        .map(|entry| entry.language.as_str())
+        .collect();
+
+    // A sweep that enriched nothing reported the same sentence as one that had
+    // nothing left to do, and on a JavaScript repository with 66 admitted files
+    // that sentence was "complete (0/66 files)".
+    if done == 0 && total > 0 {
+        let mut lines = vec![format!(
+            "note: cross-file enrichment finished without enriching any of the {total} files \
+             it walked ({blocked} blocked); reference and import edges will be missing until \
+             it can run, and `.kin/daemon.log` records what stopped it"
+        )];
+        // The arm that loses the most used to name the least: it returned before
+        // it looked at the rows, so the coldwalk's own container leg, where the
+        // sweep walked 66 files and enriched none, handed a reader a count and a
+        // blocked number and never said which language they had lost or why.
+        // With no rows the headline already accounts for every blocked file, so
+        // nothing is appended and the sentence stays the one that shipped.
+        if !skipped.is_empty() {
+            lines.extend(skipped_detail_lines(blocked, skipped));
+        }
+        let pending = if languages.is_empty() {
+            format!(
+                "the sweep walked {total} files and enriched none of them, so cross-file \
+                 reference and override edges are not in this graph; `kin daemon sweep` \
+                 retries it"
+            )
+        } else {
+            format!(
+                "the sweep walked {total} files and enriched none of them, so cross-file \
+                 reference and override edges are not in this graph, and it could not serve \
+                 {} at all: {}; the note above names what each one needs, and `kin daemon \
+                 sweep` retries once that is repaired",
+                plural_count(languages.len() as u64, "language", "languages"),
+                languages.join(", ")
+            )
+        };
+        return (lines.join("\n"), CrossFileEnrichment::Withheld { pending });
+    }
+    if !skipped.is_empty() {
+        let mut lines = vec![format!(
+            "  cross-file enrichment ended having enriched {done} of {total} files, leaving {} \
+             unserved:",
+            plural_count(skipped.len() as u64, "language", "languages")
+        )];
+        lines.extend(skipped_detail_lines(blocked, skipped));
+        return (
+            lines.join("\n"),
+            CrossFileEnrichment::Withheld {
+                pending: format!(
+                    "the sweep enriched {done} of {total} files and could not serve {}, so \
+                     cross-file reference and override edges for {} are not in this graph; the \
+                     note above names what each one needs, and `kin daemon sweep` retries once \
+                     that is repaired",
+                    plural_count(skipped.len() as u64, "language", "languages"),
+                    languages.join(", ")
+                ),
+            },
+        );
+    }
+    if blocked > 0 {
+        // Blocked files the daemon could not attribute to a language. The
+        // verdict deliberately stays `Produced`: every language this build
+        // serves WAS served, and telling a reader that `kin daemon sweep` would
+        // repair a file whose extension no server here handles is the same
+        // fabricated-cause defect in the other direction. What changes is the
+        // sentence, which no longer calls a pass with blocked files complete.
+        let mut lines = vec![format!(
+            "  cross-file enrichment covered {done} of {total} files:"
+        )];
+        lines.extend(skipped_detail_lines(blocked, skipped));
+        return (lines.join("\n"), CrossFileEnrichment::Produced);
+    }
+    (
+        format!("  cross-file enrichment complete ({done}/{total} files)"),
+        CrossFileEnrichment::Produced,
+    )
 }
 
 /// Run the conversion phase and ALWAYS clean up after it.
@@ -631,26 +836,10 @@ async fn enrich_phase(kin_root: &Path, layout: &kin_core::KinLayout) -> CrossFil
                 .get("files_blocked")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
-            // A sweep that enriched nothing reported the same sentence as one
-            // that had nothing left to do, and on a JavaScript repository with
-            // 66 admitted files that sentence was "complete (0/66 files)". The
-            // conversion had not failed and nothing said the enrichment had.
-            if done == 0 && total > 0 {
-                note!(
-                    "note: cross-file enrichment finished without enriching any of the {total} \
-                     files it walked ({blocked} blocked); reference and import edges will be \
-                     missing until it can run"
-                );
-                return CrossFileEnrichment::Withheld {
-                    pending: format!(
-                        "the sweep walked {total} files and enriched none of them, so cross-file \
-                         reference and override edges are not in this graph; `kin daemon sweep` \
-                         retries it"
-                    ),
-                };
-            }
-            note!("  cross-file enrichment complete ({done}/{total} files)");
-            return CrossFileEnrichment::Produced;
+            let skipped = skipped_languages_from_status(&status);
+            let (line, outcome) = cross_file_enrichment_outcome(done, total, blocked, &skipped);
+            note!("{}", line);
+            return outcome;
         }
         if std::time::Instant::now() >= deadline {
             note!(
@@ -984,6 +1173,7 @@ fn print_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
+    model_present_before: bool,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
     emit(&render_human_result(
@@ -991,6 +1181,7 @@ fn print_human_result(
         boundary,
         semantic_enrichment,
         cross_file,
+        model_present_before,
         daemon_death,
     )?)
 }
@@ -1019,6 +1210,7 @@ fn render_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
+    model_present_before: bool,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<String> {
     let default_ref = initialized_default_ref(result);
@@ -1062,6 +1254,14 @@ fn render_human_result(
             writeln!(out, "  Workspace: empty exact tree")?;
         }
     }
+    // The reading that explains a fetch that did not happen, selected by the
+    // work it is about. `read_all(...).last()` was the newest refusal of ANY
+    // heavy work, so on a pressured host whose last refusal was the LSP sweep
+    // this line explained a missing model download with a cause about something
+    // else. Read here rather than remembered, for the same reason the daemon
+    // death beside it is: the refusal is written by a daemon during the
+    // enrichment phase and leaves nothing in this process.
+    let embed_refusal = embed_refusal_for(result.layout.root());
     let guidance = ordered_init_guidance_lines(
         format!(
             "  Semantic enrichment: {}",
@@ -1072,7 +1272,11 @@ fn render_human_result(
         semantic_absence_notice(semantic_enrichment),
         format!(
             "  {}",
-            embedding_model_notice(&crate::embed_model::EmbedModelFetch::probe(false))
+            embedding_model_notice(
+                &crate::embed_model::EmbedModelFetch::probe(false),
+                model_present_before,
+                embed_refusal.as_ref(),
+            )
         ),
     );
     for line in guidance {
@@ -1129,7 +1333,25 @@ fn ordered_init_guidance_lines(
 /// `kin init` does, during `kin init`, and this notice prints after it rather
 /// than before. Saying so costs a clause and saves a reader the wrong mental
 /// model of when their machine is busy.
-fn embedding_model_notice(fetch: &crate::embed_model::EmbedModelFetch) -> String {
+/// The refusal that explains a model download this run did not do.
+///
+/// Selected by the work it is about. The newest refusal of ANY heavy work was
+/// what this used to read, so on a pressured host whose last refusal was the
+/// LSP sweep the notice explained a missing model download with a cause about
+/// something else entirely. `LspSweep` is a live sibling producer, not a
+/// hypothetical one.
+fn embed_refusal_for(root: &std::path::Path) -> Option<kin_core::memory_pressure::PressureRefusal> {
+    kin_core::memory_pressure::PressureRefusal::read_for_work(
+        root,
+        kin_core::memory_pressure::HeavyWork::EmbedBatch,
+    )
+}
+
+fn embedding_model_notice(
+    fetch: &crate::embed_model::EmbedModelFetch,
+    present_before: bool,
+    refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+) -> String {
     if let Some(reason) = fetch.no_fetch_reason.as_deref() {
         return format!("Embedding model: {} ({reason})", fetch.model_id);
     }
@@ -1137,24 +1359,34 @@ fn embedding_model_notice(fetch: &crate::embed_model::EmbedModelFetch) -> String
         Some(dir) => format!(" at {dir}"),
         None => String::new(),
     };
-    if fetch.present {
-        return format!(
-            "Embedding model: {} is already cached{location}, so nothing is downloaded",
+    match (present_before, fetch.present) {
+        (true, _) => format!(
+            "Embedding model: {} was already cached{location}, so this command downloaded nothing",
             fetch.model_id
-        );
-    }
-    format!(
-        "Embedding model: {} is not on this machine yet; `kin init` starts the first embed \
-         pass, which fetches {} from {}{} and needs egress. On a repository with parseable \
-         content that download happens during this command, before any vector exists",
-        fetch.model_id,
-        fetch.expected_download(),
-        crate::embed_model::endpoint_host(),
-        match fetch.cache_dir.as_deref() {
-            Some(dir) => format!(" into {dir}"),
-            None => String::new(),
+        ),
+        (false, true) => format!(
+            "Embedding model: {} was not on this machine, and this command fetched it{location}",
+            fetch.model_id
+        ),
+        (false, false) => {
+            let because = match refusal {
+                Some(refusal) => format!(", because {}", refusal.cause_sentence()),
+                None => String::new(),
+            };
+            format!(
+                "Embedding model: {} is not on this machine and this command did not fetch \
+                 it{because}. The first embed pass fetches {} from {}{} and needs egress; run \
+                 `kin embed` to start it now",
+                fetch.model_id,
+                fetch.expected_download(),
+                crate::embed_model::endpoint_host(),
+                match fetch.cache_dir.as_deref() {
+                    Some(dir) => format!(" into {dir}"),
+                    None => String::new(),
+                }
+            )
         }
-    )
+    }
 }
 
 /// Paths listed by name before the rest are counted rather than named.
@@ -1405,6 +1637,268 @@ mod tests {
     /// other half, the sentence a user reads, because the defect this replaced
     /// lived in the sentence: the daemon computed the truth, logged the truth
     /// to itself, and handed the reader a fabrication.
+    /// Coldwalk finding 6, as its own module.
+    ///
+    /// Every fixture below is that walk's measurement rather than a shape
+    /// invented here: `tokio-rs/axum` on a macOS host carrying rustup and
+    /// rust-analyzer, `enriched 5/303 files`, the five JavaScript, and the same
+    /// store's next `kin graph status` reading `cross-file reference and
+    /// override edges unavailable for rust: no language server found`.
+    mod a_sweep_that_skipped_a_language {
+        use super::super::{
+            cross_file_enrichment_outcome, skipped_languages_from_status, CrossFileEnrichment,
+            SkippedLanguage,
+        };
+
+        const RUST_REASON: &str = "the `rust-analyzer` language server did not start (No such \
+                                   file or directory (os error 2)), so nothing in this language \
+                                   was enriched";
+
+        fn coldwalk_status() -> serde_json::Value {
+            serde_json::json!({
+                "running": false,
+                "files_done": 5,
+                "files_total": 303,
+                "files_blocked": 298,
+                "sweeps_completed": 1,
+                "enrichment_available": true,
+                "languages_skipped": [
+                    { "language": "rust", "files": 298, "reason": RUST_REASON }
+                ]
+            })
+        }
+
+        /// The sentence the walk caught, on the input that produced it.
+        ///
+        /// The ban on "complete" is the assertion rather than a style note. This
+        /// is the one place in that whole walkthrough where the product stated a
+        /// completion that did not happen, and it happened because `done` was 5
+        /// rather than 0, so the only guard on this branch could not fire.
+        #[test]
+        fn the_word_complete_is_not_used_and_the_gap_is_named() {
+            let skipped = skipped_languages_from_status(&coldwalk_status());
+            assert_eq!(skipped.len(), 1, "the fixture carries one skipped language");
+            let (line, outcome) = cross_file_enrichment_outcome(5, 303, 298, &skipped);
+
+            assert!(
+                !line.contains("complete"),
+                "a pass that could not serve a language must not report a completion: {line}"
+            );
+            assert!(
+                line.contains("enriched 5 of 303 files"),
+                "the line must say what WAS enriched: {line}"
+            );
+            assert!(
+                line.contains("rust"),
+                "the line must name the language that was skipped: {line}"
+            );
+            assert!(
+                line.contains("298 files"),
+                "the line must say how much was skipped: {line}"
+            );
+            assert!(
+                line.contains("rust-analyzer"),
+                "the line must say WHY, from what the daemon observed: {line}"
+            );
+            match outcome {
+                CrossFileEnrichment::Withheld { pending } => assert!(
+                    pending.contains("rust"),
+                    "the withheld reason must name the language still owed: {pending}"
+                ),
+                CrossFileEnrichment::Produced => {
+                    panic!("a sweep that skipped a whole language did not produce that language")
+                }
+            }
+        }
+
+        /// The control, and it is half of the test above.
+        ///
+        /// A ban on one word is satisfied by never saying anything, so the same
+        /// function on a sweep that skipped nothing must still reach the
+        /// completion line and `Produced`. Without this, deleting the word
+        /// everywhere would pass.
+        #[test]
+        fn a_sweep_that_skipped_nothing_still_reports_a_completion() {
+            let status = serde_json::json!({
+                "files_done": 303,
+                "files_total": 303,
+                "files_blocked": 0,
+                "languages_skipped": []
+            });
+            let skipped = skipped_languages_from_status(&status);
+            assert!(skipped.is_empty(), "no rows means nothing was skipped");
+
+            let (line, outcome) = cross_file_enrichment_outcome(303, 303, 0, &skipped);
+            assert!(
+                line.contains("cross-file enrichment complete (303/303 files)"),
+                "a sweep that served every language it met still completes: {line}"
+            );
+            assert_eq!(outcome, CrossFileEnrichment::Produced);
+        }
+
+        /// A daemon too old to send the field reads as nothing skipped, never as
+        /// an empty list dressed up as knowledge.
+        #[test]
+        fn a_status_without_the_field_reports_no_skipped_language() {
+            let status = serde_json::json!({ "files_done": 5, "files_total": 303 });
+            assert!(skipped_languages_from_status(&status).is_empty());
+        }
+
+        /// A row missing its reason is dropped rather than defaulted, because a
+        /// skip nothing explains sends its reader hunting a cause the daemon
+        /// never observed.
+        #[test]
+        fn a_row_missing_a_half_is_dropped_rather_than_defaulted() {
+            let status = serde_json::json!({
+                "languages_skipped": [
+                    { "language": "rust", "files": 298 },
+                    { "files": 12, "reason": "no language was named" },
+                    { "language": "python", "files": 12, "reason": "pyright did not start" }
+                ]
+            });
+            assert_eq!(
+                skipped_languages_from_status(&status),
+                vec![SkippedLanguage {
+                    language: "python".to_string(),
+                    files: 12,
+                    reason: "pyright did not start".to_string(),
+                }]
+            );
+        }
+
+        /// The zero-file case keeps its own sentence, which predates this and is
+        /// a different claim: nothing at all moved, rather than one language
+        /// moving while another could not.
+        #[test]
+        fn the_zero_file_case_keeps_its_own_sentence() {
+            let (line, outcome) = cross_file_enrichment_outcome(0, 66, 66, &[]);
+            assert!(
+                line.contains("without enriching any of the 66 files"),
+                "{line}"
+            );
+            assert!(!line.contains("complete"), "{line}");
+            assert!(matches!(outcome, CrossFileEnrichment::Withheld { .. }));
+        }
+
+        /// The sentence accounts for every file the daemon says was blocked.
+        ///
+        /// Measured, at the sha this test lands on, on three rust, three
+        /// typescript and two ruby files with both language servers reachable:
+        /// `files_total` 8, `files_done` 3, `files_blocked` 5, and one skip row
+        /// naming rust with three files. The sentence's own figures added to six
+        /// of eight and the two ruby files were named by nothing, which is the
+        /// overclaim this whole function exists to close, surviving on an input
+        /// the row list cannot describe.
+        #[test]
+        fn every_blocked_file_is_accounted_for_even_when_no_row_names_it() {
+            let skipped = vec![SkippedLanguage {
+                language: "rust".to_string(),
+                files: 3,
+                reason: "the `rust-analyzer` language server did not start".to_string(),
+            }];
+            let (line, _) = cross_file_enrichment_outcome(3, 8, 5, &skipped);
+
+            assert!(
+                line.contains("rust: 3 files not enriched"),
+                "the row still names what it can: {line}"
+            );
+            assert!(
+                line.contains("2 further files"),
+                "the five blocked files minus the three the row names leaves two the \
+                 sentence must still account for: {line}"
+            );
+            assert!(
+                line.contains("did not attribute to a language"),
+                "the remainder says what it is rather than appearing as a gap in the \
+                 arithmetic: {line}"
+            );
+        }
+
+        /// One blocked file reads `1 further file`, never `1 further files`.
+        #[test]
+        fn the_remainder_counts_one_file_in_the_singular() {
+            let skipped = vec![SkippedLanguage {
+                language: "rust".to_string(),
+                files: 3,
+                reason: "the `rust-analyzer` language server did not start".to_string(),
+            }];
+            let (line, _) = cross_file_enrichment_outcome(4, 8, 4, &skipped);
+            assert!(line.contains("1 further file "), "{line}");
+            assert!(!line.contains("1 further files"), "{line}");
+        }
+
+        /// A pass with blocked files and no row to name them is not complete.
+        ///
+        /// `cross_file_enrichment_outcome(6, 8, 2, &[])` is the ruby fixture
+        /// above with both servers reachable, and it printed
+        /// `cross-file enrichment complete (6/8 files)` on a real `kin init` at
+        /// the parent commit. The function took `blocked` and used it only in
+        /// the zero-file arm, so the argument that catches this was already in
+        /// the signature.
+        ///
+        /// The verdict stays `Produced` on purpose: every language this build
+        /// serves was served, and promising that `kin daemon sweep` would repair
+        /// a file whose extension no server here handles is the fabricated-cause
+        /// defect pointing the other way. What is fixed is the sentence.
+        #[test]
+        fn blocked_files_with_no_row_still_end_the_word_complete() {
+            let (line, outcome) = cross_file_enrichment_outcome(6, 8, 2, &[]);
+            assert!(
+                !line.contains("complete"),
+                "a pass that blocked two of eight files did not complete: {line}"
+            );
+            assert!(
+                line.contains("covered 6 of 8 files"),
+                "the line still says what it did cover: {line}"
+            );
+            assert!(
+                line.contains("2 files blocked"),
+                "and it accounts for the rest: {line}"
+            );
+            assert!(
+                !line.contains("further"),
+                "there is no row above for these to be further than: {line}"
+            );
+            assert_eq!(outcome, CrossFileEnrichment::Produced);
+        }
+
+        /// With nothing enriched, the language the daemon named is still named.
+        ///
+        /// This is the coldwalk's own container leg: no language server existed,
+        /// `kin init` walked 66 files and enriched none. The arm that loses the
+        /// most used to name the least, because it returned before it looked at
+        /// the rows, so a user was told a count and a blocked number and never
+        /// which language they had lost.
+        #[test]
+        fn the_zero_file_case_names_the_language_when_the_daemon_named_one() {
+            let skipped = vec![SkippedLanguage {
+                language: "rust".to_string(),
+                files: 60,
+                reason: "the `rust-analyzer` language server did not start".to_string(),
+            }];
+            let (line, outcome) = cross_file_enrichment_outcome(0, 66, 66, &skipped);
+
+            assert!(!line.contains("complete"), "{line}");
+            assert!(
+                line.contains("rust: 60 files not enriched"),
+                "the language, its file count and its reason: {line}"
+            );
+            assert!(
+                line.contains("6 further files"),
+                "and the blocked files no row names: {line}"
+            );
+            match outcome {
+                CrossFileEnrichment::Withheld { pending } => assert!(
+                    pending.contains("rust"),
+                    "the withheld reason must name the language still owed: {pending}"
+                ),
+                CrossFileEnrichment::Produced => {
+                    panic!("a sweep that enriched nothing did not produce cross-file edges")
+                }
+            }
+        }
+    }
+
     mod enrichment_unavailable_notes {
         use super::super::enrichment_unavailable_note;
 
@@ -2271,7 +2765,7 @@ mod tests {
     /// the destination, and a machine that has them is told nothing is owed.
     #[test]
     #[serial_test::serial]
-    fn init_states_the_model_download_a_fresh_machine_still_owes() {
+    fn init_reports_the_embedding_model_outcome_this_run_actually_had() {
         let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
         let absent = crate::embed_model::EmbedModelFetch {
             model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
@@ -2283,43 +2777,83 @@ mod tests {
             no_fetch_reason: None,
             relocated_hf_home: None,
         };
-        let notice = embedding_model_notice(&absent);
+
+        // State one: absent when the command opened, still absent when it
+        // closed. The line this replaced said the 523 MB "download happens
+        // during this command" whatever the run had done, and a cold-user walk
+        // on 0.6.0 read that sentence off a run whose background embed pass had
+        // never started, with no `~/.cache/huggingface` on the machine at all.
+        let did_not_fetch = embedding_model_notice(&absent, false, None);
         assert!(
-            notice.contains("nomic-ai/nomic-embed-text-v1.5")
-                && notice.contains("about 523 MB")
-                && notice.contains("huggingface.co")
-                && notice.contains("/home/dev/.cache/huggingface/hub/models--x"),
-            "the model, the size, the source and the destination are all named: {notice}"
+            did_not_fetch.contains("nomic-ai/nomic-embed-text-v1.5")
+                && did_not_fetch.contains("about 523 MB")
+                && did_not_fetch.contains("huggingface.co")
+                && did_not_fetch.contains("/home/dev/.cache/huggingface/hub/models--x"),
+            "the model, the size, the source and the destination are all named: {did_not_fetch}"
+        );
+        assert!(
+            did_not_fetch.contains("did not fetch it"),
+            "a run that fetched nothing must say so: {did_not_fetch}"
+        );
+        assert!(
+            did_not_fetch.contains("`kin embed`"),
+            "and must name what does fetch it: {did_not_fetch}"
+        );
+        assert!(
+            !did_not_fetch.contains("happens during this command"),
+            "the old unconditional promise is gone: {did_not_fetch}"
         );
 
-        // FIR-2555. The size and the host were already here; who pays was not.
-        // This line used to read "the first embed pass fetches", which put the
-        // cost on a command the reader had not run, while the enrichment phase
-        // of this very `kin init` was starting the daemon whose embed worker
-        // does the fetching. A stranger measured 2.576s to init an empty
-        // repository against 67.1s to init a one-file TypeScript one on shipped
-        // 0.5.45, and the difference was this download.
+        // The same state, with the daemon's own account of why. A refusal is
+        // the difference between "this did not happen" and "this did not
+        // happen, and here is the machine that decided".
+        let refusal = kin_core::memory_pressure::PressureRefusal {
+            work: kin_core::memory_pressure::HeavyWork::EmbedBatch
+                .id()
+                .to_string(),
+            level: "critical".to_string(),
+            reason: "the host had no room for the embed pass".to_string(),
+            at_unix: 4_800,
+        };
+        let refused = embedding_model_notice(&absent, false, Some(&refusal));
         assert!(
-            notice.contains("`kin init` starts the first embed pass"),
-            "the notice must name the command that pays for the download: {notice}"
-        );
-        assert!(
-            notice.contains("during this command"),
-            "the notice must say the download happens now rather than later: {notice}"
-        );
-        assert!(
-            !notice.contains("after this command finishes"),
-            "the check must be able to fail: {notice}"
+            refused.contains("the host had no room for the embed pass"),
+            "a refusal on record is named as the cause: {refused}"
         );
 
+        // State two: it arrived during this run. FIR-2555's point survives
+        // here, where it is true: the cost belongs to `kin init`, not to some
+        // later command the reader has not run.
+        let fetched = embedding_model_notice(
+            &crate::embed_model::EmbedModelFetch {
+                present: true,
+                ..absent.clone()
+            },
+            false,
+            None,
+        );
+        assert!(
+            fetched.contains("this command fetched it"),
+            "a run that paid for the download says which command paid: {fetched}"
+        );
+        assert!(
+            !fetched.contains("did not fetch it"),
+            "the states must be distinguishable: {fetched}"
+        );
+
+        // State three: it was already here, so this command owed nothing.
         let cached = crate::embed_model::EmbedModelFetch {
             present: true,
-            ..absent
+            ..absent.clone()
         };
-        let cached_notice = embedding_model_notice(&cached);
+        let cached_notice = embedding_model_notice(&cached, true, None);
         assert!(
-            cached_notice.contains("already cached") && !cached_notice.contains("523"),
-            "a machine that has the model is not warned about a download: {cached_notice}"
+            cached_notice.contains("was already cached") && !cached_notice.contains("523"),
+            "a machine that had the model is not warned about a download: {cached_notice}"
+        );
+        assert!(
+            !cached_notice.contains("this command fetched it"),
+            "and is not told this run fetched what it already had: {cached_notice}"
         );
 
         let overridden = crate::embed_model::EmbedModelFetch {
@@ -2328,7 +2862,7 @@ mod tests {
             present: false,
             ..cached
         };
-        let overridden_notice = embedding_model_notice(&overridden);
+        let overridden_notice = embedding_model_notice(&overridden, false, None);
         assert!(
             !overridden_notice.contains("523"),
             "a model this build never measured is given no size: {overridden_notice}"
@@ -2336,6 +2870,50 @@ mod tests {
         assert!(
             overridden_notice.contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {overridden_notice}"
+        );
+    }
+
+    /// The notice explains itself with the embed refusal, never with whatever
+    /// heavy work happened to be refused last.
+    ///
+    /// `LspSweep` writes refusals to the same ledger, so on a pressured host
+    /// the newest row is often about the sweep. Reading that one told a user
+    /// their model download was skipped for a reason belonging to different
+    /// work.
+    #[test]
+    fn the_model_notice_reads_the_embed_refusal_and_not_the_newest_one() {
+        use kin_core::memory_pressure::{HeavyWork, PressureLevel, PressureRefusal};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // Order matters: the sweep is published second, so it is the newest
+        // refusal of any work, which is what the old selection returned.
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "the embed batch was held back",
+        );
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::LspSweep,
+            PressureLevel::Critical,
+            "the sweep was held back",
+        );
+
+        // This is only the case that matters if the newest really is the other
+        // work, so that is asserted rather than assumed.
+        assert_eq!(
+            PressureRefusal::read_all(dir.path())
+                .last()
+                .map(|refusal| refusal.work.clone()),
+            Some(HeavyWork::LspSweep.id().to_string()),
+            "the newest refusal on this store is about the sweep"
+        );
+
+        let chosen = embed_refusal_for(dir.path()).expect("the embed refusal is on record");
+        assert_eq!(
+            chosen.work,
+            HeavyWork::EmbedBatch.id().to_string(),
+            "a download that did not happen is explained by the refusal about downloading"
         );
     }
 

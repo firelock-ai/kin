@@ -930,6 +930,20 @@ jobs:
       - name: Check the flake quarantine
         run: python3 scripts/check-quarantine.py
 
+      # Here rather than in `check`, for the reason the step above records: a
+      # script step in `check` is a gate `bin/kin-precheck` enumerates and must
+      # classify by name, and one wired there without the matching umbrella
+      # entry makes precheck refuse with no tally. Both were in `check` and
+      # precheck reported them UNCLASSIFIED, which costs every lane its local
+      # verdict. This job carries the required "Fast gate lint and policy"
+      # context, so the guard is no weaker here; promoting it back is one job
+      # move and one name joining precheck's LOCAL list.
+      - name: Check Docker daemon production features
+        run: bash scripts/check-docker-daemon-features.sh
+
+      - name: Falsify Docker daemon production feature guard
+        run: bash scripts/check-docker-daemon-features.test.sh
+
       # ADDED here rather than moved out of `check`, deliberately, for two
       # reasons. `check` carries `github.event_name != 'pull_request'`, so the
       # thinned six-context pull-request gate never runs it and main failed its
@@ -2028,6 +2042,21 @@ jobs:
   # documentation-only diff would otherwise wait forever for two contexts that
   # were never going to be created. Both legs run here on one ubuntu runner
   # because the point is the name, not the work.
+  #
+  # Read this before trusting a green `Feature permutation tests` on a pull
+  # request. On a pull request this job runs NO tests: it exists only to publish
+  # the two context names, and every step below it in `feature-tests` is skipped.
+  # The permutations execute on push to `main` and nowhere earlier, because this
+  # repository lands through direct merges rather than a merge queue, so there is
+  # no pre-merge event that runs them. The trade is deliberate: the permutations
+  # carry a 60 minute timeout and a per-pull-request gate is held to minutes, so
+  # they are kept off the pull-request path on purpose.
+  #
+  # The consequence is real and is the reason this is written down. A break that
+  # appears only under a non-default feature permutation reaches `main` first and
+  # is caught by the push run afterwards, not by the pull request that introduced
+  # it. Anything that must refuse a change BEFORE it lands belongs in the fast
+  # gate instead, where the required contexts are.
   feature-tests-pr-fast-path:
     name: Feature permutation tests
     if: ${{ !cancelled() && github.event_name == 'pull_request' }}
@@ -2038,8 +2067,9 @@ jobs:
     steps:
       - name: Report the pull-request fast path
         run: |
-          echo "The feature permutations run in the merge queue and on every"
-          echo "main commit. Admission is the fast gate."
+          echo "This job runs no tests. The feature permutations run on push to"
+          echo "main, after the merge, and not on this pull request."
+          echo "Admission before the merge is the fast gate."
 
   feature-tests:
     name: Feature permutation tests
@@ -2105,18 +2135,41 @@ jobs:
         with:
           tool: nextest
 
-      # `gcs` is a non-default feature, so the default-feature passes in Check &
-      # Test never execute the hosted-storage code it gates, and the
-      # `--all-features` Clippy pass there only type-checks it. Without this
-      # step a behavioral regression in the
-      # GCS-mode startup admission path compiles clean and reaches main with a
-      # green required context. The whole package runs rather than just the
-      # binary target: the feature gates only `bin/kin-daemon.rs` today, and
-      # scoping to that target would silently stop covering a gate added to the
-      # library later. No companion doctest pass belongs here because
-      # kin-daemon declares `doctest = false`.
+      # Keep the former gcs-only gate even though production now adds Firestore.
+      # It proves hosted bytes compiled without the durable dependency still
+      # fail closed instead of silently selecting the in-memory backend.
       - name: Test gcs feature
         run: cargo nextest run -p kin-daemon --features gcs --locked
+
+      - name: Test hosted gcs spine cursor hold
+        if: matrix.os == 'ubuntu-latest'
+        run: >-
+          cargo test -p kin-daemon --features gcs --locked
+          state::tests::hosted_spine_refuses_persistence_without_cursor_cas
+          -- --exact --nocapture --test-threads=1
+
+      # kin-spine gates its Firestore REST write-shape, envelope and migration
+      # seal tests behind its own `firestore` feature. The workspace test legs
+      # build kin-daemon with default features, so nothing enables it there, and
+      # the `-p kin-daemon --features gcs,firestore` leg below compiles kin-spine
+      # with the feature on but runs only kin-daemon's test binaries. Without
+      # this step those tests are written, compiled on no leg that runs them,
+      # and can never fail.
+      - name: Test kin-spine durable publication paths
+        run: cargo nextest run -p kin-spine --features firestore --locked
+
+      # The actual daemon container enables both non-default hosted features.
+      # Default and all-features checks do not execute this exact deployed
+      # configuration, so keep a complete package pass for the production bytes.
+      - name: Test hosted production features
+        run: cargo nextest run -p kin-daemon --features gcs,firestore --locked
+
+      - name: Test hosted production durable spine selection
+        if: matrix.os == 'ubuntu-latest'
+        run: >-
+          cargo test -p kin-daemon --features gcs,firestore --locked
+          state::tests::hosted_production_feature_pair_selects_durable_backend
+          -- --exact --nocapture --test-threads=1
 
       # Nothing else on these legs resolves kin-cli without its default
       # features, so a break that appears only with `vector` and `embeddings`

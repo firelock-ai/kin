@@ -273,14 +273,14 @@
     },
     {
       "file": "crates/kin-daemon/src/api.rs",
-      "reason": "Daemon RPC surface. This file is the answer authority every agent, editor, and CLI reaches, so it is scanned in full and only four explicit IO-boundary bodies are excused. npm_registry_routes, router_with_auth_and_shutdown and router_with_rotation_tokens materialize package-registry directories, the last because extracting the rotation-aware router moved that same directory setup out of the second and an exemption that stayed with the old name would have excused nothing; health reports local runtime diagnostics; ensure_loopback_token manages the loopback credential. None derives a semantic query answer. The two expression pins cover a graph-owned blob lease metadata accessor and the durable authority publication-record probe. Locate, search, context, trace, impact, review, verify, MCP handlers, and every newly added handler remain scanned by default.",
+      "reason": "Daemon RPC surface. This file is the answer authority every agent, editor, and CLI reaches, so it is scanned in full and only the explicit IO-boundary bodies are excused. npm_registry_routes and router_with_rotation_tokens materialize package-registry directories; the rotation-aware router is where that body now lives, because extracting it moved the directory setup out of router_with_auth_and_shutdown, and an exemption that stayed with the old name would have excused nothing. router_with_auth_and_shutdown_internal is the delegating wrapper this branch added above it for the publication-control administrator token. health reports local runtime diagnostics; ensure_loopback_token manages the loopback credential. None derives a semantic query answer. The two expression pins cover a graph-owned blob lease metadata accessor and the durable authority publication-record probe. Locate, search, context, trace, impact, review, verify, MCP handlers, and every newly added handler remain scanned by default.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
         "ensure_loopback_token",
         "health",
         "npm_registry_routes",
-        "router_with_auth_and_shutdown",
+        "router_with_auth_and_shutdown_internal",
         "router_with_rotation_tokens"
       ],
       "allow_match": [

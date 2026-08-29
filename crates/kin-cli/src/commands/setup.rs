@@ -13028,46 +13028,51 @@ struct ReadinessLine {
 
 /// Compose the closing line from the rows the table just printed.
 ///
-/// It used to be read off `report.healthy` alone, which asks a narrower
-/// question than the table answers: `healthy` gates on Missing and
+/// It used to be read off `report.healthy` alone, which asked a narrower
+/// question than the table answers: `healthy` gated on Missing and
 /// Misconfigured, so a container run whose `Reference edge coverage` row read
 /// PENDING for want of a language server closed with "First-run ready" one line
 /// under its own "4 need attention" tally, and the repair that would have
 /// closed that row had failed in the same output (FIR-2547). The row knew; the
-/// summary did not read it. A reader who trusts the last line is entitled to
-/// have it agree with the rows above it, so claiming readiness now requires
-/// that nothing at all needs attention, and the line names what does.
+/// summary did not read it. That was repaired HERE, by deriving the honest join
+/// a second time in this function, which left the two surfaces of one report
+/// disagreeing in the other direction: this line read "5 checks need attention"
+/// while the JSON beside it read `"healthy": true` (FIR-2919).
+///
+/// So both halves of this line come from `health.rs` and neither is derived
+/// here. `report.healthy()` decides whether readiness may be claimed, and
+/// `health::needs_attention` decides which rows are counted and named. A
+/// verbatim copy of that predicate stood in this function through the first
+/// round of this fix, which is the same defect wearing a smaller costume: one
+/// surface counting by its own rule while the aggregate uses another is exactly
+/// what FIR-2919 is.
 fn readiness_line(report: &crate::commands::health::HealthReport) -> ReadinessLine {
-    use crate::commands::health::HealthStatus;
+    use crate::commands::health::{HealthStatus, HealthVerdict};
 
     /// How many rows the line names before it counts the rest.
     const NAMED: usize = 4;
 
-    let summary = report.summary();
     let waiting: Vec<&crate::commands::health::HealthCheck> = report
         .checks
         .iter()
-        .filter(|check| {
-            !matches!(
-                check.status,
-                HealthStatus::Healthy | HealthStatus::Unsupported
-            )
-        })
+        .filter(|check| crate::commands::health::needs_attention(check))
         .collect();
-    if report.healthy && summary.attention == 0 && waiting.is_empty() {
+    if report.healthy() {
         return ReadinessLine {
             ready: true,
             severe: false,
-            sentence: "First-run ready — no component is missing or misconfigured.".to_string(),
+            sentence: "First-run ready. Every check that applies here is healthy.".to_string(),
         };
     }
-    let severe = !report.healthy
-        || waiting.iter().any(|check| {
-            matches!(
-                check.status,
-                HealthStatus::Missing | HealthStatus::Misconfigured | HealthStatus::Degraded
-            )
-        });
+    // Red is for a broken install, and for a host that is short of ground, which
+    // is what the row marks above already say. Work still in flight stays
+    // yellow. Reading `!report.healthy()` here would turn every warming
+    // install's closing mark red, because that boolean now answers the wider
+    // question.
+    let severe = report.verdict() == HealthVerdict::Failing
+        || waiting
+            .iter()
+            .any(|check| matches!(check.status, HealthStatus::Degraded));
     let mut labels: Vec<String> = waiting
         .iter()
         .take(NAMED)
@@ -15490,7 +15495,7 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
 mod tests {
     use super::projection_mode_to_record;
     use super::{fix_verdict, readiness_line, UnfinishedRepair};
-    use crate::commands::health::{HealthCheck, HealthReport, HealthStatus};
+    use crate::commands::health::{HealthCheck, HealthReport, HealthStatus, HealthVerdict};
     use kin_model::LanguageId;
 
     fn check(id: &str, label: &str, status: HealthStatus) -> HealthCheck {
@@ -15505,16 +15510,21 @@ mod tests {
         }
     }
 
-    /// The state the container run was actually in: `healthy` true, because
-    /// nothing was Missing or Misconfigured, while the coverage row read
+    /// The state the container run was actually in: the coverage row read
     /// PENDING because no language server was found and the repair meant to
     /// install one had just failed. The closing line said "First-run ready"
     /// under its own "4 need attention" tally (FIR-2547).
+    ///
+    /// Built through `from_checks` rather than as a literal. The literal this
+    /// used to carry set `healthy: true` beside a PENDING row, which was the
+    /// product's real answer then and is a state it can no longer produce
+    /// (FIR-2919); a fixture that keeps describing it would be grading a report
+    /// nothing emits.
     #[test]
     fn a_pending_row_keeps_the_summary_from_claiming_first_run_ready() {
-        let report = HealthReport {
-            platform: "linux".to_string(),
-            checks: vec![
+        let report = HealthReport::from_checks(
+            "linux".to_string(),
+            vec![
                 check("kin_binary", "Kin binary", HealthStatus::Healthy),
                 check(
                     "reference_edge_coverage",
@@ -15522,8 +15532,11 @@ mod tests {
                     HealthStatus::Pending,
                 ),
             ],
-            healthy: true,
-        };
+        );
+        assert!(
+            !report.healthy(),
+            "the join has to see the pending row, or this fixture proves nothing about the line"
+        );
         let line = readiness_line(&report);
         assert!(
             !line.ready,
@@ -15552,9 +15565,9 @@ mod tests {
     /// ready, or the line would refuse every correct install.
     #[test]
     fn a_report_with_nothing_waiting_still_reads_first_run_ready() {
-        let report = HealthReport {
-            platform: "linux".to_string(),
-            checks: vec![
+        let report = HealthReport::from_checks(
+            "linux".to_string(),
+            vec![
                 check("kin_binary", "Kin binary", HealthStatus::Healthy),
                 check(
                     "vfs_projection",
@@ -15562,8 +15575,11 @@ mod tests {
                     HealthStatus::Unsupported,
                 ),
             ],
-            healthy: true,
-        };
+        );
+        assert!(
+            report.healthy(),
+            "an unsupported row is out of scope, not attention: the join must still say ready"
+        );
         let line = readiness_line(&report);
         assert!(line.ready, "{}", line.sentence);
         assert!(
@@ -15573,19 +15589,206 @@ mod tests {
         );
     }
 
+    /// FIR-2919, as a reader meets it: the last printed line and the JSON
+    /// boolean are two renderings of one report, and they must not disagree.
+    ///
+    /// Graded over the row set a fresh Windows install actually emitted on the
+    /// v0.6.1 release run, taken from that run's own
+    /// `install-proof-windows-latest` artifact. This host cannot run Windows,
+    /// and it does not need to: the join is platform-independent and the rows
+    /// are the platform's contribution, so replaying the rows replays the case.
+    /// On the shipped bytes this line read "2 checks need attention" while the
+    /// JSON beside it read `"healthy": true`.
+    #[test]
+    fn the_printed_line_and_the_emitted_boolean_agree_on_the_windows_row_set() {
+        let rows: &[(&str, HealthStatus)] = &[
+            ("kin_binary", HealthStatus::Healthy),
+            ("kin_daemon_binary", HealthStatus::Healthy),
+            ("supervisor_startup_protocol", HealthStatus::Healthy),
+            ("daemon_running", HealthStatus::Unsupported),
+            ("daemon_idle_window", HealthStatus::Unsupported),
+            ("vfs_projection", HealthStatus::Unsupported),
+            ("projection_mode", HealthStatus::Unsupported),
+            ("repo_init", HealthStatus::Unsupported),
+            ("session_runtime", HealthStatus::Unsupported),
+            ("shell_path", HealthStatus::Healthy),
+            ("registry_authority", HealthStatus::Unsupported),
+            ("mcp_client_claude", HealthStatus::Healthy),
+            ("mcp_client_cursor", HealthStatus::Healthy),
+            ("mcp_client_gemini", HealthStatus::Healthy),
+            ("mcp_client_windsurf", HealthStatus::Healthy),
+            ("setup_ledger", HealthStatus::Healthy),
+            ("editor", HealthStatus::Unsupported),
+            ("kinlab_connect", HealthStatus::Unsupported),
+            ("semantic_query_readiness", HealthStatus::Unsupported),
+            ("reference_edge_coverage", HealthStatus::Unsupported),
+            ("relation_census", HealthStatus::Unsupported),
+            ("parse_coverage", HealthStatus::Unsupported),
+            ("background_work", HealthStatus::Unsupported),
+            ("embedding_model", HealthStatus::Pending),
+            ("memory_floor", HealthStatus::Degraded),
+            ("commit_memory_headroom", HealthStatus::Unsupported),
+            ("daemon_kill_record", HealthStatus::Unsupported),
+            ("interrupted_init", HealthStatus::Healthy),
+            ("suspended_sweep", HealthStatus::Unsupported),
+            ("host_memory_pressure", HealthStatus::Unsupported),
+            ("retrieval_profile", HealthStatus::Healthy),
+            ("update_policy", HealthStatus::Healthy),
+            ("binary_assessment_load", HealthStatus::Unsupported),
+        ];
+        let report = HealthReport::from_checks(
+            "windows".to_string(),
+            rows.iter()
+                .map(|(id, status)| check(id, id, status.clone()))
+                .collect(),
+        );
+        let line = readiness_line(&report);
+        assert_eq!(
+            line.ready,
+            report.healthy(),
+            "the printed line and the emitted boolean are the same claim: line ready={}, \
+             healthy={}, sentence={}",
+            line.ready,
+            report.healthy(),
+            line.sentence
+        );
+        assert!(!line.ready, "{}", line.sentence);
+        assert!(
+            line.sentence.contains("2 checks need attention"),
+            "the line has to name the count the rows support: {}",
+            line.sentence
+        );
+        // The mark and the verdict answer different questions, and this pins the
+        // difference. `memory_floor` reads DEGRADED, which is red on this
+        // surface and was red before this change too: the v0.6.1 Unix leg
+        // printed "✗ 5 checks need attention" over its own degraded row. What
+        // must NOT happen is the report calling itself a broken install, and
+        // that is the verdict, not the mark.
+        assert!(
+            line.severe,
+            "a degraded row is red on the printed page, as it was before: {}",
+            line.sentence
+        );
+        assert_eq!(
+            report.verdict(),
+            HealthVerdict::NeedsAttention,
+            "a red mark over a degraded row is not a broken install"
+        );
+
+        // The control. The same 33 rows with the two attention rows made
+        // healthy must agree the other way, or the assertion above passes for
+        // any report at all.
+        let ready_rows: Vec<(&str, HealthStatus)> = rows
+            .iter()
+            .map(|(id, status)| {
+                if *id == "embedding_model" || *id == "memory_floor" {
+                    (*id, HealthStatus::Healthy)
+                } else {
+                    (*id, status.clone())
+                }
+            })
+            .collect();
+        let ready = HealthReport::from_checks(
+            "windows".to_string(),
+            ready_rows
+                .iter()
+                .map(|(id, status)| check(id, id, status.clone()))
+                .collect(),
+        );
+        let ready_line = readiness_line(&ready);
+        assert_eq!(ready_line.ready, ready.healthy());
+        assert!(ready_line.ready, "{}", ready_line.sentence);
+        assert!(
+            ready_line.sentence.contains("First-run ready"),
+            "{}",
+            ready_line.sentence
+        );
+    }
+
+    /// The printed count and the emitted tally are one number, because both
+    /// come from `health::needs_attention` and neither is derived here.
+    ///
+    /// This is the assertion that would have caught the copy this function
+    /// carried through the first round of FIR-2919. A verbatim copy passes any
+    /// test that only reads the printed sentence, and it passes this one too
+    /// while it agrees; what it cannot survive is the copy being edited away
+    /// from the original, which is the way every duplicated rule eventually
+    /// fails. Graded over a row set holding one of every status the join treats
+    /// differently, so no single status carries the equality on its own.
+    #[test]
+    fn the_printed_count_is_the_tally_and_both_come_from_one_predicate() {
+        let report = HealthReport::from_checks(
+            "linux".to_string(),
+            vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                check(
+                    "vfs_projection",
+                    "VFS projection",
+                    HealthStatus::Unsupported,
+                ),
+                check("embedding_model", "Embedding model", HealthStatus::Pending),
+                check("memory_floor", "Memory floor", HealthStatus::Degraded),
+                check(
+                    "projection_mode",
+                    "Projection in force",
+                    HealthStatus::Stale,
+                ),
+            ],
+        );
+        let attention = report.summary().attention;
+        assert_eq!(
+            attention, 3,
+            "the fixture must hold three rows needing attention, or the equality below is \
+             trivially true"
+        );
+        let line = readiness_line(&report);
+        assert!(
+            line.sentence
+                .starts_with(&format!("{attention} checks need attention")),
+            "the printed count must be the tally: tally={attention}, line={}",
+            line.sentence
+        );
+        // The control that keeps the assertion above from passing for any
+        // report at all: turn the three rows healthy and the line has to stop
+        // counting entirely.
+        let ready = HealthReport::from_checks(
+            "linux".to_string(),
+            vec![
+                check("kin_binary", "Kin binary", HealthStatus::Healthy),
+                check(
+                    "vfs_projection",
+                    "VFS projection",
+                    HealthStatus::Unsupported,
+                ),
+                check("embedding_model", "Embedding model", HealthStatus::Healthy),
+                check("memory_floor", "Memory floor", HealthStatus::Healthy),
+                check(
+                    "projection_mode",
+                    "Projection in force",
+                    HealthStatus::Healthy,
+                ),
+            ],
+        );
+        assert_eq!(ready.summary().attention, 0);
+        assert!(
+            readiness_line(&ready).ready,
+            "{}",
+            readiness_line(&ready).sentence
+        );
+    }
+
     /// A real failure keeps the red mark and the repair route.
     #[test]
     fn a_missing_row_reads_as_severe_and_names_the_repair() {
         let mut missing = check("shell_path", "Shell PATH", HealthStatus::Missing);
         missing.fixable = true;
-        let report = HealthReport {
-            platform: "linux".to_string(),
-            checks: vec![
+        let report = HealthReport::from_checks(
+            "linux".to_string(),
+            vec![
                 check("kin_binary", "Kin binary", HealthStatus::Healthy),
                 missing,
             ],
-            healthy: false,
-        };
+        );
         let line = readiness_line(&report);
         assert!(!line.ready, "{}", line.sentence);
         assert!(line.severe, "{}", line.sentence);

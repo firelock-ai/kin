@@ -278,6 +278,51 @@ class Suite(object):
         self._write(repo, "pkg/cli.py", CLI_PY)
         self._kin_commit(repo, "Add CLI entry point")
 
+    def _build_answersurface(self, repo):
+        """The incremental shape once more, read-only for check 24.
+
+        Its own repository because check 24 grades the words `kin locate` and
+        `kin deps` print, and an earlier check's rename or commit inside a
+        shared fixture would move them.
+
+        Carries one module the shared shapes do not, `pkg/overview.py`, whose
+        prose is what check 24's off-topic arm queries against, and it ends by
+        stopping the daemon `kin init` started. See [OVERVIEW_PY] for why an arm
+        about the answer floor needs a query that retrieves rows rather than one
+        the corpus cannot answer at all, and the comment on the stop for why a
+        lexical question needs a daemon that was not the one `kin init` left
+        behind.
+        """
+        self.git(["init", "-q", "."], repo)
+        self._write(repo, ".gitignore", "*.db\n__pycache__/\n")
+        self._write(repo, "pyproject.toml",
+                    '[project]\nname = "nk"\nversion = "0.1.0"\n\n'
+                    '[project.scripts]\nnk = "pkg.cli:main"\n')
+        self._write(repo, "pkg/__init__.py", "")
+        self._write(repo, "pkg/parsing.py", PARSING_PY)
+        self._kin_init(repo)
+        self._kin_commit(repo, "Add parsing module")
+        self._write(repo, "pkg/storage.py", STORAGE_PY)
+        self._kin_commit(repo, "Add storage module")
+        self._write(repo, "pkg/linkgraph.py", LINKGRAPH_PY)
+        self._kin_commit(repo, "Add link graph module")
+        self._write(repo, "pkg/overview.py", OVERVIEW_PY)
+        self._kin_commit(repo, "Add the package overview")
+        # Stop the daemon `kin init` started, and that line is load-bearing.
+        # Measured on this binary, in this fixture shape: against the daemon
+        # `kin init` starts, `locate describe_layers` returns `pkg/overview.py`
+        # as a named match while `locate socket`, a word only that file's
+        # docstring holds, returns `No relevant files found.`; run
+        # `kin daemon stop` and the same lexical query returns the row. So that
+        # daemon answers from entity resolution and has no text index to answer
+        # a purely lexical question from. Check 24's off-topic arm asks exactly
+        # such a question, and without this line it can never see a row.
+        #
+        # It is also the truer shape. A stranger installs, runs `kin init`, and
+        # asks their first question later, against a daemon some later command
+        # started, which is the state every arm here now reads.
+        self.kin_run(["daemon", "stop"], repo)
+
     def _build_rename(self, repo):
         """The incremental shape again, in its own repository.
 
@@ -679,6 +724,31 @@ def main():
     db = Database(":memory:")
     db.ingest_dir({"a.md": "hello #tag b|c"})
     return LinkGraph.from_db(db).backlinks("b")
+'''
+
+# Prose the answersurface fixture carries and no symbol in it is named
+# after. Check 24's off-topic arm needs a query that RETRIEVES and still names
+# nothing: with KIN_DAEMON_AUTO_EMBED=0 there is no vector index, so a query
+# whose words are absent from the corpus entirely retrieves no rows at all and
+# the arm has nothing to grade. Words that live only in prose give lexical
+# retrieval something to find while leaving every row a text fallback, which is
+# the state the answer floor exists to report and the state a stranger asking an
+# English question lands in.
+#
+# `socket`, `server`, `network` and `deployment` appear here and nowhere else in
+# this fixture, and this module defines no symbol by any of those names.
+OVERVIEW_PY = '''"""How this package fits together, for a reader arriving cold.
+
+The reading layer turns raw text into records, the holding layer keeps those
+records in memory, and the traversal layer walks between them.
+
+Nothing here opens a socket or speaks to a server over the network, so there is
+no deployment step and nothing to keep running between calls.
+"""
+
+
+def describe_layers():
+    return "reading, holding, traversal"
 '''
 
 ADAPTER_PY = '''class Adapter:
@@ -3388,6 +3458,136 @@ def check_23(suite):
     return res
 
 
+def check_24(suite):
+    """What a `kin locate` row claims, and what a first one buries under.
+
+    Two defects from the J6 cold-user walk on 0.6.0, both on the surface a
+    stranger's first semantic question comes back on, and both invisible to
+    every suite here because every one of them reads `--json`.
+
+    A first `kin locate` on axum printed 1,400 characters of coverage warnings
+    ahead of 432 characters of answer: the vector index was absent, the
+    capability tier had narrowed a budget, and the role filter had withheld 134
+    test paths. Each is worth having. Stacked ahead of five result lines on a
+    first run, the answer is buried.
+
+    And the rows carried no relevance signal at all, so `kin locate "Router
+    path_router"` inside a Flask store returned six confident-looking Flask
+    paths. Scoping was correct in both directions, which is the good news; the
+    rows simply never said nothing had matched.
+
+    Four arms. The collapse has to hold and it has to hide nothing, so
+    `--explain` is graded beside it; and the row labels have to distinguish, so
+    a query that names a symbol is graded against one that names none. An arm
+    that only checked a label was present would pass against a build that
+    printed the same label on every row.
+    """
+    res = Result("24", "J6-14/18/21",
+                 "a locate row says what it rests on and the notes collapse")
+    repo = suite.fixture("answersurface")
+
+    rc, out, err = suite.kin_run(["locate", "normalize_title"], repo)
+    rows = strip_ansi(out)
+    notes = strip_ansi(err)
+    if rc != 0 or not rows.strip():
+        res.unknown("`kin locate` on a symbol this fixture defines exited %d with no rows: %s"
+                    % (rc, notes[-300:]))
+        return res
+
+    note_lines = [line for line in notes.splitlines() if line.strip().startswith("\u26a0")]
+    collapsed = [line for line in note_lines if "how this answer was produced" in line]
+    if len(note_lines) > 1 and not collapsed:
+        res.bad("a default locate still stacks %d warning lines ahead of the answer: %s"
+                % (len(note_lines), " | ".join(l[:120] for l in note_lines[:4])))
+    elif collapsed and "--explain" not in collapsed[0]:
+        res.bad("the notes collapsed but the line does not say how to read them: %s"
+                % collapsed[0][:300])
+    else:
+        res.ok("the answer is not buried: %d note line(s) ahead of %d rows"
+               % (len(note_lines), len([l for l in rows.splitlines() if l.strip()])))
+
+    # Nothing may be hidden by the collapse: --explain still prints it all.
+    if collapsed:
+        rc_x, _, err_x = suite.kin_run(["locate", "--explain", "normalize_title"], repo)
+        explained = strip_ansi(err_x)
+        named = re.findall(r"\(([^)]*)\)\.", collapsed[0])
+        components = [c.strip() for c in (named[0].split(",") if named else [])]
+        missing = [c for c in components if c and c not in explained]
+        if rc_x != 0 or missing:
+            res.bad("--explain does not carry back every component the summary named: "
+                    "missing %r from %s" % (missing, explained[:300]))
+        else:
+            res.ok("--explain carries back every component the summary named: %s"
+                   % (", ".join(components) or "none named"))
+
+    labelled = [line for line in rows.splitlines() if line.strip().startswith(("1.", "  1."))]
+    if not any("[" in line and "]" in line for line in rows.splitlines() if line.strip()):
+        res.bad("no locate row says what evidence it rests on: %s" % rows[:300])
+    elif not any("[named match]" in line for line in rows.splitlines()):
+        res.bad("a query naming a symbol this repository defines produced no named match: %s"
+                % rows[:400])
+    else:
+        res.ok("a query that names a symbol gets a named row: %s"
+               % (labelled[0].strip()[:160] if labelled else rows.splitlines()[0][:160]))
+
+    # The control: a question whose words this repository's prose carries and
+    # whose symbols it does not. Only `pkg/overview.py` says socket, server,
+    # network or deployment, and it defines none of them, so every row that
+    # comes back is a nearest neighbour rather than a match. That is the state
+    # the answer floor exists to report, and it is the state a stranger asking
+    # an English question lands in.
+    #
+    # It used to query `Router path_router axum tower`, words this fixture
+    # carries nowhere at all. With KIN_DAEMON_AUTO_EMBED=0 there is no vector
+    # index, so a query absent from the corpus retrieves nothing at all,
+    # `No relevant files found.` is the honest answer, and this arm graded
+    # nothing on every run it ever had. An arm about what the rows say needs
+    # rows.
+    rc_o, out_o, err_o = suite.kin_run(
+        ["locate", "socket server network deployment"], repo)
+    off = strip_ansi(out_o)
+    off_notes = strip_ansi(err_o)
+    off_rows = [line for line in off.splitlines() if line.strip() and "[" in line]
+    if rc_o != 0:
+        res.unknown("the off-topic control exited %d: %s" % (rc_o, off_notes[-200:]))
+    elif not off_rows:
+        # Not a pass. "No relevant files found." is an honest answer, and it is
+        # also the one state in which this arm cannot grade the floor note it
+        # exists to grade. Reporting it as a pass would be a check that cannot
+        # fail; the floor note itself is pinned by `answer_floor_note`'s unit
+        # test in crates/kin-cli/src/commands/locate.rs.
+        res.unknown("the off-topic control returned no rows, so the answer-floor note had "
+                    "nothing to fire on and this arm graded nothing; `pkg/overview.py` "
+                    "carries every word of that query and should have been retrieved: %r"
+                    % off[:200])
+    elif any("[named match]" in line for line in off_rows):
+        res.unknown("the off-topic control named a symbol this fixture holds, so it is not "
+                    "off-topic here: %s" % off[:300])
+    elif "answer floor" not in off_notes:
+        res.bad("six confident-looking rows and nothing saying nothing matched: rows=%s "
+                "notes=%s" % (off[:300], off_notes[:200]))
+    else:
+        res.ok("an answer where no row cleared the floor says so and names the floor")
+
+    # Finding 21 from the same walk: the caveat named repositories this binary
+    # had just registered, because the only thing it keyed on was the empty
+    # listing, where a correct zero and an unrecorded one look identical.
+    rc_d, out_d, _ = suite.kin_run(["deps", "--all"], repo)
+    deps = strip_ansi(out_d)
+    if rc_d != 0:
+        res.unknown("`kin deps --all` exited %d: %s" % (rc_d, deps[-200:]))
+    else:
+        caveat = [line for line in deps.splitlines() if "predate" in line or "before this build" in line]
+        repo_id = os.path.basename(repo)
+        if caveat and any(repo_id in line for line in caveat):
+            res.bad("`kin deps --all` names a repository this same binary registered in its "
+                    "predates-recording caveat: %s" % caveat[0][:300])
+        else:
+            res.ok("the predates-recording caveat does not name a repository this build "
+                   "registered")
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -3413,6 +3613,7 @@ CHECKS = [
     ("21", check_21),
     ("22", check_22),
     ("23", check_23),
+    ("24", check_24),
 ]
 
 

@@ -178,6 +178,28 @@ pub struct RegisteredRepo {
     pub last_commit: String, // ISO 8601
     #[serde(default)]
     pub dependencies: Vec<crate::dependencies::RepoDependency>,
+    /// The Kin version whose registration wrote this entry's `dependencies`,
+    /// absent for an entry written before any build recorded one.
+    ///
+    /// Exists so an empty `dependencies` can be read for what it is. Without
+    /// it the only available predicate is the emptiness itself, and `kin deps
+    /// --all` named two repositories this very binary had registered minutes
+    /// earlier in a caveat about repositories "initialized before this build".
+    /// The caveat was written for stores that genuinely predate dependency
+    /// recording; the absence of records cannot tell those apart from a
+    /// correct zero, and this can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies_recorded_by: Option<String>,
+}
+
+/// The Kin version a registration written now records against its entry.
+///
+/// The workspace version rather than the build sha: the question this answers
+/// is whether the writer was a build that records dependencies at all, and a
+/// version answers that while staying readable in the registry file a person
+/// may open.
+pub fn dependency_recording_build() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
 }
 
 impl KinRegistry {
@@ -317,6 +339,7 @@ impl KinRegistry {
             existing.entities = entities;
             existing.last_commit = now;
             existing.dependencies = deps;
+            existing.dependencies_recorded_by = Some(dependency_recording_build());
         } else {
             self.repos.push(RegisteredRepo {
                 id,
@@ -324,6 +347,7 @@ impl KinRegistry {
                 entities,
                 last_commit: now,
                 dependencies: deps,
+                dependencies_recorded_by: Some(dependency_recording_build()),
             });
         }
     }
@@ -2063,6 +2087,7 @@ mod tests {
                             entities: 1,
                             last_commit: "now".to_string(),
                             dependencies: Vec::new(),
+                            dependencies_recorded_by: None,
                         });
                     })
                     .unwrap();
@@ -2106,6 +2131,7 @@ mod tests {
                         entities: index,
                         last_commit: "2026-07-13T00:00:00Z".to_string(),
                         dependencies: Vec::new(),
+                        dependencies_recorded_by: None,
                     });
                 })
                 .map_err(|err| err.to_string())
@@ -2313,6 +2339,7 @@ mod tests {
                                 entities: index,
                                 last_commit: "2026-07-13T00:00:00Z".to_string(),
                                 dependencies: Vec::new(),
+                                dependencies_recorded_by: None,
                             });
                         })
                         .unwrap();
@@ -2333,6 +2360,7 @@ mod tests {
                                 entities: index,
                                 last_commit: "2026-07-13T00:00:00Z".to_string(),
                                 dependencies: Vec::new(),
+                                dependencies_recorded_by: None,
                             });
                         })
                         .unwrap();
@@ -2484,6 +2512,7 @@ mod tests {
                     entities: 1,
                     last_commit: "2026-07-13T00:00:00Z".to_string(),
                     dependencies: Vec::new(),
+                    dependencies_recorded_by: None,
                 });
                 assert!(changed.save_to(&registry_path).is_err());
                 fail_after_temp_sync.apply::<_, &str>("REGISTRY_TEST_FAIL_AFTER_TEMP_SYNC", None);

@@ -744,6 +744,7 @@ mod tests {
             entities: 0,
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies: Vec::new(),
+            dependencies_recorded_by: None,
         }
     }
 

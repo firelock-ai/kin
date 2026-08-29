@@ -1159,6 +1159,26 @@ jobs:
             "vfs_projection",
             "projection_mode",
           ];
+          // --- BEGIN HEALTH JOIN ---
+          // A check is out of scope only when the platform or the context puts it out of
+          // scope, which is exactly `unsupported`. Every other status is a component that
+          // is not answering at full strength, so a report claiming readiness over one
+          // claims more than its components support (FIR-2919).
+          const healthNeedsAttention = (check) =>
+            check.status !== "healthy" && check.status !== "unsupported";
+          // Something wrong with the INSTALL, as against work in flight or ground the
+          // host never had. A different question from the one above, and conflating the
+          // two is what fenced v0.6.1.
+          const healthBlocksReadiness = (check) =>
+            check.status === "missing" ||
+            check.status === "misconfigured" ||
+            (check.id === "semantic_query_readiness" && check.status === "stale");
+          const healthJoin = (checks) => {
+            if (checks.some(healthBlocksReadiness)) return "failing";
+            return checks.some(healthNeedsAttention) ? "needs_attention" : "ready";
+          };
+          // --- END HEALTH JOIN ---
+
           const summary = [];
           const problems = [];
           for (const name of ["kin-health.json", "kin-doctor.json"]) {
@@ -1174,17 +1194,26 @@ jobs:
             // The rollup has to agree with the checks it summarizes. A release
             // has already been abandoned over an aggregate that disagreed with
             // its own list, and that defect is invisible to any check that only
-            // reads `healthy`.
-            const expectedHealthy = !report.checks.some(
-              (check) =>
-                check.status === "missing" ||
-                check.status === "misconfigured" ||
-                (check.id === "semantic_query_readiness" && check.status === "stale")
-            );
-            if (report.healthy !== expectedHealthy) {
+            // reads `healthy`. The rule is pasted above rather than restated
+            // here: this copy and the two in install-proof.yml said one thing
+            // while the product said another, which is how v0.6.1 was fenced
+            // (FIR-2919).
+            if (report.verdict === undefined) {
               problems.push(
-                `${name}: aggregate healthy=${report.healthy} disagrees with its checks; expected ${expectedHealthy}`
+                `${name}: the report carries no verdict field, so these bytes predate FIR-2919 and their aggregate cannot be graded against the health join`
               );
+            } else {
+              const verdict = healthJoin(report.checks);
+              if (report.verdict !== verdict) {
+                problems.push(
+                  `${name}: verdict=${report.verdict} disagrees with its checks; expected ${verdict}`
+                );
+              }
+              if (report.healthy !== (verdict === "ready")) {
+                problems.push(
+                  `${name}: aggregate healthy=${report.healthy} disagrees with its checks; expected ${verdict === "ready"}`
+                );
+              }
             }
             for (const id of asserted) {
               const status = byId.get(id)?.status;
@@ -1202,7 +1231,8 @@ jobs:
               .join("\n");
             summary.push(
               `### ${process.env.PROBE_OS}: ${name}\n\n` +
-                `Candidate archive \`${process.env.ARTIFACT}\`, aggregate healthy=${report.healthy}.\n\n` +
+                `Candidate archive \`${process.env.ARTIFACT}\`, aggregate healthy=${report.healthy}, ` +
+                `verdict=${report.verdict ?? "absent"}.\n\n` +
                 `| check | status | this job |\n| --- | --- | --- |\n${rows}\n`
             );
           }

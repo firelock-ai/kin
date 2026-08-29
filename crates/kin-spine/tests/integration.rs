@@ -6,6 +6,7 @@
 //! These tests exercise the full spine stack: SpineIndex registration,
 //! cross-repo edge resolution, federated BFS traversal, and routing.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,7 +21,14 @@ use kin_spine::backend::SpineBackend;
 use kin_spine::federation::federated_impact;
 use kin_spine::index::{CrossRepoEdge, EntityEntry, SpineIndex};
 use kin_spine::routing::{RepoEndpoint, RoutingTable};
-use kin_spine::{FirestoreSpineBackend, LoadedRepo, SpineError, SpineStore};
+use kin_spine::{
+    FirestoreSpineBackend, LegacySpineWriterDrainAttestation, LoadedRepo, LoadedRepoPublication,
+    LoadedSpineRolloutFence, PreparedStorePublication, RepoPublicationCleanupProgress,
+    RepoPublicationCommit, RepoPublicationConflict, RepoPublicationHead, RepoSpinePublication,
+    SpineError, SpineRolloutFence, SpineRolloutFenceCommit, SpineRolloutFenceEvidence,
+    SpineRolloutRepositoryFence, SpineSourceCursor, SpineStore, StoreHeadPrecondition,
+    StorePublicationStageGuard, StoreRepoHeadGuard, LEGACY_SPINE_WRITER_DRAIN_SCHEMA,
+};
 
 // ── Helpers ─────────────────────────────────────────────────────────────
 
@@ -563,17 +571,423 @@ fn multiple_entities_per_repo_with_mixed_kinds() {
 // non-empty cross-repo edges. The store seam is in-memory here so the whole
 // pipeline runs with no Firestore and no filesystem siblings.
 
-/// In-memory [`SpineStore`] standing in for Firestore: same replace-by-repo
-/// semantics, no network, no disk. Shared between a writer backend (the
-/// ingestion side) and a reader backend (the freshly started pod) via `Arc`.
-#[derive(Default)]
+/// In-memory [`SpineStore`] standing in for Firestore: immutable staged
+/// publications plus one revision-checked head per repository. Shared between
+/// a writer backend and a freshly started pod via `Arc`.
 struct HostedFakeStore {
-    /// (root_hash, entries) keyed by repo_id.
     repos: Mutex<HashMap<String, (String, Vec<EntityEntry>)>>,
     edges: Mutex<Vec<CrossRepoEdge>>,
+    publications: Mutex<HostedPublicationState>,
+    rollout_fence: Mutex<Option<(u64, SpineRolloutFence)>>,
+    legacy_migration_seal: Mutex<
+        Option<(
+            SpineRolloutFenceEvidence,
+            LegacySpineWriterDrainAttestation,
+            Vec<RepoPublicationHead>,
+        )>,
+    >,
+}
+
+#[derive(Default)]
+struct HostedPublicationState {
+    heads: HashMap<String, (u64, RepoPublicationHead)>,
+    staged: HashMap<String, LoadedRepoPublication>,
+    stage_revisions: HashMap<String, u64>,
+}
+
+impl Default for HostedFakeStore {
+    fn default() -> Self {
+        let expected = vec!["kin".to_string(), "kin-db".to_string()];
+        let fence = SpineRolloutFence::new_exact(
+            "gcs://test-bucket/test-prefix".to_string(),
+            1,
+            "hosted-integration-rollout",
+            &expected,
+            vec![
+                SpineRolloutRepositoryFence {
+                    repo_id: "kin".to_string(),
+                    pre_fence_generation: 10,
+                    fenced_generation: 11,
+                    snapshot_schema: 4,
+                    e_tag: Some("kin-etag".to_string()),
+                },
+                SpineRolloutRepositoryFence {
+                    repo_id: "kin-db".to_string(),
+                    pre_fence_generation: 20,
+                    fenced_generation: 21,
+                    snapshot_schema: 4,
+                    e_tag: Some("kin-db-etag".to_string()),
+                },
+            ],
+        )
+        .expect("valid hosted test rollout fence");
+        Self {
+            repos: Mutex::new(HashMap::new()),
+            edges: Mutex::new(Vec::new()),
+            publications: Mutex::new(HostedPublicationState::default()),
+            rollout_fence: Mutex::new(Some((1, fence))),
+            legacy_migration_seal: Mutex::new(None),
+        }
+    }
 }
 
 impl SpineStore for HostedFakeStore {
+    fn load_rollout_fence(&self) -> Result<Option<LoadedSpineRolloutFence>, SpineError> {
+        Ok(self
+            .rollout_fence
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(revision, fence)| LoadedSpineRolloutFence {
+                fence: fence.clone(),
+                update_time: revision.to_string(),
+            }))
+    }
+
+    fn advance_rollout_fence(
+        &self,
+        candidate: SpineRolloutFence,
+    ) -> Result<SpineRolloutFenceCommit, SpineError> {
+        let mut state = self.rollout_fence.lock().unwrap();
+        if let Some((revision, current)) = state.as_ref() {
+            if current.payload_sha256 == candidate.payload_sha256 {
+                return Ok(SpineRolloutFenceCommit::AlreadyCurrent(
+                    SpineRolloutFenceEvidence {
+                        rollout_fence: current.rollout_fence,
+                        payload_sha256: current.payload_sha256.clone(),
+                        update_time: revision.to_string(),
+                    },
+                ));
+            }
+            if current.scope != candidate.scope || current.rollout_fence >= candidate.rollout_fence
+            {
+                return Ok(SpineRolloutFenceCommit::Conflict {
+                    attempted_rollout_fence: candidate.rollout_fence,
+                    observed: Some(SpineRolloutFenceEvidence {
+                        rollout_fence: current.rollout_fence,
+                        payload_sha256: current.payload_sha256.clone(),
+                        update_time: revision.to_string(),
+                    }),
+                });
+            }
+        }
+        let revision = state
+            .as_ref()
+            .map_or(1, |(revision, _)| revision.saturating_add(1));
+        *state = Some((revision, candidate.clone()));
+        Ok(SpineRolloutFenceCommit::Advanced(
+            SpineRolloutFenceEvidence {
+                rollout_fence: candidate.rollout_fence,
+                payload_sha256: candidate.payload_sha256,
+                update_time: revision.to_string(),
+            },
+        ))
+    }
+
+    fn legacy_migration_complete(&self) -> Result<bool, SpineError> {
+        let seal = self.legacy_migration_seal.lock().unwrap();
+        let Some((sealed_evidence, writer_drain, sealed_heads)) = seal.as_ref() else {
+            return Ok(false);
+        };
+        writer_drain.validate()?;
+        let active = self.load_rollout_fence()?.ok_or_else(|| {
+            SpineError::Backend(
+                "hosted integration migration seal has no rollout fence".to_string(),
+            )
+        })?;
+        let expected_ids = active
+            .fence
+            .repositories
+            .iter()
+            .map(|row| row.repo_id.as_str())
+            .collect::<Vec<_>>();
+        let sealed_ids = sealed_heads
+            .iter()
+            .map(|head| head.repo_id.as_str())
+            .collect::<Vec<_>>();
+        if sealed_evidence != &active.evidence()
+            || writer_drain.rollout_fence_evidence != *sealed_evidence
+            || sealed_ids != expected_ids
+        {
+            return Err(SpineError::Backend(
+                "hosted integration migration seal does not match active authority".to_string(),
+            ));
+        }
+        Ok(true)
+    }
+
+    fn complete_legacy_migration(
+        &self,
+        rollout_fence: &LoadedSpineRolloutFence,
+        writer_drain: &LegacySpineWriterDrainAttestation,
+    ) -> Result<(), SpineError> {
+        writer_drain.validate()?;
+        if writer_drain.rollout_fence_evidence != rollout_fence.evidence() {
+            return Err(SpineError::Backend(
+                "hosted integration writer-drain evidence does not match rollout fence".to_string(),
+            ));
+        }
+        let state = self.publications.lock().unwrap();
+        let mut heads = state
+            .heads
+            .values()
+            .map(|(_, head)| head.clone())
+            .collect::<Vec<_>>();
+        heads.sort_by(|left, right| left.repo_id.cmp(&right.repo_id));
+        let expected_ids = rollout_fence
+            .fence
+            .repositories
+            .iter()
+            .map(|row| row.repo_id.as_str())
+            .collect::<Vec<_>>();
+        let observed_ids = heads
+            .iter()
+            .map(|head| head.repo_id.as_str())
+            .collect::<Vec<_>>();
+        if observed_ids != expected_ids {
+            return Err(SpineError::Backend(
+                "hosted integration migration seal requires exact fleet heads".to_string(),
+            ));
+        }
+        drop(state);
+        let candidate = (rollout_fence.evidence(), writer_drain.clone(), heads);
+        let mut seal = self.legacy_migration_seal.lock().unwrap();
+        if let Some(existing) = seal.as_ref() {
+            if existing != &candidate {
+                return Err(SpineError::Backend(
+                    "a different hosted integration migration seal already exists".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+        *seal = Some(candidate);
+        Ok(())
+    }
+
+    fn prepare_repo_publication(
+        &self,
+        publication: RepoSpinePublication,
+    ) -> Result<PreparedStorePublication, SpineError> {
+        let rollout_fence = self.load_rollout_fence()?.ok_or_else(|| {
+            SpineError::Backend("hosted integration rollout fence is missing".to_string())
+        })?;
+        let mut state = self.publications.lock().unwrap();
+        let observed = state.heads.get(&publication.repo_id).cloned();
+        let (precondition, observed_head) = match observed {
+            Some((revision, head)) => (
+                StoreHeadPrecondition::Revision(revision.to_string()),
+                Some(head),
+            ),
+            None => (StoreHeadPrecondition::Missing, None),
+        };
+        let mut dependency_heads = BTreeMap::new();
+        for (repo_id, expected_root) in publication
+            .resolution_roots
+            .as_ref()
+            .into_iter()
+            .flat_map(|roots| roots.iter())
+        {
+            if repo_id == &publication.repo_id {
+                continue;
+            }
+            let (revision, head) = state.heads.get(repo_id).cloned().ok_or_else(|| {
+                SpineError::Backend(format!(
+                    "hosted integration edge publication is missing dependency head {repo_id}"
+                ))
+            })?;
+            if head.root_hash != *expected_root {
+                return Err(SpineError::Backend(format!(
+                    "hosted integration edge publication resolved {repo_id} at {expected_root}, but head is at {}",
+                    head.root_hash
+                )));
+            }
+            dependency_heads.insert(
+                repo_id.clone(),
+                StoreRepoHeadGuard {
+                    head,
+                    precondition: StoreHeadPrecondition::Revision(revision.to_string()),
+                },
+            );
+        }
+        let mut prepared = PreparedStorePublication::new_fenced(
+            publication,
+            observed_head,
+            precondition,
+            dependency_heads,
+            rollout_fence,
+        )?;
+        if prepared.requires_staging() {
+            let candidate = prepared.publication();
+            state.staged.insert(
+                prepared.candidate_head().publication_id.clone(),
+                LoadedRepoPublication {
+                    head: prepared.candidate_head().clone(),
+                    entries: candidate.entries.clone(),
+                    outgoing_edges: candidate.outgoing_edges.clone().unwrap_or_default(),
+                },
+            );
+            let publication_id = prepared.candidate_head().publication_id.clone();
+            let revision = state.stage_revisions.entry(publication_id).or_insert(1);
+            prepared = prepared.bind_stage_guard(StorePublicationStageGuard {
+                stage_sequence: 1,
+                revision_sha256: format!("hosted-integration-stage-{revision}"),
+                update_time: revision.to_string(),
+            })?;
+        }
+        Ok(prepared)
+    }
+
+    fn commit_repo_publication(
+        &self,
+        prepared: &PreparedStorePublication,
+    ) -> Result<RepoPublicationCommit, SpineError> {
+        let candidate = prepared.candidate_head().clone();
+        if let Some(RepoPublicationCommit::Conflict(conflict)) = prepared.terminal_result() {
+            return Ok(RepoPublicationCommit::Conflict(conflict));
+        }
+        let prepared_fence = prepared.rollout_fence().ok_or_else(|| {
+            SpineError::Backend("hosted integration publication has no rollout fence".to_string())
+        })?;
+        let fence_state = self.rollout_fence.lock().unwrap();
+        let mut state = self.publications.lock().unwrap();
+        let current = state.heads.get(&candidate.repo_id).cloned();
+        if !fence_state.as_ref().is_some_and(|(revision, fence)| {
+            revision.to_string() == prepared_fence.update_time
+                && fence.payload_sha256 == prepared_fence.fence.payload_sha256
+        }) {
+            return Ok(RepoPublicationCommit::Conflict(
+                RepoPublicationConflict::against_rollout_fence(
+                    candidate.source_cursor,
+                    prepared_fence.fence.rollout_fence,
+                    current.as_ref().map(|(_, head)| head),
+                    fence_state.as_ref().map(|(_, fence)| fence),
+                ),
+            ));
+        }
+        if prepared.requires_staging() {
+            let stage_guard = prepared.stage_guard().ok_or_else(|| {
+                SpineError::Backend("hosted integration publication has no stage guard".to_string())
+            })?;
+            let stage_matches = state
+                .stage_revisions
+                .get(&candidate.publication_id)
+                .is_some_and(|revision| revision.to_string() == stage_guard.update_time);
+            if !stage_matches {
+                return Ok(RepoPublicationCommit::Conflict(
+                    RepoPublicationConflict::against(
+                        candidate.source_cursor,
+                        current.as_ref().map(|(_, head)| head),
+                    ),
+                ));
+            }
+        }
+        for (repo_id, guard) in prepared.dependency_heads() {
+            let observed_dependency = state.heads.get(repo_id).cloned();
+            let dependency_matches = match (&guard.precondition, &observed_dependency) {
+                (StoreHeadPrecondition::Revision(expected), Some((revision, head))) => {
+                    expected == &revision.to_string() && head == &guard.head
+                }
+                _ => false,
+            };
+            if !dependency_matches {
+                return Ok(RepoPublicationCommit::Conflict(
+                    RepoPublicationConflict::against_dependency(
+                        candidate.source_cursor,
+                        repo_id,
+                        observed_dependency.as_ref().map(|(_, head)| head),
+                    ),
+                ));
+            }
+        }
+        let precondition_matches = match (prepared.head_precondition(), &current) {
+            (StoreHeadPrecondition::Missing, None) => true,
+            (StoreHeadPrecondition::Revision(expected), Some((revision, _))) => {
+                expected == &revision.to_string()
+            }
+            _ => false,
+        };
+        if !precondition_matches {
+            if current
+                .as_ref()
+                .is_some_and(|(_, head)| head.publication_id == candidate.publication_id)
+            {
+                return Ok(RepoPublicationCommit::AlreadyCommitted {
+                    source_cursor: candidate.source_cursor,
+                });
+            }
+            return Ok(RepoPublicationCommit::Conflict(
+                RepoPublicationConflict::against(
+                    candidate.source_cursor,
+                    current.as_ref().map(|(_, head)| head),
+                ),
+            ));
+        }
+        if matches!(
+            prepared.terminal_result(),
+            Some(RepoPublicationCommit::AlreadyCommitted { .. })
+        ) {
+            if current
+                .as_ref()
+                .is_some_and(|(_, head)| head.publication_id == candidate.publication_id)
+            {
+                return Ok(RepoPublicationCommit::AlreadyCommitted {
+                    source_cursor: candidate.source_cursor,
+                });
+            }
+            return Ok(RepoPublicationCommit::Conflict(
+                RepoPublicationConflict::against(
+                    candidate.source_cursor,
+                    current.as_ref().map(|(_, head)| head),
+                ),
+            ));
+        }
+        if !state.staged.contains_key(&candidate.publication_id) {
+            return Err(SpineError::Backend(
+                "staged hosted publication is missing".to_string(),
+            ));
+        }
+        let revision = match current.as_ref() {
+            Some((revision, _)) => revision.checked_add(1).ok_or_else(|| {
+                SpineError::Backend("hosted fake head revision exhausted".to_string())
+            })?,
+            None => 1,
+        };
+        state
+            .heads
+            .insert(candidate.repo_id.clone(), (revision, candidate.clone()));
+        Ok(RepoPublicationCommit::Committed {
+            source_cursor: candidate.source_cursor,
+        })
+    }
+
+    fn load_repo_publications(&self) -> Result<Vec<LoadedRepoPublication>, SpineError> {
+        let state = self.publications.lock().unwrap();
+        state
+            .heads
+            .values()
+            .map(|(_, head)| {
+                state
+                    .staged
+                    .get(&head.publication_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        SpineError::Serialization(format!(
+                            "head references missing staged publication {}",
+                            head.publication_id
+                        ))
+                    })
+            })
+            .collect()
+    }
+
+    fn cleanup_repo_publications(
+        &self,
+        _active_head: &RepoPublicationHead,
+        _max_rows: usize,
+    ) -> Result<RepoPublicationCleanupProgress, SpineError> {
+        Ok(RepoPublicationCleanupProgress::default())
+    }
+
     fn load_repos(&self) -> Result<Vec<LoadedRepo>, SpineError> {
         Ok(self
             .repos
@@ -684,10 +1098,24 @@ fn hosted_pod_serves_non_empty_xref_from_store_only() {
     // different ingestion actor; only its metadata reaches the store, never a
     // local `.kndb`.
     let graph_entity = entry("kin-db", "InMemoryGraph", EntityKind::Class, 7);
+    let caller = EntityId::new();
+    let primary_entities = vec![source_entity(caller, "open_graph", LanguageId::Rust)];
+    let primary_entries = vec![EntityEntry {
+        repo_id: "kin".to_string(),
+        entity_id: caller,
+        name: "open_graph".to_string(),
+        kind: EntityKind::Function,
+        signature: "fn open_graph()".to_string(),
+        fingerprint: make_fp(1),
+        file_path: Some("src/graph.rs".to_string()),
+        role: Some(EntityRole::Source),
+    }];
     {
         let ingest = FirestoreSpineBackend::with_store(store.clone());
         ingest_repo(&ingest, "kin-db", vec![graph_entity.clone()], "db-hash");
+        ingest_repo(&ingest, "kin", primary_entries.clone(), "kin-hash");
     }
+    seal_hosted_store(&store);
 
     // ── Pod startup side (the bug surface) ────────────────────────────
     // A freshly started pod builds the same store-backed backend the cloud
@@ -702,29 +1130,15 @@ fn hosted_pod_serves_non_empty_xref_from_store_only() {
     pod.hydrate().expect("hydrate cache from store");
     assert_eq!(
         pod.repo_count(),
-        1,
-        "the sibling repo is visible purely from the store after hydrate"
+        2,
+        "the exact sealed fleet is visible purely from the store after hydrate"
     );
 
-    // The pod registers its own primary repo and refreshes cross-repo edges,
-    // exactly as the daemon spine init does. The primary `kin` has a function
+    // The pod publishes its own primary metadata and then derives a detached
+    // edge-phase candidate. The primary `kin` has a function
     // that calls `kin_db::InMemoryGraph`; the relation carries the
     // `import_source` and the imported symbol, so the resolver can bind it to
     // the store-resident `kin-db` entity.
-    let caller = EntityId::new();
-    let primary_entities = vec![source_entity(caller, "open_graph", LanguageId::Rust)];
-    let primary_entries = vec![EntityEntry {
-        repo_id: "kin".to_string(),
-        entity_id: caller,
-        name: "open_graph".to_string(),
-        kind: EntityKind::Function,
-        signature: "fn open_graph()".to_string(),
-        fingerprint: make_fp(1),
-        file_path: Some("src/graph.rs".to_string()),
-        role: Some(EntityRole::Source),
-    }];
-    pod.register_repo("kin", primary_entries, "kin-hash");
-
     let relations = vec![cross_repo_call(
         caller,
         "kin_db",
@@ -732,7 +1146,23 @@ fn hosted_pod_serves_non_empty_xref_from_store_only() {
         RelationKind::Calls,
     )];
     let registry: Vec<String> = pod.registered_repo_ids().into_iter().collect();
-    pod.refresh_cross_repo_edges("kin", &primary_entities, &relations, &registry);
+    let edges = pod
+        .derive_cross_repo_edges("kin", &primary_entities, &relations, &registry)
+        .expect("derive edge publication");
+    publish_repo(
+        &pod,
+        RepoSpinePublication {
+            repo_id: "kin".to_string(),
+            source_cursor: SpineSourceCursor::from_backend_generation(1),
+            root_hash: "kin-hash".to_string(),
+            entries: primary_entries,
+            outgoing_edges: Some(edges),
+            resolution_roots: Some(BTreeMap::from([
+                ("kin".to_string(), "kin-hash".to_string()),
+                ("kin-db".to_string(), "db-hash".to_string()),
+            ])),
+        },
+    );
 
     // ── The contract the demo needs: non-empty cross-repo xref ────────
     // This is exactly what `GET /spine/xref?repo=kin&entity=<caller>` reads.
@@ -772,7 +1202,7 @@ fn hosted_pod_serves_non_empty_xref_from_store_only() {
 //
 // A second pod that only ever hydrates from the store — never touching the
 // primary repo's relations — must still see the materialized cross-repo
-// edges, because `refresh_cross_repo_edges` write-through persisted them.
+// edges, because the cursor-bound edge head committed them.
 // This proves the edge state is owned by the store, not by an ephemeral
 // in-pod refresh.
 
@@ -783,8 +1213,7 @@ fn cross_repo_edges_survive_cold_pod_restart_via_store() {
     let graph_entity = entry("kin-db", "InMemoryGraph", EntityKind::Class, 7);
     let caller = EntityId::new();
 
-    // First pod: ingest sibling, register primary, refresh edges (all
-    // write-through to the store).
+    // First pod: publish sibling metadata, primary metadata, then an edge head.
     {
         let pod = FirestoreSpineBackend::with_store(store.clone());
         ingest_repo(&pod, "kin-db", vec![graph_entity.clone()], "db-hash");
@@ -800,7 +1229,7 @@ fn cross_repo_edges_survive_cold_pod_restart_via_store() {
             role: Some(EntityRole::Source),
         }];
         let primary_entities = vec![source_entity(caller, "open_graph", LanguageId::Rust)];
-        pod.register_repo("kin", primary_entries, "kin-hash");
+        ingest_repo(&pod, "kin", primary_entries.clone(), "kin-hash");
 
         let relations = vec![cross_repo_call(
             caller,
@@ -809,9 +1238,27 @@ fn cross_repo_edges_survive_cold_pod_restart_via_store() {
             RelationKind::Calls,
         )];
         let registry: Vec<String> = pod.registered_repo_ids().into_iter().collect();
-        pod.refresh_cross_repo_edges("kin", &primary_entities, &relations, &registry);
+        let edges = pod
+            .derive_cross_repo_edges("kin", &primary_entities, &relations, &registry)
+            .expect("derive edge publication");
+        publish_repo(
+            &pod,
+            RepoSpinePublication {
+                repo_id: "kin".to_string(),
+                source_cursor: SpineSourceCursor::from_backend_generation(1),
+                root_hash: "kin-hash".to_string(),
+                entries: primary_entries,
+                outgoing_edges: Some(edges),
+                resolution_roots: Some(BTreeMap::from([
+                    ("kin".to_string(), "kin-hash".to_string()),
+                    ("kin-db".to_string(), "db-hash".to_string()),
+                ])),
+            },
+        );
         assert_eq!(pod.edge_count(), 1);
     }
+
+    seal_hosted_store(&store);
 
     // Second (cold) pod: hydrate only — no access to the primary's relations.
     let cold = FirestoreSpineBackend::with_store(store.clone());
@@ -1052,13 +1499,51 @@ fn two_hop_resolves_independent_of_refresh_order_when_prewired() {
     );
 }
 
-/// Register a repo's entity metadata through the store-backed backend,
-/// mirroring the metadata write the daemon performs when it indexes a repo.
+fn publish_repo(backend: &FirestoreSpineBackend, publication: RepoSpinePublication) {
+    let prepared = backend
+        .prepare_repo_publication(publication)
+        .expect("prepare hosted publication");
+    assert!(matches!(
+        backend
+            .commit_repo_publication(prepared)
+            .expect("commit hosted publication"),
+        RepoPublicationCommit::Committed { .. } | RepoPublicationCommit::AlreadyCommitted { .. }
+    ));
+}
+
+fn seal_hosted_store(store: &Arc<HostedFakeStore>) {
+    let active = store
+        .load_rollout_fence()
+        .expect("load hosted rollout fence")
+        .expect("hosted rollout fence");
+    let writer_drain = LegacySpineWriterDrainAttestation {
+        schema: LEGACY_SPINE_WRITER_DRAIN_SCHEMA.to_string(),
+        rollout_fence_evidence: active.evidence(),
+        daemon_image_sha256: format!("sha256:{}", "a".repeat(64)),
+        drain_proof_sha256: format!("sha256:{}", "b".repeat(64)),
+    };
+    FirestoreSpineBackend::with_store(store.clone())
+        .complete_legacy_migration(writer_drain)
+        .expect("seal hosted integration fleet after trusted old-writer drain");
+}
+
+/// Publish a repo's cursor-bound entity metadata through the store-backed
+/// backend, mirroring the daemon's first publication phase.
 fn ingest_repo(
     backend: &FirestoreSpineBackend,
     repo_id: &str,
     entries: Vec<EntityEntry>,
     root_hash: &str,
 ) {
-    backend.register_repo(repo_id, entries, root_hash);
+    publish_repo(
+        backend,
+        RepoSpinePublication {
+            repo_id: repo_id.to_string(),
+            source_cursor: SpineSourceCursor::from_backend_generation(1),
+            root_hash: root_hash.to_string(),
+            entries,
+            outgoing_edges: None,
+            resolution_roots: None,
+        },
+    );
 }

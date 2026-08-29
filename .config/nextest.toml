@@ -42,6 +42,27 @@
 # of this file is that a reader can see which way a flake is being graded.
 flaky-result = "pass"
 
+# No test may hang a run without bound. A hang is worse than a red test, because
+# a red test reports and a hang reports nothing: on 2026-08-28 two kin-spine race
+# fixtures deadlocked on a mutex held across a two-party rendezvous, ran 13305
+# seconds each, and took the other 112 of that suite's 145 tests down with them,
+# so the run said nothing about any of them. The deadlock is fixed; this is the
+# property that keeps the next one cheap.
+#
+# 120s starts the SLOW line, which is a warning and nothing more. Ten of those
+# periods terminate the test, so the worst case is twenty minutes rather than
+# unbounded. That is deliberately far above any legitimate test here, because
+# this value must never be the thing that fails a slow but working test: it is a
+# backstop, not a performance budget. Tune it down only with a measurement of
+# the slowest passing test in the workspace beside it.
+#
+# `--slow-timeout` is not a CLI flag on cargo-nextest 0.9.140, verified by
+# running it: `error: unexpected argument '--slow-timeout' found`. Config is the
+# only place this can be declared, which is also the right place, since it makes
+# the bound a property of the repository rather than of whoever remembered a
+# flag.
+slow-timeout = { period = "120s", terminate-after = 10 }
+
 # The record. Written on every nextest run, including a lane's local one, so the
 # reporting verdict never depends on having remembered a flag. Lands at
 # target/nextest/default/junit.xml.

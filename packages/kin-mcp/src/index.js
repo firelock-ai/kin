@@ -196,25 +196,31 @@ export async function runKinMcp(argv = [], options = {}) {
   const cwd = options.cwd || process.cwd();
   if (!await kinRepoExists(cwd)) {
     if (!isTruthyEnv(env.KIN_MCP_AUTO_INIT)) {
-      stderr.write(
-        'No .kin/ found. Run `kin init .` first, or set KIN_MCP_AUTO_INIT=1 to allow this wrapper to initialize the repo.\n'
+      // Start anyway. This wrapper used to exit 2 here, and the configuration
+      // every client is handed points at this wrapper, so the advertised
+      // agent-setup path produced a server that died on `initialize` before a
+      // first-time user had any repository to bind. `kin mcp start` already
+      // treats an unbound launch directory as the ordinary case: it serves
+      // `initialize` and `tools/list`, re-resolves its repository on every
+      // later tool call, and answers each tool with the instruction to run
+      // `kin init`. Refusing here is the only thing that ever made this fatal.
+      stderr.write(noRepositoryNotice(cwd));
+    } else {
+      stderr.write('No .kin/ found; KIN_MCP_AUTO_INIT=1, running kin init...\n');
+      const initCode = await spawnKin(
+        binaryPath,
+        ['init', '.'],
+        {
+          ...spawnOptions,
+          cwd,
+          stdio: ['ignore', 'pipe', 'pipe']
+        },
+        { forwardOutputTo: stderr }
       );
-      return 2;
-    }
-    stderr.write('No .kin/ found; KIN_MCP_AUTO_INIT=1, running kin init...\n');
-    const initCode = await spawnKin(
-      binaryPath,
-      ['init', '.'],
-      {
-        ...spawnOptions,
-        cwd,
-        stdio: ['ignore', 'pipe', 'pipe']
-      },
-      { forwardOutputTo: stderr }
-    );
-    if (initCode !== 0) {
-      stderr.write('kin init failed. Cannot start MCP server.\n');
-      return initCode;
+      if (initCode !== 0) {
+        stderr.write('kin init failed. Cannot start MCP server.\n');
+        return initCode;
+      }
     }
   }
 
@@ -514,6 +520,26 @@ function parseChecksum(text) {
 
 function sha256(bytes) {
   return crypto.createHash('sha256').update(bytes).digest('hex');
+}
+
+/**
+ * What a launch directory that is no Kin repository is told, on stderr.
+ *
+ * Exported so the wording is assertable without spawning a server, and stderr
+ * rather than stdout because stdout is the protocol channel and a byte of prose
+ * on it corrupts the first frame.
+ */
+export function noRepositoryNotice(cwd) {
+  return [
+    `kin-mcp: no .kin/ found in ${cwd}, so no repository is bound yet.`,
+    'Starting anyway. The MCP transport comes up, `initialize` and `tools/list` are served,',
+    'and a graph tool called before a repository exists answers by naming the gap and telling',
+    'the caller to run `kin init .` rather than failing silently.',
+    'Run `kin init .` in the repository you want served, or point this client\'s workspace',
+    'roots at one. This server re-resolves its repository on later tool calls, so nothing here',
+    'needs a restart. Set KIN_MCP_AUTO_INIT=1 to let this wrapper run `kin init .` for you.',
+    ''
+  ].join('\n');
 }
 
 async function kinRepoExists(cwd) {

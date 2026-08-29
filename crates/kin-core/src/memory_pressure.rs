@@ -600,6 +600,15 @@ impl BudgetStanding {
         self.footprint.total_bytes() as f64 / self.budget.bytes as f64
     }
 
+    /// Whether the tree is holding more than its allowance.
+    ///
+    /// The one definition of "over", so the clause that explains the overrun
+    /// and the surface that grades it cannot come to disagree about when it
+    /// applies.
+    pub fn is_over_allowance(&self) -> bool {
+        self.footprint.total_bytes() > self.budget.bytes
+    }
+
     /// The rung this standing sits at, on the same scale host pressure uses.
     ///
     /// The same two bars, so an operator learns one set of numbers rather than
@@ -625,7 +634,7 @@ impl BudgetStanding {
     pub fn sentence(&self) -> String {
         format!(
             "this repository's daemon and the {} process(es) it started hold {} of the {} it is \
-             allowed ({}), of which {} is in those child processes{}",
+             allowed ({}), of which {} is in those child processes{}{}",
             self.footprint.child_count,
             human_bytes(self.footprint.total_bytes()),
             human_bytes(self.budget.bytes),
@@ -636,6 +645,33 @@ impl BudgetStanding {
             } else {
                 ""
             },
+            self.over_allowance_clause(),
+        )
+    }
+
+    /// What a held figure larger than the allowance means, or nothing when the
+    /// tree is inside it.
+    ///
+    /// "hold 7.0 GiB of the 4.0 GiB it is allowed" is arithmetically impossible
+    /// on its face, and a reader who cannot resolve it stops believing the row.
+    /// It is not impossible: the allowance is a ceiling Kin sets for itself out
+    /// of what the host offers, and nothing outside Kin enforces it, so a tree
+    /// can and does pass it. Saying so is the difference between a number that
+    /// looks broken and one that reports a daemon over its own bar.
+    ///
+    /// Deliberately silent about what is refused while it is over. The rungs
+    /// are operator-tunable ([`Thresholds::from_env`]), so this sentence cannot
+    /// promise a refusal; the surface that holds the refusal record names what
+    /// was actually held back.
+    fn over_allowance_clause(&self) -> String {
+        let held = self.footprint.total_bytes();
+        if !self.is_over_allowance() {
+            return String::new();
+        }
+        format!(
+            "; that is {} past the allowance, which is a ceiling Kin holds itself to rather than \
+             one the kernel imposes, so a tree can pass it",
+            human_bytes(held - self.budget.bytes)
         )
     }
 }
@@ -1559,7 +1595,13 @@ impl PressureRefusal {
         }
     }
 
-    fn is_unreadable_record(&self) -> bool {
+    /// Whether this row is the synthetic "the ledger could not be read" record
+    /// rather than a refusal some producer actually wrote.
+    ///
+    /// Public because a surface rendering the row has to know. This record's
+    /// `at_unix` is the moment of the read, not a moment work was declined, so
+    /// a caller that stamps it as a declining states something it cannot know.
+    pub fn is_unreadable_record(&self) -> bool {
         self.work == PRESSURE_RECORD_UNREADABLE_WORK_ID
     }
 
@@ -1923,11 +1965,13 @@ impl DaemonFootprint {
         now_unix.saturating_sub(self.at_unix)
     }
 
-    /// The standing as one line, labelled with its age when it is no longer
-    /// current.
-    pub fn line(&self, now_unix: u64) -> String {
-        let age = self.age_secs(now_unix);
-        let standing = BudgetStanding {
+    /// The standing this record published, as the type every other surface
+    /// grades.
+    ///
+    /// One reconstruction, so the line, the overrun clause and the health row
+    /// all read the same numbers through the same shape.
+    pub fn standing(&self) -> BudgetStanding {
+        BudgetStanding {
             footprint: self.footprint,
             budget: FootprintBudget {
                 bytes: self.budget_bytes,
@@ -1937,7 +1981,33 @@ impl DaemonFootprint {
                     BudgetSource::Operator
                 },
             },
-        };
+        }
+    }
+
+    /// The standing as one row, always stamped with the moment it was taken.
+    ///
+    /// The stamp is unconditional, unlike [`Self::line`], which names the age
+    /// only once the reading has gone stale. A surface that prints two
+    /// measurements has to say when each was taken or the two read as one
+    /// contradictory claim: `kin doctor` printed a refusal's captured standing
+    /// and this live one in a single row joined by "Also:", and the pair said a
+    /// daemon held 3.7 GiB and 7.0 GiB of the same 4.0 GiB allowance. Neither
+    /// number was wrong. The row never said they were minutes apart.
+    pub fn row_sentence(&self, now_unix: u64) -> String {
+        format!(
+            "{} (measured at {}, {}s ago, by pid {})",
+            self.standing().sentence(),
+            kin_daemon_spawn::hhmm_utc(self.at_unix),
+            self.age_secs(now_unix),
+            self.pid
+        )
+    }
+
+    /// The standing as one line, labelled with its age when it is no longer
+    /// current.
+    pub fn line(&self, now_unix: u64) -> String {
+        let age = self.age_secs(now_unix);
+        let standing = self.standing();
         if age <= FOOTPRINT_RECORD_FRESH_FOR_SECS {
             standing.sentence()
         } else {

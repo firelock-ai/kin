@@ -1196,6 +1196,7 @@ kin-db = { git = "https://github.com/firelock-ai/kin-db.git" }
                         source: "cargo".to_string(),
                     },
                 ],
+                dependencies_recorded_by: None,
             },
             crate::registry::RegisteredRepo {
                 id: "kinlab".to_string(),
@@ -1203,6 +1204,7 @@ kin-db = { git = "https://github.com/firelock-ai/kin-db.git" }
                 entities: 50,
                 last_commit: String::new(),
                 dependencies: vec![],
+                dependencies_recorded_by: None,
             },
         ];
 

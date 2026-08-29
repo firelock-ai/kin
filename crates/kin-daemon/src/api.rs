@@ -660,6 +660,14 @@ fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> 
 #[derive(Debug, Serialize, serde::Deserialize)]
 pub struct HealthResponse {
     pub status: String,
+    /// Last hosted-reader admission verdict observed by this process. This is
+    /// diagnostic only: `/ready` and `/readiness` re-read durable authority and
+    /// are the fail-closed admission gates. `/health` remains process liveness
+    /// even when this is false.
+    #[serde(default)]
+    pub reader_admitted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader_admission_error: Option<String>,
     pub version: String,
     pub uptime_seconds: u64,
     pub graph_entity_count: Option<usize>,
@@ -1356,6 +1364,7 @@ fn current_build_response() -> BuildResponse {
 #[derive(Clone)]
 struct DaemonAuthState {
     tokens: crate::auth_rotation::RotationTokens,
+    publication_control_auth_token: Option<String>,
 }
 
 #[derive(Clone)]
@@ -1421,16 +1430,61 @@ async fn daemon_auth(
     request: axum::http::Request<axum::body::Body>,
     next: Next,
 ) -> impl IntoResponse {
-    if !auth_state.tokens.is_enforced() || is_public_route(request.uri().path()) {
-        return next.run(request).await;
-    }
-
     let provided = request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim);
+
+    // Publication control is decided BEFORE the enforcement and public-route
+    // gate, deliberately. With no daemon token configured at all an
+    // administrative route must refuse rather than fall through unauthenticated,
+    // which is why this branch does not sit under `is_enforced()`.
+    if is_publication_control_route(request.uri().path()) {
+        let Some(expected_admin_token) = auth_state.publication_control_auth_token.as_deref()
+        else {
+            return auth_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Publication control authentication is unavailable",
+            );
+        };
+        // Constant time, like every other token compare on this path. A `==`
+        // here would return at the first differing byte, a few lines from a
+        // digest comparison written specifically to not do that.
+        if provided
+            .is_some_and(|token| crate::auth_rotation::tokens_match(token, expected_admin_token))
+        {
+            return next.run(request).await;
+        }
+        // An ordinary daemon token, primary or superseded, is authenticated but
+        // not authorized here, so it is 403 rather than 401.
+        //
+        // Asked WITHOUT spending an accept, which reverses this branch's first
+        // version. Counting looked right, on the reasoning that a retired
+        // credential reaching an admin route is real traffic on it. The
+        // measurement says otherwise: with a cap of one, a single 403 here
+        // spends the only slot and the next `/session` on that same retired
+        // token gets 401. So requests this surface REFUSED close the window
+        // against serve traffic it never carried once, and the counter's own
+        // documentation says the count means dropping the credential would 401
+        // that traffic, which an already-refused request cannot be.
+        if auth_state
+            .tokens
+            .accepts_without_spending(provided)
+            .is_accepted()
+        {
+            return auth_error(
+                StatusCode::FORBIDDEN,
+                "Publication control administrator authentication required",
+            );
+        }
+        return auth_error(StatusCode::UNAUTHORIZED, "Authentication required");
+    }
+
+    if !auth_state.tokens.is_enforced() || is_public_route(request.uri().path()) {
+        return next.run(request).await;
+    }
 
     // Both configured tokens are compared, a superseded accept is counted
     // against the window's two bounds, and a window either bound has closed
@@ -1545,6 +1599,46 @@ async fn daemon_activity(
 
     state.begin_request();
     let _guard = RequestActivityGuard(state);
+    next.run(request).await
+}
+
+fn is_publication_control_route(path: &str) -> bool {
+    let path = path.strip_prefix("/v2").unwrap_or(path);
+    path == "/authority/publication-control" || path.starts_with("/authority/publication-control/")
+}
+
+fn is_process_liveness_route(path: &str) -> bool {
+    let path = path.strip_prefix("/v2").unwrap_or(path);
+    path == "/health"
+}
+
+/// A hosted daemon may expose the authenticated rollout surface while its
+/// reader admission is absent or moving, but it must not serve graph authority
+/// under an unadmitted image. This keeps first bootstrap and recovery possible
+/// without turning a successfully opened process into an implicitly admitted
+/// reader.
+async fn hosted_reader_admission(
+    State(state): State<Arc<DaemonState>>,
+    request: axum::http::Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    if is_publication_control_route(request.uri().path())
+        || is_process_liveness_route(request.uri().path())
+    {
+        return next.run(request).await;
+    }
+    if let Some(control) = state.publication_control.as_ref() {
+        if let Err(error) = control.assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": format!("hosted graph reader admission refused: {error}")
+                })),
+            )
+                .into_response();
+        }
+    }
     next.run(request).await
 }
 
@@ -1810,6 +1904,29 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/vfs/blob/{hash}", get(vfs_blob))
         .route("/vfs/readdir/{*path}", get(vfs_readdir))
         .route("/vfs/subscribe", get(vfs_subscribe))
+        // Fleet-wide hosted authority admission. These protected routes and
+        // every server-side publisher share one CAS record beneath the GCS
+        // backend, so rollout checks cannot race a graph writer.
+        .route(
+            "/authority/publication-control",
+            get(publication_control_status),
+        )
+        .route(
+            "/authority/publication-control/rollout/acquire",
+            post(publication_control_acquire_rollout),
+        )
+        .route(
+            "/authority/publication-control/rollout/renew",
+            post(publication_control_renew_rollout),
+        )
+        .route(
+            "/authority/publication-control/rollout/admit-reader",
+            post(publication_control_admit_reader),
+        )
+        .route(
+            "/authority/publication-control/rollout/release",
+            post(publication_control_release_rollout),
+        )
         // Spine endpoints — cross-repo federation queries
         .route("/spine/health", get(spine_health))
         .route("/spine/repos", get(spine_repos))
@@ -2034,6 +2151,10 @@ fn npm_registry_auth_error(status: StatusCode, message: &str) -> Response {
 /// authority contract. All responses identify the effective API contract in
 /// the `X-Kin-API-Version` header.
 pub fn router(state: Arc<DaemonState>) -> Router {
+    assert!(
+        state.publication_control.is_none(),
+        "hosted graph publication control requires an authenticated serving router"
+    );
     router_with_auth(state, None)
 }
 
@@ -2041,9 +2162,30 @@ fn router_with_auth(state: Arc<DaemonState>, auth_token: Option<String>) -> Rout
     router_with_auth_and_shutdown(state, auth_token, None)
 }
 
+/// Build a router whose publication-control routes carry their own separate
+/// token. Production wires that token through `router_with_auth_and_shutdown`,
+/// so only the direct route tests reach for this shape.
+#[cfg(test)]
+fn router_with_publication_control_auth(
+    state: Arc<DaemonState>,
+    auth_token: Option<String>,
+    publication_control_auth_token: Option<String>,
+) -> Router {
+    router_with_auth_and_shutdown_internal(state, auth_token, publication_control_auth_token, None)
+}
+
 fn router_with_auth_and_shutdown(
     state: Arc<DaemonState>,
     auth_token: Option<String>,
+    shutdown: Option<tokio::sync::watch::Sender<bool>>,
+) -> Router {
+    router_with_auth_and_shutdown_internal(state, auth_token, None, shutdown)
+}
+
+fn router_with_auth_and_shutdown_internal(
+    state: Arc<DaemonState>,
+    auth_token: Option<String>,
+    publication_control_auth_token: Option<String>,
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Router {
     // A single token is a closed rotation window, which is the ordinary state.
@@ -2056,14 +2198,34 @@ fn router_with_auth_and_shutdown(
     // through it here made building a router delete a live window's durable
     // record from the layout's own state directory.
     let tokens = crate::auth_rotation::RotationTokens::primary_only(auth_token);
-    router_with_rotation_tokens(state, tokens, shutdown)
+    router_with_rotation_tokens(state, tokens, publication_control_auth_token, shutdown)
 }
 
 fn router_with_rotation_tokens(
     state: Arc<DaemonState>,
     tokens: crate::auth_rotation::RotationTokens,
+    publication_control_auth_token: Option<String>,
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Router {
+    if state.publication_control.is_some() {
+        assert!(
+            tokens.is_enforced(),
+            "hosted graph publication control requires daemon authentication"
+        );
+        let Some(administrator) = publication_control_auth_token.as_deref() else {
+            panic!("hosted graph publication control requires administrator authentication");
+        };
+        // Against BOTH configured daemon tokens, not just the primary. The
+        // superseded token is a daemon credential every client still holding it
+        // can present, so letting it double as the administrator token makes
+        // each of them an administrator on this surface. Asked here rather than
+        // on the plaintext, because this is the one point every entry path
+        // passes through, and it needs only the digests.
+        assert!(
+            !tokens.matches_any_configured(administrator),
+            "hosted graph publication control administrator authentication must not be any token this daemon accepts, the superseded one included"
+        );
+    }
     let routes = api_routes();
     let activity_state = Arc::clone(&state);
 
@@ -2157,6 +2319,7 @@ fn router_with_rotation_tokens(
     //
     // The outer layers below (`daemon_activity`, `api_version_header`,
     // `validate_host_and_origin`) still apply to EVERYTHING, registry included.
+    let admission_state = Arc::clone(&state);
     let daemon_routes = Router::new()
         .merge(routes.clone())
         .nest("/v2", routes)
@@ -2165,7 +2328,14 @@ fn router_with_rotation_tokens(
         // the guard increments rather than a second copy that reads zero.
         .layer(Extension(tokens.clone()))
         .layer(middleware::from_fn_with_state(
-            DaemonAuthState { tokens },
+            admission_state,
+            hosted_reader_admission,
+        ))
+        .layer(middleware::from_fn_with_state(
+            DaemonAuthState {
+                tokens,
+                publication_control_auth_token,
+            },
             daemon_auth,
         ))
         .with_state(state);
@@ -3041,7 +3211,16 @@ where
 {
     // Initialize once outside the stamped interval: lazy spine hydration and
     // registration can be expensive, but it is not part of the graph read.
-    let spine = state.ensure_spine();
+    let spine_authority = state.acquire_spine_read_authority().await;
+    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            state.spine_unavailable_reason(),
+        ));
+    }
+    let spine = spine_authority
+        .as_ref()
+        .map(|authority| authority.backend());
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
             settle_graph_authority_writer(attempt_number, XREF_CURRENCY_ATTEMPTS).await;
@@ -3104,7 +3283,13 @@ where
             kin_mcp::handlers::entities::FIND_REFERENCES_FOCAL_MISS,
         ));
     }
-    let spine = state.ensure_spine();
+    let spine_authority = state.acquire_spine_read_authority().await;
+    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+        return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
+    }
+    let spine = spine_authority
+        .as_ref()
+        .map(|authority| authority.backend());
     let repository_authority = mcp_repository_authority_source(state)?;
     let mut superseded = None;
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
@@ -3258,7 +3443,13 @@ async fn mcp_bulk_check_references_with_stable_authority<F>(
 where
     F: FnMut(usize),
 {
-    let spine = state.ensure_spine();
+    let spine_authority = state.acquire_spine_read_authority().await;
+    if state.hosted_spine_readiness_required() && spine_authority.is_none() {
+        return Err(kin_mcp::McpError::Other(state.spine_unavailable_reason()));
+    }
+    let spine = spine_authority
+        .as_ref()
+        .map(|authority| authority.backend());
     let mut superseded = None;
     for attempt_number in 0..XREF_CURRENCY_ATTEMPTS {
         let Some(attempt) = prepare_xref_graph_read(state, &selected_graph, authority) else {
@@ -3446,7 +3637,17 @@ async fn health(
     // every admission satisfies perfectly well, so this endpoint answered `ok`
     // for a daemon that had admitted nothing in days. That field stays as it is,
     // and the verdict now also reads what those passes achieved.
-    let status = if mass_deletion_blocked
+    let runtime_admission = state
+        .publication_control
+        .as_ref()
+        .map(|control| control.runtime_admission_status());
+    let reader_admitted = runtime_admission
+        .as_ref()
+        .map(|diagnostic| diagnostic.admitted)
+        .unwrap_or(true);
+    let reader_admission_error = runtime_admission.and_then(|diagnostic| diagnostic.error);
+    let status = if !reader_admitted
+        || mass_deletion_blocked
         || embed_worker_failed
         || embed_persistence_unavailable
         || vector_index_discarded.is_some()
@@ -3463,6 +3664,8 @@ async fn health(
 
     Ok(Json(HealthResponse {
         status: status.to_string(),
+        reader_admitted,
+        reader_admission_error,
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds,
         graph_entity_count: Some(entity_count),
@@ -3515,17 +3718,22 @@ async fn health(
 /// An initialized daemon has either loaded a snapshot or completed at least
 /// one reconciliation cycle. An empty but initialized workspace is ready.
 ///
-/// Readiness is deliberately independent of cross-repo spine warm-up: this
-/// daemon's own repo is what a client connecting to it needs served, and a
-/// sibling warm-up that gated readiness would report a busy daemon as a dead
-/// one. A warm-up in progress is reported through `warming` instead.
+/// Local readiness remains independent of optional cross-repo warm-up. Hosted
+/// graph service is different: the exact-fleet durable spine is part of the
+/// product authority, so a hydration, migration-seal, fleet-fence, cursor, or
+/// root failure must keep the pod out of service.
 async fn readiness(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let initialized = state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed);
-    let warming = state.spine_warming();
+    let hosted_spine_ready = if initialized && state.hosted_spine_readiness_required() {
+        state.acquire_spine_read_authority().await.is_some()
+    } else {
+        true
+    };
+    let warming = state.spine_warming() || (initialized && !hosted_spine_ready);
 
-    if initialized {
+    if initialized && hosted_spine_ready {
         (
             StatusCode::OK,
             Json(ReadinessResponse {
@@ -13121,6 +13329,36 @@ fn repository_metadata(
     })
 }
 
+/// Resolve the ref metadata for the exact hosted graph generation already in
+/// the daemon cache.
+///
+/// A hosted daemon loads and validates the complete repository authority when
+/// it opens a graph. Reopening the manager here downloaded that same full
+/// authority for every tiny refs response. The state cache binds metadata and
+/// graph in one entry, probes its publication cursor, and replaces both as one
+/// unit when authority moves, so this is both cheaper and stricter about
+/// generation consistency.
+async fn repository_ref_metadata(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<Arc<kin_db::PersistedRepositoryAuthority>, (StatusCode, String)> {
+    if state.storage_backend.is_some() {
+        return state
+            .get_repo_authority_metadata(repo_id)
+            .await
+            .map_err(|error| repo_addressed_error(state, error))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::FAILED_DEPENDENCY,
+                    "snapshot has no repository-v6 authority envelope".to_string(),
+                )
+            });
+    }
+
+    let snapshot = repository_authority_snapshot(state, repo_id).await?;
+    Ok(Arc::new(repository_metadata(&snapshot)?.clone()))
+}
+
 fn resolve_repository_ref_target(
     snapshot: &kin_db::GraphSnapshot,
     target: &kin_model::RefTarget,
@@ -13470,7 +13708,12 @@ async fn repo_transfer_receive(
     // the committed transfer, and must not be answered to the sending peer as
     // a failed publication.
     let refresh = if state.storage_backend.is_some() {
-        state.repo_graphs.write().await.remove(&repo_id);
+        // Hosted cache entries carry their exact backend publication cursor.
+        // The committed writer must return its durable receipt immediately;
+        // the next reader probes that cursor and single-flights any successor
+        // reload. An explicit post-commit eviction could wait behind an
+        // unrelated full reload and could delete a successor installed before
+        // the eviction finally acquired its gate.
         DerivedViewRefresh::Current
     } else {
         match refresh_local_derived_views(
@@ -13489,7 +13732,6 @@ async fn repo_transfer_receive(
 
 /// Everything a negotiation needs, resolved from one authority lease.
 struct TransferCommandContext {
-    repo_id: String,
     repository_id: RepositoryId,
     authority: RepositoryAuthorityManager<dyn StorageBackend>,
     /// Absent when neither the caller nor this replica names a ref, which is
@@ -13574,7 +13816,6 @@ fn transfer_command_context(
     }
 
     Ok(TransferCommandContext {
-        repo_id,
         repository_id,
         authority,
         source_ref,
@@ -13645,7 +13886,6 @@ pub(crate) async fn pull_into_replica(
 ) -> Result<kin_cli::commands::transfer::CommandTransferResponse, (StatusCode, String)> {
     let state = Arc::clone(state);
     let context = transfer_command_context(&state, request)?;
-    let repo_id = context.repo_id.clone();
     let repository_id = context.repository_id.clone();
     let requested_source_ref = context.source_ref.clone();
     let requested_destination_ref = context.destination_ref.clone();
@@ -13730,9 +13970,9 @@ pub(crate) async fn pull_into_replica(
         }
     })?;
 
-    if !local_derived_views && outcome.moved_history() {
-        state.repo_graphs.write().await.remove(&repo_id);
-    }
+    // Hosted cache freshness is cursor-driven. Do not put a durable pull
+    // receipt behind an in-flight full reload, and do not evict a successor a
+    // concurrent reader may already have installed.
     if !outcome.moved_history() {
         derived_views = DerivedViewRefresh::Current;
     }
@@ -14047,8 +14287,7 @@ async fn repo_refs(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
-    let metadata = repository_metadata(&snapshot)?;
+    let metadata = repository_ref_metadata(&state, &repo_id).await?;
     let default_name = metadata.ref_state.default_ref.clone();
     let workspace_head = metadata.workspaces.iter().find_map(|workspace| {
         if let kin_model::WorkspaceHead::Symbolic { target } = &workspace.head {
@@ -14057,7 +14296,7 @@ async fn repo_refs(
             None
         }
     });
-    let selected = default_repository_ref(metadata)?;
+    let selected = default_repository_ref(&metadata)?;
     let selected_head = selected.map(|repository_ref| match &repository_ref.target {
         kin_model::RefTarget::Change { change_id } => change_id.to_string(),
         kin_model::RefTarget::ExternalObject { object } => object.oid.to_string(),
@@ -14936,6 +15175,130 @@ struct SpineXrefParams {
     entity: String,
 }
 
+fn publication_control(
+    state: &DaemonState,
+) -> Result<&Arc<crate::publication_lease::PublicationControl>, (StatusCode, String)> {
+    state.publication_control.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "graph publication control is unavailable outside the hosted GCS authority path"
+                .to_string(),
+        )
+    })
+}
+
+fn publication_control_error(
+    error: crate::publication_lease::PublicationControlError,
+) -> (StatusCode, String) {
+    let status = if error.is_request_error() {
+        StatusCode::BAD_REQUEST
+    } else if error.is_conflict() {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (status, error.to_string())
+}
+
+async fn publication_control_status(
+    State(state): State<Arc<DaemonState>>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let record = publication_control(&state)?
+        .redacted_status()
+        .map_err(publication_control_error)?;
+    Ok(Json(record))
+}
+
+async fn publication_control_acquire_rollout(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::AcquireRolloutLeaseRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let control = publication_control(&state)?;
+    let pending = control
+        .acquire_rollout(request)
+        .map_err(publication_control_error)?;
+    let proof = crate::publication_lease::LeaseProof {
+        scope: control.scope().to_string(),
+        token: pending.token.clone(),
+        fence: pending.fence,
+    };
+    let fence = control
+        .spine_rollout_fence(&proof)
+        .map_err(publication_control_error)?;
+    let evidence = state
+        .advance_hosted_spine_rollout_fence(fence)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    control
+        .checkpoint_spine_rollout_fence(&proof, &evidence)
+        .map_err(publication_control_error)?;
+    let lease = control
+        .complete_rollout_acquisition(&proof)
+        .map_err(publication_control_error)?;
+    let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
+    Ok(Json(lease))
+}
+
+async fn publication_control_renew_rollout(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::RenewRolloutLeaseRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let control = publication_control(&state)?;
+    let lease = control
+        .renew_rollout(request)
+        .map_err(publication_control_error)?;
+    let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
+    Ok(Json(lease))
+}
+
+async fn publication_control_admit_reader(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::AdmitReaderRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let control = publication_control(&state)?;
+    state
+        .prepare_hosted_spine_rollout(&request)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let record = state
+        .admit_hosted_spine_rollout_fence(request)
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
+    Ok(Json(record))
+}
+
+async fn publication_control_release_rollout(
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<crate::publication_lease::ReleaseRolloutLeaseRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let control = publication_control(&state)?;
+    match control
+        .classify_rollout_release(&request.lease)
+        .map_err(publication_control_error)?
+    {
+        crate::publication_lease::RolloutReleaseDisposition::Active => {
+            state
+                .release_hosted_spine_rollout(request)
+                .await
+                .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+        }
+        crate::publication_lease::RolloutReleaseDisposition::CompletedExact => {
+            control
+                .release_rollout(request)
+                .map_err(publication_control_error)?;
+        }
+    }
+    let _ = control.refresh_runtime_admission(kin_db::GraphSnapshot::CURRENT_VERSION);
+    // A lost-response retry can race a later unrelated rollout. Returning the
+    // raw ordered record here would disclose that rollout's live capability
+    // token to a caller holding only an old completed proof.
+    let status = control
+        .redacted_status()
+        .map_err(publication_control_error)?;
+    Ok(Json(status))
+}
+
 /// Stable wire response for the canonical `GET /spine/edges` bulk read.
 /// Field order plus the snapshot's canonical collections make identical graph
 /// authority serialize to identical response bytes.
@@ -14953,12 +15316,14 @@ struct SpineEdgesResponse {
 async fn spine_health(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
-        )
-    })?;
+    // This route is intentionally public diagnostics. Never let an
+    // unauthenticated health read initialize or re-register hosted Firestore
+    // authority; mutating routes own that transition under publication guard.
+    let authority = state
+        .acquire_initialized_spine_read_authority()
+        .await
+        .map_err(|error| (StatusCode::SERVICE_UNAVAILABLE, error))?;
+    let spine = authority.backend();
 
     // Two completeness readings, never one. `cross_repo_edges: 0` beside nothing
     // else is a bare zero: it reads as "this install has no cross-repo edges"
@@ -14985,6 +15350,17 @@ async fn spine_health(
     let capture = state.sibling_capture_report();
     Ok(Json(json!({
         "status": "ok",
+        // A FOURTH reading, and the one that says what the three above are
+        // about. This route is side-effect-free on purpose: it must never warm,
+        // hydrate or publish, so it does not re-read durable heads. The counts
+        // below are therefore the last proven head set under the current
+        // rollout fence, not a fresh read of Firestore. Another pod committing
+        // an ordinary head under an unchanged fence is not visible here until a
+        // semantic route takes the full refresh and proof path. Saying so is
+        // the difference between a diagnostic and a false green: a reader who
+        // takes these counts as current authority is reading a cache, and
+        // nothing else on this response tells them that.
+        "durable_heads_reread": false,
         "repos": spine.repo_count(),
         "entities": spine.entity_count(),
         "cross_repo_edges": spine.edge_count(),
@@ -15000,12 +15376,13 @@ async fn spine_health(
 async fn spine_repos(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     let repo_ids: Vec<String> = spine.registered_repo_ids().into_iter().collect();
     Ok(Json(json!({ "repos": repo_ids })))
@@ -15016,12 +15393,13 @@ async fn spine_resolve(
     Query(params): Query<SpineResolveParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     let kind_str = params.kind.as_deref();
     let kind = kind_str.and_then(parse_entity_kind);
@@ -15039,12 +15417,13 @@ async fn spine_impact(
     Query(params): Query<SpineImpactParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     let entity_id = parse_entity_id_hex(&params.entity)?;
     let impact = spine.federated_impact(&params.repo, &entity_id, params.depth);
@@ -15064,12 +15443,13 @@ async fn spine_xref(
     Query(params): Query<SpineXrefParams>,
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
 
     let entity_id = parse_entity_id_hex(&params.entity)?;
     Ok(Json(
@@ -15086,12 +15466,13 @@ async fn spine_xref(
 async fn spine_edges(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let spine = state.ensure_spine().ok_or_else(|| {
+    let spine_authority = state.acquire_spine_read_authority().await.ok_or_else(|| {
         (
             StatusCode::SERVICE_UNAVAILABLE,
-            "spine disabled via KIN_DISABLE_SPINE".to_string(),
+            state.spine_unavailable_reason().to_string(),
         )
     })?;
+    let spine = spine_authority.backend();
     let snapshot = spine.cross_repo_edges_snapshot();
 
     Ok(Json(SpineEdgesResponse {
@@ -15143,6 +15524,12 @@ async fn spine_ingest_repo(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let Json(body) = body.unwrap_or_default();
 
+    if let Some(control) = state.publication_control.as_ref() {
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .map_err(publication_control_error)?;
+    }
+
     // The path `repo_id` is authoritative; reject a body `repo` that disagrees
     // so an orchestrator wiring bug can't ingest the wrong repo silently.
     if let Some(repo) = body.repo.as_deref() {
@@ -15165,6 +15552,7 @@ async fn spine_ingest_repo(
         "entityCount": outcome.entity_count,
         "relationCount": outcome.relation_count,
         "resolvableRelationCount": outcome.resolvable_relations,
+        "rolloutFenceEvidence": outcome.rollout_fence_evidence,
     })))
 }
 
@@ -15179,6 +15567,11 @@ async fn spine_ingest_repo(
 async fn spine_refresh_cross_repo_edges(
     State(state): State<Arc<DaemonState>>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if let Some(control) = state.publication_control.as_ref() {
+        control
+            .assert_runtime_admitted(kin_db::GraphSnapshot::CURRENT_VERSION)
+            .map_err(publication_control_error)?;
+    }
     let outcome = state
         .refresh_all_cross_repo_edges()
         .await
@@ -15187,6 +15580,7 @@ async fn spine_refresh_cross_repo_edges(
     Ok(Json(json!({
         "reposRefreshed": outcome.repos_refreshed,
         "crossRepoEdges": outcome.cross_repo_edges,
+        "rolloutFenceEvidence": outcome.rollout_fence_evidence,
     })))
 }
 
@@ -15358,6 +15752,15 @@ async fn lsp_sweep_status(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         // without it `kin init` printed "complete (0/66 files)" over a sweep
         // whose language server never started.
         "files_blocked": state.lsp_sweep_files_blocked.load(Ordering::SeqCst),
+        // Which languages the sweep could not serve, and what it saw. The count
+        // above cannot name a language, so a pass that enriched one language and
+        // skipped another reported a nonzero `files_done` and nothing else, and
+        // `kin init` called that complete. This is the half that names it.
+        "languages_skipped": state
+            .lsp_sweep_languages_skipped
+            .lock()
+            .map(|skipped| serde_json::to_value(&*skipped).unwrap_or(json!([])))
+            .unwrap_or_else(|_| json!([])),
         "sweeps_completed": state.lsp_sweeps_completed.load(Ordering::SeqCst),
         // Reported rather than left for the caller to infer from a zero total:
         // a daemon with no language server never sweeps, and a caller waiting
@@ -16272,20 +16675,18 @@ pub fn bind_api_listener_pair(
 /// correctly and kills it -- the failure `state.rs` already documents in its own
 /// words. So this answers, immediately, every time.
 ///
-/// Every answer is a REFUSAL status, and that is the load-bearing detail. The
-/// clients that can retire an endpoint do so on a verdict about repository
-/// identity, and they reach that verdict only from a body they successfully
-/// parsed: a non-2xx answer is classified as silence about identity, which is
-/// explicitly not allowed to authorize deleting the endpoint. A 200 carrying a
-/// fabricated status would instead be read as a live daemon whose repository
-/// could not be matched, which is the reading that wipes endpoint files and
-/// respawns into the same state. Refusing is what keeps a warming daemon
-/// alive-and-waiting rather than dead.
+/// Readiness refuses until authority opens, while `/health` answers process
+/// liveness with an explicit warming, unadmitted diagnostic. Kubernetes uses
+/// these as different decisions: a slow or intentionally fenced reader stays
+/// alive for recovery traffic but cannot receive authority traffic.
 pub async fn serve_warming_until(
     listener: tokio::net::TcpListener,
     mut ready_rx: tokio::sync::watch::Receiver<bool>,
 ) {
     let app = Router::new()
+        .route("/health", get(warming_health))
+        .route("/v2/health", get(warming_health))
+        .route("/ready", get(warming_readiness))
         .route("/readiness", get(warming_readiness))
         .fallback(warming_unavailable);
     let served = axum::serve(listener, app)
@@ -16316,6 +16717,19 @@ async fn warming_readiness() -> impl IntoResponse {
     )
 }
 
+async fn warming_health() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "warming",
+            "process_alive": true,
+            "reader_admitted": false,
+            "ready": false,
+            "warming": true,
+        })),
+    )
+}
+
 async fn warming_unavailable() -> impl IntoResponse {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -16339,6 +16753,7 @@ pub async fn serve_bound_with_shutdown(
     shutdown_tx: Option<tokio::sync::watch::Sender<bool>>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
+    let publication_control_auth_token = publication_control_auth_token_from_env();
     let tokens = resolve_serve_rotation_tokens(&state.layout).map_err(|error| {
         // A refusal here stops the daemon starting, which is deliberate: the two
         // refused configurations both mean the operator believes a rotation
@@ -16346,7 +16761,8 @@ pub async fn serve_bound_with_shutdown(
         // belief look correct until the moment traffic is dropped.
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
     })?;
-    let app = router_with_rotation_tokens(state, tokens, shutdown_tx);
+    let app =
+        router_with_rotation_tokens(state, tokens, publication_control_auth_token, shutdown_tx);
     let port = listener
         .local_addr()
         .map(|addr| addr.port())
@@ -16409,6 +16825,10 @@ fn auth_token_from_env() -> Option<String> {
 
 fn previous_auth_token_from_env() -> Option<String> {
     resolve_auth_token(std::env::var(DAEMON_AUTH_TOKEN_PREVIOUS_ENV).ok())
+}
+
+fn publication_control_auth_token_from_env() -> Option<String> {
+    resolve_auth_token(std::env::var("KIN_PUBLICATION_CONTROL_AUTH_TOKEN").ok())
 }
 
 /// `.kin/daemon.token` — auto-provisioned per-install loopback token.
@@ -23126,12 +23546,12 @@ mod tests {
             String::from_utf8_lossy(&receive_body)
         );
         assert!(
-            !destination_state
+            destination_state
                 .list_loaded_repos()
                 .await
                 .iter()
                 .any(|loaded| loaded == &repo_id),
-            "receive must evict the old graph so the next route is a lazy reload"
+            "a durable receive receipt must not wait on or evict the cache; the next read proves freshness from its publication cursor"
         );
 
         // This is the negative control for the incident. Repository-v6 stores
@@ -25807,10 +26227,8 @@ mod tests {
     ///
     /// The assertions are on the exact statuses a client acts on, because the
     /// statuses are the contract. `/readiness` must be the 503 the spawn-wait
-    /// loop already polls, and `/health` must be a refusal rather than a 200
-    /// carrying an invented status: a parsed 200 whose repository cannot be
-    /// matched is what authorizes a client to retire the endpoint and respawn,
-    /// while a non-2xx is classified as silence about identity and keeps it.
+    /// loop already polls, while `/health` must remain 200 process liveness and
+    /// explicitly say that no reader authority is admitted yet.
     #[tokio::test]
     async fn a_daemon_answers_while_it_is_still_opening_state() {
         let state = test_state();
@@ -25846,10 +26264,14 @@ mod tests {
             .expect("health must answer during the open window");
         assert_eq!(
             health.status(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "health must REFUSE while opening; a 200 with an invented status is what makes a \
-             client retire the endpoint and respawn into the same state"
+            StatusCode::OK,
+            "process liveness must not kill a daemon while it opens authority"
         );
+        let health: serde_json::Value = health.json().await.expect("warming health body");
+        assert_eq!(health["status"], "warming");
+        assert_eq!(health["process_alive"], true);
+        assert_eq!(health["reader_admitted"], false);
+        assert_eq!(health["ready"], false);
 
         // Handing over must not rebind. Both handles accept from one listen
         // queue, so after the readiness surface stops, the same port is still
@@ -29103,6 +29525,442 @@ mod tests {
         (status, body.to_vec())
     }
 
+    async fn publication_post(
+        app: Router,
+        path: &str,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(
+                Request::post(path)
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer publication-test-token")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let body = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes)
+                .unwrap_or_else(|_| serde_json::json!({"text": String::from_utf8_lossy(&bytes)}))
+        };
+        (status, body)
+    }
+
+    async fn publication_spine_ingest(app: Router, repo_id: &str) -> (StatusCode, Vec<u8>) {
+        let response = app
+            .oneshot(
+                Request::post(format!("/spine/repos/{repo_id}/ingest"))
+                    .header("content-type", "application/json")
+                    .header("authorization", "Bearer daemon-test-token")
+                    .body(Body::from(
+                        serde_json::to_vec(&serde_json::json!({ "repo": repo_id })).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        (status, body.to_vec())
+    }
+
+    /// The direct server API is the bypass the invoking shell cannot close.
+    /// A hosted daemon built without a usable durable spine must leave the GCS
+    /// rollout active and refuse both admission and direct ingest. A test-only
+    /// local backend must never make the production control route look green.
+    /// The composed rollout path, driven end to end against a durable fake.
+    ///
+    /// This is the positive half the suite did not have. Every other test of
+    /// this surface asserts a refusal, and a refusal passes on a daemon that
+    /// refuses everything, so without this the routes could stop working
+    /// entirely and nothing would say so.
+    ///
+    /// It drives the real sequence: acquire derives the Firestore fleet fence
+    /// from server-owned lease state, advances it, checkpoints the returned
+    /// evidence back into the GCS lease and completes the acquisition; admit
+    /// publishes the exact five heads and binds the reader; release clears the
+    /// rollout. The spine underneath is kin-spine's own durable fake behind
+    /// `FirestoreSpineBackend`, so the CAS semantics exercised here are the
+    /// same ones that crate's suite exercises, not a second implementation.
+    ///
+    /// Hosted readiness is left exactly as production has it. The older
+    /// in-memory seam also switches readiness off, and every control-plane
+    /// route then refuses before it starts, which is why this test could not
+    /// have been written on that seam.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn publication_control_api_drives_the_rollout_to_release() {
+        const READER_A: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let fleet = vec![
+            "kin".to_string(),
+            "kin-db".to_string(),
+            "kin-editor".to_string(),
+            "kin-vfs".to_string(),
+            "kinlab".to_string(),
+        ];
+
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("GOOGLE_CLOUD_PROJECT", Some("fixture-project"));
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture-prefix"));
+        environment.apply("KIN_REPO_IDS", Some(&fleet.join(",")));
+        environment.apply::<_, &str>("KIN_DISABLE_SPINE", None);
+        let scope = "gcs://fixture-bucket/fixture-prefix";
+
+        // Every repository in the exact fleet needs a graph, because admit
+        // publishes all five heads and then proves the exact set.
+        let backend_root = tempfile::tempdir().unwrap();
+        for repo_id in &fleet {
+            let graph = kin_db::InMemoryGraph::new();
+            graph
+                .upsert_entity(&test_entity(
+                    &format!("{}_entity", repo_id.replace('-', "_")),
+                    "src/lib.rs",
+                ))
+                .unwrap();
+            kin_db::StorageBackend::save_snapshot(
+                &kin_db::LocalFileBackend::new(backend_root.path()),
+                repo_id,
+                &graph.to_snapshot().to_bytes().unwrap(),
+                kin_db::GENERATION_INIT,
+            )
+            .unwrap();
+        }
+
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(
+                scope,
+                READER_A,
+                fleet.clone(),
+                store,
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                "kin",
+                Some(fleet.iter().cloned().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        state.install_hosted_durable_spine_for_test(Arc::new(
+            kin_spine::FirestoreSpineBackend::with_store(Arc::new(
+                kin_spine::test_support::FakeSpineStore::cold(),
+            )),
+        ));
+        assert!(
+            state.hosted_spine_readiness_required(),
+            "this test is only about the composed path if hosted readiness is on, which the \
+             older in-memory seam turns off"
+        );
+
+        let app = router_with_publication_control_auth(
+            Arc::clone(&state),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        );
+
+        let (status, lease) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/acquire",
+            serde_json::json!({
+                "scope": scope,
+                "repositories": fleet,
+                "holder": "positive-regression",
+                "request_id": "run-positive-1",
+                "ttl_seconds": 300,
+                "bootstrap_reader": {
+                    "identity": READER_A,
+                    "min_snapshot_schema": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                    "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                    "valid_for_seconds": 3600
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "acquire must succeed: {lease}");
+        let token = lease["token"]
+            .as_str()
+            .unwrap_or_else(|| panic!("acquire must return a lease token: {lease}"))
+            .to_string();
+        let fence = lease["fence"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("acquire must return a lease fence: {lease}"));
+
+        // LeaseProof is serde(flatten) on both request types, so scope, token
+        // and fence sit at the top level rather than under a "lease" key.
+        let (status, admitted) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/admit-reader",
+            serde_json::json!({
+                "scope": scope,
+                "token": token,
+                "fence": fence,
+                "repositories": fleet,
+                "reader": {
+                    "identity": READER_A,
+                    "min_snapshot_schema": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                    "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                    "valid_for_seconds": 3600
+                },
+                // Without this the seal is never created and hosted reads stay
+                // closed behind the legacy writer-drain boundary, which is the
+                // fail-closed behaviour the negative fixture already covers.
+                // Supplying it is what the daemon binary does from
+                // KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL, so the sequence
+                // under test is the deployed one.
+                "legacy_writer_drain_proof_sha256": format!("sha256:{}", "b".repeat(64))
+            }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admit must publish the exact fleet, seal the legacy boundary and bind the \
+             reader: {admitted}"
+        );
+
+        let (status, released) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/release",
+            serde_json::json!({ "scope": scope, "token": token, "fence": fence }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "release must succeed: {released}");
+
+        // The point of the whole sequence: a reader is admitted afterwards and
+        // semantic readiness is open. Asserting only the three 200s would pass
+        // on routes that returned 200 and changed nothing.
+        let readiness = app
+            .clone()
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            readiness.status(),
+            StatusCode::OK,
+            "the daemon must be reader-ready once the rollout has released"
+        );
+    }
+
+    ///
+    /// The absence this asserts has to be established, not assumed. Other tests
+    /// in this library set `GOOGLE_CLOUD_PROJECT` and its companions, and the
+    /// process environment is shared, so under a plain parallel `cargo test`
+    /// this fixture could otherwise enter a different or real Firestore path
+    /// and still read green. The guard clears them and `serial` keeps a
+    /// concurrent test from setting them back mid-run.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn publication_control_api_fails_closed_without_durable_spine() {
+        const READER_A: &str =
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        const SCOPE: &str = "gcs://fixture/v2";
+
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        for name in [
+            "GOOGLE_CLOUD_PROJECT",
+            "FIRESTORE_DATABASE_ID",
+            "KIN_GCS_BUCKET",
+            "KIN_GCS_PREFIX",
+            "KIN_REPO_IDS",
+        ] {
+            environment.apply::<_, &str>(name, None);
+        }
+        assert!(
+            std::env::var("GOOGLE_CLOUD_PROJECT").is_err(),
+            "this fixture proves a refusal that only holds while the hosted Firestore \
+             environment is absent"
+        );
+
+        let fleet = vec![
+            "kin".to_string(),
+            "kin-db".to_string(),
+            "kin-vfs".to_string(),
+            "kinlab".to_string(),
+            "kin-editor".to_string(),
+        ];
+
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let backend_root = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(
+                SCOPE,
+                READER_A,
+                fleet.clone(),
+                store,
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                "kin",
+                Some(fleet.iter().cloned().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        let unauthenticated_embedded = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            move || router(state)
+        }));
+        assert!(
+            unauthenticated_embedded.is_err(),
+            "the public embedded router must not expose hosted rollout mutation without auth"
+        );
+        let app = router_with_publication_control_auth(
+            Arc::clone(&state),
+            Some("daemon-test-token".to_string()),
+            Some("publication-test-token".to_string()),
+        );
+
+        let ordinary_cannot_read_control = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer daemon-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ordinary_cannot_read_control.status(), StatusCode::FORBIDDEN);
+        let unauthenticated_cannot_read_control = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            unauthenticated_cannot_read_control.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let missing = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer publication-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let missing_health = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .header("authorization", "Bearer daemon-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_health.status(), StatusCode::OK);
+        let missing_health_body = axum::body::to_bytes(missing_health.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let missing_health: HealthResponse = serde_json::from_slice(&missing_health_body).unwrap();
+        assert!(!missing_health.reader_admitted);
+        assert_eq!(missing_health.status, "attention");
+        let missing_readiness = app
+            .clone()
+            .oneshot(Request::get("/readiness").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(missing_readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let (status, body) = publication_spine_ingest(app.clone(), "kin").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(String::from_utf8_lossy(&body).contains("record is absent"));
+
+        let acquire = serde_json::json!({
+            "scope": SCOPE,
+            "repositories": ["kin", "kin-db", "kin-vfs", "kinlab", "kin-editor"],
+            "holder": "staging-promotion",
+            "request_id": "run-123",
+            "ttl_seconds": 300,
+            "bootstrap_reader": {
+                "identity": READER_A,
+                "min_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "max_snapshot_schema": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "valid_for_seconds": 3600
+            }
+        });
+        let (status, lease) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/acquire",
+            acquire.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{lease}");
+        let first_error = lease
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            first_error.contains("GOOGLE_CLOUD_PROJECT") || first_error.contains("durable spine"),
+            "the production route must name its missing durable authority: {lease}"
+        );
+        let (retry_status, retry) = publication_post(
+            app.clone(),
+            "/authority/publication-control/rollout/acquire",
+            acquire,
+        )
+        .await;
+        assert_eq!(retry_status, StatusCode::SERVICE_UNAVAILABLE, "{retry}");
+
+        let control_status = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer publication-test-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(control_status.status(), StatusCode::OK);
+        let status_body = axum::body::to_bytes(control_status.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        let status_json: serde_json::Value = serde_json::from_slice(&status_body).unwrap();
+        let status_text = String::from_utf8(status_body.to_vec()).unwrap();
+        assert!(status_json["active_lease"].is_object());
+        assert!(
+            !status_text.contains("\"token\""),
+            "read-only publication status must not disclose live lease capability: {status_text}"
+        );
+
+        let (blocked_status, blocked_body) = publication_spine_ingest(app.clone(), "kin").await;
+        assert_eq!(blocked_status, StatusCode::SERVICE_UNAVAILABLE);
+        let blocked_body = String::from_utf8_lossy(&blocked_body);
+        assert!(blocked_body.contains("rollout fence"), "{blocked_body}");
+    }
+
     /// The identity contract a client depends on: read `repo_id` off `/health`
     /// and every `/repos/{repo_id}/…` route resolves it. Two key spaces here
     /// meant a caller that trusted the advertised id got a storage-mode 500 on
@@ -29227,11 +30085,155 @@ mod tests {
     /// Handle the test keeps after the backend is moved into the daemon, so a
     /// fault can be armed once the daemon has already opened healthy.
     #[derive(Default)]
+    struct BackendBlockState {
+        remaining_arrivals: usize,
+        arrivals: usize,
+        released: bool,
+    }
+
+    struct BackendBlock {
+        state: std::sync::Mutex<BackendBlockState>,
+        changed: std::sync::Condvar,
+    }
+
+    impl BackendBlock {
+        fn new(arrivals: usize) -> Self {
+            Self {
+                state: std::sync::Mutex::new(BackendBlockState {
+                    remaining_arrivals: arrivals,
+                    ..BackendBlockState::default()
+                }),
+                changed: std::sync::Condvar::new(),
+            }
+        }
+
+        fn arrive_and_wait(&self) {
+            let mut state = self.state.lock().unwrap();
+            if state.released || state.remaining_arrivals == 0 {
+                return;
+            }
+            state.remaining_arrivals -= 1;
+            state.arrivals += 1;
+            self.changed.notify_all();
+            while !state.released {
+                state = self.changed.wait(state).unwrap();
+            }
+        }
+
+        fn arrivals(&self) -> usize {
+            self.state.lock().unwrap().arrivals
+        }
+
+        fn released(&self) -> bool {
+            self.state.lock().unwrap().released
+        }
+
+        fn release(&self) {
+            let mut state = self.state.lock().unwrap();
+            state.released = true;
+            self.changed.notify_all();
+        }
+    }
+
+    #[derive(Clone)]
+    struct BackendBlockHandle(Arc<BackendBlock>);
+
+    impl BackendBlockHandle {
+        fn arrivals(&self) -> usize {
+            self.0.arrivals()
+        }
+
+        fn released(&self) -> bool {
+            self.0.released()
+        }
+
+        fn release(&self) {
+            self.0.release();
+        }
+
+        /// Fail-safe for tests that deliberately park synchronous backend I/O.
+        ///
+        /// Assertions happen only after the test releases and drains the
+        /// parked operation, but a mutant can prevent the expected rendezvous
+        /// entirely. This watchdog keeps that failure diagnostic instead of
+        /// leaving the test process hung forever.
+        fn release_on_deadline(&self, deadline: Duration) -> std::thread::JoinHandle<()> {
+            let block = self.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + deadline;
+                while !block.released() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                if !block.released() {
+                    block.release();
+                }
+            })
+        }
+    }
+
+    async fn join_task_or_abort<T: Send + 'static>(
+        task: &mut tokio::task::JoinHandle<T>,
+        bound: Duration,
+    ) -> std::result::Result<T, String> {
+        match tokio::time::timeout(bound, &mut *task).await {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(format!("task failed while draining: {error}")),
+            Err(_) => {
+                task.abort();
+                let _ = task.await;
+                Err(format!("task did not drain within {bound:?}; aborted"))
+            }
+        }
+    }
+
+    async fn drain_join_set_or_abort<T: Send + 'static>(
+        tasks: &mut tokio::task::JoinSet<T>,
+        bound: Duration,
+    ) -> std::result::Result<Vec<T>, String> {
+        let drained = tokio::time::timeout(bound, async {
+            let mut values = Vec::new();
+            while let Some(result) = tasks.join_next().await {
+                match result {
+                    Ok(value) => values.push(value),
+                    Err(error) => return Err(format!("task failed while draining: {error}")),
+                }
+            }
+            Ok(values)
+        })
+        .await;
+
+        match drained {
+            Ok(Ok(values)) => Ok(values),
+            Ok(Err(error)) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                Err(error)
+            }
+            Err(_) => {
+                tasks.abort_all();
+                while tasks.join_next().await.is_some() {}
+                Err(format!("task set did not drain within {bound:?}; aborted"))
+            }
+        }
+    }
+
+    #[derive(Default)]
     struct FaultState {
         authority_faults: std::collections::HashSet<String>,
         cursor_faults: std::collections::HashSet<String>,
+        /// Every authority-shaped read: recovery state, snapshot authority and
+        /// raw snapshot.
         authority_loads: std::collections::HashMap<String, usize>,
+        /// Only `load_recovery_state`. Separate from `authority_loads` because
+        /// the concurrency tests assert exact deltas against this one call
+        /// site, and a counter that also moved on the other two authority reads
+        /// would make those assertions mean something else.
+        recovery_loads: std::collections::HashMap<String, usize>,
         cursor_probes: std::collections::HashMap<String, usize>,
+        cursor_probe_blocks: std::collections::HashMap<String, Arc<BackendBlock>>,
+        recovery_load_blocks: std::collections::HashMap<String, Arc<BackendBlock>>,
+        recovery_return_blocks: std::collections::HashMap<String, Arc<BackendBlock>>,
+        publication_save_blocks: std::collections::HashMap<String, Arc<BackendBlock>>,
         /// Every `max_bytes` the route asked a bounded source read for. A route
         /// that never bounds its reads leaves this empty while everything else
         /// about the response looks the same.
@@ -29272,6 +30274,14 @@ mod tests {
                 .insert(repo_id.to_string());
         }
 
+        fn start_cursor_faulting(&self, repo_id: &str) {
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_faults
+                .insert(repo_id.to_string());
+        }
+
         fn authority_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
             self.0
                 .lock()
@@ -29285,6 +30295,16 @@ mod tests {
                 })
         }
 
+        /// Names both the armed backend and the specific read that failed.
+        ///
+        /// `BACKEND_FAULT_TEXT` is what a caller asserts to prove the armed
+        /// backend was reached at all. On the repo-scoped route the cursor
+        /// probe is the FIRST backend read (`load_hosted_repository_mcp_view`
+        /// calls `hosted_snapshot_cursor` before any authority load), so a
+        /// message carrying only the cursor text makes that proof fail on a
+        /// fault that did happen. `CURSOR_FAULT_TEXT` stays beside it so a test
+        /// can still tell a cursor fault from an authority one, because only
+        /// this path emits it.
         fn cursor_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
             self.0
                 .lock()
@@ -29293,7 +30313,7 @@ mod tests {
                 .contains(repo_id)
                 .then(|| {
                     kin_db::KinDbError::StorageError(format!(
-                        "{BACKEND_FAULT_TEXT} while reading {repo_id}"
+                        "{BACKEND_FAULT_TEXT}: {CURSOR_FAULT_TEXT} while reading {repo_id}"
                     ))
                 })
         }
@@ -29308,16 +30328,6 @@ mod tests {
                 .or_default() += 1;
         }
 
-        fn record_cursor_probe(&self, repo_id: &str) {
-            *self
-                .0
-                .lock()
-                .unwrap()
-                .cursor_probes
-                .entry(repo_id.to_string())
-                .or_default() += 1;
-        }
-
         fn authority_loads(&self, repo_id: &str) -> usize {
             self.0
                 .lock()
@@ -29328,6 +30338,36 @@ mod tests {
                 .unwrap_or_default()
         }
 
+        fn record_recovery_load(&self, repo_id: &str) {
+            *self
+                .0
+                .lock()
+                .unwrap()
+                .recovery_loads
+                .entry(repo_id.to_string())
+                .or_default() += 1;
+        }
+
+        fn recovery_loads(&self, repo_id: &str) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_loads
+                .get(repo_id)
+                .copied()
+                .unwrap_or_default()
+        }
+
+        fn record_cursor_probe(&self, repo_id: &str) {
+            *self
+                .0
+                .lock()
+                .unwrap()
+                .cursor_probes
+                .entry(repo_id.to_string())
+                .or_default() += 1;
+        }
+
         fn cursor_probes(&self, repo_id: &str) -> usize {
             self.0
                 .lock()
@@ -29336,6 +30376,82 @@ mod tests {
                 .get(repo_id)
                 .copied()
                 .unwrap_or_default()
+        }
+
+        fn block_cursor_probes(&self, repo_id: &str, arrivals: usize) -> BackendBlockHandle {
+            let block = Arc::new(BackendBlock::new(arrivals));
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_probe_blocks
+                .insert(repo_id.to_string(), Arc::clone(&block));
+            BackendBlockHandle(block)
+        }
+
+        fn block_recovery_loads(&self, repo_id: &str, arrivals: usize) -> BackendBlockHandle {
+            let block = Arc::new(BackendBlock::new(arrivals));
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_load_blocks
+                .insert(repo_id.to_string(), Arc::clone(&block));
+            BackendBlockHandle(block)
+        }
+
+        fn block_recovery_returns(&self, repo_id: &str, arrivals: usize) -> BackendBlockHandle {
+            let block = Arc::new(BackendBlock::new(arrivals));
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_return_blocks
+                .insert(repo_id.to_string(), Arc::clone(&block));
+            BackendBlockHandle(block)
+        }
+
+        fn block_publication_saves(&self, repo_id: &str, arrivals: usize) -> BackendBlockHandle {
+            let block = Arc::new(BackendBlock::new(arrivals));
+            self.0
+                .lock()
+                .unwrap()
+                .publication_save_blocks
+                .insert(repo_id.to_string(), Arc::clone(&block));
+            BackendBlockHandle(block)
+        }
+
+        fn cursor_probe_block_for(&self, repo_id: &str) -> Option<Arc<BackendBlock>> {
+            self.0
+                .lock()
+                .unwrap()
+                .cursor_probe_blocks
+                .get(repo_id)
+                .cloned()
+        }
+
+        fn recovery_load_block_for(&self, repo_id: &str) -> Option<Arc<BackendBlock>> {
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_load_blocks
+                .get(repo_id)
+                .cloned()
+        }
+
+        fn recovery_return_block_for(&self, repo_id: &str) -> Option<Arc<BackendBlock>> {
+            self.0
+                .lock()
+                .unwrap()
+                .recovery_return_blocks
+                .get(repo_id)
+                .cloned()
+        }
+
+        fn publication_save_block_for(&self, repo_id: &str) -> Option<Arc<BackendBlock>> {
+            self.0
+                .lock()
+                .unwrap()
+                .publication_save_blocks
+                .get(repo_id)
+                .cloned()
         }
 
         fn start_blob_panicking(&self, repo_id: &str) {
@@ -29418,12 +30534,13 @@ mod tests {
             )
         }
 
-        fn fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
+        fn authority_fault_for(&self, repo_id: &str) -> Option<kin_db::KinDbError> {
             self.faulting.authority_fault_for(repo_id)
         }
     }
 
     const BACKEND_FAULT_TEXT: &str = "object store unreachable";
+    const CURSOR_FAULT_TEXT: &str = "publication metadata unavailable";
 
     impl kin_db::StorageBackend for RepoFaultBackend {
         fn supports_incremental_deltas(&self) -> bool {
@@ -29435,17 +30552,30 @@ mod tests {
             repo_id: &str,
         ) -> std::result::Result<kin_db::SnapshotRecoveryState, kin_db::KinDbError> {
             self.faulting.record_authority_load(repo_id);
-            match self.fault_for(repo_id) {
+            self.faulting.record_recovery_load(repo_id);
+            if let Some(block) = self.faulting.recovery_load_block_for(repo_id) {
+                block.arrive_and_wait();
+            }
+            let outcome = match self.authority_fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_recovery_state(repo_id),
+            };
+            if let Some(block) = self.faulting.recovery_return_block_for(repo_id) {
+                block.arrive_and_wait();
             }
+            outcome
         }
 
         fn load_snapshot_cursor(
             &self,
             repo_id: &str,
         ) -> std::result::Result<Option<kin_db::SnapshotCursor>, kin_db::KinDbError> {
+            // Count the probe before parking on any rendezvous, so a blocked
+            // probe still shows up in `cursor_probes`.
             self.faulting.record_cursor_probe(repo_id);
+            if let Some(block) = self.faulting.cursor_probe_block_for(repo_id) {
+                block.arrive_and_wait();
+            }
             match self.faulting.cursor_fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_snapshot_cursor(repo_id),
@@ -29457,7 +30587,7 @@ mod tests {
             repo_id: &str,
         ) -> std::result::Result<Option<kin_db::SnapshotAuthority>, kin_db::KinDbError> {
             self.faulting.record_authority_load(repo_id);
-            match self.fault_for(repo_id) {
+            match self.authority_fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_snapshot_authority(repo_id),
             }
@@ -29469,7 +30599,7 @@ mod tests {
         ) -> std::result::Result<Option<(Vec<u8>, kin_db::Generation)>, kin_db::KinDbError>
         {
             self.faulting.record_authority_load(repo_id);
-            match self.fault_for(repo_id) {
+            match self.authority_fault_for(repo_id) {
                 Some(error) => Err(error),
                 None => self.inner.load_snapshot(repo_id),
             }
@@ -29543,7 +30673,13 @@ mod tests {
             data: &[u8],
             expected_gen: kin_db::Generation,
         ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
-            self.inner.save_snapshot(repo_id, data, expected_gen)
+            let outcome = self.inner.save_snapshot(repo_id, data, expected_gen);
+            if outcome.is_ok() {
+                if let Some(block) = self.faulting.publication_save_block_for(repo_id) {
+                    block.arrive_and_wait();
+                }
+            }
+            outcome
         }
 
         fn save_snapshot_classified(
@@ -29552,8 +30688,15 @@ mod tests {
             data: &[u8],
             expected_cursor: kin_db::SnapshotCursor,
         ) -> kin_db::SnapshotSaveOutcome {
-            self.inner
-                .save_snapshot_classified(repo_id, data, expected_cursor)
+            let outcome = self
+                .inner
+                .save_snapshot_classified(repo_id, data, expected_cursor);
+            if matches!(&outcome, kin_db::SnapshotSaveOutcome::Committed { .. }) {
+                if let Some(block) = self.faulting.publication_save_block_for(repo_id) {
+                    block.arrive_and_wait();
+                }
+            }
+            outcome
         }
 
         fn save_snapshot_validated(
@@ -29563,8 +30706,18 @@ mod tests {
             expected: kin_db::SnapshotCursor,
             history_validator_version: Option<u32>,
         ) -> kin_db::SnapshotSaveOutcome {
-            self.inner
-                .save_snapshot_validated(repo_id, data, expected, history_validator_version)
+            let outcome = self.inner.save_snapshot_validated(
+                repo_id,
+                data,
+                expected,
+                history_validator_version,
+            );
+            if matches!(&outcome, kin_db::SnapshotSaveOutcome::Committed { .. }) {
+                if let Some(block) = self.faulting.publication_save_block_for(repo_id) {
+                    block.arrive_and_wait();
+                }
+            }
+            outcome
         }
 
         fn record_history_validation(
@@ -29588,7 +30741,13 @@ mod tests {
             delta_data: &[u8],
             base_gen: kin_db::Generation,
         ) -> std::result::Result<kin_db::Generation, kin_db::KinDbError> {
-            self.inner.save_delta(repo_id, delta_data, base_gen)
+            let outcome = self.inner.save_delta(repo_id, delta_data, base_gen);
+            if outcome.is_ok() {
+                if let Some(block) = self.faulting.publication_save_block_for(repo_id) {
+                    block.arrive_and_wait();
+                }
+            }
+            outcome
         }
 
         fn load_deltas_since(
@@ -29667,6 +30826,7 @@ mod tests {
             DaemonState::open_with_backend(layout, Box::new(backend), advertised, Some(allowed))
                 .unwrap(),
         );
+        state.allow_hosted_in_memory_spine_for_test();
         (state, faults, backend_dir)
     }
 
@@ -29678,6 +30838,28 @@ mod tests {
         let (state, faults, _backend_dir) =
             hosted_state_with_backend_dir(label, advertised, siblings);
         (state, faults)
+    }
+
+    fn hosted_state_without_allowlist(
+        label: &str,
+        advertised: &str,
+    ) -> (Arc<DaemonState>, FaultSwitch, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kin-daemon-{label}-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), advertised, None).unwrap(),
+        );
+        state.allow_hosted_in_memory_spine_for_test();
+        (state, faults, backend_dir)
     }
 
     /// The fault fixture must be indistinguishable from the backend it wraps
@@ -29748,6 +30930,658 @@ mod tests {
             })
             .expect("the fixture must forward verified batch reads");
         assert_eq!(batched.as_deref(), Some(body));
+    }
+
+    /// Ref discovery is a metadata read over authority the daemon already
+    /// validated and loaded. Reopening the whole backend snapshot for every
+    /// request made one 315-byte response download and decode the complete
+    /// hosted repository authority, which took 54 seconds on the production
+    /// Kin graph and multiplied peak memory under concurrent status probes.
+    ///
+    /// Faulting storage after startup makes the boundary deterministic. The
+    /// loaded generation must keep answering from its generation-bound cache;
+    /// a cache invalidation test below proves that a later authority movement
+    /// does not stay hidden behind it.
+    #[tokio::test]
+    async fn hosted_refs_reuse_startup_authority_metadata_instead_of_reopening_storage() {
+        let repo_id = format!("hosted-refs-cache-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-hosted-refs-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let expected_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8053,
+            "serve refs from the loaded authority generation",
+        );
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+
+        let startup_recovery_loads = faults.recovery_loads(&repo_id);
+        faults.start_authority_faulting(&repo_id);
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the loaded authority metadata must not reopen storage: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            refs.head_ref.as_deref(),
+            Some(expected_head.to_string().as_str())
+        );
+        assert_eq!(
+            faults.recovery_loads(&repo_id),
+            startup_recovery_loads,
+            "an unchanged cursor must not reopen the full authority"
+        );
+
+        state.evict_repo_cache_for_test(&repo_id).await;
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "an invalidated generation must reopen storage rather than serve stale refs: {message}"
+        );
+        assert!(
+            message.contains(BACKEND_FAULT_TEXT),
+            "the reopen must preserve the backend failure: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hosted_refs_fail_closed_when_publication_freshness_cannot_be_probed() {
+        let repo_id = format!("hosted-refs-probe-fault-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let dir = std::env::temp_dir().join(format!("kin-daemon-hosted-probe-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8054,
+            "seed a generation whose freshness probe later fails",
+        );
+        let (backend, faults) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+
+        faults.start_cursor_faulting(&repo_id);
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "cached refs must not be served after a publication probe fails: {message}"
+        );
+        assert!(
+            message.contains(CURSOR_FAULT_TEXT),
+            "the refusal must preserve the metadata probe failure: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hosted_refs_reload_one_successor_for_concurrent_generation_misses() {
+        const REQUESTS: usize = 8;
+        let repo_id = format!("hosted-refs-successor-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let dir =
+            std::env::temp_dir().join(format!("kin-daemon-hosted-successor-{}", Uuid::new_v4()));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let first_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8055,
+            "seed the generation already cached at startup",
+        );
+        let (backend, loads) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+        let startup_recovery_loads = loads.recovery_loads(&repo_id);
+        let second_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            Some(first_head),
+            0x8056,
+            "publish a successor from another daemon",
+        );
+        let probe_block = loads.block_cursor_probes(&repo_id, REQUESTS);
+        let watchdog = probe_block.release_on_deadline(Duration::from_secs(3));
+        let recovery_block = loads.block_recovery_loads(&repo_id, 1);
+        let recovery_watchdog = recovery_block.release_on_deadline(Duration::from_secs(3));
+
+        let path = Arc::new(format!("/repos/{repo_id}/refs"));
+        let mut requests = tokio::task::JoinSet::new();
+        for _ in 0..REQUESTS {
+            let state = Arc::clone(&state);
+            let path = Arc::clone(&path);
+            requests.spawn(async move { repo_route(state, path.as_str()).await });
+        }
+        let all_arrived = tokio::time::timeout(Duration::from_secs(2), async {
+            while probe_block.arrivals() != REQUESTS {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        probe_block.release();
+        let recovery_arrived = tokio::time::timeout(Duration::from_secs(2), async {
+            while recovery_block.arrivals() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let coordination_observed = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let parked_waiters = state.repo_graph_load_waiters_for_test();
+                let recovery_loads = loads.recovery_loads(&repo_id);
+                if parked_waiters == REQUESTS - 1 || recovery_loads > startup_recovery_loads + 1 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let recovery_loads_while_winner_blocked = loads.recovery_loads(&repo_id);
+        recovery_block.release();
+        let responses_result = drain_join_set_or_abort(&mut requests, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+        recovery_watchdog.join().unwrap();
+
+        all_arrived.expect("every request must observe the stale cursor before any reload can win");
+        recovery_arrived.expect("one request must win and enter full authority recovery");
+        coordination_observed.expect(
+            "every losing request must either park at the gate or expose a duplicate recovery",
+        );
+        let responses = responses_result.expect("every concurrent refs request must drain");
+        assert_eq!(responses.len(), REQUESTS);
+        assert_eq!(
+            probe_block.arrivals(),
+            REQUESTS,
+            "the test must create concurrent generation misses"
+        );
+        assert_eq!(
+            recovery_loads_while_winner_blocked,
+            startup_recovery_loads + 1,
+            "no waiter may enter recovery while the winning generation reload is parked"
+        );
+        for (status, body) in responses {
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the moved generation must remain answerable: {}",
+                String::from_utf8_lossy(&body)
+            );
+            let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                refs.head_ref.as_deref(),
+                Some(second_head.to_string().as_str()),
+                "no concurrent waiter may receive the stale startup generation"
+            );
+        }
+        assert_eq!(
+            loads.recovery_loads(&repo_id),
+            startup_recovery_loads + 1,
+            "a generation movement must trigger exactly one full authority reload"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hosted_reload_retries_when_publication_moves_after_recovery_read() {
+        let repo_id = format!("hosted-recovery-move-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "kin-daemon-hosted-recovery-move-{}",
+            Uuid::new_v4()
+        ));
+        let kin_dir = dir.join(".kin");
+        std::fs::create_dir_all(kin_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(kin_dir.join("working")).unwrap();
+        let layout = kin_core::KinLayout::new(kin_dir);
+        kin_core::manifest::KinManifest::new()
+            .save(&layout.manifest_path())
+            .unwrap();
+        let backend_dir = dir.join("backend");
+        std::fs::create_dir_all(&backend_dir).unwrap();
+        let first_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8058,
+            "seed the generation already cached at startup",
+        );
+        let (backend, loads) = RepoFaultBackend::new(&backend_dir);
+        let state = Arc::new(
+            DaemonState::open_with_backend(layout, Box::new(backend), &repo_id, None).unwrap(),
+        );
+        let startup_recovery_loads = loads.recovery_loads(&repo_id);
+        let second_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            Some(first_head),
+            0x8059,
+            "publish the generation captured by the first recovery",
+        );
+        let recovery_return = loads.block_recovery_returns(&repo_id, 1);
+        let watchdog = recovery_return.release_on_deadline(Duration::from_secs(4));
+
+        let request_state = Arc::clone(&state);
+        let request_path = format!("/repos/{repo_id}/refs");
+        let mut request =
+            tokio::spawn(async move { repo_route(request_state, &request_path).await });
+        let recovery_captured = tokio::time::timeout(Duration::from_secs(2), async {
+            while recovery_return.arrivals() != 1 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let third_head = seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            Some(second_head),
+            0x8060,
+            "move publication after the first recovery already read its bytes",
+        );
+        recovery_return.release();
+        let response = join_task_or_abort(&mut request, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+
+        recovery_captured.expect("the first recovery must capture bytes before publication moves");
+        let (status, body) =
+            response.expect("the bounded retry must complete after the recovery block releases");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the successor generation must remain answerable: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let refs: RepoRefsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            refs.head_ref.as_deref(),
+            Some(third_head.to_string().as_str()),
+            "the route must not install or answer the generation read before the cursor moved"
+        );
+        assert_eq!(
+            loads.recovery_loads(&repo_id),
+            startup_recovery_loads + 2,
+            "one moved recovery and one stable retry must be observed"
+        );
+    }
+
+    #[tokio::test]
+    async fn absent_repo_ids_do_not_grow_reload_coordination_without_an_allowlist() {
+        let advertised = format!("hosted-gate-bound-{}", Uuid::new_v4());
+        let (state, _faults, _backend_dir) =
+            hosted_state_without_allowlist("gate-bound", &advertised);
+        let fixed_gate_count = state.repo_graph_load_gate_count_for_test();
+        assert_eq!(
+            fixed_gate_count, 64,
+            "reload coordination must remain a fixed-size sharded table"
+        );
+
+        for index in 0..(fixed_gate_count * 4) {
+            let repo_id = format!("absent-{index}-{}", Uuid::new_v4());
+            assert!(
+                matches!(
+                    state.get_repo_graph(&repo_id).await,
+                    Err(crate::error::DaemonError::RepoAbsentFromStorage(absent)) if absent == repo_id
+                ),
+                "each adversarial id must reach a real absent-storage answer"
+            );
+        }
+
+        assert_eq!(
+            state.repo_graph_load_gate_count_for_test(),
+            fixed_gate_count,
+            "absent ids must not allocate permanent reload gates"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_hosted_reload_does_not_starve_liveness() {
+        let repo_id = format!("hosted-liveness-{}", Uuid::new_v4());
+        let (state, faults, _backend_dir) =
+            hosted_state_without_allowlist("reload-liveness", &repo_id);
+        state.evict_repo_cache_for_test(&repo_id).await;
+        let recovery_block = faults.block_recovery_loads(&repo_id, 1);
+        let watchdog = recovery_block.release_on_deadline(Duration::from_secs(3));
+
+        let started = Instant::now();
+        let blocked_state = Arc::clone(&state);
+        let blocked_path = format!("/repos/{repo_id}/refs");
+        let mut blocked =
+            tokio::spawn(async move { repo_route(blocked_state, &blocked_path).await });
+        while recovery_block.arrivals() == 0 && started.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let reached_block = recovery_block.arrivals() == 1;
+
+        let (health_status, _health_body) = repo_route(Arc::clone(&state), "/health").await;
+        let liveness_elapsed = started.elapsed();
+        recovery_block.release();
+        let blocked_result = join_task_or_abort(&mut blocked, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+
+        blocked_result.expect("the released full recovery must drain");
+        assert!(
+            reached_block,
+            "the slow full recovery must actually be blocked"
+        );
+        assert_eq!(health_status, StatusCode::OK);
+        assert!(
+            liveness_elapsed < Duration::from_secs(1),
+            "a synchronous hosted reload starved the sole Tokio worker for {liveness_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn a_blocked_hosted_cursor_probe_does_not_starve_liveness() {
+        let repo_id = format!("hosted-probe-liveness-{}", Uuid::new_v4());
+        let (state, faults, _backend_dir) =
+            hosted_state_without_allowlist("probe-liveness", &repo_id);
+        let cursor_block = faults.block_cursor_probes(&repo_id, 1);
+        let watchdog = cursor_block.release_on_deadline(Duration::from_secs(3));
+
+        let started = Instant::now();
+        let blocked_state = Arc::clone(&state);
+        let blocked_path = format!("/repos/{repo_id}/refs");
+        let mut blocked =
+            tokio::spawn(async move { repo_route(blocked_state, &blocked_path).await });
+        while cursor_block.arrivals() == 0 && started.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let reached_block = cursor_block.arrivals() == 1;
+
+        let (health_status, _health_body) = repo_route(Arc::clone(&state), "/health").await;
+        let liveness_elapsed = started.elapsed();
+        cursor_block.release();
+        let blocked_result = join_task_or_abort(&mut blocked, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+
+        blocked_result.expect("the released cursor probe must drain");
+        assert!(
+            reached_block,
+            "the hosted cursor probe must actually be blocked"
+        );
+        assert_eq!(health_status, StatusCode::OK);
+        assert!(
+            liveness_elapsed < Duration::from_secs(1),
+            "a synchronous hosted cursor probe starved the sole Tokio worker for {liveness_elapsed:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn durable_transfer_receipt_bypasses_an_unrelated_blocked_reload() {
+        let repo_id = format!("hosted-receipt-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let pack = transfer_pack_for_unborn_destination(&repository_id);
+        let admitted_head = pack.source_head;
+        let transfer_id = pack.transfer_id;
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+        let expected_destination_ref = destination_ref.clone();
+        let (state, faults, _backend_dir) =
+            hosted_state_without_allowlist("receipt-reload", &repo_id);
+        state.evict_repo_cache_for_test(&repo_id).await;
+        let recovery_block = faults.block_recovery_loads(&repo_id, 1);
+        let watchdog = recovery_block.release_on_deadline(Duration::from_secs(3));
+
+        let blocked_state = Arc::clone(&state);
+        let blocked_path = format!("/repos/{repo_id}/refs");
+        let mut blocked =
+            tokio::spawn(async move { repo_route(blocked_state, &blocked_path).await });
+        let reached_block = tokio::time::timeout(Duration::from_secs(2), async {
+            while recovery_block.arrivals() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+
+        let receive = router(Arc::clone(&state)).oneshot(
+            Request::post(format!("/repos/{repo_id}/transfer/receive"))
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "destination_ref": destination_ref,
+                        "pack": pack,
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        );
+        let receive_result = tokio::time::timeout(Duration::from_secs(2), receive).await;
+        recovery_block.release();
+        let blocked_result = join_task_or_abort(&mut blocked, Duration::from_secs(3)).await;
+        watchdog.join().unwrap();
+        let (blocked_status, blocked_body) =
+            blocked_result.expect("the deliberately blocked reload must unwind after release");
+        let response = receive_result
+            .expect("a durable receipt must not wait behind an unrelated full reload")
+            .unwrap();
+        let response_status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+            serde_json::from_slice(&response_body).unwrap();
+        reached_block.expect("the unrelated full reload must reach its deliberate block");
+        assert_eq!(response_status, StatusCode::OK);
+        assert_eq!(
+            receipt.outcome,
+            kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed,
+            "the response must be the durable committed receipt"
+        );
+        assert_eq!(receipt.transfer_id, transfer_id);
+        assert_eq!(receipt.repository_id, repository_id);
+        assert_eq!(receipt.destination_ref, expected_destination_ref);
+        assert_eq!(receipt.destination_head, admitted_head);
+        assert_eq!(
+            blocked_status,
+            StatusCode::OK,
+            "the unblocked reload must install the committed successor: {}",
+            String::from_utf8_lossy(&blocked_body)
+        );
+        let refs: RepoRefsResponse = serde_json::from_slice(&blocked_body).unwrap();
+        assert_eq!(
+            refs.head_ref.as_deref(),
+            Some(admitted_head.to_string().as_str())
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_late_receive_completion_does_not_delete_an_installed_successor() {
+        let repo_id = format!("hosted-late-receive-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let pack = transfer_pack_for_unborn_destination(&repository_id);
+        let admitted_head = pack.source_head;
+        let transfer_id = pack.transfer_id;
+        let destination_ref = kin_model::RefName::branch(b"main").unwrap();
+        let expected_destination_ref = destination_ref.clone();
+        let (state, faults, _backend_dir) =
+            hosted_state_without_allowlist("late-receive", &repo_id);
+        let save_block = faults.block_publication_saves(&repo_id, 1);
+
+        let receive_state = Arc::clone(&state);
+        let receive_repo_id = repo_id.clone();
+        let mut receive = tokio::spawn(async move {
+            router(receive_state)
+                .oneshot(
+                    Request::post(format!("/repos/{receive_repo_id}/transfer/receive"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&serde_json::json!({
+                                "destination_ref": destination_ref,
+                                "pack": pack,
+                            }))
+                            .unwrap(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+        });
+        let reached_save = tokio::time::timeout(Duration::from_secs(2), async {
+            while save_block.arrivals() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        if reached_save.is_err() {
+            save_block.release();
+            let _ = join_task_or_abort(&mut receive, Duration::from_secs(3)).await;
+            panic!("the receive must pause after its durable publication");
+        }
+
+        let installed_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")),
+        )
+        .await;
+        let loads_after_install = faults.recovery_loads(&repo_id);
+
+        save_block.release();
+        let receive_result = join_task_or_abort(&mut receive, Duration::from_secs(3)).await;
+        let (installed_status, installed_body) = installed_result.expect(
+            "a reader must install the durable successor while receive completion is paused",
+        );
+        assert_eq!(
+            installed_status,
+            StatusCode::OK,
+            "a reader must install the already durable successor while receive completion is paused: {}",
+            String::from_utf8_lossy(&installed_body)
+        );
+        let installed: RepoRefsResponse = serde_json::from_slice(&installed_body).unwrap();
+        assert_eq!(
+            installed.head_ref.as_deref(),
+            Some(admitted_head.to_string().as_str())
+        );
+        let response = receive_result
+            .expect("receive completion must resume after the save block releases")
+            .unwrap();
+        let response_status = response.status();
+        let response_body = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        let receipt: kin_remote::repository_transfer::RepositoryTransferReceipt =
+            serde_json::from_slice(&response_body).unwrap();
+        assert_eq!(response_status, StatusCode::OK);
+        assert_eq!(
+            receipt.outcome,
+            kin_remote::repository_transfer::RepositoryTransferApplyOutcome::Committed,
+            "the late completion must return its durable committed receipt"
+        );
+        assert_eq!(receipt.transfer_id, transfer_id);
+        assert_eq!(receipt.repository_id, repository_id);
+        assert_eq!(receipt.destination_ref, expected_destination_ref);
+        assert_eq!(receipt.destination_head, admitted_head);
+        tokio::task::yield_now().await;
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/refs")).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            faults.recovery_loads(&repo_id),
+            loads_after_install,
+            "receive completion after successor installation must not evict that generation"
+        );
+    }
+
+    /// Durable authority that advances after the daemon froze its startup graph
+    /// must never be answered out of that frozen graph.
+    ///
+    /// A primary capture is bound to the publication cursor its cache entry was
+    /// loaded at. Once durable authority moves past that cursor the capture can
+    /// no longer be proved current, so the spine is left unpublished rather than
+    /// published over rows the store has already superseded. That is the safe
+    /// direction, and the refusal has to say which one it took: a spine that is
+    /// merely absent and a spine that refused a stale capture are the same
+    /// observation from outside, and only the recorded cause separates them.
+    ///
+    /// The narrower claim this replaced, that a later `ensure_spine` cannot
+    /// re-register the startup graph over hosted rows, is not reachable from
+    /// this fixture. A storage-backed daemon requires hosted spine readiness, so
+    /// production builds its backend through
+    /// `ensure_hosted_spine_backend_constructed` and never reaches the startup
+    /// capture path at all; only the in-memory test seam routes a backed state
+    /// through it. `hosted_spine_refuses_persistence_without_cursor_cas` carries
+    /// the hosted fail-closed half.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn hosted_spine_refuses_a_startup_capture_once_durable_authority_advanced() {
+        let registry_dir = tempfile::tempdir().unwrap();
+        let registry_path = registry_dir.path().join("registry.toml");
+        kin_core::registry::KinRegistry { repos: Vec::new() }
+            .save_to(&registry_path)
+            .unwrap();
+        let _spine_env = kin_core::test_env::EnvVarGuard::set("KIN_REGISTRY_PATH", &registry_path)
+            .without("KIN_DISABLE_SPINE");
+
+        let repo_id = format!("hosted-spine-current-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _faults, backend_dir) =
+            hosted_state_without_allowlist("spine-current", &repo_id);
+        seed_replica_change(
+            &backend_dir,
+            &repository_id,
+            None,
+            0x8057,
+            "publish authority after the daemon startup graph was frozen",
+        );
+
+        let refusal = state
+            .ingest_repo_into_spine(&repo_id, false)
+            .await
+            .expect_err("a startup capture bound to a superseded cursor must not publish");
+        let message = refusal.to_string();
+        // Two separate facts, so a mutation that keeps one and loses the other
+        // is still caught, and the assertion that fires says which half went.
+        // A `!contains(generic fallback)` arm was tried here and removed: the
+        // two strings are mutually exclusive, so it could never fire while the
+        // assertion above it passed, and an assertion that cannot fire reads as
+        // coverage without being any.
+        assert!(
+            message.contains("could not capture stable spine authority"),
+            "the refusal must name the capture that could not be proved current: {message}"
+        );
+        assert!(
+            message.contains("graph changed while its detached spine domain was captured"),
+            "the refusal must carry why the capture could not be proved, not just that it could not: {message}"
+        );
+        assert!(
+            state.spine().is_none(),
+            "a refused capture must leave no spine published"
+        );
     }
 
     /// A hosted daemon serves every allowlisted repository, not only the one it
@@ -37918,20 +39752,41 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn spine_health_returns_ok() {
+    async fn spine_health_is_side_effect_free_and_reports_initialized_state() {
         let state = test_state();
+        assert!(state.spine().is_none());
+        let app = router(Arc::clone(&state));
+        let uninitialized = app
+            .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(uninitialized.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            state.spine().is_none(),
+            "public spine health must not initialize or publish spine authority"
+        );
+
+        state.ensure_spine().expect("spine enabled in test");
         let app = router(state);
         let response = app
             .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
-        // Spine should be initialized on DaemonState::open
         assert_eq!(response.status(), StatusCode::OK);
         let body = axum::body::to_bytes(response.into_body(), 4096)
             .await
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["status"], "ok");
+        // The route is side-effect-free, so its counts are the last proven head
+        // set rather than a fresh durable read. A response that says `ok` and
+        // nothing else invites a reader to treat a cache as current authority,
+        // so the reading has to be on the wire, not only in a comment.
+        assert_eq!(
+            json["durable_heads_reread"],
+            serde_json::Value::Bool(false),
+            "health must state that it did not re-read durable heads: {json}"
+        );
     }
 
     /// A zero edge count says nothing on its own, so the health route reports
@@ -37959,6 +39814,7 @@ mod tests {
     async fn spine_health_reports_both_completeness_readings_beside_the_edge_count() {
         let state = test_state();
         let startup_complete = state.startup_authority_complete();
+        state.ensure_spine().expect("spine enabled in test");
         let app = router(state);
         let response = app
             .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
@@ -38014,6 +39870,7 @@ mod tests {
     #[serial_test::serial]
     async fn spine_health_reports_a_bounded_sibling_capture_as_its_own_state() {
         let state = test_state();
+        state.ensure_spine().expect("spine enabled in test");
         let app = router(state);
         let response = app
             .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
@@ -38111,6 +39968,7 @@ mod tests {
                 entities: 1,
                 last_commit: String::new(),
                 dependencies: vec![],
+                dependencies_recorded_by: None,
             }],
         }
         .save_to(&registry_path)
@@ -38127,6 +39985,7 @@ mod tests {
              test proves nothing about reporting one"
         );
 
+        state.ensure_spine().expect("spine enabled in test");
         let app = router(state);
         let response = app
             .oneshot(Request::get("/spine/health").body(Body::empty()).unwrap())
@@ -40515,6 +42374,308 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::OK);
     }
 
+    // Adopted from lane review-1227auth, with their message assertions
+    // re-pointed. There is one distinctness guard, in
+    // `router_with_rotation_tokens`. These two arms prove the wrapper path and
+    // the serve path each REACH it, which is what a second entry point can
+    // still be wrong about once the guard itself has its own test.
+
+    /// A hosted state, so the publication-control constructor assertions are
+    /// reachable at all. Returns the tempdirs because dropping them removes the
+    /// layout out from under the state.
+    fn reviewer_hosted_state() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        kin_core::test_env::EnvVarGuard,
+        Arc<DaemonState>,
+    ) {
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        for name in [
+            "GOOGLE_CLOUD_PROJECT",
+            "FIRESTORE_DATABASE_ID",
+            "KIN_GCS_BUCKET",
+            "KIN_GCS_PREFIX",
+            "KIN_REPO_IDS",
+        ] {
+            environment.apply::<_, &str>(name, None);
+        }
+        let fleet = vec!["kin".to_string(), "kin-db".to_string()];
+        let repo = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(repo.path()).unwrap();
+        let backend_root = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::publication_lease::InMemoryPublicationControlStore::default());
+        let control = Arc::new(
+            crate::publication_lease::PublicationControl::new(
+                "gcs://reviewer-fixture/v2",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                fleet.clone(),
+                store,
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(
+            DaemonState::open_with_backend_and_publication_control(
+                initialized.layout,
+                Box::new(kin_db::LocalFileBackend::new(backend_root.path())),
+                "kin",
+                Some(fleet.into_iter().collect()),
+                control,
+            )
+            .unwrap(),
+        );
+        (repo, backend_root, environment, state)
+    }
+
+    /// DECISION 3, first call site. The internal router wrapper must refuse an
+    /// administrator token equal to the daemon token.
+    #[test]
+    fn reviewer_the_internal_router_refuses_an_admin_token_equal_to_the_daemon_token() {
+        let (_repo, _backend, _env, state) = reviewer_hosted_state();
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            move || {
+                router_with_publication_control_auth(
+                    state,
+                    Some("one-and-the-same".to_string()),
+                    Some("one-and-the-same".to_string()),
+                )
+            }
+        }));
+        let error = refused.expect_err(
+            "an administrator token equal to the daemon token must be refused by the internal \
+             router wrapper",
+        );
+        let message = error
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| error.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_default();
+        // There is ONE distinctness guard now, in `router_with_rotation_tokens`.
+        // This arm no longer proves a wrapper-local check exists; it proves the
+        // wrapper PATH reaches the guard, which is a different claim and the
+        // only one it can still make honestly.
+        assert!(
+            message.contains(
+                "hosted graph publication control administrator authentication must not be any \
+                 token this daemon accepts, the superseded one included"
+            ),
+            "the wrapper path must reach the router's distinctness guard; got {message}"
+        );
+
+        // Control: distinct tokens must BUILD, or the arm above would pass on a
+        // constructor that refuses everything.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            router_with_publication_control_auth(
+                state,
+                Some("daemon-token".to_string()),
+                Some("admin-token".to_string()),
+            )
+        }));
+        assert!(
+            built.is_ok(),
+            "distinct tokens must build, or the refusal above says nothing about distinctness"
+        );
+    }
+
+    /// DECISION 3, second call site. The SERVE path must refuse the same
+    /// pairing. It reaches the router through `router_with_rotation_tokens`
+    /// rather than through the internal wrapper, so the arm above cannot see
+    /// this one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reviewer_the_serve_path_refuses_an_admin_token_equal_to_the_daemon_token() {
+        let (_repo, _backend, mut environment, state) = reviewer_hosted_state();
+        environment.apply(DAEMON_AUTH_TOKEN_ENV, Some("one-and-the-same"));
+        environment.apply(
+            "KIN_PUBLICATION_CONTROL_AUTH_TOKEN",
+            Some("one-and-the-same"),
+        );
+        environment.apply::<_, &str>(DAEMON_AUTH_TOKEN_PREVIOUS_ENV, None);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let served = tokio::spawn(async move {
+            let _ =
+                serve_bound_with_shutdown(state, listener, Some(shutdown_tx), shutdown_rx).await;
+        });
+        let joined = tokio::time::timeout(std::time::Duration::from_secs(20), served).await;
+        let outcome = joined.expect(
+            "the serve path must refuse an administrator token equal to the daemon token; it \
+             served instead",
+        );
+        let error = outcome.expect_err(
+            "the serve path must refuse the pairing rather than serve; it returned instead",
+        );
+        assert!(
+            error.is_panic(),
+            "the serve path must refuse by panicking, and the task ended some other way"
+        );
+        // The MESSAGE, not merely that something panicked. Any panic anywhere
+        // inside `serve_bound_with_shutdown` satisfies `is_panic`, so on its own
+        // this arm cannot tell the distinctness guard from an unrelated failure:
+        // rewording the guard would leave it green while the wrapper arm reds.
+        // Downcast the join payload the way the wrapper arm downcasts its
+        // `catch_unwind` payload, and assert the same exact string.
+        let payload = error.into_panic();
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains(
+                "hosted graph publication control administrator authentication must not be any \
+                 token this daemon accepts, the superseded one included"
+            ),
+            "the serve path must reach the router's distinctness guard rather than panic \
+             somewhere else; got {message}"
+        );
+    }
+
+    /// The administrator token may not equal the SUPERSEDED daemon token
+    /// either, which the first version of the distinctness check missed.
+    ///
+    /// It compared the primary only, so handing the retired credential over as
+    /// the administrator token was allowed, and every client still holding that
+    /// retired credential became an administrator on this surface. The check now
+    /// asks the token set rather than one plaintext, so it covers both.
+    #[test]
+    fn the_administrator_token_may_not_equal_the_superseded_daemon_token() {
+        let (_repo, _backend, _env, state) = reviewer_hosted_state();
+        let window = tempfile::tempdir().expect("tempdir");
+        let tokens = open_rotation_window(&window, 3_600, 1_000);
+
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            let tokens = tokens.clone();
+            move || {
+                router_with_rotation_tokens(
+                    state,
+                    tokens,
+                    // `open_rotation_window`'s own superseded token.
+                    Some("retired-token".to_string()),
+                    None,
+                )
+            }
+        }));
+        let error = refused.expect_err(
+            "the superseded daemon token must not be accepted as the administrator token",
+        );
+        let message = error
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| error.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains(
+                "hosted graph publication control administrator authentication must not be any \
+                 token this daemon accepts, the superseded one included"
+            ),
+            "the refusal must be the constructor guard, which is the only one that sees the \
+             superseded token; got {message}"
+        );
+
+        // The primary is refused by the same check, so neither configured token
+        // can be handed over.
+        let primary_refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe({
+            let state = Arc::clone(&state);
+            let tokens = tokens.clone();
+            move || {
+                router_with_rotation_tokens(state, tokens, Some("current-token".to_string()), None)
+            }
+        }));
+        assert!(
+            primary_refused.is_err(),
+            "the primary daemon token must not be accepted as the administrator token either"
+        );
+
+        // Control: a token that is neither must BUILD, or the two refusals above
+        // say nothing about distinctness and only that the constructor refuses.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            router_with_rotation_tokens(state, tokens, Some("admin-token".to_string()), None)
+        }));
+        assert!(
+            built.is_ok(),
+            "a distinct administrator token must build, or the refusals above prove nothing"
+        );
+    }
+
+    /// The harm the accept-cap fix is actually about, measured end to end.
+    ///
+    /// The counter is a proxy. What the cap does is CLOSE the window, and a
+    /// closed window 401s the retired credential. So the claim worth asserting
+    /// is not "the count did not move" but "a request this surface refused did
+    /// not cost a request it would have served". A cap of one makes the two
+    /// separable: before the fix the 403 spent the only slot and the /session
+    /// that followed got 401.
+    #[tokio::test]
+    async fn a_refused_admin_request_does_not_close_the_window_against_served_traffic() {
+        let window = tempfile::tempdir().expect("tempdir");
+        let tokens = open_rotation_window(&window, 3_600, 1);
+        let app = router_with_rotation_tokens(
+            test_state(),
+            tokens.clone(),
+            Some("admin-token".to_string()),
+            None,
+        );
+
+        let refused = app
+            .clone()
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            tokens.previous_accepted_count(),
+            0,
+            "the refused request must not have claimed the window's only slot"
+        );
+
+        // The slot is still there for traffic that is actually served.
+        let served = app
+            .clone()
+            .oneshot(
+                Request::get("/session")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            served.status(),
+            StatusCode::UNAUTHORIZED,
+            "the window must still admit the superseded token, because nothing it served has \
+             spent the cap yet"
+        );
+        assert_eq!(
+            tokens.previous_accepted_count(),
+            1,
+            "the SERVED request is what spends the slot"
+        );
+
+        // And the cap still closes on served traffic, so the fix did not simply
+        // stop the counter working.
+        let after_cap = app
+            .oneshot(
+                Request::get("/session")
+                    .header("authorization", "Bearer retired-token")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            after_cap.status(),
+            StatusCode::UNAUTHORIZED,
+            "a cap of one must still close the window after one served request"
+        );
+    }
+
     /// An open rotation window whose durable record lives in a temp directory.
     ///
     /// The record path is per-test on purpose: a shared one would let two tests
@@ -40541,6 +42702,108 @@ mod tests {
         .unwrap()
     }
 
+    /// The join this merge created, which nothing else covers.
+    ///
+    /// The publication-control branch and the rotation window were written by
+    /// two changes that never saw each other. Every rotation test builds a
+    /// router with no administrator token, so that branch is never entered;
+    /// every publication-control test builds one through `primary_only`, so the
+    /// window is always closed. Both sides stay green while the composition is
+    /// wrong, which is the shape that needs its own test rather than more tests
+    /// of either side.
+    #[tokio::test]
+    async fn a_superseded_token_is_forbidden_rather_than_unauthorized_on_publication_control() {
+        let window = tempfile::tempdir().expect("tempdir");
+        let tokens = open_rotation_window(&window, 3_600, 1_000);
+        let app = router_with_rotation_tokens(
+            test_state(),
+            tokens.clone(),
+            Some("publication-test-token".to_string()),
+            None,
+        );
+
+        let control = |app: Router, token: &'static str| async move {
+            app.oneshot(
+                Request::get("/authority/publication-control")
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+
+        // A superseded token is a valid daemon credential, so it is
+        // authenticated and unauthorized here: 403, not 401. The other way round
+        // would tell a caller holding a live credential that it holds none.
+        assert_eq!(
+            control(app.clone(), "retired-token").await,
+            StatusCode::FORBIDDEN
+        );
+        // And the accept is NOT counted. The count is what closes the window,
+        // and closing it means 401ing traffic the retired credential is still
+        // carrying. A request this surface refused is not that traffic, so
+        // spending a slot on it closes the window early against requests that
+        // were actually served.
+        assert_eq!(
+            tokens.previous_accepted_count(),
+            0,
+            "a request refused on authorization must not spend the window's accept cap"
+        );
+
+        // The primary is authenticated and equally unauthorized here, and it
+        // must not move the superseded counter.
+        assert_eq!(
+            control(app.clone(), "current-token").await,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(tokens.previous_accepted_count(), 0);
+
+        // Neither accepted token is refused as unauthenticated, and that refusal
+        // is not an accept.
+        assert_eq!(
+            control(app.clone(), "neither-token").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(tokens.previous_accepted_count(), 0);
+
+        // The administrator token passes the guard. What the route answers past
+        // it is not this test's business, only that it is neither refusal.
+        let admin = control(app, "publication-test-token").await;
+        assert!(
+            admin != StatusCode::UNAUTHORIZED && admin != StatusCode::FORBIDDEN,
+            "the administrator token must pass the auth guard, got {admin}"
+        );
+
+        // The ordering half of the same decision, and the reason the
+        // publication-control branch sits ABOVE the enforcement gate rather than
+        // below it. With no daemon token configured at all the gate would return
+        // early, so a daemon that enforces nothing would hand out its rollout
+        // surface to an unauthenticated caller. Every assertion above this one
+        // runs with an enforced window and stays green either way, so without
+        // this arm the ordering is untested.
+        let unenforced = router_with_rotation_tokens(
+            test_state(),
+            crate::auth_rotation::RotationTokens::primary_only(None),
+            Some("publication-test-token".to_string()),
+            None,
+        );
+        let no_daemon_auth = unenforced
+            .oneshot(
+                Request::get("/authority/publication-control")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            no_daemon_auth.status(),
+            StatusCode::FORBIDDEN,
+            "an unenforced daemon must still refuse the publication-control surface"
+        );
+    }
+
     /// The rotation window, exercised through the real router rather than
     /// through `RotationTokens` alone.
     ///
@@ -40551,7 +42814,7 @@ mod tests {
     async fn an_open_rotation_window_accepts_both_tokens_over_http() {
         let window = tempfile::tempdir().expect("tempdir");
         let tokens = open_rotation_window(&window, 3_600, 1_000);
-        let app = router_with_rotation_tokens(test_state(), tokens.clone(), None);
+        let app = router_with_rotation_tokens(test_state(), tokens.clone(), None, None);
 
         let with_current = app
             .clone()
@@ -40670,7 +42933,7 @@ mod tests {
         // A cap of one, so the second superseded request is the first refused
         // one and the arms cannot be confused for each other.
         let tokens = open_rotation_window(&window, 3_600, 1);
-        let app = router_with_rotation_tokens(test_state(), tokens.clone(), None);
+        let app = router_with_rotation_tokens(test_state(), tokens.clone(), None, None);
 
         let retired = |app: Router| async move {
             app.oneshot(
@@ -40736,7 +42999,7 @@ mod tests {
     async fn the_rotation_status_route_reports_the_counter_the_guard_increments() {
         let window = tempfile::tempdir().expect("tempdir");
         let tokens = open_rotation_window(&window, 3_600, 1_000);
-        let app = router_with_rotation_tokens(test_state(), tokens, None);
+        let app = router_with_rotation_tokens(test_state(), tokens, None, None);
 
         let before = app
             .clone()

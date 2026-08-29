@@ -5131,6 +5131,20 @@ pub async fn run_with_authority_on(
                         let mut server_start_failed: std::collections::HashSet<
                             kin_model::LanguageId,
                         > = std::collections::HashSet::new();
+                        // What this process OBSERVED when it tried to serve each
+                        // language it could not, and how many files that cost.
+                        // `files_blocked` counts files and cannot name a
+                        // language, which is why a completion line could read
+                        // "complete (5/303 files)" over a pass whose Rust server
+                        // never started. Kept beside the set rather than
+                        // replacing it so the retry short-circuit above stays a
+                        // set membership test.
+                        let mut skip_reason: std::collections::HashMap<
+                            kin_model::LanguageId,
+                            String,
+                        > = std::collections::HashMap::new();
+                        let mut skip_files: std::collections::HashMap<kin_model::LanguageId, u64> =
+                            std::collections::HashMap::new();
 
                         // Build entity index for the whole graph (used for target matching).
                         let entity_refs: Vec<kin_lsp::EntityRef> = entities
@@ -5225,6 +5239,7 @@ pub async fn run_with_authority_on(
                             // not retried for every remaining file.
                             if server_start_failed.contains(&lang) {
                                 tally.server_unavailable += 1;
+                                *skip_files.entry(lang).or_insert(0) += 1;
                                 continue;
                             }
 
@@ -5263,7 +5278,15 @@ pub async fn run_with_authority_on(
                                                  files in this language are left unenriched"
                                             );
                                             server_start_failed.insert(lang);
+                                            skip_reason.entry(lang).or_insert_with(|| {
+                                                format!(
+                                                    "the `{cmd}` language server did not start \
+                                                     ({e}), so nothing in this language was \
+                                                     enriched"
+                                                )
+                                            });
                                             tally.server_unavailable += 1;
+                                            *skip_files.entry(lang).or_insert(0) += 1;
                                             continue;
                                         }
                                     }
@@ -5276,7 +5299,13 @@ pub async fn run_with_authority_on(
                                 // uncounted file is how `files=0 total_files=66`
                                 // came to read as a completed sweep.
                                 server_start_failed.insert(lang);
+                                skip_reason.entry(lang).or_insert_with(|| {
+                                    "this build wires no language server for this language, so \
+                                     none was started"
+                                        .to_string()
+                                });
                                 tally.server_unavailable += 1;
+                                *skip_files.entry(lang).or_insert(0) += 1;
                                 continue;
                             };
 
@@ -5576,6 +5605,35 @@ pub async fn run_with_authority_on(
                         lsp_state
                             .lsp_sweep_files_blocked
                             .store(tally.blocked() as u64, std::sync::atomic::Ordering::SeqCst);
+                        // Published with the counts, so a caller reading a
+                        // nonzero blocked count can also say which language it
+                        // lost and what this process saw. Replaces the previous
+                        // sweep's record wholesale: a fresh answer supersedes an
+                        // old one, and a merged one would keep naming a language
+                        // whose server now starts.
+                        {
+                            let mut skipped: Vec<crate::state::SweepLanguageSkip> = skip_files
+                                .iter()
+                                .map(|(language, files)| crate::state::SweepLanguageSkip {
+                                    language: language.to_string(),
+                                    files: *files,
+                                    reason: skip_reason.get(language).cloned().unwrap_or_else(
+                                        || {
+                                            "this sweep could not serve the language and did not \
+                                             record why"
+                                                .to_string()
+                                        },
+                                    ),
+                                })
+                                .collect();
+                            // A HashMap iterates in an arbitrary order, so two
+                            // broken servers would otherwise hand the same host
+                            // a different sentence each run.
+                            skipped.sort_by(|a, b| a.language.cmp(&b.language));
+                            if let Ok(mut slot) = lsp_state.lsp_sweep_languages_skipped.lock() {
+                                *slot = skipped;
+                            }
+                        }
                         let unaccounted = tally.unaccounted(total_files);
                         let not_visited = tally.not_visited(total_files);
 

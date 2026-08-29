@@ -665,8 +665,27 @@ jobs:
             throw new Error(`Windows registry authority must report exactly one unsupported capability check: ${JSON.stringify(authority.checks ?? null)}`);
           }
 
-          const nonHealthyChecks = (report) => (report.checks ?? [])
-            .filter((check) => check.status !== "healthy")
+          // --- BEGIN HEALTH JOIN ---
+          // A check is out of scope only when the platform or the context puts it out of
+          // scope, which is exactly `unsupported`. Every other status is a component that
+          // is not answering at full strength, so a report claiming readiness over one
+          // claims more than its components support (FIR-2919).
+          const healthNeedsAttention = (check) =>
+            check.status !== "healthy" && check.status !== "unsupported";
+          // Something wrong with the INSTALL, as against work in flight or ground the
+          // host never had. A different question from the one above, and conflating the
+          // two is what fenced v0.6.1.
+          const healthBlocksReadiness = (check) =>
+            check.status === "missing" ||
+            check.status === "misconfigured" ||
+            (check.id === "semantic_query_readiness" && check.status === "stale");
+          const healthJoin = (checks) => {
+            if (checks.some(healthBlocksReadiness)) return "failing";
+            return checks.some(healthNeedsAttention) ? "needs_attention" : "ready";
+          };
+          // --- END HEALTH JOIN ---
+          const attentionRows = (report) => (report.checks ?? [])
+            .filter(healthNeedsAttention)
             .map((check) => `${check.id}=${check.status}`)
             .join(", ") || "none";
           const validateHealthReport = (report, reportPath) => {
@@ -677,15 +696,22 @@ jobs:
             if (checks.size !== report.checks.length) {
               throw new Error(`${reportPath}: duplicate health-check ids are not authoritative`);
             }
-            const expectedHealthy = !report.checks.some(
-              (check) =>
-                check.status === "missing" ||
-                check.status === "misconfigured" ||
-                (check.id === "semantic_query_readiness" && check.status === "stale")
-            );
-            if (report.healthy !== expectedHealthy) {
+            // Required, not optional. A report with no `verdict` came from a build that
+            // predates FIR-2919, whose aggregate gated on missing and misconfigured alone
+            // and read `true` over a pending or degraded row. Grading it against either
+            // rule would be a claim about bytes that cannot carry it.
+            if (report.verdict === undefined) {
               throw new Error(
-                `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; expected ${expectedHealthy}`
+                `${reportPath}: the report carries no verdict field, so these bytes predate FIR-2919 and their aggregate cannot be graded against the health join`
+              );
+            }
+            const verdict = healthJoin(report.checks);
+            if (report.verdict !== verdict) {
+              throw new Error(`${reportPath}: verdict=${report.verdict} disagrees with checks; expected ${verdict}`);
+            }
+            if (report.healthy !== (verdict === "ready")) {
+              throw new Error(
+                `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; expected ${verdict === "ready"}`
               );
             }
             return checks;
@@ -727,30 +753,40 @@ jobs:
           for (const reportPath of ["kin-windows-health.json", "kin-windows-doctor.json"]) {
             const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
             const checks = validateHealthReport(report, reportPath);
-            // Missing `repo_init` is the one degradation this repo-free posture
-            // expects, and it flips the aggregate report.healthy to false on its
-            // own. Accept that single named reason and keep every other
-            // degradation fatal, so a real regression in any other check still
-            // fails this leg.
-            // Work a correct install has not done yet, named as one check and
-            // one status. A public runner has never fetched the embedding
-            // model, so `embedding_model` reads `pending`, which is why the
-            // product's own readiness aggregate does not block on it either:
-            // it names expected first-run work rather than ground a working
-            // install lost. Tolerating it by name is the difference between a
+            // Everything a correct fresh repo-free Windows install reports
+            // beyond healthy and not-applicable, each named with the statuses it
+            // is allowed to hold. Tolerating by name is the difference between a
             // sweep that still fails when a second check goes pending and one
             // that waves through every status it has never seen.
-            const firstRunPending = new Map([["embedding_model", "pending"]]);
-            const tolerated = report.checks.every(
+            //
+            // `embedding_model` is pending because a public runner has never
+            // fetched the model. `memory_floor` is degraded because the runner
+            // has 4 GiB and Kin has no host-memory probe for target_os windows,
+            // so the row is scored against a stand-in rather than a measurement.
+            // Both are facts about the runner and not about the install, which is
+            // why the product's verdict for this report is `needs_attention` and
+            // not `failing`.
+            //
+            // `memory_floor` is here because it was NOT here. This sweep took
+            // `report.healthy` as its subject, the product answered `true` over
+            // both rows, and the contradiction reached the release instead of
+            // this step (FIR-2919). `repo_init` needed an exemption while it read
+            // `missing`; the required map below pins it `unsupported` and it no
+            // longer needs one.
+            const firstRunAttention = new Map([
+              ["embedding_model", ["pending"]],
+              ["memory_floor", ["degraded"]],
+            ]);
+            const untolerated = report.checks.filter(
               (check) =>
-                check.id === "repo_init" ||
-                check.status === "healthy" ||
-                check.status === "unsupported" ||
-                firstRunPending.get(check.id) === check.status
+                healthNeedsAttention(check) &&
+                !(firstRunAttention.get(check.id) ?? []).includes(check.status)
             );
-            if (!tolerated) {
+            if (untolerated.length > 0) {
               throw new Error(
-                `${reportPath}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
+                `${reportPath}: rows needing attention that a fresh repo-free install does not expect: ` +
+                `${untolerated.map((check) => `${check.id}=${check.status}`).join(", ")}; ` +
+                `verdict=${report.verdict}; every row needing attention: ${attentionRows(report)}`
               );
             }
             for (const [id, expected] of required) {
@@ -1754,8 +1790,27 @@ jobs:
             path,
             JSON.parse(fs.readFileSync(path, "utf8")),
           ]);
-          const nonHealthyChecks = (report) => (report.checks ?? [])
-            .filter((check) => check.status !== "healthy")
+          // --- BEGIN HEALTH JOIN ---
+          // A check is out of scope only when the platform or the context puts it out of
+          // scope, which is exactly `unsupported`. Every other status is a component that
+          // is not answering at full strength, so a report claiming readiness over one
+          // claims more than its components support (FIR-2919).
+          const healthNeedsAttention = (check) =>
+            check.status !== "healthy" && check.status !== "unsupported";
+          // Something wrong with the INSTALL, as against work in flight or ground the
+          // host never had. A different question from the one above, and conflating the
+          // two is what fenced v0.6.1.
+          const healthBlocksReadiness = (check) =>
+            check.status === "missing" ||
+            check.status === "misconfigured" ||
+            (check.id === "semantic_query_readiness" && check.status === "stale");
+          const healthJoin = (checks) => {
+            if (checks.some(healthBlocksReadiness)) return "failing";
+            return checks.some(healthNeedsAttention) ? "needs_attention" : "ready";
+          };
+          // --- END HEALTH JOIN ---
+          const attentionRows = (report) => (report.checks ?? [])
+            .filter(healthNeedsAttention)
             .map((check) => `${check.id}=${check.status}`)
             .join(", ") || "none";
           const validateHealthReport = (report, reportPath) => {
@@ -1766,15 +1821,22 @@ jobs:
             if (checks.size !== report.checks.length) {
               throw new Error(`${reportPath}: duplicate health-check ids are not authoritative`);
             }
-            const expectedHealthy = !report.checks.some(
-              (check) =>
-                check.status === "missing" ||
-                check.status === "misconfigured" ||
-                (check.id === "semantic_query_readiness" && check.status === "stale")
-            );
-            if (report.healthy !== expectedHealthy) {
+            // Required, not optional. A report with no `verdict` came from a build that
+            // predates FIR-2919, whose aggregate gated on missing and misconfigured alone
+            // and read `true` over a pending or degraded row. Grading it against either
+            // rule would be a claim about bytes that cannot carry it.
+            if (report.verdict === undefined) {
               throw new Error(
-                `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; expected ${expectedHealthy}`
+                `${reportPath}: the report carries no verdict field, so these bytes predate FIR-2919 and their aggregate cannot be graded against the health join`
+              );
+            }
+            const verdict = healthJoin(report.checks);
+            if (report.verdict !== verdict) {
+              throw new Error(`${reportPath}: verdict=${report.verdict} disagrees with checks; expected ${verdict}`);
+            }
+            if (report.healthy !== (verdict === "ready")) {
+              throw new Error(
+                `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; expected ${verdict === "ready"}`
               );
             }
             return checks;
@@ -1820,28 +1882,53 @@ jobs:
 
           for (const [path, report] of reports) {
             const checks = validateHealthReport(report, path);
-            // This capability capture runs before `kin embed`, so the daemon
-            // graph still has embeddings pending. A first fill reports
-            // semantic_query_readiness=pending and leaves report.healthy true,
-            // so this tolerance is not what carries the ordinary run. It
-            // remains for the one case that still blocks with work in flight:
-            // a store that had completed a fill and lost it, which reports
-            // stale. The post-embed embedded-health capture below still
-            // requires healthy=true with readiness=healthy, and every other
-            // unhealthy reason stays fatal here: any missing/misconfigured
-            // check, or any other check that is neither healthy nor
-            // unsupported, still fails.
-            const onlyPendingEmbeddingsBlocks =
-              checks.get("semantic_query_readiness")?.status === "stale" &&
-              report.checks.every(
-                (check) =>
-                  check.id === "semantic_query_readiness" ||
-                  check.status === "healthy" ||
-                  check.status === "unsupported"
-              );
-            if (report.healthy !== true && !onlyPendingEmbeddingsBlocks) {
+            // Every row a correct fresh Unix install reports beyond healthy and
+            // not-applicable, named with the statuses it may hold. This capture
+            // runs before `kin embed`, so the daemon graph still has embeddings
+            // pending and the model has never been fetched.
+            //
+            // This used to read `report.healthy !== true` with one tolerance for
+            // a stale readiness. On the v0.6.1 release run's own
+            // `install-proof-ubuntu-latest-33235776577` artifact,
+            // `kin-health.json` carried FIVE rows needing attention under
+            // `healthy: true`, so that assertion passed while naming none of
+            // them. Listing them is what makes a sixth fail (FIR-2919).
+            //
+            //   projection_mode          stale, the shim is installed and not
+            //                            engaged in this shell
+            //   semantic_query_readiness pending while the first pass fills,
+            //                            stale for a store that finished a fill
+            //                            and lost ground
+            //   reference_edge_coverage  pending, no language server on the
+            //                            runner
+            //   embedding_model          pending, the runner has never fetched
+            //                            the model
+            //   memory_floor             degraded, the runner is a small host
+            const firstRunAttention = new Map([
+              ["projection_mode", ["stale"]],
+              ["semantic_query_readiness", ["pending", "stale"]],
+              ["reference_edge_coverage", ["pending"]],
+              ["embedding_model", ["pending"]],
+              ["memory_floor", ["degraded"]],
+              // The first relation census is its own background pass, so a
+              // capture that beats it reads `pending`, the same first-run
+              // class as reference_edge_coverage above. The v0.6.2 preflight
+              // measured exactly that on a native-arch containerized fresh
+              // install (both health captures pending) while this workflow's
+              // own v0.6.1 arm leg happened to win the race and read healthy,
+              // so whether the row appears is host timing, not install state.
+              ["relation_census", ["pending"]],
+            ]);
+            const untolerated = report.checks.filter(
+              (check) =>
+                healthNeedsAttention(check) &&
+                !(firstRunAttention.get(check.id) ?? []).includes(check.status)
+            );
+            if (untolerated.length > 0) {
               throw new Error(
-                `${path}: overall healthy=${report.healthy}; non-healthy checks: ${nonHealthyChecks(report)}`
+                `${path}: rows needing attention that a fresh install does not expect: ` +
+                `${untolerated.map((check) => `${check.id}=${check.status}`).join(", ")}; ` +
+                `verdict=${report.verdict}; every row needing attention: ${attentionRows(report)}`
               );
             }
             for (const [id, expected] of required) {
@@ -1956,11 +2043,41 @@ jobs:
               const report = JSON.parse(fs.readFileSync(reportPath, "utf8"));
               const checks = validateHealthReport(report, reportPath);
               const readiness = checks.get("semantic_query_readiness")?.status;
-              if (report.healthy !== true || readiness !== "healthy") {
+              if (readiness !== "healthy") {
                 throw new Error(
-                  `${reportPath}: overall healthy=${report.healthy}; ` +
-                  `semantic_query_readiness=${readiness ?? "missing"}; ` +
-                  `non-healthy checks: ${nonHealthyChecks(report)}`
+                  `${reportPath}: semantic_query_readiness=${readiness ?? "missing"} after a ` +
+                  `completed embed; verdict=${report.verdict}; every row needing attention: ` +
+                  `${attentionRows(report)}`
+                );
+              }
+              // What a completed embed leaves behind on this runner, named. The
+              // model is cached and the fill is done, so `embedding_model` and
+              // `semantic_query_readiness` are gone from the list the pre-embed
+              // capture carries; the three below are the runner, not the embed.
+              // This used to read `report.healthy !== true`, which passed on the
+              // v0.6.1 run's own `kin-embedded-health.json` while those three
+              // rows sat inside it unnamed (FIR-2919). Naming them is what makes
+              // a fourth fail.
+              const postEmbedAttention = new Map([
+                ["projection_mode", ["stale"]],
+                ["reference_edge_coverage", ["pending"]],
+                ["memory_floor", ["degraded"]],
+                // The census pass is not tied to `kin embed`, so a capture can
+                // still beat it after a completed embed; same measurement as
+                // the pre-embed entry.
+                ["relation_census", ["pending"]],
+              ]);
+              const stillWaiting = report.checks.filter(
+                (check) =>
+                  healthNeedsAttention(check) &&
+                  !(postEmbedAttention.get(check.id) ?? []).includes(check.status)
+              );
+              if (stillWaiting.length > 0) {
+                throw new Error(
+                  `${reportPath}: rows needing attention after a completed embed that this ` +
+                  `runner does not expect: ` +
+                  `${stillWaiting.map((check) => `${check.id}=${check.status}`).join(", ")}; ` +
+                  `verdict=${report.verdict}`
                 );
               }
             }

@@ -193,8 +193,9 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_LOCATE_PHASE_SCORING_SECS", kind: Kind::SecsBound, default: "10", sensitivity: Sensitivity::Correctness, summary: "locate phase budget: scoring; 0 = unbounded" },
 
     // ---- secrets --------------------------------------------------------------
-    EnvVarSpec { name: "KIN_DAEMON_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated daemon requests" },
+    EnvVarSpec { name: "KIN_DAEMON_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated daemon requests; required for hosted GCS publication control" },
     EnvVarSpec { name: "KIN_DAEMON_AUTH_TOKEN_PREVIOUS", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "a superseded daemon bearer token this process still accepts, so a credential rotation across several containers does not have to be atomic. Set it during a rotation window and unset it once /auth/rotation reports the superseded token is no longer carrying traffic. Setting it with KIN_DAEMON_AUTH_TOKEN unset, or to the same value, is refused at startup: neither is an overlap window and both would read as one" },
+    EnvVarSpec { name: "KIN_PUBLICATION_CONTROL_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "distinct operator bearer token for hosted rollout and publication-control administration" },
     EnvVarSpec { name: "KIN_SUPERVISOR_AUTH_TOKEN", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "bearer token for authenticated supervisor requests" },
     EnvVarSpec { name: "KIN_SUPERVISOR_AUTH_TOKEN_PREVIOUS", kind: Kind::Secret, default: "", sensitivity: Sensitivity::Secret, summary: "a superseded supervisor bearer token this process still accepts, the supervisor counterpart of KIN_DAEMON_AUTH_TOKEN_PREVIOUS and subject to the same startup refusals" },
     EnvVarSpec { name: "KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS", kind: Kind::Usize, default: "86400", sensitivity: Sensitivity::Operational, summary: "how long, in seconds, a daemon rotation overlap window keeps accepting the superseded token, measured from the instant the window opened and persisted so it survives a restart. Must be a whole number greater than zero: a zero or unparseable value is refused at startup rather than read as unbounded, because an unbounded window is the state this bound exists to prevent" },
@@ -276,6 +277,8 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_STORAGE", kind: Kind::Str, default: "local", sensitivity: Sensitivity::Operational, summary: "daemon storage backend selector (e.g. local, gcs)" },
     EnvVarSpec { name: "KIN_GCS_BUCKET", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "GCS bucket for remote storage" },
     EnvVarSpec { name: "KIN_GCS_PREFIX", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "GCS key prefix for remote storage" },
+    EnvVarSpec { name: "KIN_RELEASE_DAEMON_DIGEST_INTERNAL", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "exact sha256 image identity required by hosted graph reader admission and publication fencing" },
+    EnvVarSpec { name: "KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "deployment-controller attestation digest proving every cursorless legacy spine writer revision is drained before the durable one-way migration seal is created" },
     // Correctness rather than Operational, unlike the bucket and prefix beside
     // it: this one redirects every storage request to a different server, so a
     // wrong value serves and persists graph truth somewhere other than where the
@@ -290,7 +293,7 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_ACTOR", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "actor identity recorded in provenance" },
     EnvVarSpec { name: "KIN_ORG_ID", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "organization id for federation/remote" },
     EnvVarSpec { name: "KIN_REPO_ID", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "active repo id override" },
-    EnvVarSpec { name: "KIN_REPO_IDS", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "comma-separated repo ids the daemon should serve" },
+    EnvVarSpec { name: "KIN_REPO_IDS", kind: Kind::Str, default: "", sensitivity: Sensitivity::Correctness, summary: "exact comma-separated hosted fleet membership; required by GCS publication fencing" },
     EnvVarSpec { name: "KIN_PRIMARY_REPO_ID", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "primary repo id for a multi-repo daemon" },
     EnvVarSpec { name: "KIN_SESSION", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "session id propagated to a child shell/exec" },
     EnvVarSpec { name: "KIN_SESSION_ID", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "session id used by daemon-delegated commands" },
@@ -903,9 +906,12 @@ fn doc_group(name: &str) -> &'static str {
         ("KIN_INFER_", "Inference"),
         ("KIN_INIT_", "Init"),
         ("KIN_GCS_", "Storage"),
+        ("KIN_RELEASE_DAEMON_DIGEST_INTERNAL", "Storage"),
+        ("KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL", "Storage"),
         ("KIN_CONTEXTBENCH_", "Benchmarking"),
         ("KIN_HYDRATE_", "Diagnostics"),
         ("KIN_PROFILE_", "Diagnostics"),
+        ("KIN_PUBLICATION_CONTROL_", "Daemon"),
         ("KIN_SESSION", "Session & projection"),
         ("KIN_SOURCE_ROOT", "Session & projection"),
         ("KIN_DISCOVERY_MODE", "Session & projection"),

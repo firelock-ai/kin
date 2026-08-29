@@ -319,9 +319,9 @@ the daemons it shares the box with. Every probe leaves `KIN_REGISTRY_PATH` unset
 on purpose, since an explicit pin wins on both sides of that fix and a probe that
 kept one could not fail.
 
-`first_contact_honesty.py` covers the three surfaces a stranger meets before the
-graph answers anything, all found by the npm0549 green stranger on shipped
-0.5.49. Check 0 asserts `kin commit --help` carries the same sentence a commit
+`first_contact_honesty.py` covers the surfaces a stranger meets before the
+graph answers anything. Checks 0 to 2 were found by the npm0549 green stranger on
+shipped 0.5.49. Check 0 asserts `kin commit --help` carries the same sentence a commit
 prints, that a Kin commit lands in Kin's own authority and `git status` stays
 dirty until `kin eject` or a push, and asserts the CLI reference quotes it too
 (FIR-2627). Check 1 packs `packages/kin`, makes a global npm prefix unwritable,
@@ -331,7 +331,17 @@ reach a working `kin --version` (FIR-2628). Check 2 points a real npm at a port
 nothing listens on and requires the language-server install failure to name the
 environment as the suspected cause, print the proxy variables that would route
 it, name the offline route to a working server, and state that Kin runs
-without the servers (FIR-2629).
+without the servers (FIR-2629). Check 3 requires `kin doctor` to state this
+machine's memory floor before any repository exists (FIR-2787). Checks 4 to 6
+come from the 2026-08-28 cold walkthrough: the language-server repair must work
+on a host with no rustup, the MCP entry the install page hands every client must
+serve `initialize` from a directory holding no `.kin/`, and `kin init` must not
+report a cross-file sweep complete over a language server that never started.
+Check 7 requires `kin doctor`'s roll-up to agree with the rows it summarizes, in
+both directions, and requires the printed page and the JSON to make the same
+claim; its graders are handed the exact 33-row report a fresh Windows install
+emitted on the v0.6.1 release run, which carried `"healthy": true` over a pending
+and a degraded row and fenced that release (FIR-2919).
 
 Two limits it states rather than hides. Check 1 stubs the archive download with
 `KIN_NO_PROVISION` and a seeded managed binary, so what it proves is that the

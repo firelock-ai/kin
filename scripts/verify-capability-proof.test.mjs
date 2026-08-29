@@ -13,14 +13,21 @@ import {
   CapabilityProofError,
   REQUIRED_CHECK_IDS,
   assertReadinessCoherent,
+  attentionRows,
   coverageRegime,
+  healthJoin,
   validateHealthReport,
   verifyReport,
 } from './verify-capability-proof.mjs';
 
 const SCRIPT = fileURLToPath(new URL('./verify-capability-proof.mjs', import.meta.url));
 
-function report({ readiness = 'healthy', overrides = {}, healthy = null } = {}) {
+// The aggregate is derived by the module's own join rather than a second copy
+// here, so a fixture cannot describe a report the product could not produce and
+// a change to the rule cannot leave this file quietly agreeing with the old one.
+// `healthy` and `verdict` stay overridable, because a report that disagrees with
+// its own checks is exactly what several tests below have to build.
+function report({ readiness = 'healthy', overrides = {}, healthy = null, verdict = null } = {}) {
   const checks = REQUIRED_CHECK_IDS.map((id) => ({
     id,
     label: id,
@@ -28,13 +35,12 @@ function report({ readiness = 'healthy', overrides = {}, healthy = null } = {}) 
     detail: '',
     ...(overrides[id] ?? {}),
   }));
-  const blocking = checks.some(
-    (check) =>
-      check.status === 'missing' ||
-      check.status === 'misconfigured' ||
-      (check.id === 'semantic_query_readiness' && check.status === 'stale'),
-  );
-  return { healthy: healthy === null ? !blocking : healthy, checks };
+  const joined = healthJoin(checks);
+  return {
+    healthy: healthy === null ? joined === 'ready' : healthy,
+    verdict: verdict === null ? joined : verdict,
+    checks,
+  };
 }
 
 const settled = { state: 'observed', source: 'live_query_graph', indexed: 18, pending: 0, total: 18 };
@@ -100,9 +106,99 @@ test('an aggregate that disagrees with its own checks fails', () => {
 test('a stale readiness must drag the aggregate unhealthy, exactly as the proof requires', () => {
   const honest = report({ readiness: 'stale' });
   assert.equal(honest.healthy, false);
+  assert.equal(honest.verdict, 'failing');
   expectFailure(
     () => verifyReport(report({ readiness: 'stale', healthy: true }), settled, 'p'),
     /disagrees with checks/,
+  );
+});
+
+// ---------------------------------------------------------------- FIR-2919
+//
+// The join, in the four cases the fix contract names, plus the two the shipped
+// Windows report actually carried. Each negative has a positive beside it: a
+// rule that refused everything would satisfy every "must fail" assertion here
+// on its own.
+
+test('unsupported rows do not disqualify a ready verdict', () => {
+  const rows = [
+    { id: 'kin_binary', status: 'healthy' },
+    { id: 'vfs_projection', status: 'unsupported' },
+    { id: 'registry_authority', status: 'unsupported' },
+  ];
+  assert.equal(healthJoin(rows), 'ready');
+  assert.equal(attentionRows({ checks: rows }), 'none');
+});
+
+test('a pending row keeps the report out of ready without calling it failing', () => {
+  const rows = [
+    { id: 'kin_binary', status: 'healthy' },
+    { id: 'embedding_model', status: 'pending' },
+  ];
+  assert.equal(healthJoin(rows), 'needs_attention');
+  assert.equal(attentionRows({ checks: rows }), 'embedding_model=pending');
+});
+
+test('a degraded row keeps the report out of ready without calling it failing', () => {
+  const rows = [
+    { id: 'kin_binary', status: 'healthy' },
+    { id: 'memory_floor', status: 'degraded' },
+  ];
+  assert.equal(healthJoin(rows), 'needs_attention');
+});
+
+test('a missing row is failing, which is a different answer from needs_attention', () => {
+  const rows = [
+    { id: 'kin_binary', status: 'healthy' },
+    { id: 'embedding_model', status: 'pending' },
+    { id: 'shell_path', status: 'missing' },
+  ];
+  assert.equal(healthJoin(rows), 'failing');
+});
+
+// The exact shape v0.6.1 shipped: 19 unsupported rows, one pending, one
+// degraded, under healthy=true. It is the report that fenced the release.
+test('the v0.6.1 Windows aggregate is rejected against its own rows', () => {
+  const rows = [
+    { id: 'kin_binary', status: 'healthy' },
+    ...Array.from({ length: 19 }, (_, index) => ({ id: `unsupported_${index}`, status: 'unsupported' })),
+    { id: 'embedding_model', status: 'pending' },
+    { id: 'memory_floor', status: 'degraded' },
+  ];
+  assert.equal(healthJoin(rows), 'needs_attention');
+  expectFailure(
+    () => validateHealthReport({ healthy: true, verdict: 'ready', checks: rows }, 'kin-windows-health.json'),
+    /verdict=ready disagrees with checks; expected needs_attention/,
+  );
+  // The honest emission of the same rows is accepted, or the assertion above
+  // would pass for a rule that rejected every Windows report.
+  assert.doesNotThrow(() =>
+    validateHealthReport(
+      { healthy: false, verdict: 'needs_attention', checks: rows },
+      'kin-windows-health.json',
+    ),
+  );
+});
+
+test('a report with no verdict field is refused as pre-FIR-2919 bytes', () => {
+  const rows = [{ id: 'kin_binary', status: 'healthy' }];
+  expectFailure(
+    () => validateHealthReport({ healthy: true, checks: rows }, 'kin-health.json'),
+    /predate FIR-2919/,
+  );
+  assert.doesNotThrow(() =>
+    validateHealthReport({ healthy: true, verdict: 'ready', checks: rows }, 'kin-health.json'),
+  );
+});
+
+test('a verdict that agrees with the rows but not with the boolean is refused', () => {
+  const rows = [
+    { id: 'kin_binary', status: 'healthy' },
+    { id: 'memory_floor', status: 'degraded' },
+  ];
+  expectFailure(
+    () => validateHealthReport({ healthy: true, verdict: 'needs_attention', checks: rows }, 'p'),
+    /aggregate healthy=true disagrees with checks; expected false/,
   );
 });
 

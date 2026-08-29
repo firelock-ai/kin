@@ -8,6 +8,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
+#[cfg(feature = "gcs")]
+use std::sync::Arc;
 use std::time::Duration;
 
 use kin_core::KinLayout;
@@ -200,6 +202,7 @@ fn create_state(
     layout: KinLayout,
     storage: &StorageMode,
     repo_id: &str,
+    #[cfg_attr(not(feature = "gcs"), allow(unused_variables))] runtime: &tokio::runtime::Handle,
     #[cfg_attr(not(feature = "gcs"), allow(unused_variables))] allowed_repo_ids: Option<
         HashSet<String>,
     >,
@@ -210,14 +213,154 @@ fn create_state(
         StorageMode::Gcs => {
             let bucket = env::var("KIN_GCS_BUCKET")
                 .map_err(|_| "KIN_GCS_BUCKET env var required for --storage gcs")?;
-            let prefix = env::var("KIN_GCS_PREFIX").unwrap_or_default();
-            let backend = open_gcs_backend(&bucket, prefix)?;
-            Ok(DaemonState::open_with_backend(
+            let prefix = env::var("KIN_GCS_PREFIX")
+                .unwrap_or_default()
+                .trim_matches('/')
+                .to_string();
+            let runtime_reader_identity = env::var("KIN_RELEASE_DAEMON_DIGEST_INTERNAL").map_err(
+                |_| {
+                    "KIN_RELEASE_DAEMON_DIGEST_INTERNAL is required for GCS graph publication admission"
+                },
+            )?;
+            let daemon_auth_token = env::var("KIN_DAEMON_AUTH_TOKEN")
+                .ok()
+                .map(|token| token.trim().to_string())
+                .filter(|token| !token.is_empty());
+            if daemon_auth_token.is_none() {
+                return Err(
+                    "KIN_DAEMON_AUTH_TOKEN is required for the hosted publication-control API"
+                        .into(),
+                );
+            }
+            let publication_control_auth_token =
+                env::var("KIN_PUBLICATION_CONTROL_AUTH_TOKEN")
+                    .ok()
+                    .map(|token| token.trim().to_string())
+                    .filter(|token| !token.is_empty())
+                    .ok_or(
+                        "KIN_PUBLICATION_CONTROL_AUTH_TOKEN is required for hosted rollout administration",
+                    )?;
+            if daemon_auth_token.as_deref() == Some(publication_control_auth_token.as_str()) {
+                return Err(
+                    "KIN_PUBLICATION_CONTROL_AUTH_TOKEN must differ from KIN_DAEMON_AUTH_TOKEN"
+                        .into(),
+                );
+            }
+            let (backend, object_store) = open_gcs_backend(&bucket, prefix.clone())?;
+            let fleet_repositories = parse_repo_id_list();
+            if fleet_repositories.is_empty() || allowed_repo_ids.is_none() {
+                return Err("KIN_REPO_IDS is required for GCS graph publication fencing".into());
+            }
+            let scope = if prefix.is_empty() {
+                format!("gcs://{bucket}/")
+            } else {
+                format!("gcs://{bucket}/{prefix}")
+            };
+            let control_store = Arc::new(
+                kin_daemon::publication_lease::ObjectStorePublicationControlStore::new(
+                    object_store,
+                    &prefix,
+                ),
+            );
+            let publication_control =
+                Arc::new(kin_daemon::publication_lease::PublicationControl::new(
+                    scope,
+                    runtime_reader_identity,
+                    fleet_repositories,
+                    control_store,
+                )?);
+            let bootstrap = match publication_control.bootstrap_runtime_if_absent() {
+                Ok(bootstrap) => bootstrap,
+                Err(error) => {
+                    let reason = format!(
+                        "bootstrap hosted publication control before Firestore spine recovery: {error}"
+                    );
+                    // This state is recovery-only until durable admission is
+                    // re-established. Hosted middleware exposes the admin
+                    // control route and process liveness, while refusing every
+                    // graph authority route. A successful bootstrap never opens
+                    // the primary graph until the GCS fence has completed.
+                    let state = DaemonState::open_with_backend_and_publication_control(
+                        layout,
+                        Box::new(backend),
+                        repo_id,
+                        allowed_repo_ids,
+                        Arc::clone(&publication_control),
+                    )?;
+                    state.require_hosted_restart_after_recovery(reason.clone());
+                    eprintln!(
+                        "kin-daemon: hosted spine remains unready while publication control recovers: {reason}"
+                    );
+                    return Ok(state);
+                }
+            };
+            let state = DaemonState::open_with_backend_and_publication_control(
                 layout,
                 Box::new(backend),
                 repo_id,
                 allowed_repo_ids,
-            )?)
+                Arc::clone(&publication_control),
+            )?;
+            let spine_startup = if let Some(pending) = bootstrap {
+                (|| -> std::result::Result<(), String> {
+                    let proof = kin_daemon::publication_lease::LeaseProof {
+                        scope: publication_control.scope().to_string(),
+                        token: pending.token,
+                        fence: pending.fence,
+                    };
+                    let fence = publication_control
+                        .spine_rollout_fence(&proof)
+                        .map_err(|error| error.to_string())?;
+                    let evidence =
+                        runtime.block_on(state.advance_hosted_spine_rollout_fence(fence))?;
+                    publication_control
+                        .checkpoint_spine_rollout_fence(&proof, &evidence)
+                        .map_err(|error| error.to_string())?;
+                    publication_control
+                        .complete_rollout_acquisition(&proof)
+                        .map_err(|error| error.to_string())?;
+                    let legacy_writer_drain_proof_sha256 =
+                        env::var("KIN_SPINE_LEGACY_DRAIN_PROOF_SHA256_INTERNAL")
+                            .ok()
+                            .map(|digest| digest.trim().to_string())
+                            .filter(|digest| !digest.is_empty());
+                    let admission = kin_daemon::publication_lease::AdmitReaderRequest {
+                        lease: proof.clone(),
+                        repositories: publication_control.fleet_repositories().to_vec(),
+                        reader: kin_daemon::publication_lease::ReaderAdmissionInput {
+                            identity: publication_control.runtime_reader_identity().to_string(),
+                            min_snapshot_schema: kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                            max_snapshot_schema: kin_db::GraphSnapshot::CURRENT_VERSION,
+                            valid_for_seconds:
+                                kin_daemon::publication_lease::MAX_READER_ADMISSION_SECONDS,
+                        },
+                        legacy_writer_drain_proof_sha256,
+                    };
+                    runtime.block_on(state.prepare_hosted_spine_rollout(&admission))?;
+                    runtime.block_on(state.admit_hosted_spine_rollout_fence(admission))?;
+                    runtime.block_on(state.release_hosted_spine_rollout(
+                        kin_daemon::publication_lease::ReleaseRolloutLeaseRequest { lease: proof },
+                    ))?;
+                    Ok(())
+                })()
+            } else {
+                match publication_control.runtime_spine_authority() {
+                    Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::Completed(
+                        evidence,
+                    )) => runtime.block_on(state.adopt_hosted_spine_rollout_fence(evidence)),
+                    Ok(kin_daemon::publication_lease::RuntimeSpineAuthority::RolloutActive) => {
+                        Err("a hosted rollout remains active; semantic readiness stays closed while the authenticated publication-control API resumes or replaces it".to_string())
+                    }
+                    Err(error) => Err(error.to_string()),
+                }
+            };
+            if let Err(error) = spine_startup {
+                state.record_hosted_spine_startup_failure(error.clone());
+                eprintln!(
+                    "kin-daemon: hosted spine remains unready while publication control recovers: {error}"
+                );
+            }
+            Ok(state)
         }
     }
 }
@@ -235,7 +378,13 @@ fn create_state(
 fn open_gcs_backend(
     bucket: &str,
     prefix: String,
-) -> std::result::Result<kin_db::GcsBackend, Box<dyn std::error::Error>> {
+) -> std::result::Result<
+    (
+        kin_db::GcsBackend,
+        std::sync::Arc<dyn object_store::ObjectStore>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     use kin_daemon::gcs_endpoint;
 
     let endpoint = gcs_endpoint::resolve(
@@ -243,21 +392,20 @@ fn open_gcs_backend(
         env::var(gcs_endpoint::EMULATOR_HOST_VAR).ok().as_deref(),
     )?;
 
-    match endpoint {
-        None => Ok(kin_db::GcsBackend::new(bucket, prefix)?),
-        Some(endpoint) => {
-            endpoint.probe_reachable(gcs_endpoint::DEFAULT_PROBE_TIMEOUT)?;
-            // Which storage this daemon actually talks to is the one thing an
-            // operator cannot infer from anywhere else, and stderr is where the
-            // daemon's diagnostics go (stdout carries the --compat-json
-            // protocol).
-            eprintln!(
-                "kin-daemon: GCS storage redirected to {} (from {}); no real Google Cloud Storage traffic",
-                endpoint.url, endpoint.source
-            );
-            Ok(gcs_endpoint::backend_for(&endpoint, bucket, prefix)?)
-        }
+    if let Some(endpoint) = endpoint.as_ref() {
+        endpoint.probe_reachable(gcs_endpoint::DEFAULT_PROBE_TIMEOUT)?;
+        // Which storage this daemon actually talks to is the one thing an
+        // operator cannot infer from anywhere else, and stderr is where the
+        // daemon's diagnostics go (stdout carries the --compat-json
+        // protocol).
+        eprintln!(
+            "kin-daemon: GCS storage redirected to {} (from {}); no real Google Cloud Storage traffic",
+            endpoint.url, endpoint.source
+        );
     }
+    let store = gcs_endpoint::object_store_for(endpoint.as_ref(), bucket)?;
+    let backend = kin_db::GcsBackend::from_store(Box::new(Arc::clone(&store)), prefix);
+    Ok((backend, store))
 }
 
 fn acquire_before_state<T>(
@@ -278,7 +426,6 @@ fn parse_repo_id_list() -> Vec<String> {
         .map(|raw| {
             raw.split(',')
                 .map(str::trim)
-                .filter(|value| !value.is_empty())
                 .map(ToOwned::to_owned)
                 .collect()
         })
@@ -501,6 +648,8 @@ async fn async_main() -> i32 {
                 "schema": "kin.daemon.compat.v2",
                 "version": env!("CARGO_PKG_VERSION"),
                 "graph_snapshot_version": kin_db::GraphSnapshot::CURRENT_VERSION,
+                "graph_snapshot_min_supported_version": kin_db::GraphSnapshot::MIN_SUPPORTED_VERSION,
+                "graph_snapshot_max_supported_version": kin_db::GraphSnapshot::CURRENT_VERSION,
                 "supervisor_startup_protocol": 2,
                 "supervisor_startup_capabilities": [
                     "generation-adoption-ack-v2",
@@ -623,7 +772,7 @@ async fn async_main() -> i32 {
             ));
             // A failed open drops both handles here, which closes the socket. No
             // endpoint was published for it, so nothing outlives the failure.
-            let state = create_state(bind_layout, &storage, &repo_id, allowed_repo_ids)?;
+            let state = create_state(bind_layout, &storage, &repo_id, &runtime, allowed_repo_ids)?;
             Ok((state, api_listener, bound_port, ready_tx))
         })
         // The boxed startup error is not `Send`, and this result crosses back
@@ -862,6 +1011,122 @@ mod tests {
         assert!(admitted.contains("advertised-repo"));
         assert!(admitted.contains("sibling-repo"));
         assert_eq!(admitted.len(), 2, "admission must not widen the key space");
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    #[serial_test::serial]
+    fn gcs_publication_control_refuses_an_unauthenticated_startup() {
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture"));
+        environment.apply("KIN_GCS_ENDPOINT", Some("http://127.0.0.1:9"));
+        environment.apply(
+            "KIN_RELEASE_DAEMON_DIGEST_INTERNAL",
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        environment.apply("KIN_REPO_IDS", Some("kin,kin-db"));
+        environment.apply(
+            "KIN_PUBLICATION_CONTROL_AUTH_TOKEN",
+            Some("publication-admin-token"),
+        );
+        environment.apply::<_, &str>("KIN_DAEMON_AUTH_TOKEN", None);
+        let repo = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo.path().join(".kin"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = create_state(
+            layout,
+            &StorageMode::Gcs,
+            "kin",
+            runtime.handle(),
+            Some(
+                ["kin".to_string(), "kin-db".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let Err(error) = result else {
+            panic!("GCS publication control must not start without API authentication");
+        };
+        assert!(
+            error.to_string().contains("KIN_DAEMON_AUTH_TOKEN"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    #[serial_test::serial]
+    fn gcs_publication_control_refuses_a_missing_administrator_credential() {
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture"));
+        environment.apply("KIN_GCS_ENDPOINT", Some("http://127.0.0.1:9"));
+        environment.apply(
+            "KIN_RELEASE_DAEMON_DIGEST_INTERNAL",
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        environment.apply("KIN_REPO_IDS", Some("kin,kin-db"));
+        environment.apply("KIN_DAEMON_AUTH_TOKEN", Some("ordinary-daemon-token"));
+        environment.apply::<_, &str>("KIN_PUBLICATION_CONTROL_AUTH_TOKEN", None);
+        let repo = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo.path().join(".kin"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = create_state(
+            layout,
+            &StorageMode::Gcs,
+            "kin",
+            runtime.handle(),
+            Some(
+                ["kin".to_string(), "kin-db".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let Err(error) = result else {
+            panic!("GCS publication control must not share ordinary daemon authentication");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("KIN_PUBLICATION_CONTROL_AUTH_TOKEN"),
+            "{error}"
+        );
+    }
+
+    #[cfg(feature = "gcs")]
+    #[test]
+    #[serial_test::serial]
+    fn gcs_publication_control_refuses_a_shared_administrator_credential() {
+        let mut environment = kin_core::test_env::EnvVarGuard::new();
+        environment.apply("KIN_GCS_BUCKET", Some("fixture-bucket"));
+        environment.apply("KIN_GCS_PREFIX", Some("fixture"));
+        environment.apply("KIN_GCS_ENDPOINT", Some("http://127.0.0.1:9"));
+        environment.apply(
+            "KIN_RELEASE_DAEMON_DIGEST_INTERNAL",
+            Some("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        );
+        environment.apply("KIN_REPO_IDS", Some("kin,kin-db"));
+        environment.apply("KIN_DAEMON_AUTH_TOKEN", Some("shared-token"));
+        environment.apply("KIN_PUBLICATION_CONTROL_AUTH_TOKEN", Some("shared-token"));
+        let repo = tempfile::tempdir().unwrap();
+        let layout = KinLayout::new(repo.path().join(".kin"));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let result = create_state(
+            layout,
+            &StorageMode::Gcs,
+            "kin",
+            runtime.handle(),
+            Some(
+                ["kin".to_string(), "kin-db".to_string()]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let Err(error) = result else {
+            panic!("GCS publication control must refuse a shared administrator credential");
+        };
+        assert!(error.to_string().contains("must differ"), "{error}");
     }
 
     /// No allowlist means no key-space constraint, which is how a single-repo

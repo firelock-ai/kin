@@ -4,10 +4,11 @@
 
 """First-contact honesty: what a stranger meets before the graph answers anything.
 
-Four defects strangers hit on shipped builds, each on a surface that runs before
+Eight defects strangers hit on shipped builds, each on a surface that runs before
 any semantic question is asked, and none of them visible to the suites that grade
 answers. Checks 0 to 2 come from the npm0549 green stranger on 0.5.49; check 3
-comes from the rc060n brown stranger on 0.6.0:
+comes from the rc060n brown stranger on 0.6.0; checks 4 to 6 come from the
+2026-08-28 cold walkthrough; check 7 comes from the v0.6.1 release run:
 
   CHECK 0 (FIR-2627)  `kin commit --help` never said a Kin commit is not a git
                       commit, so the write-through assumption formed at help and
@@ -30,12 +31,31 @@ comes from the rc060n brown stranger on 0.6.0:
                       conversion had already spent itself. Graded outside a
                       repository, which is the only place the question is asked
                       in time.
+  CHECK 4 (coldwalk)  `kin doctor --fix --install-language-servers` refused on a
+                      host with no `rustup`, so following the product's own
+                      repair left a Rust repository with no reference edges.
+  CHECK 5 (coldwalk)  the MCP entry the install page hands every client exited 2
+                      on `initialize` when the launch directory held no `.kin/`,
+                      which the page's own ordering guarantees for a first-time
+                      user.
+  CHECK 6 (coldwalk)  `kin init` printed `cross-file enrichment complete
+                      (5/303 files)` over a sweep whose Rust server never
+                      started, and the same store's `kin graph status` said the
+                      Rust edges were missing. One store cannot say both things.
+  CHECK 7 (FIR-2919)  `kin doctor --json` reported `"healthy": true` on a fresh
+                      Windows install whose own rows read `embedding_model`
+                      pending and `memory_floor` degraded, while the same run's
+                      printed page closed on "2 checks need attention". The
+                      release install proof threw on the contradiction and
+                      fenced v0.6.1.
 
-A new suite rather than three rows bolted onto the graph suites, for one reason:
-none of these needs a store, a daemon or a corpus, and all three are minutes
-faster without one. The CHECK line format, the exit codes and the JSON shape are
-the same as every other suite here, because scripts/acceptance/gate.py reads all
-of them through one contract.
+A new suite rather than rows bolted onto the graph suites, for one reason: these
+are graded on the surfaces a stranger meets first, and most of them need no
+store, no daemon and no corpus at all. Checks 4 and 6 do build one, because the
+defects they cover live in `kin init` and in a sweep; each builds its own from a
+handful of files and none of them touches a corpus. The CHECK line format, the
+exit codes and the JSON shape are the same as every other suite here, because
+scripts/acceptance/gate.py reads all of them through one contract.
 
 Exit status: 1 when any check fails, 2 when none fail but some are unreadable, 3
 on a setup error, 0 only when every selected check passes.
@@ -548,13 +568,15 @@ def check_2(suite):
     return res
 
 
-def doctor_rows(suite, extra_env=None):
-    """(rows_by_id, detail) from one `kin doctor --json` run outside a repository.
+def doctor_report(suite, extra_env=None):
+    """(report, detail) from one `kin doctor --json` run outside a repository.
 
-    Outside, deliberately. The row this check grades is the one FIR-2787 says
-    has to answer before `kin init` runs, and every other memory row on that
-    page reads n/a there, so a run inside a repository would grade a different
-    question entirely.
+    Outside, deliberately. The row FIR-2787 grades is the one that has to answer
+    before `kin init` runs, and every other memory row on that page reads n/a
+    there, so a run inside a repository would grade a different question
+    entirely. FIR-2919 grades the same page's roll-up, and outside a repository
+    is where that page carries the most `unsupported` rows, which is exactly the
+    shape its join has to get right.
     """
     env = suite.base_env()
     if extra_env:
@@ -567,10 +589,143 @@ def doctor_rows(suite, extra_env=None):
         return None, "`kin doctor --json` exited %d and printed nothing: %s" % (
             rc, flatten(err)[:200])
     try:
-        report = json.loads(strip_ansi(out))
+        return json.loads(strip_ansi(out)), ""
     except ValueError as exc:
         return None, "`kin doctor --json` did not print JSON: %s" % exc
+
+
+def doctor_rows(suite, extra_env=None):
+    """(rows_by_id, detail) from one `kin doctor --json` run outside a repository."""
+    report, detail = doctor_report(suite, extra_env)
+    if report is None:
+        return None, detail
     return {row.get("id"): row for row in report.get("checks", [])}, ""
+
+
+
+# ---------------------------------------------------------------- the roll-up
+#
+# FIR-2919. `kin doctor --json` emitted per-check rows that were honest and a
+# top-level `"healthy": true` that was not. On a fresh Windows install the page
+# carried 19 `unsupported` rows, `embedding_model` `pending` and `memory_floor`
+# `degraded`, printed "2 checks need attention" as its own last line, and told a
+# machine reader the install was ready. The release's install proof threw on the
+# contradiction and fenced v0.6.1.
+#
+# The rule, in one place here as it is in one place in the product: a check is
+# out of scope only when the platform or the context puts it out of scope, which
+# is exactly `unsupported`. Every other status is a component not answering at
+# full strength. `ready` requires that none of them exists; `failing` is
+# reserved for a broken install so that `healthy: false` cannot mean two things.
+
+HEALTH_VERDICTS = ("ready", "needs_attention", "failing")
+HEALTH_STATUSES = ("healthy", "missing", "stale", "misconfigured", "pending",
+                   "degraded", "unsupported")
+READINESS_ID = "semantic_query_readiness"
+
+
+def health_needs_attention(row):
+    return row.get("status") not in ("healthy", "unsupported")
+
+
+def health_blocks_readiness(row):
+    return (row.get("status") in ("missing", "misconfigured")
+            or (row.get("id") == READINESS_ID and row.get("status") == "stale"))
+
+
+def health_join(rows):
+    """The verdict a report's own rows support."""
+    if any(health_blocks_readiness(row) for row in rows):
+        return "failing"
+    return "needs_attention" if any(health_needs_attention(row) for row in rows) else "ready"
+
+
+def grade_health_rollup(report):
+    """(ok, detail) for whether a health report's roll-up matches its own rows.
+
+    Reads the report the product emitted rather than composing an expected one,
+    so the grader cannot pass by agreeing with itself. Returns None where the
+    payload cannot answer the question at all, which includes a report carrying
+    no `verdict`: that is what pre-FIR-2919 bytes emit, and grading their
+    aggregate against either rule would be a claim those bytes cannot carry.
+    """
+    if not isinstance(report, dict):
+        return None, "the doctor payload is not an object"
+    rows = report.get("checks")
+    if not isinstance(rows, list) or not rows:
+        return None, "the doctor payload carries no checks array"
+    unknown = sorted({row.get("status") for row in rows} - set(HEALTH_STATUSES))
+    if unknown:
+        return None, ("the report carries statuses this grader does not know (%s), so the "
+                      "join it computes would be a guess" % ", ".join(map(str, unknown)))
+    if "healthy" not in report:
+        return None, "the report carries no top-level `healthy` field"
+    if report.get("verdict") not in HEALTH_VERDICTS:
+        return None, ("the report carries no readable `verdict` (%r), so these bytes predate "
+                      "FIR-2919 and their roll-up cannot be graded"
+                      % report.get("verdict"))
+
+    waiting = [row for row in rows if health_needs_attention(row)]
+    named = ", ".join("%s=%s" % (row.get("id"), row.get("status")) for row in waiting) or "none"
+    expected = health_join(rows)
+    if report["verdict"] != expected:
+        return False, ("the page reports verdict %s while its own rows support %s; rows "
+                       "needing attention: %s"
+                       % (report["verdict"], expected, named))
+    if report["healthy"] is not (expected == "ready"):
+        return False, ("the page reports healthy=%s while its own rows support %s; rows "
+                       "needing attention: %s"
+                       % (report["healthy"], expected, named))
+    return True, ("the roll-up is %s over %d rows, %d of which need attention: %s"
+                  % (expected, len(rows), len(waiting), named))
+
+
+
+# The row set a fresh Windows install emitted on the v0.6.1 release run, lifted
+# from that run's own `install-proof-windows-latest-33235776577` artifact
+# (`kin-windows-health.json`) rather than composed here. 33 rows: 12 healthy, 19
+# unsupported, `embedding_model` pending and `memory_floor` degraded. The
+# shipped payload carried `"healthy": true` beside them and no `verdict` field
+# at all.
+#
+# No host that runs this suite can produce that row set, and it does not need
+# to: the rule is platform-independent and the rows are the platform's whole
+# contribution, so replaying the rows replays the case.
+WINDOWS_V061_ROWS = [
+    {"id": "kin_binary", "status": "healthy"},
+    {"id": "kin_daemon_binary", "status": "healthy"},
+    {"id": "supervisor_startup_protocol", "status": "healthy"},
+    {"id": "daemon_running", "status": "unsupported"},
+    {"id": "daemon_idle_window", "status": "unsupported"},
+    {"id": "vfs_projection", "status": "unsupported"},
+    {"id": "projection_mode", "status": "unsupported"},
+    {"id": "repo_init", "status": "unsupported"},
+    {"id": "session_runtime", "status": "unsupported"},
+    {"id": "shell_path", "status": "healthy"},
+    {"id": "registry_authority", "status": "unsupported"},
+    {"id": "mcp_client_claude", "status": "healthy"},
+    {"id": "mcp_client_cursor", "status": "healthy"},
+    {"id": "mcp_client_gemini", "status": "healthy"},
+    {"id": "mcp_client_windsurf", "status": "healthy"},
+    {"id": "setup_ledger", "status": "healthy"},
+    {"id": "editor", "status": "unsupported"},
+    {"id": "kinlab_connect", "status": "unsupported"},
+    {"id": "semantic_query_readiness", "status": "unsupported"},
+    {"id": "reference_edge_coverage", "status": "unsupported"},
+    {"id": "relation_census", "status": "unsupported"},
+    {"id": "parse_coverage", "status": "unsupported"},
+    {"id": "background_work", "status": "unsupported"},
+    {"id": "embedding_model", "status": "pending"},
+    {"id": "memory_floor", "status": "degraded"},
+    {"id": "commit_memory_headroom", "status": "unsupported"},
+    {"id": "daemon_kill_record", "status": "unsupported"},
+    {"id": "interrupted_init", "status": "healthy"},
+    {"id": "suspended_sweep", "status": "unsupported"},
+    {"id": "host_memory_pressure", "status": "unsupported"},
+    {"id": "retrieval_profile", "status": "healthy"},
+    {"id": "update_policy", "status": "healthy"},
+    {"id": "binary_assessment_load", "status": "unsupported"},
+]
 
 
 # --------------------------------------------------------- toolchain-free repair
@@ -825,6 +980,556 @@ def check_4(suite):
     return res
 
 
+# --------------------------------------------------- an unbound MCP server
+#
+# The 2026-08-28 walkthrough's finding 5. The install page hands every client
+# the same MCP entry, `{"command":"npx","args":["-y","@kinlab/kin-mcp"]}`, and
+# the wrapper behind it refused before `kin mcp start` ever ran when the launch
+# directory held no `.kin/`. The page's own ordering guarantees the failure: it
+# says to point a client at the server and then run `kin init`, so a first-time
+# user restarts their client before any repository exists. Measured on 0.6.0:
+# EOF on `initialize` with the process gone in 862 ms.
+#
+# What this grades is the handshake, on the wrapper the install page names,
+# in a directory with no `.kin/`. The binary is supplied explicitly, because the
+# wrapper's own provisioning path downloads a release asset and a check that
+# needed the network would fail on a bad morning rather than on a defect.
+
+MCP_SERVED = "SERVED"
+MCP_EOF = "EOF_NO_RESPONSE"
+MCP_TIMEOUT = "TIMEOUT_NO_RESPONSE"
+MCP_PROBE_ID = 4242
+
+# Two sentences the notice owes a reader who is about to be served nothing.
+UNBOUND_NOTICE = "no repository is bound yet"
+UNBOUND_REPAIR = "kin init ."
+
+
+def mcp_initialize(command, cwd, env, timeout=180):
+    """Hand one `initialize` frame to a stdio MCP server and read the answer.
+
+    (verdict, stdout_lines, stderr_text, alive_after_answer). The verdict is
+    matched on this request's own JSON-RPC id rather than on something coming
+    back, because a server that writes a banner and dies would otherwise read as
+    one that answered. `alive` is read at the moment the answer arrives: the
+    defect is a wrapper that exits, and a served response from a process that
+    then died is not a server a client can use.
+    """
+    request = json.dumps({
+        "jsonrpc": "2.0",
+        "id": MCP_PROBE_ID,
+        "method": "initialize",
+        "params": {"protocolVersion": "2024-11-05", "capabilities": {},
+                   "clientInfo": {"name": "first-contact-honesty", "version": "1"}},
+    })
+    try:
+        proc = subprocess.Popen(
+            command, cwd=cwd, env=env,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, bufsize=1)
+    except OSError as exc:
+        return "SPAWN_FAILED", [], "could not execute %s: %s" % (command[0], exc), False
+
+    lines = []
+    errors = []
+    answered = []
+
+    def drain_stderr():
+        for chunk in proc.stderr:
+            errors.append(chunk)
+
+    def read_stdout():
+        for line in proc.stdout:
+            lines.append(line)
+            try:
+                message = json.loads(line.strip())
+            except ValueError:
+                continue
+            if message.get("id") == MCP_PROBE_ID:
+                answered.append(message)
+                return
+
+    err_thread = threading.Thread(target=drain_stderr)
+    err_thread.daemon = True
+    err_thread.start()
+    out_thread = threading.Thread(target=read_stdout)
+    out_thread.daemon = True
+    out_thread.start()
+
+    try:
+        proc.stdin.write(request + "\n")
+        proc.stdin.flush()
+    except (IOError, OSError, ValueError):
+        # A process that has already gone takes the write with it. That is a
+        # reading, not an error: the verdict below reports EOF.
+        pass
+
+    out_thread.join(timeout)
+    alive = proc.poll() is None
+    if answered:
+        verdict = MCP_SERVED
+    elif out_thread.is_alive():
+        verdict = MCP_TIMEOUT
+    else:
+        verdict = MCP_EOF
+
+    try:
+        proc.kill()
+    except OSError:
+        pass
+    try:
+        proc.wait(timeout=10)
+    except Exception:  # noqa: BLE001 - a stuck child must not fail the suite
+        pass
+    err_thread.join(timeout=5)
+    return verdict, lines, "".join(errors), alive
+
+
+def grade_unbound_start(verdict, alive, stderr_text, stdout_lines, kin_created):
+    """(ok, detail) for a wrapper started where no repository exists."""
+    if verdict == MCP_TIMEOUT:
+        return None, ("the server neither answered `initialize` nor exited inside the "
+                      "budget, so this run says nothing about either behaviour")
+    if verdict.startswith("SPAWN_FAILED"):
+        return None, "the wrapper could not be started at all: %s" % flatten(stderr_text)[:200]
+    if verdict == MCP_EOF:
+        return False, (
+            "`initialize` got EOF with no response in a directory holding no `.kin/`, which "
+            "is the advertised MCP entry dying before a first-time user has a repository: %s"
+            % flatten(stderr_text)[:220])
+    if not alive:
+        return False, ("`initialize` was answered and the process was gone immediately after, "
+                       "so a client gets one frame and a dead server")
+    if kin_created:
+        return False, ("starting unbound initialized a repository behind the user; "
+                       "KIN_MCP_AUTO_INIT is what asks for that")
+    body = [line for line in stdout_lines if line.strip()]
+    if not body:
+        return None, "the server answered but wrote nothing this probe could read back"
+    try:
+        json.loads(body[0].strip())
+    except ValueError:
+        return False, ("the first thing on stdout is not a JSON-RPC frame, so prose is being "
+                       "written to the protocol channel: %r" % body[0][:120])
+    flat = flatten(stderr_text)
+    if UNBOUND_NOTICE not in flat:
+        return False, ("the server started and never said that no repository is bound, so the "
+                       "user is served an empty graph with no explanation: %s" % flat[:220])
+    if UNBOUND_REPAIR not in flat:
+        return False, ("the notice states the gap and not the repair, so a reader is told "
+                       "something is wrong and not what to run: %s" % flat[:220])
+    return True, ("`initialize` was served, the process stayed up, no repository was created "
+                  "behind the user, and the notice named the gap and the repair on stderr")
+
+
+def check_5(suite):
+    """The advertised MCP entry serves `initialize` outside a repository.
+
+    Probed through `packages/kin-mcp/bin/kin-mcp.js`, which is what
+    `npx -y @kinlab/kin-mcp` runs, rather than through `kin mcp start`: the
+    finding is about the wrapper, and the binary underneath it already served
+    this case. A probe pointed at the convenient surface would have reported the
+    product healthy.
+
+    The prober is proven able to say both words before either reading is
+    believed. A node process that exits without answering must read EOF, and a
+    four-line stub that answers any frame must read SERVED; without that pair, a
+    prober stuck on one verdict grades every wrapper as whatever it is stuck on.
+    """
+    res = Result("5", "cold-walk-2026-08-28",
+                 "the npx MCP wrapper serves initialize in a directory with no .kin/")
+
+    node = shutil.which("node")
+    if node is None:
+        res.unknown("no node on PATH, so the npm wrapper cannot be started here")
+        return res
+    wrapper = os.path.join(suite.repo_root, "packages", "kin-mcp", "bin", "kin-mcp.js")
+    if not os.path.exists(wrapper):
+        res.unknown("no wrapper at %s" % wrapper)
+        return res
+
+    work = suite.scratch("unbound-mcp")
+    home = suite.scratch("unbound-mcp-home")
+    env = suite.base_env()
+    env["HOME"] = home
+    env["KIN_HOME"] = os.path.join(home, ".kin")
+    # The wrapper's own provisioning downloads a release asset for its package
+    # version. Held fixed rather than measured, because this check is about the
+    # refusal in front of the server and not about how the binary arrives.
+    env["KIN_MCP_KIN_BINARY"] = suite.kin
+    env.pop("KIN_MCP_AUTO_INIT", None)
+
+    verdict, _, _, _ = mcp_initialize([node, "-e", "process.exit(2)"], work, env, timeout=60)
+    if verdict != MCP_EOF:
+        res.unknown("the negative control (a node process that answers nothing) read %s, so "
+                    "this prober cannot report a server that never answered" % verdict)
+        return res
+    answering_stub = (
+        'let buf="";process.stdin.on("data",d=>{buf+=d;const parts=buf.split("\\n");'
+        'buf=parts.pop();for(const line of parts){if(!line.trim())continue;'
+        'const m=JSON.parse(line);'
+        'process.stdout.write(JSON.stringify({jsonrpc:"2.0",id:m.id,result:{}})+"\\n");}});'
+        'setTimeout(()=>{},60000);'
+    )
+    verdict, _, _, alive = mcp_initialize([node, "-e", answering_stub], work, env, timeout=60)
+    if verdict != MCP_SERVED or not alive:
+        res.unknown("the positive control (a stub that answers every frame) read %s alive=%s, "
+                    "so this prober cannot report a server that did answer" % (verdict, alive))
+        return res
+    res.ok("the prober tells a served handshake from a process that exits, proven both ways "
+           "before the product was read")
+
+    verdict, out_lines, err, alive = mcp_initialize([node, wrapper], work, env, timeout=300)
+    kin_created = os.path.exists(os.path.join(work, ".kin"))
+    ok, detail = grade_unbound_start(verdict, alive, err, out_lines, kin_created)
+    if ok is None:
+        res.unknown(detail)
+        return res
+    if not ok:
+        res.bad(detail)
+        return res
+    res.ok(detail)
+    return res
+
+
+# ------------------------------------------- a sweep that skipped a language
+#
+# The 2026-08-28 walkthrough's finding 6. `kin init` on `tokio-rs/axum`, on a
+# macOS host that DID carry rustup and rust-analyzer, printed `cross-file
+# enrichment complete (5/303 files)`, and the same store's next `kin graph
+# status` read `imports 0/1085 (0%)` and `cross-file reference and override
+# edges unavailable for rust: no language server found`. The five files were
+# JavaScript. One store cannot say both things.
+#
+# Arranging it needs one language served while another is not, and the adapters'
+# server commands are constants in kin-lsp. PATH is the lever anyway:
+# `kin_lsp::lifecycle::LspServer::start` spawns them with `Command::new(command)`
+# on the bare name. So this scrubs `rust-analyzer` off PATH the way check 4
+# scrubs `rustup`, and puts a stub server on it under the TypeScript adapter's
+# name. The stub is what makes the check hermetic: no host is asked to have a
+# real language server, and the served language is served by bytes this file
+# writes.
+#
+# The control is the same fixture with the same stub reachable under BOTH names.
+# One PATH entry apart, one sweep must refuse the word `complete` and one must
+# use it. Without that pair a check that always reports a skipped language would
+# pass on a product that always reported one.
+
+# Rust files in the fixture below, which is the count the skipped-language row
+# has to report back. Named once so the fixture and the assertion cannot drift.
+RUST_FIXTURE_FILES = 3
+
+STUB_LSP_SERVER = r'''#!/usr/bin/env python3
+"""A stdio LSP server that completes the handshake and answers nothing else.
+
+Enough of the protocol for a sweep to count a file as visited. It declares the
+capabilities the daemon's readiness probe keys on and answers `workspace/symbol`
+at once, so readiness returns on the first poll instead of sleeping out its
+budget, and it answers every other request with a null result, so no query waits
+for a timeout. It resolves no reference and produces no edge: what it stands in
+for is a server that STARTS, which is the whole difference this check measures.
+"""
+import json
+import sys
+
+
+def read_message(stream):
+    length = None
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":", 1)[1].strip())
+    if length is None:
+        return None
+    return json.loads(stream.read(length).decode("utf-8"))
+
+
+def write_message(stream, payload):
+    body = json.dumps(payload).encode("utf-8")
+    stream.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    stream.write(body)
+    stream.flush()
+
+
+def main():
+    if "--version" in sys.argv[1:]:
+        sys.stdout.write("kin-acceptance-stub 0.0.0\n")
+        return 0
+    while True:
+        message = read_message(sys.stdin.buffer)
+        if message is None:
+            return 0
+        if "id" not in message:
+            if message.get("method") == "exit":
+                return 0
+            continue
+        if message.get("method") == "initialize":
+            result = {"capabilities": {
+                "referencesProvider": True,
+                "definitionProvider": True,
+                "typeDefinitionProvider": True,
+                "workspaceSymbolProvider": True,
+                "callHierarchyProvider": True,
+                "typeHierarchyProvider": True,
+            }}
+        else:
+            result = None
+        write_message(sys.stdout.buffer,
+                      {"jsonrpc": "2.0", "id": message["id"], "result": result})
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+# Both surfaces this check grades, in both their wordings. `kin init` and
+# `kin daemon sweep` share one function now, but they did not: the sweep printed
+# `sweep complete (3/6 files)` and nothing else. Keying the precondition on the
+# post-fix phrasing alone would grade the pre-fix sweep as a run that never
+# reached the phase, which reports UNREADABLE over a live completion claim.
+OUTCOME_MARKERS = ("cross-file enrichment", "sweep complete", "sweep finished")
+COMPLETION_CLAIMS = ("cross-file enrichment complete", "sweep complete")
+SKIP_ROW = re.compile(r"rust: (\d+) files? not enriched, because")
+
+
+def _outcome_reported(flat):
+    """The offset of the sweep's own outcome line, or None if it never printed one."""
+    found = [flat.find(marker) for marker in OUTCOME_MARKERS if marker in flat]
+    return min(found) if found else None
+
+
+def grade_skipped_language_outcome(output, expected_files=None):
+    """(ok, detail) for a sweep that served one language and not the other.
+
+    `expected_files` is the fixture's own count of files in the skipped
+    language. The daemon tallies one per blocked file, and a tally that stopped
+    after the first would report `1 file` for a language that lost hundreds:
+    that number reaches a user in a sentence, and nothing else in this suite or
+    in the unit tests reads it off a real sweep.
+    """
+    flat = flatten(output)
+    if not flat:
+        return None, "the run produced no output, so nothing could be graded"
+    at = _outcome_reported(flat)
+    if at is None:
+        return None, ("the run never reported a sweep outcome at all, so its silence about a "
+                      "skipped language is not evidence: %s" % flat[-220:])
+    claimed = [claim for claim in COMPLETION_CLAIMS if claim in flat]
+    if claimed:
+        return False, ("the pass reported a completion while a language went unserved, which "
+                       "is the sentence the walkthrough caught: %s"
+                       % flat[flat.find(claimed[0]):][:200])
+    row = SKIP_ROW.search(flat)
+    if row is None:
+        return False, ("the outcome never names the language it could not serve and how many "
+                       "files that cost, so a reader is told a count and nothing else: %s"
+                       % flat[at:][:260])
+    if "rust-analyzer" not in flat:
+        return False, ("the outcome names the language but not what the daemon observed when "
+                       "it tried, so the reason is left to be guessed: %s" % flat[at:][:260])
+    if expected_files is not None and int(row.group(1)) != expected_files:
+        return False, ("the outcome's count for the language is %s where this fixture holds %d "
+                       "files, so the count a user reads is not the count that was blocked: %s"
+                       % (row.group(1), expected_files, flat[at:][:260]))
+    return True, ("the pass refused the word complete and named the language, its %s files and "
+                  "the reason the daemon observed" % row.group(1))
+
+
+def grade_served_sweep_outcome(output):
+    """(ok, detail) for the control: every language met was served."""
+    flat = flatten(output)
+    if not flat:
+        return None, "the control run produced no output"
+    at = _outcome_reported(flat)
+    if at is None:
+        return None, ("the control never reported a sweep outcome at all, so it constrains "
+                      "nothing: %s" % flat[-220:])
+    if SKIP_ROW.search(flat):
+        return False, ("the control names a skipped language on a run where every server "
+                       "started, so the outcome reports a skip whatever happened: %s"
+                       % flat[at:][:260])
+    if not any(claim in flat for claim in COMPLETION_CLAIMS):
+        return False, ("a sweep that served every language it met still did not report a "
+                       "completion, so the ban on the word is satisfied by never saying "
+                       "anything: %s" % flat[at:][:260])
+    return True, "with both servers reachable the same fixture reports a completion"
+
+
+def _fixture_repository(suite, name):
+    """A git repository of three Rust and three TypeScript files, or None.
+
+    Both languages produce entities, so both reach the sweep's per-file loop.
+    Nothing else is added: a file whose extension no server here serves is
+    blocked for a different reason, and this check is about the language that
+    had one and could not use it.
+    """
+    git = shutil.which("git")
+    if git is None:
+        return None, "no git on PATH, so no repository can be admitted"
+    work = suite.scratch(name)
+    hooks = suite.scratch(name + "-nohooks")
+    os.makedirs(os.path.join(work, "src"))
+    os.makedirs(os.path.join(work, "web"))
+    for letter in ("a", "b", "c"):
+        with open(os.path.join(work, "src", "%s.rs" % letter), "w") as handle:
+            handle.write("pub fn %s_one() -> u32 { 1 }\n"
+                         "pub fn %s_two() -> u32 { %s_one() + 1 }\n"
+                         % (letter, letter, letter))
+    for letter in ("x", "y", "z"):
+        with open(os.path.join(work, "web", "%s.ts" % letter), "w") as handle:
+            handle.write("export function %sOne(): number { return 1; }\n"
+                         "export function %sTwo(): number { return %sOne() + 1; }\n"
+                         % (letter, letter, letter))
+    # The operator's own hooks are pointed away from, so a fixture commit cannot
+    # be refused by a policy that has nothing to do with this check.
+    common = [git, "-c", "core.hooksPath=%s" % hooks,
+              "-c", "user.email=acceptance@kin.invalid", "-c", "user.name=kin acceptance",
+              "-c", "commit.gpgsign=false"]
+    for args in (["init", "-q", "."], ["add", "-A"], ["commit", "-q", "-m", "fixture"]):
+        rc, _, err = run(common + args, cwd=work, timeout=300)
+        if rc != 0:
+            return None, "could not build the fixture repository (%s): %s" % (args[0],
+                                                                             flatten(err)[:200])
+    return work, "three Rust and three TypeScript files under one commit"
+
+
+def _stub_server_path(suite, name, names):
+    """A bin directory carrying the stub LSP server under each of `names`."""
+    binpath = suite.scratch(name)
+    source = os.path.join(binpath, "stub-language-server.py")
+    with open(source, "w") as handle:
+        handle.write(STUB_LSP_SERVER)
+    os.chmod(source, os.stat(source).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    for served in names:
+        os.symlink(source, os.path.join(binpath, served))
+    return binpath
+
+
+def _path_without_rust_analyzer(env):
+    """(PATH, complaint). Every entry that could resolve rust-analyzer is dropped.
+
+    `rustup` is dropped with it, because a rustup shim resolves `rust-analyzer`
+    through a proxy this scrub would otherwise walk straight past. The drop is
+    asserted rather than hoped for: the runner that builds this suite installs a
+    Rust toolchain, and a check that merely hoped for its absence would grade a
+    run where the real server started.
+    """
+    kept = [entry for entry in env.get("PATH", "").split(os.pathsep)
+            if entry
+            and not os.path.exists(os.path.join(entry, "rust-analyzer"))
+            and not os.path.exists(os.path.join(entry, "rustup"))]
+    path = os.pathsep.join(kept)
+    if shutil.which("rust-analyzer", path=path) is not None:
+        return None, ("the scrub left rust-analyzer reachable at %s"
+                      % shutil.which("rust-analyzer", path=path))
+    return path, ""
+
+
+def check_6(suite):
+    """A sweep that could not serve a language never calls the pass complete.
+
+    Two `kin init` runs on the same fixture, one PATH entry apart. In the first,
+    a stub language server is reachable under the TypeScript adapter's name and
+    `rust-analyzer` is not reachable at all, so three files are enriched and
+    three are not: the walkthrough's exact shape. In the second the same stub is
+    reachable under both names, so nothing is skipped and the completion line is
+    required. A ban on one word is satisfied by saying nothing, which is what the
+    second run is for.
+
+    `kin daemon sweep` is graded on the same store afterwards, because it is the
+    command the pending line tells a reader to run next and it printed
+    `sweep complete (3/6 files)` off the same status object that named rust.
+    """
+    res = Result("6", "cold-walk-2026-08-28",
+                 "a sweep that could not serve a language names it instead of reporting complete")
+
+    if shutil.which("python3") is None:
+        res.unknown("no python3 on PATH to run the stub language server")
+        return res
+
+    env = suite.base_env()
+    path, complaint = _path_without_rust_analyzer(env)
+    if path is None:
+        res.unknown(complaint)
+        return res
+    res.ok("rust-analyzer is unreachable on the scrubbed PATH, asserted rather than assumed")
+
+    work, detail = _fixture_repository(suite, "skipped-language-repo")
+    if work is None:
+        res.unknown(detail)
+        return res
+
+    home = suite.scratch("skipped-language-home")
+    served_only = _stub_server_path(suite, "skipped-language-bin",
+                                    ["typescript-language-server"])
+    skipped_env = dict(env)
+    skipped_env["HOME"] = home
+    skipped_env["KIN_HOME"] = os.path.join(home, ".kin")
+    skipped_env["PATH"] = os.pathsep.join([served_only, path])
+
+    rc, out, err = run([suite.kin, "init", "."], cwd=work, env=skipped_env, timeout=1800)
+    combined = (out or "") + "\n" + (err or "")
+    if rc != 0:
+        res.unknown("kin init exited %d on the fixture: %s" % (rc, flatten(err)[-260:]))
+        return res
+    ok, detail = grade_skipped_language_outcome(combined, RUST_FIXTURE_FILES)
+    if ok is None:
+        res.unknown(detail)
+        return res
+    if not ok:
+        res.bad("`kin init`: %s" % detail)
+        return res
+    res.ok("`kin init`: %s" % detail)
+
+    # The sibling command, on the store that run just built. It holds the whole
+    # status object and used to read two numbers out of it.
+    rc, out, err = run([suite.kin, "daemon", "sweep"], cwd=work, env=skipped_env, timeout=1800)
+    sweep_output = (out or "") + "\n" + (err or "")
+    if rc != 0:
+        res.unknown("kin daemon sweep exited %d: %s" % (rc, flatten(err)[-260:]))
+        return res
+    ok, detail = grade_skipped_language_outcome(sweep_output, RUST_FIXTURE_FILES)
+    if ok is None:
+        res.unknown("`kin daemon sweep`: %s" % detail)
+        return res
+    if not ok:
+        res.bad("`kin daemon sweep`: %s" % detail)
+        return res
+    res.ok("`kin daemon sweep`: %s" % detail)
+
+    control, detail = _fixture_repository(suite, "served-language-repo")
+    if control is None:
+        res.unknown("the control fixture could not be built: %s" % detail)
+        return res
+    control_home = suite.scratch("served-language-home")
+    both = _stub_server_path(suite, "served-language-bin",
+                             ["typescript-language-server", "rust-analyzer"])
+    control_env = dict(env)
+    control_env["HOME"] = control_home
+    control_env["KIN_HOME"] = os.path.join(control_home, ".kin")
+    control_env["PATH"] = os.pathsep.join([both, path])
+
+    rc, out, err = run([suite.kin, "init", "."], cwd=control, env=control_env, timeout=1800)
+    control_output = (out or "") + "\n" + (err or "")
+    if rc != 0:
+        res.unknown("the control kin init exited %d: %s" % (rc, flatten(err)[-260:]))
+        return res
+    ok, detail = grade_served_sweep_outcome(control_output)
+    if ok is None:
+        res.unknown(detail)
+        return res
+    if not ok:
+        res.bad(detail)
+        return res
+    res.ok(detail)
+    return res
+
+
 def _serve_asset(body):
     """A loopback HTTP server answering any path with `body`.
 
@@ -850,8 +1555,64 @@ def _serve_asset(body):
     return "http://127.0.0.1:%d" % httpd.server_address[1], httpd, thread
 
 
+def check_7(suite):
+    """`kin doctor --json` does not claim more than its own rows support.
+
+    Graded outside a repository, where the page carries the most `unsupported`
+    rows and where the join therefore has the most chances to get it wrong in
+    both directions: counting an out-of-scope row as a shortfall would refuse
+    every correct install, and not counting a `pending` or `degraded` row is the
+    overclaim that fenced v0.6.1.
+
+    Whatever this host's own rows happen to be is not the subject. The subject
+    is agreement, between the roll-up and the rows and between the machine
+    report and the human page, so the check answers the same way on a warming
+    laptop and on a settled one. The `--self-test` arms carry the shipped
+    Windows row set, which no host here can reproduce.
+    """
+    res = Result("7", "FIR-2919",
+                 "kin doctor's roll-up agrees with the rows it summarizes")
+
+    report, detail = doctor_report(suite)
+    if report is None:
+        res.unknown(detail)
+        return res
+
+    ok, detail = grade_health_rollup(report)
+    if ok is None:
+        res.unknown(detail)
+        return res
+    if not ok:
+        res.bad(detail)
+        return res
+    res.ok(detail)
+
+    # The same run's human page. The two renderings are one report, and the
+    # defect was that they disagreed: the printed line counted the pending and
+    # degraded rows while the JSON beside it did not. Graded on the closing
+    # line, which is the sentence a reader trusts.
+    env = suite.base_env()
+    work = os.path.join(suite.workdir, "no-repository")
+    if not os.path.isdir(work):
+        os.makedirs(work)
+    rc, out, err = run([suite.kin, "doctor"], cwd=work, env=env, timeout=600)
+    page = flatten(strip_ansi(out or ""))
+    if not page:
+        res.unknown("`kin doctor` exited %d and printed no page: %s" % (rc, flatten(err)[:200]))
+        return res
+    claims_ready = "First-run ready" in page
+    if claims_ready != bool(report.get("healthy")):
+        res.bad("the printed page and the JSON disagree: the page %s claim first-run ready "
+                "while `healthy` is %s. Page tail: %s"
+                % ("does" if claims_ready else "does not", report.get("healthy"), page[-300:]))
+        return res
+    res.ok("the printed page and the JSON agree: first-run ready %s, healthy=%s"
+           % ("claimed" if claims_ready else "withheld", report.get("healthy")))
+    return res
+
+
 CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
-          ("4", check_4)]
+          ("4", check_4), ("5", check_5), ("6", check_6), ("7", check_7)]
 
 
 # ----------------------------------------------------------------------- suite
@@ -993,6 +1754,64 @@ def self_test():
                "pyright` exited with 1: npm error minTimeout is greater than maxTimeout\n"
            )[0], None)
 
+    # FIR-2919, both directions, on the row set that fenced v0.6.1.
+    #
+    # The overclaim must fail, the honest emission of the SAME rows must pass,
+    # and the shipped payload, which carried no verdict at all, must read
+    # unreadable rather than either. Without the third arm the grader would
+    # report a clean product on the exact bytes the defect shipped in.
+    honest = {
+        "platform": "windows",
+        "checks": WINDOWS_V061_ROWS,
+        "healthy": False,
+        "verdict": "needs_attention",
+    }
+    overclaim = dict(honest, healthy=True, verdict="ready")
+    shipped = {"platform": "windows", "checks": WINDOWS_V061_ROWS, "healthy": True}
+    expect("the honest degraded roll-up must PASS",
+           grade_health_rollup(honest)[0], True)
+    expect("the v0.6.1 roll-up violation must FAIL",
+           grade_health_rollup(overclaim)[0], False)
+    expect("the shipped payload carries no verdict and is UNREADABLE",
+           grade_health_rollup(shipped)[0], None)
+    # The failure has to name the rows, or a reader gets a verdict mismatch with
+    # nothing to act on. 19 unsupported rows are not among them.
+    overclaim_detail = grade_health_rollup(overclaim)[1]
+    for wanted in ("embedding_model=pending", "memory_floor=degraded"):
+        if wanted not in overclaim_detail:
+            failures.append("the roll-up failure must name %s: %s" % (wanted, overclaim_detail))
+    for unwanted in ("daemon_running", "binary_assessment_load"):
+        if unwanted in overclaim_detail:
+            failures.append("the roll-up failure must not list out-of-scope rows (%s): %s"
+                            % (unwanted, overclaim_detail))
+
+    # The other three ways the roll-up can lie, each with the honest twin beside
+    # it so a rule that refused everything could not pass this block.
+    only_unsupported = {
+        "checks": [{"id": "kin_binary", "status": "healthy"},
+                   {"id": "vfs_projection", "status": "unsupported"}],
+        "healthy": True, "verdict": "ready",
+    }
+    expect("unsupported rows must not disqualify a ready roll-up",
+           grade_health_rollup(only_unsupported)[0], True)
+    expect("a ready roll-up over an unsupported row must not be refused",
+           grade_health_rollup(dict(only_unsupported, healthy=False,
+                                    verdict="needs_attention"))[0], False)
+    broken = {
+        "checks": [{"id": "kin_binary", "status": "healthy"},
+                   {"id": "shell_path", "status": "missing"}],
+        "healthy": False, "verdict": "failing",
+    }
+    expect("a broken install reports failing, not needs_attention",
+           grade_health_rollup(broken)[0], True)
+    expect("calling a broken install merely warming must FAIL",
+           grade_health_rollup(dict(broken, verdict="needs_attention"))[0], False)
+    expect("a payload with no checks is UNREADABLE",
+           grade_health_rollup({"healthy": True, "verdict": "ready", "checks": []})[0], None)
+    expect("a status this grader does not know is UNREADABLE",
+           grade_health_rollup({"healthy": True, "verdict": "ready",
+                                "checks": [{"id": "x", "status": "warming"}]})[0], None)
+
     expect("npx keeps its flags and gains an explicit bin name",
            localize("npx -y @kinlab/kin --version", "/tmp/p.tgz"),
            'npx -y --package="file:/tmp/p.tgz" kin --version')
@@ -1065,6 +1884,114 @@ def self_test():
     expect("a bare absence must FAIL", grade_toolchain_free_repair(only_absence)[0], False)
     expect("and it must be the absence branch that answered",
            ENDED_ON_ABSENCE in grade_toolchain_free_repair(only_absence)[1], True)
+
+
+    # The wrapper's notice, verbatim from `noRepositoryNotice` in
+    # packages/kin-mcp/src/index.js, and the 0.6.0 refusal it replaced. Held as
+    # literals the product emits rather than rebuilt from parts, because a
+    # grader fed a fixture this file invented cannot tell you what the wrapper
+    # says.
+    shipped_refusal_stderr = (
+        "No .kin/ found. Run `kin init .` first, or set KIN_MCP_AUTO_INIT=1 to allow "
+        "this wrapper to initialize the repo.\n"
+    )
+    fixed_notice_stderr = (
+        "kin-mcp: no .kin/ found in /tmp/empty, so no repository is bound yet.\n"
+        "Starting anyway. The MCP transport comes up, `initialize` and `tools/list` are served,\n"
+        "and a graph tool called before a repository exists answers by naming the gap and telling\n"
+        "the caller to run `kin init .` rather than failing silently.\n"
+        "Run `kin init .` in the repository you want served, or point this client's workspace\n"
+        "roots at one. This server re-resolves its repository on later tool calls, so nothing here\n"
+        "needs a restart. Set KIN_MCP_AUTO_INIT=1 to let this wrapper run `kin init .` for you.\n"
+    )
+    served_frame = ['{"jsonrpc":"2.0","id":4242,"result":{"protocolVersion":"2024-11-05"}}\n']
+    expect("the 0.6.0 wrapper dying on initialize must FAIL",
+           grade_unbound_start(MCP_EOF, False, shipped_refusal_stderr, [], False)[0], False)
+    expect("the fixed wrapper must PASS",
+           grade_unbound_start(MCP_SERVED, True, fixed_notice_stderr, served_frame, False)[0],
+           True)
+    expect("a server that neither answered nor exited is UNREADABLE",
+           grade_unbound_start(MCP_TIMEOUT, True, "", [], False)[0], None)
+    expect("an answer from a process that is already gone must FAIL",
+           grade_unbound_start(MCP_SERVED, False, fixed_notice_stderr, served_frame, False)[0],
+           False)
+    expect("starting unbound and initializing the repository anyway must FAIL",
+           grade_unbound_start(MCP_SERVED, True, fixed_notice_stderr, served_frame, True)[0],
+           False)
+    expect("the notice on the protocol channel must FAIL",
+           grade_unbound_start(MCP_SERVED, True, "",
+                               [fixed_notice_stderr] + served_frame, False)[0], False)
+    expect("a silent start with no notice at all must FAIL",
+           grade_unbound_start(MCP_SERVED, True, "", served_frame, False)[0], False)
+    expect("a notice naming the gap and not the repair must FAIL",
+           grade_unbound_start(MCP_SERVED, True,
+                               "kin-mcp: no .kin/ found in /tmp/empty, so no repository is "
+                               "bound yet.\n", served_frame, False)[0], False)
+
+    # The walkthrough's own sentence, and the one this suite requires instead.
+    # Both are what the product printed: the first on 0.6.0 against axum, the
+    # second on a three-Rust three-TypeScript fixture with rust-analyzer off
+    # PATH.
+    walkthrough_completion = (
+        "Enriching cross-file references (language server)...\n"
+        "  enriched 5/303 files\n"
+        "  cross-file enrichment complete (5/303 files)\n"
+    )
+    named_skip = (
+        "Enriching cross-file references (language server)...\n"
+        "  enriched 3/6 files\n"
+        "  cross-file enrichment ended having enriched 3 of 6 files, leaving 1 language "
+        "unserved:\n"
+        "    rust: 3 files not enriched, because the `rust-analyzer` language server did not "
+        "start (server failed to start: rust-analyzer: No such file or directory (os error 2)), "
+        "so nothing in this language was enriched\n"
+    )
+    expect("the walkthrough's completion sentence must FAIL",
+           grade_skipped_language_outcome(walkthrough_completion)[0], False)
+    expect("the named skip must PASS", grade_skipped_language_outcome(named_skip)[0], True)
+    expect("the named skip with the fixture's own count must PASS",
+           grade_skipped_language_outcome(named_skip, 3)[0], True)
+    # The tally that stopped counting after the first blocked file. The sentence
+    # is otherwise perfect, which is why only the number can catch it.
+    expect("a row reporting one file for a language that lost three must FAIL",
+           grade_skipped_language_outcome(
+               named_skip.replace("rust: 3 files", "rust: 1 file"), 3)[0], False)
+    expect("no output is UNREADABLE", grade_skipped_language_outcome("")[0], None)
+    expect("a run that never enriched anything is UNREADABLE",
+           grade_skipped_language_outcome("Initialized Kin repository authority at /tmp/x\n")[0],
+           None)
+    expect("an outcome that names no language must FAIL",
+           grade_skipped_language_outcome(
+               "Enriching cross-file references (language server)...\n"
+               "  cross-file enrichment ended having enriched 3 of 6 files\n")[0], False)
+    expect("an outcome that names the language and not the reason must FAIL",
+           grade_skipped_language_outcome(
+               "  cross-file enrichment ended having enriched 3 of 6 files, leaving 1 language "
+               "unserved:\n"
+               "    rust: 3 files not enriched, because the server was unavailable\n")[0], False)
+    # The pre-fix `kin daemon sweep`, which shares no wording with `kin init`.
+    # Its completion claim must be caught as a completion, never reported as a
+    # run that produced no outcome.
+    expect("the pre-fix sweep's own sentence must FAIL",
+           grade_skipped_language_outcome("  enriched 3/6 files\nsweep complete (3/6 files)\n")[0],
+           False)
+    # The control's own grader, which is what stops "never say complete" from
+    # passing a product that never says anything.
+    expect("the control must PASS on a sweep that served every language",
+           grade_served_sweep_outcome(
+               "Enriching cross-file references (language server)...\n"
+               "  cross-file enrichment complete (6/6 files)\n")[0], True)
+    expect("the control must FAIL when a skip is reported on a clean run",
+           grade_served_sweep_outcome(named_skip)[0], False)
+    expect("the control must FAIL when the outcome claims neither",
+           grade_served_sweep_outcome(
+               "  cross-file enrichment covered 6 of 8 files:\n"
+               "    2 files blocked for a reason this sweep did not attribute to a language\n"
+           )[0], False)
+    expect("the control on progress lines alone is UNREADABLE",
+           grade_served_sweep_outcome("  enriched 6/6 files\n")[0], None)
+    expect("the control on no output is UNREADABLE",
+           grade_served_sweep_outcome("")[0], None)
 
     for line in failures:
         print("SELF-TEST FAIL %s" % line)
