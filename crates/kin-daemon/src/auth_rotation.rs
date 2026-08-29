@@ -4,10 +4,10 @@
 //! # Why an overlap window exists at all
 //!
 //! One Kubernetes Secret, `kin-daemon-auth-token`, is injected into three
-//! containers in the hosted deployment: `kin-registry`, `kin-daemon` and
-//! `kinlab-control-plane` (kin-infra `compute/workloads.ts`, three
-//! `secretKeyRef` sites). Two of those run a daemon surface that ENFORCES the
-//! token; one is a client that SENDS it.
+//! containers in the hosted deployment: the registry, the daemon, and the
+//! hosted control plane that calls them (kin-infra `compute/workloads.ts`,
+//! three `secretKeyRef` sites). Two of those run a daemon surface that ENFORCES
+//! the token; one is a client that SENDS it.
 //!
 //! Three containers cannot have their environment replaced at the same instant.
 //! During any rollout there is a window where a sender holds one value and an
