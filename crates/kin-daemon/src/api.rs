@@ -13980,6 +13980,17 @@ fn transfer_command_context(
     {
         endpoint = endpoint.with_auth(token);
     }
+    // A request naming an organization is addressing a hosted KinLab peer,
+    // whose seam is org scoped. One naming none is a peer daemon, which serves
+    // the seam at its own root, so the endpoint keeps the route it already had.
+    if let Some(organization_id) = request
+        .remote_organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|organization_id| !organization_id.is_empty())
+    {
+        endpoint = endpoint.with_organization(organization_id);
+    }
 
     Ok(TransferCommandContext {
         repository_id,
@@ -23574,6 +23585,9 @@ mod tests {
 
         let destination_url = serve_replica(Arc::clone(&destination_state)).await;
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: destination_url.clone(),
             remote_token: None,
             repository_id: Some(repo_id.clone()),
@@ -23754,6 +23768,9 @@ mod tests {
         let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
 
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: hosted_url,
             remote_token: None,
             repository_id: Some(hosted_id.clone()),
@@ -23831,6 +23848,9 @@ mod tests {
         let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
 
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: hosted_url,
             remote_token: None,
             // Left unset on purpose, so the push sends what the store actually
@@ -23903,6 +23923,9 @@ mod tests {
         let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
 
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: hosted_url,
             remote_token: None,
             repository_id: Some(hosted_id.clone()),
@@ -24709,6 +24732,9 @@ mod tests {
             );
 
             let request = kin_cli::commands::transfer::CommandTransferRequest {
+                // A peer daemon serves the seam at its own root and has no
+                // organizations; only a hosted KinLab peer is org scoped.
+                remote_organization_id: None,
                 remote_base_url: hosted_url,
                 remote_token: None,
                 repository_id: Some(hosted_id.clone()),
@@ -24856,6 +24882,9 @@ mod tests {
         let source_state =
             Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: hosted_url,
             remote_token: None,
             // Left unset so the push sends what the store actually holds.
@@ -26036,6 +26065,9 @@ mod tests {
         repo_id: &str,
     ) -> kin_cli::commands::transfer::CommandTransferRequest {
         kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: url.to_string(),
             remote_token: None,
             repository_id: Some(repo_id.to_string()),
@@ -26634,6 +26666,9 @@ mod tests {
             .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
 
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: source_url,
             remote_token: None,
             repository_id: Some(repo_id.clone()),
@@ -26739,6 +26774,9 @@ mod tests {
 
         let destination_url = serve_replica(Arc::clone(&destination_state)).await;
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: destination_url,
             remote_token: None,
             repository_id: Some(repo_id.clone()),

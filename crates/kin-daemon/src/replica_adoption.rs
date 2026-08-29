@@ -196,6 +196,9 @@ pub async fn clone_native_replica(
 
     let adopted = identity.repository_id.clone();
     let request = kin_cli::commands::transfer::CommandTransferRequest {
+        // A peer daemon serves the seam at its own root and has no
+        // organizations; only a hosted KinLab peer is org scoped.
+        remote_organization_id: None,
         remote_base_url: endpoint.base_url.clone(),
         remote_token: endpoint.auth_token.clone(),
         repository_id: Some(adopted.to_string()),
