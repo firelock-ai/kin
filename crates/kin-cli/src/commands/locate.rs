@@ -1965,16 +1965,26 @@ pub fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: Retrieval
 /// Deliberately at query entry rather than at every mutation. The mutation
 /// surface is commit, checkout, rename, stash, merge, rollback, tag, the MCP
 /// writes and the language-server sweep; the read surface is this function's two
-/// callers. Two call sites cover every mutation, a clean index costs one atomic
-/// load, and a dirty one pays exactly the commit the daemon would have paid
+/// callers. Two call sites cover every mutation, a clean index returns on two
+/// atomics, and a dirty one pays exactly the commit the daemon would have paid
 /// moments later.
+///
+/// One state costs more than a commit, and it is taken deliberately. A batch
+/// relation write sets `text_full_rebuild_required`, and `flush_text_index`
+/// does that whole rebuild here rather than deferring it. The alternative is
+/// worse than the cost: while that flag is set `text_search` refuses outright,
+/// and this pipeline swallows the refusal with a bare `continue` at four of its
+/// stages while propagating it with `?` at others, so one store answers thin or
+/// errors depending only on which stage reached the index first.
 ///
 /// The second half is the graph-gap report. A graph whose lexical index holds
 /// nothing cannot answer a lexical question from graph truth, and the rule here
 /// is to fail loud or report the gap rather than answer thin, so it goes in the
-/// degradation ledger the daemon logs at WARN and the human surface renders as a
-/// coverage note. Before this, an answer built with no lexical evidence at all
-/// carried three degradations and not one of them mentioned the index.
+/// degradation ledger. `coverage_notes` renders that ledger as one
+/// component-prefixed note per entry, collapsed to a line and printed whole
+/// under `--explain`, and the daemon carries it into the answer's own
+/// `degradations[]`. Before this, an answer built with no lexical evidence at
+/// all carried three degradations and not one of them mentioned the index.
 pub(crate) fn ensure_lexical_index_queryable(
     graph: &kin_db::InMemoryGraph,
     sink: &mut Vec<RetrievalDegradation>,
