@@ -1072,6 +1072,14 @@ fn render_human_result(
             writeln!(out, "  Workspace: empty exact tree")?;
         }
     }
+    // The reading that explains a fetch that did not happen, selected by the
+    // work it is about. `read_all(...).last()` was the newest refusal of ANY
+    // heavy work, so on a pressured host whose last refusal was the LSP sweep
+    // this line explained a missing model download with a cause about something
+    // else. Read here rather than remembered, for the same reason the daemon
+    // death beside it is: the refusal is written by a daemon during the
+    // enrichment phase and leaves nothing in this process.
+    let embed_refusal = embed_refusal_for(result.layout.root());
     let guidance = ordered_init_guidance_lines(
         format!(
             "  Semantic enrichment: {}",
@@ -1085,11 +1093,7 @@ fn render_human_result(
             embedding_model_notice(
                 &crate::embed_model::EmbedModelFetch::probe(false),
                 model_present_before,
-                // The reading that explains a fetch that did not happen. Read
-                // here rather than remembered, for the same reason the daemon
-                // death beside it is: the refusal is written by a daemon during
-                // the enrichment phase and leaves nothing in this process.
-                kin_core::memory_pressure::PressureRefusal::read_all(result.layout.root()).last(),
+                embed_refusal.as_ref(),
             )
         ),
     );
@@ -1147,6 +1151,20 @@ fn ordered_init_guidance_lines(
 /// `kin init` does, during `kin init`, and this notice prints after it rather
 /// than before. Saying so costs a clause and saves a reader the wrong mental
 /// model of when their machine is busy.
+/// The refusal that explains a model download this run did not do.
+///
+/// Selected by the work it is about. The newest refusal of ANY heavy work was
+/// what this used to read, so on a pressured host whose last refusal was the
+/// LSP sweep the notice explained a missing model download with a cause about
+/// something else entirely. `LspSweep` is a live sibling producer, not a
+/// hypothetical one.
+fn embed_refusal_for(root: &std::path::Path) -> Option<kin_core::memory_pressure::PressureRefusal> {
+    kin_core::memory_pressure::PressureRefusal::read_for_work(
+        root,
+        kin_core::memory_pressure::HeavyWork::EmbedBatch,
+    )
+}
+
 fn embedding_model_notice(
     fetch: &crate::embed_model::EmbedModelFetch,
     present_before: bool,
@@ -2408,6 +2426,50 @@ mod tests {
         assert!(
             overridden_notice.contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {overridden_notice}"
+        );
+    }
+
+    /// The notice explains itself with the embed refusal, never with whatever
+    /// heavy work happened to be refused last.
+    ///
+    /// `LspSweep` writes refusals to the same ledger, so on a pressured host
+    /// the newest row is often about the sweep. Reading that one told a user
+    /// their model download was skipped for a reason belonging to different
+    /// work.
+    #[test]
+    fn the_model_notice_reads_the_embed_refusal_and_not_the_newest_one() {
+        use kin_core::memory_pressure::{HeavyWork, PressureLevel, PressureRefusal};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // Order matters: the sweep is published second, so it is the newest
+        // refusal of any work, which is what the old selection returned.
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "the embed batch was held back",
+        );
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::LspSweep,
+            PressureLevel::Critical,
+            "the sweep was held back",
+        );
+
+        // This is only the case that matters if the newest really is the other
+        // work, so that is asserted rather than assumed.
+        assert_eq!(
+            PressureRefusal::read_all(dir.path())
+                .last()
+                .map(|refusal| refusal.work.clone()),
+            Some(HeavyWork::LspSweep.id().to_string()),
+            "the newest refusal on this store is about the sweep"
+        );
+
+        let chosen = embed_refusal_for(dir.path()).expect("the embed refusal is on record");
+        assert_eq!(
+            chosen.work,
+            HeavyWork::EmbedBatch.id().to_string(),
+            "a download that did not happen is explained by the refusal about downloading"
         );
     }
 
