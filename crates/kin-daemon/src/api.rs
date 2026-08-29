@@ -13933,6 +13933,44 @@ impl TransferCommandContext {
     }
 }
 
+/// Where this transfer's peer is, and how to address it.
+///
+/// The authentication and the organization scope are applied here rather than
+/// inline at the one call site, so neither can be dropped on its own: an
+/// endpoint is not optional, and this is the only place that builds one. A
+/// separate `if let` beside the constructor was deletable without breaking any
+/// build, and a falsification arm that deleted it passed every test.
+///
+/// A request naming an organization addresses a hosted KinLab peer, whose seam
+/// is org scoped. One naming none is a peer daemon, which serves the seam at
+/// its own root, so the endpoint keeps the route it already had. A daemon that
+/// predates the field sends none and so keeps addressing peers exactly as it
+/// did.
+fn transfer_endpoint(
+    base_url: &str,
+    request: &kin_cli::commands::transfer::CommandTransferRequest,
+) -> kin_remote::repository_transfer_http::RepositoryTransferEndpoint {
+    let mut endpoint =
+        kin_remote::repository_transfer_http::RepositoryTransferEndpoint::new(base_url);
+    if let Some(token) = request
+        .remote_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        endpoint = endpoint.with_auth(token);
+    }
+    if let Some(organization_id) = request
+        .remote_organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|organization_id| !organization_id.is_empty())
+    {
+        endpoint = endpoint.with_organization(organization_id);
+    }
+    endpoint
+}
+
 /// Resolve the repository, refs, and peer for one transfer command.
 ///
 /// An absent source ref means the repository's own default ref, which is the
@@ -13970,27 +14008,7 @@ fn transfer_command_context(
         .clone()
         .or_else(|| source_ref.clone());
 
-    let mut endpoint =
-        kin_remote::repository_transfer_http::RepositoryTransferEndpoint::new(base_url);
-    if let Some(token) = request
-        .remote_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        endpoint = endpoint.with_auth(token);
-    }
-    // A request naming an organization is addressing a hosted KinLab peer,
-    // whose seam is org scoped. One naming none is a peer daemon, which serves
-    // the seam at its own root, so the endpoint keeps the route it already had.
-    if let Some(organization_id) = request
-        .remote_organization_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|organization_id| !organization_id.is_empty())
-    {
-        endpoint = endpoint.with_organization(organization_id);
-    }
+    let endpoint = transfer_endpoint(base_url, request);
 
     Ok(TransferCommandContext {
         repository_id,
@@ -17223,6 +17241,44 @@ mod tests {
     /// embedding worker has failed while `impact_analysis` refuses on the same
     /// instant. Human surface more confident than agent surface is the exact
     /// divergence this ticket closes.
+    /// One transfer request, carrying only what these tests vary.
+    fn transfer_request_for(
+        organization_id: Option<&str>,
+    ) -> kin_cli::commands::transfer::CommandTransferRequest {
+        kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: "https://kinlab.ai".to_string(),
+            remote_token: None,
+            remote_organization_id: organization_id.map(str::to_string),
+            repository_id: None,
+            source_ref: None,
+            destination_ref: None,
+        }
+    }
+
+    #[test]
+    fn a_request_naming_an_organization_scopes_the_endpoint_to_it() {
+        // The daemon is where a transfer runs, so the organization the CLI
+        // resolved has to survive the trip into the endpoint. A daemon that
+        // dropped it would address a hosted peer on the daemon route, which on
+        // kinlab.ai is outside /api/ and answers from the static bucket.
+        let endpoint = transfer_endpoint("https://kinlab.ai", &transfer_request_for(Some("acme")));
+        assert_eq!(endpoint.organization_id.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn a_request_naming_no_organization_stays_on_the_peer_daemon_route() {
+        let endpoint = transfer_endpoint("http://127.0.0.1:4010", &transfer_request_for(None));
+        assert_eq!(endpoint.organization_id, None);
+    }
+
+    #[test]
+    fn a_blank_organization_on_the_wire_is_not_an_organization() {
+        // A caller that sends an empty string is not naming an organization,
+        // and taking it would build `/orgs//repos/...`.
+        let endpoint = transfer_endpoint("https://kinlab.ai", &transfer_request_for(Some("   ")));
+        assert_eq!(endpoint.organization_id, None);
+    }
+
     #[test]
     fn the_impact_envelope_carries_the_daemons_degraded_signals() {
         let health = serde_json::json!({
