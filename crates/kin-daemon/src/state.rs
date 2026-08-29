@@ -316,12 +316,18 @@ struct DurableVectorTestState {
     artifacts: HashMap<(String, u64, u32, [u8; 32]), kin_db::PersistedVectorArtifact>,
     corrupt_loads: HashSet<String>,
     next_cursor: u64,
+    // Save counters and fault injection. Every reader is an `embeddings` test
+    // below, so a featureless build neither writes nor reads these three.
+    #[cfg(feature = "embeddings")]
     saves: u64,
+    #[cfg(feature = "embeddings")]
     last_expected_cursor: Option<kin_db::VectorArtifactCursor>,
+    #[cfg(feature = "embeddings")]
     next_save_fault: Option<DurableVectorSaveFault>,
 }
 
-#[cfg(test)]
+/// Every variant is constructed by an `embeddings` test and by nothing else.
+#[cfg(all(test, feature = "embeddings"))]
 #[derive(Debug, Clone, Copy)]
 enum DurableVectorSaveFault {
     ConflictInstallWinner,
@@ -357,6 +363,7 @@ impl DurableVectorTestBackend {
             .expect("test graph snapshot must publish")
     }
 
+    #[cfg(feature = "embeddings")]
     pub(crate) fn corrupt_vector_loads(&self, repo_id: &str) {
         self.vectors
             .lock()
@@ -394,6 +401,7 @@ impl DurableVectorTestBackend {
         state.corrupt_loads.insert(repo_id.to_string());
     }
 
+    #[cfg(feature = "embeddings")]
     pub(crate) fn vector_save_count(&self) -> u64 {
         self.vectors
             .lock()
@@ -401,6 +409,7 @@ impl DurableVectorTestBackend {
             .saves
     }
 
+    #[cfg(feature = "embeddings")]
     pub(crate) fn last_expected_vector_cursor(&self) -> Option<kin_db::VectorArtifactCursor> {
         self.vectors
             .lock()
@@ -408,6 +417,7 @@ impl DurableVectorTestBackend {
             .last_expected_cursor
     }
 
+    #[cfg(feature = "embeddings")]
     fn inject_next_save_fault(&self, fault: DurableVectorSaveFault) {
         self.vectors
             .lock()
@@ -415,6 +425,7 @@ impl DurableVectorTestBackend {
             .next_save_fault = Some(fault);
     }
 
+    #[cfg(feature = "embeddings")]
     fn current_vector_artifact(&self, repo_id: &str) -> Option<kin_db::PersistedVectorArtifact> {
         let binding = self.current_binding(repo_id).ok()?;
         self.vectors
@@ -425,6 +436,7 @@ impl DurableVectorTestBackend {
             .cloned()
     }
 
+    #[cfg(feature = "embeddings")]
     fn corrupt_current_vector_indexed_count(&self, repo_id: &str) {
         let binding = self
             .current_binding(repo_id)
@@ -560,7 +572,10 @@ impl StorageBackend for DurableVectorTestBackend {
             .vectors
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.last_expected_cursor = Some(expected);
+        #[cfg(feature = "embeddings")]
+        {
+            state.last_expected_cursor = Some(expected);
+        }
         let key = Self::artifact_key(repo_id, artifact.binding);
         let installed = state.artifacts.get(&key).map(|stored| stored.cursor);
         if installed.unwrap_or(kin_db::VectorArtifactCursor::INITIAL) != expected {
@@ -571,29 +586,36 @@ impl StorageBackend for DurableVectorTestBackend {
                 observed_cursor: installed,
             };
         }
+        #[cfg(feature = "embeddings")]
         let fault = state.next_save_fault.take();
-        if matches!(fault, Some(DurableVectorSaveFault::ConflictWithoutCursor)) {
-            return kin_db::VectorArtifactSaveOutcome::NotCommitted {
-                error: kin_db::KinDbError::StorageError(format!(
-                    "repo {repo_id}: injected vector conflict without cursor evidence"
-                )),
-                observed_cursor: None,
-            };
-        }
-        if matches!(
-            fault,
-            Some(DurableVectorSaveFault::IndeterminateNotInstalled)
-        ) {
-            return kin_db::VectorArtifactSaveOutcome::Indeterminate {
-                error: kin_db::KinDbError::StorageError(format!(
-                    "repo {repo_id}: injected ambiguous pre-install vector failure"
-                )),
-                observed_cursor: installed,
-            };
+        #[cfg(feature = "embeddings")]
+        {
+            if matches!(fault, Some(DurableVectorSaveFault::ConflictWithoutCursor)) {
+                return kin_db::VectorArtifactSaveOutcome::NotCommitted {
+                    error: kin_db::KinDbError::StorageError(format!(
+                        "repo {repo_id}: injected vector conflict without cursor evidence"
+                    )),
+                    observed_cursor: None,
+                };
+            }
+            if matches!(
+                fault,
+                Some(DurableVectorSaveFault::IndeterminateNotInstalled)
+            ) {
+                return kin_db::VectorArtifactSaveOutcome::Indeterminate {
+                    error: kin_db::KinDbError::StorageError(format!(
+                        "repo {repo_id}: injected ambiguous pre-install vector failure"
+                    )),
+                    observed_cursor: installed,
+                };
+            }
         }
         let cursor = kin_db::VectorArtifactCursor::from_backend_generation(state.next_cursor);
         state.next_cursor += 1;
-        state.saves += 1;
+        #[cfg(feature = "embeddings")]
+        {
+            state.saves += 1;
+        }
         state.corrupt_loads.remove(repo_id);
         state.artifacts.insert(
             key,
@@ -603,22 +625,26 @@ impl StorageBackend for DurableVectorTestBackend {
                 artifact_sha256,
             },
         );
-        if matches!(fault, Some(DurableVectorSaveFault::ConflictInstallWinner)) {
-            return kin_db::VectorArtifactSaveOutcome::NotCommitted {
-                error: kin_db::KinDbError::StorageError(format!(
-                    "repo {repo_id}: injected concurrent vector winner"
-                )),
-                observed_cursor: Some(cursor),
-            };
+        #[cfg(feature = "embeddings")]
+        {
+            if matches!(fault, Some(DurableVectorSaveFault::ConflictInstallWinner)) {
+                return kin_db::VectorArtifactSaveOutcome::NotCommitted {
+                    error: kin_db::KinDbError::StorageError(format!(
+                        "repo {repo_id}: injected concurrent vector winner"
+                    )),
+                    observed_cursor: Some(cursor),
+                };
+            }
+            if matches!(fault, Some(DurableVectorSaveFault::IndeterminateInstalled)) {
+                return kin_db::VectorArtifactSaveOutcome::Indeterminate {
+                    error: kin_db::KinDbError::StorageError(format!(
+                        "repo {repo_id}: injected lost vector acknowledgement"
+                    )),
+                    observed_cursor: Some(cursor),
+                };
+            }
         }
-        if matches!(fault, Some(DurableVectorSaveFault::IndeterminateInstalled)) {
-            return kin_db::VectorArtifactSaveOutcome::Indeterminate {
-                error: kin_db::KinDbError::StorageError(format!(
-                    "repo {repo_id}: injected lost vector acknowledgement"
-                )),
-                observed_cursor: Some(cursor),
-            };
-        }
+        #[cfg(feature = "embeddings")]
         let acknowledged_sha256 =
             if matches!(fault, Some(DurableVectorSaveFault::CommittedWrongDigest)) {
                 let mut wrong = artifact_sha256;
@@ -627,6 +653,8 @@ impl StorageBackend for DurableVectorTestBackend {
             } else {
                 artifact_sha256
             };
+        #[cfg(not(feature = "embeddings"))]
+        let acknowledged_sha256 = artifact_sha256;
         kin_db::VectorArtifactSaveOutcome::Committed {
             cursor,
             artifact_sha256: acknowledged_sha256,
@@ -2152,6 +2180,12 @@ struct HostedVectorProducerPolicy {
     allowed: kin_db::EmbeddingProducerSet,
 }
 
+/// The profile half of the policy on its own.
+///
+/// Gated on the two features that build its call sites: the sidecar refresh in
+/// `flush_embed_progress` (`embeddings`) and the sidecar write in
+/// `persist_vector_sidecar` (`vector`). A featureless build constructs neither.
+#[cfg(any(feature = "embeddings", feature = "vector"))]
 fn hosted_vector_producer_profile() -> std::result::Result<String, String> {
     hosted_vector_producer_policy().map(|policy| policy.profile)
 }
@@ -2255,6 +2289,9 @@ enum HostedVectorPersistenceState {
         authority: HostedVectorArtifactAuthority,
         detail: String,
     },
+    /// Constructed only by `persist_hosted_vector_artifact` and the reload it
+    /// runs after a conflict, both of which the `vector` feature builds.
+    #[cfg(feature = "vector")]
     ConflictReloading {
         binding: kin_db::VectorArtifactBinding,
         observed_cursor: Option<kin_db::VectorArtifactCursor>,
@@ -2273,10 +2310,9 @@ impl HostedVectorPersistenceState {
             Self::Empty { authority }
             | Self::Ready { authority, .. }
             | Self::RepairableCorrupt { authority, .. } => Some(*authority),
-            Self::NotHosted
-            | Self::Unsupported { .. }
-            | Self::ConflictReloading { .. }
-            | Self::Indeterminate { .. } => None,
+            Self::NotHosted | Self::Unsupported { .. } | Self::Indeterminate { .. } => None,
+            #[cfg(feature = "vector")]
+            Self::ConflictReloading { .. } => None,
         }
     }
 }
@@ -8360,6 +8396,7 @@ impl DaemonState {
                     ..HostedVectorPersistenceHealth::default()
                 }
             }
+            #[cfg(feature = "vector")]
             HostedVectorPersistenceState::ConflictReloading {
                 binding,
                 observed_cursor,
