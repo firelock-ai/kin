@@ -189,7 +189,7 @@ SHA-256, and caches the binaries per user:
   "mcpServers": {
     "kin": {
       "command": "npx",
-      "args": ["-y", "@kinlab/kin-mcp"]
+      "args": ["-y", "@kinlab/kin", "mcp", "start"]
     }
   }
 }
@@ -200,13 +200,16 @@ Codex CLI uses TOML rather than JSON:
 ```toml
 [mcp_servers.kin]
 command = "npx"
-args = ["-y", "@kinlab/kin-mcp"]
+args = ["-y", "@kinlab/kin", "mcp", "start"]
 ```
 
-The wrapper refuses to start against a directory with no `.kin/`. If you want it to admit a
-repository on its own instead of running step 2 first, add
-`"env": { "KIN_MCP_AUTO_INIT": "1" }` to the entry. Say so out loud before enabling it,
-because it means an agent session can admit a repository without being asked.
+`kin setup status` and `kin doctor` recognize this exact shape and the absolute-path form
+above, and grade any other argument vector MISCONFIGURED. The older `@kinlab/kin-mcp`
+package keeps working for configurations that already name it. Run step 2 before you wire
+a client either way, because a client pointed at a directory with no graph gets a tool
+surface with nothing behind it. If you want the older wrapper to admit a repository on its
+own instead, add `"env": { "KIN_MCP_AUTO_INIT": "1" }` to the entry. Say so out loud before
+enabling it, because it means an agent session can admit a repository without being asked.
 
 ## Step 5: verify
 
