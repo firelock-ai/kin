@@ -1910,6 +1910,14 @@ jobs:
               ["reference_edge_coverage", ["pending"]],
               ["embedding_model", ["pending"]],
               ["memory_floor", ["degraded"]],
+              // The first relation census is its own background pass, so a
+              // capture that beats it reads `pending`, the same first-run
+              // class as reference_edge_coverage above. The v0.6.2 preflight
+              // measured exactly that on a native-arch containerized fresh
+              // install (both health captures pending) while this workflow's
+              // own v0.6.1 arm leg happened to win the race and read healthy,
+              // so whether the row appears is host timing, not install state.
+              ["relation_census", ["pending"]],
             ]);
             const untolerated = report.checks.filter(
               (check) =>
@@ -2054,6 +2062,10 @@ jobs:
                 ["projection_mode", ["stale"]],
                 ["reference_edge_coverage", ["pending"]],
                 ["memory_floor", ["degraded"]],
+                // The census pass is not tied to `kin embed`, so a capture can
+                // still beat it after a completed embed; same measurement as
+                // the pre-embed entry.
+                ["relation_census", ["pending"]],
               ]);
               const stillWaiting = report.checks.filter(
                 (check) =>
