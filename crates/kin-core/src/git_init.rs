@@ -271,6 +271,30 @@ fn init_from_git_with_hooks(
     crate::init_attempt::report_reclaimed_stages(reclaimed.recovered, reclaimed.retained);
     crate::init_attempt::report_reclaimed(&leftovers);
 
+    // Still inside phase 1, and deliberately the last thing it does. A
+    // conversion whose forecast peak is larger than the ceiling this process can
+    // read is a conversion the kernel ends at phase 4 with no message at all,
+    // because `SIGKILL` runs no destructor: the operator sees four phase lines
+    // and a shell that prints `Killed`. The post-mortem this crate writes for
+    // that death is read off disk by the NEXT command, so the run that dies is
+    // the only run that says nothing, and it is the run a first-time user has.
+    //
+    // Placed after the reap above rather than before it, so an operator turned
+    // away here still gets back the disk an earlier kill stranded. Placed before
+    // the journal and before any capture, so the refusal itself writes nothing:
+    // the capture directory claimed above is still empty and its handle removes
+    // it as this returns.
+    let budget = crate::init_budget::assess(&source);
+    if budget.refuses() {
+        for line in budget.refusal_lines() {
+            crate::init_attempt::disclose_line(&line);
+        }
+        return Err(KinError::ConversionBudgetExceeded);
+    }
+    if let Some(line) = budget.advisory_line() {
+        crate::init_attempt::disclose_line(&line);
+    }
+
     // The ladder now stamps every phase it opens into the capture directory, so
     // the next command can name where a kill landed.
     let journal = std::sync::Arc::new(crate::init_attempt::InitAttemptJournal::open(

@@ -122,6 +122,11 @@ EXPECTED_SUITES = (
         "working_copy_freshness",
         "acceptance/working_copy_freshness.json",
     ),
+    ExpectedSuite(
+        "scripts/acceptance/init_budget_refusal.py",
+        "init_budget",
+        "acceptance/init_budget.json",
+    ),
 )
 
 

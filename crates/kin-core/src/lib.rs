@@ -27,6 +27,7 @@ pub mod hydration_semantics;
 pub mod identity;
 pub mod init;
 pub mod init_attempt;
+pub mod init_budget;
 mod init_progress;
 pub use init_progress::report_admission_progress;
 mod init_staging;

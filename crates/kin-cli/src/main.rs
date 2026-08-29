@@ -2643,7 +2643,19 @@ fn main() -> Result<()> {
                     json,
                     no_enrich,
                     adopt_repository_id,
-                } => commands::init::run(path, json, no_enrich, adopt_repository_id).await,
+                } => {
+                    let code =
+                        commands::init::run(path, json, no_enrich, adopt_repository_id).await?;
+                    // A conversion whose store exists but whose enrichment a
+                    // killed daemon left unattested reports that through the
+                    // exit code, so a scripted or agent-driven setup can branch
+                    // on it without parsing the summary. It is not an error:
+                    // the store is durable and the summary above is true.
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
                 Command::Status { json, wait_quiesce } => {
                     commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await
                 }
