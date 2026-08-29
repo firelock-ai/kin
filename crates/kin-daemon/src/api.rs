@@ -13422,7 +13422,16 @@ enum RepositoryReadView {
 }
 
 impl RepositoryReadView {
-    fn metadata(&self) -> Result<&kin_db::PersistedRepositoryAuthority, (StatusCode, String)> {
+    /// This generation's authority envelope.
+    ///
+    /// Named `authority` and not `metadata` on purpose.
+    /// `scripts/verify-zero-file-search.py` reads `.metadata()` as a filesystem
+    /// metadata probe, which is exactly the call the zero-file-search rule
+    /// exists to keep out of an answer path. A repository-authority accessor
+    /// wearing that name spends the guard's allowlist on a call that touches no
+    /// filesystem, and the guard runs only in the `check` job, which pull
+    /// requests skip, so the cost lands on main rather than on the PR.
+    fn authority(&self) -> Result<&kin_db::PersistedRepositoryAuthority, (StatusCode, String)> {
         match self {
             Self::Hosted { metadata, .. } => Ok(metadata.as_ref()),
             Self::Local { snapshot } => repository_metadata(snapshot),
@@ -13434,7 +13443,7 @@ impl RepositoryReadView {
         &self,
         target: &kin_model::RefTarget,
     ) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
-        crate::state::resolve_repository_target(self.metadata()?, target)
+        crate::state::resolve_repository_target(self.authority()?, target)
             .map_err(repository_authority_error)
     }
 
@@ -14431,7 +14440,7 @@ async fn repo_files(
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
     let view = repository_read_view(&state, &repo_id).await?;
-    let selected = default_repository_ref(view.metadata()?)?.cloned();
+    let selected = default_repository_ref(view.authority()?)?.cloned();
     let files = if let Some(repository_ref) = selected {
         let change_id = view.resolve_target(&repository_ref.target)?;
         view.resolve_tree_at(&state, &change_id)?
@@ -14519,7 +14528,7 @@ async fn repo_history(
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
     let view = repository_read_view(&state, &repo_id).await?;
-    let metadata = view.metadata()?;
+    let metadata = view.authority()?;
     let Some(repository_ref) = default_repository_ref(metadata)? else {
         return Ok(Json(RepoHistoryResponse {
             repo_id,
