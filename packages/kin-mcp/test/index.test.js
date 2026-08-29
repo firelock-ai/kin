@@ -86,6 +86,18 @@ const fakeKinPreload = [
   "      fs.mkdirSync(path.join(process.env.KIN_MCP_FAKE_REPO, '.kin'), { recursive: true });",
   "    }",
   "  }",
+  "  if (command === 'mcp' && process.env.KIN_MCP_FAKE_ECHO_INITIALIZE) {",
+  "    let request = '';",
+  "    try { request = fs.readFileSync(0, 'utf8'); } catch (error) { request = ''; }",
+  "    const method = /\"method\"\\s*:\\s*\"([^\"]+)\"/.exec(request);",
+  "    const payload = JSON.stringify({",
+  "      jsonrpc: '2.0',",
+  "      id: 1,",
+  "      result: { served: method ? method[1] : 'nothing-arrived', cwd: process.cwd() }",
+  "    });",
+  "    process.stdout.write(`Content-Length: ${Buffer.byteLength(payload)}\\r\\n\\r\\n${payload}`);",
+  "    process.exit(0);",
+  "  }",
   "  if (command === 'mcp') {",
   "    if (process.env.KIN_MCP_FAKE_PROFILE) {",
   "      fs.writeFileSync(process.env.KIN_MCP_FAKE_PROFILE, process.env.KIN_MCP_TOOL_PROFILE || '');",
@@ -569,20 +581,96 @@ test('runKinMcp invokes kin mcp start', async () => {
   }
 });
 
-test('runKinMcp refuses implicit init when .kin/ is missing', async () => {
+// Coldwalk finding 5. The install page hands every client
+// `{"command":"npx","args":["-y","@kinlab/kin-mcp"]}`, and this wrapper used to
+// exit 2 before `kin mcp start` ever ran when the launch directory held no
+// `.kin/`. Measured on 2026-08-28: EOF on `initialize`, process gone in 862 ms,
+// against `kin mcp start` in the same directory serving `initialize` in 6 ms
+// with 20 tools listed. So the advertised agent-setup path died on first
+// contact for exactly the user it exists for, the one who has not run
+// `kin init` yet.
+test('runKinMcp starts the server when the launch directory is no Kin repository', async () => {
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-no-autoinit-'));
+  const argsPath = path.join(tmpDir, 'args.txt');
+  const env = await fakeKinEnvironment(tmpDir, { KIN_MCP_FAKE_LOG: argsPath });
+  delete env.KIN_MCP_AUTO_INIT;
+  // fakeKinEnvironment points the fake `kin init` at tmpDir, and this test is
+  // about the path where init must not run at all.
+  delete env.KIN_MCP_FAKE_REPO;
 
   try {
     let stderr = '';
     const exitCode = await runKinMcp([], {
-      env: { ...process.env, KIN_MCP_KIN_BINARY: process.execPath },
+      env,
       cwd: tmpDir,
       stderr: { write(chunk) { stderr += chunk; } },
       stdio: 'ignore'
     });
 
-    assert.equal(exitCode, 2);
-    assert.match(stderr, /Run `kin init \.` first/);
+    assert.equal(exitCode, 0, 'a directory with no .kin/ must not be fatal');
+    assert.equal(
+      await fs.readFile(argsPath, 'utf8'),
+      'mcp\nstart\n',
+      'the wrapper must reach `kin mcp start`, and must not run `kin init` unasked'
+    );
+    assert.match(stderr, /Run `kin init \.`/);
+    assert.match(stderr, /Starting anyway/);
+    assert.equal(
+      await exists(path.join(tmpDir, '.kin')),
+      false,
+      'starting unbound must not initialize a repository behind the user'
+    );
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  }
+});
+
+// The end-to-end half of finding 5: a real `initialize` request written to the
+// wrapper's stdin in an empty directory must reach the server and be answered.
+// The fixture reports the method it actually received, so a server that started
+// but was handed nothing answers `nothing-arrived` rather than passing.
+test('initialize is served through the wrapper in an empty directory', async () => {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'kin-mcp-initialize-'));
+  const env = await fakeKinEnvironment(tmpDir, {
+    KIN_MCP_FAKE_ECHO_INITIALIZE: '1'
+  });
+  delete env.KIN_MCP_AUTO_INIT;
+  delete env.KIN_MCP_FAKE_REPO;
+
+  const request = JSON.stringify({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: { protocolVersion: '2024-11-05', capabilities: {} }
+  });
+
+  try {
+    const result = cp.spawnSync(
+      process.execPath,
+      [fileURLToPath(new URL('../bin/kin-mcp.js', import.meta.url))],
+      {
+        cwd: tmpDir,
+        encoding: 'utf8',
+        env,
+        input: `Content-Length: ${Buffer.byteLength(request)}\r\n\r\n${request}`
+      }
+    );
+
+    assert.equal(result.status, 0, result.stderr);
+    const framed = /Content-Length: \d+\r\n\r\n(\{.*\})$/.exec(result.stdout);
+    assert.ok(framed, `expected one framed response, got: ${JSON.stringify(result.stdout)}`);
+    const response = JSON.parse(framed[1]);
+    assert.equal(
+      response.result.served,
+      'initialize',
+      'the initialize request must reach the server, not die with the wrapper'
+    );
+    assert.doesNotMatch(
+      result.stdout,
+      /no \.kin\/ found/i,
+      'the notice belongs on stderr; a byte of prose on stdout corrupts the first frame'
+    );
+    assert.match(result.stderr, /Run `kin init \.`/);
     assert.equal(await exists(path.join(tmpDir, '.kin')), false);
   } finally {
     await fs.rm(tmpDir, { recursive: true, force: true });
