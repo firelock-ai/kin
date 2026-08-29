@@ -1127,10 +1127,33 @@ pub fn read_serving_daemon(kin_root: &Path) -> Option<ServingDaemon> {
 /// attributes nothing either.
 ///
 /// A daemon whose pid is still alive is not settled: it is serving, and its
-/// record is doing its job.
+/// record is doing its job. Neither is one whose pid this host cannot
+/// classify, which is a third answer and not the second: see
+/// [`settle_unwatched_daemon_death_with`].
 pub fn settle_unwatched_daemon_death(kin_root: &Path) -> Option<DaemonKillRecord> {
+    settle_unwatched_daemon_death_with(kin_root, process_liveness)
+}
+
+/// [`settle_unwatched_daemon_death`] against a named liveness probe.
+///
+/// The probe is a parameter so a test can produce the answer a real host will
+/// not produce on demand, which is the `Unknown` this grading turns on.
+///
+/// A death is graded on `Dead` and on nothing else. `!process_is_alive(pid)`
+/// looks like the same test and is not: it folds `Unknown` in with `Dead`, so
+/// a host whose probe cannot classify a pid reports every serving record as a
+/// killed daemon. [`process_liveness`] is implemented for `unix` only and
+/// answers `Unknown` everywhere else, so on Windows that negation graded a
+/// kill for every store that had ever started a daemon, and `kin init` began
+/// exiting non-zero for it once FIR-2639 wired the record to the exit status.
+/// `unix` reaches it too, through the `EPERM` a reused pid owned by another
+/// user returns.
+fn settle_unwatched_daemon_death_with(
+    kin_root: &Path,
+    liveness: impl Fn(u32) -> Liveness,
+) -> Option<DaemonKillRecord> {
     let serving = read_serving_daemon(kin_root)?;
-    if process_is_alive(serving.pid) {
+    if liveness(serving.pid) != Liveness::Dead {
         return None;
     }
     retire_serving_daemon(kin_root);
@@ -1167,8 +1190,18 @@ pub fn settle_unwatched_daemon_death(kin_root: &Path) -> Option<DaemonKillRecord
 /// what the store WOULD record, not what the store has recorded, and a caller
 /// wanting the tally reads [`read_daemon_kill_record`] instead.
 pub fn peek_unwatched_daemon_death(kin_root: &Path) -> Option<DaemonKillRecord> {
+    peek_unwatched_daemon_death_with(kin_root, process_liveness)
+}
+
+/// [`peek_unwatched_daemon_death`] against a named liveness probe. Grades a
+/// death on `Dead` alone, for the reason
+/// [`settle_unwatched_daemon_death_with`] states.
+fn peek_unwatched_daemon_death_with(
+    kin_root: &Path,
+    liveness: impl Fn(u32) -> Liveness,
+) -> Option<DaemonKillRecord> {
     let serving = read_serving_daemon(kin_root)?;
-    if process_is_alive(serving.pid) {
+    if liveness(serving.pid) != Liveness::Dead {
         return None;
     }
     if read_daemon_death_note(kin_root).is_some_and(|note| note.pid == serving.pid) {
@@ -8682,6 +8715,62 @@ Shared_Dirty:          0 kB\n";
         let dir = tempfile::tempdir().unwrap();
         assert!(settle_unwatched_daemon_death(dir.path()).is_none());
         assert!(read_daemon_kill_record(dir.path()).is_none());
+    }
+
+    /// A pid this host cannot classify is not a death, and the same store with
+    /// the same record IS one when the probe can say so.
+    ///
+    /// Both halves in one test on purpose: the refusal alone would pass on a
+    /// grader that never reports anything, so the `Dead` arm is what proves the
+    /// `Unknown` arm refused something real.
+    ///
+    /// The arm that matters is `Unknown`, which is every non-`unix` answer
+    /// [`process_liveness`] has. Grading it as a death is what made every
+    /// Windows `kin init` report a killed daemon, and, once FIR-2639 wired that
+    /// record to the exit status, exit non-zero after publishing complete
+    /// authority.
+    #[test]
+    fn a_pid_this_host_cannot_classify_is_not_a_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = u32::MAX;
+        fs::write(
+            serving_path(dir.path()),
+            serde_json::to_vec(&ServingDaemon {
+                pid,
+                oom_kills_at_start: Some(0),
+                at_unix: 1_000,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            peek_unwatched_daemon_death_with(dir.path(), |_| Liveness::Unknown).is_none(),
+            "a probe that cannot classify a pid says nothing about whether it died"
+        );
+        assert!(
+            settle_unwatched_daemon_death_with(dir.path(), |_| Liveness::Unknown).is_none(),
+            "an unclassifiable pid must not be settled as a death"
+        );
+        assert!(
+            read_daemon_kill_record(dir.path()).is_none(),
+            "nothing may be written about a death nothing established"
+        );
+        assert!(
+            read_serving_daemon(dir.path()).is_some(),
+            "the record must survive, because retiring it claims the daemon ended"
+        );
+
+        assert!(
+            peek_unwatched_daemon_death_with(dir.path(), |_| Liveness::Alive).is_none(),
+            "a living daemon is serving, not dead"
+        );
+
+        let settled = settle_unwatched_daemon_death_with(dir.path(), |_| Liveness::Dead)
+            .expect("a probe that proves the pid is gone must grade the death");
+        assert_eq!(settled.kills, 1);
+        assert_eq!(settled.last_pid, Some(pid));
+        assert!(read_serving_daemon(dir.path()).is_none());
     }
 
     /// The peek reads what settling would take, and leaves it there.
