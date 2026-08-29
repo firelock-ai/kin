@@ -165,6 +165,12 @@ pub async fn run(
     adopt_repository_id: Option<String>,
 ) -> Result<i32> {
     let _span = tracing::info_span!("kin.init").entered();
+    // Read before any work, so the closing summary can say what this run did
+    // rather than what a run of its shape usually does. The summary used to
+    // say the 523 MB download "happens during this command" unconditionally,
+    // and on a container under memory pressure the background embed pass never
+    // started, so nothing was fetched and the sentence was still printed.
+    let model_present_before = crate::embed_model::EmbedModelFetch::probe(false).present;
     let dir = path
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
@@ -272,6 +278,7 @@ pub async fn run(
             boundary,
             &enrichment,
             &cross_file,
+            model_present_before,
             daemon_death.as_ref(),
         )?;
     }
@@ -1166,6 +1173,7 @@ fn print_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
+    model_present_before: bool,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
     emit(&render_human_result(
@@ -1173,6 +1181,7 @@ fn print_human_result(
         boundary,
         semantic_enrichment,
         cross_file,
+        model_present_before,
         daemon_death,
     )?)
 }
@@ -1201,6 +1210,7 @@ fn render_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
+    model_present_before: bool,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<String> {
     let default_ref = initialized_default_ref(result);
@@ -1244,6 +1254,14 @@ fn render_human_result(
             writeln!(out, "  Workspace: empty exact tree")?;
         }
     }
+    // The reading that explains a fetch that did not happen, selected by the
+    // work it is about. `read_all(...).last()` was the newest refusal of ANY
+    // heavy work, so on a pressured host whose last refusal was the LSP sweep
+    // this line explained a missing model download with a cause about something
+    // else. Read here rather than remembered, for the same reason the daemon
+    // death beside it is: the refusal is written by a daemon during the
+    // enrichment phase and leaves nothing in this process.
+    let embed_refusal = embed_refusal_for(result.layout.root());
     let guidance = ordered_init_guidance_lines(
         format!(
             "  Semantic enrichment: {}",
@@ -1254,7 +1272,11 @@ fn render_human_result(
         semantic_absence_notice(semantic_enrichment),
         format!(
             "  {}",
-            embedding_model_notice(&crate::embed_model::EmbedModelFetch::probe(false))
+            embedding_model_notice(
+                &crate::embed_model::EmbedModelFetch::probe(false),
+                model_present_before,
+                embed_refusal.as_ref(),
+            )
         ),
     );
     for line in guidance {
@@ -1311,7 +1333,25 @@ fn ordered_init_guidance_lines(
 /// `kin init` does, during `kin init`, and this notice prints after it rather
 /// than before. Saying so costs a clause and saves a reader the wrong mental
 /// model of when their machine is busy.
-fn embedding_model_notice(fetch: &crate::embed_model::EmbedModelFetch) -> String {
+/// The refusal that explains a model download this run did not do.
+///
+/// Selected by the work it is about. The newest refusal of ANY heavy work was
+/// what this used to read, so on a pressured host whose last refusal was the
+/// LSP sweep the notice explained a missing model download with a cause about
+/// something else entirely. `LspSweep` is a live sibling producer, not a
+/// hypothetical one.
+fn embed_refusal_for(root: &std::path::Path) -> Option<kin_core::memory_pressure::PressureRefusal> {
+    kin_core::memory_pressure::PressureRefusal::read_for_work(
+        root,
+        kin_core::memory_pressure::HeavyWork::EmbedBatch,
+    )
+}
+
+fn embedding_model_notice(
+    fetch: &crate::embed_model::EmbedModelFetch,
+    present_before: bool,
+    refusal: Option<&kin_core::memory_pressure::PressureRefusal>,
+) -> String {
     if let Some(reason) = fetch.no_fetch_reason.as_deref() {
         return format!("Embedding model: {} ({reason})", fetch.model_id);
     }
@@ -1319,24 +1359,34 @@ fn embedding_model_notice(fetch: &crate::embed_model::EmbedModelFetch) -> String
         Some(dir) => format!(" at {dir}"),
         None => String::new(),
     };
-    if fetch.present {
-        return format!(
-            "Embedding model: {} is already cached{location}, so nothing is downloaded",
+    match (present_before, fetch.present) {
+        (true, _) => format!(
+            "Embedding model: {} was already cached{location}, so this command downloaded nothing",
             fetch.model_id
-        );
-    }
-    format!(
-        "Embedding model: {} is not on this machine yet; `kin init` starts the first embed \
-         pass, which fetches {} from {}{} and needs egress. On a repository with parseable \
-         content that download happens during this command, before any vector exists",
-        fetch.model_id,
-        fetch.expected_download(),
-        crate::embed_model::endpoint_host(),
-        match fetch.cache_dir.as_deref() {
-            Some(dir) => format!(" into {dir}"),
-            None => String::new(),
+        ),
+        (false, true) => format!(
+            "Embedding model: {} was not on this machine, and this command fetched it{location}",
+            fetch.model_id
+        ),
+        (false, false) => {
+            let because = match refusal {
+                Some(refusal) => format!(", because {}", refusal.cause_sentence()),
+                None => String::new(),
+            };
+            format!(
+                "Embedding model: {} is not on this machine and this command did not fetch \
+                 it{because}. The first embed pass fetches {} from {}{} and needs egress; run \
+                 `kin embed` to start it now",
+                fetch.model_id,
+                fetch.expected_download(),
+                crate::embed_model::endpoint_host(),
+                match fetch.cache_dir.as_deref() {
+                    Some(dir) => format!(" into {dir}"),
+                    None => String::new(),
+                }
+            )
         }
-    )
+    }
 }
 
 /// Paths listed by name before the rest are counted rather than named.
@@ -2715,7 +2765,7 @@ mod tests {
     /// the destination, and a machine that has them is told nothing is owed.
     #[test]
     #[serial_test::serial]
-    fn init_states_the_model_download_a_fresh_machine_still_owes() {
+    fn init_reports_the_embedding_model_outcome_this_run_actually_had() {
         let _endpoint = kin_core::test_env::EnvVarGuard::unset("HF_ENDPOINT");
         let absent = crate::embed_model::EmbedModelFetch {
             model_id: crate::embed_model::DEFAULT_EMBED_MODEL_ID.to_string(),
@@ -2727,43 +2777,83 @@ mod tests {
             no_fetch_reason: None,
             relocated_hf_home: None,
         };
-        let notice = embedding_model_notice(&absent);
+
+        // State one: absent when the command opened, still absent when it
+        // closed. The line this replaced said the 523 MB "download happens
+        // during this command" whatever the run had done, and a cold-user walk
+        // on 0.6.0 read that sentence off a run whose background embed pass had
+        // never started, with no `~/.cache/huggingface` on the machine at all.
+        let did_not_fetch = embedding_model_notice(&absent, false, None);
         assert!(
-            notice.contains("nomic-ai/nomic-embed-text-v1.5")
-                && notice.contains("about 523 MB")
-                && notice.contains("huggingface.co")
-                && notice.contains("/home/dev/.cache/huggingface/hub/models--x"),
-            "the model, the size, the source and the destination are all named: {notice}"
+            did_not_fetch.contains("nomic-ai/nomic-embed-text-v1.5")
+                && did_not_fetch.contains("about 523 MB")
+                && did_not_fetch.contains("huggingface.co")
+                && did_not_fetch.contains("/home/dev/.cache/huggingface/hub/models--x"),
+            "the model, the size, the source and the destination are all named: {did_not_fetch}"
+        );
+        assert!(
+            did_not_fetch.contains("did not fetch it"),
+            "a run that fetched nothing must say so: {did_not_fetch}"
+        );
+        assert!(
+            did_not_fetch.contains("`kin embed`"),
+            "and must name what does fetch it: {did_not_fetch}"
+        );
+        assert!(
+            !did_not_fetch.contains("happens during this command"),
+            "the old unconditional promise is gone: {did_not_fetch}"
         );
 
-        // FIR-2555. The size and the host were already here; who pays was not.
-        // This line used to read "the first embed pass fetches", which put the
-        // cost on a command the reader had not run, while the enrichment phase
-        // of this very `kin init` was starting the daemon whose embed worker
-        // does the fetching. A stranger measured 2.576s to init an empty
-        // repository against 67.1s to init a one-file TypeScript one on shipped
-        // 0.5.45, and the difference was this download.
+        // The same state, with the daemon's own account of why. A refusal is
+        // the difference between "this did not happen" and "this did not
+        // happen, and here is the machine that decided".
+        let refusal = kin_core::memory_pressure::PressureRefusal {
+            work: kin_core::memory_pressure::HeavyWork::EmbedBatch
+                .id()
+                .to_string(),
+            level: "critical".to_string(),
+            reason: "the host had no room for the embed pass".to_string(),
+            at_unix: 4_800,
+        };
+        let refused = embedding_model_notice(&absent, false, Some(&refusal));
         assert!(
-            notice.contains("`kin init` starts the first embed pass"),
-            "the notice must name the command that pays for the download: {notice}"
-        );
-        assert!(
-            notice.contains("during this command"),
-            "the notice must say the download happens now rather than later: {notice}"
-        );
-        assert!(
-            !notice.contains("after this command finishes"),
-            "the check must be able to fail: {notice}"
+            refused.contains("the host had no room for the embed pass"),
+            "a refusal on record is named as the cause: {refused}"
         );
 
+        // State two: it arrived during this run. FIR-2555's point survives
+        // here, where it is true: the cost belongs to `kin init`, not to some
+        // later command the reader has not run.
+        let fetched = embedding_model_notice(
+            &crate::embed_model::EmbedModelFetch {
+                present: true,
+                ..absent.clone()
+            },
+            false,
+            None,
+        );
+        assert!(
+            fetched.contains("this command fetched it"),
+            "a run that paid for the download says which command paid: {fetched}"
+        );
+        assert!(
+            !fetched.contains("did not fetch it"),
+            "the states must be distinguishable: {fetched}"
+        );
+
+        // State three: it was already here, so this command owed nothing.
         let cached = crate::embed_model::EmbedModelFetch {
             present: true,
-            ..absent
+            ..absent.clone()
         };
-        let cached_notice = embedding_model_notice(&cached);
+        let cached_notice = embedding_model_notice(&cached, true, None);
         assert!(
-            cached_notice.contains("already cached") && !cached_notice.contains("523"),
-            "a machine that has the model is not warned about a download: {cached_notice}"
+            cached_notice.contains("was already cached") && !cached_notice.contains("523"),
+            "a machine that had the model is not warned about a download: {cached_notice}"
+        );
+        assert!(
+            !cached_notice.contains("this command fetched it"),
+            "and is not told this run fetched what it already had: {cached_notice}"
         );
 
         let overridden = crate::embed_model::EmbedModelFetch {
@@ -2772,7 +2862,7 @@ mod tests {
             present: false,
             ..cached
         };
-        let overridden_notice = embedding_model_notice(&overridden);
+        let overridden_notice = embedding_model_notice(&overridden, false, None);
         assert!(
             !overridden_notice.contains("523"),
             "a model this build never measured is given no size: {overridden_notice}"
@@ -2780,6 +2870,50 @@ mod tests {
         assert!(
             overridden_notice.contains("fetches the model from huggingface.co"),
             "the fetch is still named without a size: {overridden_notice}"
+        );
+    }
+
+    /// The notice explains itself with the embed refusal, never with whatever
+    /// heavy work happened to be refused last.
+    ///
+    /// `LspSweep` writes refusals to the same ledger, so on a pressured host
+    /// the newest row is often about the sweep. Reading that one told a user
+    /// their model download was skipped for a reason belonging to different
+    /// work.
+    #[test]
+    fn the_model_notice_reads_the_embed_refusal_and_not_the_newest_one() {
+        use kin_core::memory_pressure::{HeavyWork, PressureLevel, PressureRefusal};
+        let dir = tempfile::tempdir().expect("a temp dir");
+        // Order matters: the sweep is published second, so it is the newest
+        // refusal of any work, which is what the old selection returned.
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::EmbedBatch,
+            PressureLevel::Critical,
+            "the embed batch was held back",
+        );
+        PressureRefusal::record(
+            dir.path(),
+            HeavyWork::LspSweep,
+            PressureLevel::Critical,
+            "the sweep was held back",
+        );
+
+        // This is only the case that matters if the newest really is the other
+        // work, so that is asserted rather than assumed.
+        assert_eq!(
+            PressureRefusal::read_all(dir.path())
+                .last()
+                .map(|refusal| refusal.work.clone()),
+            Some(HeavyWork::LspSweep.id().to_string()),
+            "the newest refusal on this store is about the sweep"
+        );
+
+        let chosen = embed_refusal_for(dir.path()).expect("the embed refusal is on record");
+        assert_eq!(
+            chosen.work,
+            HeavyWork::EmbedBatch.id().to_string(),
+            "a download that did not happen is explained by the refusal about downloading"
         );
     }
 

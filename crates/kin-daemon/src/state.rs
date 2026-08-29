@@ -11046,6 +11046,7 @@ mod tests {
                 entities: 1,
                 last_commit: String::new(),
                 dependencies: vec![],
+                dependencies_recorded_by: None,
             }],
         }
         .save_to(&registry_path)
@@ -11225,6 +11226,7 @@ mod tests {
                 entities: 0,
                 last_commit: String::new(),
                 dependencies: vec![],
+                dependencies_recorded_by: None,
             });
         }
         kin_core::registry::KinRegistry { repos }
@@ -11317,6 +11319,7 @@ mod tests {
                 entities: 0,
                 last_commit: String::new(),
                 dependencies: vec![],
+                dependencies_recorded_by: None,
             }],
         }
         .save_to(&registry_path)
@@ -11769,6 +11772,7 @@ mod tests {
                     entities: 1,
                     last_commit: String::new(),
                     dependencies: vec![],
+                    dependencies_recorded_by: None,
                 },
                 kin_core::registry::RegisteredRepo {
                     id: "sibling-checkout-copy".to_string(),
@@ -11776,6 +11780,7 @@ mod tests {
                     entities: 1,
                     last_commit: String::new(),
                     dependencies: vec![],
+                    dependencies_recorded_by: None,
                 },
             ],
         }
@@ -11830,6 +11835,7 @@ mod tests {
                     entities: 1,
                     last_commit: String::new(),
                     dependencies: vec![],
+                    dependencies_recorded_by: None,
                 })
                 .collect(),
         }

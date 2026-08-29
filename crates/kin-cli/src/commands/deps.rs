@@ -27,6 +27,13 @@ pub struct RepoDependencyView {
     pub repo_id: String,
     pub depends_on: Vec<DependencyEdge>,
     pub consumers: Vec<DependencyEdge>,
+    /// This repository's registration was written before any build recorded
+    /// dependencies, so an empty `depends_on` cannot be read as none.
+    pub depends_on_predates_recording: bool,
+    /// At least one OTHER registered repository's registration was, so an empty
+    /// `consumers` cannot be read as none either. A separate fact because the
+    /// two directions are answered by different entries' records.
+    pub consumers_predate_recording: bool,
 }
 
 /// Show the cross-repo dependencies of the repository the caller is in.
@@ -175,6 +182,11 @@ pub fn repo_dependency_view(registry: &KinRegistry, repo_id: &str) -> Result<Rep
         repo_id: repo_id.to_string(),
         depends_on,
         consumers,
+        depends_on_predates_recording: selected.dependencies_recorded_by.is_none(),
+        consumers_predate_recording: registry
+            .repos
+            .iter()
+            .any(|other| other.id != repo_id && other.dependencies_recorded_by.is_none()),
     })
 }
 
@@ -213,12 +225,18 @@ pub fn render_repo_view_lines(view: &RepoDependencyView) -> Vec<String> {
         }
     }
 
-    if view.depends_on.is_empty() || view.consumers.is_empty() {
+    // Keyed on which registrations recorded a build, not on the emptiness
+    // itself. An empty direction written by a build that records dependencies
+    // is a measured zero and saying it "may be unrecorded" makes the reader
+    // doubt a correct answer.
+    let unrecorded_direction = (view.depends_on.is_empty() && view.depends_on_predates_recording)
+        || (view.consumers.is_empty() && view.consumers_predate_recording);
+    if unrecorded_direction {
         lines.push(String::new());
         lines.push(
-            "note: dependency records are written when `kin init` registers a repository, so \
-             empty directions here may mean this repository predates that registration rather \
-             than that none exist."
+            "note: dependency records are written when `kin init` registers a repository, and a \
+             registration here predates that, so an empty direction above may mean unrecorded \
+             rather than none."
                 .to_string(),
         );
     }
@@ -280,12 +298,24 @@ fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()
     }
 
     println!("Cross-repo dependencies:\n");
+    // Which registrations were written by a build that records dependencies at
+    // all. The caveat below keys on this and never on an empty listing: with
+    // axum and flask both registered minutes earlier by the same 0.6.0 binary,
+    // keying on emptiness named them both as possibly predating that binary.
+    let predates_recording: HashSet<&str> = registry
+        .repos
+        .iter()
+        .filter(|repo| repo.dependencies_recorded_by.is_none())
+        .map(|repo| repo.id.as_str())
+        .collect();
     let mut unrecorded = Vec::new();
     for (id, deps) in &repo_deps {
         println!("  {}", id);
         if deps.is_empty() {
             println!("    (no cross-repo dependencies recorded)");
-            unrecorded.push(id.clone());
+            if predates_recording.contains(id.as_str()) {
+                unrecorded.push(id.clone());
+            }
         } else {
             for (name, dep_type) in deps {
                 println!("    -> {} ({})", name, dep_type);
@@ -296,9 +326,9 @@ fn report_every_registered_repo(registry: &KinRegistry, json: bool) -> Result<()
 
     if !unrecorded.is_empty() {
         println!(
-            "note: dependency records are written when `kin init` registers a repository, so a \
-             repository initialized before this build may show no records rather than no \
-             dependencies: {}",
+            "note: dependency records are written when `kin init` registers a repository, and \
+             these registrations predate that, so their empty listing may mean unrecorded \
+             rather than no dependencies: {}",
             unrecorded.join(", ")
         );
     }
@@ -419,6 +449,7 @@ mod tests {
             entities: 0,
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies,
+            dependencies_recorded_by: None,
         }
     }
 
@@ -429,6 +460,7 @@ mod tests {
             entities: 0,
             last_commit: "2026-01-01T00:00:00Z".to_string(),
             dependencies,
+            dependencies_recorded_by: None,
         }
     }
 
@@ -639,6 +671,7 @@ mod tests {
                 entities: 0,
                 last_commit: "2026-01-01T00:00:00Z".to_string(),
                 dependencies: Vec::new(),
+                dependencies_recorded_by: None,
             },
         ];
 
@@ -708,5 +741,70 @@ mod tests {
         assert!(rendered.contains("no cross-repo dependencies recorded"));
         assert!(rendered.contains("no registered repository records this one as a provider"));
         assert!(rendered.contains("kin init") && rendered.contains("registers a repository"));
+    }
+
+    /// The caveat is about stores that predate dependency recording. With axum
+    /// and flask both registered minutes earlier by the same 0.6.0 binary,
+    /// `kin deps --all` named them both, because the only thing it could key on
+    /// was the empty listing, and a correct zero and an unrecorded one look
+    /// identical there.
+    #[test]
+    fn the_unrecorded_caveat_keys_on_the_recorded_build_not_on_an_empty_listing() {
+        let recorded = |id: &str| RegisteredRepo {
+            id: id.to_string(),
+            path: std::path::PathBuf::from(format!("/registered/{id}")),
+            entities: 0,
+            last_commit: "2026-01-01T00:00:00Z".to_string(),
+            dependencies: Vec::new(),
+            dependencies_recorded_by: Some("0.6.1".to_string()),
+        };
+
+        // Registered by a build that records dependencies. The zero is measured.
+        let mut registry = KinRegistry::default();
+        registry.repos = vec![recorded("axum")];
+        let view = repo_dependency_view(&registry, "axum").unwrap();
+        assert!(
+            !view.depends_on_predates_recording,
+            "an entry written by a recording build does not predate recording"
+        );
+        let rendered = render_repo_view_lines(&view).join("\n");
+        assert!(
+            rendered.contains("no cross-repo dependencies recorded"),
+            "the empty direction is still reported: {rendered}"
+        );
+        assert!(
+            !rendered.contains("may mean unrecorded"),
+            "but a measured zero is not called possibly-unrecorded: {rendered}"
+        );
+
+        // The same shape, written before any build recorded dependencies.
+        let mut old = KinRegistry::default();
+        old.repos = vec![named_repo("legacy", Vec::new())];
+        let old_view = repo_dependency_view(&old, "legacy").unwrap();
+        assert!(
+            old_view.depends_on_predates_recording,
+            "an entry with no recorded build is exactly what the caveat is for"
+        );
+        assert!(
+            render_repo_view_lines(&old_view)
+                .join("\n")
+                .contains("may mean unrecorded"),
+            "and it still gets the caveat"
+        );
+
+        // The two directions are answered by different entries' records: this
+        // repository recorded its own, a sibling did not, so only the consumers
+        // direction is in doubt.
+        let mut mixed = KinRegistry::default();
+        mixed.repos = vec![recorded("axum"), named_repo("legacy", Vec::new())];
+        let mixed_view = repo_dependency_view(&mixed, "axum").unwrap();
+        assert!(
+            !mixed_view.depends_on_predates_recording,
+            "this repository's own records are current"
+        );
+        assert!(
+            mixed_view.consumers_predate_recording,
+            "a sibling that predates recording leaves the inverse direction in doubt"
+        );
     }
 }

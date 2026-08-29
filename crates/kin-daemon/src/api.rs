@@ -38120,6 +38120,7 @@ mod tests {
                 entities: 1,
                 last_commit: String::new(),
                 dependencies: vec![],
+                dependencies_recorded_by: None,
             }],
         }
         .save_to(&registry_path)
