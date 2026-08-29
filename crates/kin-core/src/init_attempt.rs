@@ -580,22 +580,34 @@ pub fn post_mortem_lines(
     lines
 }
 
-/// Name the repository being initialized, when the corpse belongs to another
-/// one.
+/// Name the repository being initialized, and say honestly how it relates to
+/// the corpse.
 ///
 /// `kin init .` in `/root/shallow` opened with "a previous kin init of
 /// /root/repo did not finish", and a reader with one repository in mind reads
 /// that as a sentence about the directory they are standing in. The cleanup is
 /// right and worth announcing; the header just never said the two paths were
-/// different repositories. Silent when they are the same, because repeating one
-/// path twice in one sentence is noise.
+/// different repositories.
+///
+/// Three forms, because there are three states and only two of them were ever
+/// distinguished. `converted` is `is_some_and` over the attempt's record, so it
+/// is false both when the record names another source and when there is no
+/// record at all, and those are not the same claim. With no record there is no
+/// source path to compare and the staging may well belong to this repository,
+/// so the difference is not asserted; but the current repository still has to
+/// be named, because on that branch the opening sentence has no source to name
+/// and this clause is the only thing that tells the reader what the run is
+/// about. Silent only when the two paths match, because repeating one path
+/// twice in one sentence is noise.
 fn elsewhere_clause(attempt: &AbandonedInit, initializing: &Path) -> String {
-    // `converted` is false for two different reasons and only one of them is a
-    // difference. With no record there is no source path to compare, so the
-    // abandoned staging may well belong to this same repository, and saying it
-    // does not is a claim from no evidence. Silent there, exactly as it is
-    // silent when the two paths match.
-    if attempt.record.is_none() || attempt.converted(initializing) {
+    if attempt.record.is_none() {
+        return format!(
+            "; this run is initializing {}, and no record survives to say whether the staging \
+             is from it",
+            initializing.display()
+        );
+    }
+    if attempt.converted(initializing) {
         return String::new();
     }
     format!(
@@ -1120,6 +1132,11 @@ mod tests {
     /// one. It used to say it was another one, because `converted` is
     /// `is_some_and` and a missing record makes it false for a reason that is
     /// not a difference.
+    ///
+    /// The naming half is asserted by
+    /// `the_post_mortem_names_the_repository_it_is_about_and_the_one_being_initialized`.
+    /// This one asks only that no difference is claimed, so the two halves
+    /// cannot each catch the other's mutation and read as two defences.
     #[test]
     fn staging_without_a_record_claims_no_difference_it_cannot_see() {
         let mut orphan = attempt(None);
@@ -1128,6 +1145,10 @@ mod tests {
         assert!(
             !rendered.contains("a different repository"),
             "with no record there is nothing to compare, so nothing is claimed: {rendered}"
+        );
+        assert!(
+            rendered.contains("no record survives to say whether the staging is from it"),
+            "and the unknown is stated rather than left as a silence: {rendered}"
         );
 
         // The control, so the clause was made honest rather than deleted: with
@@ -1612,14 +1633,17 @@ mod tests {
         );
 
         // A capture with no readable record cannot name a source, so the
-        // clause is what carries the current repository there.
+        // clause is what carries the current repository there. This arm asks
+        // only that it is named; whether a difference is claimed is asked by
+        // `staging_without_a_record_claims_no_difference_it_cannot_see`, so
+        // one mutation cannot be caught twice and read as two defences.
         let orphan = AbandonedInit {
             record: None,
             ..attempt(None)
         };
         let orphan_lines = post_mortem_lines(&orphan, None, Path::new("/work/shallow")).join("\n");
         assert!(
-            orphan_lines.contains("/work/shallow this run is initializing"),
+            orphan_lines.contains("this run is initializing /work/shallow"),
             "an unreadable record still says which repository this run is about: {orphan_lines}"
         );
     }
