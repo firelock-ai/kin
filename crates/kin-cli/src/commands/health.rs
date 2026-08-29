@@ -30,16 +30,18 @@ pub enum HealthStatus {
     Missing,
     Stale,
     Misconfigured,
-    /// Expected first-run work a correct install is still doing. It counts as
-    /// needing attention, because the surface is not answering at full strength
-    /// yet, but it never blocks readiness: nothing is wrong and nothing is lost.
+    /// Expected first-run work a correct install is still doing. Nothing is
+    /// wrong and nothing is lost, so it never makes the verdict
+    /// [`HealthVerdict::Failing`]. It does keep the report out of
+    /// [`HealthVerdict::Ready`], because the surface is not answering at full
+    /// strength yet and a roll-up that said otherwise would claim more than
+    /// this row supports.
     Pending,
     /// A real shortfall in the machine or container Kin was asked to run on,
-    /// rather than in the install. It reads red because ignoring it costs the
-    /// reader work, and it never blocks readiness because nothing about the
-    /// install is wrong: a host below a measured cost is a fact about the host,
-    /// and a gate that failed on one would fail every correct install on a
-    /// small machine.
+    /// rather than in the install. Nothing about the install is wrong, so it
+    /// never makes the verdict [`HealthVerdict::Failing`]: a host below a
+    /// measured cost is a fact about the host. It does keep the report out of
+    /// [`HealthVerdict::Ready`], for the same reason `Pending` does.
     Degraded,
     Unsupported,
 }
@@ -56,12 +58,40 @@ pub struct HealthCheck {
     pub manual_fix: Option<String>,
 }
 
+/// The overall verdict a [`HealthReport`] carries, as one word.
+///
+/// The boolean beside it answers "is everything answering at full strength",
+/// which is the only question a boolean can carry honestly. This says which of
+/// the two ways a report can fall short of that it is in, so a reader can tell
+/// an install that is still warming up on a small host from one that is broken
+/// without re-deriving it from the rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthVerdict {
+    /// Every check in scope is [`HealthStatus::Healthy`].
+    Ready,
+    /// Nothing about the install is wrong, and something is not answering at
+    /// full strength yet: work still in flight, or ground the host never had.
+    NeedsAttention,
+    /// Something about the install itself is wrong, or the semantic authority
+    /// cannot be read. See [`blocks_readiness`].
+    Failing,
+}
+
 /// Aggregated report across every health check.
+///
+/// `healthy` and `verdict` are derived from `checks` by [`join_over_checks`]
+/// and are private for that reason: the aggregate is not an independent
+/// opinion, and every place that could write one by hand is a place the
+/// roll-up can start claiming more than its components support. Build one with
+/// [`HealthReport::from_checks`], read the aggregate with [`HealthReport::healthy`]
+/// and [`HealthReport::verdict`].
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct HealthReport {
     pub platform: String,
     pub checks: Vec<HealthCheck>,
-    pub healthy: bool,
+    healthy: bool,
+    verdict: HealthVerdict,
 }
 
 impl HealthCheck {
@@ -97,14 +127,14 @@ fn is_failing(status: &HealthStatus) -> bool {
     matches!(status, HealthStatus::Missing | HealthStatus::Misconfigured)
 }
 
-/// Whether a check prevents the aggregate report from claiming readiness.
+/// Whether a check names something wrong with the INSTALL.
 ///
 /// Most `Stale` checks describe recoverable local drift and remain advisory,
 /// but semantic readiness is an authority gate: if daemon graph coverage is
 /// stale or cannot be read, the report cannot honestly claim the semantic
 /// query surface is ready.
 ///
-/// `Pending` sits deliberately outside that gate. It names work a correct
+/// `Pending` sits deliberately outside this predicate. It names work a correct
 /// install is expected to be doing on its way to ready, not ground a ready
 /// install lost, and a gate that cannot tell those apart fails every fresh
 /// install for succeeding.
@@ -112,18 +142,57 @@ fn is_failing(status: &HealthStatus) -> bool {
 /// `Degraded` sits outside it too, for the opposite reason. It names ground the
 /// host never had rather than ground a correct install lost, and a gate that
 /// failed on one would fail every correct install on a small machine.
+///
+/// This is not the same question as whether the report may claim readiness.
+/// That is [`needs_attention`], and conflating the two is what FIR-2919
+/// records.
 fn blocks_readiness(check: &HealthCheck) -> bool {
     is_failing(&check.status)
         || (check.id == "semantic_query_readiness" && matches!(check.status, HealthStatus::Stale))
 }
 
-fn assemble_health_report(platform: String, checks: Vec<HealthCheck>) -> HealthReport {
-    let healthy = !checks.iter().any(blocks_readiness);
-    HealthReport {
-        platform,
-        checks,
-        healthy,
+/// Whether a check keeps the report out of [`HealthVerdict::Ready`].
+///
+/// The one rule the whole roll-up is built from, and the reason it is one line:
+/// a check is out of scope only when the platform or the context puts it out of
+/// scope, which is exactly `Unsupported`. Every other status is a component
+/// that is not answering at full strength, so a report claiming readiness over
+/// one claims more than its components support.
+///
+/// FIR-2919 is what that costs when it is spelt twice. The roll-up gated on
+/// `blocks_readiness` while the printed readiness line gated on this, so a
+/// fresh Windows install emitted 19 `unsupported` rows, `embedding_model`
+/// `pending` and `memory_floor` `degraded` under `"healthy": true` while its
+/// own last printed line read "2 checks need attention". The release's install
+/// proof threw on the contradiction and fenced v0.6.1.
+///
+/// `pub(crate)` so the printed readiness line in `setup.rs` can call it. It
+/// held a verbatim copy of this predicate to derive its own count, which is the
+/// same shape as the defect one layer up: two surfaces of one report, each
+/// correct on its own, deriving the same rule twice.
+pub(crate) fn needs_attention(check: &HealthCheck) -> bool {
+    !matches!(
+        check.status,
+        HealthStatus::Healthy | HealthStatus::Unsupported
+    )
+}
+
+/// The whole roll-up, as one function of the checks.
+///
+/// Nothing else in Kin may compute an overall health verdict. Callers that
+/// need one build a [`HealthReport`] and read it back.
+fn join_over_checks(checks: &[HealthCheck]) -> HealthVerdict {
+    if checks.iter().any(blocks_readiness) {
+        HealthVerdict::Failing
+    } else if checks.iter().any(needs_attention) {
+        HealthVerdict::NeedsAttention
+    } else {
+        HealthVerdict::Ready
     }
+}
+
+fn assemble_health_report(platform: String, checks: Vec<HealthCheck>) -> HealthReport {
+    HealthReport::from_checks(platform, checks)
 }
 
 /// A pass/attention/skip tally over a set of checks, used for the one-line
@@ -132,14 +201,52 @@ fn assemble_health_report(platform: String, checks: Vec<HealthCheck>) -> HealthR
 pub struct HealthSummary {
     /// Checks that are Healthy.
     pub passed: usize,
-    /// Checks that need attention (Missing, Misconfigured, or Stale).
+    /// Checks that need attention, which is every check [`needs_attention`]
+    /// answers true for: Missing, Misconfigured, Stale, Pending or Degraded.
+    /// The list was already this long when the doc said three; the tally and
+    /// the roll-up read one predicate now, so they cannot drift again.
     pub attention: usize,
     /// Checks that do not apply on this platform / context (Unsupported).
     pub skipped: usize,
 }
 
 impl HealthReport {
+    /// Build a report and derive its aggregate from the checks it carries.
+    ///
+    /// The only way to make one. `healthy` and `verdict` are computed here by
+    /// [`join_over_checks`] and are private, so no caller and no test can hand
+    /// the report an aggregate its own rows do not support.
+    pub fn from_checks(platform: String, checks: Vec<HealthCheck>) -> Self {
+        let verdict = join_over_checks(&checks);
+        Self {
+            platform,
+            checks,
+            healthy: verdict == HealthVerdict::Ready,
+            verdict,
+        }
+    }
+
+    /// Whether every check in scope is answering at full strength.
+    ///
+    /// True exactly when [`HealthReport::verdict`] is [`HealthVerdict::Ready`].
+    /// A reader that needs to tell a warming install from a broken one reads
+    /// the verdict; this boolean cannot carry that difference and must not be
+    /// asked to.
+    pub fn healthy(&self) -> bool {
+        self.healthy
+    }
+
+    /// The overall verdict, derived from the checks by [`join_over_checks`].
+    pub fn verdict(&self) -> HealthVerdict {
+        self.verdict
+    }
+
     /// Tally checks into pass / needs-attention / not-applicable buckets.
+    ///
+    /// The attention bucket is [`needs_attention`] rather than its own list of
+    /// statuses, so the tally and the roll-up cannot disagree about what needs
+    /// attention. They did: the printed tally counted `pending` and `degraded`
+    /// while the aggregate did not (FIR-2919).
     pub fn summary(&self) -> HealthSummary {
         let mut summary = HealthSummary {
             passed: 0,
@@ -147,14 +254,12 @@ impl HealthReport {
             skipped: 0,
         };
         for check in &self.checks {
-            match check.status {
-                HealthStatus::Healthy => summary.passed += 1,
-                HealthStatus::Unsupported => summary.skipped += 1,
-                HealthStatus::Missing
-                | HealthStatus::Misconfigured
-                | HealthStatus::Stale
-                | HealthStatus::Pending
-                | HealthStatus::Degraded => summary.attention += 1,
+            if needs_attention(check) {
+                summary.attention += 1;
+            } else if matches!(check.status, HealthStatus::Unsupported) {
+                summary.skipped += 1;
+            } else {
+                summary.passed += 1;
             }
         }
         summary
@@ -5714,15 +5819,21 @@ mod tests {
         );
     }
 
-    /// Neither warning band may fail an install.
+    /// Neither warning band may report the install as broken.
     ///
-    /// The install proof computes its own aggregate from the check statuses and
-    /// fails a fresh install whose report disagrees with it, so a headroom band
-    /// that blocked readiness would fence a release at tag time, where no fix on
-    /// `main` can reach it. Both bands are asserted here rather than trusted to
-    /// the enum, because `blocks_readiness` is where that would go wrong.
+    /// A headroom band names ground the host never had. It keeps the report out
+    /// of `Ready`, because the row is real and the reader is entitled to see it
+    /// in the roll-up, and it must never reach `Failing`, which is the verdict
+    /// that says something about the install itself is wrong. Both bands are
+    /// asserted here rather than trusted to the enum, because `blocks_readiness`
+    /// is where that would go wrong.
+    ///
+    /// This used to assert `report.healthy` was true over a `Degraded` row,
+    /// which is the overclaim FIR-2919 records: the aggregate said ready while
+    /// the row said the machine had no measured room. The property the test was
+    /// written for survives as the `Failing` assertion; the overclaim does not.
     #[test]
-    fn no_commit_headroom_band_blocks_aggregate_readiness() {
+    fn no_commit_headroom_band_reports_the_install_as_broken() {
         for limit in [
             MEASURED_COMMIT_PEAKS[1].peak_bytes,
             12288 * MIB,
@@ -5740,11 +5851,28 @@ mod tests {
                 check.status
             );
             let report = assemble_health_report("test".to_string(), vec![check]);
+            assert_eq!(
+                report.verdict(),
+                HealthVerdict::NeedsAttention,
+                "a small machine needs attention and is not a broken install: {:?}",
+                check_status_of(&report, "commit_memory_headroom")
+            );
             assert!(
-                report.healthy,
-                "commit headroom must never flip the aggregate the install proof reads"
+                !report.healthy(),
+                "the roll-up may not claim readiness over a row that says the host has no \
+                 measured room"
             );
         }
+    }
+
+    /// The status a report carries for one id, for an assertion message.
+    fn check_status_of(report: &HealthReport, id: &str) -> String {
+        report
+            .checks
+            .iter()
+            .find(|check| check.id == id)
+            .map(|check| format!("{:?}", check.status))
+            .unwrap_or_else(|| format!("{id} absent"))
     }
 
     /// A machine with the headroom is told so, quoting the same measurement.
@@ -6170,9 +6298,9 @@ mod tests {
         );
     }
 
-    /// A `Stale` row needs attention without failing readiness. A missing
-    /// language server degrades a working install; calling it a failure would
-    /// turn `kin doctor` red on every host that never installed one.
+    /// A `Stale` row needs attention without reporting a broken install. A
+    /// missing language server degrades a working install; calling it a failure
+    /// would turn `kin doctor` red on every host that never installed one.
     #[test]
     fn a_missing_language_server_needs_attention_without_blocking_readiness() {
         let missing = missing_language_servers(
@@ -6186,8 +6314,17 @@ mod tests {
         );
         assert!(!blocks_readiness(&check));
         let report = assemble_health_report("test".to_string(), vec![check]);
-        assert!(report.healthy);
+        assert_eq!(
+            report.verdict(),
+            HealthVerdict::NeedsAttention,
+            "a host with no language server is not a broken install: {:?}",
+            report.checks[0].status
+        );
         assert_eq!(report.summary().attention, 1);
+        assert!(
+            !report.healthy(),
+            "the tally says one row needs attention, so the aggregate may not say ready"
+        );
     }
 
     /// A healthy response for the fetch tests to hand back.
@@ -8423,7 +8560,7 @@ mod tests {
         assert_eq!(summary.passed, 2);
         assert_eq!(summary.skipped, 1);
         assert!(
-            report.healthy,
+            report.healthy(),
             "the footer must close green on an install whose only unconfigured surface is one setup was told not to touch"
         );
 
@@ -8438,7 +8575,7 @@ mod tests {
             ],
         );
         assert_eq!(regressed.summary().attention, 1);
-        assert!(!regressed.healthy);
+        assert!(!regressed.healthy());
     }
 
     #[cfg(feature = "vector")]
@@ -8567,7 +8704,7 @@ mod tests {
         let summary = report.summary();
 
         assert!(
-            report.healthy,
+            report.healthy(),
             "a correct fresh install must not report as broken: {:?}",
             report
                 .checks
@@ -8962,40 +9099,248 @@ mod tests {
         ));
     }
 
+    // ------------------------------------------------------------------ join
+    //
+    // FIR-2919. The roll-up is one function of the rows, and these pin it. Each
+    // case is built through `HealthReport::from_checks`, which is the only
+    // constructor, so no fixture can describe an aggregate the product cannot
+    // produce.
+
+    fn joined(statuses: &[(&str, HealthStatus)]) -> HealthReport {
+        HealthReport::from_checks(
+            "test".to_string(),
+            statuses
+                .iter()
+                .map(|(id, status)| HealthCheck::new(id, id, status.clone(), "fixture"))
+                .collect(),
+        )
+    }
+
+    /// Every check healthy is the only shape that may claim readiness.
+    #[test]
+    fn the_join_reports_ready_over_all_healthy_checks() {
+        let report = joined(&[
+            ("kin_binary", HealthStatus::Healthy),
+            ("shell_path", HealthStatus::Healthy),
+        ]);
+        assert_eq!(report.verdict(), HealthVerdict::Ready);
+        assert!(report.healthy());
+        assert_eq!(report.summary().attention, 0);
+    }
+
+    /// `Unsupported` is out of scope, not a shortfall, so it does not
+    /// disqualify a ready verdict. This is the half of the rule that must NOT
+    /// change: 19 of the 33 rows a fresh Windows install emits are unsupported,
+    /// and a join that counted them would report every correct Windows install
+    /// as needing attention.
+    #[test]
+    fn the_join_reports_ready_over_healthy_plus_unsupported_checks() {
+        let report = joined(&[
+            ("kin_binary", HealthStatus::Healthy),
+            ("vfs_projection", HealthStatus::Unsupported),
+            ("registry_authority", HealthStatus::Unsupported),
+        ]);
+        assert_eq!(report.verdict(), HealthVerdict::Ready);
+        assert!(report.healthy());
+        assert_eq!(report.summary().skipped, 2);
+    }
+
+    /// One `Pending` row is enough. The install is not broken, so the verdict
+    /// is `NeedsAttention` and not `Failing`, and it is not ready either.
+    #[test]
+    fn the_join_refuses_ready_over_any_pending_check() {
+        let report = joined(&[
+            ("kin_binary", HealthStatus::Healthy),
+            ("vfs_projection", HealthStatus::Unsupported),
+            ("embedding_model", HealthStatus::Pending),
+        ]);
+        assert!(
+            !report.healthy(),
+            "a pending row is a component not answering at full strength"
+        );
+        assert_eq!(report.verdict(), HealthVerdict::NeedsAttention);
+        assert_eq!(serde_json::to_value(&report).unwrap()["healthy"], false);
+    }
+
+    /// One `Degraded` row is enough, for the same reason and not the same
+    /// cause: pending is work in flight, degraded is ground the host never had.
+    /// Both keep the report out of ready; neither makes it failing.
+    #[test]
+    fn the_join_refuses_ready_over_any_degraded_check() {
+        let report = joined(&[
+            ("kin_binary", HealthStatus::Healthy),
+            ("vfs_projection", HealthStatus::Unsupported),
+            ("memory_floor", HealthStatus::Degraded),
+        ]);
+        assert!(!report.healthy());
+        assert_eq!(report.verdict(), HealthVerdict::NeedsAttention);
+        assert_eq!(serde_json::to_value(&report).unwrap()["healthy"], false);
+    }
+
+    /// A broken install is a third answer, not the same one louder. Without
+    /// this, `healthy: false` would mean two different things and no consumer
+    /// could tell a warming install from one that cannot work.
+    #[test]
+    fn the_join_reports_failing_over_a_missing_check() {
+        let report = joined(&[
+            ("kin_binary", HealthStatus::Healthy),
+            ("embedding_model", HealthStatus::Pending),
+            ("shell_path", HealthStatus::Missing),
+        ]);
+        assert!(!report.healthy());
+        assert_eq!(
+            report.verdict(),
+            HealthVerdict::Failing,
+            "a missing component outranks work in flight"
+        );
+        assert_eq!(serde_json::to_value(&report).unwrap()["verdict"], "failing");
+    }
+
+    /// `Stale` on the semantic authority is the one stale that fails, and it
+    /// must still fail now that stale rows elsewhere merely need attention.
+    #[test]
+    fn the_join_separates_authority_stale_from_ordinary_stale() {
+        let authority = joined(&[
+            ("kin_binary", HealthStatus::Healthy),
+            ("semantic_query_readiness", HealthStatus::Stale),
+        ]);
+        assert_eq!(authority.verdict(), HealthVerdict::Failing);
+
+        let ordinary = joined(&[
+            ("kin_binary", HealthStatus::Healthy),
+            ("projection_mode", HealthStatus::Stale),
+        ]);
+        assert_eq!(
+            ordinary.verdict(),
+            HealthVerdict::NeedsAttention,
+            "an ordinary stale row is drift, not a broken install"
+        );
+        assert!(!ordinary.healthy());
+    }
+
+    /// The exact row set a fresh Windows install emitted on the v0.6.1 release
+    /// run, lifted from the `install-proof-windows-latest-33235776577`
+    /// artifact's `kin-windows-health.json` rather than composed here.
+    ///
+    /// This host cannot run Windows. What is portable is the rule, and the rule
+    /// is what the fixture exercises: 12 healthy rows, 19 unsupported, one
+    /// pending and one degraded, under `"healthy": true` on the shipped bytes.
+    /// That contradiction is what the release's install proof threw on, and it
+    /// is what this asserts is gone.
+    const WINDOWS_V061_ROWS: &[(&str, HealthStatus)] = &[
+        ("kin_binary", HealthStatus::Healthy),
+        ("kin_daemon_binary", HealthStatus::Healthy),
+        ("supervisor_startup_protocol", HealthStatus::Healthy),
+        ("daemon_running", HealthStatus::Unsupported),
+        ("daemon_idle_window", HealthStatus::Unsupported),
+        ("vfs_projection", HealthStatus::Unsupported),
+        ("projection_mode", HealthStatus::Unsupported),
+        ("repo_init", HealthStatus::Unsupported),
+        ("session_runtime", HealthStatus::Unsupported),
+        ("shell_path", HealthStatus::Healthy),
+        ("registry_authority", HealthStatus::Unsupported),
+        ("mcp_client_claude", HealthStatus::Healthy),
+        ("mcp_client_cursor", HealthStatus::Healthy),
+        ("mcp_client_gemini", HealthStatus::Healthy),
+        ("mcp_client_windsurf", HealthStatus::Healthy),
+        ("setup_ledger", HealthStatus::Healthy),
+        ("editor", HealthStatus::Unsupported),
+        ("kinlab_connect", HealthStatus::Unsupported),
+        ("semantic_query_readiness", HealthStatus::Unsupported),
+        ("reference_edge_coverage", HealthStatus::Unsupported),
+        ("relation_census", HealthStatus::Unsupported),
+        ("parse_coverage", HealthStatus::Unsupported),
+        ("background_work", HealthStatus::Unsupported),
+        ("embedding_model", HealthStatus::Pending),
+        ("memory_floor", HealthStatus::Degraded),
+        ("commit_memory_headroom", HealthStatus::Unsupported),
+        ("daemon_kill_record", HealthStatus::Unsupported),
+        ("interrupted_init", HealthStatus::Healthy),
+        ("suspended_sweep", HealthStatus::Unsupported),
+        ("host_memory_pressure", HealthStatus::Unsupported),
+        ("retrieval_profile", HealthStatus::Healthy),
+        ("update_policy", HealthStatus::Healthy),
+        ("binary_assessment_load", HealthStatus::Unsupported),
+    ];
+
+    #[test]
+    fn the_windows_first_install_row_set_no_longer_claims_ready() {
+        let report = joined(WINDOWS_V061_ROWS);
+        assert_eq!(report.checks.len(), 33, "the shipped row set is 33 rows");
+        let summary = report.summary();
+        assert_eq!(summary.passed, 12);
+        assert_eq!(summary.skipped, 19);
+        assert_eq!(
+            summary.attention, 2,
+            "embedding_model pending and memory_floor degraded"
+        );
+        assert!(
+            !report.healthy(),
+            "the shipped report emitted healthy=true over these exact rows"
+        );
+        assert_eq!(
+            report.verdict(),
+            HealthVerdict::NeedsAttention,
+            "nothing about that install was broken; it had not fetched the model \
+             and the host was small"
+        );
+
+        // The control that makes the assertion above mean something. Drop the
+        // two rows that need attention and the same 31 rows must read ready, or
+        // this is a fixture that fails for having any rows at all.
+        let in_scope_only: Vec<(&str, HealthStatus)> = WINDOWS_V061_ROWS
+            .iter()
+            .filter(|(id, _)| *id != "embedding_model" && *id != "memory_floor")
+            .map(|(id, status)| (*id, status.clone()))
+            .collect();
+        let control = joined(&in_scope_only);
+        assert_eq!(control.checks.len(), 31);
+        assert_eq!(
+            control.verdict(),
+            HealthVerdict::Ready,
+            "19 unsupported rows must not be what refuses readiness"
+        );
+        assert!(control.healthy());
+    }
+
     #[test]
     fn summary_tallies_pass_attention_skip_buckets() {
-        let report = HealthReport {
-            platform: "test".to_string(),
-            checks: vec![
+        // Every status the enum carries, so the tally is graded over the whole
+        // vocabulary rather than the four an author happens to think of.
+        let report = HealthReport::from_checks(
+            "test".to_string(),
+            vec![
                 check_with("a", HealthStatus::Healthy),
                 check_with("b", HealthStatus::Healthy),
                 check_with("c", HealthStatus::Missing),
                 check_with("d", HealthStatus::Misconfigured),
                 check_with("e", HealthStatus::Stale),
                 check_with("f", HealthStatus::Unsupported),
+                check_with("g", HealthStatus::Pending),
+                check_with("h", HealthStatus::Degraded),
             ],
-            healthy: false,
-        };
+        );
         let summary = report.summary();
         assert_eq!(summary.passed, 2, "two Healthy checks pass");
         assert_eq!(
-            summary.attention, 3,
-            "Missing + Misconfigured + Stale need attention"
+            summary.attention, 5,
+            "Missing + Misconfigured + Stale + Pending + Degraded need attention"
         );
         assert_eq!(summary.skipped, 1, "Unsupported is not applicable");
     }
 
     #[test]
     fn summary_buckets_sum_to_total_checks() {
-        let report = HealthReport {
-            platform: "test".to_string(),
-            checks: vec![
+        let report = HealthReport::from_checks(
+            "test".to_string(),
+            vec![
                 check_with("a", HealthStatus::Healthy),
                 check_with("b", HealthStatus::Stale),
                 check_with("c", HealthStatus::Unsupported),
+                check_with("d", HealthStatus::Pending),
+                check_with("e", HealthStatus::Degraded),
             ],
-            healthy: false,
-        };
+        );
         let summary = report.summary();
         assert_eq!(
             summary.passed + summary.attention + summary.skipped,
@@ -9064,7 +9409,7 @@ mod tests {
         );
 
         assert!(
-            !report.healthy,
+            !report.healthy(),
             "unknown graph authority must fail aggregate semantic readiness"
         );
         let value = serde_json::to_value(&report).unwrap();
@@ -9196,7 +9541,7 @@ mod tests {
         );
         assert!(stale.manual_fix.is_some());
         assert!(
-            !assemble_health_report("test".to_string(), vec![stale]).healthy,
+            !assemble_health_report("test".to_string(), vec![stale]).healthy(),
             "a retired coverage has to fail the aggregate, as a discard does"
         );
     }
@@ -9244,7 +9589,7 @@ mod tests {
         assert!(matches!(stale.status, HealthStatus::Stale));
         assert!(stale.manual_fix.is_some());
         assert!(
-            !assemble_health_report("test".to_string(), vec![stale]).healthy,
+            !assemble_health_report("test".to_string(), vec![stale]).healthy(),
             "a discarded index still has to fail the aggregate"
         );
 
@@ -9288,7 +9633,7 @@ mod tests {
 
         let report = assemble_health_report("test".to_string(), vec![semantic]);
         assert!(
-            report.healthy,
+            report.healthy(),
             "a corpus that grew after its fill completed must not report the install unhealthy"
         );
 
@@ -9337,7 +9682,7 @@ mod tests {
         // Unsupported is a statement about the host, not a way to stay quiet:
         // it must not block the aggregate, and the same store must report
         // pending again the moment local persistence is available.
-        assert!(assemble_health_report("test".to_string(), vec![semantic]).healthy);
+        assert!(assemble_health_report("test".to_string(), vec![semantic]).healthy());
         let local = crate::commands::resources::EmbedRuntimeState {
             embed_persistence_unavailable: false,
             ..no_local_sidecar
@@ -9441,17 +9786,25 @@ mod tests {
         assert!(semantic.manual_fix.is_some());
 
         let report = assemble_health_report("test".to_string(), vec![semantic]);
-        assert!(
-            report.healthy,
-            "a fresh install mid-first-fill must not report the whole install unhealthy"
+        assert_eq!(
+            report.verdict(),
+            HealthVerdict::NeedsAttention,
+            "a fresh install mid-first-fill is warming up, not broken: {:?}",
+            report.checks[0].status
         );
         assert_eq!(
             report.summary().attention,
             1,
             "the fill is still work in progress, so it is attention rather than not-applicable"
         );
+        // The emitted pair, read off the serialized report rather than the
+        // struct, because the JSON is what the install proof and every other
+        // consumer actually reads. `healthy` false with `verdict`
+        // `needs_attention` is the whole difference FIR-2919 bought: the old
+        // shape emitted `true` here, over this exact row.
         let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["healthy"], true);
+        assert_eq!(json["healthy"], false);
+        assert_eq!(json["verdict"], "needs_attention");
         assert_eq!(json["checks"][0]["status"], "pending");
 
         // Falsification: same call, same fixture, discard reason set. If this
@@ -9469,7 +9822,7 @@ mod tests {
             after_discard.status
         );
         assert!(
-            !assemble_health_report("test".to_string(), vec![after_discard]).healthy,
+            !assemble_health_report("test".to_string(), vec![after_discard]).healthy(),
             "a rebuild after a discard must still block readiness"
         );
 
@@ -9491,7 +9844,7 @@ mod tests {
             "a backlog on a store whose fill completed is not lost ground: {:?}",
             after_top_up.status
         );
-        assert!(assemble_health_report("test".to_string(), vec![after_top_up]).healthy);
+        assert!(assemble_health_report("test".to_string(), vec![after_top_up]).healthy());
 
         // A wedged worker fails outright whether or not the fill ever finished.
         let wedged = crate::commands::resources::EmbedRuntimeState {
@@ -9504,7 +9857,7 @@ mod tests {
             "a failed embedding worker is a failure at any point in a store's life: {:?}",
             after_wedge.status
         );
-        assert!(!assemble_health_report("test".to_string(), vec![after_wedge]).healthy);
+        assert!(!assemble_health_report("test".to_string(), vec![after_wedge]).healthy());
     }
 
     #[test]
@@ -10454,7 +10807,7 @@ mod tests {
         );
 
         let report = assemble_health_report("test".to_string(), vec![check]);
-        assert!(report.healthy);
+        assert!(report.healthy());
         let summary = report.summary();
         assert_eq!(
             (summary.attention, summary.skipped),

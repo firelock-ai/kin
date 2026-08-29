@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import json
 import os
@@ -1486,11 +1487,58 @@ def validator_unix_mcp_home_fixture() -> dict[str, object]:
     }
 
 
+HEALTH_JOIN_BEGIN = "// --- BEGIN HEALTH JOIN ---"
+HEALTH_JOIN_END = "// --- END HEALTH JOIN ---"
+# Every file carrying a copy of the health join. install-proof.yml and
+# rc-build.yml run with no checkout and cannot import the module, so they paste
+# it; `assert_health_join_copies_agree` requires the copies equal.
+HEALTH_JOIN_HOMES = (
+    "scripts/verify-capability-proof.mjs",
+    ".github/workflows/install-proof.yml",
+    ".github/workflows/rc-build.yml",
+)
+
+
+def health_join_verdict(statuses: dict[str, str]) -> str:
+    """The product's roll-up rule, in Python, for building honest fixtures.
+
+    A fourth copy, and deliberately so: a fixture generator that took the
+    aggregate as an argument is what let this harness carry `healthy=True`
+    beside `embedding_model: pending` and pass while the real Windows leg threw
+    on that exact pair (FIR-2919). `assert_health_join_copies_agree` pins the
+    three JavaScript copies to each other; this one is pinned by the fixtures it
+    builds having to survive the extracted validators.
+    """
+
+    if any(
+        status in {"missing", "misconfigured"}
+        or (check_id == "semantic_query_readiness" and status == "stale")
+        for check_id, status in statuses.items()
+    ):
+        return "failing"
+    if any(
+        status not in {"healthy", "unsupported"} for status in statuses.values()
+    ):
+        return "needs_attention"
+    return "ready"
+
+
 def validator_health_report(
-    statuses: dict[str, str], *, healthy: bool
+    statuses: dict[str, str],
+    *,
+    healthy: bool | None = None,
+    verdict: str | None = None,
 ) -> dict[str, object]:
+    """A health report whose aggregate is derived from its own checks.
+
+    `healthy` and `verdict` stay overridable because several probes below have
+    to build a report that disagrees with itself. Nothing else may pass them.
+    """
+
+    joined = health_join_verdict(statuses)
     return {
-        "healthy": healthy,
+        "healthy": joined == "ready" if healthy is None else healthy,
+        "verdict": joined if verdict is None else verdict,
         "checks": [
             {"id": check_id, "status": status}
             for check_id, status in statuses.items()
@@ -1527,13 +1575,20 @@ WINDOWS_REQUIRED_VALIDATOR_CHECKS = {
 WINDOWS_VALIDATOR_CHECKS = {
     **WINDOWS_REQUIRED_VALIDATOR_CHECKS,
     "retrieval_profile": "unsupported",
-    # The one first-run status the leg tolerates beyond healthy and
+    # The two first-run statuses the leg tolerates beyond healthy and
     # not-applicable. A public runner has never fetched the embedding model, so
-    # a correct install reports `pending` here, and the step names this check
-    # and this status rather than accepting `pending` generally. Carried in the
-    # fixture for the reason `retrieval_profile` is: a fixture that omits a
-    # check the real report carries cannot fail the way the real leg does.
+    # a correct install reports `pending` there; the runner has 4 GiB and Kin
+    # has no host-memory probe for target_os windows, so `memory_floor` reports
+    # `degraded`. The step names each check with the status it may hold rather
+    # than accepting those statuses generally. Carried in the fixture for the
+    # reason `retrieval_profile` is: a fixture that omits a check the real
+    # report carries cannot fail the way the real leg does.
+    #
+    # `memory_floor` is the proof of that sentence. It was absent here, the real
+    # v0.6.1 Windows report carried it as `degraded`, and this harness passed
+    # while that leg threw (FIR-2919).
     "embedding_model": "pending",
+    "memory_floor": "degraded",
 }
 
 
@@ -1542,7 +1597,7 @@ def windows_node_validator_fixture() -> tuple[
 ]:
     """Build a complete valid repository-free Windows proof fixture."""
 
-    report = validator_health_report(WINDOWS_VALIDATOR_CHECKS, healthy=True)
+    report = validator_health_report(WINDOWS_VALIDATOR_CHECKS)
     return (
         {
             "expected-commit.txt": VALIDATOR_FIXTURE_COMMIT,
@@ -1606,17 +1661,19 @@ def unix_node_validator_fixture() -> tuple[
 ]:
     """Build a complete valid Unix release-byte proof fixture."""
 
-    pre_embed_report = validator_health_report(UNIX_VALIDATOR_CHECKS, healthy=False)
-    # The post-embed capture reads the aggregate rather than every check, and
-    # `unsupported` must not move it. Carrying the check here is what makes that
-    # a tested claim instead of an assumed one.
+    pre_embed_report = validator_health_report(UNIX_VALIDATOR_CHECKS)
+    # The post-embed capture names the rows a completed embed leaves behind on
+    # this runner, so the fixture carries them: `unsupported` must not move the
+    # aggregate, and `memory_floor` degraded must not fail the leg. Carrying
+    # both here is what makes those tested claims instead of assumed ones.
     embedded_report = validator_health_report(
-        {"semantic_query_readiness": "healthy", "retrieval_profile": "unsupported"},
-        healthy=True,
+        {
+            "semantic_query_readiness": "healthy",
+            "retrieval_profile": "unsupported",
+            "memory_floor": "degraded",
+        }
     )
-    fallback_report = validator_health_report(
-        {"mcp_client_claude": "healthy"}, healthy=True
-    )
+    fallback_report = validator_health_report({"mcp_client_claude": "healthy"})
     executable = f"{VALIDATOR_HOME}/.kin/bin/kin"
     ordinary_config = validator_mcp_config(validator_mcp_entry(executable))
     repository_config = validator_mcp_config(
@@ -1714,6 +1771,30 @@ def fixture_with_json_value(
     for key in keys[:-1]:
         cursor = cursor[key]  # type: ignore[index]
     cursor[keys[-1]] = value  # type: ignore[index]
+    return mutated
+
+
+
+def fixture_with_derived_aggregate(
+    fixture: dict[str, object], path: str
+) -> dict[str, object]:
+    """Re-derive one report's aggregate from the checks it now carries.
+
+    Every arm that mutates a check and still expects the fixture accepted has to
+    call this. Setting `healthy` by hand beside a mutated check is how a probe
+    builds a report the product could not emit, and a validator that rejects it
+    is right for the wrong reason (FIR-2919).
+    """
+
+    mutated = copy.deepcopy(fixture)
+    report = mutated[path]
+    statuses = {
+        check["id"]: check["status"]  # type: ignore[index]
+        for check in report["checks"]  # type: ignore[index]
+    }
+    verdict = health_join_verdict(statuses)
+    report["healthy"] = verdict == "ready"  # type: ignore[index]
+    report["verdict"] = verdict  # type: ignore[index]
     return mutated
 
 
@@ -1943,9 +2024,25 @@ def assert_windows_node_validator_behavior(step: str) -> None:
                 proof, report_path, "kin_binary", "unsupported"
             ),
         )
+        # The overclaim itself, in the shape it shipped. A fresh repo-free
+        # install carries a pending row and a degraded row, so its honest
+        # aggregate is `healthy: false` with `verdict: needs_attention`. The
+        # v0.6.1 Windows binary emitted `true` over exactly those rows; the
+        # first arm is that report and it must be refused. The second is the
+        # aggregate agreeing while the verdict does not, which no build should
+        # be able to emit and which the validator must catch on its own rather
+        # than by inference from the boolean.
         reject(
             f"{report_path} inconsistent healthy aggregate",
-            fixture_with_json_value(proof, report_path, ("healthy",), False),
+            fixture_with_json_value(proof, report_path, ("healthy",), True),
+        )
+        reject(
+            f"{report_path} inconsistent verdict",
+            fixture_with_json_value(proof, report_path, ("verdict",), "ready"),
+        )
+        reject(
+            f"{report_path} verdict absent, as pre-FIR-2919 bytes emit",
+            fixture_without_json_key(proof, report_path, ("verdict",)),
         )
         reject(
             f"{report_path} unexpected hard failure",
@@ -2360,11 +2457,32 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             fixture_with_json_value(proof, report_path, ("healthy",), True),
         )
 
-        healthy_readiness = fixture_with_check_status(
-            proof, report_path, "semantic_query_readiness", "healthy"
+        reject(
+            f"{report_path} inconsistent verdict",
+            fixture_with_json_value(proof, report_path, ("verdict",), "ready"),
         )
-        healthy_readiness = fixture_with_json_value(
-            healthy_readiness, report_path, ("healthy",), True
+        reject(
+            f"{report_path} verdict absent, as pre-FIR-2919 bytes emit",
+            fixture_without_json_key(proof, report_path, ("verdict",)),
+        )
+        # A row that needs attention and is not one this posture named. The
+        # aggregate is re-derived, so the fixture is a report the product could
+        # actually emit and only the tolerance sweep can refuse it.
+        reject(
+            f"{report_path} an unnamed row needs attention",
+            fixture_with_derived_aggregate(
+                fixture_with_extra_check(
+                    proof, report_path, "kinlab_connect", "degraded"
+                ),
+                report_path,
+            ),
+        )
+
+        healthy_readiness = fixture_with_derived_aggregate(
+            fixture_with_check_status(
+                proof, report_path, "semantic_query_readiness", "healthy"
+            ),
+            report_path,
         )
         assert_node_validator_accepts_fixture(
             step,
@@ -2374,11 +2492,11 @@ def assert_unix_node_validator_behavior(step: str) -> None:
             environment,
         )
 
-        unsupported_readiness = fixture_with_check_status(
-            proof, report_path, "semantic_query_readiness", "unsupported"
-        )
-        unsupported_readiness = fixture_with_json_value(
-            unsupported_readiness, report_path, ("healthy",), True
+        unsupported_readiness = fixture_with_derived_aggregate(
+            fixture_with_check_status(
+                proof, report_path, "semantic_query_readiness", "unsupported"
+            ),
+            report_path,
         )
         reject(
             f"{report_path} semantic readiness unsupported",
@@ -2386,9 +2504,24 @@ def assert_unix_node_validator_behavior(step: str) -> None:
         )
 
     for report_path in ("kin-embedded-health.json", "kin-embedded-doctor.json"):
+        # The post-embed capture carries `memory_floor: degraded`, so its honest
+        # aggregate is already false. The overclaim is the true one.
         reject(
             f"{report_path} inconsistent healthy aggregate",
-            fixture_with_json_value(proof, report_path, ("healthy",), False),
+            fixture_with_json_value(proof, report_path, ("healthy",), True),
+        )
+        reject(
+            f"{report_path} verdict absent, as pre-FIR-2919 bytes emit",
+            fixture_without_json_key(proof, report_path, ("verdict",)),
+        )
+        reject(
+            f"{report_path} an unnamed row needs attention after the embed",
+            fixture_with_derived_aggregate(
+                fixture_with_extra_check(
+                    proof, report_path, "kinlab_connect", "pending"
+                ),
+                report_path,
+            ),
         )
         reject(
             f"{report_path} contradictory duplicate check",
@@ -8630,6 +8763,101 @@ def assert_release_hold_marker_contract(
         )
 
 
+
+def health_join_copies() -> list[tuple[str, str]]:
+    """Every pasted copy of the health join, as (home, dedented text).
+
+    Extracted from the start of the BEGIN line so the first line carries the
+    same indentation as the rest, which is what makes `textwrap.dedent` able to
+    remove it. Slicing from the marker itself leaves line one at column zero,
+    dedent finds a common prefix of "" and every copy compares unequal for a
+    reason that has nothing to do with the rule.
+    """
+
+    found: list[tuple[str, str]] = []
+    for home in HEALTH_JOIN_HOMES:
+        text = (ROOT / home).read_text(encoding="utf-8")
+        cursor = 0
+        while True:
+            begin = text.find(HEALTH_JOIN_BEGIN, cursor)
+            if begin < 0:
+                break
+            line_start = text.rfind("\n", 0, begin) + 1
+            end = text.index(HEALTH_JOIN_END, begin)
+            end = text.index("\n", end) + 1
+            found.append((home, textwrap.dedent(text[line_start:end])))
+            cursor = end
+    return found
+
+
+def assert_health_join_copies_agree() -> None:
+    """One roll-up rule, however many files have to carry the letters.
+
+    FIR-2919. install-proof.yml and rc-build.yml run with no checkout by design,
+    so they cannot import `scripts/verify-capability-proof.mjs` and each pastes
+    the rule instead. Four copies of a rule drift, and this set drifts in the
+    worst direction: every copy kept agreeing with every other while all four
+    disagreed with the product, so a fresh Windows install emitted
+    `"healthy": true` over a pending and a degraded row and the release's own
+    proof threw at tag time, where no fix on main can reach the tag.
+    """
+
+    copies = health_join_copies()
+    expected = 4
+    if len(copies) != expected:
+        raise AssertionError(
+            f"the health join must appear exactly {expected} times across "
+            f"{', '.join(HEALTH_JOIN_HOMES)}; found {len(copies)}: "
+            f"{[home for home, _ in copies]}"
+        )
+    # The module's copy is the reference. It is the one with a test suite.
+    reference_home, reference = copies[0]
+    if reference_home != HEALTH_JOIN_HOMES[0]:
+        raise AssertionError(
+            f"the first copy must come from {HEALTH_JOIN_HOMES[0]}, which is the "
+            f"one with unit tests; found {reference_home}"
+        )
+    for home, block in copies[1:]:
+        if block != reference:
+            diff = "\n".join(
+                difflib.unified_diff(
+                    reference.splitlines(),
+                    block.splitlines(),
+                    fromfile=reference_home,
+                    tofile=home,
+                    lineterm="",
+                )
+            )
+            raise AssertionError(
+                f"{home} carries a health join that differs from "
+                f"{reference_home}; one rule, one text:\n{diff}"
+            )
+    # The extractor itself must be able to come up empty, or "every copy agrees"
+    # is a sentence about a list nothing ever put anything into.
+    if HEALTH_JOIN_BEGIN.replace("HEALTH JOIN", "HEALTH JOIN THAT IS NOT THERE") in reference:
+        raise AssertionError("the control marker must not appear in the real block")
+    for home in HEALTH_JOIN_HOMES:
+        text = (ROOT / home).read_text(encoding="utf-8")
+        if "// --- BEGIN HEALTH JOIN THAT IS NOT THERE ---" in text:
+            raise AssertionError(
+                f"{home} carries the fabricated control marker, so the extractor "
+                "cannot be trusted to have found the real ones"
+            )
+    # Every copy must carry both halves of the rule. A block that lost
+    # `healthNeedsAttention` would still be identical in four places.
+    for clause in (
+        'check.status !== "healthy" && check.status !== "unsupported"',
+        'check.status === "missing"',
+        'check.id === "semantic_query_readiness" && check.status === "stale"',
+        'return checks.some(healthNeedsAttention) ? "needs_attention" : "ready";',
+    ):
+        if clause not in reference:
+            raise AssertionError(
+                f"the health join must carry the clause {clause!r}; four identical "
+                "copies of the wrong rule is the failure this pin exists to catch"
+            )
+
+
 def assert_capability_canary_contract(
     install_proof: str,
     canary: str,
@@ -8680,13 +8908,13 @@ def assert_capability_canary_contract(
             f"required by the canary but not the proof: {extra or 'none'}"
         )
 
-    # The rule the proof applies to every health report it reads. A canary that
-    # judges the aggregate differently would pass a report the proof rejects.
-    if 'check.id === READINESS_ID && check.status === "stale"' not in capability_script:
-        raise AssertionError(
-            "the canary must apply the proof's own aggregate-health rule, in "
-            "which a stale readiness makes the report unhealthy"
-        )
+    # The rule the proof applies to every health report it reads lives in one
+    # delimited block, pasted into the workflows that cannot import it, and
+    # `assert_health_join_copies_agree` requires every copy identical. A text
+    # probe for one clause was what stood here, and a clause probe cannot see the
+    # half of the rule that was wrong: the copies all agreed on `stale` while
+    # none of them counted `pending` or `degraded`, which is what fenced v0.6.1.
+    assert_health_join_copies_agree()
 
     # Everything below is judged on active lines only, in both directions.
     #
@@ -11492,9 +11720,16 @@ def main() -> None:
         "export SHELL=/bin/zsh",
     ):
         require(embedding, policy, "embedded-health shell reset")
+    # A health failure has to name the rows it failed on. It used to name every
+    # row that was not `healthy`, which on a fresh Windows install is 21 rows of
+    # which 19 are `unsupported` and irrelevant, so the message buried its own
+    # cause. These needles are the replacement: the rows that were NOT tolerated
+    # first, then the verdict, then the full attention list (FIR-2919).
     for policy in (
-        "overall healthy=${report.healthy}",
-        "non-healthy checks: ${nonHealthyChecks(report)}",
+        "rows needing attention that a fresh repo-free install does not expect:",
+        "rows needing attention that a fresh install does not expect:",
+        "verdict=${report.verdict}",
+        "every row needing attention: ${attentionRows(report)}",
     ):
         require(install_proof, policy, "actionable install-proof health failure")
     require(

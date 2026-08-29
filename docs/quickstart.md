@@ -480,10 +480,32 @@ kin setup status --json   # machine-readable report
 Each line shows a status mark:
 
 - `✓` **ok** means healthy.
-- `✗` **MISSING** / **MISCONFIGURED** means failing, and these are the only states that
-  make the overall report unhealthy.
-- `!` **STALE** means present but not fully ready (e.g. embeddings pending).
-- `→` **n/a** means unsupported / not applicable on this platform or context.
+- `✗` **MISSING** / **MISCONFIGURED** means the install itself is wrong.
+- `✗` **DEGRADED** means the machine is short of ground Kin measured it needs. Nothing
+  about the install is wrong and the row still costs you work, so it reads red.
+- `!` **STALE** means present but drifted, such as a shim that is installed and not
+  injected into this shell.
+- `…` **PENDING** means expected first-run work still in flight, such as the first
+  embedding pass or the model download.
+- `→` **n/a** means unsupported, so the check does not apply on this platform or in this
+  context.
+
+The report closes with one verdict over all of them, emitted in `--json` as `verdict`
+beside the `healthy` boolean:
+
+- `ready`, and `healthy: true`. Every check in scope is ok. `n/a` rows do not count
+  against it, which is why a correct Windows install can still read ready.
+- `needs_attention`, and `healthy: false`. Something is not answering at full strength:
+  a PENDING or DEGRADED or STALE row. Kin works; the row tells you what you are not
+  getting yet.
+- `failing`, and `healthy: false`. A MISSING or MISCONFIGURED check, or a semantic
+  readiness Kin cannot read.
+
+`healthy` is true only for `ready`. It used to be true whenever nothing was MISSING or
+MISCONFIGURED, which meant a fresh install printing "2 checks need attention" on its last
+line also reported `"healthy": true` to every machine reader (FIR-2919). Read `verdict`
+when you need to tell a warming install from a broken one; the boolean cannot carry that
+difference.
 
 The checks (IDs as emitted in `--json`):
 

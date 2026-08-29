@@ -4,11 +4,11 @@
 
 """First-contact honesty: what a stranger meets before the graph answers anything.
 
-Seven defects strangers hit on shipped builds, each on a surface that runs before
+Eight defects strangers hit on shipped builds, each on a surface that runs before
 any semantic question is asked, and none of them visible to the suites that grade
 answers. Checks 0 to 2 come from the npm0549 green stranger on 0.5.49; check 3
 comes from the rc060n brown stranger on 0.6.0; checks 4 to 6 come from the
-2026-08-28 cold walkthrough:
+2026-08-28 cold walkthrough; check 7 comes from the v0.6.1 release run:
 
   CHECK 0 (FIR-2627)  `kin commit --help` never said a Kin commit is not a git
                       commit, so the write-through assumption formed at help and
@@ -42,6 +42,12 @@ comes from the rc060n brown stranger on 0.6.0; checks 4 to 6 come from the
                       (5/303 files)` over a sweep whose Rust server never
                       started, and the same store's `kin graph status` said the
                       Rust edges were missing. One store cannot say both things.
+  CHECK 7 (FIR-2919)  `kin doctor --json` reported `"healthy": true` on a fresh
+                      Windows install whose own rows read `embedding_model`
+                      pending and `memory_floor` degraded, while the same run's
+                      printed page closed on "2 checks need attention". The
+                      release install proof threw on the contradiction and
+                      fenced v0.6.1.
 
 A new suite rather than rows bolted onto the graph suites, for one reason: these
 are graded on the surfaces a stranger meets first, and most of them need no
@@ -562,13 +568,15 @@ def check_2(suite):
     return res
 
 
-def doctor_rows(suite, extra_env=None):
-    """(rows_by_id, detail) from one `kin doctor --json` run outside a repository.
+def doctor_report(suite, extra_env=None):
+    """(report, detail) from one `kin doctor --json` run outside a repository.
 
-    Outside, deliberately. The row this check grades is the one FIR-2787 says
-    has to answer before `kin init` runs, and every other memory row on that
-    page reads n/a there, so a run inside a repository would grade a different
-    question entirely.
+    Outside, deliberately. The row FIR-2787 grades is the one that has to answer
+    before `kin init` runs, and every other memory row on that page reads n/a
+    there, so a run inside a repository would grade a different question
+    entirely. FIR-2919 grades the same page's roll-up, and outside a repository
+    is where that page carries the most `unsupported` rows, which is exactly the
+    shape its join has to get right.
     """
     env = suite.base_env()
     if extra_env:
@@ -581,10 +589,143 @@ def doctor_rows(suite, extra_env=None):
         return None, "`kin doctor --json` exited %d and printed nothing: %s" % (
             rc, flatten(err)[:200])
     try:
-        report = json.loads(strip_ansi(out))
+        return json.loads(strip_ansi(out)), ""
     except ValueError as exc:
         return None, "`kin doctor --json` did not print JSON: %s" % exc
+
+
+def doctor_rows(suite, extra_env=None):
+    """(rows_by_id, detail) from one `kin doctor --json` run outside a repository."""
+    report, detail = doctor_report(suite, extra_env)
+    if report is None:
+        return None, detail
     return {row.get("id"): row for row in report.get("checks", [])}, ""
+
+
+
+# ---------------------------------------------------------------- the roll-up
+#
+# FIR-2919. `kin doctor --json` emitted per-check rows that were honest and a
+# top-level `"healthy": true` that was not. On a fresh Windows install the page
+# carried 19 `unsupported` rows, `embedding_model` `pending` and `memory_floor`
+# `degraded`, printed "2 checks need attention" as its own last line, and told a
+# machine reader the install was ready. The release's install proof threw on the
+# contradiction and fenced v0.6.1.
+#
+# The rule, in one place here as it is in one place in the product: a check is
+# out of scope only when the platform or the context puts it out of scope, which
+# is exactly `unsupported`. Every other status is a component not answering at
+# full strength. `ready` requires that none of them exists; `failing` is
+# reserved for a broken install so that `healthy: false` cannot mean two things.
+
+HEALTH_VERDICTS = ("ready", "needs_attention", "failing")
+HEALTH_STATUSES = ("healthy", "missing", "stale", "misconfigured", "pending",
+                   "degraded", "unsupported")
+READINESS_ID = "semantic_query_readiness"
+
+
+def health_needs_attention(row):
+    return row.get("status") not in ("healthy", "unsupported")
+
+
+def health_blocks_readiness(row):
+    return (row.get("status") in ("missing", "misconfigured")
+            or (row.get("id") == READINESS_ID and row.get("status") == "stale"))
+
+
+def health_join(rows):
+    """The verdict a report's own rows support."""
+    if any(health_blocks_readiness(row) for row in rows):
+        return "failing"
+    return "needs_attention" if any(health_needs_attention(row) for row in rows) else "ready"
+
+
+def grade_health_rollup(report):
+    """(ok, detail) for whether a health report's roll-up matches its own rows.
+
+    Reads the report the product emitted rather than composing an expected one,
+    so the grader cannot pass by agreeing with itself. Returns None where the
+    payload cannot answer the question at all, which includes a report carrying
+    no `verdict`: that is what pre-FIR-2919 bytes emit, and grading their
+    aggregate against either rule would be a claim those bytes cannot carry.
+    """
+    if not isinstance(report, dict):
+        return None, "the doctor payload is not an object"
+    rows = report.get("checks")
+    if not isinstance(rows, list) or not rows:
+        return None, "the doctor payload carries no checks array"
+    unknown = sorted({row.get("status") for row in rows} - set(HEALTH_STATUSES))
+    if unknown:
+        return None, ("the report carries statuses this grader does not know (%s), so the "
+                      "join it computes would be a guess" % ", ".join(map(str, unknown)))
+    if "healthy" not in report:
+        return None, "the report carries no top-level `healthy` field"
+    if report.get("verdict") not in HEALTH_VERDICTS:
+        return None, ("the report carries no readable `verdict` (%r), so these bytes predate "
+                      "FIR-2919 and their roll-up cannot be graded"
+                      % report.get("verdict"))
+
+    waiting = [row for row in rows if health_needs_attention(row)]
+    named = ", ".join("%s=%s" % (row.get("id"), row.get("status")) for row in waiting) or "none"
+    expected = health_join(rows)
+    if report["verdict"] != expected:
+        return False, ("the page reports verdict %s while its own rows support %s; rows "
+                       "needing attention: %s"
+                       % (report["verdict"], expected, named))
+    if report["healthy"] is not (expected == "ready"):
+        return False, ("the page reports healthy=%s while its own rows support %s; rows "
+                       "needing attention: %s"
+                       % (report["healthy"], expected, named))
+    return True, ("the roll-up is %s over %d rows, %d of which need attention: %s"
+                  % (expected, len(rows), len(waiting), named))
+
+
+
+# The row set a fresh Windows install emitted on the v0.6.1 release run, lifted
+# from that run's own `install-proof-windows-latest-33235776577` artifact
+# (`kin-windows-health.json`) rather than composed here. 33 rows: 12 healthy, 19
+# unsupported, `embedding_model` pending and `memory_floor` degraded. The
+# shipped payload carried `"healthy": true` beside them and no `verdict` field
+# at all.
+#
+# No host that runs this suite can produce that row set, and it does not need
+# to: the rule is platform-independent and the rows are the platform's whole
+# contribution, so replaying the rows replays the case.
+WINDOWS_V061_ROWS = [
+    {"id": "kin_binary", "status": "healthy"},
+    {"id": "kin_daemon_binary", "status": "healthy"},
+    {"id": "supervisor_startup_protocol", "status": "healthy"},
+    {"id": "daemon_running", "status": "unsupported"},
+    {"id": "daemon_idle_window", "status": "unsupported"},
+    {"id": "vfs_projection", "status": "unsupported"},
+    {"id": "projection_mode", "status": "unsupported"},
+    {"id": "repo_init", "status": "unsupported"},
+    {"id": "session_runtime", "status": "unsupported"},
+    {"id": "shell_path", "status": "healthy"},
+    {"id": "registry_authority", "status": "unsupported"},
+    {"id": "mcp_client_claude", "status": "healthy"},
+    {"id": "mcp_client_cursor", "status": "healthy"},
+    {"id": "mcp_client_gemini", "status": "healthy"},
+    {"id": "mcp_client_windsurf", "status": "healthy"},
+    {"id": "setup_ledger", "status": "healthy"},
+    {"id": "editor", "status": "unsupported"},
+    {"id": "kinlab_connect", "status": "unsupported"},
+    {"id": "semantic_query_readiness", "status": "unsupported"},
+    {"id": "reference_edge_coverage", "status": "unsupported"},
+    {"id": "relation_census", "status": "unsupported"},
+    {"id": "parse_coverage", "status": "unsupported"},
+    {"id": "background_work", "status": "unsupported"},
+    {"id": "embedding_model", "status": "pending"},
+    {"id": "memory_floor", "status": "degraded"},
+    {"id": "commit_memory_headroom", "status": "unsupported"},
+    {"id": "daemon_kill_record", "status": "unsupported"},
+    {"id": "interrupted_init", "status": "healthy"},
+    {"id": "suspended_sweep", "status": "unsupported"},
+    {"id": "host_memory_pressure", "status": "unsupported"},
+    {"id": "retrieval_profile", "status": "healthy"},
+    {"id": "update_policy", "status": "healthy"},
+    {"id": "binary_assessment_load", "status": "unsupported"},
+]
 
 
 # --------------------------------------------------------- toolchain-free repair
@@ -1414,8 +1555,64 @@ def _serve_asset(body):
     return "http://127.0.0.1:%d" % httpd.server_address[1], httpd, thread
 
 
+def check_7(suite):
+    """`kin doctor --json` does not claim more than its own rows support.
+
+    Graded outside a repository, where the page carries the most `unsupported`
+    rows and where the join therefore has the most chances to get it wrong in
+    both directions: counting an out-of-scope row as a shortfall would refuse
+    every correct install, and not counting a `pending` or `degraded` row is the
+    overclaim that fenced v0.6.1.
+
+    Whatever this host's own rows happen to be is not the subject. The subject
+    is agreement, between the roll-up and the rows and between the machine
+    report and the human page, so the check answers the same way on a warming
+    laptop and on a settled one. The `--self-test` arms carry the shipped
+    Windows row set, which no host here can reproduce.
+    """
+    res = Result("7", "FIR-2919",
+                 "kin doctor's roll-up agrees with the rows it summarizes")
+
+    report, detail = doctor_report(suite)
+    if report is None:
+        res.unknown(detail)
+        return res
+
+    ok, detail = grade_health_rollup(report)
+    if ok is None:
+        res.unknown(detail)
+        return res
+    if not ok:
+        res.bad(detail)
+        return res
+    res.ok(detail)
+
+    # The same run's human page. The two renderings are one report, and the
+    # defect was that they disagreed: the printed line counted the pending and
+    # degraded rows while the JSON beside it did not. Graded on the closing
+    # line, which is the sentence a reader trusts.
+    env = suite.base_env()
+    work = os.path.join(suite.workdir, "no-repository")
+    if not os.path.isdir(work):
+        os.makedirs(work)
+    rc, out, err = run([suite.kin, "doctor"], cwd=work, env=env, timeout=600)
+    page = flatten(strip_ansi(out or ""))
+    if not page:
+        res.unknown("`kin doctor` exited %d and printed no page: %s" % (rc, flatten(err)[:200]))
+        return res
+    claims_ready = "First-run ready" in page
+    if claims_ready != bool(report.get("healthy")):
+        res.bad("the printed page and the JSON disagree: the page %s claim first-run ready "
+                "while `healthy` is %s. Page tail: %s"
+                % ("does" if claims_ready else "does not", report.get("healthy"), page[-300:]))
+        return res
+    res.ok("the printed page and the JSON agree: first-run ready %s, healthy=%s"
+           % ("claimed" if claims_ready else "withheld", report.get("healthy")))
+    return res
+
+
 CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3),
-          ("4", check_4), ("5", check_5), ("6", check_6)]
+          ("4", check_4), ("5", check_5), ("6", check_6), ("7", check_7)]
 
 
 # ----------------------------------------------------------------------- suite
@@ -1556,6 +1753,64 @@ def self_test():
                "  x could not install the python language server: `npm install -g "
                "pyright` exited with 1: npm error minTimeout is greater than maxTimeout\n"
            )[0], None)
+
+    # FIR-2919, both directions, on the row set that fenced v0.6.1.
+    #
+    # The overclaim must fail, the honest emission of the SAME rows must pass,
+    # and the shipped payload, which carried no verdict at all, must read
+    # unreadable rather than either. Without the third arm the grader would
+    # report a clean product on the exact bytes the defect shipped in.
+    honest = {
+        "platform": "windows",
+        "checks": WINDOWS_V061_ROWS,
+        "healthy": False,
+        "verdict": "needs_attention",
+    }
+    overclaim = dict(honest, healthy=True, verdict="ready")
+    shipped = {"platform": "windows", "checks": WINDOWS_V061_ROWS, "healthy": True}
+    expect("the honest degraded roll-up must PASS",
+           grade_health_rollup(honest)[0], True)
+    expect("the v0.6.1 roll-up violation must FAIL",
+           grade_health_rollup(overclaim)[0], False)
+    expect("the shipped payload carries no verdict and is UNREADABLE",
+           grade_health_rollup(shipped)[0], None)
+    # The failure has to name the rows, or a reader gets a verdict mismatch with
+    # nothing to act on. 19 unsupported rows are not among them.
+    overclaim_detail = grade_health_rollup(overclaim)[1]
+    for wanted in ("embedding_model=pending", "memory_floor=degraded"):
+        if wanted not in overclaim_detail:
+            failures.append("the roll-up failure must name %s: %s" % (wanted, overclaim_detail))
+    for unwanted in ("daemon_running", "binary_assessment_load"):
+        if unwanted in overclaim_detail:
+            failures.append("the roll-up failure must not list out-of-scope rows (%s): %s"
+                            % (unwanted, overclaim_detail))
+
+    # The other three ways the roll-up can lie, each with the honest twin beside
+    # it so a rule that refused everything could not pass this block.
+    only_unsupported = {
+        "checks": [{"id": "kin_binary", "status": "healthy"},
+                   {"id": "vfs_projection", "status": "unsupported"}],
+        "healthy": True, "verdict": "ready",
+    }
+    expect("unsupported rows must not disqualify a ready roll-up",
+           grade_health_rollup(only_unsupported)[0], True)
+    expect("a ready roll-up over an unsupported row must not be refused",
+           grade_health_rollup(dict(only_unsupported, healthy=False,
+                                    verdict="needs_attention"))[0], False)
+    broken = {
+        "checks": [{"id": "kin_binary", "status": "healthy"},
+                   {"id": "shell_path", "status": "missing"}],
+        "healthy": False, "verdict": "failing",
+    }
+    expect("a broken install reports failing, not needs_attention",
+           grade_health_rollup(broken)[0], True)
+    expect("calling a broken install merely warming must FAIL",
+           grade_health_rollup(dict(broken, verdict="needs_attention"))[0], False)
+    expect("a payload with no checks is UNREADABLE",
+           grade_health_rollup({"healthy": True, "verdict": "ready", "checks": []})[0], None)
+    expect("a status this grader does not know is UNREADABLE",
+           grade_health_rollup({"healthy": True, "verdict": "ready",
+                                "checks": [{"id": "x", "status": "warming"}]})[0], None)
 
     expect("npx keeps its flags and gains an explicit bin name",
            localize("npx -y @kinlab/kin --version", "/tmp/p.tgz"),

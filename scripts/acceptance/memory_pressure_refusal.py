@@ -430,10 +430,17 @@ def row_reports_a_refusal(row):
     return row.get("status") == "degraded" and "memory pressure" in detail
 
 
-# The two statuses `kin doctor` treats as blocking. Mirrored from
-# `blocks_readiness` in crates/kin-cli/src/commands/health.rs, whose third case
-# is `stale` on the one id `semantic_query_readiness` and cannot apply to this
-# row. A row of any other status is advisory and changes no verdict.
+# The two statuses that make `kin doctor` report a BROKEN INSTALL. Mirrored
+# from `blocks_readiness` in crates/kin-cli/src/commands/health.rs, whose third
+# case is `stale` on the one id `semantic_query_readiness` and cannot apply to
+# this row.
+#
+# A row of any other status does not report a broken install. It is no longer
+# true that it "changes no verdict": since FIR-2919 a `degraded` row keeps the
+# report out of `ready` and moves the verdict to `needs_attention`, which is
+# what an honest roll-up owes a reader whose machine is short of memory. What
+# this row must never do is move the verdict to `failing`, and that is the
+# claim `grade_pressure_verdict_shift` grades.
 BLOCKING_STATUSES = ("missing", "misconfigured")
 
 
@@ -452,6 +459,45 @@ def row_blocks_readiness(row):
     not change the verdict at all.
     """
     return bool(row) and row.get("status") in BLOCKING_STATUSES
+
+
+
+# The verdict a report may carry, in the vocabulary `HealthVerdict` serializes.
+HEALTH_VERDICTS = ("ready", "needs_attention", "failing")
+
+
+def grade_pressure_verdict_shift(pressured, healed):
+    """(ok, detail) for what forcing memory pressure did to the page's verdict.
+
+    Before FIR-2919 this compared the `healthy` boolean on both arms and
+    required it identical. That was the right claim about the shape that
+    shipped then, where a `degraded` row could not move the boolean at all, and
+    it is the wrong claim now: a degraded row is supposed to move the report out
+    of `ready`, and requiring it not to would be asking the roll-up to go back
+    to claiming more than its rows support.
+
+    What must not move is the FAILING verdict, which is the one that says the
+    install itself is broken. Pressure is a fact about the machine.
+
+    Returns `None` for ok when either arm carries no `verdict`, because a build
+    that predates FIR-2919 cannot answer this question and reading its silence
+    as agreement is how a check stops being able to fail.
+    """
+    under = (pressured or {}).get("verdict")
+    after = (healed or {}).get("verdict")
+    if under not in HEALTH_VERDICTS or after not in HEALTH_VERDICTS:
+        return None, (
+            "one of the two doctor reports carries no readable `verdict` "
+            "(pressured=%s, healed=%s), so this build cannot answer whether "
+            "pressure moves the page's verdict" % (under, after)
+        )
+    if under == "failing" and after != "failing":
+        return False, (
+            "forcing pressure moved the page's verdict from %s to failing, so this row "
+            "reports a broken install over a busy machine" % after
+        )
+    return True, "the verdict is %s under pressure and %s after the work ran" % (
+        under, after)
 
 
 def reason_names_the_budget(reason):
@@ -680,6 +726,7 @@ GRADERS = {
     "names_memory_with_a_figure": names_memory_with_a_figure,
     "row_reports_a_refusal": row_reports_a_refusal,
     "row_blocks_readiness": row_blocks_readiness,
+    "grade_pressure_verdict_shift": grade_pressure_verdict_shift,
     "status_discloses_the_refusal": status_discloses_the_refusal,
     "reason_names_the_budget": reason_names_the_budget,
     "status_publishes_the_standing": status_publishes_the_standing,
@@ -1276,16 +1323,17 @@ def check_1(suite):
         result.ok("the row heals to %s once the work runs" % healed.get("status"))
 
     if row_blocks_readiness(under) or row_blocks_readiness(healed):
-        result.bad("the row's own status withholds the page's all-clear, so it would fail "
+        result.bad("the row's own status reports a broken install, so it would fail "
                    "the install proof over a busy machine: %s" % json.dumps(under))
-    elif reports["pressured"].get("healthy") != reports["healed"].get("healthy"):
-        result.bad(
-            "forcing pressure moved the page's verdict from %s to %s, so this row decides a "
-            "gate it must not touch"
-            % (reports["healed"].get("healthy"), reports["pressured"].get("healthy"))
-        )
     else:
-        result.ok("the verdict is %s either way" % reports["healed"].get("healthy"))
+        ok, detail = grade_pressure_verdict_shift(
+            reports["pressured"], reports["healed"])
+        if ok is None:
+            result.unknown(detail)
+        elif not ok:
+            result.bad(detail)
+        else:
+            result.ok(detail)
     return result
 
 
@@ -2551,6 +2599,32 @@ def self_test():
         if got != want:
             failures.append("row_blocks_readiness(%s) = %s, wanted %s"
                             % (json.dumps(row), got, want))
+
+    # FIR-2919. What pressure may and may not do to the page's verdict, with
+    # both directions of the claim and the unreadable case beside them. A build
+    # with no `verdict` must answer None rather than True, or a suite run
+    # against pre-FIR-2919 bytes would report a property nothing checked.
+    verdict_cases = [
+        (True, {"verdict": "needs_attention"}, {"verdict": "ready"}),
+        (True, {"verdict": "needs_attention"}, {"verdict": "needs_attention"}),
+        (True, {"verdict": "ready"}, {"verdict": "ready"}),
+        # A machine already broken for its own reasons stays broken. Pressure
+        # did not move it, so this is not the defect.
+        (True, {"verdict": "failing"}, {"verdict": "failing"}),
+        # The defect: pressure alone turned the page into a broken install.
+        (False, {"verdict": "failing"}, {"verdict": "needs_attention"}),
+        (False, {"verdict": "failing"}, {"verdict": "ready"}),
+        (None, {"healthy": True}, {"verdict": "ready"}),
+        (None, {"verdict": "ready"}, {"healthy": True}),
+        (None, {"verdict": "nonsense"}, {"verdict": "ready"}),
+        (None, None, None),
+    ]
+    for want, pressured, healed in verdict_cases:
+        got, _detail = grade_pressure_verdict_shift(pressured, healed)
+        if got != want:
+            failures.append(
+                "grade_pressure_verdict_shift(%s, %s) = %s, wanted %s"
+                % (json.dumps(pressured), json.dumps(healed), got, want))
 
     status_cases = [
         (True, "Entities: 12  |  Files: 3\n\n⚠ host memory pressure is critical, so the "
