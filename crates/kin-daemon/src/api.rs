@@ -2259,7 +2259,7 @@ fn router_with_rotation_tokens(
         // passes through, and it needs only the digests.
         assert!(
             !tokens.matches_any_configured(administrator),
-            "hosted graph publication control administrator authentication must be distinct from ordinary daemon authentication, the superseded token included"
+            "hosted graph publication control administrator authentication must not be any token this daemon accepts, the superseded one included"
         );
     }
     let routes = api_routes();
@@ -42477,7 +42477,7 @@ mod tests {
                 )
             }
         }));
-        let error = refused.err().expect(
+        let error = refused.expect_err(
             "an administrator token equal to the daemon token must be refused by the internal \
              router wrapper",
         );
@@ -42486,10 +42486,21 @@ mod tests {
             .cloned()
             .or_else(|| error.downcast_ref::<&str>().map(|text| text.to_string()))
             .unwrap_or_default();
+        // The exact message, and the OTHER guard's absence. Both guards refuse
+        // this pairing, so a `contains` on shared wording is satisfied by either
+        // and neither test can then say which one fired. That is what let the
+        // reviewer delete this call site with every test still green.
         assert!(
-            message.contains("must be distinct from ordinary daemon authentication"),
-            "the refusal must be the distinctness assertion and not some other panic; got \
-             {message}"
+            message.contains(
+                "hosted graph publication control administrator authentication must be distinct \
+                 from ordinary daemon authentication"
+            ),
+            "the refusal must be the wrapper's distinctness assertion; got {message}"
+        );
+        assert!(
+            !message.contains("must not be any token this daemon accepts"),
+            "this arm must be caught by the wrapper, not by the constructor guard behind it; \
+             got {message}"
         );
 
         // Control: distinct tokens must BUILD, or the arm above would pass on a
@@ -42564,18 +42575,26 @@ mod tests {
                 )
             }
         }));
-        let error = refused
-            .err()
-            .expect("the superseded daemon token must not be accepted as the administrator token");
+        let error = refused.expect_err(
+            "the superseded daemon token must not be accepted as the administrator token",
+        );
         let message = error
             .downcast_ref::<String>()
             .cloned()
             .or_else(|| error.downcast_ref::<&str>().map(|text| text.to_string()))
             .unwrap_or_default();
         assert!(
-            message.contains("must be distinct from ordinary daemon authentication"),
-            "the refusal must be the distinctness assertion rather than some other panic; got \
-             {message}"
+            message.contains(
+                "hosted graph publication control administrator authentication must not be any \
+                 token this daemon accepts, the superseded one included"
+            ),
+            "the refusal must be the constructor guard, which is the only one that sees the \
+             superseded token; got {message}"
+        );
+        assert!(
+            !message.contains("must be distinct from ordinary daemon authentication"),
+            "the wrapper guard cannot see this pairing, so a refusal carrying its wording would \
+             mean the arm is proving the wrong thing; got {message}"
         );
 
         // The primary is refused by the same check, so neither configured token
