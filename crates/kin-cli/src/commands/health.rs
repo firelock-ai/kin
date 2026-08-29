@@ -3007,7 +3007,10 @@ fn check_kinlab_connect() -> HealthCheck {
             "kinlab_connect",
             "KinLab connection",
             HealthStatus::Healthy,
-            format!("stored credential present for {base_url}"),
+            kinlab_connect_detail(
+                &base_url,
+                crate::commands::auth::stored_credential_provider(&base_url).as_deref(),
+            ),
         )
     } else {
         HealthCheck::new(
@@ -3019,6 +3022,23 @@ fn check_kinlab_connect() -> HealthCheck {
         .with_manual_fix(format!(
             "run `kin auth login` to connect this machine to {base_url}, or `kin auth login --base-url <url>` for another workspace"
         ))
+    }
+}
+
+/// What the KinLab row says about a credential this machine holds.
+///
+/// The provider is named only when the credential records one, and worded as
+/// what the login asked for rather than as what the browser did, because the
+/// exchange response carries no provider and that is the whole distance
+/// between the two claims. A credential written before `--provider` existed,
+/// or one held in the keyring or behind a passphrase, names none, and this
+/// says nothing rather than defaulting the reader to Google.
+fn kinlab_connect_detail(base_url: &str, provider: Option<&str>) -> String {
+    match provider {
+        Some(provider) => format!(
+            "stored credential present for {base_url} (login asked for the {provider} provider)"
+        ),
+        None => format!("stored credential present for {base_url}"),
     }
 }
 
@@ -11571,5 +11591,30 @@ mod tests {
             "an unread graph must not borrow the words of a measured one: {}",
             unread.detail
         );
+    }
+
+    /// FIR-2938. The row names the provider only when the credential records
+    /// one, and words it as what the login asked for, because the exchange
+    /// response carries none and "signed in with github" would be a claim the
+    /// client cannot make. The absent arm is the one that matters: an older
+    /// credential must not read as Google.
+    #[test]
+    fn the_kinlab_row_names_a_recorded_provider_and_invents_none() {
+        let named = kinlab_connect_detail("https://kinlab.ai", Some("github"));
+        assert!(named.contains("https://kinlab.ai"), "{named}");
+        assert!(named.contains("github"), "{named}");
+        assert!(
+            named.contains("asked for"),
+            "the row must not claim more than the client knows: {named}"
+        );
+
+        let unnamed = kinlab_connect_detail("https://kinlab.ai", None);
+        assert!(unnamed.contains("https://kinlab.ai"), "{unnamed}");
+        for provider in ["google", "github"] {
+            assert!(
+                !unnamed.contains(provider),
+                "a credential naming no provider must name none: {unnamed}"
+            );
+        }
     }
 }

@@ -228,12 +228,20 @@ fn layout() -> Result<KinLayout> {
     crate::commands::require_repository_layout()
 }
 
-async fn daemon() -> Result<crate::daemon_client::DaemonClient> {
-    crate::daemon_client::DaemonClient::try_connect()
-        .await
-        .context(
-            "no Kin daemon is reachable. Repository authority and every view derived from it live in the daemon, so a transfer must run there.",
-        )
+/// The daemon a transfer runs in.
+///
+/// Repository authority and every view derived from it live in the daemon, so
+/// the negotiation happens there rather than here, through the CLI's ordinary
+/// resolution. This wrapper carries one thing the shared connector cannot:
+/// `command` is the surface the operator typed, so a refusal names `kin push`
+/// or `kin pull` rather than a generic transfer, and there are three of them.
+///
+/// The old path was not resolution at all. It read `KIN_DAEMON_URL`, found
+/// nothing when it was unset, and reported "no Kin daemon is reachable" over a
+/// daemon that was serving and that `kin doctor` named in the same second
+/// (FIR-2936).
+async fn daemon(command: &str, layout: &KinLayout) -> Result<crate::daemon_client::DaemonClient> {
+    crate::daemon_client::DaemonClient::connect_for_command(command, layout).await
 }
 
 fn build_request(
@@ -261,7 +269,10 @@ pub async fn push(
     let layout = layout()?;
     let peer = resolve_peer(&layout, remote.as_deref(), url.as_deref())?;
     let request = build_request(peer, reference.as_deref(), None)?;
-    let response = daemon().await?.command_push(&request).await?;
+    let response = daemon("kin push", &layout)
+        .await?
+        .command_push(&request)
+        .await?;
     render_outcome(&response, json)
 }
 
@@ -274,7 +285,10 @@ pub async fn pull(
     let layout = layout()?;
     let peer = resolve_peer(&layout, remote.as_deref(), url.as_deref())?;
     let request = build_request(peer, reference.as_deref(), None)?;
-    let response = daemon().await?.command_pull(&request).await?;
+    let response = daemon("kin pull", &layout)
+        .await?
+        .command_pull(&request)
+        .await?;
     render_outcome(&response, json)
 }
 
@@ -287,7 +301,10 @@ pub async fn plan_push(
     let layout = layout()?;
     let peer = resolve_peer(&layout, remote.as_deref(), url.as_deref())?;
     let request = build_request(peer, reference.as_deref(), None)?;
-    let plan = daemon().await?.command_transfer_plan(&request).await?;
+    let plan = daemon("kin remote plan-push", &layout)
+        .await?
+        .command_transfer_plan(&request)
+        .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());

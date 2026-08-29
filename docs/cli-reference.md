@@ -1758,6 +1758,25 @@ kin auth login [options]
 | --- | --- | --- |
 | `--base-url <base-url>` |  | Override the KinLab base URL |
 | `--no-browser` |  | Print a browser URL and exchange a one-time code manually |
+| `--provider <google\|github>` | `google` | Which identity provider to sign in with |
+
+Sign in with GitHub if you have a GitHub account, which is the path most people
+here already have:
+
+```sh
+kin auth login --provider github
+```
+
+`--provider` decides which sign-in page the browser lands on. The default is
+`google`, which is where every login went before there was a choice, so an
+invocation that names no provider behaves the way it did before. A provider this
+deployment holds no credentials for sends the browser to the sign-in page with
+`authError=provider-unavailable` rather than to that provider.
+
+`kin auth status` and `kin doctor` report the provider a stored credential asked
+for, worded that way on purpose: the token exchange carries no provider back, so
+what either surface knows is what the login requested. A credential minted before
+`--provider` existed names none, and both say nothing rather than guessing.
 
 #### `kin auth logout`
 

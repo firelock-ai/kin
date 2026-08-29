@@ -461,6 +461,43 @@ the all-present shape, which must pass, and a factor that kept one clause and
 dropped the rest, which must fail. Both worlds pass, and the shipped shape fails
 in both.
 
+`bridge_reach_repro.py` covers the two surfaces the 2026-08-29 bridge walk found
+dead on both shipped versions. `kin push`, `kin pull` and `kin remote plan-push`
+died in 0.03 s saying "no Kin daemon is reachable" while a daemon served that
+exact repository and `kin doctor` printed its port in the same second, because
+`try_connect` read `KIN_DAEMON_URL` and did no discovery, and nothing in the
+product sets that variable (FIR-2936). Separately, `kin auth login` sent every
+terminal user to Google on the night the GitHub sign-in shipped, because the CLI
+never sent the `provider` parameter KinLab's `/auth/login` has read for as long
+as it has had more than one (FIR-2938).
+
+Check 0 runs `kin push` against a peer that cannot answer with `KIN_DAEMON_URL`
+unset, and grades three things at once, because any one alone passes on a build
+that merely fails differently: the retired sentence is absent, `kin daemon
+status` confirms a daemon is serving in the same run, and the failure names the
+peer, which is the only way to show the command reached the transfer rather than
+the gate. Checks 1 and 2 grade the two refusals daemon resolution can produce,
+and they are the pair that reads alike from outside: autostart off with nothing
+serving must name `KIN_NO_DAEMON`, the repository and the word that undoes it,
+while an override aimed at a dead endpoint must name `KIN_DAEMON_URL`, the
+endpoint and its own remedy. The self-test drives each refusal against the
+OTHER's requirements and requires it to fail them, so a build that printed one
+sentence for both states cannot satisfy both checks. Check 1 is also the arm no
+build reading only `KIN_DAEMON_URL` can pass, since the variable is unset there,
+which is the input the old gate answered `None` for.
+
+Checks 3 to 5 drive `kin auth login --no-browser` against a stub that plays
+`/api/cli/auth/start`, returns the parameters the real `startCliFlow` returns and
+records what it was asked. The stub is the point: a suite that reached kinlab.ai
+would grade a deployment's provider configuration on every pull request and would
+go red on a network nobody changed, so this grades what the CLI SENDS. Check 3
+requires `--provider github` to reach the printed sign-in URL exactly once with
+every flow parameter intact, check 4 is the compatibility control requiring a
+login that names no provider to still ask for Google, and check 5 requires an
+unknown provider to be refused with the valid names printed and, the assertion
+that matters, with the stub recording zero requests, since a refusal that reaches
+the sign-in page comes back only as a redirect no terminal shows.
+
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no
 corpus. Each case is paired with its inverse, so a grader that cannot tell its
@@ -506,6 +543,10 @@ python3 scripts/acceptance/verdict_limits_repro.py \
 python3 scripts/acceptance/working_copy_freshness_repro.py \
   --kin target/release/kin --daemon target/release/kin-daemon \
   --json acceptance/working_copy_freshness.json --verbose
+
+python3 scripts/acceptance/bridge_reach_repro.py \
+  --kin target/release/kin \
+  --json acceptance/bridge_reach.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer

@@ -22,6 +22,50 @@ use url::Url;
 const DEFAULT_BASE_URL: &str = "https://kinlab.ai";
 const KEYRING_SERVICE: &str = "kinlab";
 
+/// Which identity provider `kin auth login` sends the browser to.
+///
+/// KinLab's `/auth/login` route has read a `provider` parameter for as long as
+/// it has had more than one, defaulting to Google when none is given, and the
+/// web sign-in page offers both. The CLI sent no parameter at all, so every
+/// terminal user reached Google and the GitHub sign-in was unreachable from
+/// the surface its users live in (FIR-2938).
+///
+/// The set is closed here rather than fetched, so a name the CLI cannot send
+/// is refused before any network call with the valid ones printed beside it.
+/// The server owns the other half: a provider it has not configured redirects
+/// to the sign-in page carrying `authError=provider-unavailable`.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthProvider {
+    /// Google sign-in. The default, and what every login did before there was
+    /// a choice, so an operator who passes nothing keeps the behaviour they
+    /// had.
+    #[default]
+    Google,
+    /// GitHub sign-in.
+    Github,
+}
+
+impl AuthProvider {
+    /// The wire name, which is what `/auth/login?provider=` expects.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AuthProvider::Google => "google",
+            AuthProvider::Github => "github",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredCredential {
     base_url: String,
@@ -29,6 +73,15 @@ struct StoredCredential {
     expires_at: String,
     user_email: String,
     user_display_name: String,
+    /// The provider the login that minted this credential asked for.
+    ///
+    /// What the CLI requested, not what the browser ultimately used: the
+    /// exchange response carries no provider, so this is the strongest claim
+    /// the client can make and the doctor row words it that way. Optional
+    /// because every credential stored before this field existed has none, and
+    /// a missing provider is reported as unknown rather than as Google.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider: Option<String>,
 }
 
 fn normalized_base_url(base_url: Option<String>) -> String {
@@ -474,7 +527,11 @@ pub(crate) fn default_cli_actor_id(base_url: &str) -> String {
     )
 }
 
-pub async fn login(base_url: Option<String>, no_browser: bool) -> Result<()> {
+pub async fn login(
+    base_url: Option<String>,
+    no_browser: bool,
+    provider: AuthProvider,
+) -> Result<()> {
     let base_url = normalized_base_url(base_url);
     let client = reqwest::Client::new();
     let code_verifier = random_token(32);
@@ -505,6 +562,8 @@ pub async fn login(base_url: Option<String>, no_browser: bool) -> Result<()> {
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("cli auth start response missing authorizationUrl"))?
         .to_string();
+    let authorization_url = with_provider(&authorization_url, provider)
+        .context("cli auth start returned an authorizationUrl that is not a URL")?;
 
     if no_browser {
         println!(
@@ -557,13 +616,68 @@ pub async fn login(base_url: Option<String>, no_browser: bool) -> Result<()> {
             .as_str()
             .unwrap_or_default()
             .to_string(),
+        provider: Some(provider.as_str().to_string()),
     };
     store_credential(&base_url, &credential)?;
     println!(
-        "Logged into {} as {} (expires {}).",
-        base_url, credential.user_email, credential.expires_at
+        "Logged into {} as {} through {} sign-in (expires {}).",
+        base_url,
+        credential.user_email,
+        provider.as_str(),
+        credential.expires_at
     );
     Ok(())
+}
+
+/// Ask the KinLab sign-in page for one provider, replacing any it already
+/// names.
+///
+/// The parameter goes on the URL the server handed back rather than into the
+/// `/api/cli/auth/start` body, because the body is not where it would land.
+/// `startCliFlow` builds that URL from `flowId`, `redirect_uri`,
+/// `code_challenge` and `state` and forwards nothing else, so a `provider`
+/// posted to it is dropped without a word and the CLI would report a choice it
+/// never made. `/auth/login` is the surface that owns provider selection, and
+/// sending the parameter there works against production today with no server
+/// change.
+///
+/// Replacing rather than appending is the part worth keeping: the day the
+/// server does put a provider on that URL, an append would leave two and the
+/// winner would be whichever the query parser reached first.
+fn with_provider(authorization_url: &str, provider: AuthProvider) -> Result<String> {
+    let mut url = Url::parse(authorization_url)?;
+    let kept: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(key, _)| key != "provider")
+        .map(|(key, value)| (key.into_owned(), value.into_owned()))
+        .collect();
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.clear();
+        for (key, value) in &kept {
+            pairs.append_pair(key, value);
+        }
+        pairs.append_pair("provider", provider.as_str());
+    }
+    Ok(url.to_string())
+}
+
+/// The provider a stored credential records, when it can be read with no
+/// prompt.
+///
+/// Reads only the plaintext fallback file, the same source and the same
+/// no-prompt rule as [`has_stored_credential`]: a `get_password` call can raise
+/// an interactive Keychain dialog on macOS and an encrypted credential needs a
+/// passphrase, and `kin doctor` must never block on either. So this answers
+/// `None` for a credential it could not read as well as for one that predates
+/// the field, and the caller says nothing rather than guessing Google.
+pub(crate) fn stored_credential_provider(base_url: &str) -> Option<String> {
+    let plaintext_path = fallback_credential_probe_path(base_url)
+        .ok()?
+        .with_extension("json");
+    let bytes = fs::read(plaintext_path).ok()?;
+    let credential: StoredCredential = serde_json::from_slice(&bytes).ok()?;
+    credential.provider.filter(|value| !value.trim().is_empty())
 }
 
 pub async fn status(base_url: Option<String>) -> Result<()> {
@@ -573,6 +687,19 @@ pub async fn status(base_url: Option<String>) -> Result<()> {
             println!("KinLab auth is configured for {}.", base_url);
             println!("  User:    {}", credential.user_email);
             println!("  Expires: {}", credential.expires_at);
+            // Printed only when the credential records one. The exchange
+            // response carries no provider, so "requested at login" is the
+            // strongest claim this surface can make, and a credential written
+            // before `--provider` existed says nothing rather than reading as
+            // Google to someone who signed in with GitHub.
+            if let Some(provider) = credential
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                println!("  Sign-in: {} (requested at login)", provider);
+            }
         }
         None => {
             println!("No KinLab auth credential stored for {}.", base_url);
@@ -647,6 +774,7 @@ mod tests {
             expires_at: "2026-03-21T00:00:00Z".to_string(),
             user_email: "troy@firelock.ai".to_string(),
             user_display_name: "Troy Fortin".to_string(),
+            provider: None,
         })
         .unwrap();
 
@@ -700,6 +828,115 @@ mod tests {
         assert_eq!(
             absent_state(false),
             HostedCredentialState::AbsentKeyringNotRead
+        );
+    }
+
+    /// The wire names are the contract with `/auth/login?provider=`. A typo
+    /// here reaches the sign-in page as an unconfigured provider and comes
+    /// back as a redirect nobody reads.
+    #[test]
+    fn the_provider_wire_names_are_what_the_login_route_reads() {
+        assert_eq!(AuthProvider::Google.as_str(), "google");
+        assert_eq!(AuthProvider::Github.as_str(), "github");
+        assert_eq!(AuthProvider::default(), AuthProvider::Google);
+    }
+
+    /// The flow parameters the server put on that URL are the flow. Losing one
+    /// while adding the provider would trade a Google-only login for a broken
+    /// one, so they are asserted by value rather than by count.
+    #[test]
+    fn asking_for_a_provider_keeps_every_parameter_the_flow_needs() {
+        let composed = with_provider(
+            "https://kinlab.ai/auth/login?flowId=abc123&code_challenge=xyz789",
+            AuthProvider::Github,
+        )
+        .expect("the server hands back a URL");
+        let parsed = Url::parse(&composed).expect("the composed value is still a URL");
+        let pairs: Vec<(String, String)> = parsed
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("flowId".to_string(), "abc123".to_string()),
+                ("code_challenge".to_string(), "xyz789".to_string()),
+                ("provider".to_string(), "github".to_string()),
+            ],
+            "composed {composed}"
+        );
+        assert_eq!(parsed.path(), "/auth/login", "composed {composed}");
+    }
+
+    /// Set, not append. The day the server starts naming a provider on that
+    /// URL itself, an append leaves two and the winner is whichever the query
+    /// parser reaches first, which is not a thing the CLI gets to decide.
+    #[test]
+    fn asking_for_a_provider_replaces_one_the_server_already_named() {
+        let composed = with_provider(
+            "https://kinlab.ai/auth/login?flowId=abc123&provider=google",
+            AuthProvider::Github,
+        )
+        .expect("the server hands back a URL");
+        let parsed = Url::parse(&composed).expect("the composed value is still a URL");
+        let providers: Vec<String> = parsed
+            .query_pairs()
+            .filter(|(key, _)| key == "provider")
+            .map(|(_, value)| value.into_owned())
+            .collect();
+        assert_eq!(providers, vec!["github".to_string()], "composed {composed}");
+    }
+
+    /// The default is the behaviour every login had before there was a choice,
+    /// so it has to survive the flag existing. `/auth/login` defaults to Google
+    /// on its own, and this asserts the CLI says so rather than relying on it.
+    #[test]
+    fn the_default_provider_is_the_google_login_that_shipped() {
+        let composed = with_provider(
+            "https://kinlab.ai/auth/login?flowId=abc123",
+            AuthProvider::default(),
+        )
+        .expect("the server hands back a URL");
+        assert!(composed.contains("provider=google"), "composed {composed}");
+    }
+
+    /// A credential written before `--provider` existed carries no provider,
+    /// and the doctor row must read that as unknown rather than as Google.
+    #[test]
+    #[serial]
+    fn a_credential_stored_before_providers_existed_names_none() {
+        let base_url = "https://kinlab.example.com";
+        let store = tempfile::tempdir().expect("a private credential store");
+        let _root = TestCredentialRoot::set(&store.path().join("auth"));
+        let path = fallback_credential_path(base_url)
+            .unwrap()
+            .with_extension("json");
+
+        let legacy = serde_json::json!({
+            "base_url": base_url,
+            "token": "token",
+            "expires_at": "2026-03-21T00:00:00Z",
+            "user_email": "troy@firelock.ai",
+            "user_display_name": "Troy Fortin",
+        });
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        assert_eq!(stored_credential_provider(base_url), None);
+
+        // The positive control: the same reader must find one that is there,
+        // or the None above would be a reader that never works.
+        let stamped = serde_json::to_vec(&StoredCredential {
+            base_url: base_url.to_string(),
+            token: "token".to_string(),
+            expires_at: "2026-03-21T00:00:00Z".to_string(),
+            user_email: "troy@firelock.ai".to_string(),
+            user_display_name: "Troy Fortin".to_string(),
+            provider: Some("github".to_string()),
+        })
+        .unwrap();
+        fs::write(&path, stamped).unwrap();
+        assert_eq!(
+            stored_credential_provider(base_url),
+            Some("github".to_string())
         );
     }
 }
