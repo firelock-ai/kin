@@ -20913,6 +20913,37 @@ mod tests {
         )
     }
 
+    /// A hosted daemon with nothing published refuses the read rather than
+    /// answering an empty one (FIR-2924).
+    ///
+    /// This is a deliberate behaviour change, pinned here rather than left
+    /// incidental. `repository_authority_snapshot` reached this case through
+    /// `RepositoryAuthorityManager::open`, which mints an empty
+    /// generation-zero authority when storage holds no snapshot, so the route
+    /// answered 200 carrying no files. Reading the generation cache instead
+    /// finds the entry the daemon started with, which carries no envelope, and
+    /// refuses by name. The crate already prefers that refusal:
+    /// `hosted_daemon_refuses_a_backend_snapshot_carrying_no_authority_envelope`
+    /// exists to say a 200 carrying no refs is where a refusal belongs.
+    #[tokio::test]
+    async fn a_hosted_repository_with_no_publication_refuses_rather_than_answering_empty() {
+        let repo_id = format!("hostedperf-unpublished-{}", Uuid::new_v4());
+        let (state, _working, _storage) = replica_state(&repo_id);
+
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/files")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FAILED_DEPENDENCY,
+            "an unpublished hosted repository must refuse, not answer empty: {message}"
+        );
+        assert!(
+            message.contains("authority envelope"),
+            "the refusal must name the missing envelope: {message}"
+        );
+    }
+
     /// A publication that moves the generation is not answered from the tree
     /// resolved before it (FIR-2924).
     ///
@@ -20936,6 +20967,15 @@ mod tests {
             "publish the first generation",
             &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
         );
+
+        // Put this test on the state the ticket is about: a daemon that has
+        // already loaded a generation and is serving repeated reads against it.
+        // `replica_state` opens against an EMPTY backend, so the entry the
+        // daemon starts with carries no envelope and no cursor, and a read that
+        // reaches it refuses for a missing envelope rather than for staleness.
+        // Without this line a mutation of the currency check is caught one step
+        // early by that refusal, and the assertion below never runs.
+        state.evict_repo_cache_for_test(&repo_id).await;
 
         let before = repo_file_paths(Arc::clone(&state), &repo_id).await;
         assert_eq!(
@@ -20991,6 +21031,15 @@ mod tests {
             &[("only_symbol", "src/only.rs", "fn only_symbol() {}\n")],
         );
 
+        // Put this test on the state the ticket is about: a daemon that has
+        // already loaded a generation and is serving repeated reads against it.
+        // `replica_state` opens against an EMPTY backend, so the entry the
+        // daemon starts with carries no envelope and no cursor, and a read that
+        // reaches it refuses for a missing envelope rather than for staleness.
+        // Without this line a mutation of the currency check is caught one step
+        // early by that refusal, and the assertion below never runs.
+        state.evict_repo_cache_for_test(&repo_id).await;
+
         let first = repo_file_paths(Arc::clone(&state), &repo_id).await;
         let (hits_after_first, misses_after_first) = read_cache_counts(&state);
         assert_eq!(
@@ -21038,6 +21087,15 @@ mod tests {
             "publish the head the file listing reads",
             &[("head_symbol", "src/head.rs", "fn head_symbol() {}\n")],
         );
+
+        // Put this test on the state the ticket is about: a daemon that has
+        // already loaded a generation and is serving repeated reads against it.
+        // `replica_state` opens against an EMPTY backend, so the entry the
+        // daemon starts with carries no envelope and no cursor, and a read that
+        // reaches it refuses for a missing envelope rather than for staleness.
+        // Without this line a mutation of the currency check is caught one step
+        // early by that refusal, and the assertion below never runs.
+        state.evict_repo_cache_for_test(&repo_id).await;
 
         let head_paths = repo_file_paths(Arc::clone(&state), &repo_id).await;
         assert_eq!(
