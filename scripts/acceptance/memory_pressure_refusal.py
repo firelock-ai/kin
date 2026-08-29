@@ -309,6 +309,59 @@ def settle_descendants(read, attempts=20, gap=0.5, sleep_fn=time.sleep):
     return None
 
 
+def contemporaneous_reading(read_tree, read_standing, now, sleep_fn=time.sleep,
+                            attempts=10, gap=6.0):
+    """A published standing minted between two equal descendant readings.
+
+    Returns `(standing, tree)`, or None when the bound is spent.
+
+    Check 12 settled the TREE and then graded it against a standing that was
+    already on disk, and settling one of two readings does not make the pair
+    contemporaneous. `DaemonFootprint` is republished on the daemon's own
+    cadence, at most once every thirty seconds, so the record can be that old
+    while the tree is freshly quiet. Every `drifted` refusal this check has
+    reported is that gap, and it took two of ten acceptance runs on main red
+    while saying nothing about the product.
+
+    The record cannot be demanded, only waited for, so contemporaneity is proven
+    by bracketing: read the tree, wait for a record whose `at_unix` is strictly
+    later than that reading, read the tree again, and require the two readings
+    to agree. A record minted between two equal readings was minted while the
+    tree held that value. Strictly later because `at_unix` is unix SECONDS: a
+    record stamped in the same second as the first reading could have been
+    minted just before it.
+
+    The bound is chosen against the republish cadence rather than picked: ten
+    attempts of a six second gap give the daemon four chances at a thirty second
+    cadence, and each bracket reading is itself a bounded settle, so the whole
+    thing is capped near two minutes on a store that never quiets. This job
+    measured twenty-nine minutes against a sixty minute timeout, so that tail is
+    affordable; a bound that could run for five would not be.
+
+    Pure over its four injected callables, because `check_12` returns UNREADABLE
+    off Linux and can never run on a developer's Mac, so the reading protocol
+    has to be falsifiable without a daemon.
+    """
+    for _ in range(max(attempts, 1)):
+        before = read_tree()
+        # A reading that never settles is not a reading. Skipping rather than
+        # comparing is the point: two unsettled reads are both None, and None
+        # equals None, so a bracket that did not guard this would report
+        # perfect agreement on a tree that never stopped moving.
+        if before is None:
+            sleep_fn(gap)
+            continue
+        marked = int(now())
+        sleep_fn(gap)
+        standing = read_standing() or {}
+        at_unix = standing.get("at_unix")
+        if not isinstance(at_unix, int) or at_unix <= marked:
+            continue
+        if read_tree() == before:
+            return standing, before
+    return None
+
+
 def thread_count(pid):
     """How many threads `pid` runs, out of `/proc/<pid>/status`.
 
@@ -734,6 +787,7 @@ GRADERS = {
     "enrichment_names_a_kill": enrichment_names_a_kill,
     "row_reports_a_kill": row_reports_a_kill,
     "footprint_child_verdict": footprint_child_verdict,
+    "contemporaneous_reading": contemporaneous_reading,
     "mcp_memory_pressure_state": mcp_memory_pressure_state,
     "mcp_memory_pressure_flag": mcp_memory_pressure_flag,
     "resources_received_session": resources_received_session,
@@ -2237,26 +2291,30 @@ def check_12(suite):
         result.unknown("no daemon pid for %s: standing=%s" % (repo, json.dumps(published)))
         return result
 
-    footprint = published.get("footprint") or {}
-    child_count = footprint.get("child_count")
     threads = thread_count(pid)
 
-    # Settled, because a daemon holds short-lived children during a sweep and a
-    # single pair taken half a second apart lands exactly in that churn, which
-    # is how this check refused on its first hosted run (4 then 1). The claim
-    # is bound to a quiet tree: two consecutive equal reads, bounded, and a
-    # tree that never quiets is reported, never averaged away.
-    trail = []
-    after = settle_descendants(
-        lambda: trail.append(descendants_of(pid)) or trail[-1]
+    # A record and a tree from ONE instant, or nothing. Settling the tree alone
+    # left the record up to a republish cadence old, and the resulting
+    # `drifted` refusal is what took this check red on two of ten acceptance
+    # runs on main without saying anything about the product. The bracket is
+    # the proof: a standing minted between two equal descendant readings was
+    # minted while the tree held that value.
+    paired = contemporaneous_reading(
+        lambda: settle_descendants(lambda: descendants_of(pid), attempts=6),
+        lambda: suite.read_published_footprint(repo),
+        time.time,
     )
-    if after is None:
+    if paired is None:
         result.unknown(
-            "the daemon's child processes changed under the reading (%s), so the "
-            "published count and this one describe different trees"
-            % " then ".join(str(len(t)) for t in trail)
+            "no standing was published between two equal readings of this daemon's "
+            "child processes inside the bound, so every record available here "
+            "describes a different instant from the tree it would be graded "
+            "against, and the two are not compared"
         )
         return result
+    published, after = paired
+    footprint = published.get("footprint") or {}
+    child_count = footprint.get("child_count")
     if threads is None or child_count is None:
         result.unknown(
             "could not read both numbers: threads=%s published child_count=%s standing=%s"
@@ -2985,6 +3043,50 @@ def self_test():
             failures.append("settle_descendants(%s case) = %s, wanted %s"
                             % (name, got, want))
 
+    # FIR-2823 again, the contemporaneity rule. Pure over four injected
+    # callables, because check 12 returns UNREADABLE off Linux and its body
+    # never runs on a developer's Mac: this table is the only place the reading
+    # protocol can be graded at all.
+    def _scripted(sequence):
+        items = list(sequence)
+        return lambda: items.pop(0) if len(items) > 1 else items[0]
+
+    _quiet = lambda _seconds: None
+    fresh = {"at_unix": 100, "footprint": {"child_count": 0}}
+    pair_cases = [
+        # a record minted after the first reading, between two equal readings.
+        ((fresh, [7]), [[7], [7]], [fresh], [50], 3, "fresh between equal reads"),
+        # the drifted case that took main red: the record predates the reading.
+        (None, [[7], [7]], [{"at_unix": 40}], [50], 3, "record older than the read"),
+        # at_unix has one-second resolution, so the same second is ambiguous.
+        (None, [[7], [7]], [{"at_unix": 50}], [50], 3, "record in the read's own second"),
+        # a fresh record whose brackets disagree is a tree that moved under it.
+        (None, [[7], [7, 8], [7], [7, 8]], [fresh], [50], 2, "tree moved under the record"),
+        # the daemon republishes late, which is the case the retry exists for
+        # and the one a single settle can never reach.
+        (({"at_unix": 100}, [3]), [[3], [3], [3], [3]],
+         [{"at_unix": 40}, {"at_unix": 100}], [50, 50], 3, "republished on the retry"),
+        # a record that is absent or malformed is refused, never defaulted.
+        (None, [[1], [1]], [None], [50], 2, "absent record"),
+        (None, [[1], [1]], [{"footprint": {}}], [50], 2, "record with no at_unix"),
+        (None, [[1], [1]], [{"at_unix": "100"}], [50], 2, "at_unix not an integer"),
+        # the bound shrunk to zero still makes one pass, so a zero bound reports
+        # the grading refusal rather than crashing, and cannot reach a retry.
+        (({"at_unix": 100}, [7]), [[7], [7]], [{"at_unix": 100}], [50], 0,
+         "zero bound still makes one pass"),
+        (None, [[3], [3], [3], [3]], [{"at_unix": 40}, {"at_unix": 100}], [50, 50], 0,
+         "zero bound cannot reach a retry"),
+        # a tree that never settles reads None, and two Nones are not agreement.
+        (None, [None], [fresh], [50], 3, "tree that never settles"),
+    ]
+    for want, trees, standings, clock, attempts, name in pair_cases:
+        got = contemporaneous_reading(
+            _scripted(trees), _scripted(standings), _scripted(clock),
+            sleep_fn=_quiet, attempts=attempts, gap=0)
+        if got != want:
+            failures.append("contemporaneous_reading(%s case) = %r, wanted %r"
+                            % (name, got, want))
+
     grade_cases = [
         (PASS, [(PASS, "a")]),
         (FAIL, [(PASS, "a"), (FAIL, "b")]),
@@ -3009,7 +3111,7 @@ def self_test():
              + len(kill_row_cases) + len(warning_cases) + len(line_cases)
              + len(tail_cases) + len(grade_cases)
              + len(proportional_cases) + len(charge_cases)
-             + len(child_cases) + len(settle_cases))
+             + len(child_cases) + len(settle_cases) + len(pair_cases))
     print("kin-memory-pressure-repro: self-test %d/%d cases"
           % (total - len(failures), total))
     return 1 if failures else 0
