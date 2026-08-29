@@ -42,6 +42,7 @@ pub mod history;
 pub mod impact;
 pub mod init;
 pub mod intent;
+pub mod language_server_release;
 pub mod language_servers;
 pub mod languages;
 pub mod locate;
