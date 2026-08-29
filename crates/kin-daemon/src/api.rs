@@ -42492,9 +42492,32 @@ mod tests {
             "the serve path must refuse an administrator token equal to the daemon token; it \
              served instead",
         );
+        let error = outcome.expect_err(
+            "the serve path must refuse the pairing rather than serve; it returned instead",
+        );
         assert!(
-            outcome.as_ref().err().is_some_and(|error| error.is_panic()),
-            "the serve path must refuse the pairing by panicking, and it returned instead"
+            error.is_panic(),
+            "the serve path must refuse by panicking, and the task ended some other way"
+        );
+        // The MESSAGE, not merely that something panicked. Any panic anywhere
+        // inside `serve_bound_with_shutdown` satisfies `is_panic`, so on its own
+        // this arm cannot tell the distinctness guard from an unrelated failure:
+        // rewording the guard would leave it green while the wrapper arm reds.
+        // Downcast the join payload the way the wrapper arm downcasts its
+        // `catch_unwind` payload, and assert the same exact string.
+        let payload = error.into_panic();
+        let message = payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+            .unwrap_or_default();
+        assert!(
+            message.contains(
+                "hosted graph publication control administrator authentication must not be any \
+                 token this daemon accepts, the superseded one included"
+            ),
+            "the serve path must reach the router's distinctness guard rather than panic \
+             somewhere else; got {message}"
         );
     }
 
