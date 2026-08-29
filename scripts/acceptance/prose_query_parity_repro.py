@@ -8,14 +8,19 @@ FIR-2918. `kin locate` has no daemonless arm: `capture` refuses
 `KIN_LOCATE_FORCE_LOCAL` outright and every query goes to `POST /locate` on a
 daemon, auto-starting one when none is up. So the two readings this ticket was
 filed on are not two code paths. They are one path against two daemon states,
-and the discriminator is which daemon process answers: the one `kin init` left
-running, or the one the next command starts after `kin daemon stop`.
+and the discriminator is which daemon process answers.
 
-That distinction is the whole finding. A stranger installs Kin, runs `kin init`,
-commits some code and asks an English question, and the daemon answering is the
-one `kin init` left behind. If a prose-only term retrieves nothing there and
-retrieves its file after a restart, the product told that stranger their code
-does not mention something it does mention, and said nothing about why.
+`kin init` stops the daemon its conversion phase started unless it borrowed a
+live one (`stop_conversion_daemon` in crates/kin-cli/src/commands/init.rs), so
+the long-lived process here is the one the first `kin commit` auto-starts, and it
+stays up through every later commit. That is the daemon a stranger's first
+English question reaches. The other state is a daemon opened after the content
+already exists, which is what `kin daemon stop` plus one more command produces.
+
+That distinction is the whole finding. If a prose-only term retrieves nothing
+through the daemon that was live while the code was ingested, and retrieves its
+file through one opened afterwards, the product told a stranger their code does
+not mention something it does mention, and said nothing about why.
 
 Two checks, and the second is underneath the first.
 
@@ -478,7 +483,7 @@ class Suite(object):
             # Past both flush intervals, so a divergence here is a state and not
             # a race the daemon closes on its own a second later.
             time.sleep(SETTLE_SECONDS)
-            warm = self.read_arm("the daemon kin init left running")
+            warm = self.read_arm("the daemon that was live while the fixture was ingested")
             if born is None or warm["pid"] is None or born != warm["pid"]:
                 raise ProbeError(
                     "the daemon serving this repository changed from pid %r to pid %r across "
@@ -488,7 +493,7 @@ class Suite(object):
             rc, out, err = self.run(["daemon", "stop"])
             if rc != 0:
                 raise ProbeError("kin daemon stop exited %d: %s" % (rc, tail(err or out)))
-            cold = self.read_arm("a daemon started after kin daemon stop")
+            cold = self.read_arm("a daemon opened after the fixture already existed")
             if cold["pid"] is None or cold["pid"] == warm["pid"]:
                 raise ProbeError(
                     "the second arm is served by pid %r, the same process as the first, so "
