@@ -16773,12 +16773,8 @@ pub async fn serve_bound_with_shutdown(
         // belief look correct until the moment traffic is dropped.
         std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
     })?;
-    let app = router_with_rotation_tokens(
-        state,
-        tokens,
-        publication_control_auth_token,
-        shutdown_tx,
-    );
+    let app =
+        router_with_rotation_tokens(state, tokens, publication_control_auth_token, shutdown_tx);
     let port = listener
         .local_addr()
         .map(|addr| addr.port())
