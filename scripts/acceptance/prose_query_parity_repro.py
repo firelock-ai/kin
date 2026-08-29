@@ -27,10 +27,12 @@ Two checks, and the second is underneath the first.
   `prose_parity` asks the behaviour question. One term that lives only in a
   docstring, asked through both daemon states, has to come back with the same
   files. Two controls decide whether the arm graded anything at all: a symbol
-  the fixture defines must retrieve in both states, or the fixture was never
-  ingested and an agreement at zero is agreement about nothing; and a fabricated
-  term must retrieve in neither, or the row counter is counting something other
-  than rows.
+  the fixture defines must come back as a NAMED match in both states, or the
+  fixture was never ingested and an agreement at zero is agreement about
+  nothing; and a fabricated term must name nothing in either, which is the shape
+  the product actually has. It is not that a fabricated term retrieves nothing:
+  measured here, it retrieves one row against a populated index, so a control
+  written the obvious way could never have fired.
 
   `lexical_index_parity` asks the mechanism question the behaviour rests on.
   `kin support --json` is served by the daemon out of its own live graph, so
@@ -60,7 +62,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 TICKET = "FIR-2918"
 PASS = "PASS"
@@ -86,14 +87,9 @@ SYMBOL_QUERY = "describe_layers"
 # that is not a result row.
 ABSENT_QUERY = "zzqxnotawordanywhere"
 
-# How long to wait for the daemon `kin init` left to be answering before the
-# first arm reads it. The daemon's own background persistence flushes on an
-# idle interval (KIN_DAEMON_IDLE_FLUSH_SECS, default 2s) and a periodic one
-# (KIN_DAEMON_PERIODIC_FLUSH_SECS, default 30s), so a wait comfortably past both
-# means arm A is not measuring a race the product would win on its own a moment
-# later. If the divergence survives this wait it is a state the product stays
-# in, not a window it passes through.
-SETTLE_SECONDS = int(os.environ.get("KIN_PROSE_PARITY_SETTLE_SECS", "40"))
+# The file the prose query must retrieve, named once so a fixture rename cannot
+# leave the assertion pointing at nothing.
+PROSE_FILE = "pkg/overview.py"
 
 
 print_ = print
@@ -179,11 +175,6 @@ def describe_layers():
     return "reading, holding, traversal"
 '''
 
-# The file the prose query must retrieve, named once so a fixture rename cannot
-# leave the assertion pointing at nothing.
-PROSE_FILE = "pkg/overview.py"
-
-
 # ------------------------------------------------------------------- graders
 #
 # Pure, so `--self-test` can falsify each one with no daemon, no repository and
@@ -213,6 +204,27 @@ def locate_paths(payload):
             return None
         paths.append(path)
     return paths
+
+
+def locate_all_fallback(payload):
+    """Did the whole ranking come back without one entity the query named?
+
+    `LocateResult::all_fallback` is the one field that separates "this query
+    found something" from "retrieval returned its best guesses". It is what makes
+    the fabricated control able to fail: measured on this fixture, a term that
+    appears nowhere still retrieves one row once the index is populated, so
+    "a fabricated term retrieves nothing" is false about this product and a
+    control resting on it could never fire.
+
+    None for a payload that is not a locate result, so an unreadable answer is
+    UNREADABLE rather than a confident false.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if "files" not in payload:
+        return None
+    value = payload.get("all_fallback", False)
+    return value if isinstance(value, bool) else None
 
 
 def text_index_gap_reported(payload):
@@ -358,6 +370,22 @@ class Suite(object):
         # this whole suite passes for the wrong reason. Held open well past the
         # settle, and the pid is asserted either way.
         self.env["KIN_DAEMON_IDLE_TIMEOUT_SECS"] = "900"
+        # Hold the daemon's background index flush off, and this is the line that
+        # decides whether this suite can fail at all.
+        #
+        # The lexical index is staged on write and committed by
+        # `InMemoryGraph::flush_text_index`, which in a live daemon only the
+        # background persistence loop calls, 2s after the last mutation or every
+        # 30s (crates/kin-daemon/src/daemon.rs). Measured on
+        # kin 0.6.1 (ff18884e3) with the default cadence: 0 of 17 entities
+        # indexed at the moment the first query arrives, 17 of 17 sixty seconds
+        # later, on one unchanged daemon process. So the divergence is a race the
+        # daemon usually wins, and a suite that waits for it grades nothing.
+        # With both intervals held past this run, the same measurement reads 0 of
+        # 17 in both readings of that daemon, and a build whose query path makes
+        # the index current answers anyway. Both directions become deterministic.
+        self.env["KIN_DAEMON_IDLE_FLUSH_SECS"] = "86400"
+        self.env["KIN_DAEMON_PERIODIC_FLUSH_SECS"] = "86400"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DAEMON_URL", None)
         if daemon:
@@ -507,19 +535,17 @@ class Suite(object):
             return self._arms
         try:
             self.build()
-            # The daemon the fixture was ingested through, named before the
-            # settle so the arm below can prove it is the same process.
+            # The daemon the fixture was ingested through, named before the arm
+            # so it can be shown to be the same process that answers it. No wait
+            # here on purpose: a stranger asks their first question seconds after
+            # committing, and that is the moment this suite is about.
             born = self.daemon_pid()
-            # Past both flush intervals, so a divergence here is a state and not
-            # a race the daemon closes on its own a second later.
-            time.sleep(SETTLE_SECONDS)
             warm = self.read_arm("the daemon that was live while the fixture was ingested")
             if born is None or warm["pid"] is None or born != warm["pid"]:
                 raise ProbeError(
-                    "the daemon serving this repository changed from pid %r to pid %r across "
-                    "the %ds settle, so the first arm is a replacement daemon and this run "
-                    "cannot grade the state the ticket is about"
-                    % (born, warm["pid"], SETTLE_SECONDS))
+                    "the daemon serving this repository changed from pid %r to pid %r while the "
+                    "first arm was being read, so that arm is a replacement daemon and this run "
+                    "cannot grade the state the ticket is about" % (born, warm["pid"]))
             rc, out, err = self.run(["daemon", "stop"])
             if rc != 0:
                 raise ProbeError("kin daemon stop exited %d: %s" % (rc, tail(err or out)))
@@ -561,7 +587,10 @@ def check_prose_parity(suite):
 
     warm_symbol = locate_paths(warm["answers"][SYMBOL_QUERY])
     cold_symbol = locate_paths(cold["answers"][SYMBOL_QUERY])
-    if warm_symbol is None or cold_symbol is None:
+    warm_symbol_named = locate_all_fallback(warm["answers"][SYMBOL_QUERY])
+    cold_symbol_named = locate_all_fallback(cold["answers"][SYMBOL_QUERY])
+    if warm_symbol is None or cold_symbol is None or warm_symbol_named is None \
+            or cold_symbol_named is None:
         res.unknown("the symbol control produced an unreadable locate payload, so nothing "
                     "below can be attributed to the product")
         return res
@@ -570,19 +599,33 @@ def check_prose_parity(suite):
                     "the fixture was not ingested and an agreement at zero would be agreement "
                     "about nothing" % (SYMBOL_QUERY, len(warm_symbol), len(cold_symbol)))
         return res
+    if warm_symbol_named or cold_symbol_named:
+        res.unknown("the symbol control %r came back all-fallback (warm %r, cold %r), so this "
+                    "build does not name a symbol it defines and the fabricated control below "
+                    "cannot mean anything" % (SYMBOL_QUERY, warm_symbol_named, cold_symbol_named))
+        return res
 
+    # The fabricated control, and the shape of it is a measurement rather than an
+    # assumption. On this fixture a term that appears nowhere still retrieves one
+    # row once the index is populated, so what it must never do is NAME
+    # something: `all_fallback` has to be true wherever it retrieves at all.
     warm_absent = locate_paths(warm["answers"][ABSENT_QUERY])
     cold_absent = locate_paths(cold["answers"][ABSENT_QUERY])
-    if warm_absent is None or cold_absent is None:
-        res.unknown("the absent control produced an unreadable locate payload")
+    warm_absent_named = locate_all_fallback(warm["answers"][ABSENT_QUERY])
+    cold_absent_named = locate_all_fallback(cold["answers"][ABSENT_QUERY])
+    if warm_absent is None or cold_absent is None or warm_absent_named is None \
+            or cold_absent_named is None:
+        res.unknown("the fabricated control produced an unreadable locate payload")
         return res
-    if warm_absent or cold_absent:
-        res.unknown("the fabricated term %r retrieved %d and %d rows, so the row reader is "
-                    "counting something other than results and no verdict below is safe"
-                    % (ABSENT_QUERY, len(warm_absent), len(cold_absent)))
-        return res
-    res.ok("controls held: %r retrieved %d and %d rows, %r retrieved none in either state"
-           % (SYMBOL_QUERY, len(warm_symbol), len(cold_symbol), ABSENT_QUERY))
+    for label, paths, fallback in (("warm", warm_absent, warm_absent_named),
+                                   ("cold", cold_absent, cold_absent_named)):
+        if paths and not fallback:
+            res.unknown("the fabricated term %r produced a NAMED match on the %s arm (%r), so "
+                        "the fallback reader is not separating a match from a guess and no "
+                        "verdict below is safe" % (ABSENT_QUERY, label, paths))
+            return res
+    res.ok("controls held: %r named a match in both states, %r named one in neither"
+           % (SYMBOL_QUERY, ABSENT_QUERY))
 
     warm_prose = locate_paths(warm["answers"][PROSE_QUERY])
     cold_prose = locate_paths(cold["answers"][PROSE_QUERY])
@@ -684,6 +727,17 @@ def self_test():
          locate_paths({"files": [{"score": 1.0}]}) is None)
     want("a row with an empty path is unreadable",
          locate_paths({"files": [{"path": ""}]}) is None)
+
+    want("a fallback ranking is read as fallback",
+         locate_all_fallback({"files": [], "all_fallback": True}) is True)
+    want("a named match is read as not fallback",
+         locate_all_fallback({"files": [], "all_fallback": False}) is False)
+    want("an omitted all_fallback means a named match, which is how it serializes",
+         locate_all_fallback({"files": []}) is False)
+    want("a payload that is not a locate result is unreadable, not a named match",
+         locate_all_fallback({"all_fallback": True}) is None)
+    want("a non-boolean all_fallback is unreadable",
+         locate_all_fallback({"files": [], "all_fallback": "yes"}) is None)
 
     want("a text_index degradation is recognised",
          text_index_gap_reported(
