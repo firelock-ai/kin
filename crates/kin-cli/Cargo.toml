@@ -99,6 +99,10 @@ kin-core = { workspace = true, features = ["test-support"] }
 kin-git = { workspace = true, features = ["test-support"] }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
+# `full` does not carry `test-util`, so `#[tokio::test(start_paused = true)]`
+# needs it named here. A workspace build unified it in from a sibling's dev
+# dependencies and hid the gap; `cargo test -p kin-cli` is where it showed.
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [target.'cfg(any(unix, windows))'.dependencies]
 cap-fs-ext = "=4.0.2"

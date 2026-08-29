@@ -245,10 +245,94 @@ async fn run_daemon_graph(
     let base_url = daemon_url
         .ok_or_else(|| crate::daemon_client::daemon_required_error("graph commands", layout))?;
     let client = crate::daemon_client::DaemonClient::from_base_url(base_url)?;
-    client
-        .graph_command(request)
+    graph_command_reporting_the_wait(&client, request)
         .await
         .map_err(|e| anyhow::anyhow!("daemon graph command failed: {e:#}"))
+}
+
+/// How long a graph command may take before the caller is told it is waiting.
+///
+/// Above a warm answer and well below a wait worth reporting. `kin graph
+/// status` answered in 28 ms and 46 ms against a daemon that had already served
+/// one, so a lower bar would put a line on every warm call for nothing.
+const GRAPH_WAIT_ANNOUNCE_AFTER: std::time::Duration = std::time::Duration::from_millis(700);
+
+/// How often the waiting line is refreshed while the request is outstanding.
+const GRAPH_WAIT_TICK: std::time::Duration = std::time::Duration::from_millis(400);
+
+/// What this command is waiting for, while it waits.
+///
+/// `kin graph status` was measured at 10,363 ms by a cold-user walk and at
+/// 10,140 ms here, on axum in a Debian 12 container. It is not a slow command.
+/// Profiling that exact run recorded 40.22 ms of CPU and a 25.6 MiB peak inside
+/// 10,067 ms of wall clock: the process spends the whole time waiting, first
+/// for a daemon to start and load the graph (6.7 s of it, timed from the CLI's
+/// own "starting daemon" and "daemon is up and ready" lines) and then for that
+/// daemon's first answer (2,506 ms measured separately against a daemon a
+/// locate had already warmed). The second and third calls answered in 28 ms.
+/// Both terms are real work in another process. Neither was visible.
+///
+/// The daemon start half announces itself now; this is the other half. The
+/// suspected cause named alongside the ticket, the LSP sweep status request,
+/// was measured and is not it: the same cold call under
+/// `KIN_DAEMON_DISABLE_LSP=1` took 10,411 ms against 10,140 ms, and the daemon
+/// log for both says no language server was found at all, so no sweep ran in
+/// either arm.
+async fn graph_command_reporting_the_wait(
+    client: &crate::daemon_client::DaemonClient,
+    request: &GraphCommandRequest,
+) -> Result<GraphCommandResponse> {
+    let label = graph_wait_label(request);
+    let mut progress: Option<crate::progress::Progress> = None;
+    let outcome = reporting_the_wait(client.graph_command(request), |waited| {
+        progress
+            .get_or_insert_with(crate::progress::Progress::stderr)
+            .update(format_args!("{label} ({:.1}s)", waited.as_secs_f64()));
+    })
+    .await;
+    if let Some(progress) = progress.as_ref() {
+        progress.finish();
+    }
+    outcome
+}
+
+/// Drive `work` to completion, calling `on_wait` once per tick after the
+/// announce threshold and never before it.
+///
+/// Split from the printing so both halves of the contract are testable without
+/// a daemon: that a fast answer reports nothing at all, and that a slow one
+/// reports while it is still outstanding rather than after it resolves.
+async fn reporting_the_wait<F, T>(work: F, mut on_wait: impl FnMut(std::time::Duration)) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    // Tokio's clock, not the standard library's, so a paused-time test can
+    // advance the wait without sleeping through it.
+    let started = tokio::time::Instant::now();
+    let mut ticker = tokio::time::interval(GRAPH_WAIT_TICK);
+    ticker.tick().await; // the first tick completes immediately
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            answered = &mut work => return answered,
+            _ = ticker.tick() => {
+                let waited = started.elapsed();
+                if waited >= GRAPH_WAIT_ANNOUNCE_AFTER {
+                    on_wait(waited);
+                }
+            }
+        }
+    }
+}
+
+/// The words for one graph command's wait.
+fn graph_wait_label(request: &GraphCommandRequest) -> &'static str {
+    match request {
+        GraphCommandRequest::Status => "reading the graph for this repository",
+        GraphCommandRequest::Validate => "validating the graph for this repository",
+        GraphCommandRequest::Inspect { .. } => "looking this entity up in the graph",
+        GraphCommandRequest::Source { .. } => "reading this entity's source from the graph",
+    }
 }
 
 fn print_graph_response(response: GraphCommandResponse) -> Result<()> {
@@ -4812,6 +4896,92 @@ mod tests {
             orphan_line(&response).is_none(),
             "graph tree carries the file: {:?}",
             response.lines
+        );
+    }
+
+    /// A warm graph command says nothing; a slow one says it is waiting, while
+    /// it is still waiting.
+    ///
+    /// Both halves, because either alone is satisfiable by a broken
+    /// implementation: a reporter that never fires passes the silence half, and
+    /// one that fires immediately passes the speaking half. The threshold is
+    /// what separates them, and the measured warm answers it has to stay above
+    /// were 28 ms and 46 ms.
+    #[tokio::test(start_paused = true)]
+    async fn a_warm_graph_command_is_silent_and_a_slow_one_reports_while_it_waits() {
+        let ticks = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let warm = ticks.clone();
+        let answered = reporting_the_wait(
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                "warm"
+            },
+            move |waited| warm.lock().unwrap().push(waited),
+        )
+        .await;
+        assert_eq!(answered, "warm");
+        assert!(
+            ticks.lock().unwrap().is_empty(),
+            "a 30 ms answer is the ordinary case and must print nothing: {:?}",
+            ticks.lock().unwrap()
+        );
+
+        let slow = ticks.clone();
+        let resolved = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = resolved.clone();
+        let answered = reporting_the_wait(
+            async move {
+                tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                "slow"
+            },
+            move |waited| {
+                // The point of the whole mechanism: the report reaches the
+                // caller while the work is still outstanding. A reporter that
+                // printed after the future resolved would leave the wait as
+                // silent as it was.
+                assert!(
+                    !resolved.load(std::sync::atomic::Ordering::SeqCst),
+                    "the wait is reported before the answer arrives, not after"
+                );
+                slow.lock().unwrap().push(waited);
+            },
+        )
+        .await;
+        assert_eq!(answered, "slow");
+
+        let waits = ticks.lock().unwrap().clone();
+        assert!(
+            !waits.is_empty(),
+            "a 2.5 s wait is the measured first-status cost and must be reported"
+        );
+        assert!(
+            waits[0] >= GRAPH_WAIT_ANNOUNCE_AFTER,
+            "nothing is reported before the threshold: first tick at {:?}",
+            waits[0]
+        );
+    }
+
+    #[test]
+    fn every_graph_command_names_its_own_wait() {
+        assert_eq!(
+            graph_wait_label(&GraphCommandRequest::Status),
+            "reading the graph for this repository"
+        );
+        assert_ne!(
+            graph_wait_label(&GraphCommandRequest::Status),
+            graph_wait_label(&GraphCommandRequest::Validate),
+            "a label that did not vary would tell a reader nothing about which \
+             command they are waiting on"
+        );
+        assert_ne!(
+            graph_wait_label(&GraphCommandRequest::Inspect {
+                name: "Router".to_string()
+            }),
+            graph_wait_label(&GraphCommandRequest::Source {
+                entity: "Router".to_string()
+            }),
         );
     }
 }

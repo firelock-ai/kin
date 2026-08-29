@@ -375,20 +375,40 @@ pub(crate) fn install_pinned_release(
 /// the rename that follows is on one filesystem, which is what makes it atomic:
 /// a crash mid-write leaves a partial temporary file and never a partial
 /// `rust-analyzer` that discovery would find and start.
+/// Render an error together with the causes underneath it.
+///
+/// `reqwest`'s own `Display` for a transport failure is `error sending request
+/// for url (...)`, which names the URL and not the failure, so a download
+/// refusal told an operator nothing about why it refused. The chain underneath
+/// carries the connection-level cause.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut rendered = error.to_string();
+    let mut next = error.source();
+    while let Some(cause) = next {
+        let text = cause.to_string();
+        if !rendered.contains(&text) {
+            rendered.push_str(": ");
+            rendered.push_str(&text);
+        }
+        next = cause.source();
+    }
+    rendered
+}
+
 fn download_to_temp(url: &str, bin_dir: &Path) -> Result<(PathBuf, String, u64), InstallFailure> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("kin/", env!("CARGO_PKG_VERSION")))
         .build()
         .map_err(|error| InstallFailure::Download {
             url: url.to_string(),
-            reason: error.to_string(),
+            reason: with_causes(&error),
         })?;
     let response = client
         .get(url)
         .send()
         .map_err(|error| InstallFailure::Download {
             url: url.to_string(),
-            reason: error.to_string(),
+            reason: with_causes(&error),
         })?;
     if !response.status().is_success() {
         return Err(InstallFailure::Download {
@@ -692,44 +712,181 @@ mod tests {
     // between the response body and the executable on disk is the same code on
     // both paths.
 
-    /// A one-request HTTP server that serves `body` and then stops.
+    /// A loopback HTTP server for the install tests.
     ///
-    /// Returns the base URL. Hand-rolled rather than pulled in as a dependency
-    /// because the whole protocol surface used here is a status line, a length
-    /// and a body.
-    fn serve_once(body: Vec<u8>) -> (String, std::thread::JoinHandle<()>) {
-        use std::io::BufRead;
-        use std::net::TcpListener;
+    /// Three properties matter, and the first one cost this fleet three red CI
+    /// runs. It reads the request head before it answers, because a socket
+    /// closed while unread request bytes are still sitting in it is ABORTED by
+    /// the kernel with an RST rather than closed with a FIN, and an abort can
+    /// destroy an answer the server has already written. It keeps accepting
+    /// until it is stopped, so a client that opened a second connection would
+    /// be served rather than refused. And it reports an accept failure instead
+    /// of swallowing it, so a fixture that quietly stopped serving fails the
+    /// test that depended on it.
+    ///
+    /// Hand-rolled rather than pulled in as a dependency because the whole
+    /// protocol surface used here is a status line, a length and a body.
+    struct FixtureServer {
+        base: String,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        served: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        trouble: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
-        let port = listener.local_addr().expect("read the bound port").port();
-        let handle = std::thread::spawn(move || {
-            let Ok((mut stream, _)) = listener.accept() else {
-                return;
-            };
-            // Drain the request head so the client is not writing into a socket
-            // nobody reads, which on some platforms surfaces as a broken pipe
-            // rather than as the response.
-            {
-                let mut reader =
-                    std::io::BufReader::new(stream.try_clone().expect("clone the accepted stream"));
-                let mut line = String::new();
-                while reader.read_line(&mut line).unwrap_or(0) > 0 {
-                    if line == "\r\n" || line == "\n" {
-                        break;
+    impl FixtureServer {
+        /// Answer every request with `status` and `body` until stopped.
+        fn serving(status: &'static str, body: Vec<u8>) -> Self {
+            use std::net::TcpListener;
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+            use std::sync::{Arc, Mutex};
+
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+            let port = listener.local_addr().expect("read the bound port").port();
+            // Polled rather than blocking so the thread can be stopped without
+            // a phantom connection to wake it out of `accept`.
+            listener
+                .set_nonblocking(true)
+                .expect("poll the listener so the fixture can be stopped");
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let served = Arc::new(AtomicUsize::new(0));
+            let trouble: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let (thread_stop, thread_served, thread_trouble) =
+                (stop.clone(), served.clone(), trouble.clone());
+
+            let thread = std::thread::spawn(move || {
+                while !thread_stop.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            thread_served.fetch_add(1, Ordering::Relaxed);
+                            if let Err(reason) = answer_one_request(stream, status, &body) {
+                                thread_trouble
+                                    .lock()
+                                    .expect("record what the fixture hit")
+                                    .push(reason);
+                            }
+                        }
+                        Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(std::time::Duration::from_micros(250));
+                        }
+                        Err(error) => {
+                            thread_trouble
+                                .lock()
+                                .expect("record what the fixture hit")
+                                .push(format!("accept failed: {error}"));
+                            return;
+                        }
                     }
-                    line.clear();
                 }
+            });
+
+            Self {
+                base: format!("http://127.0.0.1:{port}"),
+                stop,
+                served,
+                trouble,
+                thread: Some(thread),
             }
-            let head = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
+        }
+
+        /// The base URL a client should ask.
+        fn base(&self) -> &str {
+            &self.base
+        }
+
+        /// Stop the server, then fail if it hit trouble or was never asked.
+        ///
+        /// The never-asked half matters: a test asserting how a refusal is
+        /// classified proves nothing if the refusal came from somewhere other
+        /// than this fixture.
+        fn stop(mut self) -> usize {
+            use std::sync::atomic::Ordering;
+
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().expect("the fixture server thread must end");
+            }
+            let trouble = self
+                .trouble
+                .lock()
+                .expect("read what the fixture hit")
+                .clone();
+            assert!(
+                trouble.is_empty(),
+                "the fixture server hit trouble: {trouble:?}"
             );
-            let _ = stream.write_all(head.as_bytes());
-            let _ = stream.write_all(&body);
-            let _ = stream.flush();
-        });
-        (format!("http://127.0.0.1:{port}"), handle)
+            let served = self.served.load(Ordering::Relaxed);
+            assert!(
+                served > 0,
+                "the fixture server was never asked for anything"
+            );
+            served
+        }
+    }
+
+    impl Drop for FixtureServer {
+        /// Release the thread when a test panics before it reaches `stop`.
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// Read one request head, answer it, and close.
+    ///
+    /// The read is the part that is not optional, and it is not politeness
+    /// toward the client: it is what leaves the socket's receive queue empty,
+    /// which is what makes the close that follows a graceful FIN rather than an
+    /// RST. Measured at df375efa8 on a macOS host, the 404 fixture answering
+    /// without this read failed its test 12 times in 400 runs with a transport
+    /// error; reading the head first took the same measurement to 0 in 400.
+    ///
+    /// Failures are returned rather than ignored because a fixture that cannot
+    /// answer should say so. The silence is what made the original defect cost
+    /// three CI runs to find.
+    fn answer_one_request(
+        mut stream: std::net::TcpStream,
+        status: &str,
+        body: &[u8],
+    ) -> Result<(), String> {
+        use std::io::BufRead;
+
+        // An accepted socket inherits the listener's non-blocking flag on the
+        // BSDs, and this fixture wants to block until the head arrives.
+        stream
+            .set_nonblocking(false)
+            .map_err(|error| format!("could not serve the accepted stream: {error}"))?;
+        let mut reader = std::io::BufReader::new(
+            stream
+                .try_clone()
+                .map_err(|error| format!("could not clone the accepted stream: {error}"))?,
+        );
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if line == "\r\n" || line == "\n" => break,
+                Ok(_) => {}
+                Err(error) => return Err(format!("could not read the request head: {error}")),
+            }
+        }
+        let head = format!(
+            "{status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream
+            .write_all(head.as_bytes())
+            .map_err(|error| format!("could not write the response head: {error}"))?;
+        stream
+            .write_all(body)
+            .map_err(|error| format!("could not write the response body: {error}"))?;
+        stream
+            .flush()
+            .map_err(|error| format!("could not flush the response: {error}"))
     }
 
     /// A gzip of `payload`, as the release serves its binaries.
@@ -786,14 +943,15 @@ mod tests {
         let payload = b"#!/bin/sh\necho rust-analyzer 1.2.3\n";
         let archive = gzipped(payload);
         let digest = sha256_of(&archive);
-        let (base, server) = serve_once(archive.clone());
+        let server = FixtureServer::serving("HTTP/1.1 200 OK", archive.clone());
+        let base = server.base().to_string();
 
         let home = tempfile::tempdir().expect("a scratch tool root");
         let bin_dir = home.path().join("tools").join("bin");
 
         let install = install_pinned_release(&release, Some(target), &bin_dir, &base, &digest)
             .expect("a served archive whose digest matches must install");
-        server.join().expect("the fixture server thread must end");
+        server.stop();
 
         assert_eq!(install.destination, bin_dir.join("rust-analyzer"));
         assert_eq!(install.sha256, digest);
@@ -862,15 +1020,20 @@ mod tests {
         // computed from what was served could never disagree with it.
         let pinned_digest = "f".repeat(64);
         assert_ne!(served_digest, pinned_digest);
-        let (base, server) = serve_once(archive.clone());
+        let server = FixtureServer::serving("HTTP/1.1 200 OK", archive.clone());
 
         let home = tempfile::tempdir().expect("a scratch tool root");
         let bin_dir = home.path().join("tools").join("bin");
 
-        let failure =
-            install_pinned_release(&release, Some(target), &bin_dir, &base, &pinned_digest)
-                .expect_err("bytes that do not match the pin must not install");
-        server.join().expect("the fixture server thread must end");
+        let failure = install_pinned_release(
+            &release,
+            Some(target),
+            &bin_dir,
+            server.base(),
+            &pinned_digest,
+        )
+        .expect_err("bytes that do not match the pin must not install");
+        server.stop();
 
         match &failure {
             InstallFailure::ChecksumMismatch {
@@ -909,16 +1072,7 @@ mod tests {
     /// operator behind a proxy that their bytes were tampered with.
     #[test]
     fn a_refused_request_is_a_download_failure_rather_than_a_mismatch() {
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
-        let port = listener.local_addr().expect("read the bound port").port();
-        let server = std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let _ = stream.write_all(
-                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-                );
-            }
-        });
+        let server = FixtureServer::serving("HTTP/1.1 404 Not Found", Vec::new());
 
         let target = host_target().expect("this fleet builds on a pinned host");
         let release = fixture_release(target);
@@ -928,11 +1082,15 @@ mod tests {
             &release,
             Some(target),
             &bin_dir,
-            &format!("http://127.0.0.1:{port}"),
+            server.base(),
             &"e".repeat(64),
         )
         .expect_err("a 404 must not install");
-        server.join().expect("the fixture server thread must end");
+        assert_eq!(
+            server.stop(),
+            1,
+            "the client opened more than one connection"
+        );
 
         match &failure {
             InstallFailure::Download { reason, .. } => {
@@ -985,5 +1143,110 @@ mod tests {
             "{lines}"
         );
         assert!(lines.contains("2026-08-24"), "{lines}");
+    }
+
+    /// The fixture server closes its connections gracefully, never abortively.
+    ///
+    /// This is the FIR-2922 regression. The 404 fixture used to answer without
+    /// reading the request, and a socket closed while unread request bytes are
+    /// still in it is aborted by the kernel with an RST rather than closed with
+    /// a FIN. The answer usually arrives first anyway, which is why the test it
+    /// served passed for weeks and then failed three times in two days on
+    /// loaded CI runners: when the abort wins, the client's request fails at
+    /// the transport layer and the refusal arrives with no status to classify.
+    ///
+    /// Ten exchanges rather than one, because the abort is a property of the
+    /// close and not of every exchange. Measured at df375efa8, the undrained
+    /// shape aborted 378 of 400 exchanges on macOS and 394 of 400 on Linux, so
+    /// a single exchange would leave better than a one-in-twenty chance of
+    /// missing it; the drained shape aborted none of 800.
+    ///
+    /// Falsified by deleting the request-head read in `answer_one_request`:
+    /// this test then fails on the `must close gracefully, not abort` panic.
+    #[test]
+    fn the_fixture_server_closes_gracefully_rather_than_aborting() {
+        use std::io::Read;
+        use std::net::TcpStream;
+
+        let server = FixtureServer::serving("HTTP/1.1 404 Not Found", Vec::new());
+        let address = server
+            .base()
+            .strip_prefix("http://")
+            .expect("the fixture base is an http URL")
+            .to_string();
+
+        for exchange in 1..=10 {
+            let mut client = TcpStream::connect(&address).expect("reach the fixture server");
+            client
+                .write_all(
+                    b"GET /fixture-tag/rust-analyzer-fixture.gz HTTP/1.1\r\n\
+                      host: 127.0.0.1\r\naccept: */*\r\n\r\n",
+                )
+                .expect("send a request head");
+            let mut answer = Vec::new();
+            match client.read_to_end(&mut answer) {
+                Ok(_) => assert!(
+                    answer.starts_with(b"HTTP/1.1 404"),
+                    "exchange {exchange} read {:?}",
+                    String::from_utf8_lossy(&answer)
+                ),
+                Err(error) => panic!(
+                    "exchange {exchange}: the fixture must close gracefully, not abort, got {:?}: {error}",
+                    error.kind()
+                ),
+            }
+        }
+
+        assert_eq!(server.stop(), 10, "every exchange must reach the fixture");
+    }
+
+    /// A rendered error names the cause, not just the top layer.
+    ///
+    /// `reqwest`'s own `Display` for a transport failure stops at the URL,
+    /// which is why three red CI runs reported `error sending request for url
+    /// (...)` and nothing at all about the connection underneath it.
+    ///
+    /// Falsified by deleting the `while let Some(cause)` loop in `with_causes`:
+    /// the `must name the cause underneath` assertion then fires.
+    #[test]
+    fn a_rendered_error_carries_the_causes_underneath_it() {
+        #[derive(Debug)]
+        struct Layer(&'static str, Option<Box<Layer>>);
+
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(self.0)
+            }
+        }
+
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                match &self.1 {
+                    Some(inner) => Some(inner.as_ref()),
+                    None => None,
+                }
+            }
+        }
+
+        let error = Layer(
+            "error sending request for url (http://127.0.0.1:1/a.gz)",
+            Some(Box::new(Layer(
+                "client error (SendRequest)",
+                Some(Box::new(Layer(
+                    "Connection reset by peer (os error 54)",
+                    None,
+                ))),
+            ))),
+        );
+
+        let rendered = with_causes(&error);
+        assert!(
+            rendered.contains("error sending request for url"),
+            "the top layer must survive: {rendered}"
+        );
+        assert!(
+            rendered.contains("Connection reset by peer"),
+            "it must name the cause underneath: {rendered}"
+        );
     }
 }

@@ -208,7 +208,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_daemon_kill_record());
     checks.push(check_interrupted_init());
     checks.push(check_suspended_sweep());
-    checks.push(check_host_memory_pressure(embedding_coverage));
+    checks.extend(check_memory_pressure_rows(embedding_coverage));
     checks.push(check_retrieval_profile());
     checks.push(check_update_policy());
     checks.push(check_binary_assessment_load());
@@ -4443,6 +4443,55 @@ fn check_host_memory_pressure(
     )
 }
 
+/// Every row the memory-pressure reading is worth, one measurement each.
+///
+/// Split from [`check_host_memory_pressure`] so the row set is one function
+/// rather than a branch at the call site.
+fn check_memory_pressure_rows(
+    embedding_coverage: Option<kin_core::memory_pressure::EmbeddingCoverage>,
+) -> Vec<HealthCheck> {
+    let cwd = env::current_dir().unwrap_or_default();
+    let refusal_row = check_host_memory_pressure(embedding_coverage);
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return vec![refusal_row];
+    };
+    let mut rows = vec![refusal_row];
+    if let Some(footprint) = kin_core::memory_pressure::DaemonFootprint::read(layout.root()) {
+        rows.push(daemon_memory_standing_check_for(&footprint, unix_now()));
+    }
+    rows
+}
+
+/// Unix seconds now, or zero when the clock is before the epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default()
+}
+
+/// What this store's daemon last published about what it is holding.
+///
+/// Its own row rather than a clause appended to the refusal row. A refusal is a
+/// reading taken at the moment work was declined; this is the reading taken
+/// when the daemon last published one. Joined into one row with "Also:" they
+/// read as one self-contradicting claim, and the walkthrough that found it
+/// quoted both halves back: 3.7 GiB and 7.0 GiB of the same 4.0 GiB allowance,
+/// eleven child processes and ten. Two moments, two rows, each stamped.
+fn daemon_memory_standing_check_for(
+    footprint: &kin_core::memory_pressure::DaemonFootprint,
+    now_unix: u64,
+) -> HealthCheck {
+    const ID: &str = "daemon_memory_standing";
+    const LABEL: &str = "Daemon memory standing";
+    let status = if footprint.standing().is_over_allowance() {
+        HealthStatus::Degraded
+    } else {
+        HealthStatus::Healthy
+    };
+    HealthCheck::new(ID, LABEL, status, footprint.row_sentence(now_unix))
+}
+
 /// Whether this store's creation-time replay version matches the one this
 /// binary carries.
 ///
@@ -4508,24 +4557,40 @@ fn host_memory_pressure_check_for(
             .map(|coverage| refusal.describes_outstanding_work(coverage))
             .unwrap_or(true)
     });
-    let standing = footprint.map(|footprint| {
-        footprint.line(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_secs())
-                .unwrap_or_default(),
-        )
-    });
     let Some(refusal) = refusal else {
-        let detail = match standing {
-            Some(standing) => format!("no work has been held back on this store; {standing}"),
+        // The gauge is not appended here. It is a live reading with its own
+        // moment and it gets its own row, so this one carries exactly what the
+        // refusal ledger says and nothing else.
+        let detail = match footprint {
+            Some(_) => "no work has been held back on this store for want of memory; the \
+                        Daemon memory standing row reports how close it is"
+                .to_string(),
             None => "no work has been held back on this store for want of memory".to_string(),
         };
         return HealthCheck::new(ID, LABEL, HealthStatus::Healthy, detail);
     };
-    let detail = match standing {
-        Some(standing) => format!("{} Also: {standing}", refusal.cause_sentence()),
-        None => refusal.cause_sentence(),
+    // One measurement, stamped. The live standing used to be appended here
+    // behind "Also:", which put a reading from the moment work was declined
+    // beside a reading from minutes later and let the row disagree with itself.
+    // It has its own row now; see [`daemon_memory_standing_check_for`].
+    // The synthetic record that means "I could not read the ledger" stamps
+    // `at_unix` with the moment of the READ, and its own reason says Kin could
+    // not read one complete record. So there may have been no declining at all,
+    // and the ordinary clause would put a clock time on one that never
+    // happened. That is the same fault as the row this check exists to fix,
+    // which is why this record is stamped with what it is instead.
+    let detail = if refusal.is_unreadable_record() {
+        format!(
+            "{}; Kin read that at {}, which is a read time and not a moment work was declined",
+            refusal.cause_sentence(),
+            kin_daemon_spawn::hhmm_utc(refusal.at_unix)
+        )
+    } else {
+        format!(
+            "{}; that reading was taken at {}, when the work was declined",
+            refusal.cause_sentence(),
+            kin_daemon_spawn::hhmm_utc(refusal.at_unix)
+        )
     };
     HealthCheck::new(ID, LABEL, HealthStatus::Degraded, detail)
         .with_manual_fix(refusal.remediation())
@@ -10620,6 +10685,152 @@ mod tests {
         );
     }
 
+    /// One row, one measurement, one moment.
+    ///
+    /// `kin doctor` used to join a refusal's captured standing and the daemon's
+    /// live one into a single row behind "Also:", and a cold-user walk quoted
+    /// the pair back: the same row said the daemon held 3.7 GiB and 7.0 GiB of
+    /// the same 4.0 GiB allowance, with eleven child processes and ten. Both
+    /// readings were true. The row never said they were minutes apart, and the
+    /// second one, being larger than the allowance, read as arithmetically
+    /// impossible.
+    #[test]
+    fn memory_pressure_rows_carry_one_measurement_each_with_its_moment() {
+        let gib = 1024 * 1024 * 1024;
+        let over = kin_core::memory_pressure::DaemonFootprint {
+            footprint: kin_core::memory_pressure::TreeFootprint {
+                own_bytes: 4 * gib,
+                children_bytes: 3 * gib,
+                child_count: 10,
+                kernel_capped: false,
+            },
+            budget_bytes: 4 * gib,
+            budget_is_derived: true,
+            level: "critical".to_string(),
+            pid: 4103,
+            at_unix: 76_440, // 21:14Z
+        };
+        let refusal = kin_core::memory_pressure::PressureRefusal {
+            work: kin_core::memory_pressure::HeavyWork::LspSweep
+                .id()
+                .to_string(),
+            level: "critical".to_string(),
+            reason: "this repository's daemon and the 11 process(es) it started hold 3.7 GiB \
+                     of the 4.0 GiB it is allowed"
+                .to_string(),
+            at_unix: 76_440, // 21:14Z
+        };
+
+        let row = host_memory_pressure_check_for(std::slice::from_ref(&refusal), Some(&over), None);
+        assert!(
+            !row.detail.contains("Also:"),
+            "the two readings are no longer joined into one row: {}",
+            row.detail
+        );
+        assert!(
+            row.detail.contains("21:14Z") && row.detail.contains("when the work was declined"),
+            "the refusal row says when its reading was taken: {}",
+            row.detail
+        );
+        assert!(
+            !row.detail.contains("7.0 GiB"),
+            "and carries only its own measurement: {}",
+            row.detail
+        );
+
+        // The synthetic record that means "I could not read the ledger" is a
+        // different claim and must not be stamped as a declining. Its
+        // `at_unix` is the moment of the read, and `describes_outstanding_work`
+        // returns true for every work id that is not `EmbedBatch`, so nothing
+        // filters it out before the clause.
+        let unreadable = kin_core::memory_pressure::PressureRefusal {
+            work: kin_core::memory_pressure::PRESSURE_RECORD_UNREADABLE_WORK_ID.to_string(),
+            level: "unknown".to_string(),
+            reason: "Kin found an existing memory-pressure publication but could not read one \
+                     complete record from it"
+                .to_string(),
+            at_unix: 76_440, // 21:14Z
+        };
+        let unreadable_row =
+            host_memory_pressure_check_for(std::slice::from_ref(&unreadable), None, None);
+        assert!(
+            !unreadable_row.detail.contains("when the work was declined"),
+            "an unreadable ledger records no declining, so the row must not claim one: {}",
+            unreadable_row.detail
+        );
+        assert!(
+            unreadable_row.detail.contains("21:14Z")
+                && unreadable_row.detail.contains("a read time"),
+            "and the moment it does carry is named as the read it was: {}",
+            unreadable_row.detail
+        );
+
+        // The control that keeps the fix narrow: a refusal a producer actually
+        // wrote still says when the work was declined, so the clause was told
+        // apart rather than dropped for everything.
+        let declined_row =
+            host_memory_pressure_check_for(std::slice::from_ref(&refusal), None, None);
+        assert!(
+            declined_row.detail.contains("when the work was declined"),
+            "a real refusal keeps the clause: {}",
+            declined_row.detail
+        );
+
+        let standing = daemon_memory_standing_check_for(&over, 76_440 + 42);
+        assert!(
+            standing.detail.contains("7.0 GiB") && standing.detail.contains("10 process(es)"),
+            "the live standing is a row of its own: {}",
+            standing.detail
+        );
+        assert!(
+            standing.detail.contains("measured at 21:14Z")
+                && standing.detail.contains("42s ago")
+                && standing.detail.contains("pid 4103"),
+            "stamped unconditionally, not only once it has gone stale: {}",
+            standing.detail
+        );
+        assert!(
+            matches!(standing.status, HealthStatus::Degraded),
+            "a tree past its allowance is not a healthy row"
+        );
+        assert!(
+            !blocks_readiness(&standing),
+            "and it still must not fail a correct install on a small machine"
+        );
+
+        // The impossible-looking figure now says what it means. Without this
+        // clause "hold 7.0 GiB of the 4.0 GiB it is allowed" is a sentence a
+        // reader cannot resolve, and an unresolvable row stops being read.
+        assert!(
+            standing.detail.contains("3.0 GiB past the allowance")
+                && standing
+                    .detail
+                    .contains("rather than one the kernel imposes"),
+            "the overrun is named and explained: {}",
+            standing.detail
+        );
+
+        let under = kin_core::memory_pressure::DaemonFootprint {
+            footprint: kin_core::memory_pressure::TreeFootprint {
+                own_bytes: gib,
+                children_bytes: gib,
+                child_count: 2,
+                kernel_capped: false,
+            },
+            ..over.clone()
+        };
+        let inside = daemon_memory_standing_check_for(&under, 76_440);
+        assert!(
+            matches!(inside.status, HealthStatus::Healthy),
+            "a tree inside its allowance is healthy"
+        );
+        assert!(
+            !inside.detail.contains("past the allowance"),
+            "and says nothing about an overrun it does not have: {}",
+            inside.detail
+        );
+    }
+
     /// A refusal remains visible exactly while its own work is outstanding or
     /// the count is unknown, and it never changes the verdict of the page.
     ///
@@ -10656,10 +10867,22 @@ mod tests {
         let gauge = host_memory_pressure_check_for(&[], Some(&published), None);
         assert!(matches!(gauge.status, HealthStatus::Healthy));
         assert!(!blocks_readiness(&gauge));
+        // The gauge moved to its own row, so this one points at it rather than
+        // carrying a second measurement of its own. See
+        // `memory_pressure_rows_carry_one_measurement_each_with_its_moment`.
         assert!(
-            gauge.detail.contains("it is allowed") && gauge.detail.contains("child processes"),
-            "the healthy row reports the standing and names the children: {}",
+            gauge.detail.contains("Daemon memory standing"),
+            "the refusal row points at the row that holds the standing: {}",
             gauge.detail
+        );
+        let standing_row = daemon_memory_standing_check_for(&published, published.at_unix + 3);
+        assert!(matches!(standing_row.status, HealthStatus::Healthy));
+        assert!(!blocks_readiness(&standing_row));
+        assert!(
+            standing_row.detail.contains("it is allowed")
+                && standing_row.detail.contains("child processes"),
+            "the standing row reports the standing and names the children: {}",
+            standing_row.detail
         );
 
         let refusal = |work: &str| kin_core::memory_pressure::PressureRefusal {
@@ -10684,9 +10907,8 @@ mod tests {
         assert!(completed.manual_fix.is_none());
         assert!(!completed.detail.contains(&embed.reason));
         assert!(
-            completed.detail.contains("it is allowed")
-                && completed.detail.contains("child processes"),
-            "retiring an old embed refusal must preserve the footprint gauge: {}",
+            completed.detail.contains("Daemon memory standing"),
+            "retiring an old embed refusal still points at the footprint gauge: {}",
             completed.detail
         );
 
@@ -10732,11 +10954,27 @@ mod tests {
                 "a busy machine is not a broken install, and this row must never fail the proof"
             );
         }
-        assert_eq!(live_embed.detail, embed.reason);
-        assert_eq!(queue_empty_but_short.detail, embed.reason);
-        assert_eq!(unobserved_embed.detail, embed.reason);
-        assert_eq!(live_lsp.detail, lsp.reason);
-        assert_eq!(live_unknown.detail, unknown.reason);
+        // The row now stamps the refusal with the moment it was taken, so it
+        // opens with the reason rather than equalling it. Which refusal is
+        // being reported is still what these arms are asking.
+        for (reported, expected) in [
+            (&live_embed, &embed.reason),
+            (&queue_empty_but_short, &embed.reason),
+            (&unobserved_embed, &embed.reason),
+            (&live_lsp, &lsp.reason),
+            (&live_unknown, &unknown.reason),
+        ] {
+            assert!(
+                reported.detail.starts_with(expected.as_str()),
+                "the row reports this refusal: {} against {expected}",
+                reported.detail
+            );
+            assert!(
+                reported.detail.contains("when the work was declined"),
+                "stamped with the moment it was taken: {}",
+                reported.detail
+            );
+        }
 
         for independent in [&lsp, &unknown] {
             for refusals in [
@@ -10746,10 +10984,11 @@ mod tests {
                 let reported =
                     host_memory_pressure_check_for(&refusals, None, Some(coverage(0, 9, 9)));
                 assert!(matches!(reported.status, HealthStatus::Degraded));
-                assert_eq!(
-                    reported.detail, independent.reason,
-                    "a completed embed entry cannot mask {} in either publication order",
-                    independent.work
+                assert!(
+                    reported.detail.starts_with(independent.reason.as_str()),
+                    "a completed embed entry cannot mask {} in either publication order: {}",
+                    independent.work,
+                    reported.detail
                 );
                 assert!(!blocks_readiness(&reported));
             }

@@ -516,13 +516,18 @@ pub fn human_bytes(bytes: u64) -> String {
 /// running a conversion. `now_unix` and `current` are passed in for the same
 /// reason: a post-mortem that reads the clock and the cgroup for itself cannot
 /// be asserted on.
-pub fn post_mortem_lines(attempt: &AbandonedInit, current: Option<&MemoryReading>) -> Vec<String> {
+pub fn post_mortem_lines(
+    attempt: &AbandonedInit,
+    current: Option<&MemoryReading>,
+    initializing: &Path,
+) -> Vec<String> {
     let mut lines = Vec::new();
     match &attempt.record {
         Some(record) => {
             lines.push(format!(
-                "a previous kin init of {} did not finish",
-                record.source
+                "a previous kin init of {} did not finish{}",
+                record.source,
+                elsewhere_clause(attempt, initializing),
             ));
             lines.push(format!(
                 "  it stopped in phase {} of {}, {}, {} into the conversion",
@@ -539,8 +544,9 @@ pub fn post_mortem_lines(attempt: &AbandonedInit, current: Option<&MemoryReading
         }
         None => {
             lines.push(format!(
-                "a previous kin init left staging at {} behind",
-                attempt.capture_path.display()
+                "a previous kin init left staging at {} behind{}",
+                attempt.capture_path.display(),
+                elsewhere_clause(attempt, initializing),
             ));
             if let Some(reason) = &attempt.record_unreadable {
                 lines.push(format!(
@@ -572,6 +578,42 @@ pub fn post_mortem_lines(attempt: &AbandonedInit, current: Option<&MemoryReading
             .join(", ")
     ));
     lines
+}
+
+/// Name the repository being initialized, and say honestly how it relates to
+/// the corpse.
+///
+/// `kin init .` in `/root/shallow` opened with "a previous kin init of
+/// /root/repo did not finish", and a reader with one repository in mind reads
+/// that as a sentence about the directory they are standing in. The cleanup is
+/// right and worth announcing; the header just never said the two paths were
+/// different repositories.
+///
+/// Three forms, because there are three states and only two of them were ever
+/// distinguished. `converted` is `is_some_and` over the attempt's record, so it
+/// is false both when the record names another source and when there is no
+/// record at all, and those are not the same claim. With no record there is no
+/// source path to compare and the staging may well belong to this repository,
+/// so the difference is not asserted; but the current repository still has to
+/// be named, because on that branch the opening sentence has no source to name
+/// and this clause is the only thing that tells the reader what the run is
+/// about. Silent only when the two paths match, because repeating one path
+/// twice in one sentence is noise.
+fn elsewhere_clause(attempt: &AbandonedInit, initializing: &Path) -> String {
+    if attempt.record.is_none() {
+        return format!(
+            "; this run is initializing {}, and no record survives to say whether the staging \
+             is from it",
+            initializing.display()
+        );
+    }
+    if attempt.converted(initializing) {
+        return String::new();
+    }
+    format!(
+        "; that is a different repository from the {} this run is initializing",
+        initializing.display()
+    )
 }
 
 /// The ceiling clause, kept apart because it has three honest forms and the
@@ -661,7 +703,7 @@ pub fn report_previous_attempts(attempts: &[AbandonedInit], source: &Path) {
     let current = memory_pressure::read();
     let current = current.reading().copied();
     for attempt in attempts {
-        let mut lines = post_mortem_lines(attempt, current.as_ref());
+        let mut lines = post_mortem_lines(attempt, current.as_ref(), source);
         if let Some(first) = lines.first_mut() {
             *first = format!("warning: {first}");
         }
@@ -996,7 +1038,11 @@ mod tests {
 
     #[test]
     fn a_post_mortem_names_the_phase_the_ceiling_and_the_staging() {
-        let lines = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(1))));
+        let lines = post_mortem_lines(
+            &attempt(Some(record())),
+            Some(&reading(Some(1))),
+            Path::new("/work/requests"),
+        );
         let rendered = lines.join("\n");
         assert!(
             rendered.contains("phase 13 of 17, commit bootstrap transaction"),
@@ -1030,17 +1076,29 @@ mod tests {
     /// covers a conversion an operator killed by hand.
     #[test]
     fn a_cgroup_with_no_kills_is_never_told_it_had_one() {
-        let quiet = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(0))));
+        let quiet = post_mortem_lines(
+            &attempt(Some(record())),
+            Some(&reading(Some(0))),
+            Path::new("/work/requests"),
+        );
         assert!(
             !quiet.join("\n").contains("out-of-memory"),
             "zero recorded kills must produce no kill sentence: {quiet:?}"
         );
-        let unknown = post_mortem_lines(&attempt(Some(record())), Some(&reading(None)));
+        let unknown = post_mortem_lines(
+            &attempt(Some(record())),
+            Some(&reading(None)),
+            Path::new("/work/requests"),
+        );
         assert!(
             !unknown.join("\n").contains("out-of-memory"),
             "an unreadable kill counter is not evidence of a kill: {unknown:?}"
         );
-        let some = post_mortem_lines(&attempt(Some(record())), Some(&reading(Some(2))));
+        let some = post_mortem_lines(
+            &attempt(Some(record())),
+            Some(&reading(Some(2))),
+            Path::new("/work/requests"),
+        );
         assert!(
             some.join("\n").contains("2 kernel out-of-memory kills"),
             "more than one kill pluralizes: {some:?}"
@@ -1054,7 +1112,7 @@ mod tests {
     fn staging_without_a_record_is_reported_without_inventing_a_phase() {
         let mut orphan = attempt(None);
         orphan.record_unreadable = Some("it carries no phase record".to_string());
-        let rendered = post_mortem_lines(&orphan, None).join("\n");
+        let rendered = post_mortem_lines(&orphan, None, Path::new("/work/requests")).join("\n");
         assert!(
             rendered.contains("left staging at /work/.kin-git-capture-abdd7a1c behind"),
             "the path is all this case can name: {rendered}"
@@ -1069,6 +1127,43 @@ mod tests {
         );
     }
 
+    /// With no record there is no source path to compare, so the orphan branch
+    /// cannot know whether the staging belongs to this repository or another
+    /// one. It used to say it was another one, because `converted` is
+    /// `is_some_and` and a missing record makes it false for a reason that is
+    /// not a difference.
+    ///
+    /// The naming half is asserted by
+    /// `the_post_mortem_names_the_repository_it_is_about_and_the_one_being_initialized`.
+    /// This one asks only that no difference is claimed, so the two halves
+    /// cannot each catch the other's mutation and read as two defences.
+    #[test]
+    fn staging_without_a_record_claims_no_difference_it_cannot_see() {
+        let mut orphan = attempt(None);
+        orphan.record_unreadable = Some("it carries no phase record".to_string());
+        let rendered = post_mortem_lines(&orphan, None, Path::new("/work/shallow")).join("\n");
+        assert!(
+            !rendered.contains("a different repository"),
+            "with no record there is nothing to compare, so nothing is claimed: {rendered}"
+        );
+        assert!(
+            rendered.contains("no record survives to say whether the staging is from it"),
+            "and the unknown is stated rather than left as a silence: {rendered}"
+        );
+
+        // The control, so the clause was made honest rather than deleted: with
+        // a record naming another source, the difference is still named.
+        let known = post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/shallow"))
+            .join("\n");
+        assert!(
+            known.contains(
+                "a different repository from the /work/shallow this run is \
+                            initializing"
+            ),
+            "a record that names another source still reports the difference: {known}"
+        );
+    }
+
     /// A build that measured no ceiling says so. The alternative is a sentence
     /// naming a limit nobody read, which is the failure mode the whole
     /// memory-pressure seam exists to prevent.
@@ -1077,7 +1172,12 @@ mod tests {
         let mut unmeasured = record();
         unmeasured.memory_limit_bytes = None;
         unmeasured.memory_source = None;
-        let rendered = post_mortem_lines(&attempt(Some(unmeasured.clone())), None).join("\n");
+        let rendered = post_mortem_lines(
+            &attempt(Some(unmeasured.clone())),
+            None,
+            Path::new("/work/requests"),
+        )
+        .join("\n");
         assert!(
             rendered.contains("could not read a memory ceiling"),
             "an unmeasured ceiling must be disclosed: {rendered}"
@@ -1476,7 +1576,9 @@ mod tests {
         let mut unopened = record();
         unopened.phase_index = 0;
         unopened.phase_label = String::new();
-        let rendered = post_mortem_lines(&attempt(Some(unopened)), None).join("\n");
+        let rendered =
+            post_mortem_lines(&attempt(Some(unopened)), None, Path::new("/work/requests"))
+                .join("\n");
         assert!(
             rendered.contains("phase 1 of 17, before the first phase opened"),
             "{rendered}"
@@ -1495,5 +1597,54 @@ mod tests {
         assert_eq!(human_seconds(89), "89 s");
         assert_eq!(human_seconds(90), "1 min 30 s");
         assert_eq!(human_seconds(707), "11 min 47 s");
+    }
+
+    /// `kin init .` in `/root/shallow` opened with "a previous kin init of
+    /// /root/repo did not finish". The cleanup is right and worth announcing.
+    /// The header just never said the two paths were different repositories,
+    /// and a reader with one repository in mind reads it as the one they are
+    /// standing in.
+    #[test]
+    fn the_post_mortem_names_the_repository_it_is_about_and_the_one_being_initialized() {
+        let elsewhere =
+            post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/shallow"))
+                .join("\n");
+        assert!(
+            elsewhere.contains("a previous kin init of /work/requests did not finish"),
+            "the corpse is still named: {elsewhere}"
+        );
+        assert!(
+            elsewhere.contains(
+                "a different repository from the /work/shallow this run is \
+                                initializing"
+            ),
+            "and so is the repository this run is converting: {elsewhere}"
+        );
+
+        let ours = post_mortem_lines(&attempt(Some(record())), None, Path::new("/work/requests"))
+            .join("\n");
+        assert!(
+            ours.contains("a previous kin init of /work/requests did not finish"),
+            "the same-repository case still opens the same way: {ours}"
+        );
+        assert!(
+            !ours.contains("a different repository"),
+            "and does not print one path twice in one sentence: {ours}"
+        );
+
+        // A capture with no readable record cannot name a source, so the
+        // clause is what carries the current repository there. This arm asks
+        // only that it is named; whether a difference is claimed is asked by
+        // `staging_without_a_record_claims_no_difference_it_cannot_see`, so
+        // one mutation cannot be caught twice and read as two defences.
+        let orphan = AbandonedInit {
+            record: None,
+            ..attempt(None)
+        };
+        let orphan_lines = post_mortem_lines(&orphan, None, Path::new("/work/shallow")).join("\n");
+        assert!(
+            orphan_lines.contains("this run is initializing /work/shallow"),
+            "an unreadable record still says which repository this run is about: {orphan_lines}"
+        );
     }
 }

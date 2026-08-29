@@ -954,14 +954,20 @@ async fn wait_for_sweep(
                     .get("files_blocked")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
-                if done == 0 && total > 0 {
-                    println!(
-                        "sweep finished without enriching any of the {total} files it walked \
-                         ({blocked} blocked); see .kin/daemon.log for what stopped it"
-                    );
-                } else {
-                    println!("sweep complete ({done}/{total} files)");
-                }
+                // The same claim `kin init` prints, from the same function, off
+                // the same status object. This command held the whole payload
+                // and read only two of its numbers, so it printed
+                // "sweep complete (3/6 files)" while `languages_skipped` in its
+                // own hand named rust, three files and the reason the daemon
+                // observed. It is also the command the pending line from
+                // `kin init` tells a reader to run next, so the two surfaces
+                // disagreeing is the defect arriving at its own remedy.
+                let skipped = super::init::skipped_languages_from_status(&status);
+                let (line, _) =
+                    super::init::cross_file_enrichment_outcome(done, total, blocked, &skipped);
+                // The leading indent belongs to the note block `kin init` prints
+                // this under. Continuation lines keep their own.
+                println!("{}", line.trim_start());
             }
             return Ok(());
         }
