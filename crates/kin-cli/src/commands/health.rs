@@ -4573,11 +4573,25 @@ fn host_memory_pressure_check_for(
     // behind "Also:", which put a reading from the moment work was declined
     // beside a reading from minutes later and let the row disagree with itself.
     // It has its own row now; see [`daemon_memory_standing_check_for`].
-    let detail = format!(
-        "{}; that reading was taken at {}, when the work was declined",
-        refusal.cause_sentence(),
-        kin_daemon_spawn::hhmm_utc(refusal.at_unix)
-    );
+    // The synthetic record that means "I could not read the ledger" stamps
+    // `at_unix` with the moment of the READ, and its own reason says Kin could
+    // not read one complete record. So there may have been no declining at all,
+    // and the ordinary clause would put a clock time on one that never
+    // happened. That is the same fault as the row this check exists to fix,
+    // which is why this record is stamped with what it is instead.
+    let detail = if refusal.is_unreadable_record() {
+        format!(
+            "{}; Kin read that at {}, which is a read time and not a moment work was declined",
+            refusal.cause_sentence(),
+            kin_daemon_spawn::hhmm_utc(refusal.at_unix)
+        )
+    } else {
+        format!(
+            "{}; that reading was taken at {}, when the work was declined",
+            refusal.cause_sentence(),
+            kin_daemon_spawn::hhmm_utc(refusal.at_unix)
+        )
+    };
     HealthCheck::new(ID, LABEL, HealthStatus::Degraded, detail)
         .with_manual_fix(refusal.remediation())
 }
@@ -10722,6 +10736,44 @@ mod tests {
             !row.detail.contains("7.0 GiB"),
             "and carries only its own measurement: {}",
             row.detail
+        );
+
+        // The synthetic record that means "I could not read the ledger" is a
+        // different claim and must not be stamped as a declining. Its
+        // `at_unix` is the moment of the read, and `describes_outstanding_work`
+        // returns true for every work id that is not `EmbedBatch`, so nothing
+        // filters it out before the clause.
+        let unreadable = kin_core::memory_pressure::PressureRefusal {
+            work: kin_core::memory_pressure::PRESSURE_RECORD_UNREADABLE_WORK_ID.to_string(),
+            level: "unknown".to_string(),
+            reason: "Kin found an existing memory-pressure publication but could not read one \
+                     complete record from it"
+                .to_string(),
+            at_unix: 76_440, // 21:14Z
+        };
+        let unreadable_row =
+            host_memory_pressure_check_for(std::slice::from_ref(&unreadable), None, None);
+        assert!(
+            !unreadable_row.detail.contains("when the work was declined"),
+            "an unreadable ledger records no declining, so the row must not claim one: {}",
+            unreadable_row.detail
+        );
+        assert!(
+            unreadable_row.detail.contains("21:14Z")
+                && unreadable_row.detail.contains("a read time"),
+            "and the moment it does carry is named as the read it was: {}",
+            unreadable_row.detail
+        );
+
+        // The control that keeps the fix narrow: a refusal a producer actually
+        // wrote still says when the work was declined, so the clause was told
+        // apart rather than dropped for everything.
+        let declined_row =
+            host_memory_pressure_check_for(std::slice::from_ref(&refusal), None, None);
+        assert!(
+            declined_row.detail.contains("when the work was declined"),
+            "a real refusal keeps the clause: {}",
+            declined_row.detail
         );
 
         let standing = daemon_memory_standing_check_for(&over, 76_440 + 42);

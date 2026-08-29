@@ -1595,7 +1595,13 @@ impl PressureRefusal {
         }
     }
 
-    fn is_unreadable_record(&self) -> bool {
+    /// Whether this row is the synthetic "the ledger could not be read" record
+    /// rather than a refusal some producer actually wrote.
+    ///
+    /// Public because a surface rendering the row has to know. This record's
+    /// `at_unix` is the moment of the read, not a moment work was declined, so
+    /// a caller that stamps it as a declining states something it cannot know.
+    pub fn is_unreadable_record(&self) -> bool {
         self.work == PRESSURE_RECORD_UNREADABLE_WORK_ID
     }
 
