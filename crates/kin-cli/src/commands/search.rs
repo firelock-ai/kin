@@ -1822,6 +1822,61 @@ mod tests {
         assert_eq!(json["match_kind"].as_str(), Some("semantic"));
     }
 
+    /// FIR-2918, on the second surface that reads the same lexical index.
+    ///
+    /// `kin search` and `kin locate` both read an index that is STAGED on write
+    /// and committed by `flush_text_index`, which in a live daemon only the
+    /// background persistence loop calls. This fixture stages a document and
+    /// never flushes it, which is what a daemon holds between those flushes, and
+    /// the prose term has to come back anyway.
+    ///
+    /// The sibling test below flushes by hand and says so. That call is exactly
+    /// what a caller does not get to make, and its absence here is the fixture.
+    #[test]
+    fn a_docstring_term_answers_search_on_a_graph_whose_text_index_was_never_flushed() {
+        use super::{collect_daemon_search_response, DaemonSearchRequest};
+        use kin_model::EntityStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let graph = kin_db::InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let mut overview = dedupe_test_entity("describe_layers", "pkg/overview.py");
+        overview.doc_summary = Some(
+            "Nothing here opens a socket or speaks to a server over the network.".to_string(),
+        );
+        graph.upsert_entity(&overview).expect("upsert");
+        assert_eq!(
+            graph.text_document_count(),
+            0,
+            "the fixture must start with nothing committed, or this test grades a flushed index"
+        );
+
+        let response = collect_daemon_search_response(
+            &graph,
+            &DaemonSearchRequest {
+                query: "socket".to_string(),
+                kind: None,
+                language: None,
+                limit: None,
+                semantic: false,
+                show_body: false,
+                body_limit: None,
+            },
+            &healthy_search_envelope(),
+        )
+        .expect("search answers");
+
+        assert!(
+            graph.text_document_count() > 0,
+            "the search path left the lexical index empty, so no lexical evidence could have \
+             answered"
+        );
+        assert!(
+            response.total_matches > 0,
+            "a term only this entity's docstring carries returned nothing: {:?}",
+            response.records
+        );
+    }
+
     /// The collector must label a guess as a guess against a real graph.
     ///
     /// This runs the mechanism rather than the serializer: a live text index, a
