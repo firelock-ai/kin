@@ -88,6 +88,28 @@ struct InitResultPayload<'a> {
     /// unaffected, and one that does can tell a fresh machine's pending
     /// download from a warm cache before it schedules work.
     embedding_model: crate::embed_model::EmbedModelFetch,
+    /// A daemon serving this store that was killed during this conversion.
+    ///
+    /// Absent is the ordinary case and means the store has no record of losing
+    /// one. Present is the machine-readable half of the sentence the human
+    /// summary already prints, and it is why this command can exit non-zero on
+    /// a run that produced a real store: until it existed, a `--json` caller had
+    /// no field to read and every caller had a zero to misread. Additive to this
+    /// schema version, so a consumer that does not read it is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    daemon_killed: Option<DaemonKilledPayload>,
+}
+
+/// What one machine-readable result says about a daemon it lost.
+#[derive(Debug, Serialize)]
+struct DaemonKilledPayload {
+    /// The store's own sentence about the death, unchanged from the one the
+    /// human summary prints, so the two surfaces cannot drift apart.
+    summary: String,
+    /// The status this command exits with because of it, stated rather than
+    /// inferred, so a consumer reading the payload and a consumer reading `$?`
+    /// agree without either having to know the constant.
+    exit_code: i32,
 }
 
 /// The uncommitted delta initialization saw and did not admit.
@@ -127,12 +149,21 @@ macro_rules! note {
     }};
 }
 
+/// Exit status for a conversion that produced a store whose semantic enrichment
+/// a killed daemon left unattested.
+///
+/// Distinct from success so a script can tell "converted" from "converted, and
+/// something died on the way", and distinct from 1 so it is never read as the
+/// conversion having failed. The store is real, publishable and answers
+/// questions; what nobody can attest is that its enrichment finished.
+pub const EXIT_ENRICHMENT_UNATTESTED: i32 = 7;
+
 pub async fn run(
     path: Option<String>,
     json: bool,
     no_enrich: bool,
     adopt_repository_id: Option<String>,
-) -> Result<()> {
+) -> Result<i32> {
     let _span = tracing::info_span!("kin.init").entered();
     let dir = path
         .map(PathBuf::from)
@@ -226,12 +257,46 @@ pub async fn run(
         }
     };
 
+    // Read once, here, and handed to whichever surface reports it. The kill
+    // happens during the enrichment phase above and leaves nothing in this
+    // process, so it has to come off the store's own records; reading it twice,
+    // once for the prose and once for the exit status, would let the sentence a
+    // person reads and the number a script reads disagree about the same run.
+    let daemon_death = crate::daemon_death::recorded_for_store(result.layout.root());
+
     if json {
-        print_json_result(&result, boundary, enrichment)?;
+        print_json_result(&result, boundary, enrichment, daemon_death.as_ref())?;
     } else {
-        print_human_result(&result, boundary, &enrichment, &cross_file)?;
+        print_human_result(
+            &result,
+            boundary,
+            &enrichment,
+            &cross_file,
+            daemon_death.as_ref(),
+        )?;
     }
-    Ok(())
+    Ok(exit_code_for(daemon_death.as_ref()))
+}
+
+/// Exit status for a conversion that finished.
+///
+/// A store exists either way, which is why this is not an error: the repository
+/// was admitted, its authority is durable and every count printed above is
+/// true. What a killed daemon takes away is the attestation that the enrichment
+/// beside those counts ever finished, and that is invisible to a caller reading
+/// a status code, which is the caller most likely to act on it. A scripted
+/// setup, a CI step or an agent driving `kin init` reads zero and moves on to
+/// asking questions of a graph that stopped converging, and the store's own
+/// summary says as much in words nobody parsed.
+///
+/// So the degraded outcome gets its own code rather than an error. Exit 1 would
+/// say the conversion failed and invite a re-run, which at the repository size
+/// that causes this is a loop that cannot terminate.
+fn exit_code_for(daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>) -> i32 {
+    match daemon_death {
+        Some(_) => EXIT_ENRICHMENT_UNATTESTED,
+        None => 0,
+    }
 }
 
 /// Resolve `--adopt-repository-id` into the identity the store will carry.
@@ -856,6 +921,7 @@ fn print_json_result(
     result: &kin_core::InitResult,
     boundary: InitBoundary,
     semantic_enrichment: SemanticEnrichmentStatus,
+    daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
     let workspace = &result.authority.workspace;
     let default_ref = initialized_default_ref(result);
@@ -883,6 +949,10 @@ fn print_json_result(
         store_footprint: StoreFootprint::measure(&result.layout),
         uncommitted_worktree: uncommitted_worktree_payload(&result.workspace_divergence),
         embedding_model: crate::embed_model::EmbedModelFetch::probe(false),
+        daemon_killed: daemon_death.map(|record| DaemonKilledPayload {
+            summary: record.summary(),
+            exit_code: EXIT_ENRICHMENT_UNATTESTED,
+        }),
     };
     emit(&format!("{}\n", serde_json::to_string_pretty(&payload)?))
 }
@@ -914,12 +984,14 @@ fn print_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
+    daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
     emit(&render_human_result(
         result,
         boundary,
         semantic_enrichment,
         cross_file,
+        daemon_death,
     )?)
 }
 
@@ -947,6 +1019,7 @@ fn render_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
+    daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<String> {
     let default_ref = initialized_default_ref(result);
     let mut out = String::new();
@@ -989,19 +1062,12 @@ fn render_human_result(
             writeln!(out, "  Workspace: empty exact tree")?;
         }
     }
-    // Read here rather than remembered from the enrichment phase, because the
-    // death this looks for happens during that phase and leaves nothing in this
-    // process. The daemon publishes a serving record at start and retires it as
-    // it exits on its own terms, so a surviving record beside a dead pid is the
-    // only trace an unwatched kill leaves, and this is the summary a reader is
-    // already looking at when they need it.
-    let daemon_death = crate::daemon_death::recorded_for_store(result.layout.root());
     let guidance = ordered_init_guidance_lines(
         format!(
             "  Semantic enrichment: {}",
-            render_semantic_enrichment(semantic_enrichment, daemon_death.as_ref(), cross_file)
+            render_semantic_enrichment(semantic_enrichment, daemon_death, cross_file)
         ),
-        enrichment_kill_warning(daemon_death.as_ref()),
+        enrichment_kill_warning(daemon_death),
         cross_file_pending_notice(semantic_enrichment, cross_file),
         semantic_absence_notice(semantic_enrichment),
         format!(
@@ -1713,6 +1779,64 @@ mod tests {
         assert!(
             warning.contains("To recover:"),
             "and a cause with no remedy is most of the way back to the parenthetical: {warning}"
+        );
+    }
+
+    /// The sentence and the exit code have to say the same thing about one run.
+    ///
+    /// The measured defect is the gap between them. On `pallets/flask` inside an
+    /// 8 GiB container `kin init` exited 0 after 473 seconds with a summary that
+    /// read "completion not attested, and a daemon serving this store was
+    /// killed". The prose was already right; the zero was what a scripted setup
+    /// or an agent reads, and a zero says done.
+    ///
+    /// Asserted as an agreement rather than as two facts, because two readings
+    /// that are each correct can still jointly guarantee nothing: this walks the
+    /// same reading into both surfaces and requires them to match, so a future
+    /// change that fixes one and forgets the other goes red here.
+    #[test]
+    fn the_exit_code_and_the_summary_agree_about_a_killed_daemon() {
+        let status = enrichment(SemanticEnrichmentPresence::Present, 1058);
+        let record = kin_daemon_spawn::DaemonKillRecord {
+            kills: 1,
+            memory_kills: 1,
+            first_unix: 1_787_000_000,
+            last_unix: 1_787_000_000,
+            last_pid: Some(4103),
+            last_cause: kin_daemon_spawn::DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: Some(8 * 1024 * 1024 * 1024),
+            last_rss_bytes: Some(7 * 1024 * 1024 * 1024),
+        };
+
+        for reading in [None, Some(&record)] {
+            let summary =
+                render_semantic_enrichment(&status, reading, &CrossFileEnrichment::Produced);
+            let names_a_kill = summary.contains("a daemon serving this store was killed");
+            let code = exit_code_for(reading);
+            assert_eq!(
+                names_a_kill,
+                code != 0,
+                "the summary and the exit code disagree about one run: summary said \
+                 {names_a_kill}, exit code was {code} ({summary})"
+            );
+        }
+
+        assert_eq!(
+            exit_code_for(None),
+            0,
+            "a conversion that lost no daemon must still exit 0"
+        );
+        assert_eq!(
+            exit_code_for(Some(&record)),
+            EXIT_ENRICHMENT_UNATTESTED,
+            "a conversion that lost one must exit the degraded code"
+        );
+        assert_ne!(
+            EXIT_ENRICHMENT_UNATTESTED, 1,
+            "exit 1 says the conversion failed and invites a re-run, which at the repository \
+             size that causes this is a loop that cannot terminate"
         );
     }
 

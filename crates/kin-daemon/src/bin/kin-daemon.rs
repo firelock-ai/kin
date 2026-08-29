@@ -398,6 +398,13 @@ fn main() {
     // still single-threaded and still ahead of every reader (FIR-2504). An
     // operator's own KIN_RESOURCE_PROFILE outranks the file and is untouched.
     apply_repository_resource_profile();
+    // Put Kin's own tool directories on PATH, still single-threaded and ahead
+    // of the startup discovery sweep that decides whether this daemon opens an
+    // enrichment channel at all. A daemon started directly, rather than by a
+    // `kin` command that already did this, would otherwise never see a server
+    // Kin provisioned for the user, and a daemon that finds none never opens
+    // that channel for the life of the process.
+    kin_core::tool_prefix::augment_path_with_managed_tools();
     // Build the async runtime explicitly (rather than via `#[tokio::main]`) so
     // we own its teardown. The embedding worker dispatches batches onto the
     // blocking pool doing synchronous GPU compute that cannot observe the

@@ -638,6 +638,16 @@ fn disclose(line: &str) {
     let _ = writeln!(stderr, "{line}");
 }
 
+/// The same pipe-safe write, for the admission ladder's other disclosures.
+///
+/// Exported rather than duplicated so every line a conversion says about itself
+/// goes out the one way that survives `kin init | head -1`. A second writer
+/// using `eprintln!` would panic on the closed pipe and turn a refusal a reader
+/// asked to truncate into a crash.
+pub fn disclose_line(line: &str) {
+    disclose(line);
+}
+
 /// Tell the operator about every conversion that died beside this one before
 /// this run reaps its remains.
 ///

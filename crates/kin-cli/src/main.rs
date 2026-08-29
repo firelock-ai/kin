@@ -2570,6 +2570,12 @@ fn main() -> Result<()> {
     if let Ok(cwd) = std::env::current_dir() {
         kin_cli::resource_profile::apply_repository_profile_at(&cwd);
     }
+    // Put Kin's own tool directories on PATH while this process is still
+    // single-threaded, so a language server Kin provisioned is reachable by the
+    // `which` lookup enrichment discovery performs, and by the daemon this
+    // command may spawn, which inherits this environment. Appended rather than
+    // prepended: an operator's own toolchain outranks Kin's fallback copy.
+    kin_core::tool_prefix::augment_path_with_managed_tools();
     if kin_migrate::run_migration_process_host_if_requested()? {
         return Ok(());
     }
@@ -2643,7 +2649,19 @@ fn main() -> Result<()> {
                     json,
                     no_enrich,
                     adopt_repository_id,
-                } => commands::init::run(path, json, no_enrich, adopt_repository_id).await,
+                } => {
+                    let code =
+                        commands::init::run(path, json, no_enrich, adopt_repository_id).await?;
+                    // A conversion whose store exists but whose enrichment a
+                    // killed daemon left unattested reports that through the
+                    // exit code, so a scripted or agent-driven setup can branch
+                    // on it without parsing the summary. It is not an error:
+                    // the store is durable and the summary above is true.
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
                 Command::Status { json, wait_quiesce } => {
                     commands::status::run(json, std::time::Duration::from_secs(wait_quiesce)).await
                 }

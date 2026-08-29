@@ -3,7 +3,7 @@
 
 # Kin environment variables
 
-This is the authoritative list of supported `KIN_*` environment variables (500 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
+This is the authoritative list of supported `KIN_*` environment variables (509 total, 339 correctness-relevant), generated from the central registry in `kin-core`.
 
 At CLI and daemon startup Kin validates this surface (`KIN_ENV_VALIDATION`, default `warn`):
 
@@ -58,6 +58,8 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_BUILD_GRAPH_TIMEOUT_SECS` | seconds>=0 | 60 | operational | timeout for building a historical ref-view graph |
 | `KIN_BYPASS_EMBEDDING_COVERAGE_CHECK` | bool | false | correctness | bypass the embedding-coverage correctness gate |
 | `KIN_DISABLE_SPINE` | bool | false | correctness | disable the spine federation layer, narrowing retrieval scope |
+| `KIN_LANGUAGE_SERVER_ASSET_BASE` | url | GitHub Releases | operational | base URL the language-server release binaries are fetched from; set by acceptance checks to drive the standalone install against a fixture |
+| `KIN_LANGUAGE_SERVER_ASSET_SHA256` | string | *(unset)* | operational | sha256 an overridden language-server asset is verified against; IGNORED unless KIN_LANGUAGE_SERVER_ASSET_BASE is also set, so it can never relax the pinned release check |
 | `KIN_MEMORY_PRESSURE` | enum | *(unset)* | operational | force the memory-pressure level heavy work is judged against, in place of measuring the machine: 'critical' refuses the enrichment sweep, the embedding batch and ambient admission with a named reason, 'elevated' shrinks the embedding batch, 'unknown' proceeds exactly as an unreadable host does, and unset measures the cgroup or the host. Read by the daemon at process start, so it takes effect on the command that starts one |
 | `KIN_MEMORY_PRESSURE_CRITICAL_FRACTION` | float>=0 | 0.90 | operational | fraction of the memory ceiling at or above which heavy work refuses to start; must be within 0..=1, anything else keeps 0.90, and a value below the elevated fraction is raised to it |
 | `KIN_MEMORY_PRESSURE_ELEVATED_FRACTION` | float>=0 | 0.75 | operational | fraction of the memory ceiling at or above which heavy work shrinks; must be within 0..=1, and anything else keeps 0.75 |
@@ -105,7 +107,10 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
+| `KIN_DAEMON_AUTH_ROTATION_MAX_ACCEPTS` | usize | 10000 | operational | how many requests a daemon rotation overlap window accepts on the superseded token before closing, counted durably across restarts. Subject to the same refusal of zero and of unparseable values as KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS; whichever bound is reached first closes the window |
+| `KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS` | usize | 86400 | operational | how long, in seconds, a daemon rotation overlap window keeps accepting the superseded token, measured from the instant the window opened and persisted so it survives a restart. Must be a whole number greater than zero: a zero or unparseable value is refused at startup rather than read as unbounded, because an unbounded window is the state this bound exists to prevent |
 | `KIN_DAEMON_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated daemon requests |
+| `KIN_DAEMON_AUTH_TOKEN_PREVIOUS` | secret | *(unset)* | secret | a superseded daemon bearer token this process still accepts, so a credential rotation across several containers does not have to be atomic. Set it during a rotation window and unset it once /auth/rotation reports the superseded token is no longer carrying traffic. Setting it with KIN_DAEMON_AUTH_TOKEN unset, or to the same value, is refused at startup: neither is an overlap window and both would read as one |
 | `KIN_DAEMON_AUTO_EMBED` | bool | true | operational | let the daemon start background embedding on its own; set falsy to defer until an explicit embed request. Read by the daemon at process start, so it takes effect on the command that starts one; a command reaching an already-running daemon cannot change it and is warned that it diverged |
 | `KIN_DAEMON_BIN` | path | *(unset)* | operational | override path to the kin-daemon binary |
 | `KIN_DAEMON_BIND_HOST` | string | *(unset)* | operational | host/interface the daemon binds its HTTP endpoint to |
@@ -138,7 +143,10 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | Variable | Kind | Default | Sensitivity | Description |
 | --- | --- | --- | --- | --- |
 | `KIN_SUPERVISOR_ADOPT_DISABLE` | bool | false | operational | disable supervisor adoption of an existing daemon |
+| `KIN_SUPERVISOR_AUTH_ROTATION_MAX_ACCEPTS` | usize | 10000 | operational | the supervisor counterpart of KIN_DAEMON_AUTH_ROTATION_MAX_ACCEPTS, bounding its own rotation overlap window with its own durable record |
+| `KIN_SUPERVISOR_AUTH_ROTATION_WINDOW_SECS` | usize | 86400 | operational | the supervisor counterpart of KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS, bounding its own rotation overlap window with its own durable record |
 | `KIN_SUPERVISOR_AUTH_TOKEN` | secret | *(unset)* | secret | bearer token for authenticated supervisor requests |
+| `KIN_SUPERVISOR_AUTH_TOKEN_PREVIOUS` | secret | *(unset)* | secret | a superseded supervisor bearer token this process still accepts, the supervisor counterpart of KIN_DAEMON_AUTH_TOKEN_PREVIOUS and subject to the same startup refusals |
 | `KIN_SUPERVISOR_BIND_HOST` | string | *(unset)* | operational | host/interface the supervisor binds to |
 | `KIN_SUPERVISOR_IDLE_TIMEOUT_SECS` | seconds>=0 | 3600 | operational | supervisor auto-shutdown idle period; 0 disables idle shutdown |
 | `KIN_SUPERVISOR_REAP_CPU` | bool | true | operational | enable the CPU-heuristic zombie reaper; set falsey to disable |
@@ -240,6 +248,12 @@ Sensitivity legend: **correctness** (affects retrieval/ranking/output or data sa
 | `KIN_INFER_STAGE_TIMINGS` | string | *(unset)* | diagnostic | kin-infer splits batched-forward wall time into the device encode/readback stage and the host pooling tail; any present value including '0' enables it, and it is zero-cost while unset |
 | `KIN_INFER_STEEL` | bool | *(unset)* | operational | kin-infer double-buffered K-loop MMA GEMM, numerically identical to the single-buffer path (same fp32 accumulate and per-fragment reduction order, only when the loads are issued differs); unset engages it under the throughput and interactive profiles on Metal, and an explicit 1/0 overrides in either direction |
 | `KIN_INFER_ZERO_ALL` | bool | false | diagnostic | kin-infer zeroes every acquired Metal buffer and its size-class tail so no read can observe stale recycled bytes; only 1/true/yes/on enable it, and the default path is byte-identical |
+
+## Init
+
+| Variable | Kind | Default | Sensitivity | Description |
+| --- | --- | --- | --- | --- |
+| `KIN_INIT_MEMORY_CEILING_BYTES` | usize | *(unset)* | operational | the memory ceiling `kin init` judges a conversion's forecast peak against, in bytes, in place of the container cap or host memory it would otherwise measure. Two audiences share one lever: a machine whose real ceiling Kin reads wrongly can state it, and an operator who has judged the forecast wrong for their repository can get past the refusal without editing anything. An operator value wins outright and is not clamped; zero or an unparseable value is refused rather than ignored, because silently converting under a ceiling nobody set is how a conversion gets killed with no warning. It moves only the up-front refusal and changes nothing about what a conversion holds |
 
 ## Storage
 
