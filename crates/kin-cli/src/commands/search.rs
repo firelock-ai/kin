@@ -552,8 +552,15 @@ pub fn collect_daemon_search_response(
     request: &DaemonSearchRequest,
     envelope: &kin_mcp::Envelope,
 ) -> Result<DaemonSearchResponse> {
+    // FIR-2918. `kin search` reads the same staged-on-write lexical index
+    // `kin locate` does, so it needs the same guarantee: the index answers from
+    // graph truth before this query reads it, and a graph gap is reported rather
+    // than answered thin.
+    let mut lexical: Vec<crate::commands::locate::RetrievalDegradation> = Vec::new();
+    crate::commands::locate::ensure_lexical_index_queryable(graph, &mut lexical);
     if request.semantic {
         let mut response = collect_daemon_semantic_search_response(graph, request, envelope)?;
+        response.degradations.extend(lexical.iter().cloned());
         if response.records.is_empty() {
             let reported = response.degradations.clone();
             response.absence_qualifier = search_absence_qualifier(graph, envelope, &reported);
@@ -579,7 +586,7 @@ pub fn collect_daemon_search_response(
         .map(|matched| record_to_daemon_record(&matched.record, matched.match_kind, matched.score))
         .collect::<Vec<_>>();
     let absence_qualifier = if records.is_empty() {
-        search_absence_qualifier(graph, envelope, &[])
+        search_absence_qualifier(graph, envelope, &lexical)
     } else {
         Vec::new()
     };
@@ -591,7 +598,7 @@ pub fn collect_daemon_search_response(
         records,
         semantic_coverage: None,
         absence_qualifier,
-        degradations: Vec::new(),
+        degradations: lexical,
     })
 }
 
