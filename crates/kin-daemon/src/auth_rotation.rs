@@ -1453,14 +1453,19 @@ mod tests {
 
     #[test]
     fn bounds_are_read_from_the_environment_and_an_unusable_value_is_refused() {
-        // `KIN_*` reads are process-global, so this holds the shared lock every
-        // env-mutating test in this binary takes.
-        let _guard = crate::test_env_lock();
+        // `KIN_*` reads are process-global, so every write here goes through
+        // the sanctioned guard rather than a bare process-environment write.
+        // The guard
+        // serializes this test against every other env-mutating test in the
+        // binary and restores what it found on the way out; a bare write does
+        // neither, and `no_source_outside_the_sanctioned_guard_writes_the_environment`
+        // in kin-core fails the whole tree for one.
         const AGE: &str = "KIN_DAEMON_AUTH_ROTATION_WINDOW_SECS";
         const ACCEPTS: &str = "KIN_DAEMON_AUTH_ROTATION_MAX_ACCEPTS";
+        let mut env = kin_core::test_env::EnvVarGuard::new()
+            .without(AGE)
+            .without(ACCEPTS);
 
-        std::env::remove_var(AGE);
-        std::env::remove_var(ACCEPTS);
         let defaulted = RotationBounds::from_env(AGE, ACCEPTS).expect("unset takes the defaults");
         assert_eq!(
             defaulted.max_age_secs(),
@@ -1468,15 +1473,15 @@ mod tests {
         );
         assert_eq!(defaulted.max_accepts(), RotationBounds::DEFAULT_MAX_ACCEPTS);
 
-        std::env::set_var(AGE, "120");
-        std::env::set_var(ACCEPTS, "7");
+        env.apply(AGE, Some("120"));
+        env.apply(ACCEPTS, Some("7"));
         let set = RotationBounds::from_env(AGE, ACCEPTS).expect("positive values are usable");
         assert_eq!(set.max_age_secs(), 120);
         assert_eq!(set.max_accepts(), 7);
 
         // Zero is refused rather than read as unbounded, and so is a value that
         // is not a number at all. Both would otherwise silently default.
-        std::env::set_var(AGE, "0");
+        env.apply(AGE, Some("0"));
         let zero = RotationBounds::from_env(AGE, ACCEPTS).expect_err("zero must be refused");
         assert_eq!(
             zero,
@@ -1486,17 +1491,18 @@ mod tests {
             }
         );
 
-        std::env::set_var(AGE, "forever");
+        env.apply(AGE, Some("forever"));
         let unparseable = RotationBounds::from_env(AGE, ACCEPTS)
             .expect_err("a value that is not a number must be refused");
         assert!(matches!(
             unparseable,
             RotationConfigError::UnusableBound { .. }
         ));
+
         // The refusal must not echo what it found. An operator can paste
         // anything into a bound variable, including the token meant for the
         // one above it.
-        std::env::set_var(AGE, TOKEN_SENTINEL);
+        env.apply(AGE, Some(TOKEN_SENTINEL));
         let pasted = RotationBounds::from_env(AGE, ACCEPTS)
             .expect_err("a pasted token must be refused as a bound")
             .to_string();
@@ -1507,9 +1513,6 @@ mod tests {
         assert!(pasted.contains(AGE), "{pasted}");
         // Control: the assertion above must be able to fire.
         assert!(format!("leaked {TOKEN_SENTINEL}").contains(TOKEN_SENTINEL));
-
-        std::env::remove_var(AGE);
-        std::env::remove_var(ACCEPTS);
     }
 
     #[test]
