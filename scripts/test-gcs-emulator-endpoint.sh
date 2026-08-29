@@ -14,6 +14,14 @@
 # exercises the same bytes an operator would run, and it needs no Rust
 # toolchain in the Docker job.
 #
+# GCS mode is an admitted mode, not just a storage selector. A daemon started
+# with KIN_STORAGE=gcs refuses without an exact image identity, a fleet
+# allowlist that contains the id it serves, and two distinct API credentials,
+# because those are what fence hosted graph publication. So this smoke supplies
+# all of them the way a hosted deployment does, and arm 1b removes the image
+# identity again to prove the requirement is still live in these bytes rather
+# than satisfied by something else.
+#
 # Bucket seeding goes through the emulator's JSON API. Creating a directory
 # inside an already-running container does NOT register a bucket: fake-gcs-server
 # reads its data directory at process start, and under `-backend memory` that
@@ -31,6 +39,19 @@ NET="kin-gcs-net-$$"
 GCS_CID=""
 KIN_CID=""
 BUCKET="kin-emulator-test"
+
+# The entrypoint runs `kin init`, which mints a fresh UUID v4 repo id into the
+# manifest on every container start, and `served_repo_key_space` refuses to
+# start a GCS daemon whose KIN_REPO_IDS omits the id it will advertise. Pin the
+# served id and the fleet allowlist to one value so the two agree by
+# construction instead of by whatever that start happened to mint. It is a real
+# UUID v4 because a minted repo identity is one.
+REPO_ID="8f1c0e64-2b7a-4d59-9a3e-6c5b1f0d7a42"
+# GCS mode also refuses without an ordinary daemon credential and a DISTINCT
+# administrator credential for the publication-control API. Distinct is the
+# point: the daemon rejects a shared value outright.
+DAEMON_TOKEN="emulator-daemon-token"
+PUBLICATION_TOKEN="emulator-publication-admin-token"
 
 cleanup() {
   [ -n "${KIN_CID}" ] && docker rm -f "${KIN_CID}" >/dev/null 2>&1
@@ -56,16 +77,48 @@ dump_kin() {
   return 0
 }
 
-# Run the daemon in GCS mode against the emulator. Argv is branched rather than
-# assembled in an array, because bash 3.2 aborts expanding an empty one under
-# `set -u`.
+# The exact image identity the daemon admits itself under in GCS mode.
+#
+# `create_state` refuses GCS mode without KIN_RELEASE_DAEMON_DIGEST_INTERNAL,
+# and `validate_image_identity` in crates/kin-daemon/src/publication_lease.rs
+# admits exactly `sha256:` followed by 64 lowercase hex characters. Production
+# passes the pinned REGISTRY digest of the image the pod runs (kin-infra
+# compute/workloads.ts). This job never pushes, so no registry digest for these
+# bytes exists anywhere, and `.RepoDigests` is not a stand-in: depending on the
+# image store it is either empty or a restatement of the local digest.
+# `--format '{{.Id}}'` is the honest source. It is the image's own
+# content-addressed identity, it is always present, and it already carries the
+# shape the daemon admits. Asserting that shape here means a docker that
+# answered with something else says so by name rather than arriving later
+# disguised as an admission failure.
+IMAGE_IDENTITY="$(docker image inspect --format '{{.Id}}' "${IMAGE}" 2>/dev/null || true)"
+printf '%s' "${IMAGE_IDENTITY}" | grep -Eq '^sha256:[0-9a-f]{64}$' \
+  || fail "docker image inspect gave no sha256:<64 lowercase hex> identity for ${IMAGE} (got '${IMAGE_IDENTITY}'); the daemon's validate_image_identity admits nothing else"
+
+# Run the daemon in GCS mode against the emulator.
+#
+# start_kin <emulator-host> [omit-identity]
+#
+# There is ONE argv here rather than a copy per arm: a second copy is only ever
+# wrong in a way that looks like a passing run, because the arm that lost a
+# variable cannot fail on it. The identity is the only argument that varies, so
+# it is the only one held in an array, and bash 3.2 aborts expanding an EMPTY
+# array under `set -u`, so it is expanded through the `${arr[@]+...}` guard.
 start_kin() {
   local emulator_host="$1"
+  local identity_mode="${2:-with-identity}"
+  local identity_env=(-e "KIN_RELEASE_DAEMON_DIGEST_INTERNAL=${IMAGE_IDENTITY}")
+  [ "${identity_mode}" = "omit-identity" ] && identity_env=()
   KIN_CID="$(docker run -d --network "${NET}" \
     -e KIN_STORAGE=gcs \
     -e "KIN_GCS_BUCKET=${BUCKET}" \
     -e "STORAGE_EMULATOR_HOST=${emulator_host}" \
     -e KIN_DISABLE_SPINE=1 \
+    -e "KIN_REPO_ID=${REPO_ID}" \
+    -e "KIN_REPO_IDS=${REPO_ID}" \
+    -e "KIN_DAEMON_AUTH_TOKEN=${DAEMON_TOKEN}" \
+    -e "KIN_PUBLICATION_CONTROL_AUTH_TOKEN=${PUBLICATION_TOKEN}" \
+    ${identity_env[@]+"${identity_env[@]}"} \
     "${IMAGE}" --port 4219)"
 }
 
@@ -139,6 +192,52 @@ code="$(docker exec "${KIN_CID}" sh -c \
 [ -n "${code}" ] && [ "${code}" != "000" ] \
   || { dump_kin; fail "daemon reached listening but /readiness did not answer"; }
 echo "==> [serves] OK (listening, redirect logged, /readiness http ${code})"
+docker rm -f "${KIN_CID}" >/dev/null 2>&1; KIN_CID=""
+
+# ---------------------------------------------------------------------------
+# 1b. The control for arm 1's image identity. Same emulator, same network, same
+#     everything else: the ONE difference is that
+#     KIN_RELEASE_DAEMON_DIGEST_INTERNAL is not passed. The daemon must refuse
+#     on that requirement by name.
+#
+#     Without this arm, arm 1 would keep passing if the requirement were ever
+#     removed or exempted for CI, which is exactly how this smoke went red in
+#     the first place: FIR-2941, where the daemon grew the requirement and the
+#     smoke that never set it read as a broken emulator. It runs here rather
+#     than after the fails-loud arms because those remove the emulator, and a
+#     control whose refusal could be caused by two different things is not a
+#     control.
+# ---------------------------------------------------------------------------
+echo "==> [identity-required] the same daemon without KIN_RELEASE_DAEMON_DIGEST_INTERNAL must refuse"
+start_kin "http://fake-gcs:4443" omit-identity
+state="$(await_kin)"
+logs="$(docker logs "${KIN_CID}" 2>&1 || true)"
+
+[ "${state}" = "exited" ] \
+  || { dump_kin; fail "identity-required: daemon did not exit without an image identity (state=${state}); the admission requirement is not live in these bytes"; }
+contains "${logs}" "daemon API server listening" \
+  && { dump_kin; fail "identity-required: daemon reached serving state with no image identity"; }
+identity_exit="$(docker inspect -f '{{.State.ExitCode}}' "${KIN_CID}" 2>/dev/null || echo unknown)"
+[ "${identity_exit}" != "0" ] \
+  || { dump_kin; fail "identity-required: daemon exited 0; the refusal must be an error"; }
+
+# The refusal string has TWO producers in one container log. `kin init` in the
+# entrypoint spawns a daemon of its own before the exec, and it walks the same
+# admission path, so it prints the same line. The three assertions above already
+# pin the container's MAIN daemon, since only that process can exit the
+# container, but a message match against the whole log would not: reorder
+# `create_state` so the main daemon refuses on some other lever first, and the
+# init step's line would still satisfy it while this arm reported a green
+# control over the wrong refusal. So scope the message to the log after the
+# entrypoint's own start marker, and refuse loudly when that marker is missing
+# rather than matching against an empty string, which would pass nothing and
+# look like a failed assertion for the wrong reason.
+main_daemon_logs="$(printf '%s\n' "${logs}" | sed -n '/\[entrypoint\] Starting kin-daemon/,$p')"
+[ -n "${main_daemon_logs}" ] \
+  || { dump_kin; fail "identity-required: the entrypoint's own start marker is absent, so no refusal in this log can be attributed to the container's main daemon"; }
+contains "${main_daemon_logs}" "KIN_RELEASE_DAEMON_DIGEST_INTERNAL is required for GCS graph publication admission" \
+  || { dump_kin; fail "identity-required: the main daemon did not refuse by naming KIN_RELEASE_DAEMON_DIGEST_INTERNAL, so this arm proves nothing about the identity"; }
+echo "==> [identity-required] OK (exit ${identity_exit}, refusal names the variable)"
 docker rm -f "${KIN_CID}" >/dev/null 2>&1; KIN_CID=""
 
 # ---------------------------------------------------------------------------
