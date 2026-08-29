@@ -20572,6 +20572,147 @@ mod tests {
         );
     }
 
+    /// Measurement instrument for FIR-2924: what one repeated identical hosted
+    /// repository read costs.
+    ///
+    /// Ignored by default. It publishes a long history and then drives one read
+    /// route several times, which is a measurement rather than an assertion,
+    /// and the default suite must never pay for it. Run it by name:
+    ///
+    /// ```text
+    /// cargo test -p kin-daemon --lib hosted_repository_read_cost_instrument \
+    ///   -- --ignored --nocapture --exact
+    /// ```
+    ///
+    /// It prints one `HOSTEDPERF read` line per call rather than a total, so a
+    /// before and an after arm are compared on printed numbers instead of on a
+    /// figure worked out afterwards. `KIN_HOSTEDPERF_CHANGES`,
+    /// `KIN_HOSTEDPERF_FILES` and `KIN_HOSTEDPERF_READS` size it.
+    ///
+    /// The measured premise is asserted, not assumed: every response body must
+    /// be byte-identical, because a read that returns something different each
+    /// time is not the identical read this ticket is about.
+    ///
+    /// A local file backend stands in for object storage, so these numbers
+    /// carry the recovery, validation and graph-construction cost of the hosted
+    /// read path and none of its network cost. The hosted 52 s is the same
+    /// shape over a slower backend and a larger history.
+    #[tokio::test]
+    #[ignore = "FIR-2924 measurement instrument; run by name with --ignored"]
+    async fn hosted_repository_read_cost_instrument() {
+        fn sized(key: &str, fallback: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(fallback)
+        }
+        let changes = sized("KIN_HOSTEDPERF_CHANGES", 40);
+        let files_per_change = sized("KIN_HOSTEDPERF_FILES", 8);
+        let reads = sized("KIN_HOSTEDPERF_READS", 5);
+
+        let repo_id = format!("hostedperf-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+
+        let seeding = std::time::Instant::now();
+        let mut head = None;
+        for change in 0..changes {
+            let owned: Vec<(String, String, String)> = (0..files_per_change)
+                .map(|file| {
+                    let name = format!("symbol_{change}_{file}");
+                    let path = format!("src/generation_{change}/file_{file}.rs");
+                    let body = format!("fn {name}() -> usize {{ {change} * 100 + {file} }}\n");
+                    (name, path, body)
+                })
+                .collect();
+            let symbols: Vec<(&str, &str, &str)> = owned
+                .iter()
+                .map(|(name, path, body)| (name.as_str(), path.as_str(), body.as_str()))
+                .collect();
+            let (published, _entities) = publish_hosted_semantic_change(
+                storage.path(),
+                &repository_id,
+                head,
+                0x9240_0000 + change as u128,
+                &format!("publish generation {change}"),
+                &symbols,
+            );
+            head = Some(published);
+        }
+        println!(
+            "HOSTEDPERF seed changes={changes} files_per_change={files_per_change} \
+             total_files={} seed_ms={}",
+            changes * files_per_change,
+            seeding.elapsed().as_millis()
+        );
+
+        // `/refs` is the control, not a second subject. On this tree it already
+        // answers from the generation cache, so it pays the publication-cursor
+        // probe and the envelope read and nothing else. Its reading is
+        // therefore the floor `/files` cannot go below on this harness, and the
+        // gap between them is what the read path spends on the tree.
+        //
+        // The floor is a property of the backend under measurement. A
+        // `LocalFileBackend` inherits the default `load_snapshot_cursor`, which
+        // performs a full recovery load; `GcsBackend` overrides it with a list
+        // plus a head. So this floor is real here and is not what the hosted
+        // pod pays, which makes every post-fix number below pessimistic rather
+        // than flattering.
+        let refs_path = format!("/repos/{repo_id}/refs");
+        for call in 1..=reads {
+            let started = std::time::Instant::now();
+            let (status, body) = repo_route(Arc::clone(&state), &refs_path).await;
+            let elapsed = started.elapsed();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the control route must answer: {}",
+                String::from_utf8_lossy(&body)
+            );
+            println!(
+                "HOSTEDPERF refs call={call} ms={} bytes={}",
+                elapsed.as_millis(),
+                body.len()
+            );
+        }
+
+        let path = format!("/repos/{repo_id}/files");
+        let mut first_body: Option<Vec<u8>> = None;
+        for call in 1..=reads {
+            let started = std::time::Instant::now();
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            let elapsed = started.elapsed();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the measured route must answer: {}",
+                String::from_utf8_lossy(&body)
+            );
+            println!(
+                "HOSTEDPERF read call={call} ms={} bytes={}",
+                elapsed.as_millis(),
+                body.len()
+            );
+            match &first_body {
+                None => first_body = Some(body),
+                Some(first) => assert_eq!(
+                    first.len(),
+                    body.len(),
+                    "call {call} returned a different answer; this is not an identical read"
+                ),
+            }
+        }
+
+        // Printed rather than asserted: this is the daemon's own reporting, and
+        // the instrument records whatever it says at the sha under measurement.
+        let (health_status, health) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/health")).await;
+        println!(
+            "HOSTEDPERF health status={health_status} body={}",
+            String::from_utf8_lossy(&health)
+        );
+    }
+
     #[tokio::test]
     async fn repo_scoped_hosted_tools_answer_only_from_the_selected_repository() {
         let _budget = kin_core::test_env::EnvVarGuard::set("KIN_LOCATE_TOTAL_TIMEOUT_SECS", "0")
