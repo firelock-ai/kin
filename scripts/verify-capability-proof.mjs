@@ -57,10 +57,42 @@ function fail(message) {
   throw new CapabilityProofError(message);
 }
 
-// Byte-for-byte the rule the install proof applies to every health report it
-// reads. The aggregate is not an independent opinion: it is a function of the
-// checks, and a report whose summary disagrees with its own contents is the
-// failure mode that hides every other one.
+// The one rule, mirrored verbatim into the workflows that cannot import it.
+//
+// install-proof.yml and rc-build.yml run with no checkout by design, so they
+// cannot `import` this module and each carries a copy of the block below
+// instead. scripts/test-release-workflow-authority.py extracts the three copies
+// between these markers, strips leading indentation, and requires them equal, so
+// a change here that is not made there fails on `main` rather than at tag time.
+//
+// Keep the block free of anything a workflow cannot paste: no `export`, no
+// import, no reference to a name defined outside it.
+//
+// --- BEGIN HEALTH JOIN ---
+// A check is out of scope only when the platform or the context puts it out of
+// scope, which is exactly `unsupported`. Every other status is a component that
+// is not answering at full strength, so a report claiming readiness over one
+// claims more than its components support (FIR-2919).
+const healthNeedsAttention = (check) =>
+  check.status !== "healthy" && check.status !== "unsupported";
+// Something wrong with the INSTALL, as against work in flight or ground the
+// host never had. A different question from the one above, and conflating the
+// two is what fenced v0.6.1.
+const healthBlocksReadiness = (check) =>
+  check.status === "missing" ||
+  check.status === "misconfigured" ||
+  (check.id === "semantic_query_readiness" && check.status === "stale");
+const healthJoin = (checks) => {
+  if (checks.some(healthBlocksReadiness)) return "failing";
+  return checks.some(healthNeedsAttention) ? "needs_attention" : "ready";
+};
+// --- END HEALTH JOIN ---
+
+export { healthNeedsAttention, healthBlocksReadiness, healthJoin };
+
+// The aggregate a health report carries is not an independent opinion: it is a
+// function of the checks, and a report whose summary disagrees with its own
+// contents is the failure mode that hides every other one.
 export function validateHealthReport(report, reportPath) {
   if (!report || typeof report !== "object" || !Array.isArray(report.checks)) {
     fail(`${reportPath}: checks is missing or malformed`);
@@ -69,19 +101,41 @@ export function validateHealthReport(report, reportPath) {
   if (checks.size !== report.checks.length) {
     fail(`${reportPath}: duplicate health-check ids are not authoritative`);
   }
-  const expectedHealthy = !report.checks.some(
-    (check) =>
-      check.status === "missing" ||
-      check.status === "misconfigured" ||
-      (check.id === READINESS_ID && check.status === "stale"),
-  );
-  if (report.healthy !== expectedHealthy) {
+  // Required, not optional. A report with no `verdict` was produced by a build
+  // that predates FIR-2919, where the aggregate gated on missing and
+  // misconfigured alone and read `true` over a pending or degraded row. Grading
+  // such a report against either rule would be a claim about bytes that cannot
+  // carry it, so the proof says which bytes it met instead.
+  if (report.verdict === undefined) {
+    fail(
+      `${reportPath}: the report carries no \`verdict\` field, so these bytes predate ` +
+        "FIR-2919 and their aggregate cannot be graded against the health join",
+    );
+  }
+  const verdict = healthJoin(report.checks);
+  if (report.verdict !== verdict) {
+    fail(
+      `${reportPath}: verdict=${report.verdict} disagrees with checks; ` +
+        `expected ${verdict}`,
+    );
+  }
+  if (report.healthy !== (verdict === "ready")) {
     fail(
       `${reportPath}: aggregate healthy=${report.healthy} disagrees with checks; ` +
-        `expected ${expectedHealthy}`,
+        `expected ${verdict === "ready"}`,
     );
   }
   return checks;
+}
+
+// The rows that keep a report out of `ready`, as `id=status`, for a message.
+export function attentionRows(report) {
+  return (
+    (report.checks ?? [])
+      .filter(healthNeedsAttention)
+      .map((check) => `${check.id}=${check.status}`)
+      .join(", ") || "none"
+  );
 }
 
 export function assertRequiredChecksPresent(checks, reportPath) {
