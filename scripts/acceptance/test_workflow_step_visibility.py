@@ -137,6 +137,11 @@ EXPECTED_SUITES = (
         "bridge_reach",
         "acceptance/bridge_reach.json",
     ),
+    ExpectedSuite(
+        "scripts/acceptance/prose_query_parity_repro.py",
+        "prose_parity",
+        "acceptance/prose_parity.json",
+    ),
 )
 
 
