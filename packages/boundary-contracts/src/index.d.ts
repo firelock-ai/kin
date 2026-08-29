@@ -632,6 +632,33 @@ export interface RepositoryTransferStatus {
   pull_apply_ready: boolean;
 }
 
+/** One advertised ref and the change it resolves to. */
+export interface RepositoryRefAdvertisementEntry {
+  name: RepositoryTransferRefName;
+  target: RepositoryTransferRefTarget;
+  head: string;
+}
+
+/**
+ * What a repository publishes before any history moves.
+ *
+ * A clone starts here: it has no ref of its own to ask about yet, so it cannot
+ * use the per-ref transfer status, and it needs the default ref before it can
+ * initialize a replica that adopts the remote layout. An unborn repository
+ * publishes a `default_ref` that is absent from `refs`, which a clone must
+ * reproduce rather than treat as an error.
+ */
+export interface RepositoryRefAdvertisement {
+  schema_version: 4;
+  protocol: "kin-repository-v6-fast-forward";
+  repository_id: string;
+  refs: RepositoryRefAdvertisementEntry[];
+  default_ref: RepositoryTransferRefName | null;
+  roots: RepositoryTransferRootBundle;
+  supported_features: string[];
+  limits: RepositoryTransferLimits;
+}
+
 export interface RepositoryTransferBody {
   hash: string;
   byte_len: number;

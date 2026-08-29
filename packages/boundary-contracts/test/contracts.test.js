@@ -584,11 +584,20 @@ test('the hosted transfer seam is one contract three implementations read', asyn
     export: 'RepositoryTransferPack',
     receive: 'RepositoryTransferReceipt'
   };
+  // Every response type carries a declaration, so no leaf's envelope is
+  // described in Rust alone. The advertise leaf was the one that was: a pull
+  // starts there, and nothing on the TypeScript side named its shape.
   const declaredHere = new Set([
+    'RepositoryRefAdvertisement',
     'RepositoryTransferStatus',
     'RepositoryTransferPack',
     'RepositoryTransferReceipt'
   ]);
+  assert.deepEqual(
+    [...declaredHere].sort(),
+    Object.values(responseTypes).sort(),
+    'every response type must be declared, or the join covers only some leaves'
+  );
 
   assert.deepEqual(
     seam.leaves.map(leaf => leaf.leaf).sort(),
@@ -625,6 +634,12 @@ test('the hosted transfer seam is one contract three implementations read', asyn
   assert.deepEqual(expectation.fields, seam.expectationKeys);
   const limits = rustStructFields(transferSource, 'RepositoryTransferLimits');
   assert.deepEqual(limits.fields, seam.limitsKeys);
+  const entry = rustStructFields(transferSource, 'RepositoryRefAdvertisementEntry');
+  assert.deepEqual(
+    declaredInterfaceFields(declarations, 'RepositoryRefAdvertisementEntry'),
+    entry.fields,
+    'an advertised ref entry must be declared with the keys the Rust struct sends'
+  );
   assert.deepEqual(
     declaredInterfaceFields(declarations, 'RepositoryTransferLimits'),
     seam.limitsKeys
