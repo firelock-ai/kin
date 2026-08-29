@@ -141,6 +141,29 @@ can open later.
 
 ## Shortest graph-backed path
 
+Five commands, and the last one is the answer:
+
+```sh
+curl -fsSL https://get.kinlab.dev/install | sh
+exec "$SHELL" -l
+cd /path/to/your/repository
+kin init .
+kin locate "where are webhook retries handled"
+```
+
+`kin init` is the slow step and the one that earns the rest. It admits your Git
+history into the graph, and every answer after it comes from that graph rather
+than from re-reading the tree. Measured on a fresh Debian 12 container with 4
+CPUs and 8 GiB against the release npm serves today, the installer took 4
+seconds, `kin init` took 139 seconds on a 503-file repository with 1,983
+commits, and the first `kin locate` answered in 6.7 seconds while the daemon
+cold-started, then in 71 milliseconds warm. Those are separately measured legs
+of one sitting, not one timed run, and a repository with deeper history takes
+longer.
+
+Wire your agent after `kin init`, not before. The rest of this section is the
+same path with the detail behind each step.
+
 ### 1. Install and configure Kin
 
 On macOS or Linux:
@@ -328,6 +351,12 @@ stays first class. `kin setup --intent agent` configures every client it detects
 in one pass. These are the per-client one-liners when you would rather install Kin
 directly.
 
+Run `kin init .` in the repository before you wire a client, not after. These
+tools answer from the graph, so a client pointed at a directory with no graph
+gets a tool surface with nothing behind it. `kin setup` says so itself: its
+round-trip check reports "no initialized Kin repository at or above" the
+directory it ran in, and tells you to run `kin init` there and re-run setup.
+
 Claude Code, from inside a session:
 
 ```
@@ -352,11 +381,11 @@ Cursor takes a one-click install link. Paste this into Cursor or into your
 browser's address bar:
 
 ```
-cursor://anysphere.cursor-deeplink/mcp/install?name=kin&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBraW5sYWIva2luLW1jcCJdfQ==
+cursor://anysphere.cursor-deeplink/mcp/install?name=kin&config=eyJjb21tYW5kIjoibnB4IiwiYXJncyI6WyIteSIsIkBraW5sYWIva2luIiwibWNwIiwic3RhcnQiXX0=
 ```
 
 Kiro takes the same thing as a web link:
-[Add Kin to Kiro](https://kiro.dev/launch/mcp/add?name=kin&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40kinlab%2Fkin-mcp%22%5D%7D).
+[Add Kin to Kiro](https://kiro.dev/launch/mcp/add?name=kin&config=%7B%22command%22%3A%22npx%22%2C%22args%22%3A%5B%22-y%22%2C%22%40kinlab%2Fkin%22%2C%22mcp%22%2C%22start%22%5D%7D).
 
 Cline takes the standard entry below rather than a one-liner. Its CLI reads
 `~/.cline/mcp.json`. In the VS Code extension, open the MCP Servers panel, then
@@ -367,10 +396,17 @@ Every other client that reads a standard MCP config takes this entry:
 ```json
 {
   "mcpServers": {
-    "kin": { "command": "npx", "args": ["-y", "@kinlab/kin-mcp"] }
+    "kin": { "command": "npx", "args": ["-y", "@kinlab/kin", "mcp", "start"] }
   }
 }
 ```
+
+`kin setup status` and `kin doctor` recognize this exact shape, alongside the
+absolute-path form `kin setup` writes, and grade anything else MISCONFIGURED. Do
+not shorten `command` to a bare `kin`, because agent clients do not reliably
+inherit your shell `PATH`. `@kinlab/kin-mcp` is the older launcher and keeps
+working for configurations that already name it; new ones should point at
+`@kinlab/kin`, which ships the same MCP server as one mode of the full CLI.
 
 The wrapper needs Node 20 or newer, and on its first run it downloads the
 matching Kin release, verifies its published SHA-256, and caches the binaries per

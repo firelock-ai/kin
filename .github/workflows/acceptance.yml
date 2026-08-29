@@ -268,6 +268,16 @@ jobs:
       - name: Falsify the init budget graders
         run: python3 scripts/acceptance/init_budget_refusal.py --self-test
 
+      # FIR-2936, FIR-2938. Two refusals that read alike from outside decide this
+      # suite: autostart is off and nothing is serving, or the operator's own
+      # override answered nothing. A build that printed one sentence for both
+      # would pass a grader that only looks for the retired sentence, so each
+      # refusal is driven against the OTHER one's requirements and has to fail
+      # them. The provider graders get the same treatment, including the count a
+      # single-value read cannot see: two providers on one URL.
+      - name: Falsify the bridge reach graders
+        run: python3 scripts/acceptance/bridge_reach_repro.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -878,6 +888,30 @@ jobs:
             echo "::warning title=Init budget acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Bridge reach acceptance suite (verdict comes from the gate step)
+        id: bridgereach
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/bridge_reach_repro.py \
+            --kin target/release/kin \
+            --json acceptance/bridge_reach.json \
+            --verbose >acceptance/bridge_reach.log 2>&1 || rc=$?
+          cat acceptance/bridge_reach.log
+          {
+            echo "### Bridge reach acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/bridge_reach.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Bridge reach acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -925,4 +959,5 @@ jobs:
             --report verdict_limits=acceptance/verdict_limits.json \
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
             --report init_budget=acceptance/init_budget.json \
+            --report bridge_reach=acceptance/bridge_reach.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'

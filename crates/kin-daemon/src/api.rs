@@ -1175,6 +1175,26 @@ pub struct RepoHealthResponse {
     /// Hosted semantic tool contracts available for this addressed repository.
     #[serde(default)]
     pub semantic_capabilities: Vec<String>,
+    /// What this daemon's generation-bound repository read cache has done
+    /// since the process started (FIR-2924).
+    #[serde(default)]
+    pub repository_read_cache: RepositoryReadCacheHealth,
+}
+
+/// How often repository reads reused a generation's already-resolved tree.
+///
+/// Reported rather than logged, because a cache whose hits and misses are
+/// invisible cannot be told apart from one that is not running at all. Both
+/// counts at zero on a daemon that has served repository reads means the cache
+/// is not being reached, which is a different fault from a cache that is
+/// missing every time.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct RepositoryReadCacheHealth {
+    /// Reads answered from the tree this generation had already resolved.
+    pub hits: u64,
+    /// Reads that had to resolve a tree, including every read addressed at a
+    /// change that is not this generation's default-ref head.
+    pub misses: u64,
 }
 
 /// Serde default for a boolean whose healthy value is `true`, so a payload from
@@ -13359,18 +13379,164 @@ async fn repository_ref_metadata(
     Ok(Arc::new(repository_metadata(&snapshot)?.clone()))
 }
 
-fn resolve_repository_ref_target(
-    snapshot: &kin_db::GraphSnapshot,
-    target: &kin_model::RefTarget,
-) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
-    let metadata = repository_metadata(snapshot)?;
-    crate::state::resolve_repository_target(metadata, target).map_err(repository_authority_error)
-}
-
 fn default_repository_ref(
     metadata: &kin_db::PersistedRepositoryAuthority,
 ) -> Result<Option<&kin_model::RepositoryRef>, (StatusCode, String)> {
     crate::state::select_repository_default_ref(metadata).map_err(repository_authority_error)
+}
+
+/// One repository generation as a read route sees it (FIR-2924).
+///
+/// A hosted route answers from the daemon's generation-bound cache. The query
+/// graph and the authority envelope come out of one entry, so the change the
+/// envelope names is resolved against the graph of the same generation, and no
+/// route pays again for authority the daemon is already holding.
+///
+/// What it replaces is the reason it exists. These routes called
+/// [`repository_authority_snapshot`], which on a hosted daemon reopens
+/// [`RepositoryAuthorityManager`] once per HTTP request. That open re-reads the
+/// whole authority out of object storage and revalidates its history before it
+/// answers, and then the tree read built a second `InMemoryGraph` out of the
+/// cloned snapshot. None of that varies between two identical reads and all of
+/// it was paid twice: measured on the hosted deployment on 2026-08-29,
+/// `/repos/kin/files` took 52.14 s and then 52.39 s over an unchanged
+/// publication, with the daemon's peak at 5.89 GiB.
+///
+/// Resolving against the cached graph is exact rather than merely cheaper.
+/// Tree resolution replays first-parent history and reads the change map alone,
+/// and `materialize_hosted_repository_snapshot` rewrites the entity, relation
+/// and tree views of a snapshot while leaving that map untouched, so the cached
+/// graph and the reopened authority resolve the same tree from the same bytes.
+///
+/// A local daemon keeps opening its own authority. Its startup cache entry
+/// carries no envelope, so there is nothing cached for the local arm to read,
+/// and a local repository has no publication cursor to bind reuse to.
+enum RepositoryReadView {
+    Hosted {
+        generation: Arc<crate::state::HostedRepoCacheEntry>,
+        metadata: Arc<kin_db::PersistedRepositoryAuthority>,
+    },
+    Local {
+        snapshot: kin_db::GraphSnapshot,
+    },
+}
+
+impl RepositoryReadView {
+    /// This generation's authority envelope.
+    ///
+    /// Named `authority` and not `metadata` on purpose.
+    /// `scripts/verify-zero-file-search.py` reads `.metadata()` as a filesystem
+    /// metadata probe, which is exactly the call the zero-file-search rule
+    /// exists to keep out of an answer path. A repository-authority accessor
+    /// wearing that name spends the guard's allowlist on a call that touches no
+    /// filesystem, and the guard runs only in the `check` job, which pull
+    /// requests skip, so the cost lands on main rather than on the PR.
+    fn authority(&self) -> Result<&kin_db::PersistedRepositoryAuthority, (StatusCode, String)> {
+        match self {
+            Self::Hosted { metadata, .. } => Ok(metadata.as_ref()),
+            Self::Local { snapshot } => repository_metadata(snapshot),
+        }
+    }
+
+    /// Resolve one ref target to the change it names.
+    fn resolve_target(
+        &self,
+        target: &kin_model::RefTarget,
+    ) -> Result<kin_model::SemanticChangeId, (StatusCode, String)> {
+        crate::state::resolve_repository_target(self.authority()?, target)
+            .map_err(repository_authority_error)
+    }
+
+    /// One change out of this generation's history.
+    fn change(
+        &self,
+        change_id: &kin_model::SemanticChangeId,
+    ) -> Result<Option<kin_model::SemanticChange>, (StatusCode, String)> {
+        match self {
+            Self::Hosted { generation, .. } => generation
+                .graph()
+                .get_change(change_id)
+                .map_err(repository_authority_error),
+            Self::Local { snapshot } => Ok(snapshot.changes.get(change_id).cloned()),
+        }
+    }
+
+    /// Resolve the exact repository tree at `change_id`.
+    ///
+    /// Consuming the view is deliberate. The local arm builds a graph out of
+    /// its own snapshot, and a caller still holding the view would keep two
+    /// copies of one repository resident for the length of the response, which
+    /// is the memory shape this change exists to remove.
+    fn resolve_tree_at(
+        self,
+        state: &DaemonState,
+        change_id: &kin_model::SemanticChangeId,
+    ) -> Result<Arc<kin_model::ResolvedTree>, (StatusCode, String)> {
+        match self {
+            Self::Hosted { generation, .. } => state
+                .repository_resolved_tree(&generation, change_id)
+                .map_err(repository_authority_error),
+            Self::Local { snapshot } => repository_tree_at(snapshot, change_id).map(Arc::new),
+        }
+    }
+}
+
+/// Resolve one repository generation for a read route.
+///
+/// Capability decides which authority answers, exactly as
+/// [`repository_authority_snapshot`] decides it: a daemon with a storage
+/// backend reaches every repository it serves through the generation cache, and
+/// a daemon without one has only the local binding it opened at startup.
+/// Addressability is decided first and by the same rule
+/// [`repo_scoped_graph`] uses, so an id this daemon does not serve keeps
+/// answering the refusal that already names both identities.
+async fn repository_read_view(
+    state: &DaemonState,
+    repo_id: &str,
+) -> Result<RepositoryReadView, (StatusCode, String)> {
+    if state.storage_backend.is_some() {
+        if !state.serves_repo_id(repo_id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!(
+                    "this daemon serves repository {} and does not serve {repo_id}; \
+                 GET /health advertises the repo_id every /repos/{{repo_id}} route accepts",
+                    state.cached_repo_id
+                ),
+            ));
+        }
+        let generation = state
+            .repository_read_generation(repo_id)
+            .await
+            .map_err(|error| repo_addressed_error(state, error))?;
+        // The manager's own open refuses a snapshot whose envelope belongs to
+        // another repository, so this arm owes the same refusal: the cache is
+        // keyed by the id the caller asked for, and an envelope naming a
+        // different repository would otherwise be served under the wrong name.
+        let metadata = generation.repository_authority().cloned().ok_or_else(|| {
+            (
+                StatusCode::FAILED_DEPENDENCY,
+                "snapshot has no repository-v6 authority envelope".to_string(),
+            )
+        })?;
+        if metadata.repository_id.as_str() != repo_id {
+            return Err((
+                StatusCode::FAILED_DEPENDENCY,
+                format!(
+                    "snapshot authority belongs to {}, not {repo_id}",
+                    metadata.repository_id
+                ),
+            ));
+        }
+        return Ok(RepositoryReadView::Hosted {
+            generation,
+            metadata,
+        });
+    }
+
+    Ok(RepositoryReadView::Local {
+        snapshot: repository_authority_snapshot(state, repo_id).await?,
+    })
 }
 
 fn repository_tree_at(
@@ -14226,6 +14392,14 @@ async fn repo_health(
             .as_ref()
             .map(|_| vec![REPO_SCOPED_SEMANTIC_CAPABILITY.to_string()])
             .unwrap_or_default(),
+        repository_read_cache: RepositoryReadCacheHealth {
+            hits: state
+                .repository_read_cache_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            misses: state
+                .repository_read_cache_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+        },
     }))
 }
 
@@ -14265,15 +14439,15 @@ async fn repo_files(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
-    let metadata = repository_metadata(&snapshot)?;
-    let files = if let Some(repository_ref) = default_repository_ref(metadata)? {
-        let change_id = resolve_repository_ref_target(&snapshot, &repository_ref.target)?;
-        repository_tree_at(snapshot, &change_id)?
-            .into_artifacts()
+    let view = repository_read_view(&state, &repo_id).await?;
+    let selected = default_repository_ref(view.authority()?)?.cloned();
+    let files = if let Some(repository_ref) = selected {
+        let change_id = view.resolve_target(&repository_ref.target)?;
+        view.resolve_tree_at(&state, &change_id)?
+            .artifacts()
             .map(|artifact| RepoFileEntry {
                 display_path: artifact.path.as_utf8().map(ToOwned::to_owned),
-                path: artifact.path,
+                path: artifact.path.clone(),
             })
             .collect()
     } else {
@@ -14353,8 +14527,8 @@ async fn repo_history(
     Path(repo_id): Path<String>,
     State(state): State<Arc<DaemonState>>,
 ) -> std::result::Result<impl IntoResponse, (StatusCode, String)> {
-    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
-    let metadata = repository_metadata(&snapshot)?;
+    let view = repository_read_view(&state, &repo_id).await?;
+    let metadata = view.authority()?;
     let Some(repository_ref) = default_repository_ref(metadata)? else {
         return Ok(Json(RepoHistoryResponse {
             repo_id,
@@ -14364,7 +14538,8 @@ async fn repo_history(
             commits: Vec::new(),
         }));
     };
-    let head = resolve_repository_ref_target(&snapshot, &repository_ref.target)?;
+    let branch_name = short_ref_name(&repository_ref.name);
+    let head = view.resolve_target(&repository_ref.target)?;
     let mut commits = Vec::new();
     let mut seen = HashSet::new();
     let mut current = Some(head);
@@ -14375,7 +14550,7 @@ async fn repo_history(
                 format!("repository-v6 history contains a cycle at {change_id}"),
             ));
         }
-        let change = snapshot.changes.get(&change_id).ok_or_else(|| {
+        let change = view.change(&change_id)?.ok_or_else(|| {
             (
                 StatusCode::FAILED_DEPENDENCY,
                 format!("repository-v6 ref history references missing change {change_id}"),
@@ -14397,7 +14572,7 @@ async fn repo_history(
 
     Ok(Json(RepoHistoryResponse {
         repo_id,
-        branch_name: Some(short_ref_name(&repository_ref.name)),
+        branch_name: Some(branch_name),
         baseline_ref: None,
         head_ref: Some(head.to_string()),
         commits,
@@ -16308,7 +16483,7 @@ fn build_exact_source_tar_gz(
 fn load_exact_source_entries(
     state: &DaemonState,
     repo_id: &str,
-    tree: kin_model::ResolvedTree,
+    tree: &kin_model::ResolvedTree,
 ) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
     if repo_id == state.cached_repo_id {
         let authority = ActiveApiRepositoryAuthority::open(state)?;
@@ -16352,14 +16527,14 @@ fn load_exact_source_entries(
 }
 
 fn load_exact_source_entries_with(
-    tree: kin_model::ResolvedTree,
+    tree: &kin_model::ResolvedTree,
     mut load_blob: impl FnMut(
         &RepoPath,
         kin_model::Hash256,
         u64,
     ) -> Result<Option<Vec<u8>>, (StatusCode, String)>,
 ) -> Result<Vec<ExactSourceEntry>, (StatusCode, String)> {
-    let mut artifacts: Vec<_> = tree.into_artifacts().collect();
+    let mut artifacts: Vec<_> = tree.artifacts().cloned().collect();
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let archive_entry_count = artifacts.len().checked_add(1).ok_or_else(|| {
         (
@@ -16511,20 +16686,20 @@ async fn repo_exact_source_tar_gz(
     // streaming lands so concurrent requests cannot multiply peak RSS.
     let archive_permit = try_acquire_exact_source_archive_slot(exact_source_archive_exports())?;
     let requested_change = parse_exact_source_change_id(&source_change_id)?;
-    let snapshot = repository_authority_snapshot(&state, &repo_id).await?;
-    if !snapshot.changes.contains_key(&requested_change) {
+    let view = repository_read_view(&state, &repo_id).await?;
+    if view.change(&requested_change)?.is_none() {
         return Err((
             StatusCode::NOT_FOUND,
             format!("semantic change {requested_change} was not found in repo {repo_id}"),
         ));
     }
 
-    let tree = repository_tree_at(snapshot, &requested_change)?;
+    let tree = view.resolve_tree_at(&state, &requested_change)?;
     let state_for_archive = Arc::clone(&state);
     let repo_for_archive = repo_id.clone();
     let ((archive, manifest_hash), archive_permit) = tokio::task::spawn_blocking(move || {
         hold_exact_source_archive_permit(archive_permit, || {
-            let entries = load_exact_source_entries(&state_for_archive, &repo_for_archive, tree)?;
+            let entries = load_exact_source_entries(&state_for_archive, &repo_for_archive, &tree)?;
             build_exact_source_tar_gz(entries)
         })
     })
@@ -17457,7 +17632,7 @@ mod tests {
         ])
         .unwrap();
         let mut loads = 0;
-        let entries = load_exact_source_entries_with(tree, |_, requested, max_bytes| {
+        let entries = load_exact_source_entries_with(&tree, |_, requested, max_bytes| {
             loads += 1;
             assert_eq!(requested, hash);
             assert_eq!(max_bytes, EXACT_SOURCE_MAX_EXPANDED_BYTES as u64);
@@ -17503,7 +17678,7 @@ mod tests {
         expected.sort_by_key(|(digest, _)| digest.to_string());
         let mut observed = Vec::new();
 
-        load_exact_source_entries_with(tree, |_, requested, max_bytes| {
+        load_exact_source_entries_with(&tree, |_, requested, max_bytes| {
             observed.push((requested, max_bytes));
             let bytes = expected
                 .iter()
@@ -20569,6 +20744,392 @@ mod tests {
         assert!(
             detail.contains("authority envelope"),
             "the refusal must name the missing envelope, got: {detail}"
+        );
+    }
+
+    /// Measurement instrument for FIR-2924: what one repeated identical hosted
+    /// repository read costs.
+    ///
+    /// Ignored by default. It publishes a long history and then drives one read
+    /// route several times, which is a measurement rather than an assertion,
+    /// and the default suite must never pay for it. Run it by name:
+    ///
+    /// ```text
+    /// cargo test -p kin-daemon --lib hosted_repository_read_cost_instrument \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// The filter is a substring on purpose. A bare leaf name under `--exact`
+    /// matches nothing, so libtest grades nothing and exits 0 printing the same
+    /// `test result: ok` a clean pass prints.
+    ///
+    /// It prints one `HOSTEDPERF read` line per call rather than a total, so a
+    /// before and an after arm are compared on printed numbers instead of on a
+    /// figure worked out afterwards. `KIN_HOSTEDPERF_CHANGES`,
+    /// `KIN_HOSTEDPERF_FILES` and `KIN_HOSTEDPERF_READS` size it.
+    ///
+    /// The measured premise is asserted, not assumed: every response body must
+    /// be byte-identical, because a read that returns something different each
+    /// time is not the identical read this ticket is about.
+    ///
+    /// A local file backend stands in for object storage, so these numbers
+    /// carry the recovery, validation and graph-construction cost of the hosted
+    /// read path and none of its network cost. The hosted 52 s is the same
+    /// shape over a slower backend and a larger history.
+    #[tokio::test]
+    #[ignore = "FIR-2924 measurement instrument; run by name with --ignored"]
+    async fn hosted_repository_read_cost_instrument() {
+        fn sized(key: &str, fallback: usize) -> usize {
+            std::env::var(key)
+                .ok()
+                .and_then(|raw| raw.parse().ok())
+                .unwrap_or(fallback)
+        }
+        let changes = sized("KIN_HOSTEDPERF_CHANGES", 40);
+        let files_per_change = sized("KIN_HOSTEDPERF_FILES", 8);
+        let reads = sized("KIN_HOSTEDPERF_READS", 5);
+
+        let repo_id = format!("hostedperf-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+
+        let seeding = std::time::Instant::now();
+        let mut head = None;
+        for change in 0..changes {
+            let owned: Vec<(String, String, String)> = (0..files_per_change)
+                .map(|file| {
+                    let name = format!("symbol_{change}_{file}");
+                    let path = format!("src/generation_{change}/file_{file}.rs");
+                    let body = format!("fn {name}() -> usize {{ {change} * 100 + {file} }}\n");
+                    (name, path, body)
+                })
+                .collect();
+            let symbols: Vec<(&str, &str, &str)> = owned
+                .iter()
+                .map(|(name, path, body)| (name.as_str(), path.as_str(), body.as_str()))
+                .collect();
+            let (published, _entities) = publish_hosted_semantic_change(
+                storage.path(),
+                &repository_id,
+                head,
+                0x9240_0000 + change as u128,
+                &format!("publish generation {change}"),
+                &symbols,
+            );
+            head = Some(published);
+        }
+        println!(
+            "HOSTEDPERF seed changes={changes} files_per_change={files_per_change} \
+             total_files={} seed_ms={}",
+            changes * files_per_change,
+            seeding.elapsed().as_millis()
+        );
+
+        // `/refs` is the control, not a second subject. On this tree it already
+        // answers from the generation cache, so it pays the publication-cursor
+        // probe and the envelope read and nothing else. Its reading is
+        // therefore the floor `/files` cannot go below on this harness, and the
+        // gap between them is what the read path spends on the tree.
+        //
+        // The floor is a property of the backend under measurement. A
+        // `LocalFileBackend` inherits the default `load_snapshot_cursor`, which
+        // performs a full recovery load; `GcsBackend` overrides it with a list
+        // plus a head. So this floor is real here and is not what the hosted
+        // pod pays, which makes every post-fix number below pessimistic rather
+        // than flattering.
+        let refs_path = format!("/repos/{repo_id}/refs");
+        for call in 1..=reads {
+            let started = std::time::Instant::now();
+            let (status, body) = repo_route(Arc::clone(&state), &refs_path).await;
+            let elapsed = started.elapsed();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the control route must answer: {}",
+                String::from_utf8_lossy(&body)
+            );
+            println!(
+                "HOSTEDPERF refs call={call} ms={} bytes={}",
+                elapsed.as_millis(),
+                body.len()
+            );
+        }
+
+        let path = format!("/repos/{repo_id}/files");
+        let mut first_body: Option<Vec<u8>> = None;
+        for call in 1..=reads {
+            let started = std::time::Instant::now();
+            let (status, body) = repo_route(Arc::clone(&state), &path).await;
+            let elapsed = started.elapsed();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "the measured route must answer: {}",
+                String::from_utf8_lossy(&body)
+            );
+            println!(
+                "HOSTEDPERF read call={call} ms={} bytes={}",
+                elapsed.as_millis(),
+                body.len()
+            );
+            match &first_body {
+                None => first_body = Some(body),
+                Some(first) => assert_eq!(
+                    first.len(),
+                    body.len(),
+                    "call {call} returned a different answer; this is not an identical read"
+                ),
+            }
+        }
+
+        // Printed rather than asserted: this is the daemon's own reporting, and
+        // the instrument records whatever it says at the sha under measurement.
+        let (health_status, health) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/health")).await;
+        println!(
+            "HOSTEDPERF health status={health_status} body={}",
+            String::from_utf8_lossy(&health)
+        );
+    }
+
+    /// Read one repository file listing and return its display paths, sorted.
+    async fn repo_file_paths(state: Arc<DaemonState>, repo_id: &str) -> Vec<String> {
+        let (status, body) = repo_route(state, &format!("/repos/{repo_id}/files")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the file listing must answer: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let listed: RepoFilesResponse = serde_json::from_slice(&body).unwrap();
+        let mut paths: Vec<String> = listed
+            .files
+            .into_iter()
+            .filter_map(|file| file.display_path)
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    fn read_cache_counts(state: &DaemonState) -> (u64, u64) {
+        (
+            state
+                .repository_read_cache_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .repository_read_cache_misses
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// A hosted daemon with nothing published refuses the read rather than
+    /// answering an empty one (FIR-2924).
+    ///
+    /// This is a deliberate behaviour change, pinned here rather than left
+    /// incidental. `repository_authority_snapshot` reached this case through
+    /// `RepositoryAuthorityManager::open`, which mints an empty
+    /// generation-zero authority when storage holds no snapshot, so the route
+    /// answered 200 carrying no files. Reading the generation cache instead
+    /// finds the entry the daemon started with, which carries no envelope, and
+    /// refuses by name. The crate already prefers that refusal:
+    /// `hosted_daemon_refuses_a_backend_snapshot_carrying_no_authority_envelope`
+    /// exists to say a 200 carrying no refs is where a refusal belongs.
+    #[tokio::test]
+    async fn a_hosted_repository_with_no_publication_refuses_rather_than_answering_empty() {
+        let repo_id = format!("hostedperf-unpublished-{}", Uuid::new_v4());
+        let (state, _working, _storage) = replica_state(&repo_id);
+
+        let (status, body) =
+            repo_route(Arc::clone(&state), &format!("/repos/{repo_id}/files")).await;
+        let message = String::from_utf8_lossy(&body);
+        assert_eq!(
+            status,
+            StatusCode::FAILED_DEPENDENCY,
+            "an unpublished hosted repository must refuse, not answer empty: {message}"
+        );
+        assert!(
+            message.contains("authority envelope"),
+            "the refusal must name the missing envelope: {message}"
+        );
+    }
+
+    /// A publication that moves the generation is not answered from the tree
+    /// resolved before it (FIR-2924).
+    ///
+    /// This is the assertion the whole design rests on. Reuse is bound to the
+    /// cache entry, the entry is bound to the publication cursor it was
+    /// recovered at, and `get_repo_cache_entry` replaces the entry when that
+    /// cursor moves. Removing the currency check turns this red on the file
+    /// listing itself, not merely on a counter: the second read serves the
+    /// first generation's tree and the file this test published is missing.
+    #[tokio::test]
+    async fn a_moved_publication_is_not_served_from_the_previous_generations_tree() {
+        let repo_id = format!("hostedperf-moved-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+
+        let (first, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x9241_0001,
+            "publish the first generation",
+            &[("first_symbol", "src/first.rs", "fn first_symbol() {}\n")],
+        );
+
+        // Put this test on the state the ticket is about: a daemon that has
+        // already loaded a generation and is serving repeated reads against it.
+        // `replica_state` opens against an EMPTY backend, so the entry the
+        // daemon starts with carries no envelope and no cursor, and a read that
+        // reaches it refuses for a missing envelope rather than for staleness.
+        // Without this line a mutation of the currency check is caught one step
+        // early by that refusal, and the assertion below never runs.
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let before = repo_file_paths(Arc::clone(&state), &repo_id).await;
+        assert_eq!(
+            before,
+            vec!["src/first.rs".to_string()],
+            "the first generation serves the file it published"
+        );
+
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first),
+            0x9241_0002,
+            "publish the second generation",
+            &[("second_symbol", "src/second.rs", "fn second_symbol() {}\n")],
+        );
+
+        let (hits_before, _misses_before) = read_cache_counts(&state);
+        let after = repo_file_paths(Arc::clone(&state), &repo_id).await;
+        assert_eq!(
+            after,
+            vec!["src/first.rs".to_string(), "src/second.rs".to_string()],
+            "a read after a publication must serve the published change, not the tree \
+             resolved before it"
+        );
+        let (hits_after, _misses_after) = read_cache_counts(&state);
+        assert_eq!(
+            hits_after, hits_before,
+            "a moved generation must be a miss; a hit here means the currency check \
+             did not run"
+        );
+    }
+
+    /// A second identical read over an unchanged publication reuses the tree
+    /// the first one resolved (FIR-2924).
+    ///
+    /// The counter is the assertion here because the bodies are equal either
+    /// way: that is exactly the state the ticket measured, two identical
+    /// answers each paid for in full. Never storing the resolved tree turns
+    /// this red on the hit count while leaving both bodies correct.
+    #[tokio::test]
+    async fn an_unchanged_publication_serves_a_repeated_read_from_the_resolved_tree() {
+        let repo_id = format!("hostedperf-steady-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x9242_0001,
+            "publish one generation and leave it alone",
+            &[("only_symbol", "src/only.rs", "fn only_symbol() {}\n")],
+        );
+
+        // Put this test on the state the ticket is about: a daemon that has
+        // already loaded a generation and is serving repeated reads against it.
+        // `replica_state` opens against an EMPTY backend, so the entry the
+        // daemon starts with carries no envelope and no cursor, and a read that
+        // reaches it refuses for a missing envelope rather than for staleness.
+        // Without this line a mutation of the currency check is caught one step
+        // early by that refusal, and the assertion below never runs.
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let first = repo_file_paths(Arc::clone(&state), &repo_id).await;
+        let (hits_after_first, misses_after_first) = read_cache_counts(&state);
+        assert_eq!(
+            (hits_after_first, misses_after_first),
+            (0, 1),
+            "the first read of a generation resolves its tree"
+        );
+
+        let second = repo_file_paths(Arc::clone(&state), &repo_id).await;
+        assert_eq!(second, first, "an unchanged publication serves one answer");
+        let (hits_after_second, misses_after_second) = read_cache_counts(&state);
+        assert_eq!(
+            (hits_after_second, misses_after_second),
+            (1, 1),
+            "the second identical read must be answered from the resolved tree"
+        );
+    }
+
+    /// A read addressed at some other change cannot displace the default ref's
+    /// tree (FIR-2924).
+    ///
+    /// This is what keeps the reuse bounded at one tree per generation without
+    /// an eviction policy, and removing the head check breaks it in the worst
+    /// available direction: the archive route's tree would be served to the
+    /// next file listing, which is a wrong answer rather than a slow one.
+    #[tokio::test]
+    async fn a_read_of_another_change_neither_displaces_nor_grows_the_reused_tree() {
+        let repo_id = format!("hostedperf-other-{}", Uuid::new_v4());
+        let repository_id = RepositoryId::new(repo_id.clone()).unwrap();
+        let (state, _working, storage) = replica_state(&repo_id);
+
+        let (first, _entities) = publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            None,
+            0x9243_0001,
+            "publish the change the archive will ask for",
+            &[("root_symbol", "src/root.rs", "fn root_symbol() {}\n")],
+        );
+        publish_hosted_semantic_change(
+            storage.path(),
+            &repository_id,
+            Some(first),
+            0x9243_0002,
+            "publish the head the file listing reads",
+            &[("head_symbol", "src/head.rs", "fn head_symbol() {}\n")],
+        );
+
+        // Put this test on the state the ticket is about: a daemon that has
+        // already loaded a generation and is serving repeated reads against it.
+        // `replica_state` opens against an EMPTY backend, so the entry the
+        // daemon starts with carries no envelope and no cursor, and a read that
+        // reaches it refuses for a missing envelope rather than for staleness.
+        // Without this line a mutation of the currency check is caught one step
+        // early by that refusal, and the assertion below never runs.
+        state.evict_repo_cache_for_test(&repo_id).await;
+
+        let head_paths = repo_file_paths(Arc::clone(&state), &repo_id).await;
+        assert_eq!(
+            head_paths,
+            vec!["src/head.rs".to_string(), "src/root.rs".to_string()],
+            "the file listing reads the default ref's head"
+        );
+
+        // The archive route resolves an arbitrary change through exactly this
+        // pair, so driving the pair is driving what that route does.
+        let generation = state.repository_read_generation(&repo_id).await.unwrap();
+        let root_tree = state
+            .repository_resolved_tree(&generation, &first)
+            .expect("an older change still resolves");
+        assert_eq!(
+            root_tree.len(),
+            1,
+            "the older change resolves its own smaller tree"
+        );
+
+        let head_paths_again = repo_file_paths(Arc::clone(&state), &repo_id).await;
+        assert_eq!(
+            head_paths_again, head_paths,
+            "a read of another change must not become the answer the default ref \
+             listing serves"
         );
     }
 

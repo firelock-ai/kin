@@ -668,27 +668,45 @@ impl DaemonClient {
         daemon_http_error(&self.base_url, leaf, status, &body)
     }
 
-    /// Try to connect to the daemon. Returns `None` if the daemon is
-    /// unreachable or unhealthy.
-    pub async fn try_connect() -> Option<Self> {
-        let base = std::env::var("KIN_DAEMON_URL")
+    /// Connect to the daemon holding `layout`'s repository authority, the way
+    /// every other daemon-backed command reaches one.
+    ///
+    /// `KIN_DAEMON_URL` stays an explicit override and is honoured first.
+    /// Otherwise this resolves the supervisor's route for this repository and
+    /// starts a daemon when none is serving yet, which is what
+    /// [`resolve_daemon_url`] already does for `kin graph` and `kin search`.
+    ///
+    /// This used to read `KIN_DAEMON_URL` and nothing else, answering `None`
+    /// when it was unset. Nothing in the product sets that variable, so every
+    /// caller that had not exported it by hand was refused in 0.03 s while a
+    /// daemon served the same repository and `kin doctor` named its port
+    /// (FIR-2936). The caller rendered that `None` as "no Kin daemon is
+    /// reachable", a cause the reader could disprove with the next command.
+    ///
+    /// The health probe survives that repair because it is what keeps the
+    /// refusal pointed at the right cause. Without it an override aimed at
+    /// nothing fails at the first request instead, where the message explains
+    /// a daemon that retired mid-flight: a second wrong cause in place of the
+    /// first.
+    pub async fn connect_for_command(command: &str, layout: &KinLayout) -> Result<Self> {
+        let override_url = std::env::var("KIN_DAEMON_URL")
             .ok()
-            .filter(|value| !value.trim().is_empty())?;
-
-        let client = Self::from_base_url(base.clone()).ok()?;
-
-        // Probe health endpoint
-        let resp = client
-            .client
-            .get(format!("{}/health", base))
-            .send()
-            .await
-            .ok()?;
-
-        if resp.status().is_success() {
-            Some(client)
-        } else {
-            None
+            .filter(|value| !value.trim().is_empty());
+        let base_url = match override_url.as_deref() {
+            Some(url) => url.to_string(),
+            None => resolve_daemon_url(layout)
+                .await?
+                .ok_or_else(|| daemon_required_error(command, layout))?,
+        };
+        let client = Self::from_base_url_for_layout(base_url.clone(), layout)?;
+        match client.health().await {
+            Ok(_) => Ok(client),
+            Err(error) => Err(error.context(unreachable_daemon_sentence(
+                command,
+                layout,
+                &base_url,
+                override_url.is_some(),
+            ))),
         }
     }
 
@@ -7387,6 +7405,46 @@ pub fn running_daemon_required_error(command: &str, layout: &KinLayout) -> anyho
     )
 }
 
+/// The headline a command reads when the endpoint it resolved did not answer.
+///
+/// The two branches are different news and must not share a sentence. An
+/// endpoint that came from `KIN_DAEMON_URL` is the operator's own instruction,
+/// so the remedy is about that variable and naming it is the whole point: an
+/// override aimed at nothing is invisible from inside the command otherwise. A
+/// discovered endpoint is kin's own resolution, so the remedy is the surface
+/// that shows what the supervisor holds.
+///
+/// Split out from [`DaemonClient::connect_for_command`] so both sentences can
+/// be graded without a daemon on either side of them.
+fn unreachable_daemon_sentence(
+    command: &str,
+    layout: &KinLayout,
+    base_url: &str,
+    from_override: bool,
+) -> String {
+    let root = layout.root().display();
+    // "did not answer a health check" rather than "did not answer", in both
+    // branches, because the probe fails two ways: nothing listening, and a
+    // daemon that is listening and reports itself unhealthy. Those are one
+    // sentence here on purpose, since the reader's next step is the same either
+    // way and the probe's own error is attached below this line as the cause.
+    // Saying "did not answer" would be wrong for the second, which is the case
+    // an operator is most likely to hit against an endpoint they chose.
+    if from_override {
+        format!(
+            "KIN_DAEMON_URL is set to {base_url} and no kin daemon answered a health check \
+             there, so {command} has no repository authority to run in; unset KIN_DAEMON_URL \
+             and kin will use the daemon serving {root}, or point it at a healthy daemon"
+        )
+    } else {
+        format!(
+            "the kin daemon for {root} resolved to {base_url} and then did not answer a health \
+             check, so {command} has no repository authority to run in; run `kin doctor` to see \
+             what the supervisor holds for this repository, then re-run"
+        )
+    }
+}
+
 /// Like [`resolve_daemon_url`] but uses the 30-minute MCP idle timeout instead
 /// of the 60-second CLI default when autostarting a daemon.
 ///
@@ -11579,5 +11637,67 @@ mod tests {
             message.contains("/tmp/kin-fixture-repo") && message.contains("kin status"),
             "{message}"
         );
+    }
+
+    /// An override that names nothing is invisible from inside the command, so
+    /// the refusal has to name the variable or the operator has no way back.
+    #[test]
+    fn an_override_that_answers_nothing_names_the_variable_that_aimed_it() {
+        let layout = KinLayout::new(std::path::PathBuf::from("/tmp/kin-fixture-repo"));
+        let message = unreachable_daemon_sentence("kin push", &layout, "http://127.0.0.1:9", true);
+        assert!(
+            message.contains("KIN_DAEMON_URL"),
+            "the operator set the endpoint, so the variable is the subject: {message}"
+        );
+        assert!(
+            message.contains("http://127.0.0.1:9"),
+            "the endpoint that answered nothing belongs in the message: {message}"
+        );
+        assert!(
+            message.contains("unset KIN_DAEMON_URL"),
+            "the remedy is one word away and must be stated: {message}"
+        );
+        assert!(
+            message.contains("kin push"),
+            "the command that went unanswered belongs in the message: {message}"
+        );
+    }
+
+    /// The two branches are different news. A discovered endpoint was kin's own
+    /// resolution, so telling the operator to unset a variable they never set
+    /// sends them looking for something that is not there.
+    #[test]
+    fn a_discovered_endpoint_that_answers_nothing_does_not_blame_the_override() {
+        let layout = KinLayout::new(std::path::PathBuf::from("/tmp/kin-fixture-repo"));
+        let message =
+            unreachable_daemon_sentence("kin pull", &layout, "http://127.0.0.1:61182", false);
+        assert!(
+            !message.contains("KIN_DAEMON_URL"),
+            "nothing set that variable on this path: {message}"
+        );
+        assert!(
+            message.contains("/tmp/kin-fixture-repo") && message.contains("kin doctor"),
+            "the repository is the subject and the doctor is the surface that shows what the \
+             supervisor holds: {message}"
+        );
+    }
+
+    /// The sentence FIR-2936 was filed about. Both branches described a daemon
+    /// that was serving, so neither may reintroduce the words that did it.
+    #[test]
+    fn neither_branch_repeats_the_refusal_that_named_a_running_daemon_unreachable() {
+        let layout = KinLayout::new(std::path::PathBuf::from("/tmp/kin-fixture-repo"));
+        for from_override in [true, false] {
+            let message = unreachable_daemon_sentence(
+                "kin push",
+                &layout,
+                "http://127.0.0.1:9",
+                from_override,
+            );
+            assert!(
+                !message.contains("no Kin daemon is reachable"),
+                "from_override={from_override}: {message}"
+            );
+        }
     }
 }

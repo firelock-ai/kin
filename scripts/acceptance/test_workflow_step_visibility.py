@@ -127,6 +127,11 @@ EXPECTED_SUITES = (
         "init_budget",
         "acceptance/init_budget.json",
     ),
+    ExpectedSuite(
+        "scripts/acceptance/bridge_reach_repro.py",
+        "bridge_reach",
+        "acceptance/bridge_reach.json",
+    ),
 )
 
 

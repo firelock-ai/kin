@@ -1983,6 +1983,10 @@ enum AuthAction {
         /// Print a browser URL and exchange a one-time code manually
         #[arg(long, default_value_t = false)]
         no_browser: bool,
+        /// Which identity provider to sign in with. Defaults to google, which
+        /// is where every login went before there was a choice.
+        #[arg(long, value_enum, default_value_t = commands::auth::AuthProvider::Google)]
+        provider: commands::auth::AuthProvider,
     },
     /// Log out and remove the stored KinLab credential
     Logout {
@@ -3307,7 +3311,8 @@ fn main() -> Result<()> {
                     AuthAction::Login {
                         base_url,
                         no_browser,
-                    } => commands::auth::login(base_url, no_browser).await,
+                        provider,
+                    } => commands::auth::login(base_url, no_browser, provider).await,
                     AuthAction::Logout { base_url } => commands::auth::logout(base_url).await,
                     AuthAction::Whoami { base_url } => commands::auth::whoami(base_url).await,
                     AuthAction::Status { base_url } => commands::auth::status(base_url).await,
@@ -4713,6 +4718,61 @@ mod tests {
                     .err()
                     .unwrap_or_else(|| panic!("{argv:?} must not parse"));
                 assert_eq!(error.exit_code(), 2, "{argv:?} must be a usage error");
+            }
+        });
+    }
+
+    /// FIR-2938. The server has read `provider` on `/auth/login` for as long
+    /// as it has had more than one, and the web page offers both, but the CLI
+    /// sent nothing, so a terminal user could not reach the GitHub sign-in at
+    /// all. Three properties, and the third is the one that makes the flag
+    /// safe to add: nobody who types what they typed yesterday moves.
+    #[test]
+    fn auth_login_can_ask_for_a_provider_and_still_defaults_to_google() {
+        on_cli_test_stack(|| {
+            let chosen = Cli::try_parse_from(["kin", "auth", "login", "--provider", "github"])
+                .expect("a provider the CLI can send must parse");
+            assert!(
+                matches!(
+                    chosen.command,
+                    Command::Auth {
+                        action: AuthAction::Login {
+                            provider: commands::auth::AuthProvider::Github,
+                            ..
+                        }
+                    }
+                ),
+                "--provider github must reach the login command"
+            );
+
+            let defaulted = Cli::try_parse_from(["kin", "auth", "login"])
+                .expect("the invocation that shipped must keep parsing");
+            assert!(
+                matches!(
+                    defaulted.command,
+                    Command::Auth {
+                        action: AuthAction::Login {
+                            provider: commands::auth::AuthProvider::Google,
+                            ..
+                        }
+                    }
+                ),
+                "a login that names no provider must stay the Google login it was"
+            );
+
+            // A name the CLI cannot send is refused here rather than at the
+            // sign-in page, where the only report is a redirect carrying
+            // authError=provider-unavailable that no terminal ever shows.
+            let error = Cli::try_parse_from(["kin", "auth", "login", "--provider", "gitlab"])
+                .err()
+                .expect("a provider the CLI cannot send must not parse");
+            assert_eq!(error.exit_code(), 2, "an unknown provider is a usage error");
+            let rendered = error.to_string();
+            for expected in ["google", "github"] {
+                assert!(
+                    rendered.contains(expected),
+                    "the refusal must list what can be asked for: {rendered}"
+                );
             }
         });
     }
