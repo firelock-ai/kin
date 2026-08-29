@@ -340,10 +340,10 @@ class Suite(object):
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
         # A CLI-autostarted daemon idles out after 60s by default. Without this,
-        # the settle below would let the daemon `kin init` left exit and the
-        # first arm would silently read a REPLACEMENT daemon, which is the one
-        # state where this whole suite passes for the wrong reason. Held open
-        # well past the settle, and the pid is asserted either way.
+        # the settle below would let the long-lived daemon exit and the first arm
+        # would silently read a REPLACEMENT daemon, which is the one state where
+        # this whole suite passes for the wrong reason. Held open well past the
+        # settle, and the pid is asserted either way.
         self.env["KIN_DAEMON_IDLE_TIMEOUT_SECS"] = "900"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DAEMON_URL", None)
