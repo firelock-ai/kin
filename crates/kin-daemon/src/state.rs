@@ -2380,10 +2380,19 @@ fn salvage_from_sidecar_outcome(
 /// snapshot and stay in one cache entry so a ref read cannot combine a newer
 /// graph with an older authority envelope. The envelope is small compared with
 /// the graph and is the only durable metadata the hosted refs route needs.
-struct HostedRepoCacheEntry {
+pub(crate) struct HostedRepoCacheEntry {
     graph: Arc<kin_db::InMemoryGraph>,
     repository_authority: Option<Arc<kin_db::PersistedRepositoryAuthority>>,
     publication_cursor: Option<kin_db::SnapshotCursor>,
+    /// This generation's default-ref tree, resolved at most once (FIR-2924).
+    ///
+    /// Bounded by construction rather than by an eviction policy. One
+    /// generation has exactly one default-ref head, so this holds one tree, and
+    /// a publication that moves the cursor replaces the whole entry. A read
+    /// addressed at any other change resolves without storing, so an archive
+    /// request for an arbitrary change can neither displace this nor grow what
+    /// the daemon keeps resident.
+    default_ref_tree: Mutex<Option<Arc<kin_model::ResolvedTree>>>,
 }
 
 impl HostedRepoCacheEntry {
@@ -2396,11 +2405,41 @@ impl HostedRepoCacheEntry {
             graph,
             repository_authority,
             publication_cursor,
+            default_ref_tree: Mutex::new(None),
         }
     }
 
     fn is_current_at(&self, publication_cursor: Option<kin_db::SnapshotCursor>) -> bool {
         self.publication_cursor == publication_cursor
+    }
+
+    /// This generation's query graph.
+    pub(crate) fn graph(&self) -> &Arc<kin_db::InMemoryGraph> {
+        &self.graph
+    }
+
+    /// This generation's authority envelope, when the publication carried one.
+    pub(crate) fn repository_authority(
+        &self,
+    ) -> Option<&Arc<kin_db::PersistedRepositoryAuthority>> {
+        self.repository_authority.as_ref()
+    }
+
+    /// Whether `change_id` is what this generation's default ref resolves to.
+    ///
+    /// Answering false is always safe: it costs a resolution this entry could
+    /// have reused, and never serves a tree for the wrong change. Every arm
+    /// that cannot establish the head therefore falls through to false rather
+    /// than guessing one.
+    fn is_default_ref_head(&self, change_id: &kin_model::SemanticChangeId) -> bool {
+        let Some(metadata) = self.repository_authority.as_ref() else {
+            return false;
+        };
+        let Ok(Some(repository_ref)) = select_repository_default_ref(metadata) else {
+            return false;
+        };
+        resolve_repository_target(metadata, &repository_ref.target)
+            .is_ok_and(|head| &head == change_id)
     }
 }
 
@@ -2744,6 +2783,17 @@ pub struct DaemonState {
     /// did, and an age-of-last-settled cannot tell a wedged daemon from one no
     /// caller has ever queried, since neither holds a settled reading.
     pub graph_status_live_sample_failures: AtomicU64,
+    /// Repository reads that reused a generation's already-resolved tree, and
+    /// reads that had to resolve one (FIR-2924).
+    ///
+    /// Reported on `/repos/{repo_id}/health` rather than logged, because a
+    /// cache whose hits and misses are invisible cannot be told apart from one
+    /// that is not running at all. Counted over the life of the process: hits
+    /// that stop rising while misses climb is a publication moving under the
+    /// reads, which is the cache working, and both staying at zero on a daemon
+    /// that has served reads is the cache not being reached.
+    pub repository_read_cache_hits: AtomicU64,
+    pub repository_read_cache_misses: AtomicU64,
     /// Serializes derived-index and hosted snapshot persistence so the
     /// persistence loop, idle-shutdown flush, and embedding worker can never
     /// interleave writes. Local repository-v6 authority is committed before
@@ -4853,6 +4903,8 @@ impl DaemonState {
             hosted_restart_required: AtomicBool::new(false),
             hosted_spine_authority_proof: Mutex::new(None),
             hosted_spine_expected_rollout_fence: Mutex::new(None),
+            repository_read_cache_hits: AtomicU64::new(0),
+            repository_read_cache_misses: AtomicU64::new(0),
             #[cfg(test)]
             spine_backend_constructions: AtomicUsize::new(0),
             #[cfg(test)]
@@ -5218,6 +5270,8 @@ impl DaemonState {
             hosted_restart_required: AtomicBool::new(false),
             hosted_spine_authority_proof: Mutex::new(None),
             hosted_spine_expected_rollout_fence: Mutex::new(None),
+            repository_read_cache_hits: AtomicU64::new(0),
+            repository_read_cache_misses: AtomicU64::new(0),
             #[cfg(test)]
             spine_backend_constructions: AtomicUsize::new(0),
             #[cfg(test)]
@@ -8011,6 +8065,77 @@ impl DaemonState {
     ) -> Result<Option<Arc<kin_db::PersistedRepositoryAuthority>>> {
         let entry = self.get_repo_cache_entry(repo_id).await?;
         Ok(entry.repository_authority.as_ref().map(Arc::clone))
+    }
+
+    /// One coherent hosted repository generation, for a read route that needs
+    /// both halves of it (FIR-2924).
+    ///
+    /// Every repository read needs the query graph and the authority envelope
+    /// together: the envelope names a change and the graph resolves it. Taking
+    /// both out of one entry is what makes the pair coherent. Calling
+    /// [`Self::get_repo_graph`] and [`Self::get_repo_authority_metadata`] in
+    /// sequence probes publication twice, so a publication landing between the
+    /// two hands back a graph from one generation and an envelope from another,
+    /// and the mismatch surfaces as a change the envelope names that the graph
+    /// cannot resolve.
+    pub(crate) async fn repository_read_generation(
+        &self,
+        repo_id: &str,
+    ) -> Result<Arc<HostedRepoCacheEntry>> {
+        self.get_repo_cache_entry(repo_id).await
+    }
+
+    /// Resolve one change's exact repository tree against a generation the
+    /// caller already holds, reusing this generation's default-ref tree when
+    /// that is the change being asked for (FIR-2924).
+    ///
+    /// Reuse is keyed on the generation and not on elapsed time. The entry that
+    /// owns the tree is bound to the publication cursor it was recovered at,
+    /// and [`Self::get_repo_cache_entry`] replaces the entry whenever that
+    /// cursor moves, so a newly published change can never be answered from a
+    /// tree resolved before it. There is no separate invalidation to keep in
+    /// step, which is the point: the only way to serve a stale tree is to serve
+    /// a stale generation, and that is already the thing the cursor probe
+    /// exists to prevent.
+    pub(crate) fn repository_resolved_tree(
+        &self,
+        generation: &HostedRepoCacheEntry,
+        change_id: &kin_model::SemanticChangeId,
+    ) -> Result<Arc<kin_model::ResolvedTree>> {
+        if !generation.is_default_ref_head(change_id) {
+            self.repository_read_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            return without_blocking_runtime_worker(|| generation.graph.resolve_tree_at(change_id))
+                .map(Arc::new)
+                .map_err(DaemonError::from);
+        }
+
+        // The lock is taken inside this and not only the resolve. Two
+        // concurrent reads of one head should replay that history once rather
+        // than twice, so the second waits; a waiter that blocked a runtime
+        // worker while it waited would starve the pool the resolve was moved
+        // off in the first place. Nothing is awaited while the lock is held.
+        without_blocking_runtime_worker(|| {
+            let mut slot = generation
+                .default_ref_tree
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(tree) = slot.as_ref() {
+                self.repository_read_cache_hits
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok(Arc::clone(tree));
+            }
+            let tree = Arc::new(
+                generation
+                    .graph
+                    .resolve_tree_at(change_id)
+                    .map_err(DaemonError::from)?,
+            );
+            *slot = Some(Arc::clone(&tree));
+            self.repository_read_cache_misses
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(tree)
+        })
     }
 
     #[cfg(test)]
