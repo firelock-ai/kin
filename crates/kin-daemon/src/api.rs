@@ -2188,13 +2188,6 @@ fn router_with_auth_and_shutdown_internal(
     publication_control_auth_token: Option<String>,
     shutdown: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Router {
-    // Checked here rather than inside `router_with_rotation_tokens`, because
-    // this is the last point that holds both tokens in plaintext.
-    assert_publication_control_auth(
-        &state,
-        auth_token.as_deref(),
-        publication_control_auth_token.as_deref(),
-    );
     // A single token is a closed rotation window, which is the ordinary state.
     // Every existing caller and test keeps this signature; only the serve path
     // resolves a superseded token as well.
@@ -2206,35 +2199,6 @@ fn router_with_auth_and_shutdown_internal(
     // record from the layout's own state directory.
     let tokens = crate::auth_rotation::RotationTokens::primary_only(auth_token);
     router_with_rotation_tokens(state, tokens, publication_control_auth_token, shutdown)
-}
-
-/// The two hosted publication-control tokens must both be present and distinct.
-///
-/// Separate from the router constructors because it needs both plaintexts, and
-/// they are only both in hand on the paths that BUILD the token set, never
-/// after. `RotationTokens` keeps digests, and its one comparison, `classify`,
-/// counts a superseded accept as a side effect, so it is not something a
-/// constructor may call to answer this.
-fn assert_publication_control_auth(
-    state: &DaemonState,
-    auth_token: Option<&str>,
-    publication_control_auth_token: Option<&str>,
-) {
-    if state.publication_control.is_none() {
-        return;
-    }
-    assert!(
-        auth_token.is_some(),
-        "hosted graph publication control requires daemon authentication"
-    );
-    assert!(
-        publication_control_auth_token.is_some(),
-        "hosted graph publication control requires administrator authentication"
-    );
-    assert_ne!(
-        auth_token, publication_control_auth_token,
-        "hosted graph publication control administrator authentication must be distinct from ordinary daemon authentication"
-    );
 }
 
 fn router_with_rotation_tokens(
@@ -16781,16 +16745,6 @@ pub async fn serve_bound_with_shutdown(
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<()> {
     let publication_control_auth_token = publication_control_auth_token_from_env();
-    // Only on the hosted path, so the primary is not resolved twice on an
-    // ordinary serve: `resolve_serve_rotation_tokens` resolves it again below,
-    // and that call provisions the loopback token when no env token is set.
-    if state.publication_control.is_some() {
-        assert_publication_control_auth(
-            &state,
-            resolve_serve_auth_token(&state.layout).as_deref(),
-            publication_control_auth_token.as_deref(),
-        );
-    }
     let tokens = resolve_serve_rotation_tokens(&state.layout).map_err(|error| {
         // A refusal here stops the daemon starting, which is deliberate: the two
         // refused configurations both mean the operator believes a rotation
@@ -42410,11 +42364,11 @@ mod tests {
         assert_eq!(accepted.status(), StatusCode::OK);
     }
 
-    // Adopted verbatim from lane review-1227auth. Deleting either
-    // `assert_publication_control_auth` call site leaves every other test in
-    // this file green; only these two arms catch it, and they catch different
-    // ones because the wrapper and the serve path reach the constructor by
-    // different routes.
+    // Adopted from lane review-1227auth, with their message assertions
+    // re-pointed. There is one distinctness guard, in
+    // `router_with_rotation_tokens`. These two arms prove the wrapper path and
+    // the serve path each REACH it, which is what a second entry point can
+    // still be wrong about once the guard itself has its own test.
 
     /// A hosted state, so the publication-control constructor assertions are
     /// reachable at all. Returns the tempdirs because dropping them removes the
@@ -42486,21 +42440,16 @@ mod tests {
             .cloned()
             .or_else(|| error.downcast_ref::<&str>().map(|text| text.to_string()))
             .unwrap_or_default();
-        // The exact message, and the OTHER guard's absence. Both guards refuse
-        // this pairing, so a `contains` on shared wording is satisfied by either
-        // and neither test can then say which one fired. That is what let the
-        // reviewer delete this call site with every test still green.
+        // There is ONE distinctness guard now, in `router_with_rotation_tokens`.
+        // This arm no longer proves a wrapper-local check exists; it proves the
+        // wrapper PATH reaches the guard, which is a different claim and the
+        // only one it can still make honestly.
         assert!(
             message.contains(
-                "hosted graph publication control administrator authentication must be distinct \
-                 from ordinary daemon authentication"
+                "hosted graph publication control administrator authentication must not be any \
+                 token this daemon accepts, the superseded one included"
             ),
-            "the refusal must be the wrapper's distinctness assertion; got {message}"
-        );
-        assert!(
-            !message.contains("must not be any token this daemon accepts"),
-            "this arm must be caught by the wrapper, not by the constructor guard behind it; \
-             got {message}"
+            "the wrapper path must reach the router's distinctness guard; got {message}"
         );
 
         // Control: distinct tokens must BUILD, or the arm above would pass on a
@@ -42590,11 +42539,6 @@ mod tests {
             ),
             "the refusal must be the constructor guard, which is the only one that sees the \
              superseded token; got {message}"
-        );
-        assert!(
-            !message.contains("must be distinct from ordinary daemon authentication"),
-            "the wrapper guard cannot see this pairing, so a refusal carrying its wording would \
-             mean the arm is proving the wrong thing; got {message}"
         );
 
         // The primary is refused by the same check, so neither configured token
