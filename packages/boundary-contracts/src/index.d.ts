@@ -695,6 +695,50 @@ export interface RepositoryTransferReceipt {
   };
 }
 
+/**
+ * One leaf of the hosted repository-v6 transfer seam, as the contract declares
+ * it. `requestKeys` is the exact top-level key set of the request body, and
+ * `responseKeys` the exact top-level key set the client deserializes.
+ */
+export interface HostedRepositoryTransferLeaf {
+  leaf: "advertise" | "status" | "export" | "receive";
+  method: "GET" | "POST";
+  requestKeys: string[];
+  responseKeys: string[];
+}
+
+export interface HostedRepositoryTransferRefusal {
+  status: number;
+  reason: string;
+}
+
+/**
+ * The hosted transfer seam a `kin push` and a `kin pull` address, and the one
+ * KinLab serves. Read it rather than spelling the route or the envelope keys
+ * again.
+ */
+export interface HostedRepositoryTransferSeam {
+  protocol: "kin-repository-v6-fast-forward";
+  schemaVersion: 4;
+  routeTemplate: string;
+  authorizationScheme: "Bearer";
+  orgScoped: true;
+  leaves: HostedRepositoryTransferLeaf[];
+  expectationKeys: string[];
+  limitsKeys: string[];
+  refusals: HostedRepositoryTransferRefusal[];
+}
+
+export declare function hostedRepositoryTransferSeam(): Promise<HostedRepositoryTransferSeam>;
+export declare function hostedRepositoryTransferLeaf(
+  leaf: string
+): Promise<HostedRepositoryTransferLeaf>;
+export declare function hostedRepositoryTransferPath(
+  orgId: string,
+  repoId: string,
+  leaf: string
+): Promise<string>;
+
 export interface RepositoryTransferPublishRequest {
   pack: RepositoryTransferPack;
   publishReviewState: boolean;

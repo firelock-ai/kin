@@ -7,7 +7,15 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { assertContract, loadAllSchemas, validateContract } from '../src/index.js';
+import {
+  assertContract,
+  hostedRepositoryTransferLeaf,
+  hostedRepositoryTransferPath,
+  hostedRepositoryTransferSeam,
+  loadAllSchemas,
+  loadSchema,
+  validateContract
+} from '../src/index.js';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = path.resolve(packageRoot, '../..');
@@ -496,4 +504,206 @@ test('shadow gate report contract accepts the kin review shadow payload shape', 
   const malformedHash = structuredClone(report);
   malformedHash.changed_artifacts[0].new.entry.hash.pop();
   assert.equal((await validateContract('shadowGateReport', malformedHash)).ok, false);
+});
+
+/**
+ * Read the top-level field names of one `pub struct` out of the Rust source.
+ *
+ * The names are the wire names only while nothing renames them, so the caller
+ * checks that separately; this returns the declaration as written.
+ */
+function rustStructFields(source, name) {
+  const opening = `pub struct ${name} {`;
+  const start = source.indexOf(opening);
+  if (start < 0) {
+    return null;
+  }
+  const end = source.indexOf('\n}', start);
+  if (end < 0) {
+    return null;
+  }
+  const body = source.slice(start + opening.length, end);
+  return {
+    body,
+    fields: [...body.matchAll(/^ {4}pub ([a-z0-9_]+):/gm)].map(match => match[1])
+  };
+}
+
+/** The same for one `export interface` in the TypeScript declarations. */
+function declaredInterfaceFields(declarations, name) {
+  const opening = `export interface ${name} {`;
+  const start = declarations.indexOf(opening);
+  if (start < 0) {
+    return null;
+  }
+  const end = declarations.indexOf('\n}', start);
+  if (end < 0) {
+    return null;
+  }
+  const body = declarations.slice(start + opening.length, end);
+  return [...body.matchAll(/^ {2}([a-z0-9_]+)\??:/gm)].map(match => match[1]);
+}
+
+test('the hosted transfer seam is one contract three implementations read', async () => {
+  const seam = await hostedRepositoryTransferSeam();
+  const [declarations, transferSource] = await Promise.all([
+    fs.readFile(path.join(packageRoot, 'src/index.d.ts'), 'utf8'),
+    fs.readFile(
+      path.join(repositoryRoot, 'crates/kin-remote/src/repository_transfer.rs'),
+      'utf8'
+    )
+  ]);
+
+  // The extractors must be shown to work before an empty result is read as
+  // agreement. A struct that does not exist returns null rather than [], and a
+  // struct that does returns a field this test names.
+  assert.equal(
+    rustStructFields(transferSource, 'RepositoryTransferNotAStruct'),
+    null,
+    'the Rust extractor must miss a struct that does not exist'
+  );
+  assert.ok(
+    rustStructFields(transferSource, 'RepositoryTransferStatus').fields.includes(
+      'push_apply_ready'
+    ),
+    'the Rust extractor must find a field the struct is known to declare'
+  );
+  assert.equal(
+    declaredInterfaceFields(declarations, 'RepositoryTransferNotAnInterface'),
+    null,
+    'the TypeScript extractor must miss an interface that does not exist'
+  );
+
+  // Each leaf's response envelope, against the Rust struct that produces it and
+  // the TypeScript interface that describes it. The three key sets are compared
+  // to the contract rather than to each other, so no two of them can agree on a
+  // name the contract never had.
+  const responseTypes = {
+    advertise: 'RepositoryRefAdvertisement',
+    status: 'RepositoryTransferStatus',
+    export: 'RepositoryTransferPack',
+    receive: 'RepositoryTransferReceipt'
+  };
+  const declaredHere = new Set([
+    'RepositoryTransferStatus',
+    'RepositoryTransferPack',
+    'RepositoryTransferReceipt'
+  ]);
+
+  assert.deepEqual(
+    seam.leaves.map(leaf => leaf.leaf).sort(),
+    Object.keys(responseTypes).sort(),
+    'every contract leaf needs a response type, and every response type a leaf'
+  );
+
+  for (const leaf of seam.leaves) {
+    const typeName = responseTypes[leaf.leaf];
+    const rust = rustStructFields(transferSource, typeName);
+    assert.ok(rust, `${typeName} must remain readable in the Rust authority`);
+    assert.equal(
+      rust.body.includes('rename'),
+      false,
+      `${typeName} renames a field, so its declared names are no longer its wire names`
+    );
+    assert.deepEqual(
+      rust.fields,
+      leaf.responseKeys,
+      `${typeName} and the ${leaf.leaf} response envelope must carry the same keys in the same order`
+    );
+
+    if (declaredHere.has(typeName)) {
+      assert.deepEqual(
+        declaredInterfaceFields(declarations, typeName),
+        leaf.responseKeys,
+        `the ${typeName} declaration and the ${leaf.leaf} response envelope must carry the same keys`
+      );
+    }
+  }
+
+  // The two request members that carry a shape of their own.
+  const expectation = rustStructFields(transferSource, 'RepositoryTransferExpectation');
+  assert.deepEqual(expectation.fields, seam.expectationKeys);
+  const limits = rustStructFields(transferSource, 'RepositoryTransferLimits');
+  assert.deepEqual(limits.fields, seam.limitsKeys);
+  assert.deepEqual(
+    declaredInterfaceFields(declarations, 'RepositoryTransferLimits'),
+    seam.limitsKeys
+  );
+
+  // The constants both sides stamp on every envelope.
+  const protocol = transferSource.match(
+    /pub const REPOSITORY_TRANSFER_PROTOCOL: &str = "([^"]+)";/
+  );
+  assert.ok(protocol, 'the Rust protocol constant must remain readable');
+  assert.equal(protocol[1], seam.protocol);
+  const version = transferSource.match(
+    /pub const REPOSITORY_TRANSFER_SCHEMA_VERSION: u32 = (\d+);/
+  );
+  assert.ok(version, 'the Rust schema version constant must remain readable');
+  assert.equal(Number(version[1]), seam.schemaVersion);
+});
+
+test('the hosted transfer route is built from the contract, and refuses what it cannot address', async () => {
+  const seam = await hostedRepositoryTransferSeam();
+  assert.equal(seam.orgScoped, true);
+  assert.equal(seam.authorizationScheme, 'Bearer');
+  assert.equal(
+    seam.routeTemplate,
+    '/api/v1/orgs/{orgId}/repos/{repoId}/transfer/{leaf}',
+    'the org-scoped route is the seam; a bare repository id names no organization'
+  );
+
+  assert.equal(
+    await hostedRepositoryTransferPath('kin-open-core', 'kin', 'receive'),
+    '/api/v1/orgs/kin-open-core/repos/kin/transfer/receive'
+  );
+  // A repository id admits a slash. An unencoded one would address a route the
+  // caller never asked for, which is a silent cross-repository write.
+  assert.equal(
+    await hostedRepositoryTransferPath('acme', 'group/repo name', 'status'),
+    '/api/v1/orgs/acme/repos/group%2Frepo%20name/transfer/status'
+  );
+
+  await assert.rejects(
+    () => hostedRepositoryTransferPath('acme', 'kin', 'zzznotaleaf'),
+    /serves no leaf zzznotaleaf/,
+    'a leaf the contract does not declare must refuse rather than build a URL'
+  );
+  await assert.rejects(
+    () => hostedRepositoryTransferPath('', 'kin', 'status'),
+    /non-empty orgId/,
+    'an empty organization must refuse rather than address /orgs//repos/'
+  );
+  await assert.rejects(
+    () => hostedRepositoryTransferLeaf('advertize'),
+    /serves no leaf advertize/
+  );
+
+  // Every method and request envelope the seam declares, so a leaf cannot
+  // quietly change verb or lose a body key.
+  assert.deepEqual(
+    seam.leaves.map(leaf => [leaf.leaf, leaf.method, leaf.requestKeys.join(',')]),
+    [
+      ['advertise', 'GET', ''],
+      ['status', 'POST', 'destination_ref'],
+      ['export', 'POST', 'source_ref,expectation'],
+      ['receive', 'POST', 'destination_ref,pack']
+    ]
+  );
+
+  // The refusal statuses the seam promises, each with a sentence. The client
+  // renders `error` verbatim, so a refusal with no body is a refusal a user
+  // cannot act on.
+  assert.deepEqual(
+    seam.refusals.map(refusal => refusal.status),
+    [401, 403, 404, 409, 413, 422, 424]
+  );
+  for (const refusal of seam.refusals) {
+    assert.ok(refusal.reason.length > 0, `refusal ${refusal.status} needs a reason`);
+  }
+  // The refusal body itself. The client prints `error` verbatim, so a schema
+  // that stopped requiring it would let a server refuse with no sentence.
+  const schema = await loadSchema('hostedRepositoryTransfer');
+  assert.deepEqual(schema.definitions.refusal.required, ['error']);
+  assert.equal(schema.definitions.refusal.properties.error.minLength, 1);
 });
