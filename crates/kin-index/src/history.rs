@@ -41,14 +41,21 @@ use crate::pipeline::IndexPipeline;
 /// they did, bump this constant and the manifest's recorded version together.
 /// Never regenerate a digest silently.
 ///
-/// This constant is a declaration, not an enforcement point. Nothing persists
-/// it beside a graph and nothing compares it when one is opened, and no path
-/// re-derives historical deltas for a repository that was already admitted, so
-/// bumping it does not invalidate, migrate, or re-enrich an existing graph. A
-/// repository admitted under an earlier version keeps whatever its past was
-/// authored to contain until it is admitted again, and reports nothing about
-/// which version authored it. Coupling the dial to graph authority so a
-/// version gap can be detected and refused is open follow-up work.
+/// This constant is now persisted and compared, and it is still not an
+/// enforcement point. `kin_core::hydration_semantics` records its value into
+/// every store at creation and compares the record when a store is read, so
+/// `kin graph status`, `kin doctor` and the `_kin` envelope all disclose a gap
+/// between what a store was created under and what this build derives. Native
+/// transfer carries no version beside the history it moves, so admitting a pack
+/// durably discards the receiver's creation record rather than letting it stand
+/// in for transported provenance.
+///
+/// What bumping the dial still does not do: no path re-derives historical
+/// deltas for a repository that was already admitted, so a bump invalidates,
+/// migrates and re-enriches nothing. A repository admitted under an earlier
+/// version keeps whatever its past was authored to contain until it is admitted
+/// again. Carrying the authoring version on the wire, automatic re-derivation,
+/// migration and refusing to answer over a gap all remain open follow-up work.
 pub const HYDRATION_SEMANTICS_VERSION: u32 = 10;
 
 /// Semantic graph delta derived for one pre-enrichment change identity.

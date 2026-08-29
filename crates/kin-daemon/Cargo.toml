@@ -60,6 +60,7 @@ hex = { workspace = true }
 sha2 = { workspace = true }
 socket2 = { workspace = true }
 async-stream = "0.3"
+base64 = "0.23"
 tar = { workspace = true }
 flate2 = { workspace = true }
 zip = { workspace = true }
@@ -94,7 +95,6 @@ kin-infer = { version = ">=0.2.1", registry = "kin", features = ["metal"] }
 
 [dev-dependencies]
 async-trait = "0.1"
-base64 = "0.23"
 futures-util = "0.3"
 kin-core = { workspace = true, features = ["test-support"] }
 kin-git = { workspace = true, features = ["test-support"] }

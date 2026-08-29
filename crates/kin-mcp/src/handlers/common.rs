@@ -24,7 +24,7 @@ thread_local! {
 }
 
 use super::repository_authority::{
-    ActiveRepositoryAuthority, RequestRepositoryAuthority, WorkspaceReadSample,
+    ActiveRepositoryAuthority, AuthorityHeadReadSample, RequestRepositoryAuthority,
 };
 use crate::error::{McpError, Result};
 
@@ -1930,7 +1930,7 @@ pub fn span_source_coherence(
 /// open would have produced at the instant it sampled the publication.
 ///
 /// Reusing one sample is also strictly MORE coherent than re-sampling per
-/// entity. [`WorkspaceReadSample`] exists because pairing a tree from one
+/// entity. [`AuthorityHeadReadSample`] exists because pairing a tree from one
 /// generation with provenance from another is a real defect; sampling once per
 /// entity reintroduced exactly that hazard across a result set, where page 1 of
 /// a response could describe a generation page 40 no longer read from.
@@ -1940,7 +1940,7 @@ pub fn span_source_coherence(
 /// authority error, so constructing a session neither opens authority nor
 /// replays anything.
 ///
-/// [`WorkspaceReadSample`]: super::repository_authority::WorkspaceReadSample
+/// [`AuthorityHeadReadSample`]: super::repository_authority::AuthorityHeadReadSample
 pub struct HeldSourceAuthority<'store, G: GraphStore> {
     store: &'store G,
     source: Option<RequestRepositoryAuthority>,
@@ -1948,7 +1948,7 @@ pub struct HeldSourceAuthority<'store, G: GraphStore> {
     /// every entity that needs authority reports the same gap this session hit,
     /// instead of re-attempting a recovery that already failed.
     authority: std::sync::OnceLock<std::result::Result<Arc<ActiveRepositoryAuthority>, String>>,
-    head_sample: std::sync::OnceLock<std::result::Result<Arc<WorkspaceReadSample>, String>>,
+    head_sample: std::sync::OnceLock<std::result::Result<Arc<AuthorityHeadReadSample>, String>>,
     graph_at: Mutex<HashMap<SemanticChangeId, Arc<kin_model::graph::ResolvedGraphState>>>,
     tree_at: Mutex<HashMap<SemanticChangeId, Arc<kin_model::ResolvedTree>>>,
     /// Replays this session actually performed, as opposed to served from its
@@ -1994,6 +1994,26 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
         self.store
     }
 
+    /// Read one immutable body through THIS REQUEST's source capability.
+    ///
+    /// The opened authority is shared by every request reading at the same
+    /// publication, so it is the wrong place for a per-request byte allowance
+    /// and deliberately carries none. Reading a blob straight off it walks
+    /// around whatever ceiling the caller derived, which is how a hosted route
+    /// could bound its response and not its reads. The request capability is
+    /// the one that holds the allowance, so the read goes through it whenever
+    /// there is one.
+    fn load_source_blob(
+        &self,
+        authority: &ActiveRepositoryAuthority,
+        digest: Hash256,
+    ) -> Result<Arc<Vec<u8>>> {
+        match self.source.as_ref() {
+            Some(source) => source.load_source_blob(authority, digest),
+            None => authority.load_source_blob(digest).map(Arc::new),
+        }
+    }
+
     fn authority(&self) -> Result<&ActiveRepositoryAuthority> {
         match self.authority.get_or_init(|| {
             let source = self.source.as_ref().ok_or_else(|| {
@@ -2009,7 +2029,7 @@ impl<'store, G: GraphStore> HeldSourceAuthority<'store, G> {
     }
 
     /// The one instant of workspace authority this request reads at.
-    fn workspace_sample(&self) -> Result<&WorkspaceReadSample> {
+    fn workspace_sample(&self) -> Result<&AuthorityHeadReadSample> {
         match self.head_sample.get_or_init(|| {
             self.authority()
                 .and_then(|authority| authority.workspace_sample())
@@ -2085,7 +2105,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
     held: &HeldSourceAuthority<'_, G>,
     entity: &Entity,
     scope: EntitySourceScope,
-) -> Result<Option<(ExactEntitySource, Vec<u8>, SourceSpan)>> {
+) -> Result<Option<(ExactEntitySource, Arc<Vec<u8>>, SourceSpan)>> {
     LAST_READ_SOURCE.with(|f| f.set("unknown"));
 
     let Some(recorded_span) = entity.span.as_ref() else {
@@ -2134,13 +2154,12 @@ fn resolve_entity_source_authority<G: GraphStore>(
             // the change id from another let a response pair generation N's bytes
             // with generation N+1's provenance, with nothing serializing the two.
             let sample = held.workspace_sample()?;
-            let workspace = &sample.workspace;
             // Absence from the current tree is graph truth answering, not
             // authority failing: the store carries history, and a file deleted
             // or renamed upstream is legitimately not here. Typed apart from a
             // gap so a multi-entity projection can skip THIS candidate while a
             // genuinely unservable path below still fails the read.
-            let artifact = workspace
+            let artifact = sample
                 .tree
                 .artifact_at_path(&path)
                 .cloned()
@@ -2148,24 +2167,24 @@ fn resolve_entity_source_authority<G: GraphStore>(
                     entity_absent_at_generation(
                         entity,
                         &recorded_origin.0,
-                        workspace.generation,
-                        workspace.workspace_id,
+                        sample.generation,
+                        &sample.label,
                     )
                 })?;
-            let source_change_id = sample.base_change_id;
+            let source_change_id = sample.source_change_id;
 
             // Report what these bytes actually are. The exact tree includes
             // uncommitted state, so it is only the committed state at base when
             // it still hashes to the tree at base; otherwise no change contains
             // it and the answer says so instead of naming one.
-            let provenance = if workspace.base_tree_hash == Some(workspace.tree_hash) {
+            let provenance = if sample.committed {
                 SourceProvenance::Committed {
                     change_id: source_change_id,
                 }
             } else {
                 SourceProvenance::Workspace {
-                    tree_hash: workspace.tree_hash,
-                    generation: workspace.generation,
+                    tree_hash: sample.tree_hash,
+                    generation: sample.generation,
                     base_change_id: source_change_id,
                 }
             };
@@ -2329,7 +2348,7 @@ fn resolve_entity_source_authority<G: GraphStore>(
             span_source_coherence(entity, &hash, &recorded_origin.0)?
         }
     };
-    let bytes = authority.load_source_blob(hash).map_err(|error| {
+    let bytes = held.load_source_blob(authority, hash).map_err(|error| {
         graph_source_gap(format!(
             "blob {hash} for entity {} artifact {:?} is unavailable or corrupt: {error}",
             entity.id, current_artifact.artifact_id

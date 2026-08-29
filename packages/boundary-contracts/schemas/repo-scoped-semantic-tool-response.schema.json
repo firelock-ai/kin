@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/repo-scoped-semantic-tool-response",
+  "description": "Successful hosted semantic tool result bound to one exact repository authority publication.",
+  "type": "object",
+  "required": ["schema_version", "capability", "repository", "name", "result"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "capability": { "const": "repo_scoped_semantic_tools_v1" },
+    "repository": {
+      "type": "object",
+      "required": ["repo_id", "snapshot_identity", "graph_root", "selected_change_id"],
+      "properties": {
+        "repo_id": { "type": "string" },
+        "snapshot_identity": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "graph_root": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "selected_change_id": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      },
+      "additionalProperties": false
+    },
+    "name": {
+      "type": "string",
+      "enum": ["semantic_locate", "get_context_pack", "trace_data_flow"]
+    },
+    "result": {
+      "type": "object",
+      "required": ["content"],
+      "properties": {
+        "content": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["type", "text"],
+            "properties": {
+              "type": { "const": "text" },
+              "text": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "isError": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

@@ -1766,6 +1766,112 @@ mod tests {
         );
     }
 
+    /// A query-vector producer mismatch must reach the single verdict.
+    ///
+    /// The ruling is that a mismatch leaves the answer usable for ranking hints
+    /// and never certified: the vector half is not dropped, but `state` goes
+    /// inconclusive and `safe_to_conclude_absent` goes false while the mismatch
+    /// stands. That happens through `degradations`, and the fragile part is not
+    /// the array being non-empty, it is the label surviving
+    /// `describes_the_store_not_the_run`. The corpus-scale arm below is what
+    /// separates those two: it is a real degradation entry that must NOT move
+    /// the verdict, so if the producer arm refused merely because the array was
+    /// populated, that arm would refuse too.
+    ///
+    /// An authoritative absence object is supplied because
+    /// `safe_to_conclude_absent` is `false` on any answer that claims no
+    /// absence, whatever its quality. Without it the assertion below would read
+    /// false in every arm and prove nothing about the mismatch.
+    #[test]
+    fn a_query_producer_mismatch_leaves_the_answer_uncertified() {
+        let clean = || {
+            json!({
+                "references": [{"name": "caller"}],
+                "relation_kinds": ["calls"],
+                "counts": {"receiver_name_candidates": 0},
+                "degradations": [],
+                "edge_coverage": {
+                    "language": "Rust",
+                    "classes": {"calls": "present"},
+                    "reference_enrichment": "supported",
+                },
+            })
+        };
+        let absence = json!({"trust": "authoritative"});
+        let compute = |payload: &Value| {
+            Verdict::compute(
+                "find_references",
+                payload,
+                &Envelope::daemon(),
+                Some(&absence),
+            )
+            .expect("a retrieval payload carries a verdict")
+            .to_value()
+        };
+
+        // Control that must certify: nothing degraded.
+        let baseline = compute(&clean());
+        assert_eq!(baseline["state"], json!(CERTIFIED), "{baseline}");
+        assert_eq!(
+            baseline["safe_to_conclude_absent"],
+            json!(true),
+            "the baseline must certify its absence, or the mismatch arm below \
+             cannot show that the mismatch is what withdrew it: {baseline}"
+        );
+
+        // The reason string comes from the policy that produces it, so a rename
+        // there breaks this test instead of quietly decoupling the two.
+        let mismatch_reason = kin_core::vector_producer_policy::QueryProducerVerdict::Mismatched {
+            query: "metal".to_string(),
+            index: "cpu".to_string(),
+        }
+        .reason()
+        .expect("a mismatch names a machine reason");
+
+        let mut mismatched = clean();
+        mismatched["degradations"] =
+            json!([{"component": "vector_index", "reason": mismatch_reason}]);
+        let verdict = compute(&mismatched);
+        assert_eq!(verdict["state"], json!(INCONCLUSIVE), "{verdict}");
+        assert_eq!(
+            verdict["safe_to_conclude_absent"],
+            json!(false),
+            "{verdict}"
+        );
+        assert_eq!(
+            verdict["inputs"]["degradations"],
+            json!(INCONCLUSIVE),
+            "{verdict}"
+        );
+        let factor = verdict["limiting_factor"]
+            .as_str()
+            .expect("an inconclusive verdict names its factor");
+        assert!(
+            factor.contains("retrieval_degraded:"),
+            "the factor must carry the degradation clause: {factor}"
+        );
+        assert!(
+            factor.contains(mismatch_reason),
+            "the factor must name the producer mismatch itself: {factor}"
+        );
+
+        // The separating control: query-shape guidance is a real degradation
+        // entry that advises how to read the result rather than reporting a
+        // lost capability, so it must leave the verdict certified. If this went
+        // inconclusive, the arm above would prove only that the array was
+        // non-empty. The pair is read from the constants the exemption itself
+        // keys on, so a rename there breaks this control rather than silently
+        // turning it into a second copy of the arm above.
+        let mut corpus = clean();
+        corpus["degradations"] = json!([{
+            "component": crate::negative::QUERY_SHAPE_COMPONENT,
+            "reason": crate::negative::DESCRIPTION_ENTITY_RANKING_REASON,
+        }]);
+        let scaled = compute(&corpus);
+        assert_eq!(scaled["state"], json!(CERTIFIED), "{scaled}");
+        assert_eq!(scaled["safe_to_conclude_absent"], json!(true), "{scaled}");
+    }
+
     /// FIR-2496. The `edge_coverage` input used to answer `certified` for an
     /// observation that named no class to check, which is every observation a
     /// tool traversing no edge publishes. The shipped v0.5.43 verdict block read

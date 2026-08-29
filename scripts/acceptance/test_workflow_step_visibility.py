@@ -58,9 +58,19 @@ EXPECTED_SUITES = (
         "acceptance/response_budget.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/trace_spine_clipping_repro.py",
+        "trace_spine",
+        "acceptance/trace_spine.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/parse_hole_repro.py",
         "parsehole",
         "acceptance/parsehole.json",
+    ),
+    ExpectedSuite(
+        "scripts/acceptance/hydration_semantics_repro.py",
+        "hydration_semantics",
+        "acceptance/hydration_semantics.json",
     ),
     ExpectedSuite(
         "scripts/acceptance/same_owner_call_repro.py",

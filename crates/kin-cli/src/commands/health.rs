@@ -199,6 +199,7 @@ pub async fn run_health_checks() -> HealthReport {
     let graph_status = RunGraphStatus::for_run();
     checks.push(check_reference_edge_coverage(&graph_status).await);
     checks.push(check_relation_census(&graph_status).await);
+    checks.push(check_hydration_semantics());
     checks.push(check_parse_coverage(&graph_status).await);
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
@@ -4440,6 +4441,46 @@ fn check_host_memory_pressure(
         kin_core::memory_pressure::DaemonFootprint::read(layout.root()).as_ref(),
         embedding_coverage,
     )
+}
+
+/// Whether this store's creation-time replay version matches the one this
+/// binary carries.
+///
+/// Advisory in phase one. A gap is real and deserves a red row, but it does not
+/// mean the install or daemon is broken, so [`HealthStatus::Stale`] discloses it
+/// without making the aggregate readiness result fail.
+fn check_hydration_semantics() -> HealthCheck {
+    const ID: &str = "hydration_semantics";
+    const LABEL: &str = "Hydration semantics";
+    let cwd = env::current_dir().unwrap_or_default();
+    let Some(layout) = kin_core::KinLayout::discover(&cwd) else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "not in a Kin repository, so there is no store whose replay semantics can be compared",
+        );
+    };
+    hydration_semantics_check_for(&kin_core::hydration_semantics::standing(&layout))
+}
+
+/// Core of [`check_hydration_semantics`] with the standing as input, so every
+/// comparison branch is testable without creating a repository.
+fn hydration_semantics_check_for(
+    standing: &kin_core::hydration_semantics::HydrationStanding,
+) -> HealthCheck {
+    const ID: &str = "hydration_semantics";
+    const LABEL: &str = "Hydration semantics";
+    let status = if standing.is_gap() {
+        HealthStatus::Stale
+    } else {
+        HealthStatus::Healthy
+    };
+    let check = HealthCheck::new(ID, LABEL, status, standing.sentence());
+    match standing.remedy() {
+        Some(remedy) => check.with_manual_fix(remedy),
+        None => check,
+    }
 }
 
 /// Core of [`check_host_memory_pressure`] with both records and the exact
@@ -10713,6 +10754,67 @@ mod tests {
                 assert!(!blocks_readiness(&reported));
             }
         }
+    }
+
+    /// The hydration row is advisory but never vague: agreement is healthy,
+    /// every other standing is stale, and each gap keeps its direction-specific
+    /// remedy. `Stale` stays outside the aggregate readiness gate in phase one.
+    #[test]
+    fn the_hydration_semantics_row_separates_agreement_from_every_gap() {
+        use kin_core::hydration_semantics::HydrationStanding;
+
+        let current = hydration_semantics_check_for(&HydrationStanding::Current { version: 10 });
+        assert!(matches!(current.status, HealthStatus::Healthy));
+        assert!(current.manual_fix.is_none());
+        assert!(!blocks_readiness(&current));
+
+        let standing = HydrationStanding::Behind {
+            created_under: 9,
+            derives: 10,
+        };
+        let row = hydration_semantics_check_for(&standing);
+        assert!(matches!(row.status, HealthStatus::Stale), "{row:?}");
+        assert!(
+            row.manual_fix
+                .as_deref()
+                .is_some_and(|fix| fix.contains("re-ingest")),
+            "a store this build can repair needs the re-ingest remedy: {row:?}"
+        );
+        assert!(
+            !blocks_readiness(&row),
+            "phase-one disclosure must not turn a legacy store into a broken install"
+        );
+
+        for standing in [
+            HydrationStanding::Unstamped { derives: 10 },
+            HydrationStanding::Unreadable {
+                reason: "future schema".to_string(),
+                derives: 10,
+            },
+        ] {
+            let unknown = hydration_semantics_check_for(&standing);
+            assert!(matches!(unknown.status, HealthStatus::Stale));
+            let fix = unknown.manual_fix.as_deref().unwrap_or_default();
+            assert!(
+                fix.starts_with("upgrade Kin before changing this store"),
+                "unknown provenance must not trigger destructive advice: {unknown:?}"
+            );
+            assert!(fix.contains("separate fresh store"));
+            assert!(!blocks_readiness(&unknown));
+        }
+
+        let ahead = hydration_semantics_check_for(&HydrationStanding::Ahead {
+            created_under: 11,
+            derives: 10,
+        });
+        assert!(matches!(ahead.status, HealthStatus::Stale));
+        let fix = ahead.manual_fix.as_deref().unwrap_or_default();
+        assert!(fix.contains("upgrade this Kin build"), "{ahead:?}");
+        assert!(
+            !fix.contains("re-ingest the repository"),
+            "an older binary must not replace a store recorded under newer replay semantics: {ahead:?}"
+        );
+        assert!(!blocks_readiness(&ahead));
     }
 
     /// The row exists because every other row on the page reads healthy after a

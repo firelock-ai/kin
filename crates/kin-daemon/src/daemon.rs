@@ -4227,7 +4227,7 @@ pub async fn run_with_authority_on(
         if !embed_state.can_persist_embed_progress_locally() {
             retire_embed_pressure_for_unavailable_persistence(&embed_state);
             warn!(
-                "background embedding worker disabled: storage-backend graph authority has no durable vector-sidecar persistence contract; graph serving remains available"
+                "background embedding worker disabled: durable vector-artifact capability or its compare-and-swap cursor is unavailable; graph serving remains available"
             );
             return;
         }

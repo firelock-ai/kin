@@ -23,6 +23,7 @@ pub mod error;
 pub mod exact_tree;
 pub mod git_init;
 pub mod hooks;
+pub mod hydration_semantics;
 pub mod identity;
 pub mod init;
 pub mod init_attempt;
@@ -50,6 +51,7 @@ pub mod sync_state;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_env;
 pub mod tree;
+pub mod vector_producer_policy;
 pub mod workspace_carry;
 pub mod workspace_semantics;
 
