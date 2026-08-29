@@ -2570,6 +2570,12 @@ fn main() -> Result<()> {
     if let Ok(cwd) = std::env::current_dir() {
         kin_cli::resource_profile::apply_repository_profile_at(&cwd);
     }
+    // Put Kin's own tool directories on PATH while this process is still
+    // single-threaded, so a language server Kin provisioned is reachable by the
+    // `which` lookup enrichment discovery performs, and by the daemon this
+    // command may spawn, which inherits this environment. Appended rather than
+    // prepended: an operator's own toolchain outranks Kin's fallback copy.
+    kin_core::tool_prefix::augment_path_with_managed_tools();
     if kin_migrate::run_migration_process_host_if_requested()? {
         return Ok(());
     }

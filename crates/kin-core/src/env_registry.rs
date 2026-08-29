@@ -152,6 +152,8 @@ pub const OPERATIONAL: &[EnvVarSpec] = &[
     EnvVarSpec { name: "KIN_MANAGED_BIN", kind: Kind::Path, default: "", sensitivity: Sensitivity::Operational, summary: "explicit native Kin binary used by the @kinlab/kin launcher instead of provisioning" },
     EnvVarSpec { name: "KIN_NO_PROVISION", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "forbid network provisioning by the @kinlab/kin launcher" },
     EnvVarSpec { name: "KIN_LAUNCHER_ADOPT", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Operational, summary: "force the @kinlab/kin launcher to provision its pinned release, including an intentional downgrade" },
+    EnvVarSpec { name: "KIN_LANGUAGE_SERVER_ASSET_BASE", kind: Kind::Url, default: "GitHub Releases", sensitivity: Sensitivity::Operational, summary: "base URL the language-server release binaries are fetched from; set by acceptance checks to drive the standalone install against a fixture" },
+    EnvVarSpec { name: "KIN_LANGUAGE_SERVER_ASSET_SHA256", kind: Kind::Str, default: "", sensitivity: Sensitivity::Operational, summary: "sha256 an overridden language-server asset is verified against; IGNORED unless KIN_LANGUAGE_SERVER_ASSET_BASE is also set, so it can never relax the pinned release check" },
     // ---- correctness / retrieval-affecting ------------------------------------
     EnvVarSpec { name: "KIN_SEMLOC_RERANK", kind: Kind::Bool, default: "false", sensitivity: Sensitivity::Correctness, summary: "enable semantic-locate reranking of daemon locate results" },
     EnvVarSpec { name: "KIN_SEARCH_MODE", kind: Kind::OneOf(&["precise"]), default: "", sensitivity: Sensitivity::Correctness, summary: "search strictness; 'precise' rejects broad show-body searches" },

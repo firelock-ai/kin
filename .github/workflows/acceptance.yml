@@ -134,6 +134,16 @@ jobs:
       - name: Falsify the same-owner call graders
         run: python3 scripts/acceptance/same_owner_call_repro.py --self-test
 
+      # The 2026-08-28 cold walk. A stranger followed the documented install,
+      # initialized a Rust repository, got imports 0/1085, ran the repair the
+      # product named, and was told to install rustup. The grader is handed that
+      # exact refusal and has to fail on it. Its two failing branches carry
+      # different sentences and each gets an input only it can catch, because
+      # the text that shipped trips both and two branches that overlap hide each
+      # other's absence.
+      - name: Falsify the toolchain-free repair grader
+        run: python3 scripts/acceptance/first_contact_honesty.py --self-test
+
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
