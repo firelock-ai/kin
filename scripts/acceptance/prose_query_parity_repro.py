@@ -469,9 +469,15 @@ class Suite(object):
         index, not what it held before anything asked it anything, and reading it
         first would grade a moment no caller ever observes.
         """
-        arm = {"label": label, "pid": self.daemon_pid(), "answers": {}}
+        arm = {"label": label, "answers": {}}
         for query in (PROSE_QUERY, SYMBOL_QUERY, ABSENT_QUERY):
             arm["answers"][query] = self.locate_json(query)
+        # After the queries, for two reasons. `kin daemon status` reads recorded
+        # endpoints and starts nothing, so on the arm that follows
+        # `kin daemon stop` there is no daemon to name until a query has started
+        # one; and reading it here reports the process that actually answered
+        # rather than one that could have been replaced since.
+        arm["pid"] = self.daemon_pid()
         arm["support"] = self.support_json()
         return arm
 
@@ -488,6 +494,8 @@ class Suite(object):
             return self._arms
         try:
             self.build()
+            # The daemon the fixture was ingested through, named before the
+            # settle so the arm below can prove it is the same process.
             born = self.daemon_pid()
             # Past both flush intervals, so a divergence here is a state and not
             # a race the daemon closes on its own a second later.
