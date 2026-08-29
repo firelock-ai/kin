@@ -91,6 +91,13 @@ UNREADABLE = "UNREADABLE"
 
 TICKET_SILENCE = "FIR-2639"
 TICKET_EXIT = "FIR-2650"
+TICKET_REPORT = "FIR-2929"
+
+# What a seeded row says before its check answers. Named once, because the
+# self-test reads it back to prove `main` replaced the row rather than shipping
+# the placeholder, and a second spelling is how that assertion goes quietly
+# blind.
+PENDING_MARKER = "did not answer"
 
 CEILING_ENV = "KIN_INIT_MEMORY_CEILING_BYTES"
 
@@ -183,6 +190,114 @@ class Result(object):
                     return a["detail"]
         graded = [a["detail"] for a in self.asserts if a["status"] == PASS]
         return "; ".join(graded) if graded else "no assertion was reached"
+
+
+# ------------------------------------------------------------------ reporting
+
+
+def report_payload(rows, label, kin):
+    """The report shape `scripts/acceptance/gate.py` reads.
+
+    The key is `results` and not `checks`. That is not a style choice: the gate
+    calls `payload.get("results")` at `gate.py:98` and refuses anything else
+    with "carries no results list". This suite shipped keyed `checks`, which is
+    the third time that key has broken this gate; `same_owner_call_repro.py`
+    records the first and `working_copy_freshness_repro.py` the second.
+
+    What the third instance cost is worth writing down, because the failure is
+    quiet. Every acceptance run on main from kin#1232's squash `5088b0e4c`
+    onward carried this finding, while the suite itself printed five green
+    CHECK lines and exited 0. The step read fine, the log read fine, and the
+    only red surface said a report was unreadable. The run that opened FIR-2929
+    was read as a runner OOM, because the log carried `daemon exited during
+    startup with status signal: 9 (SIGKILL)`, which is the OOM signature; it
+    was check 4 signalling the daemon on purpose, which is the whole of what
+    check 4 does, and the daemon's own record beside it read `memory_kills=0`.
+
+    Written once here and read back through the gate's own loader by
+    `--self-test`, over rows this file's own writer produced, so a rename on
+    either side of that boundary fails here rather than on main.
+    """
+    return {
+        "suite": "init_budget_refusal",
+        "label": label,
+        "kin": kin,
+        "results": [{"id": r.id, "ticket": r.ticket, "title": r.title,
+                     "status": r.status, "detail": r.detail} for r in rows],
+    }
+
+
+def pending_row(check_id):
+    """The row a check that has not answered yet leaves in the report.
+
+    The gate's other refusal is an absent file, and the shape that produces one
+    is a report written once at the end: a suite the runner kills, or one that
+    returns early, leaves nothing, and "no report at acceptance/init_budget.json"
+    is an absence that reads exactly like every other absence. So every selected
+    check has a row from the moment the report path is known, and each is
+    replaced as its check answers.
+
+    UNREADABLE rather than FAIL, because a check that never ran did not fail;
+    the gate treats both as red and only one of them is true.
+    """
+    row = Result(check_id, TICKET_REPORT, "check %s has not answered" % check_id)
+    row.unknown("check %s %s: this suite was interrupted before it graded, so "
+                "the report carries the row and not the verdict"
+                % (check_id, PENDING_MARKER))
+    return row
+
+
+class Reporter(object):
+    """Keeps `--json` on disk and current, rather than writing it once at exit.
+
+    Rewritten in full after every check, because a partial report the gate can
+    read is worth more than a complete one it never receives. The write is
+    atomic through a sibling temp file so a kill mid-write cannot leave the
+    gate half a JSON document, which is the one failure that would read as
+    "not JSON" rather than as an interrupted run.
+    """
+
+    def __init__(self, path, label, kin):
+        self.path = path
+        self.label = label
+        self.kin = kin
+        self.rows = []
+
+    def seed(self, check_ids):
+        self.rows = [pending_row(cid) for cid in check_ids]
+        self.flush()
+
+    def setup_error(self, detail):
+        """The row a run that never reached a check leaves behind.
+
+        A setup failure used to return before the report was written, so the
+        gate said the file was missing and named nothing. One FAIL row saying
+        what went wrong is strictly more than that.
+        """
+        row = Result("setup", TICKET_REPORT, "the suite could not start")
+        row.bad(detail)
+        self.rows = [row]
+        self.flush()
+
+    def record(self, result):
+        for index, row in enumerate(self.rows):
+            if row.id == result.id:
+                self.rows[index] = result
+                break
+        else:
+            self.rows.append(result)
+        self.flush()
+
+    def flush(self):
+        if not self.path:
+            return
+        payload = report_payload(self.rows, self.label, self.kin)
+        tmp = "%s.partial" % self.path
+        with open(tmp, "w") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, self.path)
 
 
 # ------------------------------------------------------------------- grading
@@ -546,9 +661,15 @@ def self_test():
     """
     failures = []
 
+    # Counted rather than remembered. The tally this used to print was a
+    # hardcoded 14 against twelve assertions, and a number nobody measures is a
+    # number that drifts the moment an assertion is added or dropped.
     def expect(condition, message):
+        expect.count += 1
         if not condition:
             failures.append(message)
+
+    expect.count = 0
 
     complete = (
         "this conversion needs more memory than this container has: about 108.9 GB against 8.0 GB\n"
@@ -600,12 +721,199 @@ def self_test():
     expect(len(CHECKS) == len({check_id for check_id, _ in CHECKS}),
            "two checks share an id, so one of them cannot be selected")
 
+    failures += grade_report_shape(expect)
+
     for failure in failures:
         print("SELFTEST FAIL %s" % failure)
     if failures:
         return 1
-    print("SELFTEST PASS %d assertions over %d checks" % (14, len(CHECKS)))
+    print("SELFTEST PASS %d assertions over %d checks" % (expect.count, len(CHECKS)))
     return 0
+
+
+def load_gate():
+    """`scripts/acceptance/gate.py`, imported from beside this file.
+
+    Imported rather than reimplemented. A copy of the gate's rules in this file
+    would pass on the day the gate's rules changed, which is the whole failure
+    being guarded against, one level up.
+    """
+    import importlib.util
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("acceptance_gate", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def grade_report_shape(expect):
+    """Drive this suite's own report through the gate's own loader.
+
+    The defect this exists for grades nothing in the suite: every check passed,
+    every CHECK line printed, the process exited 0, and the verdict step could
+    not read the file. A self-test that only grades graders cannot see that, and
+    for three suites in this directory it did not.
+
+    So the assertions here are about the join between two files rather than
+    about either one. `Reporter` is what `main` writes with, `gate.load_report`
+    is what the workflow reads with, and neither key is spelled a second time
+    here: the ids come from CHECKS, and the statuses come back off the loaded
+    rows. Renaming the key on either side turns this red.
+
+    Three arms:
+
+      * the writer `main` uses produces rows the gate reads, with the ids and
+        the statuses intact;
+      * CONTROL, the `checks`-keyed shape that shipped is still refused, or the
+        first arm would pass over any payload at all;
+      * `main` is wired to that writer, proven by running this file as a
+        subprocess down a path that returns before any check and requiring a
+        readable report to exist afterwards. Deleting the `reporter` calls from
+        `main` leaves the first two arms green, measured.
+    """
+    problems = []
+    gate = load_gate()
+    if gate is None:
+        return ["gate.py is not beside this file, so the report shape went unchecked"]
+
+    scratch = tempfile.mkdtemp(prefix="kin-init-budget-selftest-")
+    try:
+        # Arm 1. The writer main uses, over one row per real check.
+        written = os.path.join(scratch, "report.json")
+        reporter = Reporter(written, "selftest", "/nonexistent/kin")
+        reporter.seed([check_id for check_id, _ in CHECKS])
+        graded = Result(CHECKS[0][0], TICKET_REPORT, "a check that answered")
+        graded.ok("this row was graded")
+        reporter.record(graded)
+        try:
+            rows = gate.load_report(written)
+        except Exception as error:  # noqa: BLE001 - the refusal is the finding
+            problems.append("the gate refused this suite's own report: %s" % error)
+            rows = {}
+        expect(sorted(rows) == sorted(check_id for check_id, _ in CHECKS),
+               "the gate read %s out of this suite's report, not %s"
+               % (sorted(rows), sorted(check_id for check_id, _ in CHECKS)))
+        # Against the GATE's vocabulary, never this file's. `PASS` here and the
+        # `PASS` that produced the row are one module global, so comparing them
+        # is comparing a constant to itself and a rename of this suite's three
+        # status names sails through. Measured: renamed to PASSED/FAILED/UNKNOWN
+        # with gate.py untouched, this self-test stayed green at 18 assertions
+        # while the real gate reported "carries status 'PASSED', which this gate
+        # does not recognize" five times. That is this PR's own defect one field
+        # over.
+        expect(rows.get(CHECKS[0][0], {}).get("status") == gate.PASS,
+               "the gate did not read a graded row's status back as its own %s"
+               % gate.PASS)
+        expect(rows.get(CHECKS[-1][0], {}).get("status") == gate.UNREADABLE,
+               "the gate did not read an unanswered row back as its own %s"
+               % gate.UNREADABLE)
+
+        # And through `decide`, which is where the vocabulary is actually
+        # enforced. `load_report` accepts any status string; only `decide` says
+        # "carries status %r, which this gate does not recognize". A report whose
+        # every row passed must produce no findings, or this suite is writing
+        # words the gate will refuse on a run where nothing is wrong.
+        all_pass = os.path.join(scratch, "all-pass.json")
+        passing = Reporter(all_pass, "selftest", "/nonexistent/kin")
+        rows_out = []
+        for check_id, _ in CHECKS:
+            row = Result(check_id, TICKET_REPORT, "a check that answered")
+            row.ok("graded")
+            rows_out.append(row)
+        passing.rows = rows_out
+        passing.flush()
+        try:
+            findings, _notes = gate.decide({"init_budget": gate.load_report(all_pass)}, {})
+        except Exception as error:  # noqa: BLE001 - a refusal is the finding
+            findings = ["the gate could not decide this suite's report: %s" % error]
+        expect(findings == [],
+               "the gate does not recognize what this suite writes on a clean "
+               "run: %s" % "; ".join(findings)[:300])
+
+        # Arm 2, the control. The shape that shipped must still be refused, or
+        # arm 1 proves only that the gate accepts something.
+        shipped = os.path.join(scratch, "shipped.json")
+        with open(shipped, "w") as handle:
+            json.dump({"suite": "init_budget_refusal",
+                       "checks": [{"id": check_id, "status": PASS, "detail": "green"}
+                                  for check_id, _ in CHECKS]}, handle)
+        try:
+            gate.load_report(shipped)
+            refused = None
+        except Exception as error:  # noqa: BLE001 - the refusal is what is wanted
+            refused = str(error)
+        # Matched on the key this suite owns, not on the gate's sentence. A
+        # reword of `gate.py`'s message that still refuses would otherwise turn
+        # this red under a CONTROL label saying the gate stopped refusing, which
+        # points the next reader at the wrong file.
+        expect(refused is not None and "results" in refused,
+               "CONTROL the gate no longer refuses the `checks`-keyed shape that "
+               "broke every acceptance run on main, so arm 1 grades nothing")
+
+        # Arm 3. That main writes through that writer at all, which neither arm
+        # above can see. `--only` naming no real check returns 3 before any
+        # fixture is built, so this costs a process and no binary.
+        from_main = os.path.join(scratch, "from-main.json")
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__),
+             "--kin", sys.executable, "--json", from_main,
+             "--only", "no-such-check-id"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=120)
+        expect(proc.returncode == 3,
+               "a run selecting no checks exited %d, not 3" % proc.returncode)
+        if not os.path.exists(from_main):
+            problems.append("main returned before writing a report, so the gate would "
+                            "see an absent file and name nothing about why")
+        else:
+            try:
+                setup_rows = gate.load_report(from_main)
+            except Exception as error:  # noqa: BLE001
+                problems.append("the gate could not read the report main wrote on a "
+                                "setup error: %s" % error)
+                setup_rows = {}
+            expect(any(row.get("status") == gate.FAIL for row in setup_rows.values()),
+                   "main's setup-error report carries no FAIL row, so a suite that "
+                   "never started would read as one that graded nothing")
+
+        # Arm 4. That a check which ANSWERS replaces its seeded row. Arm 3 only
+        # ever reaches `setup_error`, so deleting `reporter.record` from the
+        # check loop leaves every arm above green while the report ships the
+        # pending placeholders: five green CHECK lines, exit 0, and five
+        # UNREADABLE rows to the gate. Measured, and it is the same shape as the
+        # defect this file exists to fix.
+        #
+        # A stub `kin` rather than a real one, because the question is whether
+        # the row was replaced, not what it was replaced with. Check 0 grades the
+        # stub's silence as a FAIL and that is a graded row.
+        stub = os.path.join(scratch, "kin-stub")
+        with open(stub, "w") as handle:
+            handle.write("#!/bin/sh\nexit 9\n")
+        os.chmod(stub, 0o755)
+        answered_path = os.path.join(scratch, "answered.json")
+        subprocess.run(
+            [sys.executable, os.path.abspath(__file__),
+             "--kin", stub, "--json", answered_path, "--only", CHECKS[0][0]],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+        if not os.path.exists(answered_path):
+            problems.append("a run of check %s wrote no report at all" % CHECKS[0][0])
+        else:
+            try:
+                answered = gate.load_report(answered_path)
+            except Exception as error:  # noqa: BLE001
+                problems.append("the gate could not read the report a graded run "
+                                "wrote: %s" % error)
+                answered = {}
+            row = answered.get(CHECKS[0][0], {})
+            expect(bool(row) and PENDING_MARKER not in str(row.get("detail", "")),
+                   "check %s ran and the report still carries its seeded placeholder, "
+                   "so main graded a check and never recorded it: %s"
+                   % (CHECKS[0][0], str(row.get("detail"))[:160]))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return problems
 
 
 # ----------------------------------------------------------------------- main
@@ -630,57 +938,99 @@ def main(argv):
     if args.self_test:
         return self_test()
 
+    # The report exists from here on, whatever happens next. A suite that
+    # returns early, raises, or is signalled used to leave the gate an absent
+    # file, and "no report at acceptance/init_budget.json" names nothing about
+    # why. Every path below writes rows instead.
+    reporter = Reporter(args.json_path, args.label,
+                        os.path.abspath(args.kin) if args.kin else None)
+
     if not args.kin:
-        print("setup: no kin binary given; pass --kin or set KIN_BIN")
+        detail = "no kin binary given; pass --kin or set KIN_BIN"
+        print("setup: %s" % detail)
+        reporter.setup_error(detail)
         return 3
     kin = os.path.abspath(args.kin)
     if not os.path.isfile(kin) or not os.access(kin, os.X_OK):
-        print("setup: %s is not an executable file" % kin)
+        detail = "%s is not an executable file" % kin
+        print("setup: %s" % detail)
+        reporter.setup_error(detail)
         return 3
 
     selected = [(cid, fn) for cid, fn in CHECKS if not args.only or cid in args.only]
     if not selected:
-        print("setup: --only selected no checks out of %s"
-              % ", ".join(cid for cid, _ in CHECKS))
+        detail = ("--only selected no checks out of %s"
+                  % ", ".join(cid for cid, _ in CHECKS))
+        print("setup: %s" % detail)
+        reporter.setup_error(detail)
         return 3
 
+    reporter.seed([cid for cid, _ in selected])
     workdir = tempfile.mkdtemp(prefix="kin-init-budget-")
+
+    # A cancelled or timed-out job sends SIGTERM, and the rows already on disk
+    # are the last thing worth saving. SIGKILL cannot be caught by anything and
+    # is not claimed to be: what the seeded rows buy against a SIGKILL is that
+    # the report is already there, carrying UNREADABLE rows for whatever had
+    # not answered.
+    #
+    # Installed after the workdir exists so it can remove it. `os._exit` runs no
+    # `finally`, so a handler that did not clean up here would strand a fixture
+    # tree on every interrupted run, which the plain KeyboardInterrupt this
+    # replaces did not.
+    def _flush_and_die(signum, _frame):
+        reporter.flush()
+        if not args.keep:
+            shutil.rmtree(workdir, ignore_errors=True)
+        print("CHECK - %s %s the suite was signalled (%d) before every check answered"
+              % (TICKET_REPORT, UNREADABLE, signum))
+        os._exit(2)
+
+    for signame in ("SIGTERM", "SIGINT"):
+        if hasattr(signal, signame):
+            try:
+                signal.signal(getattr(signal, signame), _flush_and_die)
+            except (ValueError, OSError):
+                pass  # not the main thread, or a platform without it
+
     results = []
     try:
         suite = Suite(kin, workdir, verbose=args.verbose)
         for check_id, check in selected:
             try:
-                results.append(check(suite))
+                result = check(suite)
             except Exception as error:  # a check that threw graded nothing
-                broken = Result(check_id, TICKET_SILENCE, "check %s raised" % check_id)
-                broken.unknown("check %s raised %s: %s"
+                result = Result(check_id, TICKET_SILENCE, "check %s raised" % check_id)
+                result.unknown("check %s raised %s: %s"
                                % (check_id, type(error).__name__, error))
-                results.append(broken)
+            results.append(result)
+            reporter.record(result)
     finally:
+        # The fixture tree goes first. A flush that raised ahead of the rmtree
+        # would strand the tree and swallow the CHECK-line loop below, and the
+        # old `finally` held only the rmtree.
         if not args.keep:
             shutil.rmtree(workdir, ignore_errors=True)
+        reporter.flush()
 
     for result in results:
         print("CHECK %s %s %s %s" % (result.id, result.ticket, result.status, result.detail))
 
     # The ids that answered must be the ids that were asked for. A suite that
-    # graded fewer checks than it was given prints a clean tally otherwise.
+    # graded fewer checks than it was given prints a clean tally otherwise. The
+    # mismatch is a row in the report as well as a line on stdout, because this
+    # used to return before the report was written and the gate then said the
+    # file was missing rather than that the suite graded the wrong things.
     asked = [cid for cid, _ in selected]
     answered = [result.id for result in results]
     if asked != answered:
-        print("CHECK - - %s asked for %s and %s answered"
-              % (UNREADABLE, ",".join(asked), ",".join(answered)))
+        detail = ("asked for %s and %s answered"
+                  % (",".join(asked), ",".join(answered)))
+        print("CHECK - - %s %s" % (UNREADABLE, detail))
+        mismatch = Result("asked", TICKET_REPORT, "the ids asked for are the ids that answered")
+        mismatch.unknown(detail)
+        reporter.record(mismatch)
         return 2
-
-    if args.json_path:
-        with open(args.json_path, "w") as handle:
-            json.dump({
-                "suite": "init_budget_refusal",
-                "label": args.label,
-                "kin": kin,
-                "checks": [{"id": r.id, "ticket": r.ticket, "title": r.title,
-                            "status": r.status, "detail": r.detail} for r in results],
-            }, handle, indent=2)
 
     if any(result.status == FAIL for result in results):
         return 1
