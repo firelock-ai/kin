@@ -284,6 +284,14 @@ class Suite(object):
         Its own repository because check 24 grades the words `kin locate` and
         `kin deps` print, and an earlier check's rename or commit inside a
         shared fixture would move them.
+
+        Carries one module the shared shapes do not, `pkg/overview.py`, whose
+        prose is what check 24's off-topic arm queries against, and it ends by
+        stopping the daemon `kin init` started. See [OVERVIEW_PY] for why an arm
+        about the answer floor needs a query that retrieves rows rather than one
+        the corpus cannot answer at all, and the comment on the stop for why a
+        lexical question needs a daemon that was not the one `kin init` left
+        behind.
         """
         self.git(["init", "-q", "."], repo)
         self._write(repo, ".gitignore", "*.db\n__pycache__/\n")
@@ -298,6 +306,22 @@ class Suite(object):
         self._kin_commit(repo, "Add storage module")
         self._write(repo, "pkg/linkgraph.py", LINKGRAPH_PY)
         self._kin_commit(repo, "Add link graph module")
+        self._write(repo, "pkg/overview.py", OVERVIEW_PY)
+        self._kin_commit(repo, "Add the package overview")
+        # Stop the daemon `kin init` started, and that line is load-bearing.
+        # Measured on this binary, in this fixture shape: against the daemon
+        # `kin init` starts, `locate describe_layers` returns `pkg/overview.py`
+        # as a named match while `locate socket`, a word only that file's
+        # docstring holds, returns `No relevant files found.`; run
+        # `kin daemon stop` and the same lexical query returns the row. So that
+        # daemon answers from entity resolution and has no text index to answer
+        # a purely lexical question from. Check 24's off-topic arm asks exactly
+        # such a question, and without this line it can never see a row.
+        #
+        # It is also the truer shape. A stranger installs, runs `kin init`, and
+        # asks their first question later, against a daemon some later command
+        # started, which is the state every arm here now reads.
+        self.kin_run(["daemon", "stop"], repo)
 
     def _build_rename(self, repo):
         """The incremental shape again, in its own repository.
@@ -700,6 +724,31 @@ def main():
     db = Database(":memory:")
     db.ingest_dir({"a.md": "hello #tag b|c"})
     return LinkGraph.from_db(db).backlinks("b")
+'''
+
+# Prose the answersurface fixture carries and no symbol in it is named
+# after. Check 24's off-topic arm needs a query that RETRIEVES and still names
+# nothing: with KIN_DAEMON_AUTO_EMBED=0 there is no vector index, so a query
+# whose words are absent from the corpus entirely retrieves no rows at all and
+# the arm has nothing to grade. Words that live only in prose give lexical
+# retrieval something to find while leaving every row a text fallback, which is
+# the state the answer floor exists to report and the state a stranger asking an
+# English question lands in.
+#
+# `socket`, `server`, `network` and `deployment` appear here and nowhere else in
+# this fixture, and this module defines no symbol by any of those names.
+OVERVIEW_PY = '''"""How this package fits together, for a reader arriving cold.
+
+The reading layer turns raw text into records, the holding layer keeps those
+records in memory, and the traversal layer walks between them.
+
+Nothing here opens a socket or speaks to a server over the network, so there is
+no deployment step and nothing to keep running between calls.
+"""
+
+
+def describe_layers():
+    return "reading, holding, traversal"
 '''
 
 ADAPTER_PY = '''class Adapter:
@@ -3481,9 +3530,21 @@ def check_24(suite):
         res.ok("a query that names a symbol gets a named row: %s"
                % (labelled[0].strip()[:160] if labelled else rows.splitlines()[0][:160]))
 
-    # The control: a question this repository has no answer to. The rows that
-    # come back must not look like the rows above.
-    rc_o, out_o, err_o = suite.kin_run(["locate", "Router path_router axum tower"], repo)
+    # The control: a question whose words this repository's prose carries and
+    # whose symbols it does not. Only `pkg/overview.py` says socket, server,
+    # network or deployment, and it defines none of them, so every row that
+    # comes back is a nearest neighbour rather than a match. That is the state
+    # the answer floor exists to report, and it is the state a stranger asking
+    # an English question lands in.
+    #
+    # It used to query `Router path_router axum tower`, words this fixture
+    # carries nowhere at all. With KIN_DAEMON_AUTO_EMBED=0 there is no vector
+    # index, so a query absent from the corpus retrieves nothing at all,
+    # `No relevant files found.` is the honest answer, and this arm graded
+    # nothing on every run it ever had. An arm about what the rows say needs
+    # rows.
+    rc_o, out_o, err_o = suite.kin_run(
+        ["locate", "socket server network deployment"], repo)
     off = strip_ansi(out_o)
     off_notes = strip_ansi(err_o)
     off_rows = [line for line in off.splitlines() if line.strip() and "[" in line]
@@ -3496,7 +3557,9 @@ def check_24(suite):
         # fail; the floor note itself is pinned by `answer_floor_note`'s unit
         # test in crates/kin-cli/src/commands/locate.rs.
         res.unknown("the off-topic control returned no rows, so the answer-floor note had "
-                    "nothing to fire on and this arm graded nothing: %r" % off[:200])
+                    "nothing to fire on and this arm graded nothing; `pkg/overview.py` "
+                    "carries every word of that query and should have been retrieved: %r"
+                    % off[:200])
     elif any("[named match]" in line for line in off_rows):
         res.unknown("the off-topic control named a symbol this fixture holds, so it is not "
                     "off-topic here: %s" % off[:300])
