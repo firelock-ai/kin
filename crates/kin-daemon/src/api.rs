@@ -38141,13 +38141,25 @@ mod tests {
             "eight sequential admission reads at one publication must load the authority zero              further times; each load decodes the whole store and re-verifies every CAS body"
         );
 
+        // The concurrent arm gets a COLD state of its own, and that is the
+        // whole point of it. Written against the warm state above, eight tasks
+        // all hit the populated slot and never reach the load gate, so removing
+        // the gate left it green across three runs: an arm that could not fail
+        // for the reason it was written. Cold, the eight race into an empty
+        // slot and only the gate holds them to one load between them.
+        let cold = test_state();
+        install_repository_file(&cold, "src/lib.py", b"def handler():\n    return 1\n");
+        cold.is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let cold_before = cold.projection_authority.loads();
+
         // No join_all: this crate carries futures-util rather than futures, and
         // a hand-rolled join needs no dependency at all here.
         let mut tasks = Vec::new();
         for call in 0..8 {
-            let state = Arc::clone(&state);
+            let cold = Arc::clone(&cold);
             tasks.push(tokio::task::spawn_blocking(move || {
-                cached_authority_admission(&state)
+                cached_authority_admission(&cold)
                     .map(|_| call)
                     .map_err(|(_, message)| format!("concurrent call {call} failed: {message}"))
             }));
@@ -38158,9 +38170,11 @@ mod tests {
                 .expect("every concurrent call must succeed");
         }
         assert_eq!(
-            state.projection_authority.loads(),
-            before,
-            "eight CONCURRENT admission reads at one publication must still load zero further              times; a burst that each misses and opens is the shape this cache exists to stop"
+            cold.projection_authority.loads(),
+            cold_before + 1,
+            "eight CONCURRENT admission reads racing into a COLD slot must pay one load between \
+             them, not one each; the load gate is what makes that true, and this is the only \
+             arm that can watch it go"
         );
     }
 
