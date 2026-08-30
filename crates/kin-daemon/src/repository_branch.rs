@@ -1064,7 +1064,13 @@ fn switch(
     )
     .with_context(|| format!("validate exact workspace projection before moving onto {name}"))?;
     if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::projection_conflict(format!(
+        // Tracked drift by construction, which the comment above states as this
+        // reader's contract: it reads only paths the workspace tree already
+        // tracks, and untracked host paths are never read. Naming the kind here
+        // is what lets one admission pass clear this refusal, and the aggregate
+        // is where it has to be named, because the per-path kinds are collected
+        // as messages and this error is a new one built from them.
+        return Err(kin_core::KinError::tracked_projection_drift(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
              reconcile them into graph authority or discard them {}",
             drift.len(),
