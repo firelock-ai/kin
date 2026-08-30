@@ -46,7 +46,7 @@ pub use backend::{
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };
-pub use format::{CompactionStats, GraphSnapshot, WorkspaceGraphFacts};
+pub use format::{AuthorityEnvelopeSnapshot, CompactionStats, GraphSnapshot, WorkspaceGraphFacts};
 #[cfg(feature = "gcs")]
 pub use gcs::GcsBackend;
 pub use gcs_compatibility::{
@@ -62,8 +62,8 @@ pub use merkle::{
 };
 pub use repository::{
     ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze, PersistedRepositoryAuthority,
-    PreparedWorkspaceGraphStats, RepositoryAuthorityManager, RepositoryAuthorityState,
-    WorkspaceAdmissionSnapshot, PREPARED_WORKSPACE_GRAPH_VERSION,
+    PreparedWorkspaceGraphStats, RepositoryAuthorityManager, RepositoryAuthorityMetadata,
+    RepositoryAuthorityState, WorkspaceAdmissionSnapshot, PREPARED_WORKSPACE_GRAPH_VERSION,
 };
 #[cfg(feature = "vector")]
 pub use snapshot::{

@@ -1563,6 +1563,120 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
     }
 }
 
+/// The repository-authority envelope alone, decoded without materializing the
+/// history the same bytes carry.
+///
+/// A converted repository's snapshot IS its history: on psf/requests at 6493
+/// commits the `changes` map dominates a 1051 MiB body, and decoding it costs
+/// gigabytes of resident set. A caller that only needs the envelope, which is
+/// where refs, workspaces, admission state and the roots live, was paying all
+/// of it. `kin graph status` is such a caller: it opens the whole authority to
+/// read one workspace tree and then load a handful of bodies by content
+/// address.
+///
+/// The body is compact MessagePack, so a struct is a positional ARRAY and the
+/// only way to reach field 33 is to walk the thirty-three ahead of it. Walking
+/// them as [`IgnoredAny`] parses the bytes and allocates nothing, which is the
+/// same trade [`LocateGraphSnapshot`] already makes for cold-start locate.
+///
+/// This is a projection, never a substitute for an authority open. It proves
+/// the frame and its checksum exactly as a full decode does, so tampered bytes
+/// still refuse, and every body it later hands a caller is verified against its
+/// own content address by the backend that returns it. What it deliberately
+/// does not do is re-verify bodies nobody asked for.
+#[derive(Debug, Clone)]
+pub struct AuthorityEnvelopeSnapshot {
+    /// The on-disk format version these bytes declared.
+    pub version: u32,
+    /// The envelope. `None` is a legacy graph-only snapshot with no authority.
+    pub repository_authority: Option<PersistedRepositoryAuthority>,
+}
+
+impl AuthorityEnvelopeSnapshot {
+    /// Decode the envelope from a checksum-verified snapshot frame.
+    pub fn from_bytes(data: &[u8]) -> Result<Self, crate::error::KinDbError> {
+        let frame = {
+            let _span = tracing::info_span!("kindb.snapshot.decode_envelope_frame").entered();
+            GraphSnapshot::decode_frame(data, true)?
+        };
+        match frame.version {
+            GraphSnapshot::CURRENT_VERSION => {
+                let _span = tracing::info_span!("kindb.snapshot.decode_envelope").entered();
+                rmp_serde::from_slice(frame.body).map_err(|e| {
+                    crate::error::KinDbError::StorageError(format!(
+                        "authority envelope decode failed: {e}"
+                    ))
+                })
+            }
+            _ => unreachable!("decode_frame validates supported versions"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct AuthorityEnvelopeVisitor;
+
+        impl<'de> Visitor<'de> for AuthorityEnvelopeVisitor {
+            type Value = AuthorityEnvelopeSnapshot;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("GraphSnapshot sequence")
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                // Width is the format discriminator, exactly as it is for
+                // `LocateGraphSnapshot`. The eleven-field locate projection
+                // carries no envelope at all, so it is refused by name here
+                // rather than silently decoding as an absent authority.
+                if seq.size_hint() != Some(GRAPH_SNAPSHOT_FIELD_COUNT) {
+                    return Err(serde::de::Error::invalid_length(
+                        seq.size_hint().unwrap_or_default(),
+                        &self,
+                    ));
+                }
+
+                let version = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(0, &self))?;
+                for index in 1..REPOSITORY_AUTHORITY_FIELD_INDEX {
+                    let _: IgnoredAny = seq
+                        .next_element()?
+                        .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+                }
+                let repository_authority = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(REPOSITORY_AUTHORITY_FIELD_INDEX, &self)
+                })?;
+                let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
+                    serde::de::Error::invalid_length(REPOSITORY_AUTHORITY_FIELD_INDEX + 1, &self)
+                })?;
+
+                Ok(AuthorityEnvelopeSnapshot {
+                    version,
+                    repository_authority,
+                })
+            }
+        }
+
+        deserializer.deserialize_seq(AuthorityEnvelopeVisitor)
+    }
+}
+
+/// Fields in the v13 positional body, and where the envelope sits in it.
+///
+/// Named constants rather than literals because two decoders and one
+/// round-trip proof have to agree about the same array, and a field appended to
+/// `GraphSnapshot` moves the envelope. `the_envelope_index_names_the_authority`
+/// pins both against the struct itself.
+pub(crate) const GRAPH_SNAPSHOT_FIELD_COUNT: usize = 35;
+pub(crate) const REPOSITORY_AUTHORITY_FIELD_INDEX: usize = 33;
+
 struct SnapshotFrame<'a> {
     version: u32,
     body: &'a [u8],
@@ -2121,6 +2235,116 @@ mod tests {
             )
         });
         assert_eq!(proof.version, snapshot.version);
+    }
+
+    #[test]
+    fn the_envelope_decode_reads_the_same_authority_the_full_decode_reads() {
+        // This is what pins REPOSITORY_AUTHORITY_FIELD_INDEX to the struct
+        // rather than to a comment. The envelope decoder walks thirty-three
+        // fields as IgnoredAny and then parses the thirty-fourth as an
+        // `Option<PersistedRepositoryAuthority>`. Pointed one field either way
+        // it would be parsing `entity_revisions` or `external_references`,
+        // which are maps, and a struct is a positional array, so the decode
+        // fails loudly instead of returning a wrong envelope.
+        let mut snapshot = GraphSnapshot::empty();
+        let repository_id = RepositoryId::new("envelope-index-test").expect("repository id");
+        snapshot.repository_authority = Some(
+            PersistedRepositoryAuthority::empty(repository_id.clone(), &snapshot)
+                .expect("an empty authority is constructible"),
+        );
+        let bytes = snapshot.to_bytes().expect("serializes");
+
+        let envelope = AuthorityEnvelopeSnapshot::from_bytes(&bytes).expect("the envelope decodes");
+        assert_eq!(envelope.version, snapshot.version);
+        assert_eq!(
+            envelope.repository_authority, snapshot.repository_authority,
+            "the envelope must be the authority the full decode reads, field for field"
+        );
+
+        let full = GraphSnapshot::from_bytes(&bytes).expect("the full decode accepts these bytes");
+        assert_eq!(envelope.repository_authority, full.repository_authority);
+    }
+
+    #[test]
+    fn the_envelope_constants_match_the_encoded_snapshot() {
+        // The arity half of the same tripwire. A field appended to
+        // GraphSnapshot moves the envelope, and this fails on the count before
+        // anyone debugs a decode error.
+        let snapshot = GraphSnapshot::empty();
+        let body = rmp_serde::to_vec(&snapshot).expect("empty snapshot serializes");
+        assert_eq!(
+            encoded_field_count(&body),
+            GRAPH_SNAPSHOT_FIELD_COUNT,
+            "GraphSnapshot's encoded arity moved; the envelope decoder's field \
+             indices are stale"
+        );
+        assert!(
+            REPOSITORY_AUTHORITY_FIELD_INDEX < GRAPH_SNAPSHOT_FIELD_COUNT,
+            "the envelope index must name a field that exists"
+        );
+    }
+
+    #[test]
+    fn the_envelope_decode_reports_an_absent_authority_as_absent() {
+        // The negative arm. A legacy graph-only snapshot has no envelope, and
+        // that has to read as None rather than as an error or as an empty
+        // authority. Without this the test above passes with a decoder that
+        // returns whatever it finds.
+        let snapshot = GraphSnapshot::empty();
+        assert!(snapshot.repository_authority.is_none());
+        let bytes = snapshot
+            .to_bytes_pre_validated()
+            .expect("an authority-free snapshot serializes");
+        let envelope = AuthorityEnvelopeSnapshot::from_bytes(&bytes).expect("the envelope decodes");
+        assert!(
+            envelope.repository_authority.is_none(),
+            "an absent authority must read as absent"
+        );
+    }
+
+    #[test]
+    fn the_envelope_decode_refuses_a_locate_projection() {
+        // The eleven-field locate cache is a current format that carries no
+        // envelope. Decoding it as one would report every locate cache as an
+        // authority-free repository, so the width is checked by name.
+        let locate = LocateGraphSnapshot {
+            version: GraphSnapshot::CURRENT_VERSION,
+            entities: Default::default(),
+            relations: Default::default(),
+            changes: Default::default(),
+            entity_revisions: Default::default(),
+            shallow_files: Vec::new(),
+            file_layouts: Vec::new(),
+            structured_artifacts: Vec::new(),
+            opaque_artifacts: Vec::new(),
+            resolved_tree: ResolvedTree::default(),
+            external_references: Default::default(),
+        };
+        let body = rmp_serde::to_vec(&locate).expect("the locate projection serializes");
+        assert_eq!(encoded_field_count(&body), 11);
+        assert!(
+            rmp_serde::from_slice::<AuthorityEnvelopeSnapshot>(&body).is_err(),
+            "an eleven-field locate body is not an authority envelope"
+        );
+    }
+
+    #[test]
+    fn the_envelope_decode_still_verifies_the_checksum() {
+        // Named the same way its sibling above is named, and for the same
+        // reason: a corrupted body also breaks the decode, so `is_err()` alone
+        // would pass with checksum verification switched off and prove nothing.
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes_pre_validated().expect("serializes");
+        let mut corrupt = bytes.clone();
+        let body_start = 16;
+        assert!(corrupt.len() > body_start, "body must exist to corrupt");
+        corrupt[body_start] ^= 0xff;
+        let error = AuthorityEnvelopeSnapshot::from_bytes(&corrupt)
+            .expect_err("a corrupted body must be refused");
+        assert!(
+            error.to_string().contains("checksum"),
+            "the refusal must be the checksum's, not the decoder's: {error}"
+        );
     }
 
     #[test]

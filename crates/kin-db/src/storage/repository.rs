@@ -554,7 +554,10 @@ pub struct PersistedRepositoryAuthority {
 }
 
 impl PersistedRepositoryAuthority {
-    fn empty(repository_id: RepositoryId, snapshot: &GraphSnapshot) -> Result<Self, KinDbError> {
+    pub(crate) fn empty(
+        repository_id: RepositoryId,
+        snapshot: &GraphSnapshot,
+    ) -> Result<Self, KinDbError> {
         let mut authority = Self {
             schema_version: REPOSITORY_AUTHORITY_SCHEMA_VERSION,
             repository_id,
@@ -1896,6 +1899,277 @@ impl StorageBackend for FrozenLocalBodyBackend<'_> {
 
     fn list_repos(&self) -> Result<Vec<String>, KinDbError> {
         Err(Self::unsupported("repository listing"))
+    }
+}
+
+/// Walk the acknowledged journal forward onto an envelope read on its own.
+///
+/// An authority whose acknowledged head is past its snapshot base has an
+/// envelope that lives partly in frames, and reading the base alone would serve
+/// a superseded envelope as current. The frames are where that is cheap to fix:
+/// on a converted psf/requests store the base snapshot is 1051.5 MiB and one
+/// frame is about a megabyte, so replaying the journal onto the envelope costs
+/// a thousandth of what decoding the base again costs.
+///
+/// `Ok(None)` means this journal cannot be walked cheaply and correctly, and
+/// the caller must open in full. Each such case is named in a log line rather
+/// than silently declined, because an unexplained fallback is indistinguishable
+/// from a fallback that never happens.
+///
+/// The chain rules are the ones recovery applies to the same journal: strictly
+/// ordered generations, no gaps between the base and the head, and entries
+/// staged past the head skipped rather than attached, since a writer that died
+/// before its record rename leaves exactly that. On top of them,
+/// [`AuthorityFrame::apply_to_envelope`] refuses any frame whose `roots_before`
+/// is not the envelope it is being applied to, so a frame walked onto the wrong
+/// base cannot produce a plausible wrong envelope; it refuses.
+fn advance_envelope_over_journal(
+    repository_id: &RepositoryId,
+    mut envelope: PersistedRepositoryAuthority,
+    journal: &[crate::storage::backend::PersistedDelta],
+    base_generation: Generation,
+    head_generation: Generation,
+) -> Result<Option<PersistedRepositoryAuthority>, KinDbError> {
+    if base_generation == head_generation {
+        return Ok(Some(envelope));
+    }
+    if base_generation > head_generation {
+        return Err(storage(format!(
+            "repository {repository_id} snapshot base generation {base_generation} exceeds acknowledged head {head_generation}"
+        )));
+    }
+
+    let mut acknowledged: Vec<(&[u8], Generation)> = Vec::new();
+    let mut expected = base_generation.checked_add(1).ok_or_else(|| {
+        storage(format!(
+            "repository {repository_id} generation counter overflowed walking its journal"
+        ))
+    })?;
+    let mut previous: Option<Generation> = None;
+    for (bytes, generation) in journal {
+        let generation = *generation;
+        if previous.is_some_and(|prev| generation <= prev) {
+            tracing::debug!(
+                repository = %repository_id,
+                generation,
+                "authority envelope read declined: the journal is not strictly ordered"
+            );
+            return Ok(None);
+        }
+        previous = Some(generation);
+        if generation <= base_generation {
+            continue;
+        }
+        if generation > head_generation {
+            // Staged past the head by a writer that did not commit. Recovery
+            // warns and ignores it; so does this.
+            continue;
+        }
+        if generation != expected {
+            tracing::debug!(
+                repository = %repository_id,
+                expected,
+                found = generation,
+                "authority envelope read declined: the journal has a gap"
+            );
+            return Ok(None);
+        }
+        expected = generation.saturating_add(1);
+        acknowledged.push((bytes.as_slice(), generation));
+    }
+
+    let reached = acknowledged
+        .last()
+        .map_or(base_generation, |(_, generation)| *generation);
+    if reached != head_generation {
+        tracing::debug!(
+            repository = %repository_id,
+            reached,
+            head = head_generation,
+            "authority envelope read declined: the journal does not reach the acknowledged head"
+        );
+        return Ok(None);
+    }
+
+    for (bytes, generation) in &acknowledged {
+        if !crate::storage::authority_frame::AuthorityFrame::is_frame_bytes(bytes) {
+            // An envelope-bearing authority advances only through frames, and
+            // recovery refuses the mixed case outright. Declining here hands
+            // that refusal to the full open rather than duplicating it.
+            tracing::debug!(
+                repository = %repository_id,
+                generation,
+                "authority envelope read declined: the journal carries an entry that is not an authority frame"
+            );
+            return Ok(None);
+        }
+        let frame = crate::storage::authority_frame::AuthorityFrame::from_bytes(bytes)
+            .map_err(|error| {
+                storage(format!(
+                    "repository {repository_id} authority frame at generation {generation} is unreadable: {error}"
+                ))
+            })?;
+        envelope = frame.apply_to_envelope(envelope).map_err(|error| {
+            storage(format!(
+                "repository {repository_id} authority frame at generation {generation} does not apply to the envelope: {error}"
+            ))
+        })?;
+    }
+    Ok(Some(envelope))
+}
+
+/// The repository-authority envelope, opened without materializing the history.
+///
+/// A full [`RepositoryAuthorityManager::open`] decodes every domain the
+/// snapshot carries, replays history when no durable validation record covers
+/// the exact bytes, and re-verifies every persisted body against its content
+/// address. On a converted repository that is the whole store: 6493 commits of
+/// psf/requests produce a 1051 MiB snapshot whose `changes` map dominates it.
+///
+/// A caller that reads the envelope and then loads a few bodies by content
+/// address needs none of that. `kin graph status` is the case that forced this
+/// open: it takes one workspace tree out of the envelope and loads the bodies
+/// its structured facets name, and it was paying a whole-store open per cold
+/// request to do it.
+///
+/// What this still proves, so nobody reads it as a weakened boundary:
+///
+/// - The snapshot frame and its checksum are verified exactly as a full decode
+///   verifies them, so tampered or truncated bytes refuse here too.
+/// - The authority digest is checked against the durable authority record by
+///   the backend load this is built on.
+/// - Every body [`Self::load_source_blob`] returns is re-verified against its
+///   own content address at this boundary, byte for byte, by the same code the
+///   manager uses.
+///
+/// What it deliberately does not do is re-verify the bodies nobody asked for.
+/// That sweep is a whole-store integrity audit; it belongs to an open that
+/// intends to serve the store, not to a read of two fields. `open` keeps it,
+/// unconditionally, and so does the freeze path.
+///
+/// This refuses rather than guesses in the one case it cannot answer: an
+/// authority whose acknowledged journal head is past its snapshot base has an
+/// envelope that lives partly in unapplied frames, and reading the base alone
+/// would serve a superseded envelope as current. That returns `None`, which
+/// means "take the full open", never a wrong answer.
+pub struct RepositoryAuthorityMetadata<B: StorageBackend + ?Sized> {
+    repository_id: RepositoryId,
+    backend: Arc<B>,
+    metadata: PersistedRepositoryAuthority,
+    generation: Generation,
+}
+
+impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
+    /// Read the envelope for `repository_id`, or `None` when a full open is
+    /// required to answer correctly.
+    ///
+    /// `None` has exactly three producers and each is a "cannot answer cheaply"
+    /// rather than an error: no persisted authority exists yet, the acknowledged
+    /// journal head is past the snapshot base, or the snapshot carries no v13
+    /// envelope. A caller treats all three the same way, by opening in full.
+    pub fn open(repository_id: RepositoryId, backend: Arc<B>) -> Result<Option<Self>, KinDbError> {
+        let started = std::time::Instant::now();
+        let (Some(authority), journal) = backend.load_recovery_state(repository_id.as_str())?
+        else {
+            return Ok(None);
+        };
+        let read_at = started.elapsed();
+        let envelope = crate::storage::format::AuthorityEnvelopeSnapshot::from_bytes(
+            &authority.snapshot_bytes,
+        )?;
+        // The base bytes are the largest thing this function ever holds and
+        // nothing below reads them, so they go here rather than at the end of
+        // the scope. The journal is kept: it is about a megabyte where the base
+        // is about a gigabyte.
+        let base_generation = authority.snapshot_generation;
+        let head_generation = authority.head_generation;
+        drop(authority);
+        let decode_at = started.elapsed();
+        let Some(metadata) = envelope.repository_authority else {
+            return Ok(None);
+        };
+        if metadata.repository_id != repository_id {
+            return Err(storage(format!(
+                "snapshot authority belongs to {}, not {}",
+                metadata.repository_id, repository_id
+            )));
+        }
+
+        let Some(metadata) = advance_envelope_over_journal(
+            &repository_id,
+            metadata,
+            &journal,
+            base_generation,
+            head_generation,
+        )?
+        else {
+            return Ok(None);
+        };
+        let frames_at = started.elapsed();
+
+        let generation = metadata.roots.generation;
+        if generation != head_generation {
+            return Err(storage(format!(
+                "repository {repository_id} envelope reached generation {generation}, not the acknowledged head {head_generation}"
+            )));
+        }
+        tracing::debug!(
+            repository = %repository_id,
+            generation,
+            base_generation,
+            frames = head_generation.saturating_sub(base_generation),
+            read_ms = read_at.as_millis(),
+            decode_ms = (decode_at - read_at).as_millis(),
+            frames_ms = (frames_at - decode_at).as_millis(),
+            "repository authority envelope read"
+        );
+        Ok(Some(Self {
+            repository_id,
+            backend,
+            metadata,
+            generation,
+        }))
+    }
+
+    /// The envelope this read resolved.
+    pub const fn metadata(&self) -> &PersistedRepositoryAuthority {
+        &self.metadata
+    }
+
+    /// The authority generation the envelope names.
+    pub const fn generation(&self) -> Generation {
+        self.generation
+    }
+
+    /// Load exact immutable source bytes from repository-owned CAS authority.
+    ///
+    /// Byte for byte the manager's own boundary: bounded, size-validated, and
+    /// re-verified against the requested content address before it returns.
+    pub fn load_source_blob(&self, digest: Hash256) -> Result<Option<Vec<u8>>, KinDbError> {
+        let Some(data) = self.backend.load_source_blob_bounded(
+            self.repository_id.as_str(),
+            *digest.as_bytes(),
+            MAX_SOURCE_BLOB_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        let byte_len = u64::try_from(data.len()).map_err(|_| {
+            storage(format!(
+                "immutable source blob {} length does not fit u64",
+                digest
+            ))
+        })?;
+        validate_source_blob_size(
+            byte_len,
+            &format!("repository authority {}", self.repository_id),
+        )?;
+        verify_source_blob_digest(
+            *digest.as_bytes(),
+            &data,
+            &format!("repository authority {}", self.repository_id),
+        )?;
+        Ok(Some(data))
     }
 }
 
@@ -13934,6 +14208,97 @@ mod tests {
         assert_eq!(reopened.read_authority().generation(), 2);
     }
 
+    /// The envelope read answers what the full open answers.
+    ///
+    /// The assertion is the JOIN rather than either endpoint. Comparing the
+    /// envelope against a hardcoded expectation would pass with both sides
+    /// wrong; comparing it against what the full open produces is the property
+    /// that matters, and it cannot be satisfied by writing the same value
+    /// twice.
+    ///
+    /// **This fixture is the journal-FREE arm, and it says so rather than
+    /// pretending otherwise.** One commit on this backend writes a full
+    /// snapshot base, so base and head are equal and the read takes
+    /// `advance_envelope_over_journal`'s early return. Two attempts to make it
+    /// carry a frame failed in CI on the fixture rather than on the code, first
+    /// on a duplicate operation id and then on `ref refs/heads/main already
+    /// exists`, because the helper builds a bootstrap-shaped transaction that
+    /// applies once. A second valid transaction is real work and no test in
+    /// this file does it.
+    ///
+    /// The frame WALK is held by
+    /// `native_admission_lineage::the_envelope_walk_reaches_the_envelope_a_full_open_reaches`,
+    /// which lives in that module because its `transaction_shell` can build a
+    /// valid second transaction and this module's bootstrap helper cannot. The
+    /// two tests are the two arms of the same read and neither covers the
+    /// other's.
+    #[test]
+    fn the_envelope_read_answers_what_the_full_open_answers() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        manager
+            .commit_repository_transaction(arbitrary_repository_transaction(&manager))
+            .expect("the fixture commit must land");
+
+        // Not a control on the walk, a statement of which arm this is. If a
+        // future fixture makes this fail, the test is finally on the journal
+        // path and the doc comment above is stale.
+        let persisted = backend
+            .load_snapshot_authority(repository_id().as_str())
+            .unwrap()
+            .expect("the fixture wrote an authority");
+        assert_eq!(
+            persisted.snapshot_generation, persisted.head_generation,
+            "this fixture is the journal-free arm; if it grew a journal, rewrite the doc \
+             comment above, because the walk is then under test"
+        );
+
+        let envelope = RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
+            .expect("the envelope read must not error")
+            .expect("a persisted authority must answer");
+        assert_eq!(
+            envelope.generation(),
+            manager.read_authority().generation(),
+            "the envelope must reach the generation the full open reaches"
+        );
+        assert_eq!(
+            envelope.metadata(),
+            manager.read_authority().metadata(),
+            "the envelope read must produce the envelope the full open produces, field for field"
+        );
+    }
+
+    /// A repository with no persisted authority declines rather than inventing
+    /// an empty envelope.
+    ///
+    /// The third branch of the read, and the one whose failure mode is quiet:
+    /// an envelope-shaped answer for a repository that has never committed
+    /// would report a real store as empty. `None` sends the caller to the full
+    /// open, which is the only thing that can decide what an uncommitted
+    /// repository is.
+    #[test]
+    fn the_envelope_read_declines_a_repository_with_no_persisted_authority() {
+        let directory = TempDir::new().unwrap();
+        let backend = Arc::new(LocalFileBackend::new(directory.path()));
+        let _manager =
+            RepositoryAuthorityManager::open(repository_id(), Arc::clone(&backend)).unwrap();
+        assert!(
+            backend
+                .load_snapshot_authority(repository_id().as_str())
+                .unwrap()
+                .is_none(),
+            "this fixture must have no persisted authority, or it is a different branch"
+        );
+        assert!(
+            RepositoryAuthorityMetadata::open(repository_id(), Arc::clone(&backend))
+                .expect("the envelope read must not error")
+                .is_none(),
+            "a repository with no persisted authority must decline, not answer empty"
+        );
+    }
+
     #[test]
     fn local_commit_returns_successor_freeze_without_releasing_writer_lock() {
         let directory = TempDir::new().unwrap();
@@ -19671,6 +20036,76 @@ mod native_admission_lineage {
             Vec::new(),
         )
         .expect("a one-source shared policy is valid")
+    }
+
+    /// The journal WALK reaches the envelope a full open reaches.
+    ///
+    /// Every live store takes this path, because a store's acknowledged head
+    /// moves past its snapshot base the first time its daemon writes anything,
+    /// and a walk that builds a wrong envelope gives wrong workspace answers
+    /// with no error on the daemon's primary read.
+    ///
+    /// It lives here because this module has the two-commit shape the outer one
+    /// does not. `committed_history(true)` lands the bootstrap through a bound
+    /// workspace, and `transaction_shell` then reads `expected_generation` and
+    /// `expected_roots` off the current lease while mutating no refs, so a
+    /// second call is a valid successor and therefore a frame past the base.
+    ///
+    /// **The follow-on change carries no tree deltas, and that is required
+    /// rather than incidental.** `transaction_shell` sets
+    /// `workspace_mutation: None`, so a change introducing artifacts is refused
+    /// with "introduces artifacts without a bound workspace admission context".
+    /// An earlier version of this test built its own first commit out of
+    /// `transfer_fixture` plus `chained_history` and hit exactly that.
+    ///
+    /// The assertion is the JOIN, against what the full open produces, because
+    /// a hardcoded expectation passes with both sides wrong. The control above
+    /// it is what makes the join mean anything: without a frame past the base
+    /// the read takes its early return and this test passes with the walk
+    /// deleted.
+    #[test]
+    fn the_envelope_walk_reaches_the_envelope_a_full_open_reaches() {
+        let fixture = committed_history(true);
+        let shared = SharedAdmissionPolicy::empty(0);
+        let follow_on = native_change(CHANGES, Some(fixture.head), &shared, Vec::new());
+        let receipt = fixture
+            .manager
+            .commit_repository_transaction(transaction_shell(&fixture.manager, 2, vec![follow_on]))
+            .expect("a follow-on Native change that introduces nothing must commit");
+        assert_eq!(receipt.generation, 2);
+
+        let backend = std::sync::Arc::new(crate::storage::backend::LocalFileBackend::new(
+            fixture._directory.path(),
+        ));
+
+        // THE CONTROL. A fixture whose base already is its head exercises the
+        // early return, and this test would then pass with the walk deleted.
+        let persisted = backend
+            .load_snapshot_authority(repository().as_str())
+            .expect("the authority loads")
+            .expect("the fixture wrote an authority");
+        assert!(
+            persisted.snapshot_generation < persisted.head_generation,
+            "this fixture must carry an acknowledged frame past its base, or the walk is not \
+             under test: base {} head {}",
+            persisted.snapshot_generation,
+            persisted.head_generation
+        );
+
+        let envelope =
+            RepositoryAuthorityMetadata::open(repository(), std::sync::Arc::clone(&backend))
+                .expect("the envelope read must not error")
+                .expect("the envelope read must answer over a journal, not decline");
+        assert_eq!(
+            envelope.generation(),
+            fixture.manager.read_authority().generation(),
+            "the walked envelope must reach the acknowledged head"
+        );
+        assert_eq!(
+            envelope.metadata(),
+            fixture.manager.read_authority().metadata(),
+            "the walked envelope must equal the one a full open produces, field for field"
+        );
     }
 
     /// Call the transferred-commit entry through a GENERIC bound.

@@ -484,7 +484,27 @@ impl AuthorityFrame {
         Ok(())
     }
 
-    fn apply_to_envelope(
+    /// Apply only this frame's envelope patch, to an envelope read on its own.
+    ///
+    /// `pub(crate)` for the envelope-only open, which decodes the authority
+    /// envelope without the history the same bytes carry and then walks the
+    /// acknowledged journal forward onto it.
+    ///
+    /// What this does NOT do, said here because the difference is the whole
+    /// safety argument: [`Self::apply`] additionally refuses a frame that
+    /// re-adds a change the base already carries, and it cannot be run here
+    /// because an envelope-only read holds no change map to compare against.
+    /// That check is about the HISTORY the frame carries, not about the
+    /// envelope it patches, so an envelope built here is the same envelope
+    /// `apply` would produce; what an envelope-only reader gives up is
+    /// noticing that the frame's history half is malformed. A reader that
+    /// needs the history opens in full and gets the check.
+    ///
+    /// Every envelope-level refusal is still here, and the load-bearing one is
+    /// `roots_before`: a frame applies only to the exact envelope its operation
+    /// names, so a frame walked onto the wrong base refuses rather than
+    /// producing a plausible wrong envelope.
+    pub(crate) fn apply_to_envelope(
         &self,
         mut envelope: PersistedRepositoryAuthority,
     ) -> Result<PersistedRepositoryAuthority, KinDbError> {
