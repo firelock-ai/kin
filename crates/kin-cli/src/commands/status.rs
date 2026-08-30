@@ -2066,21 +2066,35 @@ mod tests {
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
         let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
 
-        let rendered = render_text(
-            &report,
-            None,
-            None,
-            None,
-            &LastAdmissionRead::Absent,
-            &skipped_pass(),
-        );
-        let tree_line = rendered
-            .lines()
-            .find(|line| line.starts_with("Tree: "))
-            .unwrap_or_default();
+        let tree_line_of = |pass: &StatusAdmission| {
+            render_text(&report, None, None, None, &LastAdmissionRead::Absent, pass)
+                .lines()
+                .find(|line| line.starts_with("Tree: "))
+                .unwrap_or_default()
+                .to_string()
+        };
+
+        // Read-after-admit outranks the marker, so with no pass behind it the
+        // line names itself unmeasured and never reaches the marker's own arm.
+        // Both are a basis; this asserts WHICH one, because a test that accepted
+        // either could not tell the two apart.
+        let skipped = tree_line_of(&skipped_pass());
         assert!(
-            tree_line.contains("no complete admission"),
-            "the Tree line itself has to carry the basis: {tree_line}"
+            skipped.contains("not measured against the working copy"),
+            "an unmeasured verdict has to say so on the Tree line itself: {skipped}"
+        );
+
+        // With a pass behind it the marker's arm is reachable again, and an
+        // absent marker still has to name itself rather than render as a bare
+        // verdict. This is the arm kin#1254 added and it is still load-bearing.
+        let took = tree_line_of(&took_pass());
+        assert!(
+            took.contains("no complete admission"),
+            "an absent marker behind a real pass still has to name itself: {took}"
+        );
+        assert!(
+            !took.contains("not measured against the working copy"),
+            "a pass that ran must not report itself unmeasured: {took}"
         );
     }
 
