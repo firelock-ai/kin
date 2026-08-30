@@ -169,6 +169,11 @@ impl RequestRepositoryAuthority {
     /// per entity — costs one open for the whole batch on the shared arm and one
     /// per item on the pinned arm, which is exactly the one-shot behavior that
     /// arm is for.
+    /// `#[track_caller]` so the log below names the READ that wanted an
+    /// authority rather than this wrapper. Without it every pinned open in the
+    /// product attributes to this one line, which is the attribution being
+    /// useless in the most convincing way.
+    #[track_caller]
     pub(crate) fn open(&self) -> Result<std::sync::Arc<ActiveRepositoryAuthority>> {
         match &self.shared {
             Some(resolve) => resolve(),
@@ -185,8 +190,32 @@ impl ActiveRepositoryAuthority {
     /// asked for. `pub` so a long-lived server can pay for one open and hand it
     /// to the requests that read at that publication, through
     /// [`RequestRepositoryAuthority::shared`].
+    #[track_caller]
     pub fn open(binding: &kin_core::LocalRepositoryAuthorityBinding) -> Result<Self> {
-        REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| opens.set(opens.get() + 1));
+        let opens = REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| {
+            opens.set(opens.get() + 1);
+            opens.get()
+        });
+        // Who asked, in the product's own log, at the moment of asking.
+        //
+        // kin-db already logs `repository authority open` with timings, and one
+        // `kin graph status` on a converted repository produced twelve of them
+        // with nine concurrent. That count says the cost is a multiplier rather
+        // than a working set, and says nothing about which callers make it,
+        // which is the whole difference between fixing one site and fixing the
+        // mechanism. `#[track_caller]` costs nothing at runtime and names the
+        // call site rather than a backtrace, so the attribution is a grep.
+        //
+        // Deliberately not `debug!`: the count is the thing an operator needs
+        // when a read is slow, and a level nobody turns on is a line nobody
+        // reads.
+        let caller = std::panic::Location::caller();
+        tracing::info!(
+            repository = %binding.repository_id(),
+            caller = %format_args!("{}:{}", caller.file(), caller.line()),
+            opens_on_this_thread = opens,
+            "opening repository authority, which re-verifies every persisted body"
+        );
         let repository_id = binding.repository_id().clone();
         let workspace_id = binding.workspace_id();
         let (manager, payload_stats) = binding
