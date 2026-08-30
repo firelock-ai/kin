@@ -601,6 +601,11 @@ enum Command {
         action: SpecAction,
     },
     /// Merge semantic and exact-tree changes from another branch
+    ///
+    /// Exits 0 when the merge published or was already up to date, and 8 when it
+    /// is parked with conflicts: no ref moved, the record is durable, and `kin
+    /// conflicts` lists what is outstanding. A script can tell those apart from
+    /// a failed command, which exits 1.
     Merge {
         /// Branch to merge from
         branch: String,

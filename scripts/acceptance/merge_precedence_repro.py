@@ -739,12 +739,28 @@ def grade_exit_code(actual, expected, what):
     return (PASS, "%s exited %s" % (what, actual))
 
 
+def grade_parked_output_names_its_code(out, err, code):
+    """A code a reader never sees is not documentation.
+
+    Asserts the exact sentence rather than the bare number, because the number
+    alone appears in paths, hashes and counts all over this output, and a phrase
+    satisfied by a different producer is a check on a proxy.
+    """
+    text = (out or "") + (err or "")
+    if not text.strip():
+        return (UNREADABLE, "the parked merge printed nothing to read")
+    wanted = "Exit %d: the merge is parked with conflicts" % code
+    if wanted not in text:
+        return (FAIL, "the parked merge never names its own exit code")
+    return (PASS, "the parked merge names exit %d where it fires" % code)
+
+
 def check_exitcode(suite):
     """rc062k. A merge that parks conflicts must not report success, and one
     that publishes must not report failure. Both arms, because a build that
     always exited nonzero would satisfy the first alone."""
     repo = suite.repo("exitcode", BODY_FILES)
-    conflicted = suite.kin_run(["merge", "feature"], repo)[0]
+    conflicted, parked_out, parked_err = suite.kin_run(["merge", "feature"], repo)
     publishing = suite.repo("exitcode-clean", MIXED_FILES)
     suite.kin_run(["merge", "feature"], publishing)
     suite.kin_run(["resolve", "--all-theirs"], publishing)
@@ -752,6 +768,8 @@ def check_exitcode(suite):
     return _combine("exitcode", [
         ("parked", grade_exit_code(conflicted, EXIT_MERGE_CONFLICTED, "a merge that parked")),
         ("published", grade_exit_code(settled, 0, "a merge that published")),
+        ("named", grade_parked_output_names_its_code(parked_out, parked_err,
+                                                     EXIT_MERGE_CONFLICTED)),
     ], ticket=WORKFLOW_TICKET)
 
 
@@ -1116,6 +1134,16 @@ def self_test():
                                "summarize"), FAIL)
     expect("selector passes a bare name that settled",
            grade_name_selector(0, "Settled 1 conflict(s)", "", "summarize"), PASS)
+
+    expect("named passes output carrying the exact sentence",
+           grade_parked_output_names_its_code(
+               "Exit 8: the merge is parked with conflicts; `kin conflicts` lists them",
+               "", 8), PASS)
+    expect("named fails output that carries the number but not the sentence",
+           grade_parked_output_names_its_code("merged 8 entities into refs/heads/main", "", 8),
+           FAIL)
+    expect("named cannot read empty output",
+           grade_parked_output_names_its_code("", "", 8), UNREADABLE)
 
     expect("a relative kin path is absolutized by this suite",
            (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)
