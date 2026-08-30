@@ -1249,10 +1249,13 @@ pub(crate) fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'stati
 /// is the same reason this reads the recorded case rather than re-probing a
 /// filesystem.
 ///
-/// `None` means this receiver has no workspace whose case it can honestly claim,
-/// which is a hosted backend with no local `.kin` layout. kin-db accepts `None`
-/// only where the shared policy has no rule sources, so nothing can be admitted
-/// under a case nobody chose.
+/// `None` means the caller speaks for no replica at all, which is the negotiation
+/// convenience wrapper and the test-only entry point beside it. It is NOT what a
+/// hosted receiver passes: a hosted replica has no workspace overlay but it does
+/// have a store, and that store is byte-exact object storage, so it admits under
+/// `Sensitive` because that is what it does. kin-db accepts `None` only where the
+/// shared policy has no rule sources, so a caller that claims no case can never
+/// admit anything under a case nobody chose.
 ///
 /// `before_authority_commit` runs exactly once, after every validation and
 /// after the immutable CAS prewrites, immediately before the authority

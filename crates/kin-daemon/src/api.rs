@@ -13823,15 +13823,27 @@ fn apply_received_repository_transfer_pack(
     // store would apply two rules depending on whether content arrived locally or
     // over the wire.
     //
-    // `None` is a hosted daemon, which has no local `.kin` layout and therefore no
-    // workspace whose case it can honestly claim. kin-db accepts `None` only where
-    // the shared policy has no rule sources, so nothing is ever admitted under a
-    // case nobody chose.
-    let receiver_case = state
-        .local_repository_workspace_id()
-        .and_then(|workspace_id| {
-            kin_remote::repository_transfer::receiver_admission_case(authority, workspace_id)
-        });
+    // A daemon with no workspace overlay to read admits under `Sensitive`, and
+    // that is not a guess. `DaemonState::open_with_backend`, the hosted path,
+    // leaves `cached_workspace_id` unset, so there is no overlay; what a hosted
+    // replica actually stores artifacts in is byte-exact object storage, where two
+    // paths differing only in case are two objects. Case-sensitive matching is
+    // what that store does, so admitting under it describes this replica rather
+    // than choosing on the publisher's behalf.
+    //
+    // Passing `None` here would be the honest-looking answer and the wrong one.
+    // kin-db refuses `None` wherever the shared policy has any rule source, and
+    // one `.gitignore` rule is one source, measured. A hosted receiver claiming no
+    // case would therefore refuse every brownfield push that introduces a file,
+    // which is the defect this change exists to remove.
+    let receiver_case = Some(
+        state
+            .local_repository_workspace_id()
+            .and_then(|workspace_id| {
+                kin_remote::repository_transfer::receiver_admission_case(authority, workspace_id)
+            })
+            .unwrap_or(kin_model::AdmissionCase::Sensitive),
+    );
     kin_remote::repository_transfer::apply_repository_transfer_pack_with_pre_commit(
         authority,
         repository_id,
