@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-08-30
+
+### Changed
+
+- Cover the resolve --continue merge publication in the live-graph check (#1294)
+- Stop reporting a conflicted identity as a removal, and name which clause refused a merge (#1291)
+- Correct the counter comment, assert the invariant, and unbreak the Windows build (#1295)
+- Show a conflict's three sides as source, checked back against the digests the merge recorded (#1296)
+- Ungate generation_pair so the rollback arm still compiles on Windows (#1298)
+- Move the four compile-heavy CI jobs to the kin-16core larger runner (#1174)
+- Stop hashing the runner's incidental toolchains into the cargo cache key (#1158)
+- Give the conflict-body digest check an arm that can fail, and correct the sha #1296 cited (#1299)
+
+
 ## [0.6.2] - 2026-08-29
 
 ### Changed
