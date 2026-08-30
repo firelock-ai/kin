@@ -1211,3 +1211,112 @@ fn contradictory_settlements_inside_one_artifact_refuse_and_name_both() {
         .state
         .is_in_progress());
 }
+
+/// Name every field on which two versions of one entity disagree.
+///
+/// Written as a list of every field the model declares rather than a derived
+/// comparison, so a field added to `Entity` later fails to compile here and has
+/// to be classified deliberately as semantic or as provenance.
+fn entity_field_differences(ours: &kin_model::Entity, theirs: &kin_model::Entity) -> Vec<&'static str> {
+    let kin_model::Entity {
+        id,
+        kind,
+        name,
+        language,
+        fingerprint,
+        file_origin,
+        span,
+        signature,
+        visibility,
+        role,
+        doc_summary,
+        metadata,
+        lineage_parent,
+        created_in,
+        superseded_by,
+    } = ours;
+    let mut differing = Vec::new();
+    for (label, differs) in [
+        ("id", *id != theirs.id),
+        ("kind", *kind != theirs.kind),
+        ("name", *name != theirs.name),
+        ("language", *language != theirs.language),
+        ("fingerprint", *fingerprint != theirs.fingerprint),
+        ("file_origin", *file_origin != theirs.file_origin),
+        ("span", *span != theirs.span),
+        ("signature", *signature != theirs.signature),
+        ("visibility", *visibility != theirs.visibility),
+        ("role", *role != theirs.role),
+        ("doc_summary", *doc_summary != theirs.doc_summary),
+        ("metadata", *metadata != theirs.metadata),
+        ("lineage_parent", *lineage_parent != theirs.lineage_parent),
+        ("created_in", *created_in != theirs.created_in),
+        ("superseded_by", *superseded_by != theirs.superseded_by),
+    ] {
+        if differs {
+            differing.push(label);
+        }
+    }
+    differing
+}
+
+/// The one entity named `name` in a resolved graph state.
+fn entity_named(state: &kin_model::graph::ResolvedGraphState, name: &str) -> kin_model::Entity {
+    let mut found: Vec<kin_model::Entity> = state
+        .entities
+        .values()
+        .filter(|entity| entity.name == name)
+        .cloned()
+        .collect();
+    assert_eq!(found.len(), 1, "exactly one entity named {name}");
+    found.pop().expect("checked immediately above")
+}
+
+/// An entity NEITHER branch edited still differs between the branches, and the
+/// measurement says on which field.
+///
+/// Measured rather than assumed, and the measurement corrected the guess that
+/// produced it. `beta` is untouched by both sides, so provenance looked like the
+/// likely difference; `created_in` is in fact EQUAL, because nothing re-minted
+/// the record. The one field that differs is `span`, and the reason is that the
+/// two edits to `alpha` above it are different LENGTHS, so every byte offset
+/// below shifts by a different amount on each side.
+///
+/// That is why one changed function reports three entity conflicts here and
+/// nine in the rc062j stranger run. A byte offset is a projection of whichever
+/// bytes the merge publishes, not an independent decision, so the operator is
+/// being asked a question whose answer is already determined by another answer.
+/// Removing that question is the derived-conflict design, which is FIR-2960 and
+/// not this change: this test records the premise, and the count it explains.
+///
+/// The assertion is an equality against the exact measured set rather than a
+/// subset check, so an entity that starts differing on a SEMANTIC field fails
+/// here rather than being quietly folded into the same explanation.
+#[test]
+fn an_untouched_entity_differs_between_branches_only_in_its_span() {
+    let root = tempdir().expect("temp root");
+    let repo = container_settle_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let init = run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]);
+    ok(&init, "kin init");
+    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+
+    let ours = graph_at(&layout, &branch_change(&layout, "main"));
+    let theirs = graph_at(&layout, &branch_change(&layout, "feature"));
+
+    let untouched = entity_field_differences(&entity_named(&ours, "beta"), &entity_named(&theirs, "beta"));
+    assert_eq!(
+        untouched,
+        vec!["span"],
+        "an entity neither side edited differs only in its byte offsets; it actually differed on {untouched:?}"
+    );
+
+    // The control that keeps the reading honest: the entity both sides DID edit
+    // must differ on a semantic field too, or the comparison above is measuring
+    // nothing and would report the same set for every entity in the file.
+    let edited = entity_field_differences(&entity_named(&ours, "alpha"), &entity_named(&theirs, "alpha"));
+    assert!(
+        edited.contains(&"fingerprint"),
+        "the entity both sides edited must differ semantically; it differed on {edited:?}"
+    );
+}
