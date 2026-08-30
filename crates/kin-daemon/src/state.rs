@@ -15101,7 +15101,18 @@ mod tests {
         .unwrap()
         .expect("exact source admission must advance authority");
 
+        // The positive control, and it is not optional. Every assertion below is
+        // that a count did NOT move, and a counter stuck at any constant
+        // satisfies all of them while proving nothing. Opening the daemon does
+        // genuinely open authority, so this arm requires the counter to move
+        // before the arms that require it to hold still are worth reading.
+        let before_open = kin_core::authority_opens();
         let state = DaemonState::open(init.layout).unwrap();
+        assert!(
+            kin_core::authority_opens() > before_open,
+            "the authority-open counter did not move across a daemon open, so it cannot \
+             report an open at all and the assertions below would pass on any tree"
+        );
 
         // Read the counter AFTER the state is open, because opening a daemon
         // legitimately opens authority once and this test is about the view.
