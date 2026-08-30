@@ -266,7 +266,7 @@ pub fn inspect_with_endpoint_entities(
     let mut head_state = head_state;
     let semantic_basis = derive_workspace_semantics(
         live,
-        workspace,
+        workspace.tree_hash,
         &artifact_deltas,
         &mut base_state,
         &mut head_state,
@@ -318,7 +318,7 @@ pub fn inspect_with_endpoint_entities(
 /// says.
 fn derive_workspace_semantics(
     live: Option<&kin_db::InMemoryGraph>,
-    workspace: &kin_model::WorkspaceState,
+    admitted_tree_hash: Hash256,
     artifact_deltas: &[kin_model::TreeDelta],
     base_state: &mut EndpointState,
     head_state: &mut EndpointState,
@@ -393,7 +393,7 @@ fn derive_workspace_semantics(
 
     Some(WorkspaceSemanticBasis::Derived {
         graph_tree_hash,
-        matches_admitted_tree: graph_tree_hash == workspace.tree_hash,
+        matches_admitted_tree: graph_tree_hash == admitted_tree_hash,
         derived_paths,
     })
 }
@@ -798,7 +798,7 @@ pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Resu
                 println!("{line}");
             }
             if let Some(report) = response.report.as_ref() {
-                if let Some(line) = semantic_scope_line(report) {
+                if let Some(line) = semantic_scope_line(report.semantic_basis.as_ref()) {
                     println!("{line}");
                 }
             }
@@ -835,7 +835,7 @@ pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Resu
         for line in render_lines(&report) {
             println!("{line}");
         }
-        if let Some(line) = semantic_scope_line(&report) {
+        if let Some(line) = semantic_scope_line(report.semantic_basis.as_ref()) {
             println!("{line}");
         }
         if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
@@ -904,11 +904,11 @@ fn endpoint_is_workspace(requested: Option<&str>) -> bool {
 ///
 /// Silent on a diff between two changes, where the entity delta is computed and
 /// means what it says.
-fn semantic_scope_line(report: &DiffReport) -> Option<String> {
+fn semantic_scope_line(basis: Option<&WorkspaceSemanticBasis>) -> Option<String> {
     // Derived answers name their own basis instead of the old blanket
     // disclaimer, because the count CAN move now and a line saying it cannot
     // would be the new wrong sentence.
-    match &report.semantic_basis {
+    match basis {
         Some(WorkspaceSemanticBasis::Derived {
             graph_tree_hash,
             matches_admitted_tree,
@@ -939,24 +939,7 @@ fn semantic_scope_line(report: &DiffReport) -> Option<String> {
         }
         None => {}
     }
-    let base_is_workspace = matches!(report.base.source, DiffEndpointSource::Workspace);
-    let head_is_workspace = matches!(report.head.source, DiffEndpointSource::Workspace);
-    if !base_is_workspace && !head_is_workspace {
-        return None;
-    }
-    let side = if base_is_workspace && head_is_workspace {
-        "Both endpoints are"
-    } else if head_is_workspace {
-        "The head endpoint is"
-    } else {
-        "The base endpoint is"
-    };
-    Some(format!(
-        "Semantic scope: {side} the workspace, whose entities are its base change's plus a \
-         workspace semantic overlay that nothing writes an entity delta into, so the entity \
-         count above cannot move for work in the working copy however many artifacts or \
-         relations do; commit it and diff change to change to see entity movement."
-    ))
+    None
 }
 
 /// What this diff does not cover, and when the graph last caught up.
@@ -1172,6 +1155,207 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn entity_in(id: EntityId, name: &str, file: &str) -> Entity {
+        let mut built = entity(id, name);
+        built.file_origin = Some(FilePathId::new(file));
+        built
+    }
+
+    fn endpoint(source: DiffEndpointSource, entities: HashMap<EntityId, Entity>) -> EndpointState {
+        EndpointState {
+            report: DiffEndpoint {
+                source,
+                requested: None,
+                ref_name: None,
+                target: None,
+                change_id: None,
+                workspace_generation: None,
+                workspace_head: None,
+                tree_hash: Hash256::from_bytes([9; 32]),
+                artifact_count: 0,
+                entity_count: entities.len(),
+                relation_count: 0,
+            },
+            tree: kin_model::ResolvedTree::default(),
+            entities,
+            relations: HashMap::new(),
+        }
+    }
+
+    fn updated_delta(path: &str) -> kin_model::TreeDelta {
+        let entry = kin_model::LocatedEntry {
+            path: RepoPath::new(path).unwrap(),
+            entry: kin_model::TreeEntry::Blob {
+                hash: Hash256::from_bytes([7; 32]),
+                executable: false,
+            },
+        };
+        kin_model::TreeDelta::Updated {
+            artifact_id: ArtifactId::new(),
+            old: entry.clone(),
+            new: entry,
+        }
+    }
+
+    /// The correctness condition, and it is the one I nearly got wrong.
+    /// `diff_entities` diffs whole maps, so an endpoint populated ONLY from the
+    /// moved paths would report every untouched file's entities as REMOVED. The
+    /// base map is kept and only the moved file is replaced in it.
+    #[test]
+    fn derivation_replaces_the_moved_path_and_leaves_the_rest_of_the_map_alone() {
+        let moved_old = EntityId::new();
+        let moved_new = EntityId::new();
+        let untouched = EntityId::new();
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .batch_upsert_entities(&[entity_in(moved_new, "after", "src/moved.rs")])
+            .unwrap();
+
+        let admitted = HashMap::from([
+            (moved_old, entity_in(moved_old, "before", "src/moved.rs")),
+            (untouched, entity_in(untouched, "elsewhere", "src/other.rs")),
+        ]);
+        let mut base = endpoint(DiffEndpointSource::Head, admitted.clone());
+        let mut head = endpoint(DiffEndpointSource::Workspace, admitted);
+
+        let basis = derive_workspace_semantics(
+            Some(&graph),
+            Hash256::from_bytes([9; 32]),
+            &[updated_delta("src/moved.rs")],
+            &mut base,
+            &mut head,
+        );
+
+        // The head is the workspace, so it derives.
+        assert!(
+            head.entities.contains_key(&moved_new),
+            "the moved path's entities must come from the live graph"
+        );
+        assert!(
+            !head.entities.contains_key(&moved_old),
+            "an entity the edit removed has to leave the map, or the delta under-reports"
+        );
+        assert!(
+            head.entities.contains_key(&untouched),
+            "an untouched file's entities must survive, or every one of them reads as REMOVED"
+        );
+        // The base is HEAD, so it must be untouched by the derivation.
+        assert!(
+            base.entities.contains_key(&moved_old) && !base.entities.contains_key(&moved_new),
+            "a non-workspace endpoint must not be re-derived"
+        );
+
+        // And the delta says what happened, which is the whole point.
+        let deltas = diff_entities(&base.entities, &head.entities);
+        assert_eq!(deltas.len(), 2, "one added, one removed: {deltas:?}");
+
+        match basis {
+            Some(WorkspaceSemanticBasis::Derived {
+                matches_admitted_tree,
+                derived_paths,
+                ..
+            }) => {
+                assert_eq!(derived_paths, 1);
+                let _ = matches_admitted_tree;
+            }
+            other => panic!("expected a derived basis, got {other:?}"),
+        }
+    }
+
+    /// The gap, by name. This is the zero-file-search rule applied to a read:
+    /// when the graph cannot answer, report the gap rather than a zero that reads
+    /// like an answer.
+    #[test]
+    fn no_live_graph_reports_the_gap_rather_than_a_zero() {
+        let mut base = endpoint(DiffEndpointSource::Head, HashMap::new());
+        let mut head = endpoint(DiffEndpointSource::Workspace, HashMap::new());
+        let basis = derive_workspace_semantics(
+            None,
+            Hash256::from_bytes([9; 32]),
+            &[updated_delta("src/moved.rs")],
+            &mut base,
+            &mut head,
+        );
+        assert_eq!(basis, Some(WorkspaceSemanticBasis::AdmittedOverlayOnly));
+
+        let line = semantic_scope_line(basis.as_ref()).expect("a workspace diff states its scope");
+        assert!(line.contains("no live graph was reachable"), "{line}");
+        assert!(
+            line.contains("not a statement that nothing changed"),
+            "the gap has to say what it is NOT, or a reader takes it for an answer: {line}"
+        );
+    }
+
+    /// The control. A change-to-change diff is history on both sides, where the
+    /// entity delta is already computed and already means what it says, so
+    /// nothing is derived and nothing is disclosed. Without this, a derivation
+    /// that fired on every diff would pass every assertion above.
+    #[test]
+    fn a_change_to_change_diff_derives_nothing_and_says_nothing() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut base = endpoint(DiffEndpointSource::Change, HashMap::new());
+        let mut head = endpoint(DiffEndpointSource::Change, HashMap::new());
+        let basis = derive_workspace_semantics(
+            Some(&graph),
+            Hash256::from_bytes([9; 32]),
+            &[updated_delta("src/moved.rs")],
+            &mut base,
+            &mut head,
+        );
+        assert_eq!(basis, None, "history needs no derivation");
+
+        assert!(
+            semantic_scope_line(None).is_none(),
+            "a change-to-change diff must not carry a workspace scope note"
+        );
+    }
+
+    /// A reconcile can land between the authority lease read and the derivation,
+    /// and an answer derived from a NEWER graph than the tree it describes is a
+    /// different answer. So the basis names the graph's own tree and the text
+    /// says when it disagrees.
+    #[test]
+    fn a_graph_holding_another_tree_names_the_mismatch() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut base = endpoint(DiffEndpointSource::Head, HashMap::new());
+        let mut head = endpoint(DiffEndpointSource::Workspace, HashMap::new());
+        // The workspace's admitted tree is deliberately not the empty tree the
+        // fresh graph holds.
+        let basis = derive_workspace_semantics(
+            Some(&graph),
+            Hash256::from_bytes([0xAB; 32]),
+            &[],
+            &mut base,
+            &mut head,
+        );
+        let Some(WorkspaceSemanticBasis::Derived {
+            matches_admitted_tree,
+            ..
+        }) = basis
+        else {
+            panic!("expected a derived basis, got {basis:?}");
+        };
+        assert!(
+            !matches_admitted_tree,
+            "a graph holding a different tree must not claim to match"
+        );
+
+        let line = semantic_scope_line(basis.as_ref()).expect("a workspace diff states its scope");
+        assert!(line.contains("rather than the admitted"), "{line}");
+
+        // The control: when it DOES match, the line must not carry the warning,
+        // or the caveat is boilerplate rather than a signal.
+        let matching = WorkspaceSemanticBasis::Derived {
+            graph_tree_hash: Hash256::from_bytes([0xAB; 32]),
+            matches_admitted_tree: true,
+            derived_paths: 3,
+        };
+        let clean = semantic_scope_line(Some(&matching)).expect("still states its scope");
+        assert!(!clean.contains("rather than the admitted"), "{clean}");
+        assert!(clean.contains("3 moved path(s)"), "{clean}");
     }
 
     #[test]
