@@ -142,11 +142,23 @@ ROOMY_DAEMON_BUDGET = str(512 * 1024 * 1024 * 1024)
 # start. A reader told the first when the second is true goes looking in the
 # wrong place.
 REQUIRED_DAEMON_BAND_PHRASES = [
+    # Unique to this band's sentence. Checked by grepping the tree: it occurs
+    # exactly once across kin-core and kin-daemon, in the sentence this check
+    # exists to grade.
+    "is a different matter",
     "repository daemon",
-    "is allowed",
     "answers nothing",
     "convert a repository with less history",
 ]
+# `is allowed` was in this list and has been removed, because it is not this
+# band's phrase. `memory_pressure.rs` uses "it is allowed" four times in the
+# daemon's own footprint warning, which a run under a tight pinned budget prints
+# anyway, so the assertion was satisfied by a DIFFERENT message than the one it
+# named. It was caught on a Linux run whose FAIL detail listed three missing
+# phrases and not four: the daemon's own warning had supplied the fourth. The
+# check still went red, because the other three are genuinely this band's, and
+# an assertion that passes on someone else's output is a passing assertion for
+# the wrong reason whether or not its neighbours cover for it.
 
 # Every phrase the refusal owes an operator. A refusal that fires and does not
 # say what to do next leaves the reader exactly where the silence did.
