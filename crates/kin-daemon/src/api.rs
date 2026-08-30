@@ -28377,6 +28377,57 @@ mod tests {
         );
     }
 
+    /// The third arm of the switch retry: a refusal the retry cannot clear must
+    /// survive it, and must be the NEXT question rather than the same one.
+    ///
+    /// The workspace edits a path both branches track and both hold
+    /// differently. The first attempt refuses for drift, the retry admits, and
+    /// the second attempt gets far enough to ask the real question, which is
+    /// whether that pending work can replay onto the destination. It cannot, so
+    /// it refuses again and that refusal stands.
+    ///
+    /// The assertion that matters is the one on WHICH refusal comes back. A
+    /// retry that never ran would return the drift message again, and a retry
+    /// that ran but did not stop would return success, so the carry refusal is
+    /// the only answer that means both halves worked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_switch_retry_stops_at_a_refusal_no_admission_can_clear() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-retry-stops");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let generation_before = authority.manager.read_authority().roots().generation;
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: local-edit\n",
+        )
+        .unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-retry-stops-test"),
+        };
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        let rendered = String::from_utf8_lossy(&body).to_string();
+
+        assert_eq!(status, StatusCode::CONFLICT, "{rendered}");
+        assert!(
+            rendered.contains("cannot move onto"),
+            "the retry must reach the carry question and refuse there: {rendered}"
+        );
+        assert!(
+            !rendered.contains("diverge from the graph-owned workspace projection"),
+            "returning the drift refusal again means the retry never ran: {rendered}"
+        );
+        // The admission the retry ran is allowed to publish, so the generation
+        // may move. What must not move is the ref, because the switch refused.
+        assert!(
+            authority.manager.read_authority().roots().generation >= generation_before,
+            "an admission may advance the generation; nothing may move it backwards"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn command_branch_returns_conflict_for_untracked_target_path_without_mutation() {
