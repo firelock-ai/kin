@@ -482,7 +482,12 @@ mod tests {
 
     /// Render the contract's own template, so the expected URL is derived from
     /// the contract rather than typed beside it.
-    fn expected_hosted_url(base_url: &str, organization_id: &str, repo_id: &str, leaf: &str) -> String {
+    fn expected_hosted_url(
+        base_url: &str,
+        organization_id: &str,
+        repo_id: &str,
+        leaf: &str,
+    ) -> String {
         let rendered = contract_route_template()
             .replace("{orgId}", organization_id)
             .replace("{repoId}", repo_id)
@@ -530,7 +535,10 @@ mod tests {
         for leaf in leaves {
             let leaf = leaf["leaf"].as_str().expect("every leaf is named");
             let url = transport.url(&repository_id, leaf);
-            assert_eq!(url, expected_hosted_url("https://kinlab.ai", "acme", "kin", leaf));
+            assert_eq!(
+                url,
+                expected_hosted_url("https://kinlab.ai", "acme", "kin", leaf)
+            );
             assert!(
                 url.starts_with("https://kinlab.ai/api/"),
                 "leaf {leaf} is addressed outside /api/, where the edge serves the bucket: {url}"

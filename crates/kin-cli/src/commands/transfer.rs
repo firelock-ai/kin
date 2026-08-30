@@ -157,6 +157,25 @@ pub(crate) struct TransferPeer {
     pub(crate) organization_id: Option<String>,
 }
 
+/// Split a peer URL into the base the seam is served from and the organization
+/// it names, if any.
+///
+/// A locator carries both, and they must be taken together: its base URL is the
+/// part before `/api/orgs/...`, so keeping the whole locator as the base and
+/// lifting only the organization out of it addresses
+/// `<base>/api/orgs/<org>/repos/<repo>/api/v1/orgs/<org>/...`, which is nobody's
+/// route. Anything that is not a locator is a peer daemon base with no
+/// organization.
+pub(crate) fn peer_base_and_organization(url: &str) -> (String, Option<String>) {
+    match crate::commands::remote::native_remote_locator(url) {
+        Some(target) => (
+            target.base_url.trim_end_matches('/').to_string(),
+            Some(target.organization_id),
+        ),
+        None => (url.trim().trim_end_matches('/').to_string(), None),
+    }
+}
+
 /// Resolve the peer from an explicit URL or a configured native-Kin remote.
 ///
 /// This fails closed rather than guessing a host. A transfer publishes exact
@@ -172,10 +191,11 @@ pub(crate) fn resolve_peer(
         // organization addresses that hosted repository; anything else is a
         // peer daemon, which is what `--url http://127.0.0.1:<port>` has always
         // meant and must keep meaning.
+        let (base_url, organization_id) = peer_base_and_organization(url);
         return Ok(TransferPeer {
-            organization_id: crate::commands::remote::native_remote_organization_id(url),
-            base_url: url.trim_end_matches('/').to_string(),
-            token: crate::commands::remote::native_remote_bearer_token(url),
+            token: crate::commands::remote::native_remote_bearer_token(&base_url),
+            base_url,
+            organization_id,
         });
     }
 
@@ -223,7 +243,9 @@ pub(crate) fn resolve_peer(
                 selected.name
             )
         })?;
-    let base_url = base_url.trim_end_matches('/').to_string();
+    // A locator names both the base and the organization, so split it here
+    // rather than treating the whole locator as a base URL.
+    let (base_url, located_organization) = peer_base_and_organization(base_url);
 
     // A KinLab remote is hosted, and a hosted seam is org scoped. The
     // organization comes from the remote's own locator, or from KIN_ORG_ID, and
@@ -237,7 +259,7 @@ pub(crate) fn resolve_peer(
     // the organization the user forgot to set (FIR-2945).
     let organization_id = match selected.host {
         RemoteHostKind::KinLab => Some(
-            crate::commands::remote::native_remote_organization_id(&base_url)
+            located_organization
                 .or_else(|| {
                     std::env::var("KIN_ORG_ID")
                         .ok()
@@ -508,6 +530,41 @@ mod tests {
         assert_eq!(
             parse_ref(Some("refs/tags/v1")).unwrap(),
             Some(RefName::from_bytes(b"refs/tags/v1".to_vec()).unwrap())
+        );
+    }
+
+    #[test]
+    fn a_locator_gives_up_its_base_and_its_organization_together() {
+        // The bug this pins: taking the organization from a locator while
+        // keeping the whole locator as the base URL builds
+        // `<base>/api/orgs/o/repos/r/api/v1/orgs/o/repos/r/transfer/...`.
+        let (base, org) =
+            peer_base_and_organization("http://127.0.0.1:8080/api/orgs/acme/repos/kin");
+        assert_eq!(base, "http://127.0.0.1:8080");
+        assert_eq!(org.as_deref(), Some("acme"));
+        // Said as the property rather than as two literals: the base must not
+        // still contain the organization path the locator carried.
+        assert!(
+            !base.contains("/api/orgs/"),
+            "the base still carries the locator's own org path: {base}"
+        );
+    }
+
+    #[test]
+    fn a_bare_peer_base_names_no_organization() {
+        let (base, org) = peer_base_and_organization("http://127.0.0.1:4010/");
+        assert_eq!(base, "http://127.0.0.1:4010");
+        assert_eq!(org, None);
+    }
+
+    #[test]
+    fn a_kinlab_scheme_locator_names_an_organization_and_the_default_host() {
+        let (base, org) = peer_base_and_organization("kinlab://acme/kin");
+        assert_eq!(org.as_deref(), Some("acme"));
+        assert!(!base.is_empty(), "a locator must still resolve a base URL");
+        assert!(
+            !base.contains("/api/orgs/"),
+            "base carries an org path: {base}"
         );
     }
 
