@@ -199,6 +199,10 @@ fn git_allow_empty(cwd: &Path, args: &[&str]) -> Option<String> {
         //
         // It is set for every subcommand rather than only `status` so a future
         // call that also takes an optional lock cannot reintroduce this.
+        // Acceptance for the line above is a CI reading, not a local one:
+        // the shard's `cargo nextest run` step must compile ZERO crates,
+        // against the four it recompiled before. This comment is the no-op
+        // commit that takes that reading.
         .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .ok()?;
