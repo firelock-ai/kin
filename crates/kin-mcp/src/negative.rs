@@ -1459,13 +1459,22 @@ fn focal_resolution_gap(payload: &Value, subject: &str) -> Option<String> {
                 .get("matched")
                 .and_then(Value::as_str)
                 .unwrap_or("exact_focal_name");
+            // A pattern match and a name collision are different situations and
+            // the old wording described the milder one in the vocabulary of the
+            // worse. `find_references("slugify")` reported "3 entities match the
+            // name that was queried" where one entity is NAMED slugify and two
+            // are tests whose names merely contain it, which reads as three
+            // same-named definitions: a much scarier thing than what happened
+            // (FIR-3037). The response already carries the distinction in
+            // `matched`; this says it.
             let clause = if counted == "query_name_pattern" {
-                "match the name that was queried"
+                "matched the queried name as a pattern, which includes entities whose names \
+                 merely contain it,"
             } else {
-                "share the focal's name"
+                "share the focal's name exactly, and"
             };
             Some(format!(
-                "focal_resolution_ambiguous: {candidates} entities {clause} and only one was \
+                "focal_resolution_ambiguous: {candidates} entities {clause} only one was \
                  answered for, so {subject} is not evidence about the others"
             ))
         }
@@ -3200,9 +3209,52 @@ mod tests {
             "the ambiguous resolution must be named: {reason}"
         );
         assert!(
-            reason.contains("match the name that was queried"),
+            reason.contains("matched the queried name as a pattern"),
             "an ambiguous QUERY and an ambiguous graph send a reader to different \
              places, so the gap must say which one this is: {reason}"
+        );
+        assert!(
+            reason.contains("names merely contain it"),
+            "a pattern match is not a name collision, and saying so is the fix: {reason}"
+        );
+        assert!(
+            !reason.contains("share the focal's name"),
+            "the collision wording belongs to the other arm: {reason}"
+        );
+    }
+
+    /// The control for the pattern-match wording: a GENUINE collision, two
+    /// definitions carrying one name, where the collision wording must still
+    /// appear.
+    ///
+    /// Without this, the fix above is satisfied by a message that never says
+    /// "share the focal's name" at all, which would trade a message that
+    /// overstates for one that cannot state the real case.
+    #[test]
+    fn a_real_name_collision_still_reads_as_a_collision() {
+        let mut payload = authoritative_empty_references("function");
+        payload["focal_resolution"] = json!({
+            "addressed_by": "name",
+            "same_name_candidates": 2,
+            "matched": "exact_focal_name",
+            "other_candidates": [
+                {"id": "00000000-0000-0000-0000-000000000002", "name": "resolve"},
+            ],
+        });
+        let negative = negative_for("find_references", &payload, &structural_ready_envelope())
+            .expect("an empty reference list yields a negative");
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(
+            reason.contains("focal_resolution_ambiguous"),
+            "a real collision is still an ambiguity: {reason}"
+        );
+        assert!(
+            reason.contains("share the focal's name exactly"),
+            "two definitions of one name is the case the collision wording is for: {reason}"
+        );
+        assert!(
+            !reason.contains("names merely contain it"),
+            "and it must not borrow the pattern-match wording: {reason}"
         );
     }
 

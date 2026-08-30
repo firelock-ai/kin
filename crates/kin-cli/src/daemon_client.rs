@@ -4758,13 +4758,69 @@ pub(crate) fn validate_health_repo(health: &HealthResponse, working_dir: &Path) 
         RepoIdentity::Rejected(reason) | RepoIdentity::Indeterminate(reason) => bail!(reason),
     }
     if health.status == "attention" {
+        warn_on_health_change(
+            health.repo_root.as_deref().unwrap_or("<unknown>"),
+            "attention",
+        );
+    } else {
+        // Any other serving status clears the memory, so a daemon that returns
+        // to attention later is announced again. Without this the notice would
+        // be once per process and a real change of state would go unsaid.
+        forget_reported_health(health.repo_root.as_deref().unwrap_or("<unknown>"));
+    }
+    Ok(())
+}
+
+/// The health status last announced for a repository root, so a degraded daemon
+/// is reported when its state CHANGES rather than on every call.
+///
+/// [`validate_health_repo`] has four production call sites and is entered
+/// several times per command, so the notice printed twice inside one `kin
+/// doctor` and, in a stranger's words, "before almost every command after the
+/// daemon restart" (FIR-3037). The decision to keep serving a degraded daemon is
+/// right and is not what changed; a line that prints before every command
+/// teaches the reader to skip it, which is expensive on the day the cause is
+/// different.
+///
+/// Keyed by repo root because one process can talk to more than one repository,
+/// and a second repository going degraded is its own news.
+static REPORTED_HEALTH: std::sync::Mutex<Option<std::collections::HashMap<String, &'static str>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether this status is news for this repository root.
+///
+/// Separated from the `warn!` so the rule can be graded directly. A test that
+/// counted log lines would be asserting on a proxy for the decision; this IS the
+/// decision, and the warning below is its one consequence.
+fn should_report_health(repo_root: &str, status: &'static str) -> bool {
+    match REPORTED_HEALTH.lock() {
+        Ok(mut guard) => {
+            let seen = guard.get_or_insert_with(std::collections::HashMap::new);
+            seen.insert(repo_root.to_string(), status) != Some(status)
+        }
+        // A poisoned lock must not silence a degraded daemon. Warning twice is
+        // the failure this exists to reduce; warning zero times is the one it
+        // must not introduce.
+        Err(_) => true,
+    }
+}
+
+fn warn_on_health_change(repo_root: &str, status: &'static str) {
+    if should_report_health(repo_root, status) {
         warn!(
-            repo_root = health.repo_root.as_deref().unwrap_or("<unknown>"),
+            repo_root = repo_root,
             "daemon is up and serving but reports health=attention (degraded); \
              continuing to use it. Run `kin doctor` for details."
         );
     }
-    Ok(())
+}
+
+fn forget_reported_health(repo_root: &str) {
+    if let Ok(mut guard) = REPORTED_HEALTH.lock() {
+        if let Some(seen) = guard.as_mut() {
+            seen.remove(repo_root);
+        }
+    }
 }
 
 struct StartupLock {
@@ -7597,6 +7653,72 @@ mod urlencoding {
 
 #[cfg(test)]
 mod tests {
+    /// FIR-3037. A degraded daemon is announced when its state CHANGES, not on
+    /// every call.
+    ///
+    /// `validate_health_repo` has four production call sites and is entered
+    /// several times per command, so this line printed twice inside one `kin
+    /// doctor` and before almost every command in a stranger's session. The
+    /// decision to keep serving a degraded daemon is right and is not what
+    /// changed.
+    #[test]
+    fn a_degraded_daemon_is_announced_on_a_change_and_not_per_call() {
+        let repo = "/tmp/fir3037-repeat";
+        assert!(
+            super::should_report_health(repo, "attention"),
+            "the first sighting is news"
+        );
+        for call in 0..4 {
+            assert!(
+                !super::should_report_health(repo, "attention"),
+                "call {call} repeated a state nothing changed about"
+            );
+        }
+    }
+
+    /// The control: a daemon whose health CHANGES mid-session must produce a
+    /// second line.
+    ///
+    /// Without it the rule above is satisfied by a latch that reports once and
+    /// never again, which would hide the very transition the warning exists for.
+    #[test]
+    fn a_health_change_mid_session_is_announced_again() {
+        let repo = "/tmp/fir3037-change";
+        // Named, not bare. A silent `assert!` is red under any mutation and
+        // tells the falsification grid nothing about WHICH one it caught, which
+        // is the difference between a mutant that was caught and one that
+        // happened to break something.
+        assert!(
+            super::should_report_health(repo, "attention"),
+            "the first sighting of a degraded daemon is news"
+        );
+        assert!(
+            !super::should_report_health(repo, "attention"),
+            "and repeating it is not"
+        );
+
+        // The daemon recovers. `validate_health_repo` clears the memory on any
+        // other serving status, which is what this models.
+        super::forget_reported_health(repo);
+
+        assert!(
+            super::should_report_health(repo, "attention"),
+            "a daemon that went degraded again is news again"
+        );
+    }
+
+    /// And a second repository is its own subject, because one process can talk
+    /// to more than one.
+    #[test]
+    fn each_repository_root_is_announced_on_its_own() {
+        assert!(super::should_report_health("/tmp/fir3037-a", "attention"));
+        assert!(
+            super::should_report_health("/tmp/fir3037-b", "attention"),
+            "a different repository going degraded is its own news"
+        );
+        assert!(!super::should_report_health("/tmp/fir3037-a", "attention"));
+    }
+
     use super::*;
 
     /// The startup-phase line the MCP answer-early path injects must track the
