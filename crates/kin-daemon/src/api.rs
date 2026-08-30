@@ -34720,7 +34720,15 @@ mod tests {
     /// bare again, and the three must agree. Lane vcsreads added this control to
     /// the probe that produced these assertions, and without it the pair is
     /// unfalsifiable in the same way an unmeasured fixture is.
-    #[cfg(unix)]
+    ///
+    /// Deliberately NOT `#[cfg(unix)]`. Two of its three callers are, because
+    /// they build fixtures through `universal_branch_test_state`, which is;
+    /// the rollback arm builds its own and has compiled on Windows since it
+    /// was written. Gating this helper alongside the two made the third arm
+    /// call a function that is absent on Windows, which is a compile error
+    /// rather than a test failure, so the whole leg graded nothing. Both
+    /// symbols it touches are ungated: `DaemonState::snapshot_generation`
+    /// and `ActiveApiRepositoryAuthority::open`.
     fn generation_pair(state: &Arc<DaemonState>) -> (u64, u64) {
         use std::sync::atomic::Ordering::SeqCst;
         let bare = state.snapshot_generation.load(SeqCst);
