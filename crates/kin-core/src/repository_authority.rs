@@ -290,6 +290,7 @@ impl LocalRepositoryAuthorityBinding {
     /// so naming a replaced namespace as such costs no second recovery. KinDB
     /// may separately persist a reusable history-validation proof after a full
     /// replay; that does not reload authority or decide whether a record exists.
+    #[track_caller]
     pub fn open_manager(
         &self,
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
@@ -314,6 +315,7 @@ impl LocalRepositoryAuthorityBinding {
     /// The optional shape remains for callers that already expose KinDB's
     /// payload-receipt type; use KinDB directly when deliberately constructing
     /// an unpersisted repository before its first commit.
+    #[track_caller]
     pub fn open_manager_with_payload_stats(
         &self,
     ) -> std::result::Result<
@@ -338,11 +340,32 @@ impl LocalRepositoryAuthorityBinding {
 /// record when constructing an unpersisted generation-zero repository, so this
 /// boundary uses the payload receipt from the same recovery to retain the
 /// stricter reopen contract without paying for a second load or lock.
+#[track_caller]
 pub fn open_persisted_local_repository_authority<B: StorageBackend + ?Sized + 'static>(
     repository_id: RepositoryId,
     backend: Arc<B>,
 ) -> std::result::Result<(RepositoryAuthorityManager<B>, AuthorityPayloadStats), kin_db::KinDbError>
 {
+    // The funnel, and the reason the attribution lives here rather than only on
+    // kin-cli's wrapper.
+    //
+    // Measured on a converted psf/requests store: one `kin graph status`
+    // performs twelve whole-store authority opens, and instrumenting kin-cli's
+    // `ActiveRepositoryAuthority::open` attributed two of twenty-six across a
+    // run. The other twenty-four never reach that type. Every path into kin-db's
+    // recovery does reach THIS function, so a caller named here is a caller
+    // named for all of them.
+    //
+    // `#[track_caller]` names the call site rather than a backtrace and costs
+    // nothing at runtime. Info rather than debug, for the same reason as the
+    // wrapper's: the count is what an operator needs when a read is slow, and a
+    // level nobody turns on is a line nobody reads.
+    let caller = std::panic::Location::caller();
+    tracing::info!(
+        repository = %repository_id,
+        caller = %format_args!("{}:{}", caller.file(), caller.line()),
+        "opening persisted repository authority, which re-verifies every persisted body"
+    );
     let missing_repository_id = repository_id.clone();
     let (manager, payload_stats) =
         RepositoryAuthorityManager::open_with_payload_stats(repository_id, backend)?;
