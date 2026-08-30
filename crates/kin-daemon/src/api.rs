@@ -8210,7 +8210,15 @@ async fn blame(
         &req,
     )
     .map_err(|error| {
-        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+        // A live-graph replay miss is the CALLER'S news, not an internal fault.
+        // The ref was fine and the change is durable; this daemon's projection
+        // cannot replay to it. It reached `internal_error` below, so the user
+        // got a 500 carrying the RESOLVED change id rather than the ref they
+        // typed, which is an internal invariant leaking. rc062j saw exactly
+        // that after a merge, on every ref form, always naming the same id.
+        if kin_cli::commands::ref_lookup::is_graph_projection_error(&error) {
+            (StatusCode::CONFLICT, crate::error::cause_first(&error))
+        } else if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
             (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
@@ -8246,7 +8254,15 @@ async fn history(
         &req,
     )
     .map_err(|error| {
-        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+        // A live-graph replay miss is the CALLER'S news, not an internal fault.
+        // The ref was fine and the change is durable; this daemon's projection
+        // cannot replay to it. It reached `internal_error` below, so the user
+        // got a 500 carrying the RESOLVED change id rather than the ref they
+        // typed, which is an internal invariant leaking. rc062j saw exactly
+        // that after a merge, on every ref form, always naming the same id.
+        if kin_cli::commands::ref_lookup::is_graph_projection_error(&error) {
+            (StatusCode::CONFLICT, crate::error::cause_first(&error))
+        } else if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
             (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)

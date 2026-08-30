@@ -4680,6 +4680,9 @@ mod tests {
             &kin_cli::commands::history::HistoryRequest {
                 entity: "value".to_string(),
                 reference: None,
+                // The DEFAULT, so these keep grading the shape a caller gets
+                // without asking for anything.
+                all_revisions: false,
             },
         )
         .unwrap();
@@ -4711,6 +4714,9 @@ mod tests {
             &kin_cli::commands::blame::BlameRequest {
                 entity: "value".to_string(),
                 reference: None,
+                // The DEFAULT, so these keep grading the shape a caller gets
+                // without asking for anything.
+                all_revisions: false,
             },
         )
         .unwrap();
@@ -5472,6 +5478,9 @@ mod tests {
             &kin_cli::commands::history::HistoryRequest {
                 entity: "value".to_string(),
                 reference: None,
+                // The DEFAULT, so these keep grading the shape a caller gets
+                // without asking for anything.
+                all_revisions: false,
             },
         )
         .unwrap();

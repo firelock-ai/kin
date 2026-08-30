@@ -514,6 +514,10 @@ enum Command {
         /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
+        /// List every file-level revision, including ones that did not change
+        /// this entity
+        #[arg(long, default_value_t = false)]
+        all_revisions: bool,
     },
     /// Find dead code (whole-repo scan, or seeded by semantic query)
     DeadCode {
@@ -673,6 +677,10 @@ enum Command {
         /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
+        /// List every file-level revision, including ones that did not change
+        /// this entity
+        #[arg(long, default_value_t = false)]
+        all_revisions: bool,
     },
     /// MCP server commands
     Mcp {
@@ -3162,9 +3170,11 @@ fn main() -> Result<()> {
                         commands::review::run(change, entities, files, changes).await
                     }
                 }
-                Command::History { entity, reference } => {
-                    commands::history::run(entity, reference).await
-                }
+                Command::History {
+                    entity,
+                    reference,
+                    all_revisions,
+                } => commands::history::run(entity, reference, all_revisions).await,
                 Command::DeadCode {
                     seed,
                     limit,
@@ -3246,9 +3256,11 @@ fn main() -> Result<()> {
                     StashAction::Pop => commands::stash::pop().await,
                     StashAction::List { json } => commands::stash::list(json).await,
                 },
-                Command::Blame { entity, reference } => {
-                    commands::blame::run(entity, reference).await
-                }
+                Command::Blame {
+                    entity,
+                    reference,
+                    all_revisions,
+                } => commands::blame::run(entity, reference, all_revisions).await,
                 Command::Agent { action } => {
                     // The agent loop is blocking, and a blocking HTTP client builds and
                     // drops its own runtime. Dropping one inside an async context panics,

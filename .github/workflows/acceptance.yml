@@ -292,6 +292,14 @@ jobs:
       - name: Falsify the diff-content graders
         run: python3 scripts/acceptance/diff_content_repro.py --self-test
 
+      # The control that decides this suite: in its fixture, the function that
+      # DID change twice also reports 3 revisions, so the right answer and the
+      # wrong answer are the same number and a grader that counts cannot tell
+      # them apart. Every attribution row therefore asserts the PAIR, and the
+      # truncates-everything arm is the one a counting check would pass.
+      - name: Falsify the blame-attribution graders
+        run: python3 scripts/acceptance/blame_attribution_repro.py --self-test
+
       # The graders here decide two verdicts that read alike from outside: a
       # refusal that fires with no remedy behind it, and a conversion with room
       # that narrates its memory anyway. Both are driven against their inverse,
@@ -928,6 +936,27 @@ jobs:
             echo "::warning title=Working-copy freshness acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Blame-attribution acceptance suite (verdict comes from the gate step)
+        id: blameattribution
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/blame_attribution_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/blame_attribution.json \
+            --verbose >acceptance/blame_attribution.log 2>&1 || rc=$?
+          cat acceptance/blame_attribution.log
+          {
+            echo "### Blame-attribution acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/blame_attribution.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Diff-content acceptance suite (verdict comes from the gate step)
         id: diffcontent
         if: always()
@@ -1155,6 +1184,7 @@ jobs:
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
             --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
             --report diff_content=acceptance/diff_content.json \
+            --report blame_attribution=acceptance/blame_attribution.json \
             --report init_budget=acceptance/init_budget.json \
             --report coverage_read=acceptance/coverage_read.json \
             --report bridge_reach=acceptance/bridge_reach.json \
