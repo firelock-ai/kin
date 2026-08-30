@@ -30,10 +30,10 @@ carries all of them the merge refuses and names both decisions. Nothing is
 synthesized, because kin has no textual line merge to build a third body from,
 so a projection is a choice among sides this merge already bound.
 
-Eleven checks over twelve repositories, run in order because two of them are
+Twelve checks over thirteen repositories, run in order because two of them are
 destructive: they publish the merge the earlier assertions are about. The first
-four grade FIR-2958's precedence rule; the last two grade rc062j finding (2),
-which is the same authority reporting conflicts that are not conflicts.
+four grade FIR-2958's precedence rule. The rest cover the related merge-truth
+findings this suite already owns, ending with FIR-3023's two abort cases.
 
   precedence  the entity settled `--theirs` decides the bytes of the artifact
               holding it, even though a later `--all-ours` settled that artifact,
@@ -57,6 +57,16 @@ which is the same authority reporting conflicts that are not conflicts.
   bodies      rc062j finding (1): a conflict's three sides render as source,
               every printed side hashed back to its recorded digest, and the
               listing that did not ask for bodies still carries none
+  exitcode    a merge that parks conflicts exits 8, while a clean merge exits 0
+  byname      an unambiguous entity name resolves exactly one conflict, while
+              an ambiguous name is refused with both candidates named
+  wrotenothing
+              refusing to continue an unresolved merge says it wrote nothing
+              and leaves the published head unchanged
+  wedge       abort succeeds after a hand edit, says the workspace moved, and
+              leaves the caller's exact bytes on disk; continue still refuses
+  sequence    the stranger's exact hand-edit then stash-push state: the tree is
+              back at base, the workspace generation moved, and abort succeeds
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when one could not
 be read, and 3 when the run could not be set up. `--self-test` exercises every
@@ -408,6 +418,22 @@ class Suite(object):
             os.makedirs(directory)
         with open(path, "wb") as handle:
             handle.write(content)
+
+    def workspace_state(self, repo):
+        """The tree hash and workspace generation `kin status` prints."""
+        rc, out, err = self.kin_run(["status"], repo)
+        out = out or ""
+        tree = None
+        generation = None
+        for line in out.splitlines():
+            if line.startswith("Tree: "):
+                tree = line.split()[1]
+            elif line.startswith("Workspace generation: "):
+                try:
+                    generation = int(line.split()[-1])
+                except (TypeError, ValueError):
+                    generation = None
+        return rc, out, err, (tree, generation)
 
     def read_bytes(self, repo, rel):
         try:
@@ -793,14 +819,8 @@ def grade_refusal_says_what_is_true(rc, out, err, published_before, published_af
     return (PASS, "the refusal names its reason, warns of no write, and published nothing")
 
 
-def grade_abort_frees_a_moved_workspace(rc, out, err, edited_after):
-    """FIR-3023. Abandoning must work from a workspace that moved.
-
-    Four claims together, because each passes alone for a wrong reason: an abort
-    that refuses everything fails the first, one that reverts the caller's edit
-    fails the third, and one that claims a restore point it no longer has fails
-    the second while doing the right thing.
-    """
+def grade_abort_frees_workspace(rc, out, err):
+    """Abandoning works after a move, and the line says that it moved."""
     text = (out or "") + (err or "")
     if rc is None:
         return (UNREADABLE, "`kin resolve --abort` produced no exit code")
@@ -811,10 +831,24 @@ def grade_abort_frees_a_moved_workspace(rc, out, err, edited_after):
         problems.append("it does not say the workspace moved")
     if "is unchanged at the recorded restore point" in text:
         problems.append("it still claims a restore point that no longer holds")
-    if not edited_after:
-        problems.append("the caller's own edit did not survive the abort")
     if problems:
         return (FAIL, "; ".join(problems))
+    return (PASS, "the merge is abandoned and the line says what moved")
+
+
+def grade_abort_frees_a_moved_workspace(rc, out, err, edited_after):
+    """FIR-3023. Abandoning must work and leave the caller's bytes alone.
+
+    Four claims together, because each passes alone for a wrong reason: an abort
+    that refuses everything fails the first, one that reverts the caller's edit
+    fails the third, and one that claims a restore point it no longer has fails
+    the second while doing the right thing.
+    """
+    verdict = grade_abort_frees_workspace(rc, out, err)
+    if verdict[0] != PASS:
+        return verdict
+    if not edited_after:
+        return (FAIL, "the caller's own edit did not survive the abort")
     return (PASS, "the merge is abandoned, the edit survives, and the line says what is true")
 
 
@@ -832,6 +866,111 @@ def grade_continue_still_refuses(rc, out, err):
     if "unresolved conflict" not in text:
         return (FAIL, "the refusal does not name what is outstanding: %s" % text[-160:].strip())
     return (PASS, "settling still refuses while conflicts remain, and says how many")
+
+
+def grade_tree_returned_to_base(before, after_edit, after_stash):
+    """The stranger's own state: the tree back where it started, counter moved.
+
+    Graded as a precondition rather than as a result. If the stash step does not
+    return the tree to base, the arm below is measuring some other state and its
+    pass would mean nothing, which is what the hand-edit-only arm was doing.
+    """
+    before_tree, before_generation = before
+    after_edit_tree, after_edit_generation = after_edit
+    after_stash_tree, after_stash_generation = after_stash
+    if (not before_tree or before_generation is None or not after_edit_tree
+            or after_edit_generation is None or not after_stash_tree
+            or after_stash_generation is None):
+        return (UNREADABLE, "could not read the tree hash and generation at both ends")
+    if before_tree == after_edit_tree:
+        return (UNREADABLE, "the hand edit did not move the tree, so nothing was staged")
+    if after_edit_generation <= before_generation:
+        return (FAIL, "the hand edit moved the tree but did not advance the workspace generation")
+    if before_tree != after_stash_tree:
+        return (FAIL, "the stash did not return the tree to base: %s then %s"
+                % (before_tree, after_stash_tree))
+    if before_generation == after_stash_generation:
+        return (FAIL, "the tree returned to base but the workspace generation never moved")
+    if after_stash_generation <= after_edit_generation:
+        return (FAIL, "the stash returned the tree but did not advance the workspace generation")
+    return (PASS, "the tree is back at %s while the workspace generation moved %s to %s"
+            % (before_tree, before_generation, after_stash_generation))
+
+
+def grade_merge_record_aborted(rc, out, err):
+    """The durable merge account is terminated, not merely reported that way."""
+    text = out or ""
+    if rc is None or not text.strip():
+        return (UNREADABLE, "`kin conflicts --json` produced no record to read")
+    if rc != 0:
+        return (FAIL, "reading the post-abort merge record failed: %s"
+                % ((err or out)[-160:].strip()))
+    try:
+        payload = json.loads(text)
+    except (TypeError, ValueError):
+        return (UNREADABLE, "the post-abort merge record was not JSON")
+    record = payload.get("record") or {}
+    state = record.get("state") or {}
+    if isinstance(state, dict):
+        state = state.get("state")
+    if state != "aborted":
+        return (FAIL, "the durable merge record is %r rather than aborted" % state)
+    return (PASS, "the durable merge record is aborted")
+
+
+def grade_workspace_state_unchanged(before_abort, after_abort):
+    """Abort restores nothing, including a counter move it did not author."""
+    if (not before_abort[0] or before_abort[1] is None or not after_abort[0]
+            or after_abort[1] is None):
+        return (UNREADABLE, "could not read the workspace state on both sides of abort")
+    if before_abort != after_abort:
+        return (FAIL, "abort changed workspace state from %r to %r"
+                % (before_abort, after_abort))
+    return (PASS, "abort left the tree and workspace generation exactly as it found them")
+
+
+def check_sequence(suite):
+    """FIR-3023, the stranger's own sequence rather than my shorter one.
+
+    Hand-edit, then `kin stash push --yes`, which returns the workspace to its
+    authority base while the generation moves. That is the state the ticket's
+    mechanism is about, tree identical and only the counter moved, and it is the
+    state a hand-edit-only fixture never enters: there the tree really did move,
+    so a tree comparison would have changed nothing and my first reading of the
+    refutation reached too far.
+
+    Here it would have worked, which is why this arm exists beside the other:
+    the fix has to cover both, and it does, because abandoning restores nothing
+    either way.
+    """
+    repo = suite.repo("sequence", BODY_FILES)
+    merge_rc, merge_out, merge_err = suite.kin_run(["merge", "feature"], repo)
+    before_rc, _before_out, _before_err, before = suite.workspace_state(repo)
+    suite.write_bytes(repo, "pkg/core.py",
+                      b"def summarize(rows):\n    return HAND_MERGED(rows)\n")
+    edit_rc, _edit_out, _edit_err, after_edit = suite.workspace_state(repo)
+    stash_rc, stash_out, stash_err = suite.kin_run(["stash", "push", "--yes"], repo)
+    stash_state_rc, _stash_state_out, _stash_state_err, after_stash = \
+        suite.workspace_state(repo)
+    rc, out, err = suite.kin_run(["resolve", "--abort"], repo)
+    abandoned = grade_abort_frees_workspace(rc, out, err)
+    conflicts_rc, conflicts_out, conflicts_err = \
+        suite.kin_run(["conflicts", "--json"], repo)
+    after_abort_rc, _after_abort_out, _after_abort_err, after_abort = \
+        suite.workspace_state(repo)
+    return _combine("sequence", [
+        ("parked", grade_exit_code(merge_rc, EXIT_MERGE_CONFLICTED,
+                                   "the sequence's conflicted merge")),
+        ("before", grade_exit_code(before_rc, 0, "status before the hand edit")),
+        ("edit", grade_exit_code(edit_rc, 0, "status after the hand edit")),
+        ("stashed", grade_exit_code(stash_rc, 0, "the sequence's stash push")),
+        ("stash-state", grade_exit_code(stash_state_rc, 0, "status after the stash")),
+        ("state", grade_tree_returned_to_base(before, after_edit, after_stash)),
+        ("abandoned", abandoned),
+        ("record", grade_merge_record_aborted(conflicts_rc, conflicts_out, conflicts_err)),
+        ("after", grade_exit_code(after_abort_rc, 0, "status after abort")),
+        ("kept", grade_workspace_state_unchanged(after_stash, after_abort)),
+    ], ticket=WEDGE_TICKET)
 
 
 def check_wedge(suite):
@@ -978,6 +1117,7 @@ CHECKS = [
     ("byname", check_byname),
     ("wrotenothing", check_wrotenothing),
     ("wedge", check_wedge),
+    ("sequence", check_sequence),
 ]
 
 
@@ -1299,12 +1439,68 @@ def self_test():
     expect("wedge cannot read a missing exit code",
            grade_abort_frees_a_moved_workspace(None, "", "", True), UNREADABLE)
 
+    expect("counter-move abort passes only when it names the move",
+           grade_abort_frees_workspace(0, good_abort, ""), PASS)
+    expect("counter-move abort fails the shipped refusal",
+           grade_abort_frees_workspace(1, "", old_abort), FAIL)
+    expect("counter-move abort fails the old all-clear",
+           grade_abort_frees_workspace(0, lying_abort, ""), FAIL)
+    expect("counter-move abort cannot read a missing exit code",
+           grade_abort_frees_workspace(None, "", ""), UNREADABLE)
+
     expect("continue-control passes a refusal naming what is outstanding",
            grade_continue_still_refuses(1, "", "still has 3 unresolved conflict(s)"), PASS)
     expect("continue-control fails a settle accepted with conflicts outstanding",
            grade_continue_still_refuses(0, "Merged", ""), FAIL)
     expect("continue-control fails a refusal that names nothing",
            grade_continue_still_refuses(1, "", "no"), FAIL)
+
+    expect("sequence passes a stash that returned the tree while the counter moved",
+           grade_tree_returned_to_base(("aaa", 3), ("bbb", 4), ("aaa", 5)), PASS)
+    expect("sequence fails a stash that left the tree moved",
+           grade_tree_returned_to_base(("aaa", 3), ("bbb", 4), ("ccc", 5)), FAIL)
+    expect("sequence fails a hand edit that moved no counter",
+           grade_tree_returned_to_base(("aaa", 3), ("bbb", 3), ("aaa", 4)), FAIL)
+    expect("sequence fails a stash that moved no further counter",
+           grade_tree_returned_to_base(("aaa", 3), ("bbb", 4), ("aaa", 4)), FAIL)
+    expect("sequence fails a stash that moved no counter",
+           grade_tree_returned_to_base(("aaa", 3), ("bbb", 4), ("aaa", 3)), FAIL)
+    # CONTROL: if the edit never moved the tree there was nothing to return, so
+    # the arm graded some other state and must say so rather than pass.
+    expect("CONTROL sequence cannot read a run where the edit moved nothing",
+           grade_tree_returned_to_base(("aaa", 3), ("aaa", 4), ("aaa", 5)), UNREADABLE)
+    expect("sequence cannot read a missing tree hash",
+           grade_tree_returned_to_base((None, 3), ("bbb", 4), ("aaa", 5)), UNREADABLE)
+    expect("sequence cannot read a missing generation",
+           grade_tree_returned_to_base(("aaa", None), ("bbb", 4), ("aaa", 5)), UNREADABLE)
+    expect("sequence cannot read a missing post-edit tree",
+           grade_tree_returned_to_base(("aaa", 3), (None, 4), ("aaa", 5)), UNREADABLE)
+    expect("sequence cannot read a missing post-edit generation",
+           grade_tree_returned_to_base(("aaa", 3), ("bbb", None), ("aaa", 5)), UNREADABLE)
+    expect("sequence cannot read a missing post-stash tree",
+           grade_tree_returned_to_base(("aaa", 3), ("bbb", 4), (None, 5)), UNREADABLE)
+    expect("sequence cannot read a missing post-stash generation",
+           grade_tree_returned_to_base(("aaa", 3), ("bbb", 4), ("aaa", None)), UNREADABLE)
+
+    aborted_record = json.dumps({"record": {"state": {"state": "aborted"}}})
+    parked_record = json.dumps({"record": {"state": {"state": "in_progress"}}})
+    expect("sequence proves the durable merge record was aborted",
+           grade_merge_record_aborted(0, aborted_record, ""), PASS)
+    expect("sequence fails a merge record that stayed parked",
+           grade_merge_record_aborted(0, parked_record, ""), FAIL)
+    expect("sequence cannot read a non-JSON merge record",
+           grade_merge_record_aborted(0, "not json", ""), UNREADABLE)
+    expect("sequence fails when reading the post-abort record failed",
+           grade_merge_record_aborted(1, "{}", "read failed"), FAIL)
+
+    expect("sequence passes an abort that left workspace state alone",
+           grade_workspace_state_unchanged(("aaa", 5), ("aaa", 5)), PASS)
+    expect("sequence fails an abort that changed the tree",
+           grade_workspace_state_unchanged(("aaa", 5), ("bbb", 5)), FAIL)
+    expect("sequence fails an abort that changed the generation",
+           grade_workspace_state_unchanged(("aaa", 5), ("aaa", 6)), FAIL)
+    expect("sequence cannot read missing post-abort workspace state",
+           grade_workspace_state_unchanged(("aaa", 5), (None, None)), UNREADABLE)
 
     expect("a relative kin path is absolutized by this suite",
            (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)
