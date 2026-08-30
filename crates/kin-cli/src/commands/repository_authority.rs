@@ -118,6 +118,11 @@ impl RequestRepositoryAuthority {
     /// per entity — costs one open for the whole batch on the shared arm and one
     /// per item on the pinned arm, which is exactly the one-shot behavior that
     /// arm is for.
+    /// `#[track_caller]` so the log at the open names the READ that wanted an
+    /// authority rather than this wrapper. Without it every pinned open in the
+    /// product attributes to one line here, which is attribution being useless
+    /// in the most convincing way.
+    #[track_caller]
     pub(crate) fn open(&self) -> Result<std::sync::Arc<ActiveRepositoryAuthority>> {
         match &self.shared {
             Some(resolve) => resolve(),
@@ -134,8 +139,38 @@ impl ActiveRepositoryAuthority {
     /// asked for. `pub` so a long-lived server can pay for one open and hand it
     /// to the requests that read at that publication, through
     /// [`RequestRepositoryAuthority::shared`].
+    #[track_caller]
     pub fn open(binding: &kin_core::LocalRepositoryAuthorityBinding) -> Result<Self> {
-        REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| opens.set(opens.get() + 1));
+        let opens = REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| {
+            opens.set(opens.get() + 1);
+            opens.get()
+        });
+        // Who asked, in the product's own log, at the moment of asking.
+        //
+        // kin-db already logs `repository authority open` with its timings, and
+        // one `kin graph status` on a converted repository produced twelve of
+        // them with nine concurrent, each decoding the whole snapshot and
+        // re-verifying every persisted body. That count says the cost is a
+        // multiplier rather than a working set. It says nothing about WHICH
+        // callers make it, and that is the difference between fixing one site
+        // and fixing the mechanism.
+        //
+        // `#[track_caller]` names the call site rather than a backtrace and
+        // costs nothing at runtime, so attributing those twelve is a grep over
+        // one run instead of an argument from source. The counter beside it is
+        // the same thread-local the tests assert on, so a burst on one thread
+        // is visible without correlating timestamps.
+        //
+        // Deliberately `info` and not `debug`: the count is what an operator
+        // needs when a read is slow, and a level nobody turns on is a line
+        // nobody reads.
+        let caller = std::panic::Location::caller();
+        tracing::info!(
+            repository = %binding.repository_id(),
+            caller = %format_args!("{}:{}", caller.file(), caller.line()),
+            opens_on_this_thread = opens,
+            "opening repository authority, which re-verifies every persisted body"
+        );
         let repository_id = binding.repository_id().clone();
         let workspace_id = binding.workspace_id();
         let (manager, payload_stats) = binding
