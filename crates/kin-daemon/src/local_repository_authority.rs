@@ -45,6 +45,18 @@ impl LocalRepositoryAuthorityContext {
         self.binding.workspace_id()
     }
 
+    /// Open the local repository authority this daemon pinned at startup.
+    ///
+    /// `#[track_caller]` is load-bearing for attribution and changes no
+    /// behaviour. `open_manager` is itself `#[track_caller]` and the kin-core
+    /// funnel logs `Location::caller()` on every open, so without the attribute
+    /// here every one of this method's call sites collapses into the
+    /// `open_manager` line below. Measured on a converted psf/requests store,
+    /// eighteen of twenty opens inside one `kin graph status` reported that one
+    /// line and named no caller, which is an attribution that cannot answer the
+    /// question it exists for. With the attribute the funnel names the site that
+    /// asked for the open.
+    #[track_caller]
     pub(crate) fn open(
         &self,
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
@@ -301,4 +313,98 @@ pub(crate) fn plan_daemon_semantic_delta(
         target_relations,
     )
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod attribution_tests {
+    use super::*;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// Every `caller=` the kin-core authority funnel logged while the capture was live.
+    #[derive(Default)]
+    struct Captured {
+        callers: Vec<String>,
+    }
+
+    struct CaptureLayer(std::sync::Arc<std::sync::Mutex<Captured>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Read {
+                caller: Option<String>,
+            }
+            impl tracing::field::Visit for Read {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "caller" {
+                        // `caller = %format_args!(..)` records through
+                        // `record_debug` with a `std::fmt::Arguments`, whose
+                        // Debug delegates to Display and adds no quotes. The
+                        // trim is there so a future recording change that does
+                        // add them fails this test on the LINE rather than on
+                        // the punctuation.
+                        self.caller = Some(format!("{value:?}").trim_matches('"').to_string());
+                    }
+                }
+            }
+            let mut read = Read::default();
+            event.record(&mut read);
+            if let Some(caller) = read.caller {
+                self.0.lock().unwrap().callers.push(caller);
+            }
+        }
+    }
+
+    /// The funnel names the site that ASKED for an open, not the line inside
+    /// `open` that performs it.
+    ///
+    /// This is the only way `#[track_caller]` on `open` can be falsified, and
+    /// the assertion is exact rather than a substring: the expected value is
+    /// built from `file!()` and the `line!()` of the call below, so removing
+    /// the attribute makes the funnel report the `open_manager` line inside
+    /// `open` and this test fails naming both. A weaker assertion, that the
+    /// caller merely mentions this file, would pass with the attribute removed,
+    /// because the line inside `open` is in this file too.
+    #[test]
+    fn the_funnel_names_the_caller_of_open_rather_than_the_line_inside_it() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let context = LocalRepositoryAuthorityContext::from_layout_for_test(&init.layout).unwrap();
+
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Captured::default()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(std::sync::Arc::clone(
+            &captured,
+        )));
+        let expected_line = {
+            let _capture = crate::capture_events_on_this_thread(subscriber);
+            let line = line!() + 1;
+            context.open().expect("the test store must open");
+            line
+        };
+
+        let callers = captured.lock().unwrap().callers.clone();
+        // A capture that recorded nothing is not a passing test. The funnel logs
+        // at info, so an empty vector here means the event never reached this
+        // subscriber and the assertion below would be vacuous.
+        assert!(
+            !callers.is_empty(),
+            "the authority funnel logged no caller= field at all, so this test graded nothing"
+        );
+
+        let expected = format!("{}:{}", file!(), expected_line);
+        assert!(
+            callers.iter().any(|caller| caller == &expected),
+            "the funnel named {callers:?}, none of them the call site {expected}. Without \
+             #[track_caller] on LocalRepositoryAuthorityContext::open every caller collapses \
+             into the open_manager line inside open, which is what this asserts against."
+        );
+    }
 }
