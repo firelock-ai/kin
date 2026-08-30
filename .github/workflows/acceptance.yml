@@ -295,6 +295,16 @@ jobs:
       - name: Falsify the diff-content graders
         run: python3 scripts/acceptance/diff_content_repro.py --self-test
 
+      # The reference set this suite grades against is MEASURED, not written in
+      # the suite: it drives every candidate form through `kin blame --ref`
+      # first and requires `kin diff` to accept what blame accepted. A list
+      # written in the suite would be a third grammar and would drift from the
+      # product the way the first two drifted from each other. Every grader has
+      # a control that must go the other way, because a `kin diff` that resolved
+      # every string it was handed would satisfy a one-directional check.
+      - name: Falsify the ref-grammar graders
+        run: python3 scripts/acceptance/ref_grammar_repro.py --self-test
+
       # The control that decides this suite: in its fixture, the function that
       # DID change twice also reports 3 revisions, so the right answer and the
       # wrong answer are the same number and a grader that counts cannot tell
@@ -973,6 +983,31 @@ jobs:
             echo "::warning title=VCS read-surface acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Ref-grammar acceptance suite (verdict comes from the gate step)
+        id: refgrammar
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/ref_grammar_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/ref_grammar.json \
+            --verbose >acceptance/ref_grammar.log 2>&1 || rc=$?
+          cat acceptance/ref_grammar.log
+          {
+            echo "### Ref-grammar acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/ref_grammar.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Ref-grammar acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       - name: Diff-content acceptance suite (verdict comes from the gate step)
         id: diffcontent
         if: always()
@@ -1228,6 +1263,7 @@ jobs:
             --report verdict_limits=acceptance/verdict_limits.json \
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
             --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
+            --report ref_grammar=acceptance/ref_grammar.json \
             --report diff_content=acceptance/diff_content.json \
             --report blame_attribution=acceptance/blame_attribution.json \
             --report init_budget=acceptance/init_budget.json \
