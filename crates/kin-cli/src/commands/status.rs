@@ -1410,7 +1410,8 @@ mod tests {
             payload.snapshot_bytes + payload.acknowledged_delta_bytes
         );
         assert!(
-            render_text(&report, None, None, None, &LastAdmissionRead::Absent).contains("Authority payload read: "),
+            render_text(&report, None, None, None, &LastAdmissionRead::Absent)
+                .contains("Authority payload read: "),
             "text status must state the payload the open read"
         );
 
@@ -1848,7 +1849,13 @@ mod tests {
         );
 
         let footprint = StoreFootprint::measure(&init.layout);
-        let with = render_text(&report, None, Some(&footprint), None, &LastAdmissionRead::Absent);
+        let with = render_text(
+            &report,
+            None,
+            Some(&footprint),
+            None,
+            &LastAdmissionRead::Absent,
+        );
         assert!(
             with.contains("Store size: ") && with.contains("under .kin/"),
             "a measured status must print the store line: {with}"
