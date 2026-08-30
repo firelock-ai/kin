@@ -792,17 +792,58 @@ impl DaemonKillRecord {
     /// of them: the process that would have to be restarted is the one serving
     /// the session asking, and nobody inside that session owns it.
     fn remediation_for(&self, enrichment_disabled: bool) -> String {
-        let more_memory = match self.limit_bytes {
-            Some(limit) => format!(
+        self.remediation_in(if enrichment_disabled {
+            EnrichmentState::AlreadyDisabled
+        } else {
+            EnrichmentState::Available
+        })
+    }
+
+    /// The remedy, for a known enrichment state.
+    ///
+    /// Two things changed here after the ladder was walked end to end on a host
+    /// with no language server.
+    ///
+    /// The memory remedy now names a number the reader can act on. It used to
+    /// say "more than the {limit} it has now", which is true and unhelpful: a
+    /// reader on a 9 GiB box learns only that 9 is not enough. Where the record
+    /// carries what the daemon actually held, that figure is a measurement of
+    /// THIS store rather than a forecast, and it is the floor a bigger machine
+    /// has to clear.
+    ///
+    /// And the enrichment clause is now optional rather than always present.
+    /// See [`EnrichmentState::Unavailable`].
+    ///
+    /// The options are assembled as a list rather than joined into a sentence
+    /// by hand, so a third remedy is one push and not a rewrite. The one this
+    /// is waiting for is bounded history: when a flag exists to convert less of
+    /// it, it belongs here, and until then offering it would be advice nobody
+    /// can take, which is the defect this whole function exists to stop
+    /// repeating.
+    pub fn remediation_in(&self, state: EnrichmentState) -> String {
+        let more_memory = match (self.limit_bytes, self.last_rss_bytes) {
+            (Some(limit), Some(rss)) if rss >= limit => format!(
+                "give this container or machine more than the {} this daemon was holding when \
+                 the kernel stopped it, which is already at the {} it has now",
+                human_bytes(rss),
+                human_bytes(limit)
+            ),
+            (Some(limit), _) => format!(
                 "give this container or machine more than the {} it has now",
                 human_bytes(limit)
             ),
-            None => "run this repository on a machine with more memory".to_string(),
+            (None, Some(rss)) => format!(
+                "run this repository on a machine with more than the {} this daemon was holding",
+                human_bytes(rss)
+            ),
+            (None, None) => "run this repository on a machine with more memory".to_string(),
         };
+        let mut options = vec![more_memory];
+        options.extend(enrichment_remedy_clause_in(state));
         format!(
-            "To recover: {more_memory}, or {}. `kin doctor` reports this store's memory \
-             headroom, and `kin daemon status` reports what is running now.",
-            enrichment_remedy_clause_for(enrichment_disabled)
+            "To recover: {}. `kin doctor` reports this store's memory headroom, and \
+             `kin daemon status` reports what is running now.",
+            join_with_or(&options)
         )
     }
 
@@ -813,11 +854,25 @@ impl DaemonKillRecord {
     /// The cause and the remediation as one sentence-complete line, for a
     /// message that ends with it.
     pub fn summary(&self) -> String {
+        self.summary_in(if enrichment_disabled() {
+            EnrichmentState::AlreadyDisabled
+        } else {
+            EnrichmentState::Available
+        })
+    }
+
+    /// [`Self::summary`] for a caller that knows more about enrichment than
+    /// this process's environment does.
+    ///
+    /// The environment can say the switch is set. It cannot say the host has no
+    /// language server to switch off, which is the case where the switch is not
+    /// a remedy at all.
+    pub fn summary_in(&self, state: EnrichmentState) -> String {
         let mut cause = self.cause_sentence();
         if let Some(first) = cause.get(..1) {
             cause.replace_range(..1, &first.to_uppercase());
         }
-        format!("{cause}. {}", self.remediation())
+        format!("{cause}. {}", self.remediation_in(state))
     }
 }
 
@@ -826,6 +881,38 @@ impl DaemonKillRecord {
 /// Named here rather than spelled into each message so the remediation cannot
 /// drift from the switch `kin-daemon` actually reads.
 pub const DISABLE_ENRICHMENT_ENV: &str = "KIN_DAEMON_DISABLE_LSP";
+
+/// What the daemon says when it finds no language server to enrich with.
+///
+/// Named here for the same reason as the switch above, and read for a sharper
+/// one: a remedy that offers to turn enrichment off is useless when enrichment
+/// was never on, and the only durable record that it was never on is this
+/// sentence in the daemon's own log. Spelling it in two places would let the
+/// daemon reword its line and silently disarm the remedy that keys on it.
+///
+/// Measured on 2026-08-30 against the v0.6.2 candidate: a container with no
+/// language server installed, five checked by name, ran the whole ladder. Rung
+/// one offered `KIN_DAEMON_DISABLE_LSP=1`; rung two said to stop the daemon
+/// first so the next one picks the flag up; rung three did that and failed the
+/// same way. Four OOM kills for a lever that was already at the end it was
+/// being moved to.
+pub const ENRICHMENT_UNAVAILABLE_MARKER: &str = "no LSP servers found";
+
+/// Whether enrichment can be turned off usefully, and if not, why not.
+///
+/// Three states rather than the bool this replaced, because the bool could not
+/// tell "the sweep is running and you may turn it off" from "there is no sweep
+/// and never was". Both of those printed a lever, and only one of them had a
+/// lever to print.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrichmentState {
+    /// A sweep can run here and is not switched off.
+    Available,
+    /// This process already carries the switch, so a fresh daemon is what is missing.
+    AlreadyDisabled,
+    /// No language server exists on this host, so the switch changes nothing.
+    Unavailable,
+}
 
 /// Whether a value read from [`DISABLE_ENRICHMENT_ENV`] turns enrichment off.
 ///
@@ -868,6 +955,37 @@ pub fn enrichment_remedy_clause_for(disabled: bool) -> String {
              (`{DISABLE_ENRICHMENT_ENV}=1 kin graph status` in this repository) and retry this \
              call"
         )
+    }
+}
+
+/// The clause for a known enrichment state.
+///
+/// `Unavailable` returns `None` rather than a sentence, because the honest
+/// answer there is that this remedy does not exist, and a caller that received
+/// a string would print it beside the memory remedy as though the reader had
+/// two options.
+///
+/// Delegates to [`enrichment_remedy_clause_for`] for the two states that have a
+/// lever, rather than the other way round, so that function keeps returning a
+/// `String` for the callers it already has and nothing here needs an unwrap.
+pub fn enrichment_remedy_clause_in(state: EnrichmentState) -> Option<String> {
+    match state {
+        EnrichmentState::Unavailable => None,
+        EnrichmentState::AlreadyDisabled => Some(enrichment_remedy_clause_for(true)),
+        EnrichmentState::Available => Some(enrichment_remedy_clause_for(false)),
+    }
+}
+
+/// Join remedies so the sentence reads the same with one of them as with three.
+///
+/// Its own function because the alternative is a `format!` that assumes two,
+/// which is exactly what made the enrichment clause impossible to drop: the
+/// sentence had a hole shaped like it.
+fn join_with_or(options: &[String]) -> String {
+    match options {
+        [] => "there is nothing this run can suggest".to_string(),
+        [one] => one.clone(),
+        [head @ .., last] => format!("{}, or {last}", head.join(", ")),
     }
 }
 
@@ -9069,6 +9187,109 @@ Shared_Dirty:          0 kB\n";
             "why the signal is missing is the whole of what is known: {sentence}"
         );
         assert!(sentence.contains("no memory accounting"), "{sentence}");
+    }
+
+    fn killed_holding(limit: Option<u64>, rss: Option<u64>) -> DaemonKillRecord {
+        DaemonKillRecord {
+            kills: 1,
+            memory_kills: 1,
+            first_unix: 4_320,
+            last_unix: 4_320,
+            last_pid: Some(41),
+            last_cause: DaemonKillCause::MemoryLimit {
+                kernel_oom_kills: 1,
+            },
+            limit_bytes: limit,
+            last_rss_bytes: rss,
+        }
+    }
+
+    /// A host with no language server is offered no language-server lever.
+    ///
+    /// The defect this replaces, walked end to end on 2026-08-30 against the
+    /// v0.6.2 candidate in a container with five language servers checked by
+    /// name and none installed: rung one offered the switch, rung two said to
+    /// stop the daemon so the next one picks it up, rung three did that and
+    /// failed identically. Four OOM kills for a lever already at the end it was
+    /// being moved to.
+    #[test]
+    fn an_unavailable_sweep_is_not_offered_as_a_remedy() {
+        let record = killed_holding(Some(9 * 1024 * 1024 * 1024), None);
+        let remedy = record.remediation_in(EnrichmentState::Unavailable);
+        assert!(
+            !remedy.contains(DISABLE_ENRICHMENT_ENV),
+            "a host with no language server was told to turn one off: {remedy}"
+        );
+        assert!(
+            !remedy.contains("kin daemon stop"),
+            "and it must not be told to restart into that switch either: {remedy}"
+        );
+        // It still has to say something actionable, or it is the silence this
+        // whole function exists to end.
+        assert!(remedy.contains("To recover:"), "{remedy}");
+        assert!(remedy.contains("9.0 GiB"), "{remedy}");
+    }
+
+    /// And the two states that DO have a lever still print one, so the change
+    /// above is a third case rather than a deletion.
+    #[test]
+    fn the_two_states_with_a_lever_still_print_it() {
+        let record = killed_holding(Some(9 * 1024 * 1024 * 1024), None);
+        for state in [EnrichmentState::Available, EnrichmentState::AlreadyDisabled] {
+            let remedy = record.remediation_in(state);
+            assert!(
+                remedy.contains(DISABLE_ENRICHMENT_ENV),
+                "{state:?} lost its lever: {remedy}"
+            );
+        }
+        assert_ne!(
+            record.remediation_in(EnrichmentState::Available),
+            record.remediation_in(EnrichmentState::AlreadyDisabled),
+            "the two lever states say different things and must not collapse"
+        );
+    }
+
+    /// The memory remedy names a number the reader can act on.
+    ///
+    /// It used to say only "more than the {limit} it has now", which tells a
+    /// reader on a 9 GiB box that 9 is not enough and nothing else. Where the
+    /// record carries what the daemon was actually holding, that is a
+    /// measurement of THIS store and it is the floor a bigger machine clears.
+    #[test]
+    fn the_memory_remedy_names_what_the_daemon_was_holding() {
+        let limit = 9 * 1024 * 1024 * 1024;
+        let record = killed_holding(Some(limit), Some(limit));
+        let remedy = record.remediation_in(EnrichmentState::Unavailable);
+        assert!(
+            remedy.contains("was holding when the kernel stopped it"),
+            "{remedy}"
+        );
+        // And with no resident figure it falls back rather than inventing one.
+        let unknown = killed_holding(Some(limit), None);
+        let fallback = unknown.remediation_in(EnrichmentState::Unavailable);
+        assert!(
+            fallback.contains("more than the 9.0 GiB it has now"),
+            "{fallback}"
+        );
+        assert!(
+            !fallback.contains("was holding"),
+            "a record with no resident figure must not claim one: {fallback}"
+        );
+    }
+
+    /// The sentence reads correctly with one remedy and with two, which is what
+    /// makes the enrichment clause droppable at all.
+    #[test]
+    fn the_remedy_list_reads_as_a_sentence_at_either_length() {
+        assert_eq!(join_with_or(&["one".to_string()]), "one");
+        assert_eq!(
+            join_with_or(&["one".to_string(), "two".to_string()]),
+            "one, or two"
+        );
+        assert_eq!(
+            join_with_or(&["one".to_string(), "two".to_string(), "three".to_string()]),
+            "one, two, or three"
+        );
     }
 
     /// Every action in the remediation is one the caller can perform, and the

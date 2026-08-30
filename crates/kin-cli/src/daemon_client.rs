@@ -7479,7 +7479,37 @@ async fn resolve_daemon_url_inner(
         Err(
             err @ (AutoStartError::IncompatibleStore(_) | AutoStartError::BehaviorEnvIgnored(_)),
         ) => Err(anyhow::Error::new(err)),
-        Err(err) => Err(anyhow::Error::new(err).context("kin daemon is required")),
+        // The bottom rung of the recovery ladder, and it used to have no remedy
+        // on it at all.
+        //
+        // Walked end to end on 2026-08-30 against the v0.6.2 candidate: rung one
+        // is a good message naming the cap, the kill count and a recovery. Doing
+        // what it says brought the reader here, to a cause and a log tail and
+        // nothing to try next. A ladder whose bottom rung is silent is a ladder
+        // a user cannot get off, and each attempt costs another OOM kill.
+        //
+        // The enrichment state is read from the error's own text rather than
+        // from this process's environment alone, because the environment cannot
+        // tell you that the host has no language server. The daemon says that in
+        // one sentence, and `ENRICHMENT_UNAVAILABLE_MARKER` is that sentence,
+        // named once so neither side can reword it and disarm this.
+        Err(err) => {
+            let detail = err.to_string();
+            let state = if detail.contains(kin_daemon_spawn::ENRICHMENT_UNAVAILABLE_MARKER) {
+                kin_daemon_spawn::EnrichmentState::Unavailable
+            } else if kin_daemon_spawn::enrichment_disabled() {
+                kin_daemon_spawn::EnrichmentState::AlreadyDisabled
+            } else {
+                kin_daemon_spawn::EnrichmentState::Available
+            };
+            let headline = match kin_daemon_spawn::peek_unwatched_daemon_death(layout.root()) {
+                Some(record) => {
+                    format!("kin daemon is required. {}", record.summary_in(state))
+                }
+                None => "kin daemon is required".to_string(),
+            };
+            Err(anyhow::Error::new(err).context(headline))
+        }
     }
 }
 
