@@ -613,6 +613,10 @@ enum Command {
         /// Emit the machine-readable merge transaction record
         #[arg(long)]
         json: bool,
+        /// Print each conflict subject's three sides as source, diffed against
+        /// the common ancestor
+        #[arg(long)]
+        show: bool,
     },
     /// Resolve repository-v6 merge conflicts
     ///
@@ -3218,9 +3222,9 @@ fn main() -> Result<()> {
                     commands::capabilities::require_ready("merge")?;
                     commands::merge::run(branch, json).await
                 }
-                Command::Conflicts { json } => {
+                Command::Conflicts { json, show } => {
                     commands::capabilities::require_ready("conflicts")?;
-                    commands::conflicts::run(json).await
+                    commands::conflicts::run(json, show).await
                 }
                 Command::Resolve {
                     ours,
