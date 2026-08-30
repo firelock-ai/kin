@@ -34844,6 +34844,25 @@ mod tests {
             .graph
             .resolve_graph_at(&published)
             .expect("a graph holding the published change must replay to it");
+
+        // OVER-INVALIDATION guard, and it is the assertion a fix of the wrong
+        // shape fails. Installing into the projection is one way to close this
+        // defect; discarding the projection so the next read rebuilds is
+        // another, and it would satisfy every assertion above while destroying
+        // the changes the projection already held. Lane vcsreads measured which
+        // reads keep working across the unpatched defect (`kin log`,
+        // `kin diff <change> HEAD`, `kin status`, `kin graph status`, all
+        // resolving the change fine while blame and history cannot), and
+        // nothing guarded them. This is their equivalent one layer down: the
+        // PRE-publication change must still replay after the publication.
+        state
+            .graph
+            .resolve_graph_at(&regression)
+            .expect(
+                "the graph can no longer replay to a change it held before this publication, so \
+                 the projection was discarded rather than added to and every read that worked \
+                 across the original defect now fails",
+            );
     }
 
 
