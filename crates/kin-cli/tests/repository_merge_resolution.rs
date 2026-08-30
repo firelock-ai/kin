@@ -530,6 +530,78 @@ fn a_resolved_merge_publishes_ordered_parents_and_advances_only_the_target_ref()
 }
 
 /// Aborting proves the workspace equals the restore point the merge recorded,
+/// Abandoning a merge works from a workspace that has moved, because it
+/// restores nothing.
+///
+/// The rc063a stranger hand-edited a conflicted file and every exit refused:
+/// `resolve --continue`, `resolve --abort` and `merge` all answered 409 while
+/// `status` and `conflicts` kept advertising the merge, and `stash push --yes`
+/// followed by `stash pop` both succeeded and left it exactly as parked. The
+/// only recovery was `kin checkout --change`.
+///
+/// The gate that refused the abort compared the whole restore point, and it was
+/// protecting a sentence rather than an operation: abort's transaction carries
+/// no workspace mutation, no ref mutation and no changes, and its execution
+/// hands the finalizer the same tree twice with an empty delta.
+///
+/// So this asserts the property that makes unblocking it safe, rather than
+/// asserting that it now succeeds and stopping there: the bytes on disk are
+/// untouched, and the line says the workspace moved instead of claiming it is
+/// unchanged. A version that abandoned the merge AND reverted the caller's edit
+/// would pass a success-only test and lose their work.
+#[test]
+fn aborting_a_merge_from_a_moved_workspace_abandons_it_and_restores_nothing() {
+    let root = tempdir().expect("temp root");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    let parked = persisted_record(&layout).expect("the merge is parked");
+
+    // Move the workspace the way a caller does: edit the conflicted file by
+    // hand, then let the daemon see it. `kin status` is what the stranger ran.
+    let edited = b"pub fn base(count: u64) {}\npub fn mate() {}\n// hand merged\n";
+    fs::write(repo.join("src/lib.rs"), edited).expect("hand edit the conflicted file");
+    ok(&run_kin(&runtime, &repo, &["status"]), "kin status");
+    let moved = persisted_record(&layout).expect("the merge is still parked after the edit");
+    assert_eq!(
+        moved.restore, parked.restore,
+        "the record's saved restore point never moves; the WORKSPACE is what moved"
+    );
+
+    let aborted_output = ok(
+        &run_kin(&runtime, &repo, &["resolve", "--abort"]),
+        "kin resolve --abort from a moved workspace",
+    );
+
+    let aborted = persisted_record(&layout).expect("the record is retained as the merge's account");
+    assert!(
+        matches!(
+            aborted.state,
+            kin_model::MergeTransactionState::Aborted { .. }
+        ),
+        "the record terminates as abandoned: {:?}",
+        aborted.state
+    );
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).unwrap(),
+        edited,
+        "abandoning a merge must not touch the caller's own edit"
+    );
+    assert!(
+        aborted_output.contains("has moved since the merge opened"),
+        "the line must say the workspace moved rather than claim it is unchanged: \
+         {aborted_output}"
+    );
+    assert!(
+        !aborted_output.contains("is unchanged at the recorded restore point"),
+        "and must not claim the restore point still holds: {aborted_output}"
+    );
+}
+
 /// moves no ref, and frees the workspace for the next merge.
 #[test]
 fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {
