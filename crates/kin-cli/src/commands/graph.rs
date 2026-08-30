@@ -4333,11 +4333,10 @@ mod tests {
         // Taken outside both measured windows, and from authority METADATA,
         // which is the same field the opening path reads. Not the graph's tree.
         let durable_tree = {
-            let authority =
-                super::super::repository_authority::ActiveRepositoryAuthority::open(
-                    &fixture.binding,
-                )
-                .expect("open authority to read the durable workspace tree");
+            let authority = super::super::repository_authority::ActiveRepositoryAuthority::open(
+                &fixture.binding,
+            )
+            .expect("open authority to read the durable workspace tree");
             let workspace = authority.workspace().expect("durable workspace");
             std::sync::Arc::new(workspace.tree)
         };

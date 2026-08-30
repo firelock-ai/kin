@@ -346,10 +346,7 @@ impl LocalRepositoryAuthorityBinding {
     /// rule and has its own tests; a mismatch is a hard error rather than a
     /// `None`, because bytes that do not hash to their own name are corruption
     /// and not absence.
-    pub fn load_source_blob(
-        &self,
-        digest: kin_model::Hash256,
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn load_source_blob(&self, digest: kin_model::Hash256) -> Result<Option<Vec<u8>>> {
         let body = self
             .backend
             .load_source_blob_bounded(
@@ -382,9 +379,9 @@ pub(crate) fn verify_source_blob_digest(
     digest: kin_model::Hash256,
     body: &[u8],
 ) -> std::result::Result<(), String> {
-    let actual = kin_model::Hash256::from_bytes(
-        <[u8; 32]>::from(<sha2::Sha256 as sha2::Digest>::digest(body)),
-    );
+    let actual = kin_model::Hash256::from_bytes(<[u8; 32]>::from(
+        <sha2::Sha256 as sha2::Digest>::digest(body),
+    ));
     if actual != digest {
         return Err(format!(
             "immutable source blob {digest} does not hash to its own name; the bytes on disk              hash to {actual}"
@@ -522,9 +519,9 @@ mod source_blob_digest_tests {
     use super::*;
 
     fn digest_of(body: &[u8]) -> kin_model::Hash256 {
-        kin_model::Hash256::from_bytes(<[u8; 32]>::from(
-            <sha2::Sha256 as sha2::Digest>::digest(body),
-        ))
+        kin_model::Hash256::from_bytes(<[u8; 32]>::from(<sha2::Sha256 as sha2::Digest>::digest(
+            body,
+        )))
     }
 
     /// The bytes a digest names are admitted.
