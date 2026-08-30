@@ -34711,6 +34711,117 @@ mod tests {
         assert_eq!(carried[0].content_hash, approved_digest);
     }
 
+    /// A published MERGE must reach the live graph too, by the same contract
+    /// and with the same three guards as the rollback arm below.
+    ///
+    /// Its own arm rather than a second assertion in that one, because the two
+    /// publications reach the live graph through different code: kin#1287
+    /// installs on both merge publish paths, `publish` and
+    /// `publish_resolved_merge`, and this drives the first. A single arm
+    /// covering both would go red without saying which path regressed.
+    ///
+    /// The precondition is proved rather than assumed for the reason the
+    /// rollback arm states: a daemon whose projection was never populated holds
+    /// the change either way, so a check that publishes into an empty
+    /// projection passes on the unpatched binary.
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_published_merge_reaches_the_live_graph_without_a_restart() {
+        let (state, _layout, _repository, main_change, _feature_change) =
+            universal_branch_test_state("merge-live-graph");
+
+        // PRECONDITION, proved: this daemon's projection is populated before the
+        // publication. A failure here is NOT a verdict on the property.
+        state
+            .graph
+            .resolve_graph_at(&main_change)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOT RUN, precondition unmet rather than property refuted: the projection \
+                     could not replay to the pre-merge change, so publishing into it proves \
+                     nothing: {error}"
+                )
+            });
+
+        let backend = state.local_repository_backend().unwrap();
+        let repository_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .repository_id()
+            .clone();
+        let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        // CONTROL: two reads with no publication between must be the SAME, or
+        // the comparison below cannot be evidence that a publication moved it.
+        let identity_again = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before == identity_again,
+            "the publication identity differs between two reads with no publication between them"
+        );
+
+        let request = kin_cli::commands::merge::MergeRequest {
+            source: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("merge-live-graph-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the merge must publish for this arm to grade anything: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let published = branch_change(&state);
+        assert_ne!(
+            published, main_change,
+            "the merge must move the branch off its pre-merge change, or nothing was published \
+             and the assertions below would grade an unchanged store"
+        );
+
+        // The assertion this arm exists for. No restart between publication and
+        // this read, and it goes through the LIVE projection rather than an
+        // authority-backed surface: `kin log` and `kin status` answered rc=0 on
+        // the unpatched binary throughout, so a check reading only those would
+        // pass on both builds. The split is the whole tell.
+        assert!(
+            state.graph.get_change(&published).unwrap().is_some(),
+            "the live graph does not hold the change the merge just published, so every read \
+             that replays the graph to it fails until the daemon restarts; authority holds it \
+             and the derived query view does not"
+        );
+        state
+            .graph
+            .resolve_graph_at(&published)
+            .expect("a graph holding the published merge change must replay to it");
+
+        // OVER-INVALIDATION guard: discarding the projection would satisfy every
+        // assertion above while destroying what it already held.
+        state.graph.resolve_graph_at(&main_change).expect(
+            "the graph can no longer replay to a change it held before the merge, so the \
+             projection was discarded rather than added to",
+        );
+
+        let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before != identity_after,
+            "the publication identity did not move across a merge publication, so every authority \
+             slot keyed on it stays valid across the merge and concurrent readers admit against \
+             pre-merge roots"
+        );
+    }
+
     /// A published rollback must reach the LIVE graph, not only durable
     /// authority, without restarting the daemon.
     ///
