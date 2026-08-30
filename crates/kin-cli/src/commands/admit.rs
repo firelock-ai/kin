@@ -93,6 +93,24 @@ pub struct AdmitReport {
     /// The reconcile probes read AFTER the pass. This is the outcome surface:
     /// the request can succeed while the admission inside it failed.
     pub reconcile: ReconcileHealth,
+    /// Whether the admitted tree's CONTENT moved, when the daemon could measure
+    /// it.
+    ///
+    /// The two census counters above cannot answer this and were read as if they
+    /// could. A pass that rewrites the body of a tracked file adds no artifact
+    /// and no entity, so both deltas are zero and the summary said
+    /// `nothing changed` over an admission that moved the workspace tree hash
+    /// from `70fda9ae` to `c078181f` and its generation from 5 to 6, both
+    /// visible three lines apart in the same output. To an operator who had just
+    /// edited a file, "nothing changed" reads as "your edit is still not
+    /// admitted", which is the opposite of what happened (FIR-2961).
+    ///
+    /// `None` means nobody looked: an older daemon that does not report it, or a
+    /// tree hash that would not compute on one side. It is never collapsed into
+    /// `false`, because "the content did not move" and "nothing measured it" are
+    /// the two answers this field exists to keep apart.
+    #[serde(default)]
+    pub tree_moved: Option<bool>,
     /// False when the pass itself failed. The request still returns its report
     /// so the operator sees the counters and the recorded cause; the CLI exits
     /// nonzero.
@@ -122,6 +140,21 @@ pub fn census_moved(report: &AdmitReport) -> bool {
     report.tracked_after != report.tracked_before || report.entities_after != report.entities_before
 }
 
+/// Whether this pass moved graph authority at all, by any measure it has.
+///
+/// Kept beside [`census_moved`] rather than folded into it, because that
+/// function is named for the census and answers honestly about the census. This
+/// is the question every caller of it actually meant: an admission that rewrote
+/// a tracked file's bytes moved authority without moving either count, and a
+/// surface deriving "did anything happen" from cardinalities alone reports that
+/// as a no-op (FIR-2961).
+///
+/// An unmeasured tree (`tree_moved: None`) contributes nothing rather than a
+/// `false`, so this can only ever be more true than `census_moved`, never less.
+pub fn graph_moved(report: &AdmitReport) -> bool {
+    census_moved(report) || report.tree_moved == Some(true)
+}
+
 /// Render the operator-facing summary for one admission report.
 ///
 /// Kept separate from transport so the wording is asserted directly rather than
@@ -139,7 +172,7 @@ pub fn summary_lines(report: &AdmitReport) -> Vec<String> {
             .or(report.reconcile.last_admission_error.as_deref())
             .unwrap_or("no cause recorded");
         lines.push(format!("Complete exact-tree admission failed: {cause}"));
-        if census_moved(report) {
+        if graph_moved(report) {
             // Authority crossed before the failure. Calling that unchanged is
             // the one wording an operator cannot recover from, because it
             // describes a settled store while the real one is half admitted:
@@ -160,10 +193,27 @@ pub fn summary_lines(report: &AdmitReport) -> Vec<String> {
     }
 
     if tracked_delta == 0 && entity_delta == 0 {
-        lines.push(format!(
-            "Admitted the complete exact tree; nothing changed. {} tracked artifacts, {} entities.",
-            report.tracked_after, report.entities_after
-        ));
+        // Three answers, not two. The counts agreeing is the weakest of the
+        // three premises a "nothing changed" needs, and on its own it is
+        // satisfied by every content-only edit there is.
+        match report.tree_moved {
+            Some(true) => lines.push(format!(
+                "Admitted the complete exact tree; content changed, with no artifact or entity \
+                 added or removed. {} tracked artifacts, {} entities.",
+                report.tracked_after, report.entities_after
+            )),
+            Some(false) => lines.push(format!(
+                "Admitted the complete exact tree; nothing changed. {} tracked artifacts, {} \
+                 entities.",
+                report.tracked_after, report.entities_after
+            )),
+            None => lines.push(format!(
+                "Admitted the complete exact tree. {} tracked artifacts, {} entities, and \
+                 neither count moved; this daemon does not report whether content moved, so \
+                 this is not a statement that the tree is unchanged.",
+                report.tracked_after, report.entities_after
+            )),
+        }
     } else {
         lines.push(format!(
             "Admitted the complete exact tree: {} tracked artifacts ({tracked_delta:+}), {} \
@@ -417,10 +467,80 @@ mod tests {
             embeddings_indexed: 49,
             embeddings_total: 14187,
             reconcile: ReconcileHealth::default(),
+            tree_moved: Some(true),
             admitted,
             failure: (!admitted)
                 .then(|| "host entry changed after exact-tree admission".to_string()),
         }
+    }
+
+    /// The stranger's own pass: a content-only edit, admitted successfully, with
+    /// both counts standing exactly still.
+    fn content_only_pass(tree_moved: Option<bool>) -> AdmitReport {
+        let mut settled = report(true);
+        settled.tracked_before = 8;
+        settled.tracked_after = 8;
+        settled.entities_before = 39;
+        settled.entities_after = 39;
+        settled.tree_moved = tree_moved;
+        settled
+    }
+
+    /// FIR-2961. The stranger edited one tracked file, ran `kin admit`, and was
+    /// told `nothing changed` by a pass that moved the workspace tree hash from
+    /// `70fda9ae` to `c078181f` and its generation from 5 to 6. Both counts held
+    /// at 8 and 39 across it, because a content-only edit adds no artifact and
+    /// no entity, so the two premises the wording rested on were both true and
+    /// the wording was false.
+    #[test]
+    fn a_content_only_admission_is_not_reported_as_nothing_changed() {
+        let text = summary_lines(&content_only_pass(Some(true))).join("\n");
+        assert!(
+            !text.contains("nothing changed"),
+            "a pass that moved the tree must not claim nothing changed: {text}"
+        );
+        assert!(text.contains("content changed"), "{text}");
+        assert!(text.contains("8 tracked artifacts"), "{text}");
+        assert!(text.contains("39 entities"), "{text}");
+    }
+
+    /// The control the test above needs to mean anything. A pass over a tree
+    /// that genuinely did not move still says so, or the fix is just a surface
+    /// that never gives an all-clear.
+    #[test]
+    fn a_pass_over_an_unmoved_tree_still_reports_nothing_changed() {
+        let text = summary_lines(&content_only_pass(Some(false))).join("\n");
+        assert!(text.contains("nothing changed"), "{text}");
+        assert!(!text.contains("content changed"), "{text}");
+    }
+
+    /// An unmeasured tree is the third answer and must render as neither of the
+    /// other two. An older daemon reports no `tree_moved`, and turning that into
+    /// a `false` puts the defect straight back, one field further down.
+    #[test]
+    fn an_unmeasured_tree_claims_neither_outcome() {
+        let text = summary_lines(&content_only_pass(None)).join("\n");
+        assert!(
+            !text.contains("nothing changed"),
+            "an unmeasured tree is not an unchanged tree: {text}"
+        );
+        assert!(!text.contains("content changed"), "{text}");
+        assert!(
+            text.contains("does not report whether content moved"),
+            "{text}"
+        );
+        assert!(text.contains("8 tracked artifacts"), "{text}");
+    }
+
+    /// `graph_moved` is what every "did anything happen" caller meant, and the
+    /// three readings have to come out in this order or `mutated` publishes a
+    /// content-only admission as a no-op.
+    #[test]
+    fn graph_moved_is_true_for_a_content_only_pass_and_unmeasured_never_invents_one() {
+        assert!(!census_moved(&content_only_pass(Some(true))));
+        assert!(graph_moved(&content_only_pass(Some(true))));
+        assert!(!graph_moved(&content_only_pass(Some(false))));
+        assert!(!graph_moved(&content_only_pass(None)));
     }
 
     #[test]
@@ -440,7 +560,12 @@ mod tests {
         // errors, where the census genuinely did not move.
         refused.tracked_after = refused.tracked_before;
         refused.entities_after = refused.entities_before;
+        // The tree stood still too. A refusal before the publish moves nothing,
+        // and this fixture has to say so on every reading, not only the census,
+        // or the wording it grades is chosen by the wrong branch.
+        refused.tree_moved = Some(false);
         assert!(!census_moved(&refused));
+        assert!(!graph_moved(&refused));
 
         let text = summary_lines(&refused).join("\n");
         let first = text.lines().next().unwrap_or_default();

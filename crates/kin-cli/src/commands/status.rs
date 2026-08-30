@@ -36,6 +36,8 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
+use kin_core::last_admission::LastAdmissionRead;
 use kin_model::{
     Hash256, RefName, RefTarget, RepositoryId, RootBundle, WorkspaceHead, WorkspaceId,
 };
@@ -977,7 +979,8 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
                 &report,
                 None,
                 Some(&footprint),
-                crate::daemon_death::recorded_for_store(layout.root()).as_ref()
+                crate::daemon_death::recorded_for_store(layout.root()).as_ref(),
+                &kin_core::last_admission::read(&layout),
             )
         );
         // Which projection served the files this status describes. Appended
@@ -1104,8 +1107,9 @@ pub fn build_command_status_response(
     build: Option<BuildStatus>,
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    admission: &LastAdmissionRead,
 ) -> Result<CommandStatusResponse> {
-    let text = render_text(&report, build.as_ref(), footprint, death);
+    let text = render_text(&report, build.as_ref(), footprint, death, admission);
     let json = json
         .then(|| serde_json::to_string(&report))
         .transpose()
@@ -1116,6 +1120,58 @@ pub fn build_command_status_response(
         text,
         json,
     })
+}
+
+/// The `Tree:` line's verdict, and the basis it rests on.
+///
+/// `dirty` compares two graph-owned values, the admitted workspace tree and the
+/// tree of the change it is based on. That comparison is always right about the
+/// graph. What it cannot say is when the graph last looked, and a verdict with
+/// no clock beside it is read as a statement about the working copy: a stranger
+/// running the whole everyday loop with no Git read `matching its base change`
+/// over a tracked file they had edited twenty-two seconds earlier, polled it
+/// seven more times, and was told the same thing each time (FIR-2961).
+///
+/// So the clock rides with the verdict, from the durable last-admission marker
+/// `kin diff` and `kin graph status` already read. That marker exists for this
+/// exact failure and says so in its own module doc: without it "a store last
+/// admitted months ago reads exactly like one admitted a second ago". Reading
+/// it here needs no daemon and touches no file in the working copy, so the
+/// answer stays graph-owned truth plus the age of that truth.
+///
+/// Every arm states a basis. An absent or unparseable marker is never rendered
+/// as a bare verdict, because a surface that goes quiet when the basis is
+/// unknown is indistinguishable from one reporting a healthy store, which is
+/// the failure the marker was built to end.
+fn workspace_state_phrase(
+    dirty: bool,
+    admission: &LastAdmissionRead,
+    now: chrono::DateTime<Utc>,
+) -> String {
+    // Kept as a comparison against the base change rather than as "clean" or
+    // "dirty". Both bare words invite the reading "everything on disk is in the
+    // graph", which this flag has never meant and cannot answer: untracked host
+    // paths do not move it in either direction. `kin graph status` reports
+    // those, and saying what this line compares keeps the two questions apart.
+    let verdict = if dirty {
+        "ahead of its base change"
+    } else {
+        "matching its base change"
+    };
+    match admission {
+        LastAdmissionRead::Recorded(recorded) => format!(
+            "{verdict} as admitted {} ago",
+            kin_core::last_admission::humanize_age(recorded.age_seconds(now))
+        ),
+        LastAdmissionRead::Absent => format!(
+            "{verdict} as last admitted; this store records no complete admission, so how far \
+             behind the working copy that is is unknown, and `kin admit` takes what it holds"
+        ),
+        LastAdmissionRead::Unreadable(reason) => format!(
+            "{verdict} as last admitted; the last-admission record will not parse ({reason}), so \
+             how far behind the working copy that is is unknown, and `kin admit` rewrites it"
+        ),
+    }
 }
 
 /// Render the report, plus the two observations that are deliberately NOT in it.
@@ -1140,17 +1196,9 @@ fn render_text(
     build: Option<&BuildStatus>,
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    admission: &LastAdmissionRead,
 ) -> String {
-    // Named as a comparison against the base change rather than as "clean" or
-    // "dirty". Both bare words invite the reading "everything on disk is in the
-    // graph", which this flag has never meant and cannot answer: untracked host
-    // paths do not move it in either direction. `kin graph status` reports
-    // those, and saying what this line compares keeps the two questions apart.
-    let workspace_state = if report.workspace.dirty {
-        "ahead of its base change"
-    } else {
-        "matching its base change"
-    };
+    let workspace_state = workspace_state_phrase(report.workspace.dirty, admission, Utc::now());
     let enrichment = match report.semantic_enrichment.presence {
         SemanticEnrichmentPresence::Absent => "absent",
         SemanticEnrichmentPresence::Present => "present",
@@ -1362,7 +1410,7 @@ mod tests {
             payload.snapshot_bytes + payload.acknowledged_delta_bytes
         );
         assert!(
-            render_text(&report, None, None, None).contains("Authority payload read: "),
+            render_text(&report, None, None, None, &LastAdmissionRead::Absent).contains("Authority payload read: "),
             "text status must state the payload the open read"
         );
 
@@ -1663,7 +1711,7 @@ mod tests {
             EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoVectorIndexAttached),
         )
         .unwrap();
-        let rendered = render_text(&unobserved, None, None, None);
+        let rendered = render_text(&unobserved, None, None, None, &LastAdmissionRead::Absent);
         assert!(
             rendered.contains(
                 "Live embedding coverage: not observed (the live graph carries no vector index)"
@@ -1687,10 +1735,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            render_text(&observed, None, None, None)
+            render_text(&observed, None, None, None, &LastAdmissionRead::Absent)
                 .contains("Live embedding coverage: 41/57 indexed, 16 pending (live query graph)"),
             "{}",
-            render_text(&observed, None, None, None)
+            render_text(&observed, None, None, None, &LastAdmissionRead::Absent)
         );
     }
 
@@ -1702,6 +1750,90 @@ mod tests {
     /// fabricated zero or a "not measured" that nobody asked for. The report
     /// itself carries no store size in either case, which is what keeps
     /// authority status byte-identical across checkout drift.
+    /// FIR-2961. `Tree: ... (matching its base change)` was read as a statement
+    /// about the working copy, because with no clock beside it there is nothing
+    /// else to read it as. A stranger running the everyday loop with no Git saw
+    /// it over a tracked file edited twenty-two seconds earlier and polled it
+    /// seven more times before giving up on it.
+    ///
+    /// The verdict itself was right about the graph both times, so the fix is
+    /// not a different verdict, it is the age of the reading the verdict rests
+    /// on.
+    #[test]
+    fn the_tree_verdict_carries_the_age_of_the_admission_it_rests_on() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-29T20:49:16Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let admitted_at = chrono::DateTime::parse_from_rfc3339("2026-08-29T20:47:16Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let recorded = LastAdmissionRead::Recorded(kin_core::last_admission::LastAdmission::new(
+            admitted_at,
+            8,
+        ));
+
+        let clean = workspace_state_phrase(false, &recorded, now);
+        assert!(clean.contains("matching its base change"), "{clean}");
+        assert!(
+            clean.contains("admitted 2m ago"),
+            "the verdict has to carry when the graph last looked: {clean}"
+        );
+
+        let dirty = workspace_state_phrase(true, &recorded, now);
+        assert!(dirty.contains("ahead of its base change"), "{dirty}");
+        assert!(dirty.contains("admitted 2m ago"), "{dirty}");
+    }
+
+    /// An absent or unparseable marker is the case the whole marker exists for,
+    /// and it must not render as a bare verdict. A surface that goes quiet when
+    /// its basis is unknown is indistinguishable from one reporting a healthy
+    /// store.
+    #[test]
+    fn an_unknown_admission_basis_is_never_rendered_as_a_bare_verdict() {
+        let now = Utc::now();
+
+        let absent = workspace_state_phrase(false, &LastAdmissionRead::Absent, now);
+        assert!(
+            absent.contains("no complete admission"),
+            "an absent marker has to say so: {absent}"
+        );
+        assert!(absent.contains("kin admit"), "{absent}");
+
+        let unreadable = workspace_state_phrase(
+            false,
+            &LastAdmissionRead::Unreadable("trailing bytes".to_string()),
+            now,
+        );
+        assert!(unreadable.contains("will not parse"), "{unreadable}");
+        assert!(unreadable.contains("trailing bytes"), "{unreadable}");
+
+        // The control. Every arm carries the verdict, so the qualification is an
+        // addition to the answer and never a replacement for it.
+        for phrase in [&absent, &unreadable] {
+            assert!(phrase.contains("matching its base change"), "{phrase}");
+        }
+    }
+
+    /// The rendered line, not just the phrase, so a refactor that computes the
+    /// right words and prints the old ones is caught here.
+    #[test]
+    fn the_rendered_tree_line_carries_the_basis() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
+
+        let rendered = render_text(&report, None, None, None, &LastAdmissionRead::Absent);
+        let tree_line = rendered
+            .lines()
+            .find(|line| line.starts_with("Tree: "))
+            .unwrap_or_default();
+        assert!(
+            tree_line.contains("no complete admission"),
+            "the Tree line itself has to carry the basis: {tree_line}"
+        );
+    }
+
     #[test]
     fn store_size_renders_from_the_measurement_and_not_from_the_report() {
         let root = tempfile::tempdir().unwrap();
@@ -1709,14 +1841,14 @@ mod tests {
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
         let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
 
-        let without = render_text(&report, None, None, None);
+        let without = render_text(&report, None, None, None, &LastAdmissionRead::Absent);
         assert!(
             !without.contains("Store size"),
             "an unmeasured status must print no store line at all: {without}"
         );
 
         let footprint = StoreFootprint::measure(&init.layout);
-        let with = render_text(&report, None, Some(&footprint), None);
+        let with = render_text(&report, None, Some(&footprint), None, &LastAdmissionRead::Absent);
         assert!(
             with.contains("Store size: ") && with.contains("under .kin/"),
             "a measured status must print the store line: {with}"

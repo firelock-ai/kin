@@ -21,7 +21,7 @@
 
 use anyhow::Result;
 use kin_cli::commands::admit::{
-    census_moved, summary_lines, AdmitReport, AdmitResponse, ADMIT_SCHEMA,
+    graph_moved, summary_lines, AdmitReport, AdmitResponse, ADMIT_SCHEMA,
 };
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
@@ -110,16 +110,40 @@ impl Drop for RunningPass {
     }
 }
 
-/// One observation of the graph counts an admission can change.
+/// One observation of what an admission can change.
+///
+/// The two counts are cardinalities and cannot see a content-only edit: a pass
+/// that rewrites a tracked file's bytes leaves both exactly where they were.
+/// `tree` is the third reading, and it is the one that moves when the other two
+/// do not (FIR-2961).
 struct GraphCensus {
     tracked: usize,
     entities: usize,
+    /// The resolved tree's own hash, or `None` when it would not compute.
+    ///
+    /// `None` is carried rather than substituted, so a reading that could not be
+    /// taken never reaches a reader as a tree that did not move.
+    tree: Option<kin_model::Hash256>,
 }
 
 fn census(state: &DaemonState) -> GraphCensus {
+    let tree = state.graph.resolved_tree();
     GraphCensus {
-        tracked: state.graph.resolved_tree().len(),
+        tracked: tree.len(),
         entities: state.graph.entity_count(),
+        tree: kin_model::compute_resolved_tree_hash(&tree).ok(),
+    }
+}
+
+/// Whether the tree moved across the pass, when both sides could be read.
+///
+/// Three-way on purpose, matching every other freshness reading in this store:
+/// moved, did not move, and nobody could look. Collapsing the third into "did
+/// not move" is the whole defect, reintroduced one layer down.
+fn tree_moved(before: &GraphCensus, after: &GraphCensus) -> Option<bool> {
+    match (before.tree.as_ref(), after.tree.as_ref()) {
+        (Some(before), Some(after)) => Some(before != after),
+        _ => None,
     }
 }
 
@@ -237,12 +261,15 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
         // says so. The probes alone report a quiet loop and a parked one
         // identically.
         reconcile: state.background_work.reconcile_report(now),
+        tree_moved: tree_moved(&before, &after),
         admitted: failure.is_none(),
         failure,
     };
 
     let lines = summary_lines(&report);
-    let mutated = census_moved(&report);
+    // The wider question, so a content-only admission is not published as a
+    // no-op to every caller that reads this flag rather than the prose.
+    let mutated = graph_moved(&report);
     Ok(AdmitResponse {
         lines,
         mutated,
