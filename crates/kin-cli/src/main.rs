@@ -178,6 +178,9 @@ enum Command {
         /// Output the exact authority-backed report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Carry each changed artifact's full old and new body, not just hunks
+        #[arg(long, default_value_t = false)]
+        full_bodies: bool,
     },
     /// Verify graph-derived projection, install exact Git, and detach Kin.
     ///
@@ -2708,7 +2711,12 @@ fn main() -> Result<()> {
                         .await
                     }
                 },
-                Command::Diff { base, head, json } => commands::diff::run(base, head, json).await,
+                Command::Diff {
+                    base,
+                    head,
+                    json,
+                    full_bodies,
+                } => commands::diff::run(base, head, json, full_bodies).await,
                 Command::Eject { yes } => commands::eject::run(yes).await,
                 Command::Impact {
                     entity,
