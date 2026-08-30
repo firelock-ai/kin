@@ -25,26 +25,39 @@
 # (FIR-2593). An acceptance suite whose result depends on a profile nobody
 # releases is answering a question nobody asked.
 #
-# `Product Acceptance` IS a required context on main. It is one of the eleven on
-# ruleset 19746451, "Require status checks on main", read live from
-# `GET /repos/firelock-ai/kin/rules/branches/main` on 2026-08-27. The header
-# here used to say the opposite, that it "publishes no required context yet"
-# and would become one after five green pull requests under FIR-2591. That step
-# happened and the comment did not move.
+# Whether `Product Acceptance` is a required context is live GitHub
+# configuration that no test in this repository can read, and this comment has
+# now been wrong in BOTH directions, so it names the command rather than the
+# answer. Ask, do not trust this paragraph:
 #
-# The correction matters beyond tidiness, because the required list is live
-# GitHub configuration no test in this repository can read, which is why the
-# release mint keeps a reviewed mirror of it. A comment claiming a context is
-# advisory when a ruleset is blocking on it is the kind of thing somebody reads
-# right before deciding a job is safe to skip.
+#   gh api repos/firelock-ai/kin/rules/branches/main \
+#     --jq '.[] | select(.type=="required_status_checks")
+#                 | .parameters.required_status_checks[].context'
 #
-# The job below is off the pull-request path as of FIR-2815, and that is a
-# separate question from whether the context is required. It still reports on a
-# pull request, as `skipped`, which satisfies the required context the same way
-# the Windows installer leg has satisfied it since before this file existed. It
-# runs for real in the merge queue and on every commit that reaches main, where
-# the concurrency group below gives each commit its own run and cancels
-# nothing, so acceptance is graded per commit rather than per window.
+# The history is the reason for that rule. This header first said the context
+# "publishes no required context yet" and would become one after five green
+# pull requests under FIR-2591; that step happened and the comment did not move.
+# It was then corrected on 2026-08-27 to say the context IS required, one of
+# eleven on ruleset 19746451. FIR-2815 thinned that same ruleset to six on that
+# same day, and read on 2026-08-30 it carries cargo-deny, DCO Sign-off, Fast
+# gate build and tests, Fast gate lint and policy, gitleaks (full history) and
+# PR text hygiene. `Product Acceptance` is not among them. Twice wrong, once in
+# each direction, is what a remembered answer is worth here.
+#
+# Two consequences follow from the context not being required, and both were
+# load-bearing sentences here that are no longer true. A `skipped` report on a
+# pull request satisfies nothing, because nothing requires it. And this does not
+# "run for real in the merge queue": the `Merge queue on main` ruleset reads
+# `disabled`, kin having moved to classic landing under FIR-2815, so the
+# `merge_group` trigger below is preserved for a one-step rollback rather than
+# describing what happens today.
+#
+# So main's own push run is where acceptance is really graded, and nothing
+# blocks a landing on it. Twelve consecutive red runs on main crossed unnoticed
+# on 2026-08-29 into 2026-08-30 before anything reported one, which is what
+# `.github/workflows/acceptance-red-alarm.yml` exists to end (FIR-2984). The
+# concurrency group below gives each commit its own run and cancels nothing, so
+# acceptance is graded per commit rather than per window.
 
 name: Acceptance
 
