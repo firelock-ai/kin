@@ -552,8 +552,15 @@ pub fn collect_daemon_search_response(
     request: &DaemonSearchRequest,
     envelope: &kin_mcp::Envelope,
 ) -> Result<DaemonSearchResponse> {
+    // FIR-2918. `kin search` reads the same staged-on-write lexical index
+    // `kin locate` does, so it needs the same guarantee: the index answers from
+    // graph truth before this query reads it, and a graph gap is reported rather
+    // than answered thin.
+    let mut lexical: Vec<crate::commands::locate::RetrievalDegradation> = Vec::new();
+    crate::commands::locate::ensure_lexical_index_queryable(graph, &mut lexical);
     if request.semantic {
         let mut response = collect_daemon_semantic_search_response(graph, request, envelope)?;
+        response.degradations.extend(lexical.iter().cloned());
         if response.records.is_empty() {
             let reported = response.degradations.clone();
             response.absence_qualifier = search_absence_qualifier(graph, envelope, &reported);
@@ -578,8 +585,25 @@ pub fn collect_daemon_search_response(
         .iter()
         .map(|matched| record_to_daemon_record(&matched.record, matched.match_kind, matched.score))
         .collect::<Vec<_>>();
-    let absence_qualifier = if records.is_empty() {
-        search_absence_qualifier(graph, envelope, &[])
+    // An all-fallback answer is an absence, and it has to qualify like one.
+    //
+    // The rows below the name matches are the index's NEAREST documents, not
+    // matches: `collect_search_results` says so in its own comment, and BM25 is
+    // disjunctive, so a query token that occurs nowhere can still retrieve a
+    // document through a substring of itself. Measured on this fixture:
+    // `definitelyNoSuchSymbol` retrieves `present` at 0.45 because `def` occurs
+    // in `def present()` and is a substring of `definitely`, over a corpus where
+    // no token of the query occurs at all.
+    //
+    // Qualifying only on `records.is_empty()` therefore silenced the disclosure
+    // exactly when the fallback produced a row, which is the common case once
+    // the index is populated: a stranger on a degraded daemon got a nearest
+    // document and no word about the degradation. `text_fallback` is already the
+    // product's own name for "nothing matched by name", so the absence gate
+    // reads it too, and a single name match still carries no qualifier, which
+    // the sibling control asserts.
+    let absence_qualifier = if records.is_empty() || text_fallback {
+        search_absence_qualifier(graph, envelope, &lexical)
     } else {
         Vec::new()
     };
@@ -591,7 +615,7 @@ pub fn collect_daemon_search_response(
         records,
         semantic_coverage: None,
         absence_qualifier,
-        degradations: Vec::new(),
+        degradations: lexical,
     })
 }
 
@@ -1813,6 +1837,60 @@ mod tests {
         assert_eq!(json["end_line"].as_u64(), Some(20));
         assert!((json["score"].as_f64().unwrap() - 0.87).abs() < 1e-6);
         assert_eq!(json["match_kind"].as_str(), Some("semantic"));
+    }
+
+    /// FIR-2918, on the second surface that reads the same lexical index.
+    ///
+    /// `kin search` and `kin locate` both read an index that is STAGED on write
+    /// and committed by `flush_text_index`, which in a live daemon only the
+    /// background persistence loop calls. This fixture stages a document and
+    /// never flushes it, which is what a daemon holds between those flushes, and
+    /// the prose term has to come back anyway.
+    ///
+    /// The sibling test below flushes by hand and says so. That call is exactly
+    /// what a caller does not get to make, and its absence here is the fixture.
+    #[test]
+    fn a_docstring_term_answers_search_on_a_graph_whose_text_index_was_never_flushed() {
+        use super::{collect_daemon_search_response, DaemonSearchRequest};
+        use kin_model::EntityStore;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let graph = kin_db::InMemoryGraph::with_text_index(dir.path().join("text-index"));
+        let mut overview = dedupe_test_entity("describe_layers", "pkg/overview.py");
+        overview.doc_summary =
+            Some("Nothing here opens a socket or speaks to a server over the network.".to_string());
+        graph.upsert_entity(&overview).expect("upsert");
+        assert_eq!(
+            graph.text_document_count(),
+            0,
+            "the fixture must start with nothing committed, or this test grades a flushed index"
+        );
+
+        let response = collect_daemon_search_response(
+            &graph,
+            &DaemonSearchRequest {
+                query: "socket".to_string(),
+                kind: None,
+                language: None,
+                limit: None,
+                semantic: false,
+                show_body: false,
+                body_limit: None,
+            },
+            &healthy_search_envelope(),
+        )
+        .expect("search answers");
+
+        assert!(
+            graph.text_document_count() > 0,
+            "the search path left the lexical index empty, so no lexical evidence could have \
+             answered"
+        );
+        assert!(
+            response.total_matches > 0,
+            "a term only this entity's docstring carries returned nothing: {:?}",
+            response.records
+        );
     }
 
     /// The collector must label a guess as a guess against a real graph.

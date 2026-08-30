@@ -287,6 +287,18 @@ jobs:
       - name: Falsify the bridge reach graders
         run: python3 scripts/acceptance/bridge_reach_repro.py --self-test
 
+      # FIR-2918. `kin locate` has no daemonless arm, so a prose-only query that
+      # retrieves nothing through one daemon and its file through another is one
+      # code path answering differently depending on which process is up. The
+      # graders here decide two things that look alike from outside: whether two
+      # daemon states named the same files, and whether an answer that could not
+      # read the lexical index said so. Each is handed the input it must refuse,
+      # including the mutation that matters, a gap reader that accepts any
+      # degradation at all and would therefore pass on every query in a suite
+      # that runs with no vector index.
+      - name: Falsify the prose-query parity graders
+        run: python3 scripts/acceptance/prose_query_parity_repro.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -946,6 +958,41 @@ jobs:
             echo "::warning title=Bridge reach acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      # FIR-2918. A stranger installs Kin, commits some code and asks an English
+      # question, and the daemon that answers is the long-lived one that was up
+      # while the code was ingested. This asks one docstring-only term through
+      # that daemon and through a daemon started after `kin daemon stop`, and
+      # requires the same files back. Its own controls decide whether it graded
+      # anything: a symbol the fixture defines must retrieve in both states, and
+      # a fabricated term in neither.
+      - name: Prose-query parity suite (verdict comes from the gate step)
+        id: proseparity
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/prose_query_parity_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/prose_parity.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/prose_parity.log 2>&1 || rc=$?
+          cat acceptance/prose_parity.log
+          {
+            echo "### Prose-query parity suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/prose_parity.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Prose-query parity suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -995,4 +1042,5 @@ jobs:
             --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
             --report init_budget=acceptance/init_budget.json \
             --report bridge_reach=acceptance/bridge_reach.json \
+            --report prose_parity=acceptance/prose_parity.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'

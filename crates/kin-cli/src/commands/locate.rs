@@ -1939,6 +1939,92 @@ pub fn record_degradation(sink: &mut Vec<RetrievalDegradation>, event: Retrieval
     sink.push(event);
 }
 
+/// Make the derived text index answer from graph truth before this query reads
+/// it, and say so when it cannot.
+///
+/// Every write that puts a document into the lexical index STAGES it.
+/// `refresh_text_index_for_entities` and the three artifact upserts all go
+/// through `TextIndex::upsert`, whose contract in kin-db is "Stages the change
+/// — call `commit()` to make it visible to searches", and
+/// `InMemoryGraph::flush_text_index` is that commit. Until it runs, `text_search`
+/// answers every term with zero hits, which is why this module's own fixtures
+/// call it by hand before they assert on ranking.
+///
+/// Nothing on the query path used to call it. In a live daemon the only caller
+/// is the background persistence loop, which flushes two seconds after the last
+/// mutation or every thirty seconds, so whether an English question could be
+/// answered depended on whether that timer had fired in the process serving the
+/// query. Measured on this fixture at the default cadence: zero of seventeen
+/// entities indexed at the moment a first question arrives, seventeen of
+/// seventeen sixty seconds later, on one unchanged daemon process, and the
+/// answer in between is "No relevant files found." over a graph that holds the
+/// word (FIR-2918). A daemon opened afterwards always answers, because
+/// `from_snapshot_inner` rebuilds the index from graph truth at open and that
+/// rebuild commits.
+///
+/// Deliberately at query entry rather than at every mutation. The mutation
+/// surface is commit, checkout, rename, stash, merge, rollback, tag, the MCP
+/// writes and the language-server sweep; the read surface is this function's two
+/// callers. Two call sites cover every mutation, a clean index returns on two
+/// atomics, and a dirty one pays exactly the commit the daemon would have paid
+/// moments later.
+///
+/// One state costs more than a commit, and it is taken deliberately. A batch
+/// relation write sets `text_full_rebuild_required`, and `flush_text_index`
+/// does that whole rebuild here rather than deferring it. The alternative is
+/// worse than the cost: while that flag is set `text_search` refuses outright,
+/// and this pipeline swallows the refusal with a bare `continue` at four of its
+/// stages while propagating it with `?` at others, so one store answers thin or
+/// errors depending only on which stage reached the index first.
+///
+/// The second half is the graph-gap report. A graph whose lexical index holds
+/// nothing cannot answer a lexical question from graph truth, and the rule here
+/// is to fail loud or report the gap rather than answer thin, so it goes in the
+/// degradation ledger. `coverage_notes` renders that ledger as one
+/// component-prefixed note per entry, collapsed to a line and printed whole
+/// under `--explain`, and the daemon carries it into the answer's own
+/// `degradations[]`. Before this, an answer built with no lexical evidence at
+/// all carried three degradations and not one of them mentioned the index.
+pub(crate) fn ensure_lexical_index_queryable(
+    graph: &kin_db::InMemoryGraph,
+    sink: &mut Vec<RetrievalDegradation>,
+) {
+    if let Err(error) = graph.flush_text_index() {
+        record_degradation(
+            sink,
+            RetrievalDegradation {
+                component: "text_index".to_string(),
+                reason: "flush_failed".to_string(),
+                detail: format!(
+                    "the derived text index could not be brought up to date with graph truth, \
+                     so lexical evidence for this query is whatever was last committed: {error}"
+                ),
+                remediation: "restart the repository daemon, which rebuilds the text index from \
+                              the graph when it opens the store"
+                    .to_string(),
+            },
+        );
+        return;
+    }
+    let entities = graph.entity_count();
+    if entities > 0 && graph.text_document_count() == 0 {
+        record_degradation(
+            sink,
+            RetrievalDegradation {
+                component: "text_index".to_string(),
+                reason: "empty".to_string(),
+                detail: format!(
+                    "the derived text index holds no documents for a graph of {entities} \
+                     entities, so no lexical evidence ranked this query"
+                ),
+                remediation: "restart the repository daemon, which rebuilds the text index from \
+                              the graph when it opens the store"
+                    .to_string(),
+            },
+        );
+    }
+}
+
 /// The producer lineage of the vector index this graph currently serves.
 ///
 /// `None` in a build without the vector feature, where no index exists to have
@@ -2848,15 +2934,18 @@ fn run_with_graph_capture_budgeted(
     let cleaned_text = clean_issue_text(text);
     let semantic_text = strip_pr_template_boilerplate(&cleaned_text);
     let text = semantic_text.as_str();
-    let (semantic_coverage, vector_index_attached) =
-        evaluate_embedding_coverage(graph, vector_source)?;
-
     // Quality profile: supplies the DEFAULT for each retrieval lever below;
     // explicit env vars always win. Resolved once per query so one run cannot
     // mix profiles.
     let quality = crate::retrieval_profile::RetrievalProfile::from_env();
     // No-silent-degradation ledger for this query (attached to the result).
     let mut degradations: Vec<RetrievalDegradation> = Vec::new();
+    // FIR-2918, and it runs before anything below reads the lexical index.
+    // Hoisted above `evaluate_embedding_coverage` only so the ledger exists to
+    // receive its report; nothing between the two reads text.
+    ensure_lexical_index_queryable(graph, &mut degradations);
+    let (semantic_coverage, vector_index_attached) =
+        evaluate_embedding_coverage(graph, vector_source)?;
     record_vector_index_degradation(&semantic_coverage, vector_index_attached, &mut degradations);
     // Per-stage prune attribution, recorded only under --explain.
     let mut prune_ledger: Vec<PruneEvent> = Vec::new();
@@ -18930,6 +19019,115 @@ mod tests {
             .degradations
             .iter()
             .find(|event| event.component == "artifact_candidates" && event.reason == reason)
+    }
+
+    fn text_index_degradation(result: &LocateResult) -> Option<&RetrievalDegradation> {
+        result
+            .degradations
+            .iter()
+            .find(|event| event.component == "text_index")
+    }
+
+    /// The state a live daemon sits in between its own persistence flushes:
+    /// documents staged into the lexical index and not committed.
+    ///
+    /// Deliberately NO `graph.flush_text_index()` here, and that absence is the
+    /// whole fixture. Every other graph builder in this module makes that call
+    /// by hand, with a comment saying that without it `text_search` answers
+    /// every term with zero hits. A caller does not get to make it, which is why
+    /// the pipeline has to.
+    fn unflushed_prose_graph() -> kin_db::InMemoryGraph {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut overview = test_entity("describe_layers", "pkg/overview.py", 1, 3);
+        overview.doc_summary =
+            Some("Nothing here opens a socket or speaks to a server over the network.".to_string());
+        graph.upsert_entity(&overview).unwrap();
+        let parsing = test_entity("normalize_title", "pkg/parsing.py", 1, 3);
+        graph.upsert_entity(&parsing).unwrap();
+        graph
+    }
+
+    /// FIR-2918. A prose term the graph holds has to be answerable from the
+    /// index as the query finds it, not as a background timer will leave it.
+    ///
+    /// Measured on the product before this: a four-module store reported zero of
+    /// seventeen entities text indexed at the moment a first English question
+    /// arrived, seventeen of seventeen sixty seconds later, on one unchanged
+    /// daemon process, and answered "No relevant files found." in between.
+    #[test]
+    #[serial_test::serial]
+    fn a_docstring_term_answers_on_a_graph_whose_text_index_was_never_flushed() {
+        let graph = unflushed_prose_graph();
+        assert_eq!(
+            graph.text_document_count(),
+            0,
+            "the fixture must start with nothing committed, or this test grades a flushed index"
+        );
+
+        let result = agent_locate(&graph, "socket");
+
+        assert!(
+            graph.text_document_count() > 0,
+            "the query path left the lexical index empty, so no lexical evidence could have \
+             ranked this answer"
+        );
+        assert!(
+            result
+                .files
+                .iter()
+                .any(|file| file.path == "pkg/overview.py"),
+            "a term only this file's docstring carries did not retrieve it; got {:?}",
+            result
+                .files
+                .iter()
+                .map(|file| file.path.as_str())
+                .collect::<Vec<_>>()
+        );
+        // The control that keeps the report from becoming noise: an index that
+        // answered must not also be reported as a gap.
+        assert!(
+            text_index_degradation(&result).is_none(),
+            "an index that answered was reported as a gap: {:?}",
+            text_index_degradation(&result)
+        );
+    }
+
+    /// The other half, and it has to be a separate test or the two hide each
+    /// other. A graph with entities and no lexical index at all cannot answer a
+    /// lexical question from graph truth, and the rule here is to report that
+    /// rather than answer thin from somewhere else.
+    #[test]
+    #[serial_test::serial]
+    fn a_graph_with_no_lexical_index_reports_the_gap_rather_than_answering_thin() {
+        let source = unflushed_prose_graph();
+        let snapshot = source.to_snapshot();
+        let graph = kin_db::InMemoryGraph::from_snapshot_without_text_index(snapshot).unwrap();
+        assert!(
+            graph.entity_count() > 0,
+            "the fixture must carry entities, or the gap report is about an empty graph"
+        );
+
+        let result = agent_locate(&graph, "socket");
+
+        let reported = text_index_degradation(&result).unwrap_or_else(|| {
+            panic!(
+                "a graph with no lexical index answered without reporting the gap; ledger: {:?}",
+                result
+                    .degradations
+                    .iter()
+                    .map(|event| (event.component.as_str(), event.reason.as_str()))
+                    .collect::<Vec<_>>()
+            )
+        });
+        assert_eq!(reported.reason, "empty", "gap report: {reported:?}");
+        assert!(
+            reported.detail.contains("no documents"),
+            "the report must say what is missing: {reported:?}"
+        );
+        assert!(
+            !reported.remediation.is_empty(),
+            "a gap report with no remediation tells a caller nothing to do: {reported:?}"
+        );
     }
 
     /// A store whose answer lives in an artifact must be able to say so on the
