@@ -2593,6 +2593,59 @@ mod tests {
     /// branch. That keeps every assertion offline and deterministic: no test
     /// here ever reaches the daemon delegate, which on a machine with a live
     /// `KIN_DAEMON_URL` would open a connection and could spawn a daemon.
+    /// FIR-3031, graded through the handler a client actually reaches rather
+    /// than through the helper it calls.
+    ///
+    /// The helper has its own tests in `tools`. This one exists because a
+    /// correct helper nobody calls is the same observable surface as no fix at
+    /// all: deleting the call in `handle_tools_list` leaves every helper test
+    /// green.
+    #[test]
+    fn tools_list_says_where_a_withheld_tool_is() {
+        let config = McpServerConfig {
+            allowed_tools: Some(
+                crate::agent_default_tool_names()
+                    .iter()
+                    .map(|name| (*name).to_string())
+                    .collect(),
+            ),
+            ..McpServerConfig::default()
+        };
+        let response = handle_tools_list(Some(serde_json::json!(1)), &config);
+        let value = serde_json::to_value(&response).unwrap();
+        let tools = value["result"]["tools"].as_array().expect("a tools array");
+        assert_eq!(tools.len(), crate::agent_default_tool_names().len());
+
+        let find_references = tools
+            .iter()
+            .find(|tool| tool["name"] == "find_references")
+            .expect("find_references is served by the default profile");
+        let description = find_references["description"].as_str().unwrap();
+        assert!(
+            description.contains("bulk_check_references"),
+            "the batch advice survives: {description}"
+        );
+        assert!(
+            description.contains("not served by this tool profile"),
+            "and the served answer says the default profile withholds it: {description}"
+        );
+
+        // The control: the same handler with no profile filter must annotate
+        // nothing, because nothing is withheld.
+        let unfiltered = handle_tools_list(Some(serde_json::json!(2)), &McpServerConfig::default());
+        let unfiltered = serde_json::to_value(&unfiltered).unwrap();
+        for tool in unfiltered["result"]["tools"].as_array().unwrap() {
+            assert!(
+                !tool["description"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not served by this tool profile"),
+                "an unfiltered surface withholds nothing: {}",
+                tool["name"]
+            );
+        }
+    }
+
     async fn drive_daemon_loop(
         client_messages: &[serde_json::Value],
         repo_binder: Option<RepoBinder>,
