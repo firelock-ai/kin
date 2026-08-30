@@ -936,7 +936,10 @@ fn branch_switch_admits_and_carries_an_unadmitted_edit_the_branches_agree_about(
     initialize_git_repo(&repo);
     add_feature_branch(&repo);
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
+    // Bound to `_` rather than dropped: the call converts the repository, and
+    // this test no longer reads the layout because the authority assertions it
+    // used to make moved to the refusal test named in the comment above.
+    let _layout = initialize_kin_repo(&runtime, &repo);
     // Written straight to the working copy and never admitted, which is the
     // whole point: no `admit_uncommitted_workspace_edit` here, unlike the test
     // below that is otherwise the same scenario.
