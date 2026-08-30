@@ -34,15 +34,40 @@ fn main() {
         .or_else(|| find_workspace_root(&manifest_dir))
         .unwrap_or_else(|| manifest_dir.clone());
 
+    // `git rev-parse --git-path` answers RELATIVE to the repository in a normal
+    // checkout and ABSOLUTE in a linked worktree, and cargo resolves a relative
+    // `rerun-if-changed` against the PACKAGE manifest directory rather than the
+    // repository root. So a bare `.git/HEAD` here registers
+    // `crates/kin-buildinfo/.git/HEAD`, which does not exist, and a
+    // rerun-if-changed on a missing file makes cargo treat this unit as dirty on
+    // every invocation.
+    //
+    // Measured on CI before this was joined: cargo said
+    //   stale: missing ".../crates/kin-buildinfo/.git/HEAD"
+    //   dirty: FsStatusOutdated(StaleItem(MissingFile { path: ... }))
+    // and kin-cli, kin-daemon and kin-integration-tests followed as
+    // StaleDepFingerprint on this build script's unit. That is a whole recompile
+    // of four crates in every cargo invocation after the first, measured at 108
+    // seconds per fast-gate shard.
+    //
+    // It is invisible in a linked worktree, where the path comes back absolute
+    // and resolves, which is every lane checkout in the fleet and is why this
+    // survived so long.
+    let watch = |path: String| {
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() { path } else { root.join(path) };
+        println!("cargo:rerun-if-changed={}", path.display());
+    };
+
     if let Some(head) = git(&root, &["rev-parse", "--git-path", "HEAD"]) {
-        println!("cargo:rerun-if-changed={head}");
+        watch(head);
     }
     if let Some(index) = git(&root, &["rev-parse", "--git-path", "index"]) {
-        println!("cargo:rerun-if-changed={index}");
+        watch(index);
     }
     if let Some(reference) = git(&root, &["symbolic-ref", "-q", "HEAD"]) {
         if let Some(path) = git(&root, &["rev-parse", "--git-path", &reference]) {
-            println!("cargo:rerun-if-changed={path}");
+            watch(path);
         }
     }
 
