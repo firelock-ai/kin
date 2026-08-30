@@ -26,6 +26,7 @@ pub mod admission_history;
 pub mod authority;
 pub mod error;
 pub mod global_config;
+pub mod history_bound;
 pub mod lossless;
 pub mod preflight;
 pub mod repository_export;
@@ -47,6 +48,7 @@ pub use error::{
     Result, UnsealedContentGap, UntolerableGitWorktree,
 };
 pub use global_config::empty_global_git_config;
+pub use history_bound::{AdmittedHistoryBoundary, HistoryLimit};
 pub use lossless::{
     capture_lossless_git_repository, closure_reconstruction_count,
     rehydrate_lossless_git_repository, sync_git_repository_for_authority_handoff, GitObjectFormat,
@@ -71,6 +73,6 @@ pub use sealed_observation::{
     SealedContentObservation, SealedContentSource,
 };
 pub use semantic_import::{
-    plan_semantic_git_import, GitWorkspaceSeed, HistoricalSemanticBinding, ProvedImportClosure,
-    ProvedPlanFacts, SemanticGitImportPlan,
+    plan_bounded_semantic_git_import, plan_semantic_git_import, GitWorkspaceSeed,
+    HistoricalSemanticBinding, ProvedImportClosure, ProvedPlanFacts, SemanticGitImportPlan,
 };

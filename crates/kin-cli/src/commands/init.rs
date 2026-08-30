@@ -163,6 +163,7 @@ pub async fn run(
     json: bool,
     no_enrich: bool,
     adopt_repository_id: Option<String>,
+    history_limit: Option<usize>,
 ) -> Result<i32> {
     let _span = tracing::info_span!("kin.init").entered();
     // Read before any work, so the closing summary can say what this run did
@@ -176,6 +177,7 @@ pub async fn run(
         .unwrap_or_else(|| std::env::current_dir().expect("cannot determine current directory"));
 
     let adopted = parse_adopted_repository_id(adopt_repository_id.as_deref())?;
+    let admission = parse_history_limit(history_limit)?;
 
     ensure_directory(&dir)?;
     reject_existing_repository(&dir)?;
@@ -191,13 +193,29 @@ pub async fn run(
     // was silently ignored on the other would produce a store that looks
     // adopted and pushes nowhere, which is the failure this whole path exists
     // to remove.
+    // A native-unborn repository has no Git history to bound, so asking to
+    // bound one is refused rather than accepted and ignored. A flag that is
+    // silently dropped on one of two boundaries produces a store that looks
+    // bounded and is not, which is the same class of defect as a default that
+    // silently bounds.
+    if !admission.history_limit.is_whole() && boundary == InitBoundary::NativeUnborn {
+        anyhow::bail!(
+            "--history-limit bounds the Git history a conversion takes in, and {} has no Git              repository to take history from",
+            dir.display()
+        );
+    }
+
     let result = match (boundary, &adopted) {
-        (InitBoundary::ExactGit, None) => kin_core::init_from_git(&dir)
-            .context("admit exact reachable Git repository authority")?,
-        (InitBoundary::ExactGit, Some(adopted)) => kin_core::init_from_git_adopting(&dir, adopted)
-            .with_context(|| {
-                format!("admit exact reachable Git repository authority adopting {adopted}")
-            })?,
+        (InitBoundary::ExactGit, adopted) => {
+            kin_core::init_from_git_with_options(&dir, adopted.as_ref(), admission).with_context(
+                || match adopted {
+                    Some(adopted) => format!(
+                        "admit exact reachable Git repository authority adopting {adopted}"
+                    ),
+                    None => "admit exact reachable Git repository authority".to_string(),
+                },
+            )?
+        }
         (InitBoundary::NativeUnborn, None) => {
             kin_core::init(&dir).context("initialize unborn Kin-native repository authority")?
         }
@@ -325,6 +343,27 @@ fn parse_adopted_repository_id(value: Option<&str>) -> Result<Option<kin_model::
     kin_model::RepositoryId::new(trimmed.to_string())
         .map(Some)
         .map_err(|error| anyhow::anyhow!("invalid --adopt-repository-id {trimmed:?}: {error}"))
+}
+
+/// Turn `--history-limit N` into the admission options a conversion runs under.
+///
+/// Zero is refused rather than silently read as whole history, because an
+/// operator who typed `--history-limit 0` asked for something, and the two
+/// things they could have meant are "all of it" and "none of it". Guessing
+/// either one produces a store that is not what they asked for, and the store
+/// is the expensive thing to be wrong about.
+fn parse_history_limit(value: Option<usize>) -> Result<kin_core::GitAdmissionOptions> {
+    let Some(value) = value else {
+        return Ok(kin_core::GitAdmissionOptions::default());
+    };
+    if value == 0 {
+        bail!(
+            "--history-limit needs the number of commits to take in, and it was given 0; omit the              flag to take in every commit"
+        );
+    }
+    Ok(kin_core::GitAdmissionOptions {
+        history_limit: kin_core::HistoryLimit::from_count(value),
+    })
 }
 
 /// How long the conversion phase will wait for the sweep before handing the
@@ -2942,7 +2981,7 @@ mod tests {
         // Enrichment off: this case is about the conversion transaction, and
         // starting a daemon to query a language server would make it depend on
         // what the host has installed.
-        run(Some(repo.to_str().unwrap().to_string()), false, true, None)
+        run(Some(repo.to_str().unwrap().to_string()), false, true, None, None)
             .await
             .expect("kin init must succeed under a scratch registry");
 

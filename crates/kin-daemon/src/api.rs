@@ -4967,8 +4967,13 @@ async fn command_log(
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
     let response =
-        kin_cli::commands::log::build_log_response(&repository_authority, graph.as_ref(), &request)
-            .map_err(internal_error)?;
+        kin_cli::commands::log::build_log_response(
+            &repository_authority,
+            graph.as_ref(),
+            &request,
+            kin_core::history_boundary_for(&state.layout),
+        )
+        .map_err(internal_error)?;
     Ok(Json(response))
 }
 

@@ -66,11 +66,22 @@ pub struct LogReport {
     pub requested_count: usize,
     pub truncated: bool,
     pub entries: Vec<LogEntry>,
+    /// Where admitted Git history ends, when `kin init --history-limit` bounded
+    /// it. Absent on a whole-history repository.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_boundary: Option<kin_core::ManifestHistoryBoundary>,
 }
 
+/// Read one repository's change log.
+///
+/// `history_boundary` is supplied rather than discovered, because this reads an
+/// authority binding and the boundary lives in the manifest beside it. Every
+/// caller has a layout; passing the answer in is what stops one of them from
+/// rendering "no boundary" when it simply could not look.
 pub fn inspect(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     count: usize,
+    history_boundary: Option<kin_core::ManifestHistoryBoundary>,
 ) -> Result<LogReport> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
@@ -164,13 +175,14 @@ pub fn inspect(
         requested_count: count,
         truncated: !pending.is_empty(),
         entries,
+        history_boundary,
     })
 }
 
 pub fn run(count: usize, json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
-    let report = inspect(&binding, count)?;
+    let report = inspect(&binding, count, kin_core::history_boundary_for(&layout))?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -185,8 +197,9 @@ pub fn build_log_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     _graph: &kin_db::InMemoryGraph,
     request: &LogRequest,
+    history_boundary: Option<kin_core::ManifestHistoryBoundary>,
 ) -> Result<LogResponse> {
-    let report = inspect(binding, request.count)?;
+    let report = inspect(binding, request.count, history_boundary)?;
     Ok(LogResponse {
         lines: render_lines(&report),
         report: Some(report),
@@ -225,6 +238,15 @@ fn render_lines(report: &LogReport) -> Vec<String> {
             entry.admission_policy_changed
         ));
         lines.push(format!("    {}", entry.message.replace('\n', "\n    ")));
+    }
+    // Only once the walk has reached the bottom, because that is the moment a
+    // reader would otherwise conclude the repository began at the last entry.
+    // A truncated page has more to show and needs no such correction.
+    if !report.truncated {
+        if let Some(boundary) = &report.history_boundary {
+            lines.push(String::new());
+            lines.push(boundary.summary());
+        }
     }
     lines
 }

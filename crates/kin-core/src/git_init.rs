@@ -16,10 +16,10 @@ use kin_blobs::BlobStore;
 use kin_db::{LocalFileBackend, RepositoryAuthorityManager};
 use kin_git::{
     admit_semantic_git_import, build_git_external_authority, capture_lossless_git_repository,
-    check_git_admission_blockers, plan_semantic_git_import, preflight_git_migration,
+    check_git_admission_blockers, plan_bounded_semantic_git_import, preflight_git_migration,
     reprove_git_migration, reprove_git_migration_after_publication,
     seal_all_content_observation_observed, AdmittedContentClosure, GitLocalIgnoreSourceKind,
-    GitMigrationPreflightProof, LosslessGitRepository, ProvedImportClosure,
+    GitMigrationPreflightProof, HistoryLimit, LosslessGitRepository, ProvedImportClosure,
     SealedContentObservation, SealedContentSource,
 };
 use kin_model::{
@@ -177,7 +177,31 @@ impl AdmittedContentClosure for DivergedClosure {
 /// [`KinError::RepositoryPublishedButUncertain`] with the published repository
 /// left in place for recovery.
 pub fn init_from_git(working_dir: &Path) -> Result<InitResult> {
-    init_from_git_with_hook(working_dir, None, || {})
+    init_from_git_with_hook(working_dir, None, GitAdmissionOptions::default(), || {})
+}
+
+/// How one Git admission differs from the default, if it does.
+///
+/// A struct rather than more positional arguments, so the whole-history default
+/// is what a caller gets by saying nothing. Every existing caller of
+/// [`init_from_git`] and [`init_from_git_adopting`] keeps whole history by
+/// construction rather than by remembering to pass a zero.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GitAdmissionOptions {
+    /// How much Git history to take into the semantic graph.
+    ///
+    /// The Git capture is unaffected: a bounded repository still holds every
+    /// Git object and every ref its source had.
+    pub history_limit: HistoryLimit,
+}
+
+/// [`init_from_git`], with the admission options a command line supplied.
+pub fn init_from_git_with_options(
+    working_dir: &Path,
+    adopted: Option<&RepositoryId>,
+    options: GitAdmissionOptions,
+) -> Result<InitResult> {
+    init_from_git_with_hook(working_dir, adopted.cloned(), options, || {})
 }
 
 /// Admit one clean materialized Git worktree as a replica of a repository that
@@ -201,20 +225,33 @@ pub fn init_from_git_adopting(
     working_dir: &Path,
     repository_id: &RepositoryId,
 ) -> Result<InitResult> {
-    init_from_git_with_hook(working_dir, Some(repository_id.clone()), || {})
+    init_from_git_with_hook(
+        working_dir,
+        Some(repository_id.clone()),
+        GitAdmissionOptions::default(),
+        || {},
+    )
 }
 
 fn init_from_git_with_hook(
     working_dir: &Path,
     adopted: Option<RepositoryId>,
+    options: GitAdmissionOptions,
     before_final_source_proof: impl FnOnce(),
 ) -> Result<InitResult> {
-    init_from_git_with_hooks(working_dir, adopted, before_final_source_proof, || {})
+    init_from_git_with_hooks(
+        working_dir,
+        adopted,
+        options,
+        before_final_source_proof,
+        || {},
+    )
 }
 
 fn init_from_git_with_hooks(
     working_dir: &Path,
     adopted: Option<RepositoryId>,
+    options: GitAdmissionOptions,
     before_final_source_proof: impl FnOnce(),
     after_repository_publication: impl FnOnce(),
 ) -> Result<InitResult> {
@@ -248,7 +285,7 @@ fn init_from_git_with_hooks(
             .map_err(|error| git_boundary_error("admit this Git repository", error))?;
     }
 
-    let (manifest, identity_origin) = match &adopted {
+    let (mut manifest, identity_origin) = match &adopted {
         Some(adopted) => (
             KinManifest::adopting(adopted.as_str()),
             RepositoryIdentityOrigin::Adopted,
@@ -339,8 +376,9 @@ fn init_from_git_with_hooks(
     progress.begin("plan semantic import");
     let semantic_plan = {
         let _span = info_span!("kin.init.plan_semantic_import").entered();
-        let plan = plan_semantic_git_import(&snapshot, &capture_store)
-            .map_err(|error| git_boundary_error("derive exact semantic Git history", error))?;
+        let plan =
+            plan_bounded_semantic_git_import(&snapshot, &capture_store, options.history_limit)
+                .map_err(|error| git_boundary_error("derive exact semantic Git history", error))?;
         verify_material_workspace_seed(&plan.workspace_seed, &git_authority.material_head)?;
         plan
     };
@@ -354,6 +392,25 @@ fn init_from_git_with_hooks(
         .entered();
         bind_historical_semantics(semantic_plan, &capture_store)?
     };
+
+    // Stamped between the derivation that produced it and the layout staging
+    // that writes it, so a bounded store carries its own edge from the moment
+    // it exists. `kin log` and its siblings read this rather than inferring a
+    // boundary from a change that happens to have no parent, because every
+    // repository's oldest change has no parent and only this record separates
+    // "the history starts here" from "admission started here".
+    manifest.history_boundary = semantic_plan.admitted_boundary.as_ref().map(|boundary| {
+        crate::manifest::ManifestHistoryBoundary {
+            requested_limit: boundary.requested_limit,
+            admitted_commits: boundary.admitted_commits,
+            oldest_admitted_commit: boundary.oldest_admitted_commit.to_string(),
+            unadmitted_parents: boundary
+                .unadmitted_parents
+                .iter()
+                .map(|oid| oid.to_string())
+                .collect(),
+        }
+    });
 
     progress.begin("apply admission policy");
     // Both this phase and the proof after it re-derive the whole history from
@@ -1962,7 +2019,7 @@ mod tests {
         );
 
         let source_for_hook = source.clone();
-        let error = init_from_git_with_hook(&source, None, move || {
+        let error = init_from_git_with_hook(&source, None, GitAdmissionOptions::default(), move || {
             git(
                 &source_for_hook,
                 [
@@ -2013,7 +2070,7 @@ mod tests {
         std::fs::write(&global_config, "").unwrap();
 
         let mut ambient = None;
-        let result = init_from_git_with_hook(&source, None, || {
+        let result = init_from_git_with_hook(&source, None, GitAdmissionOptions::default(), || {
             ambient = Some(
                 crate::test_env::EnvVarGuard::new()
                     .with("GIT_CONFIG_NOSYSTEM", "1")
@@ -2049,6 +2106,7 @@ mod tests {
         let error = init_from_git_with_hooks(
             &source,
             None,
+            GitAdmissionOptions::default(),
             || {},
             move || {
                 std::fs::write(source_for_hook.join("README.md"), b"raced source\n").unwrap();
@@ -2285,7 +2343,7 @@ mod tests {
         git(&source, ["commit", "-m", "private history"]);
 
         let staging_parent = root.path().to_path_buf();
-        let result = init_from_git_with_hook(&source, None, move || {
+        let result = init_from_git_with_hook(&source, None, GitAdmissionOptions::default(), move || {
             let staging = std::fs::read_dir(&staging_parent)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -2624,6 +2682,7 @@ mod tests {
         let error = init_from_git_with_hooks(
             &source,
             None,
+            GitAdmissionOptions::default(),
             || {},
             move || remove_published_body(&published_kin_dir, opaque),
         )

@@ -22,6 +22,7 @@ use kin_model::{
 };
 
 use crate::error::{GitError, Result};
+use crate::history_bound::{AdmittedHistoryBoundary, HistoryLimit};
 use crate::lossless::{GitObjectFormat, LosslessGitRepository};
 use crate::semantic_import::{
     derive_enriched_semantic_git_history, GitWorkspaceSeed, SemanticGitImportPlan,
@@ -56,6 +57,11 @@ pub struct AdmittedSemanticGitImportPlan {
     pub workspace_base_change_id: Option<SemanticChangeId>,
     pub ref_mutations: Vec<RefMutation>,
     pub default_ref_mutation: Option<DefaultRefMutation>,
+    /// How much of the snapshot's history this admission took in, carried from
+    /// the plan it admitted so a re-derivation rebuilds the same window.
+    pub history_limit: HistoryLimit,
+    /// Where the admitted history stops, absent when nothing was cut.
+    pub admitted_boundary: Option<AdmittedHistoryBoundary>,
 }
 
 /// Refusal when an admitted plan does not match what its own raw objects,
@@ -137,6 +143,7 @@ impl AdmittedSemanticGitImportPlan {
         let derived = derive_enriched_semantic_git_history(
             &snapshot,
             blob_store,
+            self.history_limit,
             &held_semantics,
             &mut |oid, parent_oids, enriched, _enriched_alias, tree| {
                 let (admitted, alias) =
@@ -166,7 +173,8 @@ impl AdmittedSemanticGitImportPlan {
         // against is the walk's own: how many commits this repository's raw
         // objects actually reach, rather than how many the visitor happened to
         // be handed.
-        if checked != derived.commits
+        if derived.admitted_boundary != self.admitted_boundary
+            || checked != derived.commits
             || admitted.commits != derived.commits
             || self.changes.len() != derived.commits
             || self.aliases.len() != derived.commits
@@ -449,6 +457,8 @@ fn build_admitted_semantic_git_import_plan(
         workspace_base_change_id: derived.workspace_base_change_id,
         ref_mutations: plan.ref_mutations.clone(),
         default_ref_mutation: plan.default_ref_mutation.clone(),
+        history_limit: plan.history_limit,
+        admitted_boundary: plan.admitted_boundary.clone(),
     })
 }
 

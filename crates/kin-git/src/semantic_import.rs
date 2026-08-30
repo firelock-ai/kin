@@ -26,6 +26,7 @@ use kin_model::{
 use uuid::Uuid;
 
 use crate::error::{GitError, Result};
+use crate::history_bound::{AdmittedHistoryBoundary, HistoryLimit};
 use crate::lossless::{validate_snapshot, GitObjectFormat, LosslessGitRepository};
 
 const GIT_ARTIFACT_NAMESPACE: Uuid = Uuid::from_bytes([
@@ -126,6 +127,20 @@ pub struct SemanticGitImportPlan {
     pub workspace_seed: GitWorkspaceSeed,
     pub ref_mutations: Vec<RefMutation>,
     pub default_ref_mutation: Option<DefaultRefMutation>,
+    /// How much of this snapshot's history the plan took in.
+    ///
+    /// Carried on the plan rather than passed to each re-derivation, because
+    /// every proof over this plan rebuilds it from `external_objects`, which is
+    /// the WHOLE object set whatever the bound was. A re-derivation handed a
+    /// different bound than the one that built the plan would refuse a correct
+    /// plan, so the bound has to travel with the thing it shaped.
+    pub history_limit: HistoryLimit,
+    /// Where a bounded admission stopped, absent when nothing was cut.
+    ///
+    /// Derived, never supplied: [`Self::validate`] recomputes it from the raw
+    /// objects and the limit above and refuses a plan that claims a different
+    /// edge, so this field cannot assert a boundary the objects do not produce.
+    pub admitted_boundary: Option<AdmittedHistoryBoundary>,
 }
 
 /// The plan fields every Git source proof reads.
@@ -308,9 +323,17 @@ impl SemanticGitImportPlan {
         let derived = derive_semantic_git_history(
             &snapshot,
             blob_store,
+            self.history_limit,
             TreeRetention::Frontier,
             &mut |oid, change, alias, tree| comparison.check_commit(oid, change, alias, tree),
         )?;
+        if derived.admitted_boundary != self.admitted_boundary {
+            return Err(GitError::InvalidSnapshot(format!(
+                "{DETERMINISTIC_DERIVATION}: this plan records a different admitted-history \
+                 boundary than its own raw objects derive under {:?}",
+                self.history_limit
+            )));
+        }
         comparison.finish(&derived)
     }
 
@@ -332,6 +355,7 @@ impl SemanticGitImportPlan {
         let derived = derive_semantic_git_history(
             &snapshot,
             blob_store,
+            self.history_limit,
             TreeRetention::Frontier,
             &mut |oid, change, alias, tree| comparison.check_commit(oid, change, alias, tree),
         )?;
@@ -345,7 +369,21 @@ pub fn plan_semantic_git_import(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
 ) -> Result<SemanticGitImportPlan> {
-    build_semantic_git_import_plan(snapshot, blob_store)
+    build_semantic_git_import_plan(snapshot, blob_store, HistoryLimit::Whole)
+}
+
+/// [`plan_semantic_git_import`], taking in only part of the snapshot's history.
+///
+/// The snapshot is unchanged and stays the whole exact Git repository. What is
+/// bounded is the semantic history derived from it, so a bounded repository
+/// still holds every Git object and every ref, and the graph simply starts
+/// later. [`HistoryLimit::Whole`] here is byte-for-byte the call above.
+pub fn plan_bounded_semantic_git_import(
+    snapshot: &LosslessGitRepository,
+    blob_store: &BlobStore,
+    limit: HistoryLimit,
+) -> Result<SemanticGitImportPlan> {
+    build_semantic_git_import_plan(snapshot, blob_store, limit)
 }
 
 /// What an enriched re-derivation still holds once every commit has been
@@ -360,6 +398,8 @@ pub(crate) struct DerivedEnrichedHistory {
     pub(crate) default_ref_mutation: Option<DefaultRefMutation>,
     /// Commits derived, which a caller compares against what it holds.
     pub(crate) commits: usize,
+    /// Where this walk stopped taking history in, absent when nothing was cut.
+    pub(crate) admitted_boundary: Option<AdmittedHistoryBoundary>,
 }
 
 /// Re-derive exact semantic history from a lossless snapshot and re-apply the
@@ -378,6 +418,7 @@ pub(crate) struct DerivedEnrichedHistory {
 pub(crate) fn derive_enriched_semantic_git_history<'held>(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
+    limit: HistoryLimit,
     held_semantics: &dyn Fn(GitObjectId) -> Option<(&'held [EntityDelta], &'held [RelationDelta])>,
     visit: &mut dyn FnMut(
         GitObjectId,
@@ -396,6 +437,7 @@ pub(crate) fn derive_enriched_semantic_git_history<'held>(
     let derived = derive_semantic_git_history(
         snapshot,
         blob_store,
+        limit,
         TreeRetention::Frontier,
         &mut |oid, mut change, _unenriched_alias, tree| {
             let unenriched_id = change.id;
@@ -436,6 +478,7 @@ pub(crate) fn derive_enriched_semantic_git_history<'held>(
         ref_mutations: derived.ref_mutations,
         default_ref_mutation: derived.default_ref_mutation,
         commits: derived.commits,
+        admitted_boundary: derived.admitted_boundary,
     })
 }
 
@@ -717,7 +760,116 @@ struct DerivedGitHistory {
     ref_mutations: Vec<RefMutation>,
     default_ref_mutation: Option<DefaultRefMutation>,
     /// Commits derived, which a caller compares against what it accumulated.
+    ///
+    /// Under a bound this is the ADMITTED count rather than the snapshot's, so
+    /// every `!= derived.commits` check in this crate keeps meaning "the plan
+    /// holds exactly what the walk produced" without one of them being edited.
     commits: usize,
+    /// Where this walk stopped taking history in, absent when nothing was cut.
+    admitted_boundary: Option<AdmittedHistoryBoundary>,
+}
+
+/// The commits one admission takes in, with the edge it stopped at.
+struct AdmittedWindow {
+    /// Admitted commits. A parent outside the window has been removed from its
+    /// child's parent list, which is what makes that child a root.
+    commits: BTreeMap<GitObjectId, ParsedCommit>,
+    boundary: Option<AdmittedHistoryBoundary>,
+}
+
+/// Choose the commits a bounded admission takes in.
+///
+/// Walks HEAD's first-parent chain back at most `limit` commits, then strips
+/// every parent edge leaving that set. Stripping rather than skipping is the
+/// whole mechanism: the derivation already treats a commit with no parents as a
+/// root diffed against the empty tree, so the oldest admitted commit becomes a
+/// root by the same rule genesis uses, and no downstream check has to learn a
+/// new case. Leaving a dangling parent instead would fail four different ways,
+/// starting at `topological_commit_order`.
+///
+/// Whole history returns the input untouched and records no boundary, so the
+/// default path is not merely equivalent to today's but is the same values.
+fn admitted_window(
+    all: BTreeMap<GitObjectId, ParsedCommit>,
+    head_commit: Option<GitObjectId>,
+    limit: HistoryLimit,
+) -> Result<AdmittedWindow> {
+    let Some(want) = limit.commits() else {
+        return Ok(AdmittedWindow {
+            commits: all,
+            boundary: None,
+        });
+    };
+    let Some(head_commit) = head_commit else {
+        return Err(GitError::InvalidSnapshot(
+            "a bounded history import counts back from HEAD, and this repository's HEAD reaches \
+             no commit; convert it with whole history instead"
+                .to_string(),
+        ));
+    };
+
+    let mut chain = Vec::new();
+    let mut walked = BTreeSet::new();
+    let mut cursor = Some(head_commit);
+    while let Some(oid) = cursor {
+        if chain.len() == want.get() {
+            break;
+        }
+        if !walked.insert(oid) {
+            return Err(GitError::InvalidSnapshot(format!(
+                "first-parent history from HEAD revisits commit {oid}"
+            )));
+        }
+        let parsed = all.get(&oid).ok_or_else(|| GitError::MissingObject {
+            oid: oid.to_string(),
+            context: "first-parent history from HEAD".to_string(),
+        })?;
+        cursor = parsed.parents.first().copied();
+        chain.push(oid);
+    }
+
+    // Asking for more history than a repository has is not an error and is not
+    // a boundary. Reporting one would tell an operator their history is
+    // incomplete at the exact moment all of it was admitted.
+    if chain.len() == all.len() {
+        return Ok(AdmittedWindow {
+            commits: all,
+            boundary: None,
+        });
+    }
+
+    let admitted = chain.iter().copied().collect::<BTreeSet<_>>();
+    let oldest_admitted_commit = *chain
+        .last()
+        .expect("a non-empty limit over a repository with a HEAD commit admits at least one");
+
+    let mut unadmitted_parents = BTreeSet::new();
+    let mut commits = BTreeMap::new();
+    for (oid, mut parsed) in all {
+        if !admitted.contains(&oid) {
+            continue;
+        }
+        let mut kept = Vec::with_capacity(parsed.parents.len());
+        for parent in parsed.parents {
+            if admitted.contains(&parent) {
+                kept.push(parent);
+            } else {
+                unadmitted_parents.insert(parent);
+            }
+        }
+        parsed.parents = kept;
+        commits.insert(oid, parsed);
+    }
+
+    Ok(AdmittedWindow {
+        boundary: Some(AdmittedHistoryBoundary {
+            requested_limit: want.get(),
+            admitted_commits: commits.len(),
+            oldest_admitted_commit,
+            unadmitted_parents: unadmitted_parents.into_iter().collect(),
+        }),
+        commits,
+    })
 }
 
 /// Derive exact semantic history from a lossless snapshot and its CAS, handing
@@ -730,6 +882,7 @@ struct DerivedGitHistory {
 fn derive_semantic_git_history(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
+    limit: HistoryLimit,
     retention: TreeRetention,
     visit: &mut dyn FnMut(
         GitObjectId,
@@ -745,7 +898,19 @@ fn derive_semantic_git_history(
         .map(|record| (record.object, record))
         .collect::<BTreeMap<_, _>>();
     let hash_kind = gix_hash_kind(snapshot.object_format);
-    let commits = parse_commits(snapshot, &bodies, hash_kind)?;
+    // Resolved before the window rather than beside the reader-count block
+    // below, because the window counts back from this commit. It is ref
+    // arithmetic plus a tag peel, so hoisting it costs nothing.
+    let seed_commit = resolve_workspace_seed_commit(snapshot, &bodies, hash_kind)?;
+    let window = admitted_window(
+        parse_commits(snapshot, &bodies, hash_kind)?,
+        seed_commit,
+        limit,
+    )?;
+    let AdmittedWindow {
+        commits,
+        boundary: admitted_boundary,
+    } = window;
     let order = topological_commit_order(&commits)?;
 
     let mut tree_decoder = TreeDecoder::new(hash_kind, &bodies, &records);
@@ -767,7 +932,6 @@ fn derive_semantic_git_history(
             *remaining_readers.entry(*parent).or_default() += 1;
         }
     }
-    let seed_commit = resolve_workspace_seed_commit(snapshot, &bodies, hash_kind)?;
     if let Some(seed) = seed_commit {
         *remaining_readers.entry(seed).or_default() += 1;
     }
@@ -893,7 +1057,7 @@ fn derive_semantic_git_history(
 
     if derived != commits.len() {
         return Err(GitError::InvalidSnapshot(
-            "not every reachable Git commit was derived exactly once".to_string(),
+            "not every admitted Git commit was derived exactly once".to_string(),
         ));
     }
 
@@ -937,18 +1101,21 @@ fn derive_semantic_git_history(
         ref_mutations,
         default_ref_mutation,
         commits: commits.len(),
+        admitted_boundary,
     })
 }
 
 fn build_semantic_git_import_plan(
     snapshot: &LosslessGitRepository,
     blob_store: &BlobStore,
+    limit: HistoryLimit,
 ) -> Result<SemanticGitImportPlan> {
     let mut changes = Vec::new();
     let mut aliases = Vec::new();
     let derived = derive_semantic_git_history(
         snapshot,
         blob_store,
+        limit,
         TreeRetention::Whole,
         &mut |_oid, change, alias, _tree| {
             changes.push(change);
@@ -962,7 +1129,7 @@ fn build_semantic_git_import_plan(
         || aliases.len() != derived.commits
     {
         return Err(GitError::InvalidSnapshot(
-            "not every reachable Git commit produced one tree, change, and alias".to_string(),
+            "not every admitted Git commit produced one tree, change, and alias".to_string(),
         ));
     }
 
@@ -978,6 +1145,8 @@ fn build_semantic_git_import_plan(
         workspace_seed: derived.workspace_seed,
         ref_mutations: derived.ref_mutations,
         default_ref_mutation: derived.default_ref_mutation,
+        history_limit: limit,
+        admitted_boundary: derived.admitted_boundary,
     })
 }
 

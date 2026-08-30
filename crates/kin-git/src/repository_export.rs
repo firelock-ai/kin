@@ -28,7 +28,8 @@ use crate::lossless::{
     reject_existing_destination, require_anchored_publication_platform,
     GitObjectFormat as LosslessObjectFormat, LosslessGitRepository,
 };
-use crate::semantic_import::{plan_semantic_git_import, HistoricalSemanticBinding};
+use crate::history_bound::HistoryLimit;
+use crate::semantic_import::{plan_bounded_semantic_git_import, HistoricalSemanticBinding};
 
 /// Complete graph-owned input needed to project one Kin repository to Git.
 #[derive(Debug, Clone)]
@@ -594,7 +595,6 @@ where
     }
 
     let snapshot = lossless_snapshot_from_authority(authority)?;
-    let rebuilt = plan_semantic_git_import(&snapshot, &proof_store)?;
     let mut supplied_by_oid = BTreeMap::new();
     for change in plan
         .changes
@@ -610,6 +610,34 @@ where
             )));
         }
     }
+    // A repository admitted under `kin init --history-limit` holds every Git
+    // object and only part of the semantic history, so rebuilding the whole
+    // history here would compare 800 supplied changes against 6493 derived ones
+    // and refuse a correct store. The rebuild takes the same window instead.
+    //
+    // The supplied count is a HINT and never the proof. Every identity below is
+    // recomputed from raw objects, and the oldest admitted commit is derived as
+    // a root, which changes its tree deltas and therefore its change id and
+    // every descendant's. So a window that is not the one this store was built
+    // from produces different ids and fails the set comparison at the end,
+    // which is the assertion that actually decides this proof.
+    //
+    // Equality with the snapshot's own commit count means whole history, and it
+    // must be read that way rather than as a limit: HEAD's first-parent chain is
+    // shorter than the reachable set on any repository with a merged side
+    // branch, so treating a whole-history count as a limit would manufacture a
+    // boundary on exactly those repositories.
+    let snapshot_commits = snapshot
+        .objects
+        .iter()
+        .filter(|record| record.object.kind == ExternalObjectKind::Commit)
+        .count();
+    let limit = if supplied_by_oid.len() == snapshot_commits {
+        HistoryLimit::Whole
+    } else {
+        HistoryLimit::from_count(supplied_by_oid.len())
+    };
+    let rebuilt = plan_bounded_semantic_git_import(&snapshot, &proof_store, limit)?;
     let historical_deltas = rebuilt
         .changes
         .iter()

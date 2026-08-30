@@ -129,6 +129,29 @@ enum Command {
         /// identity, which is right for a repository nothing else holds.
         #[arg(long = "adopt-repository-id", value_name = "ID")]
         adopt_repository_id: Option<String>,
+        /// Take in only the last N commits of HEAD's first-parent history
+        ///
+        /// Off by default: a conversion that says nothing takes in every
+        /// commit, and that is the right answer for almost every repository.
+        ///
+        /// Use it when whole history does not fit the machine. A conversion
+        /// holds one resolved tree per commit and the daemon that serves the
+        /// store afterwards is sized by the same history, so on a large
+        /// repository a small machine can convert successfully and then be
+        /// unable to answer a question. `kin doctor` says when this repository
+        /// is in that band and names the N that would fit here.
+        ///
+        /// What it does not do is throw your history away. The Git capture is
+        /// unchanged, so the store still holds every Git object and every ref,
+        /// byte for byte. What is bounded is the semantic graph: it starts at
+        /// the oldest admitted commit rather than at the repository's first,
+        /// and `kin log` reports where that edge is rather than pretending the
+        /// repository began there.
+        ///
+        /// First-parent because it is the only window whose size you can
+        /// predict. Asking for 800 admits 800.
+        #[arg(long = "history-limit", value_name = "N")]
+        history_limit: Option<usize>,
     },
     /// Show coherent repository-v6 workspace status
     Status {
@@ -2653,9 +2676,16 @@ fn main() -> Result<()> {
                     json,
                     no_enrich,
                     adopt_repository_id,
+                    history_limit,
                 } => {
-                    let code =
-                        commands::init::run(path, json, no_enrich, adopt_repository_id).await?;
+                    let code = commands::init::run(
+                        path,
+                        json,
+                        no_enrich,
+                        adopt_repository_id,
+                        history_limit,
+                    )
+                    .await?;
                     // A conversion whose store exists but whose enrichment a
                     // killed daemon left unattested reports that through the
                     // exit code, so a scripted or agent-driven setup can branch

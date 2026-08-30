@@ -133,11 +133,35 @@ impl HistorySurvey {
     /// whatever this returns, every conversion measured at that scale needed at
     /// least that much.
     pub fn forecast_peak_bytes(&self) -> u64 {
-        let by_commit = self.commits.saturating_mul(BYTES_PER_COMMIT);
-        let by_tree = self
-            .tree_entries()
-            .saturating_mul(BYTES_PER_COMMIT_ARTIFACT);
-        by_commit.max(by_tree)
+        self.commits.saturating_mul(self.bytes_per_commit())
+    }
+
+    /// Bytes the forecast attributes to each commit in this repository.
+    ///
+    /// Factoring this out of [`Self::forecast_peak_bytes`] is what makes the
+    /// forecast invertible, and the reason it inverts exactly is that both of
+    /// its terms are linear in the commit count: the tree term is commits times
+    /// tracked artifacts, so the width divides out and what is left is a
+    /// per-commit cost that does not depend on how many commits there are.
+    fn bytes_per_commit(&self) -> u64 {
+        BYTES_PER_COMMIT.max(
+            self.tracked_artifacts
+                .saturating_mul(BYTES_PER_COMMIT_ARTIFACT),
+        )
+    }
+
+    /// Commits whose forecast fits inside `budget_bytes`.
+    ///
+    /// The number `--history-limit` is offered with, so it is deliberately the
+    /// count that lands under the silent band rather than the count that lands
+    /// exactly on the ceiling. Advising a number that converts and then warns
+    /// would be advice that half works.
+    ///
+    /// Zero means no bound helps: one commit of this repository already exceeds
+    /// the budget, which happens on a very wide tree rather than a long
+    /// history. A caller must not print a zero as a recommendation.
+    pub fn commits_within(&self, budget_bytes: u64) -> u64 {
+        budget_bytes / self.bytes_per_commit().max(1)
     }
 }
 
@@ -208,12 +232,25 @@ impl BudgetVerdict {
         // the second. So it states both figures and lets the reader compare
         // them, and it carries the remedy, because being warned and given
         // nothing to do is most of the way back to being told nothing.
+        // The remedy names the flag when a bound would help and stays silent
+        // about it when one would not, rather than always naming it. A line
+        // that offers a lever which cannot move this repository is worse than
+        // one that offers nothing, because the reader spends a conversion
+        // finding out.
+        let bounded = history_limit_remedy(survey, *ceiling_bytes).map_or_else(
+            || " or convert a repository with less history".to_string(),
+            |_| {
+                format!(
+                    " or take in less history with `kin init --history-limit {}`",
+                    survey.commits_within((*ceiling_bytes as f64 * TIGHT_FRACTION) as u64)
+                )
+            },
+        );
         Some(format!(
             "  this conversion is expected to hold about {}, against the {} this {} allows, \
              because {} commits over {} tracked files is a large history. It will probably \
              finish. If the kernel stops it you will get no message from this run, and the next \
-             one will say what happened; to be sure instead, give it more than {} or convert a \
-             repository with less history",
+             one will say what happened; to be sure instead, give it more than {}{bounded}",
             human_bytes(*forecast_bytes),
             human_bytes(*ceiling_bytes),
             ceiling_noun(),
@@ -276,9 +313,15 @@ impl BudgetVerdict {
                 human_bytes(*forecast_bytes),
                 ceiling_noun(),
             ),
-            "  or convert a repository with less history. Note that a shallow clone is not that \
-             repository: `git clone --depth` leaves a boundary Kin refuses, because a history \
-             whose oldest commits have absent parents cannot be captured losslessly"
+            history_limit_remedy(survey, *ceiling_bytes).unwrap_or_else(|| {
+                "  or convert a repository with less history. `--history-limit` will not help \
+                 here: this repository's tree is wide enough that even one commit exceeds what \
+                 this machine can hold"
+                    .to_string()
+            }),
+            "  a shallow clone is not either of those: `git clone --depth` leaves a boundary Kin \
+             refuses, because a history whose oldest commits have absent parents cannot be \
+             captured losslessly"
                 .to_string(),
             format!(
                 "  if this {} really has more memory than Kin could read, set {} to the true \
@@ -291,6 +334,36 @@ impl BudgetVerdict {
                 .to_string(),
         ]
     }
+}
+
+/// The `--history-limit` sentence, or `None` when no bound would help.
+///
+/// One builder for both the refusal and the advisory, so the two can never
+/// offer different numbers for the same repository on the same machine. The
+/// count is the one that lands in the silent band rather than on the ceiling,
+/// because advice that converts and then warns is advice that half works.
+///
+/// `None` when the recommendation would be zero, or when it would not actually
+/// be a bound because the repository already has that little history. Offering
+/// a limit larger than the history it would bound is a sentence that reads like
+/// a remedy and changes nothing.
+fn history_limit_remedy(survey: &HistorySurvey, ceiling_bytes: u64) -> Option<String> {
+    let budget = (ceiling_bytes as f64 * TIGHT_FRACTION) as u64;
+    let commits = survey.commits_within(budget);
+    if commits == 0 || commits >= survey.commits {
+        return None;
+    }
+    Some(format!(
+        "  or take in less history: `kin init --history-limit {commits}` admits the newest          {commits} commits of this repository's first-parent history, which is about {}, and          leaves the other {} out of the graph. It keeps every Git object and every ref this          repository has, so nothing is thrown away; what it bounds is the semantic history, and          `kin log` reports where the admitted history starts",
+        human_bytes(
+            HistorySurvey {
+                commits,
+                tracked_artifacts: survey.tracked_artifacts,
+            }
+            .forecast_peak_bytes()
+        ),
+        survey.commits.saturating_sub(commits),
+    ))
 }
 
 /// Whether the ceiling this process reads belongs to a container or a machine.

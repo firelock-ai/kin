@@ -301,7 +301,11 @@ async fn resolve_feature_target(work_id: &str) -> Result<String> {
     let recorded = resolve_work_item_changes(work_id).await?;
     let layout = crate::commands::require_repository_layout()?;
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
-    let report = crate::commands::log::inspect(&binding, WORK_ITEM_HISTORY_WINDOW)?;
+    let report = crate::commands::log::inspect(
+        &binding,
+        WORK_ITEM_HISTORY_WINDOW,
+        kin_core::history_boundary_for(&layout),
+    )?;
     let line = first_parent_line(&report);
     match plan_work_item_rollback(&line, report.truncated, &recorded) {
         Ok(plan) => {

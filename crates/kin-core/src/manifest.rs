@@ -55,6 +55,66 @@ pub struct KinManifest {
 
     /// Timestamp of repository creation.
     pub created_at: String,
+
+    /// Where admitted Git history ends, when `kin init --history-limit` bounded
+    /// it.
+    ///
+    /// Absent on every repository admitted with whole history, which is the
+    /// default and every repository written before this field existed, so its
+    /// absence means "nothing was cut" and never "nobody recorded it". A reader
+    /// that finds it present must not describe the oldest change as the point
+    /// where the repository began, because it is the point where admission
+    /// began and the Git commits before it are in this store as Git objects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_boundary: Option<ManifestHistoryBoundary>,
+}
+
+/// The durable form of a bounded admission's edge.
+///
+/// Kept in the manifest rather than derived on demand, because the only way to
+/// derive it is to notice that the oldest change's Git commit has parents the
+/// graph does not hold, and a reader that has to infer a boundary is a reader
+/// that will sometimes infer it wrongly. Object ids are hex strings so this
+/// record stays readable by anything that can read JSON.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManifestHistoryBoundary {
+    /// The `--history-limit N` the operator asked for.
+    pub requested_limit: usize,
+    /// Commits actually admitted into the semantic graph.
+    pub admitted_commits: usize,
+    /// Oldest admitted Git commit. Admitted history starts here.
+    pub oldest_admitted_commit: String,
+    /// Git commits that are parents of an admitted commit and were not
+    /// admitted: the first entry of the mainline edge, plus every side branch
+    /// a merge in the window reached for.
+    pub unadmitted_parents: Vec<String>,
+}
+
+/// The admitted-history boundary this repository recorded, if any.
+///
+/// Returns `None` both for a whole-history repository and for a manifest this
+/// build cannot read, and the two are the same answer on purpose: every command
+/// that calls this is about to describe history, and the honest description of
+/// an unreadable manifest is the one that claims no boundary rather than one it
+/// invented. A store whose manifest cannot be read has larger problems, and the
+/// commands that open the authority report them.
+pub fn history_boundary_for(layout: &KinLayout) -> Option<ManifestHistoryBoundary> {
+    KinManifest::load(&layout.manifest_path())
+        .ok()
+        .and_then(|manifest| manifest.history_boundary)
+}
+
+impl ManifestHistoryBoundary {
+    /// One sentence a command prints about where admitted history ends.
+    pub fn summary(&self) -> String {
+        format!(
+            "admitted history starts at Git commit {}, the oldest of {} commit(s) admitted under              `--history-limit {}`; {} older or side-branch Git commit(s) are in this store as Git              objects and are not in the semantic graph",
+            self.oldest_admitted_commit,
+            self.admitted_commits,
+            self.requested_limit,
+            self.unadmitted_parents.len(),
+        )
+    }
 }
 
 impl Default for KinManifest {
@@ -143,6 +203,7 @@ impl KinManifest {
             repo_id: uuid::Uuid::new_v4().to_string(),
             workspace_id: uuid::Uuid::new_v4().to_string(),
             created_at: chrono::Utc::now().to_rfc3339(),
+            history_boundary: None,
         }
     }
 

@@ -78,7 +78,10 @@ pub use exact_tree::{
     exact_tree_correction, plan_artifact_copy, plan_artifact_move, plan_artifact_operations,
     plan_observed_tree_deltas, ArtifactTreeOperation,
 };
-pub use git_init::{init_from_git, init_from_git_adopting};
+pub use git_init::{
+    init_from_git, init_from_git_adopting, init_from_git_with_options, GitAdmissionOptions,
+};
+pub use kin_git::{AdmittedHistoryBoundary, HistoryLimit};
 pub use hooks::{
     generate_claude_hooks, render_hooks_instructions, render_hooks_json, HookTemplate,
 };
@@ -89,7 +92,7 @@ pub use init::{
     RepositoryBootstrap, RepositoryIdentityOrigin, RepositoryPublication,
 };
 pub use layout::KinLayout;
-pub use manifest::KinManifest;
+pub use manifest::{history_boundary_for, KinManifest, ManifestHistoryBoundary};
 pub use paging::LocateCursor;
 pub use resolver::{ImportResolver, PythonResolver, SymbolTable, TypeScriptResolver};
 pub use sync_state::SyncStateStore;
