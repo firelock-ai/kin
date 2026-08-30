@@ -2022,6 +2022,7 @@ mod tests {
             embeddings_total: 6,
             reconcile: crate::commands::resources::ReconcileHealth::default(),
             tree_moved: Some(false),
+            prior_admission_at: None,
             admitted: true,
             failure: None,
         }))

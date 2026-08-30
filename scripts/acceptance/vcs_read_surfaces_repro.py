@@ -318,21 +318,42 @@ def grade_diff_discloses_its_semantic_scope(text):
     return PASS, "the workspace diff names what its semantic counts cannot show"
 
 
-def grade_admit_does_not_claim_a_no_op(text):
-    body = text or ""
-    if "Admitted the complete exact tree" not in body:
-        return UNREADABLE, "kin admit printed no admission line: %s" % body.strip()[:200]
-    if "nothing changed" in body:
+def grade_admit_left_the_graph_holding_the_edit(before_text, after_text):
+    """Whether the graph holds the edit once the pass is done, read as two hashes.
+
+    This graded the admission's WORDING until it was measured. The wording cannot
+    carry the property: `content` and `settled` print the identical sentence,
+    "Admitted the complete exact tree; nothing changed", and only one of them is a
+    defect, so no reading of that string separates the two states it grades.
+
+    Worse, the sentence was a true statement about a pass that correctly admitted
+    nothing. The daemon's watch loop drains its file watcher every 100ms and
+    admits what it finds (`loop_runner.rs`, `run_loop_armed`), and it is armed
+    before `.kin/daemon.port` is published, so a write races an explicit
+    `kin admit` and the loop usually wins. Measured on kin 0.6.2 at 510be53f9,
+    six repetitions per arm: admitting immediately reported the content change 6
+    of 6, and waiting 1.0s or 3.0s reported nothing changed 6 of 6. A stat-keyed
+    cache predicts the opposite, since a staleness window shrinks as an mtime
+    ages, and a write preserving both size and mtime was still seen 6 of 6, so
+    nothing on this path trusts stat.
+
+    So the property is that the graph ends up holding the new bytes, whoever
+    admitted them. Read as two hashes for the reason `grade_status_saw_the_edit`
+    gives one check above: no wording can fake a hash moving.
+    """
+    before = tree_hash(before_text)
+    after = tree_hash(after_text)
+    if before is None or after is None:
+        return UNREADABLE, "kin status printed no Tree: line on one of the two reads"
+    if before == after:
         return FAIL, (
-            "a pass over an edited tracked file reported nothing changed: %s"
-            % body.strip().splitlines()[0]
+            "the tree is still %s after a tracked file was edited and admitted, so the "
+            "graph does not hold the edit" % before[:16]
         )
-    if "content changed" not in body:
-        return FAIL, (
-            "the pass neither claimed a no-op nor named the content change: %s"
-            % body.strip().splitlines()[0]
-        )
-    return PASS, "the pass named the content change: %s" % body.strip().splitlines()[0]
+    return PASS, (
+        "the graph holds the edit: the tree moved %s -> %s across the write and its "
+        "admission" % (before[:16], after[:16])
+    )
 
 
 def grade_admit_still_reports_a_true_no_op(text):
@@ -521,12 +542,13 @@ def check_content(suite):
     check grades. A read that mutates has to be treated as a mutation when
     ordering an experiment around it.
     """
+    before = suite.status_text()
     suite.write_tracked_module(MODULE_FOR_ADMIT)
     rc, out, err = suite.kin_run(["admit"])
     if rc != 0:
         return Result("content", UNREADABLE,
                       "%s kin admit exited %s: %s" % (TICKET, rc, (err or out)[-200:]))
-    status, detail = grade_admit_does_not_claim_a_no_op(out)
+    status, detail = grade_admit_left_the_graph_holding_the_edit(before, suite.status_text())
     return Result("content", status, "%s %s" % (TICKET, detail))
 
 
@@ -791,10 +813,6 @@ def self_test():
          (STATUS_WITH_MERGE, CONFLICTS_HELD), PASS),
         ("heldmerge/no-merge-opened", grade_status_names_a_held_merge,
          (STATUS_SILENT_DURING_MERGE, CONFLICTS_NONE), UNREADABLE),
-        ("content/no-op-claim", grade_admit_does_not_claim_a_no_op, ADMIT_NO_OP_CLAIM, FAIL),
-        ("content/moved", grade_admit_does_not_claim_a_no_op, ADMIT_CONTENT_MOVED, PASS),
-        ("content/unmeasured", grade_admit_does_not_claim_a_no_op, ADMIT_UNMEASURED, FAIL),
-        ("content/refused", grade_admit_does_not_claim_a_no_op, ADMIT_REFUSED, UNREADABLE),
         ("settled/no-op-claim", grade_admit_still_reports_a_true_no_op, ADMIT_NO_OP_CLAIM, PASS),
         ("settled/moved", grade_admit_still_reports_a_true_no_op, ADMIT_CONTENT_MOVED, FAIL),
         ("settled/unmeasured", grade_admit_still_reports_a_true_no_op, ADMIT_UNMEASURED, FAIL),
@@ -807,6 +825,16 @@ def self_test():
         ("sawedit/moved", grade_status_saw_the_edit, (STATUS_BARE, STATUS_BARE_AHEAD), PASS),
         ("sawedit/unmoved", grade_status_saw_the_edit, (STATUS_BARE, STATUS_BARE), FAIL),
         ("sawedit/no-tree-line", grade_status_saw_the_edit,
+         (STATUS_BARE, STATUS_NO_TREE), UNREADABLE),
+        # `content` grades the same property one step later: the graph holding
+        # the edit after the admission, rather than the admission's sentence.
+        # The unmoved row is what keeps FIR-2961's original finding covered,
+        # because it is the arm that reds when the graph does NOT hold the bytes.
+        ("content/moved", grade_admit_left_the_graph_holding_the_edit,
+         (STATUS_BARE, STATUS_BARE_AHEAD), PASS),
+        ("content/unmoved", grade_admit_left_the_graph_holding_the_edit,
+         (STATUS_BARE, STATUS_BARE), FAIL),
+        ("content/no-tree-line", grade_admit_left_the_graph_holding_the_edit,
          (STATUS_BARE, STATUS_NO_TREE), UNREADABLE),
     ])
     failures = 0
