@@ -180,10 +180,33 @@ fn materialize_bodies(
     state: &DaemonState,
     record: &MergeTransactionRecord,
 ) -> Vec<kin_cli::commands::conflicts::ConflictBody> {
+    materialize_bodies_at(
+        state,
+        &record.binding.base_change,
+        &record.binding.ours_change,
+        &record.binding.theirs_change,
+        &record.entries,
+    )
+}
+
+/// The half of [`materialize_bodies`] that needs only the three bound changes
+/// and the entries.
+///
+/// Split out so a test can hand it a record whose recorded digest disagrees
+/// with the graph. Without that seam the verification below is a check nothing
+/// can fail: on a healthy merge every side hashes back, so deleting the check
+/// changes nothing any fixture built through the product can observe.
+pub(crate) fn materialize_bodies_at(
+    state: &DaemonState,
+    base_change: &kin_db::SemanticChangeId,
+    ours_change: &kin_db::SemanticChangeId,
+    theirs_change: &kin_db::SemanticChangeId,
+    entries: &[kin_model::MergeConflictEntry],
+) -> Vec<kin_cli::commands::conflicts::ConflictBody> {
     let sides = [
-        ("base", &record.binding.base_change),
-        ("ours", &record.binding.ours_change),
-        ("theirs", &record.binding.theirs_change),
+        ("base", base_change),
+        ("ours", ours_change),
+        ("theirs", theirs_change),
     ];
     let resolved: Vec<(&str, Option<kin_model::graph::ResolvedGraphState>)> = sides
         .iter()
@@ -191,7 +214,7 @@ fn materialize_bodies(
         .collect();
 
     let mut out = Vec::new();
-    for entry in record.entries.iter() {
+    for entry in entries.iter() {
         if !matches!(
             entry.subject,
             MergeConflictSubject::Entity { .. } | MergeConflictSubject::Artifact { .. }
@@ -229,6 +252,21 @@ fn materialize_bodies(
     out
 }
 
+/// Whether the value re-read from the graph is the one the record bound.
+///
+/// One site, deliberately. An entity and an artifact reach this by different
+/// routes and hash different model values, but the decision they make is the
+/// same one, and a decision written twice can be deleted once: a mutation
+/// removing only the entity copy would survive a test that grades only the
+/// artifact, which is the shape where two branches reporting the same field
+/// hide each other's absence.
+fn side_agrees(
+    recomputed: std::result::Result<kin_model::MergeSideValue, kin_model::ModelError>,
+    recorded: &kin_model::MergeSideValue,
+) -> bool {
+    matches!(recomputed, Ok(value) if &value == recorded)
+}
+
 /// What one side of one conflict subject could be read as.
 enum SideSource {
     /// The identity does not exist on this side, which the record agrees with.
@@ -254,9 +292,8 @@ fn side_source(
             match (held, recorded) {
                 (None, kin_model::MergeSideValue::Absent) => SideSource::Absent,
                 (Some(held), _) => {
-                    match kin_model::MergeSideValue::entity(Some(held)) {
-                        Ok(recomputed) if &recomputed == recorded => {}
-                        _ => return SideSource::Unverified,
+                    if !side_agrees(kin_model::MergeSideValue::entity(Some(held)), recorded) {
+                        return SideSource::Unverified;
                     }
                     let Some(span) = held.span.as_ref() else {
                         return SideSource::Unverified;
@@ -285,9 +322,8 @@ fn side_source(
             match (held, recorded) {
                 (None, kin_model::MergeSideValue::Absent) => SideSource::Absent,
                 (Some(held), _) => {
-                    match kin_model::MergeSideValue::artifact(Some(held)) {
-                        Ok(recomputed) if &recomputed == recorded => {}
-                        _ => return SideSource::Unverified,
+                    if !side_agrees(kin_model::MergeSideValue::artifact(Some(held)), recorded) {
+                        return SideSource::Unverified;
                     }
                     match blob_text(state, held) {
                         Some(text) => SideSource::Source(text),
