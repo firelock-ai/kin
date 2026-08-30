@@ -98,7 +98,7 @@ pub(crate) fn execute(
     if matches!(request, StashRequest::List) {
         let authority =
             ActiveLocalRepositoryAuthority::open_bound(state).map_err(stash_bind_refusal)?;
-        return list(&authority).map_err(internal_stash_error);
+        return list(&authority, &state.layout).map_err(internal_stash_error);
     }
 
     let graph_mutation = state.begin_graph_authority_mutation();
@@ -194,7 +194,10 @@ fn finalize(
     Ok(execution.response)
 }
 
-fn list(authority: &ActiveLocalRepositoryAuthority) -> Result<StashResponse> {
+fn list(
+    authority: &ActiveLocalRepositoryAuthority,
+    layout: &kin_core::KinLayout,
+) -> Result<StashResponse> {
     let lease = authority.manager.read_authority();
     let metadata = lease.metadata();
     let workspace = local_workspace(authority, metadata)?.clone();
@@ -247,7 +250,7 @@ fn list(authority: &ActiveLocalRepositoryAuthority) -> Result<StashResponse> {
         entries,
     };
     Ok(StashResponse {
-        lines: render_list(&report),
+        lines: render_list(&report, &kin_core::last_admission::read(layout)),
         mutated: false,
         report: Some(report),
         entry: None,
@@ -1216,23 +1219,65 @@ fn seal_message(message: Option<&str>, workspace: &WorkspaceState) -> String {
     }
 }
 
+/// The base-change verdict with the basis it rests on.
+///
+/// Every arm states one. An absent or unparseable marker renders as its own arm
+/// rather than as a bare verdict, because a surface that goes quiet when its
+/// basis is unknown is indistinguishable from one reporting a healthy store,
+/// which is the failure the marker was built to end.
+fn workspace_state_clause(
+    dirty: bool,
+    admission: &kin_core::last_admission::LastAdmissionRead,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use kin_core::last_admission::LastAdmissionRead;
+    let verdict = if dirty {
+        "ahead of its base change"
+    } else {
+        "matching its base change"
+    };
+    match admission {
+        LastAdmissionRead::Recorded(recorded) => format!(
+            "{verdict} as admitted {} ago",
+            kin_core::last_admission::humanize_age(recorded.age_seconds(now))
+        ),
+        LastAdmissionRead::Absent => format!(
+            "{verdict} as last admitted; this store records no complete admission, so how far \
+             behind the working copy that is is unknown"
+        ),
+        LastAdmissionRead::Unreadable(reason) => format!(
+            "{verdict} as last admitted; the last-admission record will not parse ({reason}), so \
+             how far behind the working copy that is is unknown"
+        ),
+    }
+}
+
 fn render_base(change_id: Option<SemanticChangeId>) -> String {
     change_id.map_or_else(|| "an unborn base".to_string(), |id| id.to_string())
 }
 
-fn render_list(report: &StashListReport) -> Vec<String> {
+fn render_list(
+    report: &StashListReport,
+    admission: &kin_core::last_admission::LastAdmissionRead,
+) -> Vec<String> {
     if report.entries.is_empty() {
         // Phrased as a comparison against the base change for the same reason
         // `kin status` is: "clean" reads as "everything on disk is in the
         // graph", which this flag does not mean and cannot answer.
+        //
+        // And carrying the admission's age for the same reason `kin status` now
+        // does. That verdict compares two graph-owned values and is always right
+        // about the graph; whether it is also a statement about the files on
+        // disk depends on when the graph last looked, and with no clock beside it
+        // there is nothing else for a reader to take it as. `kin status` shipped
+        // the same bare sentence and a stranger read it over a tracked file
+        // edited twenty-two seconds earlier (FIR-2961). This surface is lower
+        // stakes, because nobody decides whether to commit off a stash listing,
+        // and it is the same sentence.
         return vec![format!(
             "(no sealed stashes; workspace {} is {})",
             report.workspace_id,
-            if report.workspace_dirty {
-                "ahead of its base change"
-            } else {
-                "matching its base change"
-            }
+            workspace_state_clause(report.workspace_dirty, admission, chrono::Utc::now())
         )];
     }
     report
@@ -1287,4 +1332,59 @@ fn stash_bind_refusal(refusal: RepositoryAuthorityBindRefusal) -> (StatusCode, S
         StatusCode::INTERNAL_SERVER_ERROR
     };
     (status, format!("{:#}", refusal.into_error()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_state_clause;
+    use chrono::Utc;
+    use kin_core::last_admission::{LastAdmission, LastAdmissionRead};
+
+    /// FIR-2961. The verdict is right about the graph and says nothing about when
+    /// the graph last looked, which is what a reader takes it for. `kin status`
+    /// shipped the same bare sentence and a stranger read it over a tracked file
+    /// edited twenty-two seconds earlier.
+    #[test]
+    fn the_empty_stash_verdict_carries_the_age_of_its_admission() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-29T20:49:16Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let admitted_at = chrono::DateTime::parse_from_rfc3339("2026-08-29T20:47:16Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let recorded = LastAdmissionRead::Recorded(LastAdmission::new(admitted_at, 8));
+
+        let clean = workspace_state_clause(false, &recorded, now);
+        assert!(clean.contains("matching its base change"), "{clean}");
+        assert!(clean.contains("admitted 2m ago"), "{clean}");
+
+        let dirty = workspace_state_clause(true, &recorded, now);
+        assert!(dirty.contains("ahead of its base change"), "{dirty}");
+        assert!(dirty.contains("admitted 2m ago"), "{dirty}");
+    }
+
+    /// An unknown basis is the case the marker exists for and must not render as
+    /// a bare verdict, because a surface that goes quiet when its basis is
+    /// unknown cannot be told from one reporting a healthy store.
+    #[test]
+    fn an_unknown_basis_is_never_rendered_as_a_bare_verdict() {
+        let now = Utc::now();
+
+        let absent = workspace_state_clause(false, &LastAdmissionRead::Absent, now);
+        assert!(absent.contains("no complete admission"), "{absent}");
+
+        let unreadable = workspace_state_clause(
+            false,
+            &LastAdmissionRead::Unreadable("trailing bytes".to_string()),
+            now,
+        );
+        assert!(unreadable.contains("will not parse"), "{unreadable}");
+        assert!(unreadable.contains("trailing bytes"), "{unreadable}");
+
+        // The control. Every arm carries the verdict, so the qualification is an
+        // addition to the answer and never a replacement for it.
+        for clause in [&absent, &unreadable] {
+            assert!(clause.contains("matching its base change"), "{clause}");
+        }
+    }
 }
