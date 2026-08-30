@@ -977,6 +977,14 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
+        // A merge Kin is holding open, read off the authority lease. Never fatal:
+        // a status that refuses to print because it could not check for a merge
+        // is worse than one that prints and does not mention it, and this is the
+        // command an operator runs when something is already wrong.
+        let merge = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)
+            .ok()
+            .and_then(|binding| merge_in_progress(&binding).ok())
+            .flatten();
         let footprint = StoreFootprint::measure(&layout);
         print!(
             "{}",
