@@ -29,27 +29,29 @@ here, and it grades both directions: a surface that qualifies every answer it
 gives is as useless as one that qualifies none, so the all-clear has its own
 check and must still arrive.
 
-Four checks, one seeded repository, run in order because the experiment is
-destructive: the third edits the file the first two are about.
+Six checks, one seeded repository, run in order because the experiment is
+destructive: each one sets up the next, and the last stops the daemon.
 
-  basis      the `Tree:` line names when graph truth last caught up, rather
-             than rendering a bare verdict a reader takes for a statement
-             about the files on disk
-  persists   with a tracked file edited and nothing admitted since, that line
-             still carries its basis rather than reverting to a bare verdict.
-             Note what this does NOT prove: measured on macOS, the ambient
-             watcher takes about two seconds to admit such an edit, and inside
-             that window the line reads `matching its base change as admitted 0s
-             ago` over a tree that has not moved. A clock cannot separate an
-             admission that ran before the edit from one that ran after it, so
-             the age is necessary and not sufficient. The check that closes that
-             hole is the one over an UNOBSERVED working copy, and it arrives with
-             the fix it grades
-  content    `kin admit` over that content-only edit does not report
-             "nothing changed"
-  settled    the control: a second `kin admit` with nothing left to take says
-             "nothing changed" and says it plainly. Without this the other
-             three are satisfied by a product that hedges every sentence.
+  basis        the `Tree:` line names when graph truth last caught up, rather
+               than rendering a bare verdict a reader takes for a statement
+               about the files on disk
+  saw_the_edit the check an age could never make. A tracked file's body changes
+               and the tree hash on the `Tree:` line must move, read as two
+               hashes rather than as prose, because no wording can fake a hash
+               moving. This is what read-after-admit buys and it is the only
+               thing that settles the question
+  content      `kin admit` over that content-only edit does not report
+               "nothing changed"
+  settled      the control: a second `kin admit` with nothing left to take says
+               "nothing changed" and says it plainly. Without this the others
+               are satisfied by a product that hedges every sentence
+  diff_scope   a workspace diff names what its entity and relation counts cannot
+               show, rather than printing three zeroes that cannot move
+  unadmitted   with the daemon stopped, the verdict names itself unmeasured
+               instead of borrowing the clock of an older admission. A fresh
+               marker beside no admission at all is the most convincing form of
+               the defect, and its self-test row is the literal line the earlier
+               fix would have printed
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when none failed
 but one could not be read, and 3 when the run could not be set up. `--self-test`
@@ -158,6 +160,83 @@ def grade_tree_line_carries_its_basis(text):
         "the Tree: line states a verdict about the working copy with nothing "
         "saying when graph truth last looked: %s" % line
     )
+
+
+def tree_hash(text):
+    """The tree hash off the `Tree:` line, or None when there is no such line."""
+    line = tree_line(text)
+    if line is None:
+        return None
+    parts = line.split()
+    return parts[1] if len(parts) > 1 else None
+
+
+def grade_status_saw_the_edit(before_text, after_text):
+    """The check the age could never make.
+
+    kin#1254 put the admission's age beside the verdict, which made the sentence
+    honest without making it true: measured on macOS the clock reads `0s ago`
+    inside the roughly two-second window before the ambient watcher catches up,
+    and on a bind mount that window never closes. So this grades the only thing
+    that settles it, which is whether the tree the verdict describes is the tree
+    on disk. Read as two hashes rather than as prose, because no wording can fake
+    a hash moving.
+    """
+    before = tree_hash(before_text)
+    after = tree_hash(after_text)
+    if before is None or after is None:
+        return UNREADABLE, "kin status printed no Tree: line on one of the two reads"
+    if before == after:
+        return FAIL, (
+            "kin status reports the same tree %s after a tracked file changed, so it "
+            "answered from a graph that has not seen the edit" % before[:16]
+        )
+    return PASS, "the tree moved %s -> %s, so the answer was measured against the working copy" % (
+        before[:16], after[:16])
+
+
+def grade_verdict_without_an_admission_says_so(text):
+    """With nothing watching, a verdict is not a verdict.
+
+    The case this catches is the one an age cannot: with the daemon stopped, the
+    old line read `matching its base change as admitted 0s ago` while the
+    untracked line directly below it correctly said nothing had measured
+    anything. A fresh marker beside no admission is the most convincing possible
+    form of the defect.
+    """
+    line = tree_line(text)
+    if line is None:
+        return UNREADABLE, "kin status printed no Tree: line"
+    if "not measured against the working copy" in line:
+        return PASS, "the verdict names itself unmeasured: %s" % line
+    for pattern in BASIS_PATTERNS:
+        if pattern.search(line):
+            return FAIL, (
+                "with nothing admitting the working copy, the verdict still presents a "
+                "basis as though one had: %s" % line
+            )
+    return FAIL, "the verdict states no basis at all: %s" % line
+
+
+def grade_diff_discloses_its_semantic_scope(text):
+    """`Entities: +0 ~0 -0` on a workspace diff cannot move, so it must say so.
+
+    No writer in the daemon puts an entity delta into the workspace semantic
+    overlay: the admission seam publishes `WorkspaceSemanticDelta::default()`
+    unconditionally, and the one other writer passes the authority entities as
+    both the base and the desired side. A stranger checked that zero against a
+    fully settled graph and concluded the semantic layer had skipped a rewritten
+    function body.
+    """
+    body = text or ""
+    if "Entities:" not in body:
+        return UNREADABLE, "kin diff printed no Entities line"
+    if "Semantic scope:" not in body:
+        return FAIL, (
+            "a workspace diff printed its entity and relation counts with nothing saying "
+            "they cannot move"
+        )
+    return PASS, "the workspace diff names what its semantic counts cannot show"
 
 
 def grade_admit_does_not_claim_a_no_op(text):
@@ -276,15 +355,29 @@ def check_basis(suite):
     return Result("basis", status, "%s %s" % (TICKET, detail))
 
 
-def check_persists(suite):
+def check_saw_the_edit(suite):
+    before = suite.status_text()
     suite.edit_tracked_module()
-    status, detail = grade_tree_line_carries_its_basis(suite.status_text())
-    return Result(
-        "persists",
-        status,
-        "%s the basis survives an edit (not a claim that the verdict saw it), %s"
-        % (TICKET, detail),
-    )
+    status, detail = grade_status_saw_the_edit(before, suite.status_text())
+    return Result("saw_the_edit", status, "%s %s" % (TICKET, detail))
+
+
+def check_unadmitted(suite):
+    rc, out, err = suite.kin_run(["daemon", "stop"])
+    if rc != 0:
+        return Result("unadmitted", UNREADABLE,
+                      "%s the daemon would not stop: %s" % (TICKET, (err or out)[-200:]))
+    status, detail = grade_verdict_without_an_admission_says_so(suite.status_text())
+    return Result("unadmitted", status, "%s %s" % (TICKET, detail))
+
+
+def check_diff_scope(suite):
+    rc, out, err = suite.kin_run(["diff", "HEAD", "WORKSPACE"])
+    if rc != 0:
+        return Result("diff_scope", UNREADABLE,
+                      "%s kin diff exited %s: %s" % (TICKET, rc, (err or out)[-200:]))
+    status, detail = grade_diff_discloses_its_semantic_scope(out)
+    return Result("diff_scope", status, "%s %s" % (TICKET, detail))
 
 
 def check_content(suite):
@@ -305,11 +398,17 @@ def check_settled(suite):
     return Result("settled", status, "%s %s" % (TICKET, detail))
 
 
+# Order is load-bearing and the experiment is destructive. `saw_the_edit` makes
+# the edit the next two are about, `content` admits it, `settled` re-admits a
+# settled tree, `diff_scope` reads a workspace diff over it, and `unadmitted`
+# stops the daemon, which nothing after it could survive.
 CHECKS = (
     ("basis", check_basis),
-    ("persists", check_persists),
+    ("saw_the_edit", check_saw_the_edit),
     ("content", check_content),
     ("settled", check_settled),
+    ("diff_scope", check_diff_scope),
+    ("unadmitted", check_unadmitted),
 )
 
 
@@ -359,6 +458,35 @@ STATUS_BARE_AHEAD = (
     "Tree: c078181f (8 artifacts, ahead of its base change)\n"
 )
 
+# The verdict shapes read-after-admit produces, and the one it replaces.
+STATUS_UNMEASURED_VERDICT = (
+    "Kin repository-v6 status\n"
+    "Tree: 70fda9ae (8 artifacts, matching its base change as last admitted, not measured "
+    "against the working copy: no daemon is running for this repository, so nothing admitted "
+    "the working copy)\n"
+)
+# The trap this arm exists for: a marker as fresh as it gets, beside no
+# admission at all. The old line looked exactly like this.
+STATUS_FRESH_CLOCK_NO_PASS = (
+    "Kin repository-v6 status\n"
+    "Tree: 70fda9ae (8 artifacts, matching its base change as admitted 0s ago)\n"
+    "Untracked host content: not measured; no daemon is running for this repository\n"
+)
+
+DIFF_WITHOUT_SCOPE = (
+    "Kin repository-v6 diff\n"
+    "Artifacts: +0 ~1 -0\n"
+    "Entities: +0 ~0 -0\n"
+    "Relations: +0 ~0 -0\n"
+    "M  ledger/reporting.py -> ledger/reporting.py [ce183603] blob f53cc41c -> blob d712bc3d\n"
+)
+DIFF_WITH_SCOPE = DIFF_WITHOUT_SCOPE + (
+    "Semantic scope: The head endpoint is the workspace, whose entities and relations are its "
+    "base change's plus a workspace semantic overlay that no admission writes entity or "
+    "relation deltas into.\n"
+)
+DIFF_NO_ENTITIES_LINE = "Kin repository-v6 diff\nArtifacts: +0 ~1 -0\n"
+
 ADMIT_NO_OP_CLAIM = (
     "Admitted the complete exact tree; nothing changed. 8 tracked artifacts, 39 entities.\n"
     "Embeddings: 71 of 78 indexed; the remainder is queued for the background embed pass.\n"
@@ -388,6 +516,20 @@ def self_test():
         ("basis/with-age", grade_tree_line_carries_its_basis, STATUS_WITH_AGE, PASS),
         ("basis/unknown", grade_tree_line_carries_its_basis, STATUS_UNKNOWN_BASIS, PASS),
         ("basis/no-tree-line", grade_tree_line_carries_its_basis, STATUS_NO_TREE, UNREADABLE),
+        # The arm the age could never reach. A fresh clock beside no admission is
+        # the most convincing form of the defect, so it must FAIL here.
+        ("unadmitted/fresh-clock-no-pass", grade_verdict_without_an_admission_says_so,
+         STATUS_FRESH_CLOCK_NO_PASS, FAIL),
+        ("unadmitted/named", grade_verdict_without_an_admission_says_so,
+         STATUS_UNMEASURED_VERDICT, PASS),
+        ("unadmitted/bare", grade_verdict_without_an_admission_says_so, STATUS_BARE, FAIL),
+        ("unadmitted/no-tree-line", grade_verdict_without_an_admission_says_so,
+         STATUS_NO_TREE, UNREADABLE),
+        ("diffscope/absent", grade_diff_discloses_its_semantic_scope,
+         DIFF_WITHOUT_SCOPE, FAIL),
+        ("diffscope/present", grade_diff_discloses_its_semantic_scope, DIFF_WITH_SCOPE, PASS),
+        ("diffscope/no-entities", grade_diff_discloses_its_semantic_scope,
+         DIFF_NO_ENTITIES_LINE, UNREADABLE),
         ("content/no-op-claim", grade_admit_does_not_claim_a_no_op, ADMIT_NO_OP_CLAIM, FAIL),
         ("content/moved", grade_admit_does_not_claim_a_no_op, ADMIT_CONTENT_MOVED, PASS),
         ("content/unmeasured", grade_admit_does_not_claim_a_no_op, ADMIT_UNMEASURED, FAIL),
@@ -397,9 +539,18 @@ def self_test():
         ("settled/unmeasured", grade_admit_still_reports_a_true_no_op, ADMIT_UNMEASURED, FAIL),
         ("settled/refused", grade_admit_still_reports_a_true_no_op, ADMIT_REFUSED, UNREADABLE),
     ]
+    # The two-hash grader takes a pair, so its rows carry a tuple and are unpacked
+    # here. A grader that ignored one side would pass its own table, which is why
+    # the moved and unmoved rows are both required.
+    cases.extend([
+        ("sawedit/moved", grade_status_saw_the_edit, (STATUS_BARE, STATUS_BARE_AHEAD), PASS),
+        ("sawedit/unmoved", grade_status_saw_the_edit, (STATUS_BARE, STATUS_BARE), FAIL),
+        ("sawedit/no-tree-line", grade_status_saw_the_edit,
+         (STATUS_BARE, STATUS_NO_TREE), UNREADABLE),
+    ])
     failures = 0
     for name, grader, payload, expected in cases:
-        got, detail = grader(payload)
+        got, detail = grader(*payload) if isinstance(payload, tuple) else grader(payload)
         ok = got == expected
         if not ok:
             failures += 1
