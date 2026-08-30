@@ -4962,8 +4962,15 @@ async fn command_diff(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let response = kin_cli::commands::diff::build_diff_response(&repository_authority, &request)
-        .map_err(internal_error)?;
+    // The live graph, which is the whole point of routing a workspace diff here:
+    // a workspace endpoint's entities are DERIVED, and this process is the only
+    // one that holds them. Read per moved path rather than snapshot-cloned.
+    let response = kin_cli::commands::diff::build_diff_response(
+        &repository_authority,
+        &request,
+        Some(state.graph.as_ref()),
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 

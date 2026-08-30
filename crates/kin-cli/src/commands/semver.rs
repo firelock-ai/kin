@@ -198,7 +198,7 @@ pub fn inspect(
     head: &str,
 ) -> Result<SemverReport> {
     let (diff, endpoints) =
-        super::diff::inspect_with_endpoint_entities(binding, Some(base), Some(head))?;
+        super::diff::inspect_with_endpoint_entities(binding, Some(base), Some(head), None)?;
     if diff.schema != DIFF_SCHEMA {
         return Err(anyhow!(
             "repository diff returned schema '{}' instead of '{DIFF_SCHEMA}'",
