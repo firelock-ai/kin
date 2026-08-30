@@ -380,9 +380,8 @@ mod attribution_tests {
         let context = LocalRepositoryAuthorityContext::from_layout_for_test(&init.layout).unwrap();
 
         let captured = std::sync::Arc::new(std::sync::Mutex::new(Captured::default()));
-        let subscriber = tracing_subscriber::registry().with(CaptureLayer(std::sync::Arc::clone(
-            &captured,
-        )));
+        let subscriber =
+            tracing_subscriber::registry().with(CaptureLayer(std::sync::Arc::clone(&captured)));
         let expected_line = {
             let _capture = crate::capture_events_on_this_thread(subscriber);
             let line = line!() + 1;
