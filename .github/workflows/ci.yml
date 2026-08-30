@@ -1129,21 +1129,30 @@ jobs:
       # aggregate report one cause where there may be three.
       fail-fast: false
       matrix:
-      # Five, not three, because the gate's wall time is its slowest shard and
-      # three put the required context at 10.08 to 11.17 minutes end to end
-      # across five consecutive main runs, all of them over the bar. Measured
-      # per step across nine shard jobs, a shard costs 34 s of job setup plus
-      # 168 s of `cargo nextest list`, which compiles the whole selection and
-      # so does NOT shrink when shards are added, against 930 to 989 s of test
-      # work per run that does. Five is where that 201 s floor stops paying:
-      # six buys about 0.6 min more and eight about 1.4, so the count is
-      # chosen on the floor rather than on how far it can be pushed.
+      # Three, and five was tried and measured back out. Do not raise this
+      # count expecting the gate to get faster; the numbers are below and they
+      # say the shard count is not the lever.
       #
-      # This list and the `--partition count:.../5` denominator below are one
+      # Five ran on main for three consecutive pushes. Slowest shard went from
+      # a 12-run mean of 10.14 min to 9.78, which is 3.5 percent and exactly
+      # one before-side standard deviation, and the required context stayed
+      # over ten minutes on two of the three. What settles it is narrower than
+      # the mean: the SLOWEST partition's test time did not move at all, 386 s
+      # mean at three shards against 392 s at five.
+      #
+      # The reason is a floor that does not divide. Per shard: 34 s of job
+      # setup, 166 s of `cargo nextest list`, which compiles the whole
+      # selection, and 235 s inside the `Test` step itself, measured as the
+      # 470 s that two extra shards added to the run's total test time while
+      # the selection stayed constant. That is 435 s, 7.25 min, at any count.
+      # On top of it the slowest partition holds something indivisible worth
+      # about 390 s, so no count brings that partition below roughly 9.8 min.
+      #
+      # This list and the `--partition count:.../3` denominator below are one
       # fact in two places. The guard checks them against each other, because
       # a matrix SHORTER than the denominator runs that fraction of the
       # selection and still reports success.
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3]
     steps:
       # The scope read diffs a base against a head, so it needs both.
       - uses: actions/checkout@v7
@@ -1236,7 +1245,7 @@ jobs:
         run: |
           set -euo pipefail
           readarray -t SCOPE < "$RUNNER_TEMP/scope.args"
-          cargo nextest run --locked "${SCOPE[@]}" --partition count:${{ matrix.shard }}/5
+          cargo nextest run --locked "${SCOPE[@]}" --partition count:${{ matrix.shard }}/3
 
       # The reporting verdict. The run above graded a quarantined flake as
       # passing, which is what keeps it off the critical path; this reads the

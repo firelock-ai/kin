@@ -4394,7 +4394,7 @@ FAST_GATE_SHARD_STEPS = (
     "cargo nextest run --locked",
     "run: python3 scripts/check-quarantine.py --report-junit",
 )
-FAST_GATE_SHARD_MATRIX = "shard: [1, 2, 3, 4, 5]"
+FAST_GATE_SHARD_MATRIX = "shard: [1, 2, 3]"
 FAST_GATE_SHARD_INDEPENDENT_LEGS = "fail-fast: false"
 FAST_GATE_AGGREGATE_ALWAYS_RUNS = "if: ${{ !cancelled() }}"
 FAST_GATE_AGGREGATE_NEEDS = "needs: [changes, fast-gate-tests]"
@@ -13762,13 +13762,13 @@ def main() -> None:
             # prove nothing about this one; that arm was written first and the
             # falsification loop's own wrong-reason check rejected it.
             #
-            # Its effect is the silent kind. Matrix [1..5] against
-            # `count:${{ matrix.shard }}/7` means parts 6 and 7 are never
-            # dispatched, so two sevenths of the selection never runs, all five
-            # shards pass, and the required context reports success.
+            # Its effect is the silent kind. Matrix [1, 2, 3] against
+            # `count:${{ matrix.shard }}/7` means parts 4 through 7 are never
+            # dispatched, so four sevenths of the selection never runs, all
+            # three shards pass, and the required context reports success.
             "the partition denominator drifts above the shard matrix",
             "fast-gate-tests",
-            "--partition count:${{ matrix.shard }}/5",
+            "--partition count:${{ matrix.shard }}/3",
             "--partition count:${{ matrix.shard }}/7",
             "one fact in two places and they disagree",
         ),
