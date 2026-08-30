@@ -21,7 +21,9 @@ use kin_cli::commands::resolve::{
     ResolveAction, ResolveChoice, ResolveDirective, ResolveReport, ResolveRequest, ResolveResponse,
     RESOLVE_REPORT_SCHEMA,
 };
-use kin_db::{LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager};
+use kin_db::{
+    ChangeStore, LocalFileBackend, LocalRepositoryAuthorityFreeze, RepositoryAuthorityManager,
+};
 use kin_model::{
     MergeConflictSubject, MergeEntryResolution, MergeResolutionPayload, MergeResolutionProvenance,
     MergeSide, MergeTransactionDelta, MergeTransactionRecord, MergeTransactionState,
@@ -71,14 +73,18 @@ pub(crate) fn commit_and_freeze_exact(
 
 pub(crate) fn execute_conflicts(
     state: &DaemonState,
-    _request: &ConflictsRequest,
+    request: &ConflictsRequest,
 ) -> std::result::Result<ConflictsResponse, (StatusCode, String)> {
     let authority =
         ActiveLocalRepositoryAuthority::open_bound(state).map_err(merge_bind_refusal)?;
-    read_conflicts(&authority).map_err(classify_merge_error)
+    read_conflicts(state, &authority, request).map_err(classify_merge_error)
 }
 
-fn read_conflicts(authority: &ActiveLocalRepositoryAuthority) -> Result<ConflictsResponse> {
+fn read_conflicts(
+    state: &DaemonState,
+    authority: &ActiveLocalRepositoryAuthority,
+    request: &ConflictsRequest,
+) -> Result<ConflictsResponse> {
     let lease = authority.manager.read_authority();
     let generation = lease.roots().generation;
     let metadata = lease.metadata();
@@ -137,6 +143,10 @@ fn read_conflicts(authority: &ActiveLocalRepositoryAuthority) -> Result<Conflict
         }
     };
     let record_hash = record.as_ref().map(|record| record.hash.to_string());
+    let bodies = match (&record, request.bodies) {
+        (Some(record), true) => materialize_bodies(state, record),
+        _ => Vec::new(),
+    };
     Ok(ConflictsResponse {
         lines,
         report: Some(ConflictsReport {
@@ -149,8 +159,210 @@ fn read_conflicts(authority: &ActiveLocalRepositoryAuthority) -> Result<Conflict
             record_hash,
             unresolved_count,
             resolved_count,
+            bodies,
         }),
     })
+}
+
+/// Re-materialize each conflict subject's three sides as source.
+///
+/// The record holds one `Hash256` per side, and it is a digest of the model
+/// value rather than a content address, so nothing can be looked up from it. The
+/// bytes come from the graph at the three changes this merge bound, which is the
+/// only place they exist, and each side is hashed back to the recorded digest
+/// before it is offered. That check is what makes the rendering an account of
+/// the merge rather than an account of the graph as it stands now: a side whose
+/// value has moved is named, not shown.
+///
+/// A side that cannot be read is named too. A body quietly missing reads exactly
+/// like an identity that is absent on that side, and those are opposite facts.
+fn materialize_bodies(
+    state: &DaemonState,
+    record: &MergeTransactionRecord,
+) -> Vec<kin_cli::commands::conflicts::ConflictBody> {
+    materialize_bodies_at(
+        state,
+        &record.binding.base_change,
+        &record.binding.ours_change,
+        &record.binding.theirs_change,
+        &record.entries,
+    )
+}
+
+/// The half of [`materialize_bodies`] that needs only the three bound changes
+/// and the entries.
+///
+/// Split out so a test can hand it a record whose recorded digest disagrees
+/// with the graph. Without that seam the verification below is a check nothing
+/// can fail: on a healthy merge every side hashes back, so deleting the check
+/// changes nothing any fixture built through the product can observe.
+pub(crate) fn materialize_bodies_at(
+    state: &DaemonState,
+    base_change: &kin_db::SemanticChangeId,
+    ours_change: &kin_db::SemanticChangeId,
+    theirs_change: &kin_db::SemanticChangeId,
+    entries: &[kin_model::MergeConflictEntry],
+) -> Vec<kin_cli::commands::conflicts::ConflictBody> {
+    let sides = [
+        ("base", base_change),
+        ("ours", ours_change),
+        ("theirs", theirs_change),
+    ];
+    let resolved: Vec<(&str, Option<kin_model::graph::ResolvedGraphState>)> = sides
+        .iter()
+        .map(|(name, change)| (*name, state.graph.resolve_graph_at(change).ok()))
+        .collect();
+
+    let mut out = Vec::new();
+    for entry in entries.iter() {
+        if !matches!(
+            entry.subject,
+            MergeConflictSubject::Entity { .. } | MergeConflictSubject::Artifact { .. }
+        ) {
+            // A relation has no source of its own. Rendering its endpoints here
+            // would print the same bodies twice under a different name.
+            continue;
+        }
+        let mut body = kin_cli::commands::conflicts::ConflictBody {
+            subject: render_subject_identity(&entry.subject),
+            label: entry.label.clone(),
+            base: None,
+            ours: None,
+            theirs: None,
+            unverified: Vec::new(),
+        };
+        for (name, state_at) in resolved.iter() {
+            let recorded = match *name {
+                "base" => &entry.base,
+                "ours" => &entry.ours,
+                _ => &entry.theirs,
+            };
+            match side_source(state, state_at.as_ref(), &entry.subject, recorded) {
+                SideSource::Absent => {}
+                SideSource::Source(text) => match *name {
+                    "base" => body.base = Some(text),
+                    "ours" => body.ours = Some(text),
+                    _ => body.theirs = Some(text),
+                },
+                SideSource::Unverified => body.unverified.push((*name).to_string()),
+            }
+        }
+        out.push(body);
+    }
+    out
+}
+
+/// Whether the value re-read from the graph is the one the record bound.
+///
+/// One site, deliberately. An entity and an artifact reach this by different
+/// routes and hash different model values, but the decision they make is the
+/// same one, and a decision written twice can be deleted once: a mutation
+/// removing only the entity copy would survive a test that grades only the
+/// artifact, which is the shape where two branches reporting the same field
+/// hide each other's absence.
+fn side_agrees(
+    recomputed: std::result::Result<kin_model::MergeSideValue, kin_model::ModelError>,
+    recorded: &kin_model::MergeSideValue,
+) -> bool {
+    matches!(recomputed, Ok(value) if &value == recorded)
+}
+
+/// What one side of one conflict subject could be read as.
+enum SideSource {
+    /// The identity does not exist on this side, which the record agrees with.
+    Absent,
+    Source(String),
+    /// The value did not hash back to the recorded digest, or its bytes could
+    /// not be read. Never rendered, always named.
+    Unverified,
+}
+
+fn side_source(
+    state: &DaemonState,
+    state_at: Option<&kin_model::graph::ResolvedGraphState>,
+    subject: &MergeConflictSubject,
+    recorded: &kin_model::MergeSideValue,
+) -> SideSource {
+    let Some(state_at) = state_at else {
+        return SideSource::Unverified;
+    };
+    match subject {
+        MergeConflictSubject::Entity { entity } => {
+            let held = state_at.entities.get(entity);
+            match (held, recorded) {
+                (None, kin_model::MergeSideValue::Absent) => SideSource::Absent,
+                (Some(held), _) => {
+                    if !side_agrees(kin_model::MergeSideValue::entity(Some(held)), recorded) {
+                        return SideSource::Unverified;
+                    }
+                    let Some(span) = held.span.as_ref() else {
+                        return SideSource::Unverified;
+                    };
+                    // `FilePathId` already holds a UTF-8 path, so this crossing
+                    // adds no new failure mode; a path it cannot express is
+                    // reported rather than approximated.
+                    let Ok(path) = kin_model::RepoPath::from_utf8(span.file.0.clone()) else {
+                        return SideSource::Unverified;
+                    };
+                    let Some(artifact) = state_at.tree.artifact_at_path(&path) else {
+                        return SideSource::Unverified;
+                    };
+                    match blob_text(state, artifact) {
+                        Some(text) => slice_span(&text, span.start_byte, span.end_byte)
+                            .map(SideSource::Source)
+                            .unwrap_or(SideSource::Unverified),
+                        None => SideSource::Unverified,
+                    }
+                }
+                _ => SideSource::Unverified,
+            }
+        }
+        MergeConflictSubject::Artifact { artifact } => {
+            let held = state_at.tree.get(artifact);
+            match (held, recorded) {
+                (None, kin_model::MergeSideValue::Absent) => SideSource::Absent,
+                (Some(held), _) => {
+                    if !side_agrees(kin_model::MergeSideValue::artifact(Some(held)), recorded) {
+                        return SideSource::Unverified;
+                    }
+                    match blob_text(state, held) {
+                        Some(text) => SideSource::Source(text),
+                        None => SideSource::Unverified,
+                    }
+                }
+                _ => SideSource::Unverified,
+            }
+        }
+        _ => SideSource::Unverified,
+    }
+}
+
+/// The artifact's bytes as text, or `None` when it is not a readable blob.
+///
+/// A symlink and a gitlink are deliberately not text: their tree entries carry
+/// a target rather than a body, and printing one as source would be a fiction.
+fn blob_text(state: &DaemonState, artifact: &kin_model::ResolvedArtifact) -> Option<String> {
+    let kin_model::TreeEntry::Blob { hash, .. } = &artifact.entry else {
+        return None;
+    };
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .ok()?;
+    let bytes = crate::repository_commit::load_native_source_blob(&context, *hash).ok()?;
+    String::from_utf8(bytes).ok()
+}
+
+/// The entity's own bytes inside its file.
+///
+/// Refuses rather than clamps. A span that does not lie on character boundaries
+/// or runs past the end of the blob means the span and the bytes disagree, and a
+/// clamped slice would render a body that is not the entity's while looking
+/// exactly like one that is.
+fn slice_span(text: &str, start: usize, end: usize) -> Option<String> {
+    if end < start || end > text.len() {
+        return None;
+    }
+    text.get(start..end).map(|slice| slice.to_string())
 }
 
 pub(crate) fn execute_resolve(
@@ -536,10 +748,25 @@ fn entry_matches(entry: &kin_model::MergeConflictEntry, needle: &str) -> bool {
     if by_identity {
         return true;
     }
-    match &entry.label {
-        Some(label) => label == needle,
-        None => false,
+    let Some(label) = entry.label.as_deref() else {
+        return false;
+    };
+    if label == needle {
+        return true;
     }
+    // The name on its own, which is what `kin conflicts` prints beside the
+    // identity and therefore what a caller reaches for. An entity's label is
+    // composed as `<name> in <file>` wherever it carries a span, so the name is
+    // the segment before the first ` in `, and a label with no span is already
+    // the bare name and matched above.
+    //
+    // Widening the match cannot settle the wrong identity: `select_subject`
+    // refuses anything matching more than one entry and names every candidate,
+    // so a name shared by two files asks the caller to pick rather than
+    // guessing for them.
+    label
+        .split_once(" in ")
+        .is_some_and(|(name, _file)| name == needle)
 }
 
 fn resolution_for(

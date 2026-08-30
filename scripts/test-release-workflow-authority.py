@@ -524,7 +524,7 @@ REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
         ${{ !cancelled()
         && needs.changes.outputs.docs_only != 'true'
         && github.event_name != 'pull_request' }}
-      runs-on: ubuntu-latest
+      runs-on: kin-16core
       timeout-minutes: 60
       env:
         CARGO_INCREMENTAL: "0"
@@ -560,7 +560,13 @@ UBUNTU_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
     """
 ).rstrip()
 # Indented as `classifier_active_job_source` renders a dedented job block.
-UBUNTU_SHARD_RUNNER = "  runs-on: ubuntu-latest"
+# The `check` job runner, pinned here as well as inside
+# REAL_CHECK_JOB_AUTHORITY, because `shards` binds to blocks.get("check"),
+# so one job is pinned in two places and both have to move together.
+# Moved to the larger runner under the founder's 2026-08-26 ruling. The
+# aggregate is deliberately NOT moved: it compiles nothing and runs in
+# seconds, so it stays on ubuntu-latest.
+UBUNTU_SHARD_RUNNER = "  runs-on: kin-16core"
 UBUNTU_SHARD_INDEPENDENT_LEGS = "    fail-fast: false"
 UBUNTU_SHARD_MATRIX = "      shard: [1, 2]"
 UBUNTU_SHARD_PARTITION = (
@@ -5485,6 +5491,122 @@ def assert_ubuntu_shard_authority(workflow: str) -> None:
             raise AssertionError(
                 f"ubuntu shard authority requires {step!r} on both legs; a shard "
                 "that ran without it did not run a partition of the suite"
+            )
+
+
+def cached_job_cache_inputs(workflow: str) -> dict[str, dict[str, str]]:
+    """Map every job running `rust-cache` to that step's `with:` inputs."""
+
+    inputs: dict[str, dict[str, str]] = {}
+    for job, block in workflow_job_blocks(workflow).items():
+        lines = classifier_active_job_source(block).splitlines()
+        for index, line in enumerate(lines):
+            if "uses: Swatinem/rust-cache@" not in line:
+                continue
+            found: dict[str, str] = {}
+            for follow in lines[index + 1 :]:
+                indent = len(follow) - len(follow.lstrip())
+                stripped = follow.strip()
+                if stripped == "with:":
+                    continue
+                # A new step, or a shallower key, ends this step's inputs.
+                if stripped.startswith("- ") or indent <= 4:
+                    break
+                if ": " in stripped:
+                    key, value = stripped.split(": ", 1)
+                    found[key.strip()] = value.strip()
+            inputs[job] = found
+            break
+    return inputs
+
+
+def job_cargo_environment(block: str) -> dict[str, str]:
+    """The job-level `env:` mapping, which rust-cache would otherwise hash."""
+
+    lines = classifier_active_job_source(block).splitlines()
+    try:
+        start = lines.index("  env:")
+    except ValueError:
+        return {}
+    environment: dict[str, str] = {}
+    for line in lines[start + 1 :]:
+        indent = len(line) - len(line.lstrip())
+        if indent <= 2:
+            break
+        if ": " in line:
+            key, value = line.strip().split(": ", 1)
+            environment[key.strip()] = value.strip()
+    return environment
+
+
+def assert_shared_cache_key_jobs_declare_one_environment(workflow: str) -> None:
+    """Keep the jobs that SHARE a cargo cache key on one declared environment.
+
+    FIR-2744 turned `add-rust-environment-hash-key` off, because the hash it
+    computes includes every toolchain the runner image happens to carry, so two
+    jobs in one run drew different keys off the same prefix and could not share
+    an entry. That fix is only safe because of what the hash's other half
+    covered.
+
+    The hash covers the toolchain versions AND every CARGO, CC, CFLAGS, CXX,
+    CMAKE and RUST environment variable. Toolchain sensitivity survives the
+    change, because the pin lives in `rust-toolchain.toml` and the toolchain
+    action, both of which are in the key's lockfiles half. Environment
+    sensitivity does not survive it.
+
+    That loss is harmless for a job keyed on its own job id, which shares with
+    nothing. It is not harmless where a `shared-key` deliberately points one
+    job at another's entry: those jobs now agree on a key while declaring
+    whatever environment they like, and a divergence would be a silent cache
+    collision rather than a failure. Nothing else in this repository would
+    notice, which is why it is asserted here.
+
+    The check is the JOIN rather than the endpoints: it reads which jobs
+    actually share a key out of the workflow and requires each such group to
+    declare one environment, so a new sharer is covered the day it is added
+    rather than the day someone remembers to list it.
+    """
+
+    inputs = cached_job_cache_inputs(workflow)
+    if not inputs:
+        raise AssertionError(
+            "shared cache-key authority found no job running rust-cache, so it "
+            "graded nothing; the extraction is broken or the action was renamed"
+        )
+    for job, found in inputs.items():
+        if found.get("add-rust-environment-hash-key") != "false":
+            raise AssertionError(
+                "shared cache-key authority requires every rust-cache step to set "
+                f"add-rust-environment-hash-key: false (FIR-2744); {job} does not"
+            )
+
+    blocks = workflow_job_blocks(workflow)
+    # Which jobs share which key, read from the workflow rather than listed.
+    # A `shared-key` naming another job's id joins that job's group; an
+    # expression naming several joins all of them.
+    groups: dict[str, set[str]] = {}
+    for job, found in inputs.items():
+        shared = found.get("shared-key")
+        if shared is None:
+            continue
+        for other in inputs:
+            if f"'{other}'" in shared or shared == other:
+                groups.setdefault(other, {other}).add(job)
+    if not groups:
+        raise AssertionError(
+            "shared cache-key authority found no shared-key at all, so it graded "
+            "nothing; if sharing was removed on purpose, remove this check with it"
+        )
+
+    for owner, members in sorted(groups.items()):
+        environments = {job: job_cargo_environment(blocks[job]) for job in sorted(members)}
+        distinct = {tuple(sorted(env.items())) for env in environments.values()}
+        if len(distinct) != 1:
+            raise AssertionError(
+                "shared cache-key authority requires every job sharing the "
+                f"{owner!r} cargo cache key to declare one environment, because "
+                "add-rust-environment-hash-key is off and nothing else would "
+                f"notice a divergence: {environments}"
             )
 
 
@@ -13605,7 +13727,7 @@ def main() -> None:
             expected,
             lambda mutant=mutant_workflow: assert_fast_gate_authority(mutant),
         )
-
+    assert_shared_cache_key_jobs_declare_one_environment(ci_workflow)
     consumer_blocks = workflow_job_blocks(ci_workflow)
     stub_check = consumer_blocks["check-pr-fast-path"]
     real_check = consumer_blocks["check"]
@@ -13750,8 +13872,12 @@ def main() -> None:
             "      fail-fast: true",
         ),
         (
-            "the ubuntu shards leave ubuntu",
-            "    runs-on: ubuntu-latest",
+            # The shards no longer run on ubuntu-latest, so mutating away from it
+            # stopped identifying anything the day the runner moved. What the arm
+            # has always meant is "the shards leave their pinned runner", so it
+            # names the pinned value rather than the historical one.
+            "the ubuntu shards leave their pinned runner",
+            "    runs-on: kin-16core",
             "    runs-on: macos-latest",
         ),
         (
@@ -13801,6 +13927,65 @@ def main() -> None:
                 mutant_workflow
             ),
         )
+
+    # FIR-2744's guard, driven in every direction it can fail.
+    for label, old, new in (
+        (
+            "a cache step lets the runner's toolchain set back into the key",
+            "          add-rust-environment-hash-key: false",
+            "          add-rust-environment-hash-key: true",
+        ),
+        (
+            # Target the `shared-key` line itself rather than one job's
+            # expression. Unsharing a SINGLE job stopped falsifying this the day
+            # main added a second and third job keyed on `check`: the group was
+            # no longer emptied, the survivors still agreed, and the guard
+            # correctly stayed green while the arm expected red. Commenting out
+            # every shared-key leaves nothing sharing at all, which is what the
+            # label claims and what the refusal above is for, and it cannot be
+            # broken again by a new sharer arriving.
+            "the shared-key expression stops naming a job, so nothing shares",
+            "          shared-key: ",
+            "          # falsification removed shared-key: ",
+        ),
+        (
+            "the action is renamed, so the extraction silently finds no cache step",
+            "uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4",
+            "uses: Renamed/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4",
+        ),
+    ):
+        if ci_workflow.count(old) < 1:
+            raise AssertionError(
+                f"shared cache-key falsification could not identify {label}"
+            )
+        expect_assertion(
+            label,
+            "shared cache-key authority",
+            lambda mutant=ci_workflow.replace(
+                old, new
+            ): assert_shared_cache_key_jobs_declare_one_environment(mutant),
+        )
+
+    # The one that matters most, because it is the collision the guard exists
+    # for and the only one nothing else in this repository would notice.
+    feature_tests = consumer_blocks["feature-tests"]
+    diverged_env = feature_tests.replace(
+        '      CARGO_PROFILE_TEST_DEBUG: "0"',
+        '      CARGO_PROFILE_TEST_DEBUG: "2"',
+        1,
+    )
+    if diverged_env == feature_tests:
+        raise AssertionError(
+            "shared cache-key falsification could not diverge a sharing job's "
+            "environment"
+        )
+    expect_assertion(
+        "a job sharing the cargo cache key declares a different environment",
+        "shared cache-key authority",
+        lambda mutant=ci_workflow.replace(
+            feature_tests, diverged_env, 1
+        ): assert_shared_cache_key_jobs_declare_one_environment(mutant),
+    )
 
     stub_condition = (
         "    if: ${{ !cancelled() && github.event_name == 'pull_request' }}"
@@ -13909,8 +14094,11 @@ def main() -> None:
             "    needs: dco",
         ),
         (
+            # The real check job moved to the larger runner; the pull-request
+            # stub above did not, which is why only this arm changes and the
+            # stub's two arms still name ubuntu-latest.
             "real Check & Test runner detached from its shard matrix",
-            "    runs-on: ubuntu-latest",
+            "    runs-on: kin-16core",
             "    runs-on: ${{ matrix.os }}",
         ),
         (

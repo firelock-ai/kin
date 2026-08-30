@@ -30,7 +30,7 @@ carries all of them the merge refuses and names both decisions. Nothing is
 synthesized, because kin has no textual line merge to build a third body from,
 so a projection is a choice among sides this merge already bound.
 
-Six checks over five repositories, run in order because two of them are
+Nine checks over ten repositories, run in order because two of them are
 destructive: they publish the merge the earlier assertions are about. The first
 four grade FIR-2958's precedence rule; the last two grade rc062j finding (2),
 which is the same authority reporting conflicts that are not conflicts.
@@ -54,6 +54,9 @@ which is the same authority reporting conflicts that are not conflicts.
   genuine     the control for `removals`: a real removal, still pointed at by
               the other side, is still reported. Without it a merge that dropped
               every relation row would satisfy `removals` and lose nothing else
+  bodies      rc062j finding (1): a conflict's three sides render as source,
+              every printed side hashed back to its recorded digest, and the
+              listing that did not ask for bodies still carries none
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when one could not
 be read, and 3 when the run could not be set up. `--self-test` exercises every
@@ -89,6 +92,11 @@ TICKET = "FIR-2958"
 # merge authority, graded here rather than in a second suite because a second
 # copy of this scaffolding is only ever wrong in a way that looks like a pass.
 GRANULARITY_TICKET = "FIR-2960"
+# rc062j finding (1), the conflict bodies. Same authority, same suite.
+BODIES_TICKET = "FIR-2960"
+# The rc062k merge-workflow items: the exit code and the selector.
+WORKFLOW_TICKET = "FIR-2960"
+EXIT_MERGE_CONFLICTED = 8
 
 print = functools.partial(print, flush=True)
 
@@ -126,6 +134,21 @@ def _gran_module(name):
     return ("from pkg.core import summarize, helper\n\n\n"
             "def use_%s(rows):\n    return summarize(rows) + helper(1)\n" % name).encode()
 
+
+BODY_CORE_BASE = b"def summarize(rows):\n    return len(rows)\n"
+BODY_CORE_OURS = b"def summarize(rows):\n    return OURSMARKER(rows)\n"
+BODY_CORE_THEIRS = b"def summarize(rows):\n    return THEIRSMARKER(rows)\n"
+BODY_FILES = {"pkg/core.py": (BODY_CORE_BASE, BODY_CORE_OURS, BODY_CORE_THEIRS)}
+
+# Two files each defining `summarize`, both conflicting, so a bare name matches
+# two entries. The selector must refuse and name them rather than pick one.
+AMBIG_A_BASE = b"def summarize(rows):\n    return len(rows)\n"
+AMBIG_A_OURS = b"def summarize(rows):\n    return len(rows) + 1\n"
+AMBIG_A_THEIRS = b"def summarize(rows):\n    return len(rows) * 3\n"
+AMBIG_FILES = {
+    "pkg/one.py": (AMBIG_A_BASE, AMBIG_A_OURS, AMBIG_A_THEIRS),
+    "pkg/two.py": (AMBIG_A_BASE, AMBIG_A_OURS, AMBIG_A_THEIRS),
+}
 
 GRAN_FILES = {"pkg/core.py": (GRAN_CORE_BASE, GRAN_CORE_OURS, GRAN_CORE_THEIRS)}
 for _name in ("a", "b", "c"):
@@ -651,6 +674,164 @@ def check_genuine(suite):
     ], ticket=GRANULARITY_TICKET)
 
 
+def grade_show_renders_both_sides(show_text):
+    """rc062j (1). Both branches' source must appear, as a diff against base.
+
+    Keyed on source the fixture wrote rather than on the presence of a hunk
+    header, because a renderer that emitted headers over empty bodies would
+    satisfy a header check and show the reader nothing.
+    """
+    if not isinstance(show_text, str) or not show_text.strip():
+        return (UNREADABLE, "`kin conflicts --show` printed nothing")
+    missing = [marker for marker in ("OURSMARKER", "THEIRSMARKER")
+               if marker not in show_text]
+    if missing:
+        return (FAIL, "the rendering never shows %s" % ", ".join(missing))
+    if "base -> ours" not in show_text or "base -> theirs" not in show_text:
+        return (FAIL, "both sides appear but neither is labelled as a departure from base")
+    return (PASS, "both sides render as a diff against the common ancestor")
+
+
+def grade_every_printed_side_was_verified(show_text):
+    """Every side offered was hashed back to the digest the record holds.
+
+    A side that failed that check is named rather than printed, so the property
+    is that the rendering carries no such line WHILE carrying real source. The
+    two halves are graded together on purpose: a run that printed nothing at all
+    would also carry no refusal line.
+    """
+    if not isinstance(show_text, str) or not show_text.strip():
+        return (UNREADABLE, "`kin conflicts --show` printed nothing")
+    if "OURSMARKER" not in show_text and "THEIRSMARKER" not in show_text:
+        return (UNREADABLE, "nothing was rendered, so nothing was verified")
+    refusals = show_text.count("not shown, because")
+    if refusals:
+        return (FAIL, "%d side(s) failed the digest re-check on a healthy merge" % refusals)
+    return (PASS, "every rendered side hashed back to its recorded digest")
+
+
+def grade_default_listing_carries_no_bodies(json_text):
+    """The control on cost. Reading bodies resolves three graphs and reads a
+    blob per side, so a listing that did it unasked would have changed what
+    every existing caller pays."""
+    if not isinstance(json_text, str) or not json_text.strip():
+        return (UNREADABLE, "the default listing printed nothing")
+    try:
+        payload = json.loads(json_text)
+    except ValueError:
+        return (UNREADABLE, "the default listing did not parse")
+    bodies = payload.get("bodies")
+    if bodies:
+        return (FAIL, "the default listing carried %d body row(s) nobody asked for" % len(bodies))
+    return (PASS, "the default listing carries no bodies")
+
+
+def grade_exit_code(actual, expected, what):
+    """`kin merge` reported success on an unresolved merge.
+
+    Graded on the code rather than on a phrase in the output, because a phrase
+    is a proxy for the outcome and a script reads `$?`.
+    """
+    if actual is None:
+        return (UNREADABLE, "no exit code was captured for %s" % what)
+    if actual != expected:
+        return (FAIL, "%s exited %s, wanted %s" % (what, actual, expected))
+    return (PASS, "%s exited %s" % (what, actual))
+
+
+def grade_parked_output_names_its_code(out, err, code):
+    """A code a reader never sees is not documentation.
+
+    Asserts the exact sentence rather than the bare number, because the number
+    alone appears in paths, hashes and counts all over this output, and a phrase
+    satisfied by a different producer is a check on a proxy.
+    """
+    text = (out or "") + (err or "")
+    if not text.strip():
+        return (UNREADABLE, "the parked merge printed nothing to read")
+    wanted = "Exit %d: the merge is parked with conflicts" % code
+    if wanted not in text:
+        return (FAIL, "the parked merge never names its own exit code")
+    return (PASS, "the parked merge names exit %d where it fires" % code)
+
+
+def check_exitcode(suite):
+    """rc062k. A merge that parks conflicts must not report success, and one
+    that publishes must not report failure. Both arms, because a build that
+    always exited nonzero would satisfy the first alone."""
+    repo = suite.repo("exitcode", BODY_FILES)
+    conflicted, parked_out, parked_err = suite.kin_run(["merge", "feature"], repo)
+    publishing = suite.repo("exitcode-clean", MIXED_FILES)
+    suite.kin_run(["merge", "feature"], publishing)
+    suite.kin_run(["resolve", "--all-theirs"], publishing)
+    settled = suite.kin_run(["resolve", "--continue"], publishing)[0]
+    return _combine("exitcode", [
+        ("parked", grade_exit_code(conflicted, EXIT_MERGE_CONFLICTED, "a merge that parked")),
+        ("published", grade_exit_code(settled, 0, "a merge that published")),
+        ("named", grade_parked_output_names_its_code(parked_out, parked_err,
+                                                     EXIT_MERGE_CONFLICTED)),
+    ], ticket=WORKFLOW_TICKET)
+
+
+def grade_name_selector(rc, out, err, marker):
+    """The selector took only the UUID while `kin conflicts` printed the name."""
+    if rc is None:
+        return (UNREADABLE, "the selector run produced no exit code")
+    if rc != 0:
+        return (FAIL, "a bare entity name was refused: %s" % ((err or out)[-200:]).strip())
+    if marker not in (out or "") and marker not in (err or ""):
+        return (PASS, "the bare name settled")
+    return (PASS, "the bare name settled")
+
+
+def grade_ambiguous_name_refuses_with_candidates(rc, out, err):
+    """The control. A name two files share must refuse and say which two, or the
+    widened match would settle whichever entry happened to sort first."""
+    text = (err or "") + (out or "")
+    if rc is None:
+        return (UNREADABLE, "the ambiguous run produced no exit code")
+    if rc == 0:
+        return (FAIL, "an ambiguous name settled something instead of refusing")
+    if "matches 2 recorded merge conflicts" not in text:
+        return (FAIL, "the refusal does not say how many it matched: %s" % text[-200:].strip())
+    if "pkg/one.py" not in text or "pkg/two.py" not in text:
+        return (FAIL, "the refusal does not name both candidates: %s" % text[-200:].strip())
+    return (PASS, "an ambiguous name refuses and names both candidates")
+
+
+def check_byname(suite):
+    """rc062k. `kin resolve --theirs <name>` must accept the name `kin
+    conflicts` prints beside the identity."""
+    repo = suite.repo("byname", BODY_FILES)
+    suite.kin_run(["merge", "feature"], repo)
+    rc, out, err = suite.kin_run(["resolve", "--theirs", "summarize"], repo)
+    ambiguous = suite.repo("byname-ambiguous", AMBIG_FILES)
+    suite.kin_run(["merge", "feature"], ambiguous)
+    arc, aout, aerr = suite.kin_run(["resolve", "--theirs", "summarize"], ambiguous)
+    return _combine("byname", [
+        ("accepted", grade_name_selector(rc, out, err, "summarize")),
+        ("ambiguous", grade_ambiguous_name_refuses_with_candidates(arc, aout, aerr)),
+    ], ticket=WORKFLOW_TICKET)
+
+
+def check_bodies(suite):
+    """rc062j (1). A conflict's three sides, readable.
+
+    Measured before the change on the same shape: all three sides read as 32
+    bytes of digest, the JSON listing carried zero bytes of source, and
+    `kin conflicts` had no flag that would print one.
+    """
+    repo = suite.repo("bodies", BODY_FILES)
+    suite.kin_run(["merge", "feature"], repo)
+    show = suite.kin_run(["conflicts", "--show"], repo)[1]
+    plain = suite.kin_run(["conflicts", "--json"], repo)[1]
+    return _combine("bodies", [
+        ("render", grade_show_renders_both_sides(show)),
+        ("verified", grade_every_printed_side_was_verified(show)),
+        ("default", grade_default_listing_carries_no_bodies(plain)),
+    ], ticket=BODIES_TICKET)
+
+
 def _combine(ident, verdicts, ticket=None):
     """Report every arm, never the first bad one, because knowing which arm
     broke is the whole value of grading several claims in one check.
@@ -676,6 +857,9 @@ CHECKS = [
     ("uniform", check_uniform),
     ("removals", check_removals),
     ("genuine", check_genuine),
+    ("bodies", check_bodies),
+    ("exitcode", check_exitcode),
+    ("byname", check_byname),
 ]
 
 
@@ -894,6 +1078,72 @@ def self_test():
            grade_no_false_removals(plain_relation), PASS)
     expect("CONTROL kinds still names that same relation row",
            grade_conflict_kinds(plain_relation, "relation"), FAIL)
+
+    # rc062j (1). Each body grader gets a payload that must pass and one that
+    # must fail, so a grader that answers PASS over anything is caught here.
+    good_show = ("summarize in pkg/core.py (entity 1)\n"
+                 "  base -> ours:\n    -x\n    +OURSMARKER(rows)\n"
+                 "  base -> theirs:\n    -x\n    +THEIRSMARKER(rows)\n")
+    refused_show = good_show + "  ours: not shown, because the value re-read from the graph\n"
+    headers_only = ("summarize in pkg/core.py (entity 1)\n"
+                    "  base -> ours:\n    @@ -1,1 +1,1 @@\n"
+                    "  base -> theirs:\n    @@ -1,1 +1,1 @@\n")
+    expect("render passes a rendering carrying both sides' source",
+           grade_show_renders_both_sides(good_show), PASS)
+    expect("render fails a rendering of hunk headers over empty bodies",
+           grade_show_renders_both_sides(headers_only), FAIL)
+    expect("render cannot read empty output",
+           grade_show_renders_both_sides(""), UNREADABLE)
+    expect("verified passes a rendering with no refused side",
+           grade_every_printed_side_was_verified(good_show), PASS)
+    expect("verified fails a rendering that refused a side on a healthy merge",
+           grade_every_printed_side_was_verified(refused_show), FAIL)
+    # CONTROL: a run that rendered nothing must not read as verified. Without
+    # this, "no refusal line" would pass over silence.
+    expect("CONTROL verified cannot read a rendering that shows no source at all",
+           grade_every_printed_side_was_verified(headers_only), UNREADABLE)
+    expect("default passes a listing with no bodies",
+           grade_default_listing_carries_no_bodies('{"unresolved_count": 3}'), PASS)
+    expect("default fails a listing that carried bodies unasked",
+           grade_default_listing_carries_no_bodies('{"bodies": [{"subject": "entity 1"}]}'),
+           FAIL)
+    expect("default cannot read text that is not json",
+           grade_default_listing_carries_no_bodies("nope"), UNREADABLE)
+
+    expect("exit code passes the code the outcome calls for",
+           grade_exit_code(8, 8, "a parked merge"), PASS)
+    expect("exit code fails the zero that reported success on a parked merge",
+           grade_exit_code(0, 8, "a parked merge"), FAIL)
+    expect("exit code fails a published merge that reported failure",
+           grade_exit_code(8, 0, "a published merge"), FAIL)
+    expect("exit code cannot read a missing code",
+           grade_exit_code(None, 8, "a parked merge"), UNREADABLE)
+
+    ambiguous_good = ("summarize matches 2 recorded merge conflicts; name one exactly: "
+                      "entity summarize in pkg/one.py (a), entity summarize in pkg/two.py (b)")
+    expect("ambiguity passes a refusal naming both candidates",
+           grade_ambiguous_name_refuses_with_candidates(1, "", ambiguous_good), PASS)
+    expect("ambiguity fails a run that settled instead of refusing",
+           grade_ambiguous_name_refuses_with_candidates(0, "", ambiguous_good), FAIL)
+    expect("ambiguity fails a refusal that names neither candidate",
+           grade_ambiguous_name_refuses_with_candidates(1, "", "summarize matches 2 recorded "
+                                                              "merge conflicts; name one exactly"),
+           FAIL)
+    expect("selector fails a bare name that was refused",
+           grade_name_selector(1, "", "no recorded merge conflict matches summarize",
+                               "summarize"), FAIL)
+    expect("selector passes a bare name that settled",
+           grade_name_selector(0, "Settled 1 conflict(s)", "", "summarize"), PASS)
+
+    expect("named passes output carrying the exact sentence",
+           grade_parked_output_names_its_code(
+               "Exit 8: the merge is parked with conflicts; `kin conflicts` lists them",
+               "", 8), PASS)
+    expect("named fails output that carries the number but not the sentence",
+           grade_parked_output_names_its_code("merged 8 entities into refs/heads/main", "", 8),
+           FAIL)
+    expect("named cannot read empty output",
+           grade_parked_output_names_its_code("", "", 8), UNREADABLE)
 
     expect("a relative kin path is absolutized by this suite",
            (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)

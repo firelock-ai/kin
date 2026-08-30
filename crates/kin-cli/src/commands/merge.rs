@@ -116,7 +116,21 @@ pub struct MergeResponse {
     pub idempotent: bool,
 }
 
-pub async fn run(source: String, json: bool) -> Result<()> {
+/// A merge that parked conflicts instead of publishing.
+///
+/// Nonzero because `kin merge` reported success on an unresolved merge: the
+/// rc062k run took 27 conflicts and exit 0, so a script reading `$?` believed
+/// the merge landed. Git answers 1 there, and matching it would be the
+/// compatible choice, except that 1 is also what a failed command returns, so a
+/// caller could not tell a parked merge from a broken one. A distinct code is
+/// nonzero for every `if ! kin merge`, and readable for a caller that looks.
+pub const EXIT_MERGE_CONFLICTED: i32 = 8;
+
+/// Run the merge, returning the process exit code.
+///
+/// The report is printed either way, in both output modes. The exit code
+/// reports the outcome; it does not replace saying what happened.
+pub async fn run(source: String, json: bool) -> Result<i32> {
     let source = parse_ref_name(&source)?;
     if !source.is_branch() {
         anyhow::bail!("merge requires a source ref below refs/heads/, found {source}");
@@ -127,6 +141,13 @@ pub async fn run(source: String, json: bool) -> Result<()> {
         actor: crate::commands::require_commit_author()?,
     })
     .await?;
+    // Read before printing, and from the report rather than by matching the
+    // rendered lines, because a phrase in a line is a proxy for the outcome and
+    // the outcome is a field.
+    let conflicted = response
+        .report
+        .as_ref()
+        .is_some_and(|report| matches!(report.outcome, MergeOutcome::Conflicted));
     if json {
         let report = response
             .report
@@ -136,8 +157,18 @@ pub async fn run(source: String, json: bool) -> Result<()> {
         for line in response.lines {
             println!("{line}");
         }
+        if conflicted {
+            // Printed by the CLI rather than composed into the daemon's lines,
+            // because the exit code is the CLI's to name and the daemon has no
+            // business knowing it. A reader meets the number where it fires,
+            // which is the only place they can act on it.
+            println!(
+                "Exit {EXIT_MERGE_CONFLICTED}: the merge is parked with conflicts; \
+                 `kin conflicts` lists them"
+            );
+        }
     }
-    Ok(())
+    Ok(if conflicted { EXIT_MERGE_CONFLICTED } else { 0 })
 }
 
 /// Discover the repository every merge-transaction command is bound to.

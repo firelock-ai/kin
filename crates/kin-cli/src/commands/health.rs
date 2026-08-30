@@ -3143,8 +3143,8 @@ pub fn background_work_health_from_state(
         format!("{cpu}; {}{notice_detail}", reasons.join("; ")),
     )
     .with_manual_fix(
-        "restart the daemon (`kin daemon restart`) to retry the stopped pass, and report the \
-         reason above if it stops again",
+        "stop the daemon (`kin daemon stop`) so the next kin command starts one that retries \
+         the stopped pass, and report the reason above if it stops again",
     )
 }
 
@@ -3233,7 +3233,7 @@ async fn check_reference_edge_coverage(graph_status: &RunGraphStatus) -> HealthC
             HealthStatus::Stale,
             "the daemon serving this repository does not report relation-graph completeness; it \
              predates the measurement",
-            "restart the daemon with `kin daemon restart` to pick up this build",
+            "stop the daemon (`kin daemon stop`) so the next kin command starts one on this build",
             &missing_servers,
         );
     };
@@ -3412,7 +3412,9 @@ async fn check_relation_census(graph_status: &RunGraphStatus) -> HealthCheck {
             "the daemon serving this repository does not report a relation census; it predates \
              the measurement",
         )
-        .with_manual_fix("restart the daemon with `kin daemon restart` to pick up this build");
+        .with_manual_fix(
+            "stop the daemon (`kin daemon stop`) so the next kin command starts one on this build",
+        );
     };
     relation_census_health(comparison)
 }
@@ -3614,8 +3616,10 @@ pub(crate) fn reference_edge_coverage_health(
         ))
     }
     .with_manual_fix(
-        "re-admit the repository so relation extraction runs again (`kin reconcile --admit`), and \
-         treat any \"unused\" answer as unverified until cross-file edges resolve",
+        "install the servers, then stop this daemon (`kin daemon stop`) because a daemon \
+         discovers language servers once at startup and the next command starts one that finds \
+         them, then ask it to enrich (`kin daemon sweep`), and treat any \"unused\" answer as \
+         unverified until cross-file edges resolve",
     )
 }
 
@@ -4753,7 +4757,9 @@ async fn check_parse_coverage(graph_status: &RunGraphStatus) -> HealthCheck {
             "the daemon serving this repository does not report parse coverage; it predates the \
              measurement",
         )
-        .with_manual_fix("restart the daemon with `kin daemon restart` to pick up this build");
+        .with_manual_fix(
+            "stop the daemon (`kin daemon stop`) so the next kin command starts one on this build",
+        );
     };
     parse_coverage_health(census)
 }

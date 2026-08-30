@@ -34711,6 +34711,45 @@ mod tests {
         assert_eq!(carried[0].content_hash, approved_digest);
     }
 
+    /// The daemon's generation counter and the authority's, read together with
+    /// a control proving the read itself does not move the counter.
+    ///
+    /// Reading `roots().generation` requires opening authority, and that open
+    /// could advance the counter and manufacture the equality a caller is
+    /// testing for. So the counter is read bare, then through the open, then
+    /// bare again, and the three must agree. Lane vcsreads added this control to
+    /// the probe that produced these assertions, and without it the pair is
+    /// unfalsifiable in the same way an unmeasured fixture is.
+    ///
+    /// Deliberately NOT `#[cfg(unix)]`. Two of its three callers are, because
+    /// they build fixtures through `universal_branch_test_state`, which is;
+    /// the rollback arm builds its own and has compiled on Windows since it
+    /// was written. Gating this helper alongside the two made the third arm
+    /// call a function that is absent on Windows, which is a compile error
+    /// rather than a test failure, so the whole leg graded nothing. Both
+    /// symbols it touches are ungated: `DaemonState::snapshot_generation`
+    /// and `ActiveApiRepositoryAuthority::open`.
+    fn generation_pair(state: &Arc<DaemonState>) -> (u64, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bare = state.snapshot_generation.load(SeqCst);
+        let authority = ActiveApiRepositoryAuthority::open(state).unwrap();
+        let through_open = state.snapshot_generation.load(SeqCst);
+        let roots = authority.manager.read_authority().roots().generation;
+        drop(authority);
+        let bare_after = state.snapshot_generation.load(SeqCst);
+        assert_eq!(
+            bare, through_open,
+            "opening authority moved the daemon generation counter, so this read cannot be \
+             evidence about what a publication did to it"
+        );
+        assert_eq!(
+            through_open, bare_after,
+            "the daemon generation counter moved while authority was held open, so this read \
+             cannot be evidence about what a publication did to it"
+        );
+        (bare, roots)
+    }
+
     /// A merge published through `resolve --continue` must reach the live graph
     /// too, and this is the arm the plain-merge one below cannot cover.
     ///
@@ -34726,6 +34765,7 @@ mod tests {
     /// path the other arm already covers. `selected/compose.yaml` is written by
     /// the fixture on main and rewritten on feature, so editing it again on the
     /// active branch after the split is what makes the conflict real.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(repository_commit)]
     async fn a_merge_published_through_resolve_reaches_the_live_graph_without_a_restart() {
@@ -34764,6 +34804,7 @@ mod tests {
             .repository_id()
             .clone();
         let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_before, roots_before) = generation_pair(&state);
 
         let post = |path: &'static str, body: Vec<u8>| {
             let app = router(Arc::clone(&state));
@@ -34884,6 +34925,36 @@ mod tests {
         );
 
         let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_after, roots_after) = generation_pair(&state);
+        // The daemon's counter moves by exactly what the authority's generation
+        // moves across a publication. Both are asserted rather than only their
+        // equality afterwards, because equal-after is consistent with two very
+        // different worlds: something advances the counter on a publish, or the
+        // counter and the roots both sat still. Only the DELTA separates them,
+        // which is the same reason a cgroup's oom_kill cannot separate a cap
+        // kill from an outside one while max and oom can.
+        //
+        // Measured by lane vcsreads before this became an assertion: counter 2
+        // to 3 and roots 2 to 3 across a merge publish. The advancing site is
+        // `finalize_local_repository_commit` calling
+        // `record_repository_authority_commit` at `state.rs:9062` under its CAS
+        // condition, reached from `repository_merge.rs:121` and
+        // `repository_rollback.rs:91`, which is one level above where a
+        // call-site count looks.
+        assert!(
+            roots_after > roots_before,
+            "the authority generation did not move across this publication, so the counter \
+             assertion below would grade a publication that did not happen"
+        );
+        assert_eq!(
+            counter_after - counter_before,
+            roots_after - roots_before,
+            "the daemon generation counter moved by {} while the authority generation moved by \
+             {}; they must move together, and a counter left behind is what makes every \
+             freshness guard reading it refuse or pass wrongly",
+            counter_after - counter_before,
+            roots_after - roots_before
+        );
         assert!(
             identity_before != identity_after,
             "the publication identity did not move across a resolved-merge publication"
@@ -34903,6 +34974,7 @@ mod tests {
     /// rollback arm states: a daemon whose projection was never populated holds
     /// the change either way, so a check that publishes into an empty
     /// projection passes on the unpatched binary.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(repository_commit)]
     async fn a_published_merge_reaches_the_live_graph_without_a_restart() {
@@ -34948,6 +35020,7 @@ mod tests {
             .repository_id()
             .clone();
         let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_before, roots_before) = generation_pair(&state);
         // CONTROL: two reads with no publication between must be the SAME, or
         // the comparison below cannot be evidence that a publication moved it.
         let identity_again = read_local_publication_identity(&backend, &repository_id).unwrap();
@@ -35043,6 +35116,36 @@ mod tests {
         );
 
         let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_after, roots_after) = generation_pair(&state);
+        // The daemon's counter moves by exactly what the authority's generation
+        // moves across a publication. Both are asserted rather than only their
+        // equality afterwards, because equal-after is consistent with two very
+        // different worlds: something advances the counter on a publish, or the
+        // counter and the roots both sat still. Only the DELTA separates them,
+        // which is the same reason a cgroup's oom_kill cannot separate a cap
+        // kill from an outside one while max and oom can.
+        //
+        // Measured by lane vcsreads before this became an assertion: counter 2
+        // to 3 and roots 2 to 3 across a merge publish. The advancing site is
+        // `finalize_local_repository_commit` calling
+        // `record_repository_authority_commit` at `state.rs:9062` under its CAS
+        // condition, reached from `repository_merge.rs:121` and
+        // `repository_rollback.rs:91`, which is one level above where a
+        // call-site count looks.
+        assert!(
+            roots_after > roots_before,
+            "the authority generation did not move across this publication, so the counter \
+             assertion below would grade a publication that did not happen"
+        );
+        assert_eq!(
+            counter_after - counter_before,
+            roots_after - roots_before,
+            "the daemon generation counter moved by {} while the authority generation moved by \
+             {}; they must move together, and a counter left behind is what makes every \
+             freshness guard reading it refuse or pass wrongly",
+            counter_after - counter_before,
+            roots_after - roots_before
+        );
         assert!(
             identity_before != identity_after,
             "the publication identity did not move across a merge publication, so every authority \
@@ -35126,6 +35229,7 @@ mod tests {
             .repository_id()
             .clone();
         let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_before, roots_before) = generation_pair(&state);
         // CONTROL for the comparison below: read the identity twice with no
         // publication between and require it to be the SAME. Without this, an
         // identity that differed on every read would make the across-publication
@@ -35143,6 +35247,36 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
 
         let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_after, roots_after) = generation_pair(&state);
+        // The daemon's counter moves by exactly what the authority's generation
+        // moves across a publication. Both are asserted rather than only their
+        // equality afterwards, because equal-after is consistent with two very
+        // different worlds: something advances the counter on a publish, or the
+        // counter and the roots both sat still. Only the DELTA separates them,
+        // which is the same reason a cgroup's oom_kill cannot separate a cap
+        // kill from an outside one while max and oom can.
+        //
+        // Measured by lane vcsreads before this became an assertion: counter 2
+        // to 3 and roots 2 to 3 across a merge publish. The advancing site is
+        // `finalize_local_repository_commit` calling
+        // `record_repository_authority_commit` at `state.rs:9062` under its CAS
+        // condition, reached from `repository_merge.rs:121` and
+        // `repository_rollback.rs:91`, which is one level above where a
+        // call-site count looks.
+        assert!(
+            roots_after > roots_before,
+            "the authority generation did not move across this publication, so the counter \
+             assertion below would grade a publication that did not happen"
+        );
+        assert_eq!(
+            counter_after - counter_before,
+            roots_after - roots_before,
+            "the daemon generation counter moved by {} while the authority generation moved by \
+             {}; they must move together, and a counter left behind is what makes every \
+             freshness guard reading it refuse or pass wrongly",
+            counter_after - counter_before,
+            roots_after - roots_before
+        );
         let _ = loads_before;
 
         let published = branch_change(&state);
@@ -35156,13 +35290,24 @@ mod tests {
         // MOVE across a publication that never calls
         // `record_repository_authority_commit`?
         //
-        // Neither this path nor the merge paths call it, so `snapshot_generation`
-        // does not advance across either. The cache does not key on that
-        // counter: `LocalPublicationIdentity::Published` is the SHA-256 of the
-        // durable publication record's bytes, so it moves whenever the record
-        // is rewritten, whatever the in-memory counter did. If it did NOT move,
-        // an admission pair cached before this publication would stay valid
-        // after it and every concurrent task would admit against pre-publication
+        // CORRECTED. This comment previously read "neither this path nor the
+        // merge paths call it, so `snapshot_generation` does not advance across
+        // either". The first clause is true of DIRECT calls and the conclusion
+        // does not follow: both paths call `finalize_local_repository_commit`,
+        // which calls it at `state.rs:9062` behind a `generation_advanced`
+        // guard, so the counter DOES advance. A call-site count is not a call
+        // graph, and four separate readings were built on top of that zero
+        // before an in-process probe measured `counter=2 roots=2` before a
+        // merge and `counter=3 roots=3` after, with a control proving the
+        // probe's own authority open did not advance it.
+        //
+        // What stands, and it is the reason this block is here: the cache does
+        // not key on that counter either way.
+        // `LocalPublicationIdentity::Published` is the SHA-256 of the durable
+        // publication record's bytes, so it moves whenever the record is
+        // rewritten, whatever the in-memory counter did. If it did NOT move, an
+        // admission pair cached before this publication would stay valid after
+        // it and every concurrent task would admit against pre-publication
         // roots, which is a defect in the cache rather than in this path.
         // `assert!` rather than `assert_ne!`: the identity is deliberately not
         // `Debug`, since printing a publication digest into a panic is not
@@ -49082,6 +49227,211 @@ mod tests {
             &kin_mcp::budget::ResponseBudget::default(),
         );
         assert_eq!(mcp_result_text(&after), text);
+    }
+
+    /// The digest re-check must be able to FAIL, or it is a check nothing grades.
+    ///
+    /// On a healthy merge every side hashes back to its recorded digest, so
+    /// deleting the verification entirely changes nothing a fixture built
+    /// through the product can observe. That is a green arm proving nothing.
+    /// Here the record is handed a digest that disagrees with the graph, which
+    /// is the state the check exists for, and the assertions separate the three
+    /// outcomes that matter: the bad side is NAMED, the bad side is NOT PRINTED,
+    /// and the good sides are UNAFFECTED, so a blanket refusal cannot pass.
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_side_that_does_not_hash_back_to_the_record_is_named_and_not_printed() {
+        let (state, _layout, _repository, main_change, feature_change) =
+            universal_branch_test_state("bodies-artifact-digest");
+        let at_main = state.graph.resolve_graph_at(&main_change).unwrap();
+        let at_feature = state.graph.resolve_graph_at(&feature_change).unwrap();
+
+        let path = kin_model::RepoPath::from_utf8("selected/compose.yaml".to_string()).unwrap();
+        let on_main = at_main
+            .tree
+            .artifact_at_path(&path)
+            .expect("the fixture tracks selected/compose.yaml on main");
+        let on_feature = at_feature
+            .tree
+            .artifact_at_path(&path)
+            .expect("the fixture tracks selected/compose.yaml on feature");
+        let main_side = kin_model::MergeSideValue::artifact(Some(on_main)).unwrap();
+        let feature_side = kin_model::MergeSideValue::artifact(Some(on_feature)).unwrap();
+        // The precondition, asserted rather than assumed: if the two sides
+        // hashed the same, swapping one for the other below would be no
+        // tampering at all and the arm would pass while grading nothing.
+        assert_ne!(
+            main_side, feature_side,
+            "the fixture must hold this artifact differently on the two branches"
+        );
+
+        let entry = |ours: kin_model::MergeSideValue| kin_model::MergeConflictEntry {
+            subject: kin_model::MergeConflictSubject::Artifact {
+                artifact: on_main.artifact_id,
+            },
+            divergence: kin_model::MergeDivergence::ChangedBothSides,
+            base: main_side.clone(),
+            ours,
+            theirs: feature_side.clone(),
+            label: Some("selected/compose.yaml".to_string()),
+            resolution: kin_model::MergeEntryResolution::Unresolved,
+        };
+
+        let intact = crate::repository_merge_state::materialize_bodies_at(
+            &state,
+            &main_change,
+            &main_change,
+            &feature_change,
+            &[entry(main_side.clone())],
+        );
+        assert_eq!(intact.len(), 1);
+        assert!(
+            intact[0].unverified.is_empty(),
+            "a record that agrees with the graph refuses nothing: {:?}",
+            intact[0].unverified
+        );
+        assert!(
+            intact[0].ours.is_some(),
+            "the control arm must render, or the tampered arm's silence means nothing"
+        );
+
+        // The tampering: the record claims `ours` holds what THEIRS holds, so
+        // the value re-read at the ours change cannot hash back to it. A real
+        // digest from the same repository rather than a fabricated one, so the
+        // arm cannot pass because the value was merely unparseable.
+        let tampered = crate::repository_merge_state::materialize_bodies_at(
+            &state,
+            &main_change,
+            &main_change,
+            &feature_change,
+            &[entry(feature_side.clone())],
+        );
+        assert_eq!(tampered.len(), 1);
+        assert_eq!(
+            tampered[0].unverified,
+            vec!["ours".to_string()],
+            "the side whose digest disagrees must be named"
+        );
+        assert!(
+            tampered[0].ours.is_none(),
+            "and it must not be printed: {:?}",
+            tampered[0].ours
+        );
+        assert!(
+            tampered[0].base.is_some() && tampered[0].theirs.is_some(),
+            "while the sides that still agree are unaffected, so the refusal is \
+             scoped to the side that failed rather than to the whole subject"
+        );
+    }
+
+    /// A side whose stored bytes are GONE is named too, not quietly omitted.
+    ///
+    /// This grades the other refusal in the same materializer, and it can only
+    /// be graded here. Removing a source blob and going back through the CLI
+    /// does not reach the rendering at all: the daemon refuses to start, with
+    /// "Git external authority body validation failed", so the store's own
+    /// startup validation makes the CLI route unreachable and this path is
+    /// defensive code that only an already-open state can exercise.
+    ///
+    /// It matters because a body quietly missing reads exactly like an identity
+    /// that is absent on that side, and those are opposite facts.
+    #[cfg(unix)]
+    #[test]
+    fn a_side_whose_stored_bytes_are_gone_is_named_and_not_printed() {
+        let (state, _layout, _repository, main_change, feature_change) =
+            universal_branch_test_state("bodies-missing-blob");
+        let at_main = state.graph.resolve_graph_at(&main_change).unwrap();
+        let at_feature = state.graph.resolve_graph_at(&feature_change).unwrap();
+        let path = kin_model::RepoPath::from_utf8("selected/compose.yaml".to_string()).unwrap();
+        let on_main = at_main.tree.artifact_at_path(&path).unwrap();
+        let on_feature = at_feature.tree.artifact_at_path(&path).unwrap();
+        let kin_model::TreeEntry::Blob { hash, .. } = &on_main.entry else {
+            panic!("the fixture tracks this path as a blob");
+        };
+        let digest = hash.to_string();
+
+        let entry = kin_model::MergeConflictEntry {
+            subject: kin_model::MergeConflictSubject::Artifact {
+                artifact: on_main.artifact_id,
+            },
+            divergence: kin_model::MergeDivergence::ChangedBothSides,
+            base: kin_model::MergeSideValue::artifact(Some(on_main)).unwrap(),
+            ours: kin_model::MergeSideValue::artifact(Some(on_main)).unwrap(),
+            theirs: kin_model::MergeSideValue::artifact(Some(on_feature)).unwrap(),
+            label: Some("selected/compose.yaml".to_string()),
+            resolution: kin_model::MergeEntryResolution::Unresolved,
+        };
+
+        let intact = crate::repository_merge_state::materialize_bodies_at(
+            &state,
+            &main_change,
+            &main_change,
+            &feature_change,
+            std::slice::from_ref(&entry),
+        );
+        assert!(
+            intact[0].ours.is_some() && intact[0].unverified.is_empty(),
+            "the control arm must render before the bytes are removed: {:?}",
+            intact[0]
+        );
+
+        // Remove the blob this side's bytes live in. Named by its own digest,
+        // found by walking rather than by composing a path, because the store's
+        // layout is not this test's to encode.
+        let mut removed = 0_usize;
+        let mut stack = vec![state.layout.kindb_dir()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for item in read.flatten() {
+                let item_path = item.path();
+                if item_path.is_dir() {
+                    stack.push(item_path);
+                } else if item_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == digest)
+                {
+                    std::fs::remove_file(&item_path).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        // The precondition, asserted: with nothing removed the arm below would
+        // pass for the wrong reason, since both sides would still render.
+        assert_eq!(
+            removed, 1,
+            "exactly one stored body named {digest} should have been removed"
+        );
+
+        let after = crate::repository_merge_state::materialize_bodies_at(
+            &state,
+            &main_change,
+            &main_change,
+            &feature_change,
+            std::slice::from_ref(&entry),
+        );
+        // Every side is named, including the one whose own bytes are intact.
+        // That is not sloppiness in the materializer: the store validates its
+        // bodies when it is opened, so one missing body refuses every read
+        // against that store. Measured here rather than assumed, and it is the
+        // same validation that stops the daemon starting at all, which is why
+        // the CLI cannot reach this path.
+        //
+        // Scoping is graded by the digest test above, where the refusal really
+        // is per side and `base` and `theirs` keep rendering. Asserting scoping
+        // here as well would assert a property this input does not have.
+        assert_eq!(
+            after[0].unverified,
+            vec!["base".to_string(), "ours".to_string(), "theirs".to_string()],
+            "a store that cannot open names every side rather than omitting any"
+        );
+        assert!(
+            after[0].base.is_none() && after[0].ours.is_none() && after[0].theirs.is_none(),
+            "and prints none of them, because a body quietly missing reads exactly \
+             like an identity that is absent on that side"
+        );
     }
 }
 

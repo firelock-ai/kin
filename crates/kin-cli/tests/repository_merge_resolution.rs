@@ -83,6 +83,23 @@ fn run_kin_without_enrichment(
         .expect("run kin")
 }
 
+/// A merge that parked its conflicts rather than publishing.
+///
+/// Stronger than the `status.success()` this replaced, which could not tell a
+/// parked merge from a published one: that is the defect the exit code fixes,
+/// and asserting the code here is what keeps these tests able to see it.
+fn parked_merge(output: &std::process::Output, what: &str) -> String {
+    assert_eq!(
+        output.status.code(),
+        Some(kin_cli::commands::merge::EXIT_MERGE_CONFLICTED),
+        "{what} did not park: status={:?} stdout={} stderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 fn ok(output: &std::process::Output, what: &str) -> String {
     assert!(
         output.status.success(),
@@ -290,7 +307,7 @@ fn a_parked_merge_survives_a_daemon_restart() {
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
 
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -327,7 +344,7 @@ fn resolving_against_a_stale_record_identity_is_refused() {
     let repo = conflicting_repository(root.path());
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -374,7 +391,7 @@ fn concurrent_resolutions_from_one_view_leave_one_winner() {
     let repo = conflicting_repository(root.path());
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -458,7 +475,7 @@ fn a_resolved_merge_publishes_ordered_parents_and_advances_only_the_target_ref()
 
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -523,7 +540,7 @@ fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {
 
     let main_before = branch_change(&layout, "main");
     let feature_before = branch_change(&layout, "feature");
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -559,7 +576,7 @@ fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {
 
     // The workspace is free, so the same merge opens again over the terminated
     // record rather than being refused as in progress.
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "merge again after aborting",
     );
@@ -581,7 +598,7 @@ fn a_second_merge_while_one_is_in_progress_is_refused() {
     let repo = conflicting_repository(root.path());
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -616,7 +633,7 @@ fn settling_one_named_conflict_leaves_the_others_outstanding() {
     let repo = conflicting_repository(root.path());
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -676,7 +693,7 @@ fn settling_and_publishing_cannot_be_one_request() {
     let repo = conflicting_repository(root.path());
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     initialize_kin_repo(&runtime, &repo);
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -705,7 +722,7 @@ fn a_contested_path_settles_from_the_identity_the_record_reports() {
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
 
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -778,7 +795,7 @@ fn a_contested_path_listing_names_its_claimants() {
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
 
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -977,7 +994,7 @@ fn a_bulk_artifact_settle_does_not_override_a_named_entity_settle() {
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
     let layout = initialize_kin_repo(&runtime, &repo);
 
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -1102,7 +1119,7 @@ fn a_container_settle_does_not_override_a_settle_inside_it() {
     ok(&init, "kin init");
     let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
 
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
@@ -1158,7 +1175,7 @@ fn contradictory_settlements_inside_one_artifact_refuse_and_name_both() {
     let layout = initialize_kin_repo(&runtime, &repo);
 
     let main_before = branch_change(&layout, "main");
-    ok(
+    parked_merge(
         &run_kin(&runtime, &repo, &["merge", "feature"]),
         "kin merge",
     );
