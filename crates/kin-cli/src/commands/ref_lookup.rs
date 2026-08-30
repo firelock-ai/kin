@@ -193,9 +193,8 @@ where
         )
     })?;
     let lease = authority.manager().read_authority();
-    let resolved =
-        super::ref_grammar::resolve(&lease, graph, &authority.workspace_id, reference)
-            .map_err(|error| ref_error(reference, format!("{error:#}")))?;
+    let resolved = super::ref_grammar::resolve(&lease, graph, &authority.workspace_id, reference)
+        .map_err(|error| ref_error(reference, format!("{error:#}")))?;
 
     if graph
         .get_change(&resolved.change_id)

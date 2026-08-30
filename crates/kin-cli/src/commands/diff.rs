@@ -12,9 +12,9 @@ use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{
-    compute_resolved_tree_hash, ChangeStore, Entity, EntityDelta, EntityId, Hash256,
-    RefName, RefTarget, Relation, RelationDelta, RelationId, RepositoryId, ResolvedTree,
-    RootBundle, SemanticChangeId, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId,
+    compute_resolved_tree_hash, ChangeStore, Entity, EntityDelta, EntityId, Hash256, RefName,
+    RefTarget, Relation, RelationDelta, RelationId, RepositoryId, ResolvedTree, RootBundle,
+    SemanticChangeId, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 

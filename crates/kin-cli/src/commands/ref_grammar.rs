@@ -34,8 +34,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{
-    GitObjectId, GraphStore, Hash256, RefName, RefTarget, SemanticChangeId,
-    WorkspaceId,
+    GitObjectId, GraphStore, Hash256, RefName, RefTarget, SemanticChangeId, WorkspaceId,
 };
 
 use super::repository_authority::{parse_git_object_id, parse_ref_name};
@@ -440,8 +439,8 @@ where
             bail!("ref-hex selector must use non-empty canonical lowercase hexadecimal bytes");
         }
         let bytes = hex::decode(hex_name).context("decode ref-hex selector")?;
-        let name =
-            RefName::from_bytes(bytes).map_err(|error| anyhow!("invalid ref-hex selector: {error}"))?;
+        let name = RefName::from_bytes(bytes)
+            .map_err(|error| anyhow!("invalid ref-hex selector: {error}"))?;
         return resolve_named(lease, original, name);
     }
 
@@ -518,12 +517,14 @@ mod tests {
 
     /// The two files that must not grow a parser of their own again.
     ///
-    /// Resolved from `CARGO_MANIFEST_DIR`, so the test grades the tree it was
-    /// compiled from rather than whichever checkout the runner happens to be
-    /// standing in.
-    const DIFF_SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands/diff.rs");
-    const REF_LOOKUP_SOURCE: &str =
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands/ref_lookup.rs");
+    /// Embedded at compile time rather than read at run time, so the test grades
+    /// the exact bytes that were compiled. A path read would grade whichever
+    /// checkout the runner happened to be standing in, which is the same class
+    /// of mistake as the drift this module exists to end.
+    const SURFACES: &[(&str, &str)] = &[
+        ("diff.rs", include_str!("diff.rs")),
+        ("ref_lookup.rs", include_str!("ref_lookup.rs")),
+    ];
 
     /// Tagged forms this module owns. A surface that recognised any of these on
     /// its own would be a second grammar, which is the defect FIR-3015 fixed.
@@ -566,14 +567,26 @@ mod tests {
     #[test]
     fn a_change_prefix_is_lowercase_hex_of_a_workable_width() {
         assert!(is_change_prefix("dead"), "four characters is the floor");
-        assert!(is_change_prefix("1971f659d7aa"), "the width kin history prints");
-        assert!(is_change_prefix(&"a".repeat(CHANGE_ID_HEX)), "a full id is its own prefix");
-        assert!(!is_change_prefix("dea"), "three characters is below the floor");
+        assert!(
+            is_change_prefix("1971f659d7aa"),
+            "the width kin history prints"
+        );
+        assert!(
+            is_change_prefix(&"a".repeat(CHANGE_ID_HEX)),
+            "a full id is its own prefix"
+        );
+        assert!(
+            !is_change_prefix("dea"),
+            "three characters is below the floor"
+        );
         assert!(
             !is_change_prefix(&"a".repeat(CHANGE_ID_HEX + 1)),
             "longer than an id is not a prefix of one"
         );
-        assert!(!is_change_prefix("DEADBEEF"), "kin never prints uppercase ids");
+        assert!(
+            !is_change_prefix("DEADBEEF"),
+            "kin never prints uppercase ids"
+        );
         assert!(!is_change_prefix("deadbeeg"), "g is not hexadecimal");
         assert!(!is_change_prefix("main"), "a branch name is not a prefix");
     }
@@ -602,9 +615,7 @@ mod tests {
             );
         }
 
-        for path in [DIFF_SOURCE, REF_LOOKUP_SOURCE] {
-            let source = std::fs::read_to_string(path)
-                .unwrap_or_else(|error| panic!("read {path}: {error}"));
+        for (path, source) in SURFACES {
             assert_eq!(
                 source.matches("ref_grammar::resolve(").count(),
                 1,
