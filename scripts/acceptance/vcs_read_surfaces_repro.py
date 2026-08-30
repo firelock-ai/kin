@@ -144,6 +144,21 @@ def total_by(entries, key):
 '''
 
 
+# A THIRD body, for `check_content` alone. Same declarations, same count, body
+# only, like MODULE_AFTER; distinct from it so an edit reaches `kin admit` that no
+# earlier status read has already taken.
+MODULE_FOR_ADMIT = '''"""Roll ledger entries up into totals."""
+
+
+def total_by(entries, key):
+    """Sum amounts under one key, rounded to whole units."""
+    buckets = {}
+    for entry in entries:
+        buckets[entry[key]] = round(buckets.get(entry[key], 0) + entry["amount"])
+    return buckets
+'''
+
+
 def run(cmd, cwd=None, env=None, timeout=600):
     process = subprocess.Popen(
         cmd, cwd=cwd, env=env,
@@ -493,6 +508,20 @@ def check_diff_scope(suite):
 
 
 def check_content(suite):
+    """`kin admit` over a content-only edit must not report a no-op.
+
+    Makes its OWN edit, and that is the whole correction. Since kin#1258
+    `kin status` admits before it reads, so `check_saw_the_edit` above does not
+    merely observe the edit, it TAKES it: the tree hash moving is exactly how that
+    check passes. By the time this one ran, there was nothing left to admit and
+    `kin admit` correctly said so, which failed this check on every main
+    Acceptance run after kin#1258 landed.
+
+    The check that proves read-after-admit works was consuming the state the next
+    check grades. A read that mutates has to be treated as a mutation when
+    ordering an experiment around it.
+    """
+    suite.write_tracked_module(MODULE_FOR_ADMIT)
     rc, out, err = suite.kin_run(["admit"])
     if rc != 0:
         return Result("content", UNREADABLE,
@@ -510,10 +539,15 @@ def check_settled(suite):
     return Result("settled", status, "%s %s" % (TICKET, detail))
 
 
-# Order is load-bearing and the experiment is destructive. `saw_the_edit` makes
-# the edit the next two are about, `content` admits it, `settled` re-admits a
-# settled tree, `diff_scope` reads a workspace diff over it, and `unadmitted`
-# stops the daemon, which nothing after it could survive.
+# Order is load-bearing and the experiment is destructive, and since kin#1258
+# every `kin status` in it is a MUTATION: status admits before it reads. So each
+# check that grades an unadmitted state has to create that state itself, after
+# the last status call, rather than inherit one from the check above.
+# `basis` and `saw_the_edit` both read status and therefore both admit;
+# `saw_the_edit` takes the edit it makes, which is exactly how it passes.
+# `content` writes its own edit for that reason, `settled` re-admits the settled
+# tree `content` left, `diff_scope` reads a workspace diff over it, and
+# `unadmitted` stops the daemon, which nothing after it could survive.
 CHECKS = (
     ("basis", check_basis),
     ("saw_the_edit", check_saw_the_edit),
