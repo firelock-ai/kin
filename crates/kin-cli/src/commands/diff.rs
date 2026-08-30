@@ -109,6 +109,46 @@ pub struct DiffReport {
     /// daemon wire and an older peer sends none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_basis: Option<WorkspaceSemanticBasis>,
+    /// What actually changed inside each artifact, read from graph-owned CAS.
+    ///
+    /// A PARALLEL array keyed by `artifact_id` rather than a field on
+    /// `TreeDelta`, because `TreeDelta` is a kin-model type carrying
+    /// `deny_unknown_fields` and kin consumes it from the registry. Nesting the
+    /// content would be a cross-repo change; joining on the id is not, and the
+    /// content is at the artifact level either way, which is the property that
+    /// matters: a changed file with no entities still carries its content.
+    ///
+    /// `#[serde(default)]` because this crosses the daemon wire and an older
+    /// peer sends none, the same reason `semantic_basis` above carries it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifact_content: Vec<ArtifactContent>,
+}
+
+/// The content transition for one artifact, rendered from two CAS bodies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ArtifactContent {
+    pub artifact_id: kin_model::ArtifactId,
+    pub path: String,
+    /// Blob identity on each side. Absent on an add or a delete respectively,
+    /// and both are already carried by the artifact delta this joins to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_hash: Option<Hash256>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_hash: Option<Hash256>,
+    /// Unified hunks, from the same renderer the text surface uses, so the two
+    /// surfaces cannot disagree about what changed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<String>,
+    /// Full bodies, only under `--full-bodies`. Off by default so a large tree
+    /// does not double its payload to say what a hunk already said.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_text: Option<String>,
+    /// Why content is absent, when it is. Named rather than empty, because a
+    /// missing hunk list and a refused one read identically otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted: Option<String>,
 }
 
 struct EndpointState {
@@ -276,6 +316,7 @@ pub fn inspect_with_endpoint_entities(
     let summary = summarize(&artifact_deltas, &entity_deltas, &relation_deltas);
 
     let report = DiffReport {
+        artifact_content: Vec::new(),
         schema: DIFF_SCHEMA.to_string(),
         authority: "repository-v6".to_string(),
         repository_id: authority.repository_id.clone(),
@@ -787,7 +828,12 @@ fn summarize(
     summary
 }
 
-pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()> {
+pub async fn run(
+    base: Option<String>,
+    head: Option<String>,
+    json: bool,
+    full_bodies: bool,
+) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let workspace_endpoint =
         endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref());
@@ -825,6 +871,17 @@ pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Resu
                 println!("{line}");
             }
             if let Some(report) = response.report.as_ref() {
+                // Content on the daemon route too, and by the SAME renderer.
+                //
+                // The daemon renders its own header lines and this appends after
+                // them, so its output stays byte-identical and the wire payload
+                // is unchanged. The report it already returns carries both blob
+                // hashes, so the CLI opens its own binding and reads CAS here.
+                // Two renderings of a content diff would drift, and the one
+                // nobody runs would be the one that drifts.
+                for line in content_lines_for(&layout, report, full_bodies) {
+                    println!("{line}");
+                }
                 if let Some(line) = semantic_scope_line(report.semantic_basis.as_ref()) {
                     println!("{line}");
                 }
@@ -844,12 +901,23 @@ pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Resu
     // derives nothing and the basis says so by name, which is the zero
     // file-search rule applied to a read: when the graph cannot answer, report
     // the gap rather than a zero that reads like an answer.
-    let report = inspect(&binding, base.as_deref(), head.as_deref(), None)?;
+    let mut report = inspect(&binding, base.as_deref(), head.as_deref(), None)?;
+    if let Ok(authority) =
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)
+    {
+        report.artifact_content =
+            collect_artifact_content(&authority, &report.artifact_deltas, full_bodies);
+    }
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for line in render_lines(&report) {
             println!("{line}");
+        }
+        for row in &report.artifact_content {
+            for line in render_content_lines(row) {
+                println!("{line}");
+            }
         }
         if let Some(line) = semantic_scope_line(report.semantic_basis.as_ref()) {
             println!("{line}");
@@ -860,6 +928,30 @@ pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Resu
         println!("{}", admitted_scope_line(&layout));
     }
     Ok(())
+}
+
+/// Content lines for a report the daemon rendered, read from this CLI's own CAS.
+///
+/// Best effort by design: a diff that refused because the binding would not open
+/// would be a regression against the command as it shipped, so a failure here
+/// yields no lines rather than an error, exactly as `daemon_diff` itself does.
+fn content_lines_for(
+    layout: &kin_core::KinLayout,
+    report: &DiffReport,
+    full_bodies: bool,
+) -> Vec<String> {
+    let Ok(binding) = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout) else {
+        return Vec::new();
+    };
+    let Ok(authority) =
+        crate::commands::repository_authority::ActiveRepositoryAuthority::open(&binding)
+    else {
+        return Vec::new();
+    };
+    collect_artifact_content(&authority, &report.artifact_deltas, full_bodies)
+        .iter()
+        .flat_map(render_content_lines)
+        .collect()
 }
 
 /// Ask the daemon for a diff, or `None` when it cannot answer.
@@ -1095,6 +1187,174 @@ fn render_endpoint(endpoint: &DiffEndpoint) -> String {
             endpoint.tree_hash
         ),
     }
+}
+
+/// The one content cap, borrowed from the hosted semantic surface rather than
+/// invented. `kin_db::MAX_SOURCE_BLOB_BYTES` is 1 GiB, which is a storage bound
+/// and not a display one.
+const CONTENT_MAX_BYTES: u64 = kin_mcp::handlers::HOSTED_SEMANTIC_SOURCE_BLOB_MAX_BYTES;
+
+/// Read one side's body out of graph-owned CAS, or say why not.
+///
+/// Never touches the working copy. The digest comes from the artifact delta the
+/// caller already holds, and `load_source_blob` reads repository-owned CAS
+/// through KinDB, which re-verifies the digest at the manager boundary. So the
+/// Zero File-Search Authority Rule holds by construction here rather than by
+/// argument: there is no filesystem path in this function to get wrong.
+fn load_side(
+    authority: &crate::commands::repository_authority::ActiveRepositoryAuthority,
+    digest: Option<Hash256>,
+) -> Result<Option<String>, String> {
+    let Some(digest) = digest else {
+        return Ok(None);
+    };
+    let bytes = authority
+        .load_source_blob(digest)
+        .map_err(|error| format!("blob {digest} could not be read: {error}"))?;
+    if bytes.len() as u64 > CONTENT_MAX_BYTES {
+        return Err(format!(
+            "content omitted: {} bytes over the {} byte cap",
+            bytes.len() as u64 - CONTENT_MAX_BYTES,
+            CONTENT_MAX_BYTES
+        ));
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) => Err(format!(
+            "content omitted: not valid UTF-8 ({} bytes)",
+            error.into_bytes().len()
+        )),
+    }
+}
+
+/// Render two bodies as unified hunks.
+///
+/// `pub(crate)` because `kin conflicts` renders each conflict side's
+/// re-materialized body with THIS function rather than a second one. One
+/// renderer for diff and conflicts is what keeps the two surfaces from drifting,
+/// and a conflict body rendered differently from a diff body is a difference a
+/// reader would have to learn rather than read.
+///
+/// THE one renderer. The JSON hunks and the text surface both come from here, so
+/// the two cannot drift into disagreeing about what changed, which is the whole
+/// reason this is a function and not two call sites.
+pub(crate) fn render_hunks(old: Option<&str>, new: Option<&str>) -> Vec<String> {
+    let old = old.unwrap_or("");
+    let new = new.unwrap_or("");
+    if old == new {
+        return Vec::new();
+    }
+    // `unified_diff` and `iter_hunks` are the DEFAULT-feature path. The inline
+    // API next to them requires similar's `inline` feature, which is not on by
+    // default, and reaching for it is what failed this file's first compile.
+    let diff = similar::TextDiff::from_lines(old, new);
+    let mut unified = diff.unified_diff();
+    unified.context_radius(3);
+    let mut out = Vec::new();
+    for hunk in unified.iter_hunks() {
+        let mut text = format!("{}\n", hunk.header());
+        for change in hunk.iter_changes() {
+            let sign = match change.tag() {
+                similar::ChangeTag::Delete => '-',
+                similar::ChangeTag::Insert => '+',
+                similar::ChangeTag::Equal => ' ',
+            };
+            text.push(sign);
+            text.push_str(change.value());
+            if change.missing_newline() {
+                text.push('\n');
+            }
+        }
+        out.push(text);
+    }
+    out
+}
+
+/// Build the content rows for a report's artifact deltas.
+fn collect_artifact_content(
+    authority: &crate::commands::repository_authority::ActiveRepositoryAuthority,
+    deltas: &[TreeDelta],
+    full_bodies: bool,
+) -> Vec<ArtifactContent> {
+    let mut rows = Vec::new();
+    for delta in deltas {
+        let (artifact_id, path, old_hash, new_hash) = match delta {
+            TreeDelta::Added { artifact_id, new } => (
+                artifact_id.clone(),
+                new.path.to_string(),
+                None,
+                new.entry.blob_identity(),
+            ),
+            TreeDelta::Removed { artifact_id, old } => (
+                artifact_id.clone(),
+                old.path.to_string(),
+                old.entry.blob_identity(),
+                None,
+            ),
+            TreeDelta::Updated {
+                artifact_id,
+                old,
+                new,
+            } => (
+                artifact_id.clone(),
+                new.path.to_string(),
+                old.entry.blob_identity(),
+                new.entry.blob_identity(),
+            ),
+        };
+        // A mode-only or move-only change moves no bytes, and a row saying so
+        // is noise. An identical pair is the same case reached differently.
+        if old_hash.is_some() && old_hash == new_hash {
+            continue;
+        }
+        let mut row = ArtifactContent {
+            artifact_id,
+            path,
+            old_hash,
+            new_hash,
+            hunks: Vec::new(),
+            old_text: None,
+            new_text: None,
+            omitted: None,
+        };
+        let old_text = match load_side(authority, old_hash) {
+            Ok(text) => text,
+            Err(why) => {
+                row.omitted = Some(why);
+                rows.push(row);
+                continue;
+            }
+        };
+        let new_text = match load_side(authority, new_hash) {
+            Ok(text) => text,
+            Err(why) => {
+                row.omitted = Some(why);
+                rows.push(row);
+                continue;
+            }
+        };
+        row.hunks = render_hunks(old_text.as_deref(), new_text.as_deref());
+        if full_bodies {
+            row.old_text = old_text;
+            row.new_text = new_text;
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+/// The text rendering of one content row, from the same hunks the JSON carries.
+fn render_content_lines(row: &ArtifactContent) -> Vec<String> {
+    if let Some(why) = row.omitted.as_deref() {
+        return vec![format!("   {} {}", row.path, why)];
+    }
+    let mut lines = Vec::new();
+    for hunk in &row.hunks {
+        for line in hunk.lines() {
+            lines.push(format!("   {line}"));
+        }
+    }
+    lines
 }
 
 fn render_tree_delta(delta: &TreeDelta) -> String {
