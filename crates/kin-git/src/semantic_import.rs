@@ -811,8 +811,13 @@ fn admitted_window(
     let mut chain = Vec::new();
     let mut walked = BTreeSet::new();
     let mut cursor = Some(head_commit);
+    // Which of the two reasons the walk stopped, because they mean opposite
+    // things. Running out of chain means the limit bound nothing; reaching the
+    // limit means it did.
+    let mut reached_the_limit = false;
     while let Some(oid) = cursor {
         if chain.len() == want.get() {
+            reached_the_limit = true;
             break;
         }
         if !walked.insert(oid) {
@@ -831,7 +836,13 @@ fn admitted_window(
     // Asking for more history than a repository has is not an error and is not
     // a boundary. Reporting one would tell an operator their history is
     // incomplete at the exact moment all of it was admitted.
-    if chain.len() == all.len() {
+    //
+    // Keyed on WHY the walk stopped, not on comparing the chain's length to the
+    // repository's commit count. Those differ on any repository with a merged
+    // side branch, because a first-parent chain is shorter than the reachable
+    // set, so a length comparison manufactures a boundary on exactly those
+    // repositories no matter how large the limit was.
+    if !reached_the_limit {
         return Ok(AdmittedWindow {
             commits: all,
             boundary: None,

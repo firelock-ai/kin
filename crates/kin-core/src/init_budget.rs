@@ -163,6 +163,18 @@ impl HistorySurvey {
     pub fn commits_within(&self, budget_bytes: u64) -> u64 {
         budget_bytes / self.bytes_per_commit().max(1)
     }
+
+    /// Commits that convert under `ceiling_bytes` without the conversion having
+    /// anything to say about memory.
+    ///
+    /// The number `--history-limit` is offered with, everywhere it is offered,
+    /// so the refusal, the advisory and `kin doctor` cannot name three
+    /// different figures for one repository on one machine. Deliberately the
+    /// count that lands in the silent band rather than on the ceiling: advice
+    /// that converts and then warns is advice that half works.
+    pub fn commits_that_convert_quietly(&self, ceiling_bytes: u64) -> u64 {
+        self.commits_within((ceiling_bytes as f64 * TIGHT_FRACTION) as u64)
+    }
 }
 
 /// What the ladder decided about this conversion's memory before running it.
@@ -242,7 +254,7 @@ impl BudgetVerdict {
             |_| {
                 format!(
                     " or take in less history with `kin init --history-limit {}`",
-                    survey.commits_within((*ceiling_bytes as f64 * TIGHT_FRACTION) as u64)
+                    survey.commits_that_convert_quietly(*ceiling_bytes)
                 )
             },
         );
@@ -348,8 +360,7 @@ impl BudgetVerdict {
 /// a limit larger than the history it would bound is a sentence that reads like
 /// a remedy and changes nothing.
 fn history_limit_remedy(survey: &HistorySurvey, ceiling_bytes: u64) -> Option<String> {
-    let budget = (ceiling_bytes as f64 * TIGHT_FRACTION) as u64;
-    let commits = survey.commits_within(budget);
+    let commits = survey.commits_that_convert_quietly(ceiling_bytes);
     if commits == 0 || commits >= survey.commits {
         return None;
     }
@@ -601,13 +612,101 @@ mod tests {
         assert!(text.contains("1676 tracked files"), "text was:\n{text}");
         assert!(text.contains("8.0 GB"), "text was:\n{text}");
         assert!(text.contains("give it more than"), "text was:\n{text}");
+        // The less-history remedy is now a command with a number in it rather
+        // than an instruction to have a different repository. FIR-2041: this
+        // sentence used to end in a dead end, telling a reader to convert less
+        // history and then ruling out the only way they could reach that.
         assert!(
-            text.contains("convert a repository with less history"),
+            text.contains("`kin init --history-limit 896`"),
             "text was:\n{text}"
         );
+        assert!(text.contains("take in less history"), "text was:\n{text}");
         assert!(text.contains("git clone --depth"), "text was:\n{text}");
         assert!(text.contains(INIT_MEMORY_CEILING_ENV), "text was:\n{text}");
         assert!(text.contains("no staging to reclaim"), "text was:\n{text}");
+    }
+
+    /// The recommended limit is one that actually converts quietly.
+    ///
+    /// Asserted by feeding the recommendation back through the verdict rather
+    /// than by recomputing the arithmetic, because a test that recomputes the
+    /// formula passes whenever the formula is self-consistent, including when
+    /// it is self-consistently wrong.
+    #[test]
+    fn the_recommended_limit_converts_without_the_conversion_saying_anything() {
+        let ceiling = 8 * 1024 * 1024 * 1024;
+        let full = survey(18_514, 1_676);
+        let recommended = full.commits_that_convert_quietly(ceiling);
+        assert!(
+            recommended > 0 && recommended < full.commits,
+            "the recommendation must bound something: {recommended} of {}",
+            full.commits
+        );
+        let bounded = survey(recommended, full.tracked_artifacts);
+        assert!(
+            matches!(verdict_for(bounded, ceiling), BudgetVerdict::Fits { .. }),
+            "a conversion at the recommended limit still spoke: {:?}",
+            verdict_for(bounded, ceiling)
+        );
+        // One more commit than recommended must NOT be silent, or the
+        // recommendation is merely small rather than the largest that fits and
+        // the reader is being told to drop history they could have kept.
+        let one_more = survey(recommended + 1, full.tracked_artifacts);
+        assert!(
+            !matches!(verdict_for(one_more, ceiling), BudgetVerdict::Fits { .. }),
+            "the recommendation is not the largest quiet limit; {} also fits",
+            recommended + 1
+        );
+    }
+
+    /// A tree wide enough that no bound helps is told so rather than offered a
+    /// limit of zero.
+    #[test]
+    fn a_repository_no_bound_can_fit_is_not_offered_a_limit() {
+        // One commit of this tree forecasts far past the ceiling, so no window
+        // of whole commits fits and the remedy has to say that.
+        let ceiling = 1024 * 1024;
+        let wide = survey(4_000, 1_000_000);
+        assert_eq!(wide.commits_that_convert_quietly(ceiling), 0);
+        let text = verdict_for(wide, ceiling).refusal_lines().join("\n");
+        assert!(
+            text.contains("`--history-limit` will not help here"),
+            "text was:\n{text}"
+        );
+        assert!(
+            !text.contains("--history-limit 0"),
+            "a limit of zero was offered as a remedy; text was:\n{text}"
+        );
+    }
+
+    /// The refactor that made the forecast invertible did not change it.
+    ///
+    /// The old form took the larger of two whole-history products; the new one
+    /// factors the commit count out first so the forecast can be inverted. They
+    /// are the same value for every input, and this pins that rather than
+    /// trusting the algebra, because a silent change to the forecast would move
+    /// every band in this module at once.
+    #[test]
+    fn factoring_the_forecast_did_not_change_what_it_forecasts() {
+        for (commits, artifacts) in [
+            (1_u64, 1_u64),
+            (200, 40),
+            (4_000, 1_000),
+            (18_514, 1_676),
+            (6_493, 2_000),
+            (1, 10_000_000),
+        ] {
+            let subject = survey(commits, artifacts);
+            let by_commit = commits.saturating_mul(BYTES_PER_COMMIT);
+            let by_tree = subject
+                .tree_entries()
+                .saturating_mul(BYTES_PER_COMMIT_ARTIFACT);
+            assert_eq!(
+                subject.forecast_peak_bytes(),
+                by_commit.max(by_tree),
+                "the forecast changed for {commits} commits over {artifacts} artifacts"
+            );
+        }
     }
 
     /// A repository large enough to overflow the product saturates high rather

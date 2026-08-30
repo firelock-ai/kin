@@ -309,6 +309,7 @@ pub async fn run_health_checks() -> HealthReport {
     checks.push(check_background_work().await);
     checks.push(check_embedding_model().await);
     checks.push(check_memory_floor());
+    checks.push(check_unconverted_history_budget());
     checks.push(check_commit_memory_headroom());
     checks.push(check_daemon_kill_record());
     checks.push(check_interrupted_init());
@@ -4192,6 +4193,148 @@ fn check_memory_floor() -> HealthCheck {
         &crate::capability::memory_evidence(),
         &crate::capability::CapabilityDetection::detect(),
     )
+}
+
+/// Whether the Git repository in this directory can be converted whole here.
+///
+/// The row a stranger most needs and the only one that runs BEFORE a store
+/// exists in a repository that has one waiting. `kin init` forecasts the same
+/// number and prints it at step 1, which is eleven minutes too late to be a
+/// decision: by then the operator has already committed to the run. Reading it
+/// from `kin doctor` is what makes it a choice.
+///
+/// Unsupported rather than healthy when there is nothing to judge, because a
+/// green row over a directory with no Git repository is a claim about a
+/// conversion that cannot happen.
+fn check_unconverted_history_budget() -> HealthCheck {
+    const ID: &str = "unconverted_history_budget";
+    const LABEL: &str = "Whole-history conversion";
+    let Ok(cwd) = std::env::current_dir() else {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "this directory could not be resolved, so no conversion was forecast",
+        );
+    };
+    if !cwd.join(".git").exists() {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "there is no Git repository here to convert, so nothing is forecast",
+        );
+    }
+    if cwd.join(".kin").exists() {
+        return HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            "this repository is already converted, so its conversion is not forecast;              `Commit memory headroom` is the row about what writing to it costs",
+        );
+    }
+    let evidence = crate::capability::memory_evidence();
+    match kin_core::init_budget::survey_history(&cwd) {
+        Err(reason) => HealthCheck::new(
+            ID,
+            LABEL,
+            HealthStatus::Unsupported,
+            format!("this repository could not be surveyed, so nothing is forecast: {reason}"),
+        ),
+        Ok(survey) => unconverted_history_budget_check_for(survey, evidence.limit_bytes),
+    }
+}
+
+/// Core of [`check_unconverted_history_budget`] over numbers rather than over a
+/// repository, so every branch is testable without a machine of any size.
+///
+/// The verdict is the conversion's own, taken from `init_budget` rather than
+/// recomputed here, so this row and the line `kin init` prints cannot disagree
+/// about the same repository on the same machine.
+fn unconverted_history_budget_check_for(
+    survey: kin_core::init_budget::HistorySurvey,
+    ceiling_bytes: u64,
+) -> HealthCheck {
+    use kin_core::init_budget::BudgetVerdict;
+    const ID: &str = "unconverted_history_budget";
+    const LABEL: &str = "Whole-history conversion";
+
+    let verdict = kin_core::init_budget::verdict_for(survey, ceiling_bytes);
+    let forecast = format_health_bytes(survey.forecast_peak_bytes());
+    let available = format_health_bytes(ceiling_bytes);
+    let scale = format!(
+        "{} commits over {} tracked files",
+        survey.commits, survey.tracked_artifacts
+    );
+
+    let (status, verdict_clause) = match verdict {
+        BudgetVerdict::Fits { .. } => {
+            return HealthCheck::new(
+                ID,
+                LABEL,
+                HealthStatus::Healthy,
+                format!(
+                    "converting all of this repository is expected to hold about {forecast},                      against the {available} here, so {scale} converts whole. That figure is a                      floor taken from the least any measured conversion needed at a smaller                      size, so read it as an order of magnitude rather than as a target"
+                ),
+            );
+        }
+        BudgetVerdict::Tight { .. } => (
+            HealthStatus::Stale,
+            format!(
+                "converting all of this repository is expected to hold about {forecast}, close                  enough to the {available} here that it may not finish"
+            ),
+        ),
+        BudgetVerdict::Exceeds { .. } => (
+            HealthStatus::Degraded,
+            format!(
+                "converting all of this repository is expected to hold about {forecast}, more                  than the {available} here"
+            ),
+        ),
+        // Neither of these is about this repository: one means no ceiling could
+        // be read and the other means an operator set one Kin cannot parse.
+        // `kin init` refuses the second on its own, and repeating its refusal
+        // here as a conversion forecast would name the wrong subject.
+        BudgetVerdict::Unmeasured { reason } => {
+            return HealthCheck::new(
+                ID,
+                LABEL,
+                HealthStatus::Unsupported,
+                format!("no conversion was forecast: {reason}"),
+            );
+        }
+        BudgetVerdict::InvalidCeilingOverride { raw } => {
+            return HealthCheck::new(
+                ID,
+                LABEL,
+                HealthStatus::Unsupported,
+                format!(
+                    "{} is set to {raw:?}, which is not a positive whole number of bytes, so no                      conversion was forecast",
+                    kin_core::init_budget::INIT_MEMORY_CEILING_ENV
+                ),
+            );
+        }
+    };
+
+    let fitting = survey.commits_that_convert_quietly(ceiling_bytes);
+    let remedy = if fitting == 0 || fitting >= survey.commits {
+        "Convert on a machine with more memory. `--history-limit` will not help here: this          repository's tree is wide enough that even one commit exceeds what this machine can          hold."
+            .to_string()
+    } else {
+        format!(
+            "Convert on a machine with more memory, or run `kin init --history-limit {fitting}`,              which takes in the newest {fitting} commits of this repository's first-parent              history and leaves the other {} out of the graph. It keeps every Git object and              every ref, so nothing is thrown away; what it bounds is the semantic history, and              `kin log` reports where the admitted history starts.",
+            survey.commits.saturating_sub(fitting),
+        )
+    };
+
+    HealthCheck::new(
+        ID,
+        LABEL,
+        status,
+        format!(
+            "{verdict_clause}, because {scale} is a large history: a conversion materializes one              resolved tree per commit and holds every one of them. That figure is a floor taken              from the least any measured conversion needed at a smaller size, so this row              forecasts an order of magnitude rather than a total. {remedy}"
+        ),
+    )
+    .with_manual_fix(remedy)
 }
 
 /// Core of [`check_memory_floor`] with both readings as inputs, so every branch
