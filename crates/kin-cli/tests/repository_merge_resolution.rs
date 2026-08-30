@@ -1217,7 +1217,10 @@ fn contradictory_settlements_inside_one_artifact_refuse_and_name_both() {
 /// Written as a list of every field the model declares rather than a derived
 /// comparison, so a field added to `Entity` later fails to compile here and has
 /// to be classified deliberately as semantic or as provenance.
-fn entity_field_differences(ours: &kin_model::Entity, theirs: &kin_model::Entity) -> Vec<&'static str> {
+fn entity_field_differences(
+    ours: &kin_model::Entity,
+    theirs: &kin_model::Entity,
+) -> Vec<&'static str> {
     let kin_model::Entity {
         id,
         kind,
@@ -1304,7 +1307,8 @@ fn an_untouched_entity_differs_between_branches_only_in_its_span() {
     let ours = graph_at(&layout, &branch_change(&layout, "main"));
     let theirs = graph_at(&layout, &branch_change(&layout, "feature"));
 
-    let untouched = entity_field_differences(&entity_named(&ours, "beta"), &entity_named(&theirs, "beta"));
+    let untouched =
+        entity_field_differences(&entity_named(&ours, "beta"), &entity_named(&theirs, "beta"));
     assert_eq!(
         untouched,
         vec!["span"],
@@ -1314,7 +1318,10 @@ fn an_untouched_entity_differs_between_branches_only_in_its_span() {
     // The control that keeps the reading honest: the entity both sides DID edit
     // must differ on a semantic field too, or the comparison above is measuring
     // nothing and would report the same set for every entity in the file.
-    let edited = entity_field_differences(&entity_named(&ours, "alpha"), &entity_named(&theirs, "alpha"));
+    let edited = entity_field_differences(
+        &entity_named(&ours, "alpha"),
+        &entity_named(&theirs, "alpha"),
+    );
     assert!(
         edited.contains(&"fingerprint"),
         "the entity both sides edited must differ semantically; it differed on {edited:?}"
