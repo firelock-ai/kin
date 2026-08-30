@@ -3,6 +3,59 @@
 
 use thiserror::Error;
 
+/// Which kind of projection conflict a refusal is.
+///
+/// The message alone cannot carry this. Two of these refusals are answered very
+/// differently by a caller and were distinguishable only by their wording, and
+/// a predicate on wording is a check a copy edit breaks in silence.
+///
+/// `Other` exists so every site with no opinion keeps its behaviour rather than
+/// being made to claim one, and so a new site cannot pick a kind by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionConflictKind {
+    /// A path the repository TRACKS whose working-copy content has moved away
+    /// from the projection. The graph has not been told yet, and an admission
+    /// pass resolves it, which is why this one is worth naming.
+    TrackedDrift,
+    /// A path the repository does NOT track standing where a member must go. No
+    /// admission makes this carry; the caller has to move or remove the file.
+    UntrackedBlocks,
+    /// Every other projection conflict, which is most of them.
+    Other,
+}
+
+/// A projection conflict, with its kind beside the sentence.
+///
+/// Displays as the message alone, so every existing rendering of this error is
+/// byte identical to what it was.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectionConflictDetail {
+    pub kind: ProjectionConflictKind,
+    pub message: String,
+}
+
+impl ProjectionConflictDetail {
+    pub fn new(kind: ProjectionConflictKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProjectionConflictDetail {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+/// Every site that says nothing about the kind keeps saying nothing.
+impl From<String> for ProjectionConflictDetail {
+    fn from(message: String) -> Self {
+        Self::new(ProjectionConflictKind::Other, message)
+    }
+}
+
 /// Unified error type for `kin-core`.
 #[derive(Debug, Error)]
 pub enum KinError {
@@ -37,7 +90,7 @@ pub enum KinError {
     RepositoryConflict(String),
 
     #[error("repository projection conflict: {0}")]
-    ProjectionConflict(String),
+    ProjectionConflict(ProjectionConflictDetail),
 
     /// The working projection will not open until a person acts on the file
     /// the message names.
@@ -88,6 +141,41 @@ impl KinError {
         Self::Io {
             path: path.as_ref().display().to_string(),
             source,
+        }
+    }
+
+    /// A projection conflict whose kind this site does not claim.
+    pub fn projection_conflict(message: impl Into<String>) -> Self {
+        Self::ProjectionConflict(ProjectionConflictDetail::new(
+            ProjectionConflictKind::Other,
+            message,
+        ))
+    }
+
+    /// A TRACKED path whose working-copy content moved away from the projection.
+    pub fn tracked_projection_drift(message: impl Into<String>) -> Self {
+        Self::ProjectionConflict(ProjectionConflictDetail::new(
+            ProjectionConflictKind::TrackedDrift,
+            message,
+        ))
+    }
+
+    /// An UNTRACKED path standing where a member must go.
+    pub fn untracked_path_blocks(message: impl Into<String>) -> Self {
+        Self::ProjectionConflict(ProjectionConflictDetail::new(
+            ProjectionConflictKind::UntrackedBlocks,
+            message,
+        ))
+    }
+
+    /// The kind of projection conflict this is, or `None` when it is not one.
+    ///
+    /// Read by a caller that answers two of these differently. Everything else
+    /// keeps matching the variant and rendering the message, which is unchanged.
+    pub fn projection_conflict_kind(&self) -> Option<ProjectionConflictKind> {
+        match self {
+            Self::ProjectionConflict(detail) => Some(detail.kind),
+            _ => None,
         }
     }
 }

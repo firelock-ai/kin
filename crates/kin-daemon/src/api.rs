@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -5220,13 +5220,57 @@ async fn command_branch(
 
     let requires_authority_gate =
         !matches!(&request, kin_cli::commands::branch::BranchRequest::List);
-    let _coordination = if requires_authority_gate {
-        Some(state.coordination_gate.lock().await)
-    } else {
-        None
+    let attempt = |state: &Arc<DaemonState>| crate::repository_branch::execute(state, &request);
+
+    // Scoped so the gate is RELEASED before any admission runs below. The
+    // admission seam takes this same gate and the mutex is not reentrant, so a
+    // retry that held it would deadlock rather than admit.
+    let first = {
+        let _coordination = if requires_authority_gate {
+            Some(state.coordination_gate.lock().await)
+        } else {
+            None
+        };
+        attempt(&state)
     };
 
-    let response = crate::repository_branch::execute(&state, &request)?;
+    let response = match first {
+        Ok(response) => response,
+        // Retried only for the one refusal an admission clears: a TRACKED path
+        // whose working copy moved away from the projection the graph holds, so
+        // the switch refused on a view of the workspace that was simply not
+        // current. Read from the refusal's typed kind, not from its wording.
+        //
+        // An untracked path standing where a member must go never reaches here,
+        // which is the whole reason this is a retry on a named refusal rather
+        // than an admission ahead of the command: admitting first also absorbed
+        // untracked files, turning a user's own file into tracked pending work
+        // as a side effect of changing branches.
+        Err(refusal)
+            if refusal.clears_with_admission
+                && matches!(
+                    &request,
+                    kin_cli::commands::branch::BranchRequest::Switch { .. }
+                )
+                && admission_seam_would_skip(&state).is_none() =>
+        {
+            if let Err(error) = crate::repository_admit::execute(&state).await {
+                // A pass that established no outcome does not get to change the
+                // answer. The switch already refused, and that refusal stands.
+                warn!(%error, "the admission before a retried switch reported no outcome");
+                return Err(refusal.into());
+            }
+            let _coordination = if requires_authority_gate {
+                Some(state.coordination_gate.lock().await)
+            } else {
+                None
+            };
+            // Once. A second refusal is the answer, whatever its kind, because
+            // an admission that did not clear it will not clear it next time.
+            attempt(&state)?
+        }
+        Err(refusal) => return Err(refusal.into()),
+    };
     Ok(Json(response))
 }
 
@@ -5235,30 +5279,30 @@ async fn command_merge(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::merge::MergeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, crate::repository_merge::CommandRefusal> {
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
-        ));
+        )));
     }
     if state.storage_backend.is_some() {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::CONFLICT,
             "local repository merge authority is unavailable for hosted snapshot authority"
                 .to_string(),
-        ));
+        )));
     }
     if extract_session_id_from_headers(&headers)?.is_some() {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::CONFLICT,
             "merge does not accept X-Kin-Session because it mutates the primary repository \
              workspace and its active branch"
                 .to_string(),
-        ));
+        )));
     }
 
     let _coordination = state.coordination_gate.lock().await;
@@ -5305,30 +5349,30 @@ async fn command_resolve(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::resolve::ResolveRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, crate::repository_merge::CommandRefusal> {
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
-        ));
+        )));
     }
     if state.storage_backend.is_some() {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::CONFLICT,
             "local repository merge authority is unavailable for hosted snapshot authority"
                 .to_string(),
-        ));
+        )));
     }
     if extract_session_id_from_headers(&headers)?.is_some() {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::CONFLICT,
             "resolve does not accept X-Kin-Session because it mutates the primary repository \
              workspace and its active branch"
                 .to_string(),
-        ));
+        )));
     }
 
     let _coordination = state.coordination_gate.lock().await;
@@ -5965,7 +6009,9 @@ struct CommandCommitRequest {
 #[derive(Debug, Serialize)]
 struct CommandCommitResponse {
     change_id: String,
-    branch: String,
+    /// The branch this change was published onto, or `null` when the workspace
+    /// head is detached and the head itself advanced instead.
+    branch: Option<String>,
     entity_count: usize,
     relation_count: usize,
     file_count: usize,
@@ -6111,7 +6157,7 @@ fn command_commit_after_admission(
         return Err(refusal);
     }
     let change_id = plan.change.id;
-    let branch_name = plan.branch.clone();
+    let branch_name = plan.target.branch().map(|name| name.to_string());
     let entity_count = plan.entity_count;
     let relation_count = plan.relation_count;
     let file_count = plan.file_count;
@@ -6224,7 +6270,7 @@ fn command_commit_after_admission(
 
     Ok(Json(CommandCommitResponse {
         change_id: change_id.to_string(),
-        branch: branch_name.to_string(),
+        branch: branch_name,
         entity_count,
         relation_count,
         file_count,
@@ -28328,6 +28374,57 @@ mod tests {
         assert_eq!(
             std::fs::read(repository.join("selected/compose.yaml")).unwrap(),
             b"uncommitted projection drift\n"
+        );
+    }
+
+    /// The third arm of the switch retry: a refusal the retry cannot clear must
+    /// survive it, and must be the NEXT question rather than the same one.
+    ///
+    /// The workspace edits a path both branches track and both hold
+    /// differently. The first attempt refuses for drift, the retry admits, and
+    /// the second attempt gets far enough to ask the real question, which is
+    /// whether that pending work can replay onto the destination. It cannot, so
+    /// it refuses again and that refusal stands.
+    ///
+    /// The assertion that matters is the one on WHICH refusal comes back. A
+    /// retry that never ran would return the drift message again, and a retry
+    /// that ran but did not stop would return success, so the carry refusal is
+    /// the only answer that means both halves worked.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_switch_retry_stops_at_a_refusal_no_admission_can_clear() {
+        let (state, _layout, repository, _main, _feature) =
+            universal_branch_test_state("branch-retry-stops");
+        let authority = ActiveApiRepositoryAuthority::open(&state).unwrap();
+        let generation_before = authority.manager.read_authority().roots().generation;
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: local-edit\n",
+        )
+        .unwrap();
+        let request = kin_cli::commands::branch::BranchRequest::Switch {
+            name: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("branch-retry-stops-test"),
+        };
+
+        let (status, body) = post_branch_request(Arc::clone(&state), &request, None).await;
+        let rendered = String::from_utf8_lossy(&body).to_string();
+
+        assert_eq!(status, StatusCode::CONFLICT, "{rendered}");
+        assert!(
+            rendered.contains("cannot move onto"),
+            "the retry must reach the carry question and refuse there: {rendered}"
+        );
+        assert!(
+            !rendered.contains("diverge from the graph-owned workspace projection"),
+            "returning the drift refusal again means the retry never ran: {rendered}"
+        );
+        // The admission the retry ran is allowed to publish, so the generation
+        // may move. What must not move is the ref, because the switch refused.
+        assert!(
+            authority.manager.read_authority().roots().generation >= generation_before,
+            "an admission may advance the generation; nothing may move it backwards"
         );
     }
 

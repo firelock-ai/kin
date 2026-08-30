@@ -361,6 +361,51 @@ impl fmt::Display for IndeterminateDaemonCommandError {
 
 impl std::error::Error for IndeterminateDaemonCommandError {}
 
+/// A refusal the daemon raised before it wrote anything, and said so.
+///
+/// Separate from [`IndeterminateDaemonCommandError`] on purpose. That one is
+/// correct whenever the transport is guessing, which is every case but this
+/// one: the daemon marked this refusal in its own body, so the caller is told
+/// what is true rather than warned about a write that did not happen.
+///
+/// Nothing in this Display suggests a write may have occurred, because the
+/// whole point of the marker is that none did.
+#[derive(Debug)]
+pub(crate) struct RefusedBeforeWriteError {
+    pub(crate) operation_id: OperationId,
+    path: String,
+    status: reqwest::StatusCode,
+    reason: String,
+}
+
+impl RefusedBeforeWriteError {
+    fn new(
+        operation_id: OperationId,
+        path: &str,
+        status: reqwest::StatusCode,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            operation_id,
+            path: path.to_string(),
+            status,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for RefusedBeforeWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "daemon refused operation {} at {} with HTTP {} and published nothing: {}",
+            self.operation_id, self.path, self.status, self.reason
+        )
+    }
+}
+
+impl std::error::Error for RefusedBeforeWriteError {}
+
 /// Proof carried by a successful acknowledgement of a non-idempotent command.
 ///
 /// Requiring this trait at the one-dispatch transport boundary makes it
@@ -932,6 +977,24 @@ impl DaemonClient {
                 .text()
                 .await
                 .unwrap_or_else(|error| format!("<response body unavailable: {error}>"));
+            // Honoured only on a client error, and only when the daemon itself
+            // put the marker in the body. A 5xx can leave work in flight
+            // whatever any body says, and a 5xx from a proxy is not this daemon
+            // speaking at all, so both keep the indeterminate answer they have
+            // always had. Anything that does not parse keeps it too, which is
+            // what an older daemon's plain-text refusal reads as.
+            if status.is_client_error() {
+                if let Some(refusal) = crate::daemon_error::DaemonErrorBody::parse(&body) {
+                    if refusal.refused_before_write {
+                        return Err(anyhow::Error::new(RefusedBeforeWriteError::new(
+                            operation_id,
+                            path,
+                            status,
+                            refusal.message,
+                        )));
+                    }
+                }
+            }
             return Err(anyhow::Error::new(IndeterminateDaemonCommandError::new(
                 operation_id,
                 path,
@@ -8050,6 +8113,161 @@ mod tests {
         assert_indeterminate(&error, operation_id);
         assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(format!("{error:#}").contains("409 Conflict: stale merge record"));
+    }
+
+    fn assert_refused_before_write(error: &anyhow::Error, operation_id: OperationId, reason: &str) {
+        let refusal = error
+            .downcast_ref::<RefusedBeforeWriteError>()
+            .unwrap_or_else(|| panic!("the refusal must be typed, not indeterminate: {error:#}"));
+        assert_eq!(refusal.operation_id, operation_id);
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains(reason),
+            "the daemon's reason verbatim: {rendered}"
+        );
+        // The whole point of the marker. Asserted on the rendered Display
+        // rather than on the type, because a future edit to the sentence is
+        // exactly what this must catch.
+        assert!(
+            !rendered.contains("may already have committed"),
+            "a refusal the daemon says wrote nothing must not warn about a write: {rendered}"
+        );
+        assert!(
+            !rendered.contains("indeterminate"),
+            "and must not call itself indeterminate: {rendered}"
+        );
+    }
+
+    /// The marker's whole purpose: a 4xx the daemon marked is reported as what
+    /// it is, once, with the daemon's reason carried through.
+    #[tokio::test]
+    async fn a_marked_client_error_is_a_refusal_that_wrote_nothing_and_dispatched_once() {
+        let body = crate::daemon_error::DaemonErrorBody::before_write(
+            "merging refs/heads/pretty into refs/heads/main still has 27 unresolved conflict(s)",
+        )
+        .to_wire();
+        let (base_url, requests, server) = spawn_fixed_response_server_at(
+            "/commands/test",
+            axum::http::StatusCode::CONFLICT,
+            body,
+        )
+        .await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a refusal is still an error");
+        server.abort();
+
+        assert_refused_before_write(&error, operation_id, "27 unresolved conflict(s)");
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "one dispatch, exactly as before"
+        );
+    }
+
+    /// A 5xx is ignored even when it carries the marker.
+    ///
+    /// A server error can leave work in flight whatever the body says, and a
+    /// 5xx from a proxy is not the daemon speaking at all. This is the arm that
+    /// keeps the marker from becoming a way to talk the transport out of its
+    /// one real safety property.
+    #[tokio::test]
+    async fn a_marked_server_error_is_still_indeterminate() {
+        let body =
+            crate::daemon_error::DaemonErrorBody::before_write("nothing was committed").to_wire();
+        let (base_url, requests, server) = spawn_fixed_response_server_at(
+            "/commands/test",
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            body,
+        )
+        .await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a 5xx cannot prove the mutation was rejected");
+        server.abort();
+
+        assert_indeterminate(&error, operation_id);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An older daemon's plain-text refusal, which is what every daemon sent
+    /// before this field existed. It parses as nothing, so the caller keeps the
+    /// indeterminate answer, which is the compatibility direction that matters:
+    /// a new CLI must not read silence as a promise.
+    #[tokio::test]
+    async fn an_unmarked_client_error_body_is_still_indeterminate() {
+        let (base_url, requests, server) = spawn_fixed_response_server(
+            axum::http::StatusCode::CONFLICT,
+            "repository projection conflict: tracked working-copy path differs",
+        )
+        .await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("an unmarked refusal proves nothing");
+        server.abort();
+
+        assert_indeterminate(&error, operation_id);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A body that parses but says `false` is the same as saying nothing.
+    ///
+    /// Separate from the plain-text arm because they fail at different steps,
+    /// and a fix that made an unparseable body honoured would leave this one
+    /// green while breaking the other.
+    #[tokio::test]
+    async fn a_client_error_marked_false_is_still_indeterminate() {
+        let (base_url, _requests, server) = spawn_fixed_response_server(
+            axum::http::StatusCode::BAD_REQUEST,
+            r#"{"message":"no recorded merge conflict matches summarize","refused_before_write":false}"#,
+        )
+        .await;
+        let client =
+            DaemonClient::from_base_url_with_explicit_authority(base_url, None, None).unwrap();
+        let operation_id = stable_test_operation_id();
+
+        let error = client
+            .post_non_idempotent_json::<_, serde_json::Value>(
+                "/commands/test",
+                &serde_json::json!({"operation_id": operation_id}),
+                operation_id,
+                "test one-dispatch post",
+            )
+            .await
+            .expect_err("a refusal is still an error");
+        server.abort();
+
+        assert_indeterminate(&error, operation_id);
     }
 
     #[tokio::test]

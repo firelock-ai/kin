@@ -31,6 +31,37 @@ test('all schemas load', async () => {
   assert.ok(schemas.repoScopedSemanticToolResponse);
   assert.ok(schemas.repoScopedSemanticToolError);
   assert.ok(schemas.shadowGateReport);
+  assert.ok(schemas.daemonError);
+});
+
+test('a daemon refusal body carries its marker only when the daemon set it', async () => {
+  // The marker is the whole point: a caller may act on "nothing was written",
+  // so a body that never says it must not be readable as if it had.
+  assert.equal(
+    (await validateContract('daemonError', { message: 'nothing was committed' })).ok,
+    true,
+    'a refusal with no marker is valid, and means unknown'
+  );
+  assert.equal(
+    (await validateContract('daemonError', {
+      message: 'nothing was committed',
+      refused_before_write: true
+    })).ok,
+    true
+  );
+
+  // Fails closed on the three shapes that would let a wrong body through.
+  for (const bad of [
+    { refused_before_write: true },
+    { message: 'refused', refused_before_write: 'true' },
+    { message: 'refused', refused_before_write: true, committed: true }
+  ]) {
+    assert.equal(
+      (await validateContract('daemonError', bad)).ok,
+      false,
+      `this body must be refused: ${JSON.stringify(bad)}`
+    );
+  }
 });
 
 test('repo-scoped semantic contracts bind the path authority and fail closed', async () => {

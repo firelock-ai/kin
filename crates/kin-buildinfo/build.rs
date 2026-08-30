@@ -178,6 +178,28 @@ fn git_allow_empty(cwd: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
+        // Every git call this script makes goes through here, which is why the
+        // switch is set once at the chokepoint rather than per subcommand.
+        //
+        // `git status` performs an OPTIONAL index refresh: when the cached stat
+        // data is stale it rewrites `.git/index` as a side effect of reporting.
+        // This script declares that same index as one of its own
+        // `rerun-if-changed` inputs, so a plain status makes the build script
+        // invalidate itself for the next cargo invocation in the same job.
+        //
+        // Measured on CI: the fast-gate shard's `cargo nextest list` compiled 24
+        // crates, and the `cargo nextest run` that followed recompiled exactly
+        // four, kin-buildinfo and its three dependents, for 1m48s. That is 108
+        // seconds per shard per run buying nothing.
+        //
+        // GIT_OPTIONAL_LOCKS=0 is git's own switch for exactly this: it skips
+        // the optional write while returning the identical answer. Measured
+        // locally against a deliberately staled index, a plain status rewrote
+        // it and this one did not, with both reporting the same porcelain.
+        //
+        // It is set for every subcommand rather than only `status` so a future
+        // call that also takes an optional lock cannot reintroduce this.
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .output()
         .ok()?;
     if !output.status.success() {

@@ -909,32 +909,58 @@ fn branch_switch_projects_complete_polyglot_and_non_code_tree_from_repository_ca
         .is_symlink());
 }
 
+/// An edit the daemon has not admitted yet carries exactly as an admitted one
+/// does, because the switch admits it.
+///
+/// This test asserted the opposite until the rc062j stranger run, where the
+/// same shape refused seven times in nine and `kin admit` then carried it every
+/// time. Nothing about the edit differs between those two moments: the only
+/// difference is whether the daemon had got to it yet, which is a race the
+/// caller cannot see and did not cause.
+///
+/// So admission state no longer decides. What decides is the question the two
+/// tests below already ask: whether the branches agree about the member being
+/// changed. This is the Git rule, and it is now the whole rule.
+///
+/// The property this test used to carry, that a REFUSED switch must not advance
+/// repository authority, is not lost. It lives in
+/// `branch_switch_refuses_an_admitted_edit_to_a_member_the_branches_disagree_about`,
+/// which still refuses and still asserts the roots are unchanged. Moving it
+/// there rather than deleting it is deliberate: this input stopped refusing, so
+/// it can no longer say anything about what a refusal does.
 #[cfg(unix)]
 #[test]
-fn branch_switch_rejects_local_tracked_edits_and_preserves_authority() {
+fn branch_switch_admits_and_carries_an_unadmitted_edit_the_branches_agree_about() {
     let root = tempdir().expect("temp root");
     let repo = root.path().join("repo");
     initialize_git_repo(&repo);
     add_feature_branch(&repo);
     let runtime = common::IsolatedDaemonRuntime::new(&repo);
-    let layout = initialize_kin_repo(&runtime, &repo);
-    let (_, manager) = open_authority(&layout);
-    let before = manager.read_authority().roots().clone();
+    // Bound to `_` rather than dropped: the call converts the repository, and
+    // this test no longer reads the layout because the authority assertions it
+    // used to make moved to the refusal test named in the comment above.
+    let _layout = initialize_kin_repo(&runtime, &repo);
+    // Written straight to the working copy and never admitted, which is the
+    // whole point: no `admit_uncommitted_workspace_edit` here, unlike the test
+    // below that is otherwise the same scenario.
     fs::write(repo.join("unchanged.txt"), b"local uncommitted edit\n").expect("write local edit");
 
     let switched = run_kin(&runtime, &repo, &["branch", "switch", "feature"]);
-    assert!(!switched.status.success());
     assert!(
-        String::from_utf8_lossy(&switched.stderr).contains("differs from prior workspace source")
+        switched.status.success(),
+        "an unadmitted edit to a member both branches share must carry: stdout={} stderr={}",
+        String::from_utf8_lossy(&switched.stdout),
+        String::from_utf8_lossy(&switched.stderr)
     );
     assert_eq!(
         fs::read(repo.join("unchanged.txt")).unwrap(),
-        b"local uncommitted edit\n"
+        b"local uncommitted edit\n",
+        "the carried edit must survive on disk"
     );
     assert_eq!(
-        manager.read_authority().roots(),
-        &before,
-        "rejected projection advanced repository authority"
+        fs::read(repo.join("compose.yaml")).unwrap(),
+        b"services:\n  api:\n    build: .\n",
+        "members the workspace never touched must take the destination's content"
     );
 }
 

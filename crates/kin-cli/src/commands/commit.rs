@@ -3,7 +3,9 @@
 
 use anyhow::{Context, Result};
 
-use super::commit_progress::{daemon_death_explanation, PhaseTail, AUTHORITY_NOT_GIT_NOTE};
+use super::commit_progress::{
+    daemon_death_explanation, PhaseTail, AUTHORITY_NOT_GIT_NOTE, DETACHED_HEAD_NOTE,
+};
 
 pub async fn run(message: String, quiet: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
@@ -145,14 +147,22 @@ impl Drop for CommitAnnouncement {
 /// Without it a brownfield user commits all day and reads `git status` as proof
 /// that nothing happened.
 fn render_commit_summary(result: &DaemonCommitResult, pending: Option<&str>) -> String {
+    let landed = match &result.branch {
+        Some(branch) => format!("on branch '{branch}'"),
+        None => "on a detached HEAD, which no branch names".to_string(),
+    };
     let summary = format!(
-        "Created semantic change {} on branch '{}' ({} entities, {} relations, {} artifacts)\n{}",
+        "Created semantic change {} {} ({} entities, {} relations, {} artifacts)\n{}{}",
         result.change_id,
-        result.branch,
+        landed,
         result.entity_count,
         result.relation_count,
         result.file_count,
         AUTHORITY_NOT_GIT_NOTE,
+        match &result.branch {
+            Some(_) => String::new(),
+            None => format!("\n{DETACHED_HEAD_NOTE}"),
+        },
     );
     match pending {
         Some(pending) => format!("{summary}\n{pending}"),
@@ -169,7 +179,15 @@ fn render_commit_summary(result: &DaemonCommitResult, pending: Option<&str>) -> 
 #[derive(Debug, serde::Deserialize)]
 struct DaemonCommitResult {
     change_id: String,
-    branch: String,
+    /// The branch this change was published onto.
+    ///
+    /// Absent when the workspace head is detached, which is a repository
+    /// converted while Git's own HEAD was detached and never moved onto a
+    /// branch since. The daemon advances that head to the new change and moves
+    /// no ref, so there is no branch to name and inventing one here would be a
+    /// worse answer than saying so.
+    #[serde(default)]
+    branch: Option<String>,
     entity_count: usize,
     relation_count: usize,
     file_count: usize,
@@ -491,14 +509,14 @@ fn landed_commit_for_operation(
     else {
         return Ok(None);
     };
-    let Some((branch, change_id)) = receipt.operation.ref_mutations.iter().find_map(|mutation| {
-        match mutation.new_target.as_ref() {
-            Some(kin_model::RefTarget::Change { change_id }) => {
-                Some((mutation.name.clone(), *change_id))
-            }
-            _ => None,
-        }
-    }) else {
+    let Some((branch, change_id)) = landed_change_in(
+        &receipt.operation.ref_mutations,
+        receipt
+            .operation
+            .workspace_mutation
+            .as_ref()
+            .map(|workspace| &workspace.new_head),
+    ) else {
         return Ok(None);
     };
     let change = lease.snapshot().changes.get(&change_id).ok_or_else(|| {
@@ -508,11 +526,48 @@ fn landed_commit_for_operation(
     })?;
     Ok(Some(DaemonCommitResult {
         change_id: change_id.to_string(),
-        branch: branch.to_string(),
+        branch,
         entity_count: change.entity_deltas.len(),
         relation_count: change.relation_deltas.len(),
         file_count: change.tree_deltas.len(),
     }))
+}
+
+/// The change one operation record published, and the branch it published onto.
+///
+/// Two shapes, because a commit publishes in two ways and only one of them
+/// moves a ref. A commit on a branch fast-forwards the branch its head names,
+/// so the ref mutation carries both the branch and the change. A commit on a
+/// detached head moves no ref at all and advances the workspace head instead,
+/// so reading only the ref mutations would report a landed change as one that
+/// never happened. That is the one answer this lookup must never give: every
+/// caller reaching it has already lost the reply and is deciding whether to
+/// commit again.
+///
+/// Takes the two fields it reads rather than the whole record, so the decision
+/// can be exercised without building a `RepositoryOperationRecord`, which needs
+/// a real store to be meaningful. The shape it is given here is the shape the
+/// daemon writes, and `a_detached_workspace_head_advances_to_the_change_it_commits`
+/// in `kin-daemon` asserts that shape on the receipt itself, so the two sides
+/// meet at a fact one of them proved rather than at a string written twice.
+fn landed_change_in(
+    ref_mutations: &[kin_model::RefMutation],
+    new_head: Option<&kin_model::WorkspaceHead>,
+) -> Option<(Option<String>, kin_model::SemanticChangeId)> {
+    ref_mutations
+        .iter()
+        .find_map(|mutation| match mutation.new_target.as_ref() {
+            Some(kin_model::RefTarget::Change { change_id }) => {
+                Some((Some(mutation.name.to_string()), *change_id))
+            }
+            _ => None,
+        })
+        .or(match new_head {
+            Some(kin_model::WorkspaceHead::Detached {
+                target: kin_model::RefTarget::Change { change_id },
+            }) => Some((None, *change_id)),
+            _ => None,
+        })
 }
 
 /// Await `work`, printing the phases the daemon reaches while it runs.
@@ -652,10 +707,105 @@ mod tests {
         })
     }
 
+    fn change_id_fixture() -> kin_model::SemanticChangeId {
+        kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([7; 32]))
+    }
+
+    fn branch_ref_mutation(change_id: kin_model::SemanticChangeId) -> Vec<kin_model::RefMutation> {
+        vec![kin_model::RefMutation {
+            name: kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap(),
+            expected: kin_model::RefExpectation::MustNotExist,
+            new_target: Some(kin_model::RefTarget::change(change_id)),
+            policy: kin_model::RefUpdatePolicy::FastForwardOnly,
+        }]
+    }
+
+    /// The control. A commit on a branch is recovered from its ref mutation and
+    /// names the branch it moved.
+    #[test]
+    fn a_branch_commit_is_recovered_from_its_ref_mutation() {
+        let change_id = change_id_fixture();
+        assert_eq!(
+            landed_change_in(&branch_ref_mutation(change_id), None),
+            Some((Some("refs/heads/main".to_string()), change_id)),
+            "a ref mutation naming a change is the branch this commit published onto"
+        );
+    }
+
+    /// FIR-3012. A commit on a detached head moves no ref, so the only record of
+    /// where it went is the head the workspace mutation advanced. Reading only
+    /// ref mutations reported a landed change as one that never happened, to a
+    /// caller already deciding whether to commit again.
+    #[test]
+    fn a_detached_commit_is_recovered_from_the_head_it_advanced() {
+        let change_id = change_id_fixture();
+        let head = kin_model::WorkspaceHead::Detached {
+            target: kin_model::RefTarget::change(change_id),
+        };
+        assert_eq!(
+            landed_change_in(&[], Some(&head)),
+            Some((None, change_id)),
+            "a detached commit landed, and no branch names it"
+        );
+    }
+
+    /// The must-be-absent arm, so the two above are answers rather than a
+    /// function that says yes to everything. A workspace mutation that moved no
+    /// head onto a change, which is what an admission or a branch switch
+    /// records, published nothing.
+    #[test]
+    fn an_operation_that_published_no_change_is_recovered_as_nothing() {
+        let head = kin_model::WorkspaceHead::Symbolic {
+            target: kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap(),
+        };
+        assert_eq!(landed_change_in(&[], Some(&head)), None);
+        assert_eq!(landed_change_in(&[], None), None);
+    }
+
+    /// The commit line says where the change went, and on a detached head it
+    /// says so in words plus the one command that puts the work on a branch.
+    #[test]
+    fn the_commit_summary_names_a_detached_head_and_how_to_leave_it() {
+        let mut result = landed_result();
+        result.branch = None;
+        let text = render_commit_summary(&result, None);
+        assert!(
+            text.contains("on a detached HEAD"),
+            "a detached commit must say so rather than name a branch: {text}"
+        );
+        assert!(
+            !text.contains("on branch"),
+            "no branch moved, so none may be named: {text}"
+        );
+        assert!(
+            text.contains("kin branch create"),
+            "the reader is told how to put this change on a branch: {text}"
+        );
+        // The line above this one ends in "push this branch to a Kin remote".
+        // On a detached head there is no branch, so the pair has to resolve
+        // itself rather than leave a reader holding two sentences that
+        // disagree.
+        assert!(
+            text.contains("nothing to push yet"),
+            "the detached note must settle the push sentence above it: {text}"
+        );
+
+        // The control, same renderer, same fixture but for the one field.
+        let on_branch = render_commit_summary(&landed_result(), None);
+        assert!(
+            on_branch.contains("on branch 'refs/heads/main'"),
+            "a branch commit still names its branch: {on_branch}"
+        );
+        assert!(
+            !on_branch.contains("kin branch create"),
+            "a commit already on a branch is not told how to make one: {on_branch}"
+        );
+    }
+
     fn landed_result() -> DaemonCommitResult {
         DaemonCommitResult {
             change_id: "5b8ca7b7".to_string(),
-            branch: "refs/heads/main".to_string(),
+            branch: Some("refs/heads/main".to_string()),
             entity_count: 32,
             relation_count: 4,
             file_count: 1,
@@ -903,7 +1053,7 @@ mod tests {
         let summary = render_commit_summary(
             &DaemonCommitResult {
                 change_id: "9ade4452cd80".to_string(),
-                branch: "refs/heads/main".to_string(),
+                branch: Some("refs/heads/main".to_string()),
                 entity_count: 0,
                 relation_count: 0,
                 file_count: 1,
@@ -994,7 +1144,7 @@ mod tests {
     fn the_pending_line_is_added_beneath_the_summary_and_replaces_none_of_it() {
         let result = DaemonCommitResult {
             change_id: "9ade4452cd80".to_string(),
-            branch: "refs/heads/main".to_string(),
+            branch: Some("refs/heads/main".to_string()),
             entity_count: 0,
             relation_count: 0,
             file_count: 2,
