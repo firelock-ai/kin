@@ -876,6 +876,12 @@ where
             // creation record it can honestly claim to own. A receiver that
             // does own one supplies its own policy through
             // `pull_from_remote_with`, which is the path the daemon takes.
+            //
+            // The absent receiver case is the same fact a second time. A helper
+            // that cannot claim a local layout cannot claim a workspace either,
+            // and so has no case of its own to admit under. kin-db accepts that
+            // only where the shared policy has no rule sources, which is exactly
+            // the bound this helper should be held to.
             apply_repository_transfer_pack_with_pre_commit(
                 local,
                 repository_id,
@@ -883,6 +889,7 @@ where
                 actor.clone(),
                 pack,
                 &RepositoryTransferLimits::default(),
+                None,
                 || Ok(()),
             )
         },

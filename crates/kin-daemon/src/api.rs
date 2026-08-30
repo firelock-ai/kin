@@ -13805,6 +13805,45 @@ fn apply_received_repository_transfer_pack(
         .is_none()
         .then(|| state.local_kindb_capability())
         .flatten();
+    // This replica's OWN admission case, read from the overlay of the workspace
+    // this daemon pinned at startup.
+    //
+    // Which workspace is "this replica's" is the whole difficulty, and it is why
+    // the case cannot be inferred inside the transfer code. Authority is
+    // replicated, so `local_overlays` can hold overlays from several hosts with
+    // different cases: a macOS replica records `FoldAscii`, a Linux one records
+    // `Sensitive`, and both live in one authority record. Only the daemon knows
+    // which of them is its own, because it pinned that workspace id when it
+    // started rather than rediscovering it from mutable control files.
+    //
+    // The recorded case is read rather than the filesystem re-probed, and that is
+    // deliberate. `AdmissionCase` is persisted in the overlay identity so that
+    // reopen and later scans stay on one matcher; a fresh probe could disagree
+    // with the case this replica's own commits are already enforcing, and then one
+    // store would apply two rules depending on whether content arrived locally or
+    // over the wire.
+    //
+    // A daemon with no workspace overlay to read admits under `Sensitive`, and
+    // that is not a guess. `DaemonState::open_with_backend`, the hosted path,
+    // leaves `cached_workspace_id` unset, so there is no overlay; what a hosted
+    // replica actually stores artifacts in is byte-exact object storage, where two
+    // paths differing only in case are two objects. Case-sensitive matching is
+    // what that store does, so admitting under it describes this replica rather
+    // than choosing on the publisher's behalf.
+    //
+    // Passing `None` here would be the honest-looking answer and the wrong one.
+    // kin-db refuses `None` wherever the shared policy has any rule source, and
+    // one `.gitignore` rule is one source, measured. A hosted receiver claiming no
+    // case would therefore refuse every brownfield push that introduces a file,
+    // which is the defect this change exists to remove.
+    let receiver_case = Some(
+        state
+            .local_repository_workspace_id()
+            .and_then(|workspace_id| {
+                kin_remote::repository_transfer::receiver_admission_case(authority, workspace_id)
+            })
+            .unwrap_or(kin_model::AdmissionCase::Sensitive),
+    );
     kin_remote::repository_transfer::apply_repository_transfer_pack_with_pre_commit(
         authority,
         repository_id,
@@ -13812,6 +13851,7 @@ fn apply_received_repository_transfer_pack(
         actor,
         pack,
         &configured_transfer_limits(),
+        receiver_case,
         || match local_kindb {
             Some(kindb) => kindb.invalidate_for_unversioned_transfer(),
             None => Ok(()),
