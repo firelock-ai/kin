@@ -72,6 +72,7 @@ from __future__ import print_function
 
 import argparse
 import functools
+import importlib.util
 import json
 import os
 import re
@@ -525,9 +526,15 @@ CHECKS = (
 
 
 def report_payload(results):
+    # The key is `results` because that is the one `gate.py:load_report` reads.
+    # This file shipped it as `checks`, so the gate refused the report with
+    # "carries no results list" and none of the graders below was ever consulted
+    # (FIR-2985, the same class as FIR-2929 in init_budget). The self-test proves
+    # the join by handing this payload to the real loader rather than by naming
+    # the key a second time, because a string written twice drifts the same way.
     return {
         "ticket": TICKET,
-        "checks": [
+        "results": [
             {"id": result.ident, "status": result.status, "detail": result.detail}
             for result in results
         ],
@@ -635,6 +642,84 @@ ADMIT_UNMEASURED = (
 ADMIT_REFUSED = "Complete exact-tree admission failed: host entry changed\n"
 
 
+def check_the_gate_reads_this_suites_report():
+    """Hand this suite's own report to `gate.py`'s loader and require it back.
+
+    FIR-2985. This file emitted its rows under `checks` while `gate.py`'s
+    `load_report` reads `results`, so the gate refused the report with "carries
+    no results list" and every grader above went ungraded from the moment the
+    suite was wired in. The run stayed red, which is the good half, but it was
+    red for a plumbing fault wearing a product failure's clothes.
+
+    The same class had already been fixed once, in init_budget under FIR-2929,
+    and `working_copy_freshness_repro.py` already carries this exact check. It
+    is per-suite, which is precisely why the class came back here. This is that
+    proven check copied, not a new invention.
+
+    Asserting the literal key would write the string twice and drift the same
+    way. Importing the real consumer cannot: if the gate stops reading
+    `results`, or this file stops writing it, this goes red.
+
+    Returns (cases_run, broken).
+    """
+    ran = 0
+    broken = 0
+
+    def expect(name, got, want):
+        nonlocal ran, broken
+        ran += 1
+        ok = got == want
+        if not ok:
+            broken += 1
+        print("SELFTEST %s %s expected=%s got=%s"
+              % (name, "ok" if ok else "BROKEN", want, got))
+
+    gate_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.py")
+    if not os.path.exists(gate_path):
+        print("SELFTEST gate/beside BROKEN gate.py is not beside this file, "
+              "so the report shape went unchecked")
+        return 1, 1
+
+    spec = importlib.util.spec_from_file_location("acceptance_gate", gate_path)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+
+    scratch = tempfile.mkdtemp(prefix="vcs-read-surfaces-selftest-")
+    try:
+        rows = [Result(ident, UNREADABLE, "%s check raised: fabricated" % TICKET)
+                for ident, _ in CHECKS]
+        good = os.path.join(scratch, "good.json")
+        with open(good, "w") as handle:
+            json.dump(report_payload(rows), handle)
+        try:
+            loaded = gate.load_report(good)
+            expect("gate/reads-every-row", sorted(loaded),
+                   sorted(ident for ident, _ in CHECKS))
+            expect("gate/reads-a-status", loaded[CHECKS[0][0]].get("status"), UNREADABLE)
+        except Exception as exc:  # noqa: BLE001 - a refusal is the finding
+            ran += 1
+            broken += 1
+            print("SELFTEST gate/reads-every-row BROKEN the gate refused this "
+                  "suite's own report: %s" % exc)
+
+        # CONTROL: the shape that shipped must still be refused, or the two
+        # assertions above would pass over any payload at all.
+        bad = os.path.join(scratch, "bad.json")
+        with open(bad, "w") as handle:
+            json.dump({"ticket": TICKET,
+                       "checks": [{"id": ident, "status": UNREADABLE}
+                                  for ident, _ in CHECKS]}, handle)
+        try:
+            gate.load_report(bad)
+            refused = False
+        except Exception:  # noqa: BLE001 - the refusal is what is wanted
+            refused = True
+        expect("gate/CONTROL-still-refuses-the-checks-shape", refused, True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return ran, broken
+
+
 def self_test():
     """Drive every grader against a payload that must pass and one that must fail.
 
@@ -698,7 +783,9 @@ def self_test():
             failures += 1
         print("SELFTEST %s %s expected=%s got=%s %s"
               % (name, "ok" if ok else "BROKEN", expected, got, detail))
-    print("SELFTEST %d case(s), %d broken" % (len(cases), failures))
+    gate_cases, gate_broken = check_the_gate_reads_this_suites_report()
+    failures += gate_broken
+    print("SELFTEST %d case(s), %d broken" % (len(cases) + gate_cases, failures))
     return 1 if failures else 0
 
 
