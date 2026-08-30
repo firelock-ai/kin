@@ -4190,28 +4190,79 @@ mod tests {
     }
 
     fn fix_line_flags_exist() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/commands/health.rs"
-        ))
-        .expect("health.rs is readable from the crate it lives in");
+        // Every command surface, not just health.rs. The narrow scan was written
+        // for doctor's fix lines and found four more defects in that one file on
+        // its first run; three more sit in files it never read, so the scope is
+        // the whole commands directory (FIR-3009).
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/commands");
+        let mut sources: Vec<(String, String)> = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(at) = stack.pop() {
+            for entry in std::fs::read_dir(&at).expect("the commands directory is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let name = path
+                        .strip_prefix(dir)
+                        .unwrap_or(&path)
+                        .to_string_lossy()
+                        .into_owned();
+                    sources.push((
+                        name,
+                        std::fs::read_to_string(&path).expect("a readable source file"),
+                    ));
+                }
+            }
+        }
+        // A scan that reads no files passes every assertion below for the wrong
+        // reason, and the count is pinned rather than the emptiness so a walk
+        // that quietly stops descending is visible too.
+        assert!(
+            sources.len() >= 40,
+            "the walk found only {} source files under {dir}, which is too few to be reading \
+             the directory it thinks it is",
+            sources.len()
+        );
 
-        // Backticked `kin ...` spans are how every fix line names a command.
+        // Backticked `kin ...` spans are how a fix line or hint names a command.
         // Comment lines are dropped whole, before the split, because a doc
         // comment quotes commands it is not telling anyone to run: the prose
         // `kin 0.5.40` is a version and `kin health` is a surface name, and
         // grading either reports a defect that does not exist. Dropping the
         // lines rather than the spans keeps backtick parity self-consistent.
-        let graded: String = source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let mut commands: Vec<String> = Vec::new();
-        for span in graded.split('`').skip(1).step_by(2) {
-            let span = span.trim();
-            if let Some(rest) = span.strip_prefix("kin ") {
-                commands.push(rest.to_string());
+        let mut commands: Vec<(String, String)> = Vec::new();
+        for (file, source) in &sources {
+            // A Rust string literal continues across lines with a trailing
+            // backslash, which eats the newline and the next line's indent. A
+            // backticked span split that way reads as `kin \` and gets reported
+            // as a command nobody wrote, so the continuation is rejoined first.
+            let mut graded = String::with_capacity(source.len());
+            let mut continuing = false;
+            for line in source.lines() {
+                if !continuing && line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let piece = if continuing { line.trim_start() } else { line };
+                let joins = piece.ends_with('\\');
+                graded.push_str(piece.strip_suffix('\\').unwrap_or(piece));
+                if !joins {
+                    graded.push('\n');
+                }
+                continuing = joins;
+            }
+            for span in graded.split('`').skip(1).step_by(2) {
+                let span = span.trim();
+                let Some(rest) = span.strip_prefix("kin ") else {
+                    continue;
+                };
+                // A format placeholder is not a command. `kin {}` is a template
+                // whose subcommand arrives at runtime, so there is nothing here
+                // to check against clap and reporting it is a false finding.
+                if rest.contains('{') || rest.contains('}') {
+                    continue;
+                }
+                commands.push((file.clone(), rest.to_string()));
             }
         }
 
@@ -4219,15 +4270,15 @@ mod tests {
         // Pinned by count rather than by emptiness so a refactor that quietly
         // drops most of them is visible too.
         assert!(
-            commands.len() >= 10,
-            "the scan found only {} backticked `kin ...` spans in health.rs, which is too few \
-             to be reading the file it thinks it is",
+            commands.len() >= 200,
+            "the scan found only {} backticked `kin ...` spans under the commands directory, \
+             which is too few to be reading the tree it thinks it is",
             commands.len()
         );
 
         let root = Cli::command();
         let mut offenders: Vec<String> = Vec::new();
-        for command in &commands {
+        for (file, command) in &commands {
             // Walk the subcommand path, then check every flag against the
             // command that path resolved to. A word that is not a known
             // subcommand ends the path: it is a positional value, like the `.`
@@ -4256,8 +4307,8 @@ mod tests {
                         // `kin init .`, so the check does not apply there.
                         None if node.has_subcommands() => {
                             offenders.push(format!(
-                                "`kin {command}` names the subcommand {word}, which `{}` does \
-                                 not have",
+                                "{file}: `kin {command}` names the subcommand {word}, which \
+                                 `{}` does not have",
                                 node.get_name()
                             ));
                             break;
@@ -4267,10 +4318,24 @@ mod tests {
                 }
             }
             for flag in flags {
-                let known = node.get_arguments().any(|arg| arg.get_long() == Some(flag));
+                // `help` and `version` are clap's own, generated from
+                // `#[command(version = ...)]` rather than declared as fields, so
+                // they are absent from get_arguments() and a check that only
+                // walks that list calls the working `kin --version` a defect.
+                let builtin = flag == "help" || flag == "version";
+                // A long ALIAS is a real spelling of the flag: `--continue` is
+                // declared as `#[arg(long, alias = "continue")] do_continue`, so
+                // reading get_long() alone rejects a command that runs.
+                let known = builtin
+                    || node.get_arguments().any(|arg| {
+                        arg.get_long() == Some(flag)
+                            || arg
+                                .get_all_aliases()
+                                .is_some_and(|aliases| aliases.contains(&flag))
+                    });
                 if !known {
                     offenders.push(format!(
-                        "`kin {command}` names --{flag}, which `{}` does not take",
+                        "{file}: `kin {command}` names --{flag}, which `{}` does not take",
                         node.get_name()
                     ));
                 }
@@ -4279,7 +4344,7 @@ mod tests {
 
         assert!(
             offenders.is_empty(),
-            "a doctor fix line tells a user to type a command the CLI rejects:\n  {}",
+            "a user-facing string tells a user to type a command the CLI rejects:\n  {}",
             offenders.join("\n  ")
         );
     }

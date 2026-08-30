@@ -440,7 +440,7 @@ where
             original,
             format!(
                 "this repository's authority resolves to semantic change {resolved}, which the \
-                 active graph projection does not hold; run `kin status`, then `kin health` if it \
+                 active graph projection does not hold; run `kin status`, then `kin doctor` if it \
                  repeats"
             ),
         ));

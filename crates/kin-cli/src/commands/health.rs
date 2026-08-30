@@ -6588,7 +6588,7 @@ mod tests {
         );
     }
 
-    /// The failing-admission shape at the `kin health` surface. No pass is
+    /// The failing-admission shape at the `kin doctor` surface. No pass is
     /// stopped — the reconcile loop is waking, failing, and sleeping on
     /// schedule, which is exactly why the supervisor never stopped it — and the
     /// check still must not answer healthy.
