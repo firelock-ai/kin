@@ -64,6 +64,7 @@ pub mod projection;
 pub mod publish;
 pub mod purge_ignored;
 pub mod reconcile;
+pub mod ref_grammar;
 pub mod ref_lookup;
 pub mod refs;
 pub mod registry;

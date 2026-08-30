@@ -6,7 +6,7 @@ use kin_model::{
     Entity, EntityFilter, EntityId, EntityRevision, GraphStore, Hash256, SemanticChangeId,
 };
 
-use super::repository_authority::{parse_git_object_id, parse_ref_name, ActiveRepositoryAuthority};
+use super::repository_authority::ActiveRepositoryAuthority;
 
 /// A reference did not resolve through repository-v6 authority.
 #[derive(Debug)]
@@ -166,12 +166,16 @@ pub fn is_ref_resolution_error(error: &anyhow::Error) -> bool {
         .any(|cause| cause.downcast_ref::<RefResolutionError>().is_some())
 }
 
-pub(crate) fn parse_change_id(input: &str) -> Result<SemanticChangeId> {
-    Ok(SemanticChangeId::from_hash(
-        Hash256::from_hex(input).map_err(|error| anyhow!("invalid change hash: {error}"))?,
-    ))
-}
-
+/// Resolve a ref for `kin blame --ref` and `kin history --ref`.
+///
+/// The grammar itself lives in [`super::ref_grammar`], which `kin diff` calls
+/// too. Before FIR-3015 this function owned a second parser, and the two drifted
+/// until `kin history` was printing change ids `kin diff` would not take back.
+///
+/// What stays here is what is particular to these two surfaces: they answer from
+/// a graph projection the daemon holds, so a ref that resolves through authority
+/// to a change the projection does not carry is a distinct condition with its
+/// own remedy, and it is reported as one.
 pub fn resolve_ref<G>(
     graph: &G,
     binding: &kin_core::LocalRepositoryAuthorityBinding,
@@ -182,16 +186,32 @@ where
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let reference = reference.unwrap_or("HEAD");
-    if reference.contains("@{") {
+    let authority = ActiveRepositoryAuthority::open(binding).map_err(|error| {
+        ref_error(
+            reference,
+            format!("this repository's authority could not be opened: {error:#}"),
+        )
+    })?;
+    let lease = authority.manager().read_authority();
+    let resolved =
+        super::ref_grammar::resolve(&lease, graph, &authority.workspace_id, reference)
+            .map_err(|error| ref_error(reference, format!("{error:#}")))?;
+
+    if graph
+        .get_change(&resolved.change_id)
+        .map_err(|error| anyhow!(error.to_string()))?
+        .is_none()
+    {
         return Err(ref_error(
             reference,
-            "reflog/upstream '@{...}' syntax is not supported",
+            format!(
+                "this repository's authority resolves to semantic change {}, which the active \
+                 graph projection does not hold; run `kin status`, then `kin doctor` if it repeats",
+                resolved.change_id
+            ),
         ));
     }
-
-    let (core, hops) = split_relative_hops(reference)?;
-    let head = resolve_ref_core(graph, binding, reference, core)?;
-    apply_parent_hops(graph, reference, head, &hops)
+    Ok(resolved.change_id)
 }
 
 pub(crate) fn resolve_entity_query<G>(graph: &G, entity_query: &str) -> Result<Entity>
@@ -287,214 +307,6 @@ where
         .resolve_graph_at(head)
         .map_err(|error| projection_error(reference, head, error))?;
     Ok(state.entity_revisions.remove(entity_id).unwrap_or_default())
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ParentHop(usize);
-
-fn split_relative_hops(reference: &str) -> Result<(&str, Vec<ParentHop>)> {
-    let mut hops = Vec::new();
-    let mut rest = reference;
-    while let Some(&last) = rest.as_bytes().last() {
-        if last == b'^' || last == b'~' {
-            hops.push(ParentHop(1));
-            rest = &rest[..rest.len() - 1];
-            continue;
-        }
-        if last.is_ascii_digit() {
-            let digits_start = rest
-                .rfind(|character: char| !character.is_ascii_digit())
-                .map(|index| index + 1)
-                .unwrap_or(0);
-            if digits_start == 0 {
-                break;
-            }
-            let marker = rest.as_bytes()[digits_start - 1];
-            if marker != b'^' && marker != b'~' {
-                break;
-            }
-            let count: usize = rest[digits_start..]
-                .parse()
-                .map_err(|_| ref_error(reference, "parent index is out of range"))?;
-            if marker == b'^' {
-                if count == 0 {
-                    break;
-                }
-                hops.push(ParentHop(count));
-            } else {
-                hops.extend(std::iter::repeat_n(ParentHop(1), count));
-            }
-            rest = &rest[..digits_start - 1];
-            continue;
-        }
-        break;
-    }
-    Ok((rest, hops))
-}
-
-fn apply_parent_hops<G>(
-    graph: &G,
-    original: &str,
-    mut head: SemanticChangeId,
-    hops: &[ParentHop],
-) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    for hop in hops {
-        let change = graph
-            .get_change(&head)
-            .map_err(|error| anyhow!(error.to_string()))?
-            .ok_or_else(|| ref_error(original, format!("change {head} not found in history")))?;
-        head = *change.parents.get(hop.0 - 1).ok_or_else(|| {
-            ref_error(
-                original,
-                format!(
-                    "{head} has {} parent(s), no parent #{}",
-                    change.parents.len(),
-                    hop.0
-                ),
-            )
-        })?;
-    }
-    Ok(head)
-}
-
-fn resolve_ref_core<G>(
-    graph: &G,
-    binding: &kin_core::LocalRepositoryAuthorityBinding,
-    original: &str,
-    core: &str,
-) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    if let Some(change_ref) = core
-        .strip_prefix("kin:")
-        .or_else(|| core.strip_prefix("change:"))
-    {
-        return resolve_semantic_change(graph, original, change_ref);
-    }
-
-    // A full semantic change id is unambiguous when that change is present.
-    if core.len() == 64 {
-        if let Ok(change_id) = parse_change_id(core) {
-            if graph
-                .get_change(&change_id)
-                .map_err(|error| anyhow!(error.to_string()))?
-                .is_some()
-            {
-                return Ok(change_id);
-            }
-        }
-    }
-
-    let authority = ActiveRepositoryAuthority::open(binding).map_err(|error| {
-        ref_error(
-            original,
-            format!("this repository's authority could not be opened: {error:#}"),
-        )
-    })?;
-
-    let resolved = if core == "HEAD" {
-        authority
-            .current_change_id()
-            .map_err(|error| {
-                ref_error(
-                    original,
-                    format!("this workspace's head could not be read: {error:#}"),
-                )
-            })?
-            .ok_or_else(|| {
-                ref_error(
-                    original,
-                    "this workspace has no commits yet, so HEAD names nothing; make one with \
-                     `kin commit`",
-                )
-            })?
-    } else if let Some(branch_name) = core.strip_prefix("branch:") {
-        resolve_named_authority_ref(&authority, original, branch_name)?
-    } else if let Some(git_oid) = core.strip_prefix("git:") {
-        resolve_imported_git_ref(&authority, original, git_oid)?
-    } else if matches!(core.len(), 40 | 64) && core.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        resolve_imported_git_ref(&authority, original, core)?
-    } else if is_abbreviated_git_hex(core) {
-        return Err(ref_error(
-            original,
-            format!(
-                "Git commit prefix '{core}' cannot be resolved from exact alias authority; use a full object ID"
-            ),
-        ));
-    } else {
-        resolve_named_authority_ref(&authority, original, core)?
-    };
-
-    if graph
-        .get_change(&resolved)
-        .map_err(|error| anyhow!(error.to_string()))?
-        .is_none()
-    {
-        return Err(ref_error(
-            original,
-            format!(
-                "this repository's authority resolves to semantic change {resolved}, which the \
-                 active graph projection does not hold; run `kin status`, then `kin doctor` if it \
-                 repeats"
-            ),
-        ));
-    }
-    Ok(resolved)
-}
-
-fn resolve_named_authority_ref(
-    authority: &ActiveRepositoryAuthority,
-    original: &str,
-    value: &str,
-) -> Result<SemanticChangeId> {
-    let name = parse_ref_name(value)
-        .map_err(|error| ref_error(original, format!("invalid repository ref: {error:#}")))?;
-    authority
-        .resolve_named_ref(&name)
-        .map_err(|error| ref_error(original, error.to_string()))
-}
-
-fn resolve_imported_git_ref(
-    authority: &ActiveRepositoryAuthority,
-    original: &str,
-    value: &str,
-) -> Result<SemanticChangeId> {
-    let oid = parse_git_object_id(value)
-        .map_err(|error| ref_error(original, format!("invalid Git object ID: {error:#}")))?;
-    authority
-        .resolve_git_oid(&oid)
-        .map_err(|error| ref_error(original, error.to_string()))
-}
-
-fn resolve_semantic_change<G>(graph: &G, original: &str, value: &str) -> Result<SemanticChangeId>
-where
-    G: GraphStore,
-    <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
-{
-    let change_id =
-        parse_change_id(value).map_err(|error| ref_error(original, error.to_string()))?;
-    if graph
-        .get_change(&change_id)
-        .map_err(|error| anyhow!(error.to_string()))?
-        .is_some()
-    {
-        Ok(change_id)
-    } else {
-        Err(ref_error(
-            original,
-            format!("change {change_id} not found in graph authority"),
-        ))
-    }
-}
-
-fn is_abbreviated_git_hex(value: &str) -> bool {
-    (4..40).contains(&value.len()) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn choose_entity_match(mut entities: Vec<Entity>, entity_query: &str) -> Result<Entity> {
