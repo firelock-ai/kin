@@ -34720,6 +34720,7 @@ mod tests {
     /// bare again, and the three must agree. Lane vcsreads added this control to
     /// the probe that produced these assertions, and without it the pair is
     /// unfalsifiable in the same way an unmeasured fixture is.
+    #[cfg(unix)]
     fn generation_pair(state: &Arc<DaemonState>) -> (u64, u64) {
         use std::sync::atomic::Ordering::SeqCst;
         let bare = state.snapshot_generation.load(SeqCst);
@@ -34756,6 +34757,7 @@ mod tests {
     /// path the other arm already covers. `selected/compose.yaml` is written by
     /// the fixture on main and rewritten on feature, so editing it again on the
     /// active branch after the split is what makes the conflict real.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(repository_commit)]
     async fn a_merge_published_through_resolve_reaches_the_live_graph_without_a_restart() {
@@ -34964,6 +34966,7 @@ mod tests {
     /// rollback arm states: a daemon whose projection was never populated holds
     /// the change either way, so a check that publishes into an empty
     /// projection passes on the unpatched binary.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(repository_commit)]
     async fn a_published_merge_reaches_the_live_graph_without_a_restart() {
