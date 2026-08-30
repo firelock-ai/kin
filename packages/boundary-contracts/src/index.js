@@ -27,7 +27,8 @@ const schemaFiles = {
   repoScopedSemanticToolCall: 'repo-scoped-semantic-tool-call.schema.json',
   repoScopedSemanticToolResponse: 'repo-scoped-semantic-tool-response.schema.json',
   repoScopedSemanticToolError: 'repo-scoped-semantic-tool-error.schema.json',
-  shadowGateReport: 'shadow-gate-report.schema.json'
+  shadowGateReport: 'shadow-gate-report.schema.json',
+  hostedRepositoryTransfer: 'hosted-repository-transfer.schema.json'
 };
 
 const schemaIdMap = {
@@ -66,6 +67,65 @@ export async function validateContract(name, payload) {
     ok: errors.length === 0,
     errors
   };
+}
+
+/**
+ * The hosted repository-v6 transfer seam, as one literal.
+ *
+ * A caller that needs the route, the four leaves or the envelope keys reads
+ * them from here rather than spelling them again. Both replicas of this seam,
+ * the Kin client and the KinLab control plane, resolve it through this one
+ * function, so a rename in the contract moves both and a rename in either
+ * implementation fails its own test rather than a stranger's push.
+ */
+export async function hostedRepositoryTransferSeam() {
+  const schema = await loadSchema('hostedRepositoryTransfer');
+  const seam = schema?.definitions?.seam?.const;
+  if (!seam) {
+    throw new Error(
+      'hosted-repository-transfer.schema.json carries no definitions.seam.const'
+    );
+  }
+  return seam;
+}
+
+/**
+ * One leaf of that seam by name, refusing rather than returning undefined.
+ *
+ * A missing leaf is a contract that moved under a caller, which is exactly the
+ * case a silent `undefined` would carry into a request URL.
+ */
+export async function hostedRepositoryTransferLeaf(leaf) {
+  const seam = await hostedRepositoryTransferSeam();
+  const found = seam.leaves.find(candidate => candidate.leaf === leaf);
+  if (!found) {
+    throw new Error(
+      `hosted repository transfer seam serves no leaf ${leaf}; it serves ` +
+        seam.leaves.map(candidate => candidate.leaf).join(', ')
+    );
+  }
+  return found;
+}
+
+/**
+ * The org-scoped path for one leaf, with the template's own placeholders
+ * substituted and each segment encoded.
+ *
+ * Encoding is not cosmetic here: a repository id admits a slash, and an
+ * unencoded one would silently address a different route.
+ */
+export async function hostedRepositoryTransferPath(orgId, repoId, leaf) {
+  const seam = await hostedRepositoryTransferSeam();
+  await hostedRepositoryTransferLeaf(leaf);
+  for (const [name, value] of [['orgId', orgId], ['repoId', repoId]]) {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`hosted repository transfer path needs a non-empty ${name}`);
+    }
+  }
+  return seam.routeTemplate
+    .replace('{orgId}', encodeURIComponent(orgId))
+    .replace('{repoId}', encodeURIComponent(repoId))
+    .replace('{leaf}', leaf);
 }
 
 export async function assertContract(name, payload) {

@@ -632,6 +632,52 @@ export interface RepositoryTransferStatus {
   pull_apply_ready: boolean;
 }
 
+/** One advertised ref and the change it resolves to. */
+export interface RepositoryRefAdvertisementEntry {
+  name: RepositoryTransferRefName;
+  target: RepositoryTransferRefTarget;
+  head: string;
+}
+
+/**
+ * What a repository publishes before any history moves.
+ *
+ * A clone starts here: it has no ref of its own to ask about yet, so it cannot
+ * use the per-ref transfer status, and it needs the default ref before it can
+ * initialize a replica that adopts the remote layout. An unborn repository
+ * publishes a `default_ref` that is absent from `refs`, which a clone must
+ * reproduce rather than treat as an error.
+ */
+export interface RepositoryRefAdvertisement {
+  schema_version: 4;
+  protocol: "kin-repository-v6-fast-forward";
+  repository_id: string;
+  refs: RepositoryRefAdvertisementEntry[];
+  default_ref: RepositoryTransferRefName | null;
+  roots: RepositoryTransferRootBundle;
+  supported_features: string[];
+  limits: RepositoryTransferLimits;
+}
+
+/**
+ * What a sender must satisfy for the receiver to admit its pack.
+ *
+ * Derived from a transfer status by bounding the peer's declared limits with
+ * the local ones, so neither side can be made to build an envelope the other
+ * would refuse. It travels as the `expectation` member of an export request.
+ */
+export interface RepositoryTransferExpectation {
+  repository_id: string;
+  destination_ref: RepositoryTransferRefName;
+  destination_target: RepositoryTransferRefTarget | null;
+  destination_head: string | null;
+  roots: RepositoryTransferRootBundle;
+  default_ref: RepositoryTransferRefName | null;
+  git_authority_hash: string | null;
+  supported_features: string[];
+  limits: RepositoryTransferLimits;
+}
+
 export interface RepositoryTransferBody {
   hash: string;
   byte_len: number;
@@ -694,6 +740,50 @@ export interface RepositoryTransferReceipt {
     roots_after: RepositoryTransferRootBundle;
   };
 }
+
+/**
+ * One leaf of the hosted repository-v6 transfer seam, as the contract declares
+ * it. `requestKeys` is the exact top-level key set of the request body, and
+ * `responseKeys` the exact top-level key set the client deserializes.
+ */
+export interface HostedRepositoryTransferLeaf {
+  leaf: "advertise" | "status" | "export" | "receive";
+  method: "GET" | "POST";
+  requestKeys: string[];
+  responseKeys: string[];
+}
+
+export interface HostedRepositoryTransferRefusal {
+  status: number;
+  reason: string;
+}
+
+/**
+ * The hosted transfer seam a `kin push` and a `kin pull` address, and the one
+ * KinLab serves. Read it rather than spelling the route or the envelope keys
+ * again.
+ */
+export interface HostedRepositoryTransferSeam {
+  protocol: "kin-repository-v6-fast-forward";
+  schemaVersion: 4;
+  routeTemplate: string;
+  authorizationScheme: "Bearer";
+  orgScoped: true;
+  leaves: HostedRepositoryTransferLeaf[];
+  expectationKeys: string[];
+  limitsKeys: string[];
+  refusals: HostedRepositoryTransferRefusal[];
+}
+
+export declare function hostedRepositoryTransferSeam(): Promise<HostedRepositoryTransferSeam>;
+export declare function hostedRepositoryTransferLeaf(
+  leaf: string
+): Promise<HostedRepositoryTransferLeaf>;
+export declare function hostedRepositoryTransferPath(
+  orgId: string,
+  repoId: string,
+  leaf: string
+): Promise<string>;
 
 export interface RepositoryTransferPublishRequest {
   pack: RepositoryTransferPack;

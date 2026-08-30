@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/hosted-repository-transfer",
+  "description": "The one place the hosted repository-v6 transfer seam is written down. A Kin client addresses this route to push and pull against a hosted KinLab organization, and the control plane serves it. Both sides read this document rather than spelling the route, the envelope keys or the refusal codes twice.",
+  "definitions": {
+    "seam": {
+      "description": "Route, leaves and envelope keys. Held as a const so a reader gets the literal rather than a shape that would admit a renamed field.",
+      "const": {
+        "protocol": "kin-repository-v6-fast-forward",
+        "schemaVersion": 4,
+        "routeTemplate": "/api/v1/orgs/{orgId}/repos/{repoId}/transfer/{leaf}",
+        "authorizationScheme": "Bearer",
+        "orgScoped": true,
+        "remoteName": "origin",
+        "leaves": [
+          {
+            "leaf": "advertise",
+            "method": "GET",
+            "requestKeys": [],
+            "responseKeys": [
+              "schema_version",
+              "protocol",
+              "repository_id",
+              "refs",
+              "default_ref",
+              "roots",
+              "supported_features",
+              "limits"
+            ]
+          },
+          {
+            "leaf": "status",
+            "method": "POST",
+            "requestKeys": ["destination_ref"],
+            "responseKeys": [
+              "schema_version",
+              "protocol",
+              "repository_id",
+              "destination_ref",
+              "destination_target",
+              "destination_head",
+              "destination_tree_hash",
+              "roots",
+              "default_ref",
+              "git_authority_hash",
+              "supported_features",
+              "limits",
+              "push_apply_ready",
+              "bounded_envelope_export_ready",
+              "pull_apply_ready"
+            ]
+          },
+          {
+            "leaf": "export",
+            "method": "POST",
+            "requestKeys": ["source_ref", "expectation"],
+            "responseKeys": [
+              "schema_version",
+              "protocol",
+              "transfer_id",
+              "operation_id",
+              "repository_id",
+              "source_ref",
+              "destination_ref",
+              "source_head",
+              "transfer_target_head",
+              "source_tree_hash",
+              "expected_destination_target",
+              "expected_destination_head",
+              "expected_destination_roots",
+              "expected_destination_default_ref",
+              "source_git_authority_hash",
+              "expected_destination_git_authority_hash",
+              "git_authority_bootstrap",
+              "required_features",
+              "changes",
+              "trees",
+              "external_objects",
+              "aliases",
+              "bodies"
+            ]
+          },
+          {
+            "leaf": "receive",
+            "method": "POST",
+            "requestKeys": ["destination_ref", "pack"],
+            "responseKeys": [
+              "schema_version",
+              "protocol",
+              "transfer_id",
+              "repository_id",
+              "destination_ref",
+              "destination_head",
+              "outcome",
+              "authority_receipt"
+            ]
+          }
+        ],
+        "expectationKeys": [
+          "repository_id",
+          "destination_ref",
+          "destination_target",
+          "destination_head",
+          "roots",
+          "default_ref",
+          "git_authority_hash",
+          "supported_features",
+          "limits"
+        ],
+        "limitsKeys": [
+          "max_changes",
+          "max_trees",
+          "max_bodies",
+          "max_external_objects",
+          "max_aliases",
+          "max_decoded_body_bytes",
+          "max_single_body_bytes"
+        ],
+        "refusals": [
+          {
+            "status": 401,
+            "reason": "no session, or a session this seam does not accept"
+          },
+          {
+            "status": 403,
+            "reason": "the session is not a member of the organization, the repository is not readable by it, or a write the branch protection refuses"
+          },
+          {
+            "status": 404,
+            "reason": "the organization or the repository is not served here"
+          },
+          {
+            "status": 409,
+            "reason": "a repository-v6 lease or fast-forward conflict"
+          },
+          {
+            "status": 413,
+            "reason": "the envelope is larger than the declared transfer body limit"
+          },
+          {
+            "status": 422,
+            "reason": "the envelope is not a valid repository-v6 payload"
+          },
+          {
+            "status": 424,
+            "reason": "the seam is intact and the repository authority behind it failed"
+          }
+        ]
+      }
+    },
+    "refusal": {
+      "description": "Every refusal body on this seam. The client renders `error` verbatim, so this string is the sentence a user reads.",
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "string",
+          "minLength": 1
+        },
+        "apiVersion": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

@@ -985,6 +985,34 @@ jobs:
       # one. The wrapper routes its own failures by event: hard for anything
       # reaching release machinery, for the release pull request, for a push and
       # for a diff it cannot read, and a warning annotation otherwise.
+      - name: Boundary contract tests
+        # packages/boundary-contracts holds the wire contracts both sides of a
+        # boundary read, and until now no workflow ran its suite: the tests
+        # existed and no required context could report them, which is a guard
+        # that cannot fail. The hosted transfer seam is asserted there against
+        # the Rust authority and the TypeScript declarations at once, so the
+        # suite has to run where a pull request can go red.
+        #
+        # The exit code is the verdict. The pass count is only a floor, so a
+        # suite that silently graded nothing cannot report the same green a
+        # clean run reports; it moves only when tests are REMOVED.
+        working-directory: packages/boundary-contracts
+        run: |
+          node --check src/index.js
+          node --check test/contracts.test.js
+          if out=$(node --test 2>&1); then status=0; else status=$?; fi
+          printf '%s\n' "$out"
+          if [ "$status" -ne 0 ]; then
+            echo "boundary-contracts suite failed with status $status" >&2
+            exit 1
+          fi
+          passed=$(printf '%s\n' "$out" | sed -n 's/^# pass \([0-9][0-9]*\)$/\1/p')
+          if [ -z "$passed" ] || [ "$passed" -lt 7 ]; then
+            echo "boundary-contracts reported '$passed' passing tests, below the 7 it carries" >&2
+            exit 1
+          fi
+          echo "boundary-contracts: $passed tests passed"
+
       - name: Validate automatic release policy
         env:
           GH_TOKEN: ${{ github.token }}
