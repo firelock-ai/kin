@@ -38185,7 +38185,26 @@ mod tests {
         let result: kin_cli::commands::search::DaemonSearchResponse =
             serde_json::from_slice(&body).unwrap();
 
-        assert!(result.records.is_empty(), "the query must match nothing");
+        // FIR-2918. This assertion used to read `records.is_empty()`, and it
+        // held for the wrong reason: the fixture's lexical index was never
+        // committed, so every query returned nothing. Now that the query path
+        // brings the index current, the disjunctive fallback answers with the
+        // index's NEAREST document rather than a match, measured here as
+        // `definitelyNoSuchSymbol` retrieving `present` at 0.45 because `def`
+        // occurs in `def present()` and is a substring of `definitely`, over a
+        // corpus holding no token of the query.
+        //
+        // So the property this test is about is unchanged and is now stated
+        // directly: nothing matched BY NAME. `text_fallback` is the product's
+        // own name for that, and it is true only when the answer is non-empty
+        // and every row is a fallback row. The qualifier assertions below are
+        // untouched, and they are what this test exists for; making them survive
+        // a labelled-fallback answer is the fix this change carries.
+        assert!(
+            result.text_fallback,
+            "nothing may match this query by name; an answer with a name match would make the \
+             qualifier assertions below vacuous: {result:?}"
+        );
         let qualifier = result.absence_qualifier.join(" ");
         assert!(
             qualifier.contains("Kin cannot rule out"),

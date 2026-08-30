@@ -585,7 +585,24 @@ pub fn collect_daemon_search_response(
         .iter()
         .map(|matched| record_to_daemon_record(&matched.record, matched.match_kind, matched.score))
         .collect::<Vec<_>>();
-    let absence_qualifier = if records.is_empty() {
+    // An all-fallback answer is an absence, and it has to qualify like one.
+    //
+    // The rows below the name matches are the index's NEAREST documents, not
+    // matches: `collect_search_results` says so in its own comment, and BM25 is
+    // disjunctive, so a query token that occurs nowhere can still retrieve a
+    // document through a substring of itself. Measured on this fixture:
+    // `definitelyNoSuchSymbol` retrieves `present` at 0.45 because `def` occurs
+    // in `def present()` and is a substring of `definitely`, over a corpus where
+    // no token of the query occurs at all.
+    //
+    // Qualifying only on `records.is_empty()` therefore silenced the disclosure
+    // exactly when the fallback produced a row, which is the common case once
+    // the index is populated: a stranger on a degraded daemon got a nearest
+    // document and no word about the degradation. `text_fallback` is already the
+    // product's own name for "nothing matched by name", so the absence gate
+    // reads it too, and a single name match still carries no qualifier, which
+    // the sibling control asserts.
+    let absence_qualifier = if records.is_empty() || text_fallback {
         search_absence_qualifier(graph, envelope, &lexical)
     } else {
         Vec::new()
