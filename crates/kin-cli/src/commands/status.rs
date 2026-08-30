@@ -1179,7 +1179,9 @@ pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmissi
     let Some(base_url) = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await
     else {
         return StatusAdmission::Skipped(
-            "no daemon is running for this repository, so nothing admitted the working copy and              this reports durable authority alone; `kin admit` takes what the working copy holds"
+            "no daemon is running for this repository, so nothing admitted the working copy \
+             and this reports durable authority alone; `kin admit` takes what the working \
+             copy holds"
                 .to_string(),
         );
     };
@@ -1196,8 +1198,8 @@ pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmissi
             Ok(actor) => actor,
             Err(error) => {
                 return StatusAdmission::Skipped(format!(
-                    "this store cannot name an author for an admission ({}), so nothing admitted                      the working copy",
-                    crate::core::error::cause_first(&error)
+                    "this store cannot name an author for an admission ({error}), so nothing \
+                     admitted the working copy"
                 ))
             }
         },
@@ -1208,22 +1210,25 @@ pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmissi
             // it as one would put the whole defect back, one layer down.
             Some(report) if report.admitted => StatusAdmission::Took(Box::new(report)),
             Some(report) => StatusAdmission::Skipped(format!(
-                "the admission of the working copy failed ({}), so what follows describes graph                  truth from before it",
+                "the admission of the working copy failed ({}), so what follows describes graph \
+                 truth from before it",
                 report.failure.as_deref().unwrap_or("no cause recorded")
             )),
             None => StatusAdmission::Skipped(
-                "this repository's daemon answered the admission with no report, so whether the                  working copy was admitted is unknown"
+                "this repository's daemon answered the admission with no report, so whether the \
+                 working copy was admitted is unknown"
                     .to_string(),
             ),
         },
         crate::daemon_client::AdmitDispatch::Refused(error) => StatusAdmission::Skipped(format!(
-            "this repository's daemon refused to admit the working copy ({})",
-            crate::core::error::cause_first(&error)
+            "this repository's daemon refused to admit the working copy ({error})"
         )),
-        crate::daemon_client::AdmitDispatch::Unanswered(error) => StatusAdmission::Skipped(format!(
-            "the admission of the working copy did not answer ({}), so whether it ran is unknown",
-            crate::core::error::cause_first(&error)
-        )),
+        crate::daemon_client::AdmitDispatch::Unanswered(error) => {
+            StatusAdmission::Skipped(format!(
+                "the admission of the working copy did not answer ({error}), so whether it ran is \
+             unknown"
+            ))
+        }
     }
 }
 
