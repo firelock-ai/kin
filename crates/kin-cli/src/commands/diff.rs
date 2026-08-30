@@ -1229,10 +1229,16 @@ fn load_side(
 
 /// Render two bodies as unified hunks.
 ///
+/// `pub(crate)` because `kin conflicts` renders each conflict side's
+/// re-materialized body with THIS function rather than a second one. One
+/// renderer for diff and conflicts is what keeps the two surfaces from drifting,
+/// and a conflict body rendered differently from a diff body is a difference a
+/// reader would have to learn rather than read.
+///
 /// THE one renderer. The JSON hunks and the text surface both come from here, so
 /// the two cannot drift into disagreeing about what changed, which is the whole
 /// reason this is a function and not two call sites.
-fn render_hunks(old: Option<&str>, new: Option<&str>) -> Vec<String> {
+pub(crate) fn render_hunks(old: Option<&str>, new: Option<&str>) -> Vec<String> {
     let old = old.unwrap_or("");
     let new = new.unwrap_or("");
     if old == new {
