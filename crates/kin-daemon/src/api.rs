@@ -34711,6 +34711,324 @@ mod tests {
         assert_eq!(carried[0].content_hash, approved_digest);
     }
 
+    /// A published MERGE must reach the live graph too, by the same contract
+    /// and with the same three guards as the rollback arm below.
+    ///
+    /// Its own arm rather than a second assertion in that one, because the two
+    /// publications reach the live graph through different code: kin#1287
+    /// installs on both merge publish paths, `publish` and
+    /// `publish_resolved_merge`, and this drives the first. A single arm
+    /// covering both would go red without saying which path regressed.
+    ///
+    /// The precondition is proved rather than assumed for the reason the
+    /// rollback arm states: a daemon whose projection was never populated holds
+    /// the change either way, so a check that publishes into an empty
+    /// projection passes on the unpatched binary.
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_published_merge_reaches_the_live_graph_without_a_restart() {
+        let (state, _layout, repository, _base_change, _feature_change) =
+            universal_branch_test_state("merge-live-graph");
+        let app = router(Arc::clone(&state));
+
+        // Diverge the active branch AFTER the split, so the merge must author a
+        // merge change rather than fast-forwarding. Without this the merge moves
+        // the ref onto the feature change, publishes nothing, and every
+        // assertion below passes on a binary with the install removed: measured,
+        // this arm survived all three mutations of the merge-side installs until
+        // the divergence was added.
+        std::fs::write(
+            repository.join("selected/diverge.txt"),
+            b"a change on the active branch after the split\n",
+        )
+        .unwrap();
+        let main_change = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "diverge the active branch so the merge is not a fast-forward",
+        )
+        .await;
+
+        // PRECONDITION, proved: this daemon's projection is populated before the
+        // publication. A failure here is NOT a verdict on the property.
+        state
+            .graph
+            .resolve_graph_at(&main_change)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOT RUN, precondition unmet rather than property refuted: the projection \
+                     could not replay to the pre-merge change, so publishing into it proves \
+                     nothing: {error}"
+                )
+            });
+
+        let backend = state.local_repository_backend().unwrap();
+        let repository_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .repository_id()
+            .clone();
+        let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        // CONTROL: two reads with no publication between must be the SAME, or
+        // the comparison below cannot be evidence that a publication moved it.
+        let identity_again = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before == identity_again,
+            "the publication identity differs between two reads with no publication between them"
+        );
+
+        let request = kin_cli::commands::merge::MergeRequest {
+            source: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("merge-live-graph-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the merge must publish for this arm to grade anything: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let published = branch_change(&state);
+        assert_ne!(
+            published, main_change,
+            "the merge must move the branch off its pre-merge change, or nothing was published \
+             and the assertions below would grade an unchanged store"
+        );
+        // A FAST-FORWARD moves the ref onto an existing change and publishes
+        // nothing, so every assertion below would pass on an unpatched binary
+        // for a change that was already in the graph. This arm grades nothing
+        // unless a genuine merge change was authored, and the tell is that the
+        // published change is neither side's tip and carries both as parents.
+        assert_ne!(
+            published, _feature_change,
+            "NOT RUN, precondition unmet: the merge fast-forwarded onto the feature change rather \
+             than authoring a merge change, so nothing was published and this arm cannot see the \
+             defect it exists for"
+        );
+        // The property assertion comes FIRST, because it owns the absence. An
+        // earlier read that mapped a missing change onto a parent count of zero
+        // reported this defect as "not a merge change", which is a precondition
+        // refusal wearing the property's clothes: measured, the install-removed
+        // arms failed here saying the publication was the wrong KIND when the
+        // truth is the change is missing from the graph. Never map a failed read
+        // onto a value a real answer could take.
+        //
+        // It also goes through the LIVE projection rather than an
+        // authority-backed surface: `kin log` and `kin status` answered rc=0 on
+        // the unpatched binary throughout, so a check reading only those would
+        // pass on both builds. The split is the whole tell.
+        let held = state.graph.get_change(&published).unwrap().expect(
+            "the live graph does not hold the change the merge just published, so every read \
+                 that replays the graph to it fails until the daemon restarts; authority holds it \
+                 and the derived query view does not",
+        );
+        // Only now, on a change the graph actually holds, is the KIND readable.
+        assert_eq!(
+            held.parents.len(),
+            2,
+            "NOT RUN, precondition unmet: the published change carries {} parent(s) rather than \
+             two, so it is not a merge change and this arm graded a publication of a different \
+             kind",
+            held.parents.len()
+        );
+
+        // The assertion this arm exists for. No restart between publication and
+        // this read, and it goes through the LIVE projection rather than an
+        // authority-backed surface: `kin log` and `kin status` answered rc=0 on
+        // the unpatched binary throughout, so a check reading only those would
+        // pass on both builds. The split is the whole tell.
+        state
+            .graph
+            .resolve_graph_at(&published)
+            .expect("a graph holding the published merge change must replay to it");
+
+        // OVER-INVALIDATION guard: discarding the projection would satisfy every
+        // assertion above while destroying what it already held.
+        state.graph.resolve_graph_at(&main_change).expect(
+            "the graph can no longer replay to a change it held before the merge, so the \
+             projection was discarded rather than added to",
+        );
+
+        let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before != identity_after,
+            "the publication identity did not move across a merge publication, so every authority \
+             slot keyed on it stays valid across the merge and concurrent readers admit against \
+             pre-merge roots"
+        );
+    }
+
+    /// A published rollback must reach the LIVE graph, not only durable
+    /// authority, without restarting the daemon.
+    ///
+    /// The transaction publishes an inverse change to repository authority and
+    /// the in-process graph is a derived query view over it. This path
+    /// published and never installed, so `graph.get_change` returned `None` for
+    /// a change the authority resolved, and every read that replays the graph
+    /// to it failed until a restart rebuilt the graph from authority. A further
+    /// commit did not heal it, because a commit installs its OWN change and not
+    /// the missing one.
+    ///
+    /// The daemon here has LIVED THROUGH the publications, which is the
+    /// condition that makes the defect visible: this one `state` performs the
+    /// commits and then the rollback, exactly as a running daemon does. A fresh
+    /// state built after the publication rebuilds its graph from authority and
+    /// therefore holds the change either way, which is why the original report
+    /// did not reproduce on its first attempt against a new daemon.
+    ///
+    /// The reads that already worked are asserted too. They answer from
+    /// authority rather than by replaying the graph, so a fix that invalidated
+    /// the projection instead of installing into it could break them while
+    /// leaving this test's first assertion green.
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_published_rollback_reaches_the_live_graph_without_a_restart() {
+        let state = test_state();
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+        std::fs::create_dir_all(root.join("notekeeper")).unwrap();
+
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return 1\n",
+        )
+        .unwrap();
+        let restored =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish the base").await;
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return 2\n",
+        )
+        .unwrap();
+        let regression =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
+        assert_eq!(branch_change(&state), regression);
+
+        // PRECONDITION, proved rather than assumed: this daemon's projection is
+        // populated BEFORE the publication. That is the condition the defect
+        // needs, and a check that publishes into an empty projection passes on
+        // the unpatched binary, which is the single most likely way this test
+        // could fail to fail. Forcing a graph-replaying read here both creates
+        // the state and records that it existed.
+        //
+        // A failure HERE is not a verdict on the property. It says the fixture
+        // never reached the state under test, and its message says so, because
+        // a precondition red and a property red are different news and a reader
+        // of a stack trace cannot tell them apart from the line number alone.
+        state
+            .graph
+            .resolve_graph_at(&regression)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOT RUN, precondition unmet rather than property refuted: this daemon's \
+                     graph could not replay to the change it just published, so the projection \
+                     was never populated and publishing into it proves nothing: {error}"
+                )
+            });
+
+        let backend = state.local_repository_backend().unwrap();
+        let repository_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .repository_id()
+            .clone();
+        let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        // CONTROL for the comparison below: read the identity twice with no
+        // publication between and require it to be the SAME. Without this, an
+        // identity that differed on every read would make the across-publication
+        // assertion pass while proving nothing about publications.
+        let identity_again = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before == identity_again,
+            "the publication identity differs between two reads with no publication between them, \
+             so it cannot be evidence that a publication moved it"
+        );
+        let loads_before = state.projection_authority.loads();
+
+        let (status, body) =
+            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+        assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
+
+        let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let _ = loads_before;
+
+        let published = branch_change(&state);
+        assert_ne!(
+            published, regression,
+            "the rollback must move the branch off the regression"
+        );
+
+        // MEASUREMENT, recorded in the test rather than in a report: does the
+        // publication identity that `ProjectionAuthorityCache` keys on actually
+        // MOVE across a publication that never calls
+        // `record_repository_authority_commit`?
+        //
+        // Neither this path nor the merge paths call it, so `snapshot_generation`
+        // does not advance across either. The cache does not key on that
+        // counter: `LocalPublicationIdentity::Published` is the SHA-256 of the
+        // durable publication record's bytes, so it moves whenever the record
+        // is rewritten, whatever the in-memory counter did. If it did NOT move,
+        // an admission pair cached before this publication would stay valid
+        // after it and every concurrent task would admit against pre-publication
+        // roots, which is a defect in the cache rather than in this path.
+        // `assert!` rather than `assert_ne!`: the identity is deliberately not
+        // `Debug`, since printing a publication digest into a panic is not
+        // something a test should teach the type to allow.
+        assert!(
+            identity_before != identity_after,
+            "the publication identity did not move across a publication, so every authority slot \
+             keyed on it stays valid across the change and concurrent readers admit against \
+             pre-publication roots"
+        );
+
+        // The assertion this test exists for. No restart between the
+        // publication and this read.
+        assert!(
+            state.graph.get_change(&published).unwrap().is_some(),
+            "the live graph does not hold the change the rollback just published, so every read \
+             that replays the graph to it fails until the daemon restarts; authority holds it and \
+             the derived query view does not"
+        );
+
+        // The reads that already answered must still answer. `resolve_graph_at`
+        // is what a graph-replaying read does, and the branch change is what
+        // the authority resolves to.
+        state
+            .graph
+            .resolve_graph_at(&published)
+            .expect("a graph holding the published change must replay to it");
+
+        // OVER-INVALIDATION guard, and it is the assertion a fix of the wrong
+        // shape fails. Installing into the projection is one way to close this
+        // defect; discarding the projection so the next read rebuilds is
+        // another, and it would satisfy every assertion above while destroying
+        // the changes the projection already held. Lane vcsreads measured which
+        // reads keep working across the unpatched defect (`kin log`,
+        // `kin diff <change> HEAD`, `kin status`, `kin graph status`, all
+        // resolving the change fine while blame and history cannot), and
+        // nothing guarded them. This is their equivalent one layer down: the
+        // PRE-publication change must still replay after the publication.
+        state.graph.resolve_graph_at(&regression).expect(
+            "the graph can no longer replay to a change it held before this publication, so \
+                 the projection was discarded rather than added to and every read that worked \
+                 across the original defect now fails",
+        );
+    }
+
     /// An operation id is matched before any history validation runs, and an
     /// ordinary commit publishes the same receipt shape a rollback does. Only
     /// the restored content separates them, so reusing a commit's operation id
