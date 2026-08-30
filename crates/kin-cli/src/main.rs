@@ -2708,7 +2708,7 @@ fn main() -> Result<()> {
                         .await
                     }
                 },
-                Command::Diff { base, head, json } => commands::diff::run(base, head, json),
+                Command::Diff { base, head, json } => commands::diff::run(base, head, json).await,
                 Command::Eject { yes } => commands::eject::run(yes).await,
                 Command::Impact {
                     entity,
