@@ -2178,7 +2178,9 @@ fn open_conflicted_merge(
          transaction {} (authority generation {})",
         request.source, plan.target_ref, conflict_count, record.hash, receipt.generation
     )];
-    lines.extend(render_conflict_lines(&record));
+    lines.extend(render_conflict_lines(
+        &record.unresolved().collect::<Vec<_>>(),
+    ));
     lines.push(
         "Settle each conflict with `kin resolve`, then `kin resolve --continue`, or discard the \
          merge with `kin resolve --abort`"
@@ -2234,19 +2236,81 @@ pub(crate) fn restore_point(workspace: &WorkspaceState) -> MergeWorkspaceRestore
     }
 }
 
+/// The order a READER can act on, which is not the order the record stores.
+///
+/// A record sorts its entries by subject so its identity is stable whichever
+/// order a composer found them in, and that order is Entity, Relation,
+/// Artifact, Path. Presenting it verbatim spends the whole budget on the rows
+/// that name least. Measured on the rc062a stranger's merge, 22 entity rows and
+/// 3 relation rows filled all 25 lines and the two artifact rows, the only rows
+/// naming a file a reader can open, were never printed at all. The 52 relation
+/// rows that crowded them out carry a bare identity and nothing else, because
+/// the relation composition passes no label.
+///
+/// So a listing leads with location and narrows from there: a contested path,
+/// then the artifacts, then the entities, then the relations. Ranked by name
+/// rather than by reversing the declaration order, so a new subject variant is
+/// a deliberate edit here rather than a silent reordering of every listing.
+fn presentation_rank(subject: &MergeConflictSubject) -> u8 {
+    match subject {
+        MergeConflictSubject::Path { .. } => 0,
+        MergeConflictSubject::Artifact { .. } => 1,
+        MergeConflictSubject::Entity { .. } => 2,
+        MergeConflictSubject::Relation { .. } => 3,
+    }
+}
+
+/// The word a listing uses for one subject's kind, so a truncation can say what
+/// it dropped in the same vocabulary the rows themselves use.
+fn subject_kind(subject: &MergeConflictSubject) -> &'static str {
+    match subject {
+        MergeConflictSubject::Path { .. } => "path",
+        MergeConflictSubject::Artifact { .. } => "artifact",
+        MergeConflictSubject::Entity { .. } => "entity",
+        MergeConflictSubject::Relation { .. } => "relation",
+    }
+}
+
+/// Name what a truncation dropped, by kind and count.
+///
+/// A total alone says the listing is incomplete and not whether the part a
+/// reader needs is in it. "51 further conflict(s)" reads the same whether the
+/// elided rows are 51 relations or the two files the merge touched.
+fn elided_summary(elided: &[&MergeConflictEntry]) -> String {
+    let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for entry in elided {
+        *counts.entry(subject_kind(&entry.subject)).or_default() += 1;
+    }
+    counts
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Name the first conflicts individually and state the total, so a listing
 /// never reads as complete when it is truncated.
-pub(crate) fn render_conflict_lines(record: &MergeTransactionRecord) -> Vec<String> {
-    let unresolved: Vec<&MergeConflictEntry> = record.unresolved().collect();
-    let mut lines: Vec<String> = unresolved
+///
+/// Takes the unresolved set rather than the record so the function a caller
+/// reaches is the function these tests grade, with no thin wrapper in between
+/// that could stop delegating without anything going red.
+pub(crate) fn render_conflict_lines(unresolved: &[&MergeConflictEntry]) -> Vec<String> {
+    let mut ordered: Vec<&MergeConflictEntry> = unresolved.to_vec();
+    // Stable, so the record's own canonical order still decides ties inside one
+    // rank and two runs over one record produce one listing.
+    ordered.sort_by_key(|entry| presentation_rank(&entry.subject));
+    let mut lines: Vec<String> = ordered
         .iter()
         .take(RENDERED_CONFLICT_LIMIT)
         .map(|entry| format!("  - {}", render_entry(entry)))
         .collect();
-    if unresolved.len() > RENDERED_CONFLICT_LIMIT {
+    if ordered.len() > RENDERED_CONFLICT_LIMIT {
         lines.push(format!(
-            "  - ... and {} further conflict(s) not listed",
-            unresolved.len() - RENDERED_CONFLICT_LIMIT
+            "  - ... and {} further conflict(s) not listed ({}); `kin conflicts --json` carries \
+             all {}",
+            ordered.len() - RENDERED_CONFLICT_LIMIT,
+            elided_summary(&ordered[RENDERED_CONFLICT_LIMIT..]),
+            ordered.len()
         ));
     }
     lines
@@ -2510,6 +2574,191 @@ mod tests {
             render_artifact(&artifact),
             format!("{artifact:?}"),
             "the wrapper debug form is not what the record serializes"
+        );
+    }
+
+    /// One unresolved entry of each kind, labelled the way each composition
+    /// labels it: an entity by name and file, an artifact by path, a relation by
+    /// nothing at all, which is what the relation composition passes.
+    fn entry_of(kind: &str, index: usize) -> MergeConflictEntry {
+        let (subject, label) = match kind {
+            "path" => (
+                MergeConflictSubject::Path {
+                    path: RepoPath::from_utf8(&format!("docs/note{index}.md")).unwrap(),
+                },
+                Some(format!("docs/note{index}.md")),
+            ),
+            "artifact" => (
+                MergeConflictSubject::Artifact {
+                    artifact: ArtifactId::new(),
+                },
+                Some(format!("ledger/file{index}.py")),
+            ),
+            "entity" => (
+                MergeConflictSubject::Entity {
+                    entity: kin_model::EntityId::new(),
+                },
+                Some(format!("symbol{index} in ledger/file0.py")),
+            ),
+            "relation" => (
+                MergeConflictSubject::Relation {
+                    relation: RelationId::new(),
+                },
+                None,
+            ),
+            other => panic!("no such subject kind: {other}"),
+        };
+        let divergence = match &subject {
+            MergeConflictSubject::Path { .. } => MergeDivergence::PathCollision {
+                artifacts: vec![ArtifactId::new(), ArtifactId::new()],
+            },
+            _ => MergeDivergence::ChangedBothSides,
+        };
+        MergeConflictEntry {
+            subject,
+            divergence,
+            base: MergeSideValue::Absent,
+            ours: MergeSideValue::Absent,
+            theirs: MergeSideValue::Absent,
+            label,
+            resolution: MergeEntryResolution::Unresolved,
+        }
+    }
+
+    /// The shape the rc062a stranger's merge actually had: one edited function
+    /// producing 22 entity conflicts, 52 relation conflicts and 2 artifact
+    /// conflicts. Built in the record's own canonical subject order, Entity,
+    /// Relation, Artifact, Path, because that is the order a listing receives.
+    fn stranger_conflict_shape() -> Vec<MergeConflictEntry> {
+        let mut entries = Vec::new();
+        for index in 0..22 {
+            entries.push(entry_of("entity", index));
+        }
+        for index in 0..52 {
+            entries.push(entry_of("relation", index));
+        }
+        for index in 0..2 {
+            entries.push(entry_of("artifact", index));
+        }
+        entries
+    }
+
+    /// The rows that name a file a reader can open have to survive the budget.
+    ///
+    /// On the stranger's own merge they did not: entries arrive in canonical
+    /// subject order, artifacts sort last, and 22 entity rows plus 3 relation
+    /// rows filled all 25 lines before either artifact row was reached. The
+    /// listing named 76 conflicts and not one of the files they were in.
+    #[test]
+    fn a_listing_leads_with_the_rows_that_name_a_file() {
+        let entries = stranger_conflict_shape();
+        let borrowed: Vec<&MergeConflictEntry> = entries.iter().collect();
+        let lines = render_conflict_lines(&borrowed);
+
+        let named: Vec<&String> = lines
+            .iter()
+            .filter(|line| line.contains("artifact "))
+            .collect();
+        assert_eq!(
+            named.len(),
+            2,
+            "both artifact rows are listed rather than elided: {lines:#?}"
+        );
+        // And they lead, rather than merely appearing somewhere inside the
+        // budget: a build that sorted them to positions 24 and 25 would satisfy
+        // the count above while still burying them.
+        assert!(
+            lines[0].contains("artifact ") && lines[1].contains("artifact "),
+            "the artifact rows come first: {:?}",
+            &lines[..3]
+        );
+    }
+
+    /// A truncation states a total, and a total alone cannot say whether the
+    /// part a reader needs is in the listing. "51 further conflict(s)" reads the
+    /// same whether the elided rows are 51 relations or the two files the merge
+    /// touched.
+    #[test]
+    fn a_listing_names_what_the_truncation_dropped() {
+        let entries = stranger_conflict_shape();
+        let borrowed: Vec<&MergeConflictEntry> = entries.iter().collect();
+        let lines = render_conflict_lines(&borrowed);
+
+        let tail = lines.last().expect("a truncated listing has a tail line");
+        assert!(
+            tail.contains("further conflict(s) not listed"),
+            "the tail states the truncation: {tail}"
+        );
+        assert!(
+            tail.contains("51 further"),
+            "the tail states how many were dropped, out of 76: {tail}"
+        );
+        assert!(
+            tail.contains("51 relation"),
+            "the tail names WHAT was dropped, which here is relations only: {tail}"
+        );
+        assert!(
+            !tail.contains("artifact"),
+            "no artifact row was dropped, so the tail must not claim one was: {tail}"
+        );
+        assert!(
+            tail.contains("--json"),
+            "the tail names the surface carrying the rest: {tail}"
+        );
+    }
+
+    /// Ranked by what a reader can act on, across all four subject kinds at
+    /// once. Written as the whole order rather than one pair, because a rank
+    /// that swapped two adjacent kinds would pass any single-pair assertion.
+    #[test]
+    fn a_listing_orders_by_what_a_reader_can_act_on() {
+        let entries = vec![
+            entry_of("relation", 0),
+            entry_of("entity", 0),
+            entry_of("artifact", 0),
+            entry_of("path", 0),
+        ];
+        let borrowed: Vec<&MergeConflictEntry> = entries.iter().collect();
+        let lines = render_conflict_lines(&borrowed);
+        let kinds: Vec<&str> = lines
+            .iter()
+            .map(|line| {
+                for kind in ["path", "artifact", "entity", "relation"] {
+                    if line.contains(&format!("  - {kind} ")) {
+                        return kind;
+                    }
+                }
+                panic!("a listing line names no subject kind: {line}");
+            })
+            .collect();
+        assert_eq!(kinds, vec!["path", "artifact", "entity", "relation"]);
+    }
+
+    /// The control. A listing that elides nothing must say nothing about
+    /// eliding, or every merge with three conflicts reads as truncated. Without
+    /// this, a build that always appended a tail line would satisfy the two
+    /// truncation assertions above.
+    #[test]
+    fn a_small_listing_elides_nothing_and_adds_no_tail() {
+        let entries = vec![
+            entry_of("entity", 0),
+            entry_of("artifact", 0),
+            entry_of("relation", 0),
+        ];
+        let borrowed: Vec<&MergeConflictEntry> = entries.iter().collect();
+        let lines = render_conflict_lines(&borrowed);
+        assert_eq!(
+            lines.len(),
+            3,
+            "one line per conflict and nothing else: {lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("not listed")),
+            "nothing is elided, so nothing claims to be: {lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|line| !line.contains("--json")),
+            "no truncation, so no pointer at the surface carrying the rest: {lines:#?}"
         );
     }
 
