@@ -4181,8 +4181,18 @@ mod tests {
         .expect("health.rs is readable from the crate it lives in");
 
         // Backticked `kin ...` spans are how every fix line names a command.
+        // Comment lines are dropped whole, before the split, because a doc
+        // comment quotes commands it is not telling anyone to run: the prose
+        // `kin 0.5.40` is a version and `kin health` is a surface name, and
+        // grading either reports a defect that does not exist. Dropping the
+        // lines rather than the spans keeps backtick parity self-consistent.
+        let graded: String = source
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let mut commands: Vec<String> = Vec::new();
-        for span in source.split('`').skip(1).step_by(2) {
+        for span in graded.split('`').skip(1).step_by(2) {
             let span = span.trim();
             if let Some(rest) = span.strip_prefix("kin ") {
                 commands.push(rest.to_string());
@@ -4218,8 +4228,25 @@ mod tests {
                     continue;
                 }
                 if flags.is_empty() {
-                    if let Some(next) = node.find_subcommand(word) {
-                        node = next;
+                    match node.find_subcommand(word) {
+                        Some(next) => node = next,
+                        // A node that HAS subcommands expects one, so an
+                        // unknown word there is a command that does not exist
+                        // rather than a positional value. Checking only flags
+                        // would pass `kin daemon zzz` silently, which is the
+                        // same defect this guard exists for wearing a
+                        // subcommand instead of a flag. A node with no
+                        // subcommands takes positionals, like the `.` in
+                        // `kin init .`, so the check does not apply there.
+                        None if node.has_subcommands() => {
+                            offenders.push(format!(
+                                "`kin {command}` names the subcommand {word}, which `{}` does \
+                                 not have",
+                                node.get_name()
+                            ));
+                            break;
+                        }
+                        None => {}
                     }
                 }
             }
@@ -4236,7 +4263,7 @@ mod tests {
 
         assert!(
             offenders.is_empty(),
-            "a doctor fix line tells a user to type a flag the CLI rejects:\n  {}",
+            "a doctor fix line tells a user to type a command the CLI rejects:\n  {}",
             offenders.join("\n  ")
         );
     }
