@@ -1106,7 +1106,12 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
-          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
+          # Wrapped for FIR-2950: the kin registry intermittently resets one
+          # connection during the TLS handshake, which killed three shards
+          # tonight before any test ran. The wrapper retries ONLY that error
+          # and leaves stdout untouched, so this redirect still gets clean JSON.
+          scripts/retry-on-registry-reset.sh \
+            cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/metadata.json"
           : > "$RUNNER_TEMP/changed.txt"
           if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
             git diff --name-only "$BASE_SHA...$HEAD_SHA" -- > "$RUNNER_TEMP/changed.txt" || {
@@ -1130,7 +1135,11 @@ jobs:
         run: |
           set -euo pipefail
           readarray -t SCOPE < "$RUNNER_TEMP/scope.args"
-          cargo nextest list --locked "${SCOPE[@]}" --message-format json \
+          # Wrapped for FIR-2950. All three specimens died here: nextest shells
+          # out to `cargo metadata`, which fetches the sparse index, and the
+          # reset arrives before a single test runs.
+          scripts/retry-on-registry-reset.sh \
+            cargo nextest list --locked "${SCOPE[@]}" --message-format json \
             > "$RUNNER_TEMP/listing.json"
           python3 - "$RUNNER_TEMP/listing.json" <<'LISTING'
           import json, sys
