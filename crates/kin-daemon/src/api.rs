@@ -5235,30 +5235,30 @@ async fn command_merge(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::merge::MergeRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, crate::repository_merge::CommandRefusal> {
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
-        ));
+        )));
     }
     if state.storage_backend.is_some() {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::CONFLICT,
             "local repository merge authority is unavailable for hosted snapshot authority"
                 .to_string(),
-        ));
+        )));
     }
     if extract_session_id_from_headers(&headers)?.is_some() {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::CONFLICT,
             "merge does not accept X-Kin-Session because it mutates the primary repository \
              workspace and its active branch"
                 .to_string(),
-        ));
+        )));
     }
 
     let _coordination = state.coordination_gate.lock().await;
@@ -5305,30 +5305,30 @@ async fn command_resolve(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
     Json(request): Json<kin_cli::commands::resolve::ResolveRequest>,
-) -> Result<impl IntoResponse, (StatusCode, String)> {
+) -> Result<impl IntoResponse, crate::repository_merge::CommandRefusal> {
     if !state
         .is_initialized
         .load(std::sync::atomic::Ordering::Relaxed)
     {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::SERVICE_UNAVAILABLE,
             "daemon not fully initialized".to_string(),
-        ));
+        )));
     }
     if state.storage_backend.is_some() {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::CONFLICT,
             "local repository merge authority is unavailable for hosted snapshot authority"
                 .to_string(),
-        ));
+        )));
     }
     if extract_session_id_from_headers(&headers)?.is_some() {
-        return Err((
+        return Err(crate::repository_merge::CommandRefusal::from((
             StatusCode::CONFLICT,
             "resolve does not accept X-Kin-Session because it mutates the primary repository \
              workspace and its active branch"
                 .to_string(),
-        ));
+        )));
     }
 
     let _coordination = state.coordination_gate.lock().await;
