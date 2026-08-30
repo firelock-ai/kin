@@ -34819,17 +34819,35 @@ mod tests {
              than authoring a merge change, so nothing was published and this arm cannot see the \
              defect it exists for"
         );
-        let parents = state
+        // The property assertion comes FIRST, because it owns the absence. An
+        // earlier read that mapped a missing change onto a parent count of zero
+        // reported this defect as "not a merge change", which is a precondition
+        // refusal wearing the property's clothes: measured, the install-removed
+        // arms failed here saying the publication was the wrong KIND when the
+        // truth is the change is missing from the graph. Never map a failed read
+        // onto a value a real answer could take.
+        //
+        // It also goes through the LIVE projection rather than an
+        // authority-backed surface: `kin log` and `kin status` answered rc=0 on
+        // the unpatched binary throughout, so a check reading only those would
+        // pass on both builds. The split is the whole tell.
+        let held = state
             .graph
             .get_change(&published)
             .unwrap()
-            .map(|change| change.parents.len())
-            .unwrap_or(0);
+            .expect(
+                "the live graph does not hold the change the merge just published, so every read \
+                 that replays the graph to it fails until the daemon restarts; authority holds it \
+                 and the derived query view does not",
+            );
+        // Only now, on a change the graph actually holds, is the KIND readable.
         assert_eq!(
-            parents, 2,
-            "NOT RUN, precondition unmet: the published change carries {parents} parent(s) rather \
-             than two, so it is not a merge change and this arm graded a publication of a \
-             different kind"
+            held.parents.len(),
+            2,
+            "NOT RUN, precondition unmet: the published change carries {} parent(s) rather than \
+             two, so it is not a merge change and this arm graded a publication of a different \
+             kind",
+            held.parents.len()
         );
 
         // The assertion this arm exists for. No restart between publication and
@@ -34837,12 +34855,6 @@ mod tests {
         // authority-backed surface: `kin log` and `kin status` answered rc=0 on
         // the unpatched binary throughout, so a check reading only those would
         // pass on both builds. The split is the whole tell.
-        assert!(
-            state.graph.get_change(&published).unwrap().is_some(),
-            "the live graph does not hold the change the merge just published, so every read \
-             that replays the graph to it fails until the daemon restarts; authority holds it \
-             and the derived query view does not"
-        );
         state
             .graph
             .resolve_graph_at(&published)
