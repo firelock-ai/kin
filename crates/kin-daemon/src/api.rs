@@ -34711,6 +34711,75 @@ mod tests {
         assert_eq!(carried[0].content_hash, approved_digest);
     }
 
+    /// A published rollback must reach the LIVE graph, not only durable
+    /// authority, without restarting the daemon.
+    ///
+    /// The transaction publishes an inverse change to repository authority and
+    /// the in-process graph is a derived query view over it. This path
+    /// published and never installed, so `graph.get_change` returned `None` for
+    /// a change the authority resolved, and every read that replays the graph
+    /// to it failed until a restart rebuilt the graph from authority. A further
+    /// commit did not heal it, because a commit installs its OWN change and not
+    /// the missing one.
+    ///
+    /// The daemon here has LIVED THROUGH the publications, which is the
+    /// condition that makes the defect visible: this one `state` performs the
+    /// commits and then the rollback, exactly as a running daemon does. A fresh
+    /// state built after the publication rebuilds its graph from authority and
+    /// therefore holds the change either way, which is why the original report
+    /// did not reproduce on its first attempt against a new daemon.
+    ///
+    /// The reads that already worked are asserted too. They answer from
+    /// authority rather than by replaying the graph, so a fix that invalidated
+    /// the projection instead of installing into it could break them while
+    /// leaving this test's first assertion green.
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_published_rollback_reaches_the_live_graph_without_a_restart() {
+        let state = test_state();
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+        std::fs::create_dir_all(root.join("notekeeper")).unwrap();
+
+        std::fs::write(root.join("notekeeper/client.py"), b"def normalize(term):\n    return 1\n")
+            .unwrap();
+        let restored =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish the base").await;
+        std::fs::write(root.join("notekeeper/client.py"), b"def normalize(term):\n    return 2\n")
+            .unwrap();
+        let regression =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
+        assert_eq!(branch_change(&state), regression);
+
+        let (status, body) =
+            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+        assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
+
+        let published = branch_change(&state);
+        assert_ne!(
+            published, regression,
+            "the rollback must move the branch off the regression"
+        );
+
+        // The assertion this test exists for. No restart between the
+        // publication and this read.
+        assert!(
+            state.graph.get_change(&published).unwrap().is_some(),
+            "the live graph does not hold the change the rollback just published, so every read \
+             that replays the graph to it fails until the daemon restarts; authority holds it and \
+             the derived query view does not"
+        );
+
+        // The reads that already answered must still answer. `resolve_graph_at`
+        // is what a graph-replaying read does, and the branch change is what
+        // the authority resolves to.
+        state
+            .graph
+            .resolve_graph_at(&published)
+            .expect("a graph holding the published change must replay to it");
+    }
+
+
     /// An operation id is matched before any history validation runs, and an
     /// ordinary commit publishes the same receipt shape a rollback does. Only
     /// the restored content separates them, so reusing a commit's operation id

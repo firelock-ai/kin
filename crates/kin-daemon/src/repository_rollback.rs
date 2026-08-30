@@ -324,6 +324,11 @@ fn plan_and_commit(
     change.id =
         compute_semantic_change_id(&change).context("compute the rollback change identity")?;
     let inverse_change_id = change.id;
+    // Named rather than inlined into the transaction, so the install after the
+    // CAS below is over exactly the set this transaction publishes. A rollback
+    // publishes one change today; reading the set rather than a single
+    // variable is what keeps the install correct if that ever stops being true.
+    let published_changes = vec![change];
 
     let target_tree_hash =
         compute_resolved_tree_hash(&target_tree).context("hash the restored tree")?;
@@ -362,7 +367,7 @@ fn plan_and_commit(
         reason: ROLLBACK_REASON.to_string(),
         external_objects: Vec::new(),
         git_authority_delta: None,
-        changes: vec![change],
+        changes: published_changes.clone(),
         aliases: Vec::new(),
         ref_mutations: vec![RefMutation {
             name: branch.clone(),
@@ -436,6 +441,35 @@ fn plan_and_commit(
             transaction,
         )
         .context("publish the rollback change, ref, and workspace atomically")?;
+
+    // The repository transaction is durable authority. The in-process graph is
+    // a derived query view; install the exact immutable change only after the
+    // authority CAS succeeds. This is the same contract
+    // `command_commit_after_admission` states and follows for a commit, and
+    // this path did not follow it: the change reached authority and the live
+    // graph never learned of it, so every read that replays the graph to that
+    // change failed until the daemon restarted and rebuilt from authority.
+    // `kin blame` and `kin history` were the reads that failed; `kin log`,
+    // `kin diff`, `kin status` and `kin graph status` answered from authority
+    // and did not.
+    //
+    // Every change this transaction published, in the order it published them.
+    // A rollback publishes exactly one, the inverse change whose id is
+    // `inverse_change_id` and which the report carries as a single field, but
+    // the loop reads the published set rather than that one variable so the
+    // install cannot silently cover less than the transaction did.
+    //
+    // Installed on an idempotent replay too, not only on a fresh commit. A
+    // replay means an earlier attempt published the change, and if that attempt
+    // was the one that missed this install then the graph is still missing it;
+    // installing an identical payload under an identical id is a no-op in
+    // kin-db rather than a conflict.
+    for published in &published_changes {
+        state
+            .graph
+            .create_change(published)
+            .context("install the published rollback change in the live graph")?;
+    }
 
     let report = RollbackReport {
         schema: ROLLBACK_SCHEMA.to_string(),
