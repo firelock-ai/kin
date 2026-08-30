@@ -35156,13 +35156,24 @@ mod tests {
         // MOVE across a publication that never calls
         // `record_repository_authority_commit`?
         //
-        // Neither this path nor the merge paths call it, so `snapshot_generation`
-        // does not advance across either. The cache does not key on that
-        // counter: `LocalPublicationIdentity::Published` is the SHA-256 of the
-        // durable publication record's bytes, so it moves whenever the record
-        // is rewritten, whatever the in-memory counter did. If it did NOT move,
-        // an admission pair cached before this publication would stay valid
-        // after it and every concurrent task would admit against pre-publication
+        // CORRECTED. This comment previously read "neither this path nor the
+        // merge paths call it, so `snapshot_generation` does not advance across
+        // either". The first clause is true of DIRECT calls and the conclusion
+        // does not follow: both paths call `finalize_local_repository_commit`,
+        // which calls it at `state.rs:9062` behind a `generation_advanced`
+        // guard, so the counter DOES advance. A call-site count is not a call
+        // graph, and four separate readings were built on top of that zero
+        // before an in-process probe measured `counter=2 roots=2` before a
+        // merge and `counter=3 roots=3` after, with a control proving the
+        // probe's own authority open did not advance it.
+        //
+        // What stands, and it is the reason this block is here: the cache does
+        // not key on that counter either way.
+        // `LocalPublicationIdentity::Published` is the SHA-256 of the durable
+        // publication record's bytes, so it moves whenever the record is
+        // rewritten, whatever the in-memory counter did. If it did NOT move, an
+        // admission pair cached before this publication would stay valid after
+        // it and every concurrent task would admit against pre-publication
         // roots, which is a defect in the cache rather than in this path.
         // `assert!` rather than `assert_ne!`: the identity is deliberately not
         // `Debug`, since printing a publication digest into a panic is not
