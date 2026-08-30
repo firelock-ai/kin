@@ -104,6 +104,11 @@ pub struct DiffReport {
     /// still receive the complete `artifact_deltas` report.
     pub entity_deltas: Vec<EntityDelta>,
     pub relation_deltas: Vec<RelationDelta>,
+    /// Where a workspace endpoint's semantics came from, absent when neither
+    /// endpoint is the workspace. `#[serde(default)]` because this crosses the
+    /// daemon wire and an older peer sends none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_basis: Option<WorkspaceSemanticBasis>,
 }
 
 struct EndpointState {
@@ -149,18 +154,58 @@ pub struct DiffEndpointEntities {
     pub head: HashMap<EntityId, Entity>,
 }
 
+/// Where a workspace endpoint's entities and relations came from.
+///
+/// A CHANGE endpoint DERIVES its semantics: `state_at_change` replays the change
+/// DAG through `resolve_graph_at`. The WORKSPACE endpoint alone did not derive.
+/// It read its base change plus the workspace semantic overlay, and nothing ever
+/// writes an entity delta into that overlay, so `Entities: +0 ~0 -0` on a
+/// HEAD-to-WORKSPACE diff could not move for any edit whatsoever. That asymmetry
+/// was the defect (FIR-2961).
+///
+/// Storing the entities in the overlay was the other candidate and was rejected
+/// on the thesis: authority publishes the tree BEFORE the graph derives them, so
+/// at publication there is nothing to publish, and writing them later puts a
+/// reproducible derivation inside authority, which is what
+/// `language_server_enrichment_delta` refuses in as many words. Entities are
+/// derived from the tree; a read derives them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "basis", rename_all = "snake_case")]
+pub enum WorkspaceSemanticBasis {
+    /// Derived from the live graph, which held the named tree when it was read.
+    Derived {
+        /// The tree the live graph held. Named because a reconcile can land
+        /// between the authority lease read and the derivation, and an answer
+        /// derived from a NEWER graph than the tree it describes is a different
+        /// answer that must not present as this one.
+        graph_tree_hash: Hash256,
+        /// Whether that tree is the admitted workspace tree this diff is about.
+        matches_admitted_tree: bool,
+        /// Artifact paths whose entities were re-derived. Only a changed artifact
+        /// can move an entity, so this is the tree delta's own path set.
+        derived_paths: usize,
+    },
+    /// No live graph was available, so the entity and relation counts are the
+    /// admitted overlay's and cannot move. Reported rather than printed as a
+    /// zero, which is the zero-file-search rule applied to a read: when the
+    /// graph cannot answer, report the gap.
+    AdmittedOverlayOnly,
+}
+
 pub fn inspect(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: Option<&str>,
     head: Option<&str>,
+    live: Option<&kin_db::InMemoryGraph>,
 ) -> Result<DiffReport> {
-    inspect_with_endpoint_entities(binding, base, head).map(|(report, _)| report)
+    inspect_with_endpoint_entities(binding, base, head, live).map(|(report, _)| report)
 }
 
 pub fn inspect_with_endpoint_entities(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     base: Option<&str>,
     head: Option<&str>,
+    live: Option<&kin_db::InMemoryGraph>,
 ) -> Result<(DiffReport, DiffEndpointEntities)> {
     let authority = ActiveRepositoryAuthority::open(binding)?;
     let lease = authority.manager().read_authority();
@@ -212,6 +257,20 @@ pub fn inspect_with_endpoint_entities(
     .context("resolve diff head")?;
 
     let artifact_deltas = diff_trees(&base_state.tree, &head_state.tree);
+    // Derived here rather than in the endpoint arm, and the order is the whole
+    // reason: only a CHANGED artifact can move an entity, and which artifacts
+    // changed is not known until both endpoints have resolved. Deriving in the
+    // arm would mean one query per file in the tree instead of one per file that
+    // moved.
+    let mut base_state = base_state;
+    let mut head_state = head_state;
+    let semantic_basis = derive_workspace_semantics(
+        live,
+        workspace.tree_hash,
+        &artifact_deltas,
+        &mut base_state,
+        &mut head_state,
+    );
     let entity_deltas = diff_entities(&base_state.entities, &head_state.entities);
     let relation_deltas = diff_relations(&base_state.relations, &head_state.relations);
     let summary = summarize(&artifact_deltas, &entity_deltas, &relation_deltas);
@@ -229,6 +288,7 @@ pub fn inspect_with_endpoint_entities(
         artifact_deltas,
         entity_deltas,
         relation_deltas,
+        semantic_basis,
     };
     Ok((
         report,
@@ -237,6 +297,110 @@ pub fn inspect_with_endpoint_entities(
             head: head_state.entities,
         },
     ))
+}
+
+/// Re-derive a workspace endpoint's semantics for the artifacts that moved.
+///
+/// The base map is kept and only the CHANGED files are replaced in it. That is
+/// not an optimisation, it is the correctness condition: `diff_entities` diffs
+/// whole maps, so a partially populated endpoint would report every unchanged
+/// file's entities as REMOVED. Overlaying onto the admitted map is what keeps the
+/// answer about the edit.
+///
+/// One `query_entities` per moved path, filtered by file, which is the idiom
+/// `trace.rs` already uses. Deliberately NOT `to_snapshot`: that deep-clones
+/// every sub-store including the change DAG, and the commit path's own comment
+/// records it staying resident through the resident-set peak of a one-file commit
+/// on a 1.0 GB store. A diff must not pay that.
+///
+/// Returns `None` when neither endpoint is the workspace, because then both sides
+/// are history and the entity delta is already computed and already means what it
+/// says.
+fn derive_workspace_semantics(
+    live: Option<&kin_db::InMemoryGraph>,
+    admitted_tree_hash: Hash256,
+    artifact_deltas: &[kin_model::TreeDelta],
+    base_state: &mut EndpointState,
+    head_state: &mut EndpointState,
+) -> Option<WorkspaceSemanticBasis> {
+    let base_is_workspace = matches!(base_state.report.source, DiffEndpointSource::Workspace);
+    let head_is_workspace = matches!(head_state.report.source, DiffEndpointSource::Workspace);
+    if !base_is_workspace && !head_is_workspace {
+        return None;
+    }
+    let Some(graph) = live else {
+        return Some(WorkspaceSemanticBasis::AdmittedOverlayOnly);
+    };
+
+    // The tree the live graph actually holds. A reconcile can land between the
+    // authority lease read and this query, and an answer derived from a newer
+    // graph than the tree it describes is a different answer, so it is named
+    // rather than assumed.
+    let graph_tree = graph.resolved_tree();
+    let graph_tree_hash = match kin_model::compute_resolved_tree_hash(&graph_tree) {
+        Ok(hash) => hash,
+        // A tree that will not hash is not a basis. Fall back to the admitted
+        // overlay and say so, rather than deriving from something unnameable.
+        Err(_) => return Some(WorkspaceSemanticBasis::AdmittedOverlayOnly),
+    };
+    drop(graph_tree);
+
+    let mut paths: Vec<kin_model::RepoPath> = Vec::new();
+    for delta in artifact_deltas {
+        for located in [delta.old_state(), delta.new_state()].into_iter().flatten() {
+            if !paths.contains(&located.path) {
+                paths.push(located.path.clone());
+            }
+        }
+    }
+
+    let mut derived_paths = 0usize;
+    for path in &paths {
+        // A non-UTF-8 path cannot be handed to a file-path filter. It is skipped
+        // rather than guessed at, and the count below reports how many paths were
+        // actually re-derived so a reader can see the difference.
+        let Some(text) = path.as_utf8() else { continue };
+        let filter = kin_model::EntityFilter {
+            file_path: Some(kin_model::FilePathId::new(text)),
+            ..Default::default()
+        };
+        // `query_entities` is an `EntityStore` method, not an inherent one and not
+        // `GraphStore`'''s, which is what the compiler had to tell me. Imported at
+        // the call rather than at the module head so a reader sees which surface
+        // this read comes from.
+        use kin_model::EntityStore as _;
+        let Ok(found) = graph.query_entities(&filter) else {
+            continue;
+        };
+        for state in [
+            (base_is_workspace, &mut *base_state),
+            (head_is_workspace, &mut *head_state),
+        ]
+        .into_iter()
+        .filter_map(|(is_workspace, state)| is_workspace.then_some(state))
+        {
+            // Retire this file's admitted entities, then insert what the graph
+            // holds. Replacing rather than merging, because an entity the edit
+            // DELETED must leave the map or the delta under-reports.
+            state.entities.retain(|_, entity| {
+                entity
+                    .file_origin
+                    .as_ref()
+                    .map(|origin| origin.0 != text)
+                    .unwrap_or(true)
+            });
+            for entity in &found {
+                state.entities.insert(entity.id, entity.clone());
+            }
+        }
+        derived_paths += 1;
+    }
+
+    Some(WorkspaceSemanticBasis::Derived {
+        graph_tree_hash,
+        matches_admitted_tree: graph_tree_hash == admitted_tree_hash,
+        derived_paths,
+    })
 }
 
 fn resolve_endpoint(
@@ -625,31 +789,69 @@ fn summarize(
 
 pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
-    // Admit, THEN diff, for the same reason `kin status` does and by the same
-    // founder-owned decision relayed 2026-08-30. A diff whose WORKSPACE endpoint
-    // is the graph as it was before your edit reports `+0 ~0 -0` over a file you
-    // just wrote, which is the answer that sent a stranger looking for a lost
-    // module (FIR-2499) and told another that a rewritten function body had not
-    // changed (FIR-2961). Reading the working copy to ADMIT it is ingestion at
-    // an explicit input boundary, not answering from files.
+    let workspace_endpoint =
+        endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref());
+
+    // ADMIT FIRST, before anything reads, including before the daemon route
+    // below. The order is the whole point and I got it wrong once: routing to the
+    // daemon ahead of the admission answered from a graph that had not seen the
+    // edit, and the resident-set measurement caught it printing
+    // `Artifacts: +0 ~0 -0` over a file written a moment earlier, which is the
+    // very defect kin#1258 landed to fix.
     //
-    // Only when a workspace endpoint is actually involved. A diff between two
-    // changes is history, and walking the tree to answer it would be a cost with
-    // nothing behind it.
-    let pass = if endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref()) {
+    // Admission is what makes the answer about the working copy; the daemon route
+    // is what makes its entity half real. Both are needed and this one is first.
+    //
+    // Only when a workspace endpoint is involved. A diff between two changes is
+    // history, and walking the tree to answer it would be a cost with nothing
+    // behind it. Reading the working copy to ADMIT it is ingestion at an explicit
+    // input boundary, not answering from files.
+    let pass = if workspace_endpoint {
         Some(crate::commands::status::admit_before_reading(&layout).await)
     } else {
         None
     };
+
+    // A workspace endpoint's entities are DERIVED, and the daemon's graph is the
+    // only place they exist, so a workspace diff asks the daemon once the
+    // admission above has landed.
+    //
+    // Never fatal. If the daemon is absent or refuses, this falls through to the
+    // local answer, which names its own gap rather than printing a zero that
+    // reads like an answer.
+    if !json && workspace_endpoint {
+        if let Some(response) = daemon_diff(&layout, &base, &head).await {
+            for line in response.lines {
+                println!("{line}");
+            }
+            if let Some(report) = response.report.as_ref() {
+                if let Some(line) = semantic_scope_line(report.semantic_basis.as_ref()) {
+                    println!("{line}");
+                }
+            }
+            if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
+                println!(
+                    "Admission scope: this diff was not measured against the working copy: {why}"
+                );
+            }
+            println!("{}", admitted_scope_line(&layout));
+            return Ok(());
+        }
+    }
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
-    let report = inspect(&binding, base.as_deref(), head.as_deref())?;
+    // No live graph on this path: the CLI opens durable authority in-process and
+    // the entities a workspace endpoint needs live in the daemon's graph. So this
+    // derives nothing and the basis says so by name, which is the zero
+    // file-search rule applied to a read: when the graph cannot answer, report
+    // the gap rather than a zero that reads like an answer.
+    let report = inspect(&binding, base.as_deref(), head.as_deref(), None)?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         for line in render_lines(&report) {
             println!("{line}");
         }
-        if let Some(line) = semantic_scope_line(&report) {
+        if let Some(line) = semantic_scope_line(report.semantic_basis.as_ref()) {
             println!("{line}");
         }
         if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
@@ -658,6 +860,30 @@ pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Resu
         println!("{}", admitted_scope_line(&layout));
     }
     Ok(())
+}
+
+/// Ask the daemon for a diff, or `None` when it cannot answer.
+///
+/// Deliberately swallows every failure into `None`. This is a best-effort upgrade
+/// of one answer, not a dependency: a `kin diff` that refused because no daemon
+/// was running would be a regression against the command as it shipped, and the
+/// local path it falls back to states its own gap.
+async fn daemon_diff(
+    layout: &kin_core::KinLayout,
+    base: &Option<String>,
+    head: &Option<String>,
+) -> Option<DiffResponse> {
+    let base_url = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await?;
+    let client =
+        crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout).ok()?;
+    let request = DiffRequest {
+        base: base.clone(),
+        head: head.clone(),
+        // The daemon renders its own lines and this path only takes the text
+        // path, so it never asks for the JSON shape.
+        json: false,
+    };
+    client.diff(&request).await.ok()
 }
 
 /// Whether a requested endpoint spelling names the workspace.
@@ -694,25 +920,42 @@ fn endpoint_is_workspace(requested: Option<&str>) -> bool {
 ///
 /// Silent on a diff between two changes, where the entity delta is computed and
 /// means what it says.
-fn semantic_scope_line(report: &DiffReport) -> Option<String> {
-    let base_is_workspace = matches!(report.base.source, DiffEndpointSource::Workspace);
-    let head_is_workspace = matches!(report.head.source, DiffEndpointSource::Workspace);
-    if !base_is_workspace && !head_is_workspace {
-        return None;
+fn semantic_scope_line(basis: Option<&WorkspaceSemanticBasis>) -> Option<String> {
+    // Derived answers name their own basis instead of the old blanket
+    // disclaimer, because the count CAN move now and a line saying it cannot
+    // would be the new wrong sentence.
+    match basis {
+        Some(WorkspaceSemanticBasis::Derived {
+            graph_tree_hash,
+            matches_admitted_tree,
+            derived_paths,
+        }) => {
+            let qualifier = if *matches_admitted_tree {
+                String::new()
+            } else {
+                format!(
+                    ", but that graph holds tree {graph_tree_hash} rather than the admitted \
+                     workspace tree, so a reconcile landed between the two reads and this \
+                     describes the newer one"
+                )
+            };
+            return Some(format!(
+                "Semantic scope: entities and relations for the {derived_paths} moved path(s) \
+                 were derived from the live graph{qualifier}."
+            ));
+        }
+        Some(WorkspaceSemanticBasis::AdmittedOverlayOnly) => {
+            return Some(
+                "Semantic scope: no live graph was reachable, so the entity and relation counts \
+                 above are the admitted overlay's and cannot move for work in the working copy. \
+                 That is a gap in this answer, not a statement that nothing changed; start the \
+                 daemon, or commit and diff change to change."
+                    .to_string(),
+            );
+        }
+        None => {}
     }
-    let side = if base_is_workspace && head_is_workspace {
-        "Both endpoints are"
-    } else if head_is_workspace {
-        "The head endpoint is"
-    } else {
-        "The base endpoint is"
-    };
-    Some(format!(
-        "Semantic scope: {side} the workspace, whose entities are its base change's plus a \
-         workspace semantic overlay that nothing writes an entity delta into, so the entity \
-         count above cannot move for work in the working copy however many artifacts or \
-         relations do; commit it and diff change to change to see entity movement."
-    ))
+    None
 }
 
 /// What this diff does not cover, and when the graph last caught up.
@@ -751,8 +994,14 @@ fn admitted_scope_line(layout: &kin_core::KinLayout) -> String {
 pub fn build_diff_response(
     binding: &kin_core::LocalRepositoryAuthorityBinding,
     request: &DiffRequest,
+    live: Option<&kin_db::InMemoryGraph>,
 ) -> Result<DiffResponse> {
-    let report = inspect(binding, request.base.as_deref(), request.head.as_deref())?;
+    let report = inspect(
+        binding,
+        request.base.as_deref(),
+        request.head.as_deref(),
+        live,
+    )?;
     Ok(DiffResponse {
         lines: render_lines(&report),
         report: Some(report),
@@ -922,6 +1171,207 @@ mod tests {
             created_in: None,
             superseded_by: None,
         }
+    }
+
+    fn entity_in(id: EntityId, name: &str, file: &str) -> Entity {
+        let mut built = entity(id, name);
+        built.file_origin = Some(FilePathId::new(file));
+        built
+    }
+
+    fn endpoint(source: DiffEndpointSource, entities: HashMap<EntityId, Entity>) -> EndpointState {
+        EndpointState {
+            report: DiffEndpoint {
+                source,
+                requested: None,
+                ref_name: None,
+                target: None,
+                change_id: None,
+                workspace_generation: None,
+                workspace_head: None,
+                tree_hash: Hash256::from_bytes([9; 32]),
+                artifact_count: 0,
+                entity_count: entities.len(),
+                relation_count: 0,
+            },
+            tree: kin_model::ResolvedTree::default(),
+            entities,
+            relations: HashMap::new(),
+        }
+    }
+
+    fn updated_delta(path: &str) -> kin_model::TreeDelta {
+        let entry = kin_model::LocatedEntry {
+            path: RepoPath::from_utf8(path).unwrap(),
+            entry: kin_model::TreeEntry::Blob {
+                hash: Hash256::from_bytes([7; 32]),
+                executable: false,
+            },
+        };
+        kin_model::TreeDelta::Updated {
+            artifact_id: ArtifactId::new(),
+            old: entry.clone(),
+            new: entry,
+        }
+    }
+
+    /// The correctness condition, and it is the one I nearly got wrong.
+    /// `diff_entities` diffs whole maps, so an endpoint populated ONLY from the
+    /// moved paths would report every untouched file's entities as REMOVED. The
+    /// base map is kept and only the moved file is replaced in it.
+    #[test]
+    fn derivation_replaces_the_moved_path_and_leaves_the_rest_of_the_map_alone() {
+        let moved_old = EntityId::new();
+        let moved_new = EntityId::new();
+        let untouched = EntityId::new();
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph
+            .batch_upsert_entities(&[entity_in(moved_new, "after", "src/moved.rs")])
+            .unwrap();
+
+        let admitted = HashMap::from([
+            (moved_old, entity_in(moved_old, "before", "src/moved.rs")),
+            (untouched, entity_in(untouched, "elsewhere", "src/other.rs")),
+        ]);
+        let mut base = endpoint(DiffEndpointSource::Head, admitted.clone());
+        let mut head = endpoint(DiffEndpointSource::Workspace, admitted);
+
+        let basis = derive_workspace_semantics(
+            Some(&graph),
+            Hash256::from_bytes([9; 32]),
+            &[updated_delta("src/moved.rs")],
+            &mut base,
+            &mut head,
+        );
+
+        // The head is the workspace, so it derives.
+        assert!(
+            head.entities.contains_key(&moved_new),
+            "the moved path's entities must come from the live graph"
+        );
+        assert!(
+            !head.entities.contains_key(&moved_old),
+            "an entity the edit removed has to leave the map, or the delta under-reports"
+        );
+        assert!(
+            head.entities.contains_key(&untouched),
+            "an untouched file's entities must survive, or every one of them reads as REMOVED"
+        );
+        // The base is HEAD, so it must be untouched by the derivation.
+        assert!(
+            base.entities.contains_key(&moved_old) && !base.entities.contains_key(&moved_new),
+            "a non-workspace endpoint must not be re-derived"
+        );
+
+        // And the delta says what happened, which is the whole point.
+        let deltas = diff_entities(&base.entities, &head.entities);
+        assert_eq!(deltas.len(), 2, "one added, one removed: {deltas:?}");
+
+        match basis {
+            Some(WorkspaceSemanticBasis::Derived {
+                matches_admitted_tree,
+                derived_paths,
+                ..
+            }) => {
+                assert_eq!(derived_paths, 1);
+                let _ = matches_admitted_tree;
+            }
+            other => panic!("expected a derived basis, got {other:?}"),
+        }
+    }
+
+    /// The gap, by name. This is the zero-file-search rule applied to a read:
+    /// when the graph cannot answer, report the gap rather than a zero that reads
+    /// like an answer.
+    #[test]
+    fn no_live_graph_reports_the_gap_rather_than_a_zero() {
+        let mut base = endpoint(DiffEndpointSource::Head, HashMap::new());
+        let mut head = endpoint(DiffEndpointSource::Workspace, HashMap::new());
+        let basis = derive_workspace_semantics(
+            None,
+            Hash256::from_bytes([9; 32]),
+            &[updated_delta("src/moved.rs")],
+            &mut base,
+            &mut head,
+        );
+        assert_eq!(basis, Some(WorkspaceSemanticBasis::AdmittedOverlayOnly));
+
+        let line = semantic_scope_line(basis.as_ref()).expect("a workspace diff states its scope");
+        assert!(line.contains("no live graph was reachable"), "{line}");
+        assert!(
+            line.contains("not a statement that nothing changed"),
+            "the gap has to say what it is NOT, or a reader takes it for an answer: {line}"
+        );
+    }
+
+    /// The control. A change-to-change diff is history on both sides, where the
+    /// entity delta is already computed and already means what it says, so
+    /// nothing is derived and nothing is disclosed. Without this, a derivation
+    /// that fired on every diff would pass every assertion above.
+    #[test]
+    fn a_change_to_change_diff_derives_nothing_and_says_nothing() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut base = endpoint(DiffEndpointSource::Change, HashMap::new());
+        let mut head = endpoint(DiffEndpointSource::Change, HashMap::new());
+        let basis = derive_workspace_semantics(
+            Some(&graph),
+            Hash256::from_bytes([9; 32]),
+            &[updated_delta("src/moved.rs")],
+            &mut base,
+            &mut head,
+        );
+        assert_eq!(basis, None, "history needs no derivation");
+
+        assert!(
+            semantic_scope_line(None).is_none(),
+            "a change-to-change diff must not carry a workspace scope note"
+        );
+    }
+
+    /// A reconcile can land between the authority lease read and the derivation,
+    /// and an answer derived from a NEWER graph than the tree it describes is a
+    /// different answer. So the basis names the graph's own tree and the text
+    /// says when it disagrees.
+    #[test]
+    fn a_graph_holding_another_tree_names_the_mismatch() {
+        let graph = kin_db::InMemoryGraph::new();
+        let mut base = endpoint(DiffEndpointSource::Head, HashMap::new());
+        let mut head = endpoint(DiffEndpointSource::Workspace, HashMap::new());
+        // The workspace's admitted tree is deliberately not the empty tree the
+        // fresh graph holds.
+        let basis = derive_workspace_semantics(
+            Some(&graph),
+            Hash256::from_bytes([0xAB; 32]),
+            &[],
+            &mut base,
+            &mut head,
+        );
+        let Some(WorkspaceSemanticBasis::Derived {
+            matches_admitted_tree,
+            ..
+        }) = basis
+        else {
+            panic!("expected a derived basis, got {basis:?}");
+        };
+        assert!(
+            !matches_admitted_tree,
+            "a graph holding a different tree must not claim to match"
+        );
+
+        let line = semantic_scope_line(basis.as_ref()).expect("a workspace diff states its scope");
+        assert!(line.contains("rather than the admitted"), "{line}");
+
+        // The control: when it DOES match, the line must not carry the warning,
+        // or the caveat is boilerplate rather than a signal.
+        let matching = WorkspaceSemanticBasis::Derived {
+            graph_tree_hash: Hash256::from_bytes([0xAB; 32]),
+            matches_admitted_tree: true,
+            derived_paths: 3,
+        };
+        let clean = semantic_scope_line(Some(&matching)).expect("still states its scope");
+        assert!(!clean.contains("rather than the admitted"), "{clean}");
+        assert!(clean.contains("3 moved path(s)"), "{clean}");
     }
 
     #[test]
