@@ -2817,6 +2817,24 @@ pub async fn run_loop_armed(
             // reported as `waiting_deferred` rather than `idle` whenever the
             // retry lane still holds something.
             pass.idle();
+            // Publish the standing before returning to the top, because the
+            // publish at the end of this tick is below the `continue` and a
+            // quiet store never reaches it. Measured on 2026-08-29: a daemon
+            // nobody was editing against published no standing from this loop
+            // at all, and on a host with no language server nothing else
+            // published either, so the record stopped advancing for the life of
+            // the daemon.
+            //
+            // Memory pressure moves with nothing on disk moving. A daemon
+            // sitting quiet on a large repository is exactly when its standing
+            // matters, because the reader wanting it is deciding whether this
+            // machine can serve the store at all.
+            //
+            // The callee checks the interval before it reads any pressure, so
+            // this costs one lock and one `Instant::elapsed` on the twenty-nine
+            // of every thirty seconds where the answer would be thrown away.
+            crate::daemon::publish_footprint_standing_on_idle_tick(&state);
+
             // No events — sleep briefly then check again.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
