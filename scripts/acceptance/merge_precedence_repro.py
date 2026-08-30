@@ -80,13 +80,16 @@ TICKET = "FIR-2958"
 
 print = functools.partial(print, flush=True)
 
-# One function per side of the question, in one file, so an entity decision and
-# an artifact decision can cover the same bytes. `base` is what both branches
-# edit; `mate` is here so the file has a second entity the merge must leave
-# alone.
+# One file whose two entities both conflict. `base` is edited to a DIFFERENT
+# LENGTH on each branch, which moves `mate` to a different byte offset on each
+# branch, so `mate` conflicts too while being semantically identical on both
+# sides. That shape is the whole difficulty and it is what the stranger hit: a
+# bulk settle records a decision about `mate` that only its byte offsets
+# distinguish, and judging the merge on whole entity values would refuse a mix
+# kin can project honestly. The two bodies must not be the same length.
 BASE_LIB = b"pub fn base() {}\npub fn mate() {}\n"
-OURS_LIB = b"pub fn base(value: u64) {}\npub fn mate() {}\n"
-THEIRS_LIB = b"pub fn base(value: i32) {}\npub fn mate() {}\n"
+OURS_LIB = b"pub fn base(count: u64) {}\npub fn mate() {}\n"
+THEIRS_LIB = b"pub fn base(v: i32) {}\npub fn mate() {}\n"
 
 # A second file neither entity decision covers, so the bulk settle has something
 # to keep. Without it "the rule is precedence" and "the rule is take theirs" are
@@ -98,8 +101,8 @@ THEIRS_SHARED = b"feature shared\n"
 # The contradictory fixture: two entities in one file, both moved on both
 # branches, so settling them to opposite sides leaves no side carrying both.
 BASE_PAIR = b"pub fn alpha() {}\npub fn beta() {}\n"
-OURS_PAIR = b"pub fn alpha(value: u64) {}\npub fn beta(value: u64) {}\n"
-THEIRS_PAIR = b"pub fn alpha(value: i32) {}\npub fn beta(value: i32) {}\n"
+OURS_PAIR = b"pub fn alpha(count: u64) {}\npub fn beta(count: u64) {}\n"
+THEIRS_PAIR = b"pub fn alpha(v: i32) {}\npub fn beta(v: i32) {}\n"
 
 
 def run(cmd, cwd=None, env=None, timeout=600, stdin=None):
