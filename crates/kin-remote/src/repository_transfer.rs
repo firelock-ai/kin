@@ -19,12 +19,12 @@ use kin_db::{
     StorageBackend,
 };
 use kin_model::{
-    compute_resolved_tree_hash, validate_semantic_change_id, AuthorId, ChangeOrigin, ChangeStore,
-    DefaultRefExpectation, DefaultRefMutation, ExternalChangeAlias, ExternalObjectId,
+    compute_resolved_tree_hash, validate_semantic_change_id, AdmissionCase, AuthorId, ChangeOrigin,
+    ChangeStore, DefaultRefExpectation, DefaultRefMutation, ExternalChangeAlias, ExternalObjectId,
     ExternalObjectKind, ExternalObjectRecord, GitExternalAuthority, GitExternalAuthorityDelta,
     Hash256, ModelError, OperationId, RefExpectation, RefMutation, RefName, RefTarget,
     RefUpdatePolicy, RepositoryCommitOutcome, RepositoryCommitReceipt, RepositoryId,
-    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, TreeEntry,
+    RepositoryTransaction, RootBundle, SemanticChange, SemanticChangeId, TreeEntry, WorkspaceId,
     REPOSITORY_TRANSACTION_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
@@ -66,6 +66,39 @@ impl RepositoryAuthorityMetadata for RepositoryAuthorityState {
     fn committed_authority_metadata(&self) -> Option<&PersistedRepositoryAuthority> {
         self.snapshot().repository_authority.as_ref()
     }
+}
+
+/// The admission case THIS replica already enforces, read from the overlay of the
+/// workspace the caller names as its own.
+///
+/// Exposed because only the caller knows which workspace is its own, and the
+/// traversal belongs here. Authority is replicated, so `local_overlays` can hold
+/// overlays recorded on several hosts with different cases: a macOS replica
+/// records `FoldAscii`, a Linux one records `Sensitive`, and both sit in one
+/// authority record. Nothing inside a transfer can pick between them, which is
+/// exactly why `apply_repository_transfer_pack_with_pre_commit` takes the case
+/// rather than deriving it.
+///
+/// The recorded case is returned rather than a filesystem re-probed.
+/// [`AdmissionCase`] is persisted in the overlay identity so reopen and later
+/// scans stay on one matcher, and a fresh probe could disagree with the case this
+/// replica's own commits already enforce, leaving one store applying two rules
+/// depending on whether content arrived locally or over the wire.
+///
+/// `None` where the named workspace has no overlay, or where authority has never
+/// been written. Both mean this replica has no case of its own to admit under,
+/// and kin-db accepts that only where the shared policy has no rule sources.
+pub fn receiver_admission_case<B: StorageBackend + ?Sized + 'static>(
+    authority: &RepositoryAuthorityManager<B>,
+    workspace_id: WorkspaceId,
+) -> Option<AdmissionCase> {
+    let lease = authority.read_authority();
+    lease
+        .committed_authority_metadata()?
+        .local_overlays
+        .iter()
+        .find(|overlay| overlay.workspace_id == workspace_id)
+        .map(|overlay| overlay.case)
 }
 
 pub const REPOSITORY_TRANSFER_PROTOCOL: &str = "kin-repository-v6-fast-forward";
@@ -1188,6 +1221,11 @@ pub(crate) fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'stati
         actor,
         pack,
         limits,
+        // No receiver case. This wrapper exists for the arms that assert the
+        // no-case path, which is what kin-db accepts only where a shared policy
+        // has no rule sources for a matcher to compile. An arm that wants a case
+        // calls `apply_repository_transfer_pack_with_pre_commit` and names one.
+        None,
         || Ok(()),
     )
 }
@@ -1199,6 +1237,22 @@ pub(crate) fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'stati
 /// whatever the peer advertised. Passing `RepositoryTransferLimits::default()`
 /// is the compiled behaviour and is what a caller with no deployment
 /// configuration should send.
+///
+/// `receiver_case` is THIS replica's own [`AdmissionCase`], and it is deliberately
+/// not the publisher's. The same policy bytes admit different paths under
+/// case-sensitive and ASCII-folded matching, so somebody has to decide which
+/// semantics govern the transferred history, and the honest answer is the replica
+/// that will hold it: every other admission decision here already runs under this
+/// case, and a transfer deciding differently would leave one store enforcing two
+/// rules. `AdmissionCase`'s own definition says the behaviour is persisted in the
+/// overlay identity precisely to keep reopen and later scans on one matcher, which
+/// is the same reason this reads the recorded case rather than re-probing a
+/// filesystem.
+///
+/// `None` means this receiver has no workspace whose case it can honestly claim,
+/// which is a hosted backend with no local `.kin` layout. kin-db accepts `None`
+/// only where the shared policy has no rule sources, so nothing can be admitted
+/// under a case nobody chose.
 ///
 /// `before_authority_commit` runs exactly once, after every validation and
 /// after the immutable CAS prewrites, immediately before the authority
@@ -1212,6 +1266,10 @@ pub(crate) fn apply_repository_transfer_pack<B: StorageBackend + ?Sized + 'stati
 /// It does not run on an idempotent replay. A replay of a transfer this code
 /// committed already ran the policy before that original commit, and running it
 /// again would mutate local state for a transfer that moves nothing.
+// Eight, because the receiver's own admission case is a distinct receiver-side
+// input from its ceilings and from its commit-boundary policy, and folding it
+// into either would name it wrongly.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_repository_transfer_pack_with_pre_commit<B, P>(
     authority: &RepositoryAuthorityManager<B>,
     expected_repository_id: &RepositoryId,
@@ -1219,6 +1277,7 @@ pub fn apply_repository_transfer_pack_with_pre_commit<B, P>(
     actor: AuthorId,
     pack: &RepositoryTransferPack,
     limits: &RepositoryTransferLimits,
+    receiver_case: Option<AdmissionCase>,
     before_authority_commit: P,
 ) -> Result<RepositoryTransferReceipt>
 where
@@ -1355,13 +1414,17 @@ where
     // transferred history, with the full sensitive-content check run on every
     // introduced artifact because nothing here was already tracked.
     //
-    // `None` is the publisher's admission case not travelling yet. kin-db
-    // accepts that only where it cannot decide anything, which is a shared
-    // policy with no rule sources, and refuses by name otherwise rather than
-    // choosing matching semantics on the publisher's behalf. Carrying the case
-    // in the pack is the follow-on that lifts that limit.
+    // The case is THIS replica's own, supplied by the caller that knows which
+    // workspace is its own. It is not the publisher's and does not travel: the
+    // publisher's case decided what the publisher admitted, and this replica has
+    // to decide what IT holds, under the one case every other admission decision
+    // here already uses.
+    //
+    // A caller with no workspace to speak for passes `None`, and kin-db accepts
+    // that only where the shared policy has no rule sources, refusing by name
+    // otherwise rather than admitting under a case nobody chose.
     let receipt = authority
-        .commit_transferred_repository_transaction(transaction, None)
+        .commit_transferred_repository_transaction(transaction, receiver_case)
         .map_err(repository_commit)?;
     let outcome = match receipt.outcome {
         RepositoryCommitOutcome::Committed => RepositoryTransferApplyOutcome::Committed,
@@ -4384,6 +4447,7 @@ mod tests {
                 AuthorId::new("policy-test"),
                 &fixture.pack,
                 &RepositoryTransferLimits::default(),
+                None,
                 || Err(std::io::Error::other("sentinel policy refusal")),
             )
             .expect_err("a refused policy admitted the pack");
@@ -4420,6 +4484,7 @@ mod tests {
                 AuthorId::new("policy-test"),
                 &fixture.pack,
                 &RepositoryTransferLimits::default(),
+                None,
                 || {
                     calls.set(calls.get() + 1);
                     generation_at_policy
@@ -4459,6 +4524,7 @@ mod tests {
                 AuthorId::new("policy-test"),
                 &wrong_repository,
                 &RepositoryTransferLimits::default(),
+                None,
                 || {
                     calls.set(calls.get() + 1);
                     Ok(())
@@ -4487,6 +4553,7 @@ mod tests {
                 AuthorId::new("policy-test"),
                 &fixture.pack,
                 &RepositoryTransferLimits::default(),
+                None,
                 || {
                     calls.set(calls.get() + 1);
                     Ok(())
@@ -4503,6 +4570,7 @@ mod tests {
                 AuthorId::new("policy-test"),
                 &fixture.pack,
                 &RepositoryTransferLimits::default(),
+                None,
                 || {
                     calls.set(calls.get() + 1);
                     Ok(())

@@ -13805,6 +13805,33 @@ fn apply_received_repository_transfer_pack(
         .is_none()
         .then(|| state.local_kindb_capability())
         .flatten();
+    // This replica's OWN admission case, read from the overlay of the workspace
+    // this daemon pinned at startup.
+    //
+    // Which workspace is "this replica's" is the whole difficulty, and it is why
+    // the case cannot be inferred inside the transfer code. Authority is
+    // replicated, so `local_overlays` can hold overlays from several hosts with
+    // different cases: a macOS replica records `FoldAscii`, a Linux one records
+    // `Sensitive`, and both live in one authority record. Only the daemon knows
+    // which of them is its own, because it pinned that workspace id when it
+    // started rather than rediscovering it from mutable control files.
+    //
+    // The recorded case is read rather than the filesystem re-probed, and that is
+    // deliberate. `AdmissionCase` is persisted in the overlay identity so that
+    // reopen and later scans stay on one matcher; a fresh probe could disagree
+    // with the case this replica's own commits are already enforcing, and then one
+    // store would apply two rules depending on whether content arrived locally or
+    // over the wire.
+    //
+    // `None` is a hosted daemon, which has no local `.kin` layout and therefore no
+    // workspace whose case it can honestly claim. kin-db accepts `None` only where
+    // the shared policy has no rule sources, so nothing is ever admitted under a
+    // case nobody chose.
+    let receiver_case = state
+        .local_repository_workspace_id()
+        .and_then(|workspace_id| {
+            kin_remote::repository_transfer::receiver_admission_case(authority, workspace_id)
+        });
     kin_remote::repository_transfer::apply_repository_transfer_pack_with_pre_commit(
         authority,
         repository_id,
@@ -13812,6 +13839,7 @@ fn apply_received_repository_transfer_pack(
         actor,
         pack,
         &configured_transfer_limits(),
+        receiver_case,
         || match local_kindb {
             Some(kindb) => kindb.invalidate_for_unversioned_transfer(),
             None => Ok(()),
