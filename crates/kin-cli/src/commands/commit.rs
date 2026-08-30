@@ -509,16 +509,17 @@ fn landed_commit_for_operation(
     else {
         return Ok(None);
     };
-    let Some((branch, change_id)) = landed_change_in(
-        &receipt.operation.ref_mutations,
-        receipt
-            .operation
-            .workspace_mutation
-            .as_ref()
-            .map(|workspace| &workspace.new_head),
-    ) else {
+    // The daemon's own recovery asks this of the same record, so the rule lives
+    // in kin-core rather than once in each crate. A second copy is only ever
+    // wrong in a way that looks like a passing run: both suites stay green while
+    // one side writes a shape the other stopped reading.
+    let Some(published) = kin_core::published_change(&receipt.operation) else {
         return Ok(None);
     };
+    let (branch, change_id) = (
+        published.branch.map(|name| name.to_string()),
+        published.change_id,
+    );
     let change = lease.snapshot().changes.get(&change_id).ok_or_else(|| {
         anyhow::anyhow!(
             "repository receipt for operation {operation_id} references missing change {change_id}"
@@ -531,43 +532,6 @@ fn landed_commit_for_operation(
         relation_count: change.relation_deltas.len(),
         file_count: change.tree_deltas.len(),
     }))
-}
-
-/// The change one operation record published, and the branch it published onto.
-///
-/// Two shapes, because a commit publishes in two ways and only one of them
-/// moves a ref. A commit on a branch fast-forwards the branch its head names,
-/// so the ref mutation carries both the branch and the change. A commit on a
-/// detached head moves no ref at all and advances the workspace head instead,
-/// so reading only the ref mutations would report a landed change as one that
-/// never happened. That is the one answer this lookup must never give: every
-/// caller reaching it has already lost the reply and is deciding whether to
-/// commit again.
-///
-/// Takes the two fields it reads rather than the whole record, so the decision
-/// can be exercised without building a `RepositoryOperationRecord`, which needs
-/// a real store to be meaningful. The shape it is given here is the shape the
-/// daemon writes, and `a_detached_workspace_head_advances_to_the_change_it_commits`
-/// in `kin-daemon` asserts that shape on the receipt itself, so the two sides
-/// meet at a fact one of them proved rather than at a string written twice.
-fn landed_change_in(
-    ref_mutations: &[kin_model::RefMutation],
-    new_head: Option<&kin_model::WorkspaceHead>,
-) -> Option<(Option<String>, kin_model::SemanticChangeId)> {
-    ref_mutations
-        .iter()
-        .find_map(|mutation| match mutation.new_target.as_ref() {
-            Some(kin_model::RefTarget::Change { change_id }) => {
-                Some((Some(mutation.name.to_string()), *change_id))
-            }
-            _ => None,
-        })
-        .or(match new_head {
-            Some(kin_model::WorkspaceHead::Detached {
-                target: kin_model::RefTarget::Change { change_id },
-            }) => Some((None, *change_id)),
-            _ => None,
-        })
 }
 
 /// Await `work`, printing the phases the daemon reaches while it runs.
@@ -705,61 +669,6 @@ mod tests {
             "message": "publish one docstring edit",
             "author": "Ada Lovelace <ada@example.com>",
         })
-    }
-
-    fn change_id_fixture() -> kin_model::SemanticChangeId {
-        kin_model::SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([7; 32]))
-    }
-
-    fn branch_ref_mutation(change_id: kin_model::SemanticChangeId) -> Vec<kin_model::RefMutation> {
-        vec![kin_model::RefMutation {
-            name: kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap(),
-            expected: kin_model::RefExpectation::MustNotExist,
-            new_target: Some(kin_model::RefTarget::change(change_id)),
-            policy: kin_model::RefUpdatePolicy::FastForwardOnly,
-        }]
-    }
-
-    /// The control. A commit on a branch is recovered from its ref mutation and
-    /// names the branch it moved.
-    #[test]
-    fn a_branch_commit_is_recovered_from_its_ref_mutation() {
-        let change_id = change_id_fixture();
-        assert_eq!(
-            landed_change_in(&branch_ref_mutation(change_id), None),
-            Some((Some("refs/heads/main".to_string()), change_id)),
-            "a ref mutation naming a change is the branch this commit published onto"
-        );
-    }
-
-    /// FIR-3012. A commit on a detached head moves no ref, so the only record of
-    /// where it went is the head the workspace mutation advanced. Reading only
-    /// ref mutations reported a landed change as one that never happened, to a
-    /// caller already deciding whether to commit again.
-    #[test]
-    fn a_detached_commit_is_recovered_from_the_head_it_advanced() {
-        let change_id = change_id_fixture();
-        let head = kin_model::WorkspaceHead::Detached {
-            target: kin_model::RefTarget::change(change_id),
-        };
-        assert_eq!(
-            landed_change_in(&[], Some(&head)),
-            Some((None, change_id)),
-            "a detached commit landed, and no branch names it"
-        );
-    }
-
-    /// The must-be-absent arm, so the two above are answers rather than a
-    /// function that says yes to everything. A workspace mutation that moved no
-    /// head onto a change, which is what an admission or a branch switch
-    /// records, published nothing.
-    #[test]
-    fn an_operation_that_published_no_change_is_recovered_as_nothing() {
-        let head = kin_model::WorkspaceHead::Symbolic {
-            target: kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap(),
-        };
-        assert_eq!(landed_change_in(&[], Some(&head)), None);
-        assert_eq!(landed_change_in(&[], None), None);
     }
 
     /// The commit line says where the change went, and on a detached head it
