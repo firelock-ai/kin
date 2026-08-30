@@ -4387,6 +4387,16 @@ async fn command_status(
         // durable marker rather than from this daemon's own probes, which reset
         // on restart and then report every store as never admitted (FIR-2961).
         &kin_core::last_admission::read(&state.layout),
+        // This endpoint stays a pure read. The CLI admits before it reads, which
+        // is where the founder's 2026-08-30 decision applies, and a caller of
+        // this route drives its own admission through `/commands/admit`. Saying
+        // so here rather than leaving the verdict unqualified is the point: a
+        // report that did not admit must not present as one that did.
+        &kin_cli::commands::status::StatusAdmission::Skipped(
+            "this report came from the daemon's status route, which does not admit; drive \
+             `/commands/admit` first for an answer measured against the working copy"
+                .to_string(),
+        ),
     )
     .map_err(internal_error)?;
     Ok(Json(response))

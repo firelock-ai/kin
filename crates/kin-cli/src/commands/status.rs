@@ -968,6 +968,10 @@ where
 
 pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
+    // Admit, THEN read. The order is the whole point: a report read before the
+    // admission describes the graph as it was, which is exactly the answer
+    // FIR-2961 is about.
+    let pass = admit_before_reading(&layout).await;
     let report = settle_embedding_coverage(wait_quiesce, || read_status_once(&layout)).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -981,6 +985,7 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
                 Some(&footprint),
                 crate::daemon_death::recorded_for_store(layout.root()).as_ref(),
                 &kin_core::last_admission::read(&layout),
+                &pass,
             )
         );
         // Which projection served the files this status describes. Appended
@@ -1017,7 +1022,7 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
         // different facts and this line says which it has, because "no
         // untracked files were named" is exactly the shape a reader takes for
         // "there are none".
-        println!("{}", untracked_host_content_line(&layout).await);
+        println!("{}", untracked_host_content_line(&pass));
     }
     Ok(())
 }
@@ -1030,24 +1035,18 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
 /// measured nothing with the same age, a daemon that has taken no measurement,
 /// and no daemon at all. Only the first two are statements about the working
 /// copy, and the other two say so rather than rendering as a clean tree.
-async fn untracked_host_content_line(layout: &kin_core::KinLayout) -> String {
+fn untracked_host_content_line(pass: &StatusAdmission) -> String {
     const LEAD: &str = "Untracked host content:";
-    let Some(base_url) = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await
-    else {
-        return format!(
-            "{LEAD} not measured; no daemon is running for this repository, and this \
-                        command reads durable authority, which cannot see a path no admission has \
-                        taken"
-        );
+    // Read off the admission this status already took, rather than asked again.
+    // Two independent readings of one working copy is how two lines about it
+    // come to disagree, and the probes ride on the admission response for
+    // exactly this reason.
+    let Some(reconcile) = pass.reconcile().cloned() else {
+        let StatusAdmission::Skipped(why) = pass else {
+            unreachable!("an admission that took a pass carries its probes")
+        };
+        return format!("{LEAD} not measured; {why}");
     };
-    let Ok(client) = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout)
-    else {
-        return format!("{LEAD} not measured; this repository's daemon could not be addressed");
-    };
-    let Ok(health) = client.health().await else {
-        return format!("{LEAD} not measured; this repository's daemon did not answer");
-    };
-    let reconcile = health.reconcile;
     // Fifth arm, and the one that is not a gap. A daemon that admits nothing
     // from the filesystem has no host content waiting to be taken, so counting
     // its projected checkout would report a shortfall the graph is not in.
@@ -1108,8 +1107,9 @@ pub fn build_command_status_response(
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
+    pass: &StatusAdmission,
 ) -> Result<CommandStatusResponse> {
-    let text = render_text(&report, build.as_ref(), footprint, death, admission);
+    let text = render_text(&report, build.as_ref(), footprint, death, admission, pass);
     let json = json
         .then(|| serde_json::to_string(&report))
         .transpose()
@@ -1120,6 +1120,111 @@ pub fn build_command_status_response(
         text,
         json,
     })
+}
+
+/// Graph truth caught up with the working copy, or the reason it could not be.
+///
+/// `kin status` used to answer from the graph alone. That answer is right about
+/// the graph and is read as a statement about the files on disk, and the two
+/// come apart the moment an edit lands after the last admission: a stranger
+/// running the whole everyday loop with no Git was told `matching its base
+/// change` over a tracked file edited twenty-two seconds earlier, seven readings
+/// running (FIR-2961). Putting the admission's age beside the verdict, which
+/// landed in kin#1254, makes the sentence honest and does not make it right,
+/// because measured on macOS the clock reads `0s ago` inside the roughly
+/// two-second window before the ambient watcher catches up, and on a bind mount
+/// that window has no end.
+///
+/// So status admits first and then answers, which is what `kin commit` has
+/// always done and the reason no commit ever missed an edit. Founder-owned
+/// thesis decision relayed 2026-08-30: the Zero File-Search Authority Rule
+/// permits exactly this, because reading the working copy to ADMIT it is
+/// ingestion at an explicit input boundary, not answering from files. The cost
+/// is a tree walk, which is what makes the answer true, and `git status` pays
+/// the same walk for the same reason.
+///
+/// The report rides along because the admission response already carries the
+/// reconcile probes. One round trip answers the verdict and the untracked line
+/// both, so the two surfaces cannot disagree about one working copy, which is
+/// the principle this file already holds for its enrichment counters.
+pub enum StatusAdmission {
+    /// The pass ran and the status below was read after it.
+    Took(Box<crate::commands::admit::AdmitReport>),
+    /// No pass ran, carrying the clause that says why. The verdict must not
+    /// present as a statement about the working copy in this arm.
+    Skipped(String),
+}
+
+impl StatusAdmission {
+    /// The reconcile probes the pass reported, when one ran.
+    pub fn reconcile(&self) -> Option<&crate::commands::resources::ReconcileHealth> {
+        match self {
+            Self::Took(report) => Some(&report.reconcile),
+            Self::Skipped(_) => None,
+        }
+    }
+}
+
+/// Admit the complete exact tree, then let the caller read.
+///
+/// Best effort by construction and never fatal: a status that refuses to print
+/// because an admission failed is worse than one that prints and says the
+/// admission failed. Every arm names its own basis, and none of them is silence.
+///
+/// No session lease is taken. `kin admit` holds one to keep the daemon awake
+/// across a pass an operator asked for; a status read is not that, and a leaked
+/// lease keeps a daemon alive indefinitely, which is the defect this would be
+/// trading for.
+pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmission {
+    let Some(base_url) = crate::daemon_client::resolve_daemon_url_if_running_async(layout).await
+    else {
+        return StatusAdmission::Skipped(
+            "no daemon is running for this repository, so nothing admitted the working copy and              this reports durable authority alone; `kin admit` takes what the working copy holds"
+                .to_string(),
+        );
+    };
+    let Ok(client) = crate::daemon_client::DaemonClient::from_base_url_for_layout(base_url, layout)
+    else {
+        return StatusAdmission::Skipped(
+            "this repository's daemon could not be addressed, so nothing admitted the working copy"
+                .to_string(),
+        );
+    };
+    let request = crate::commands::admit::AdmitRequest {
+        operation_id: kin_model::OperationId::new(),
+        actor: match crate::commands::require_commit_author() {
+            Ok(actor) => actor,
+            Err(error) => {
+                return StatusAdmission::Skipped(format!(
+                    "this store cannot name an author for an admission ({}), so nothing admitted                      the working copy",
+                    crate::error::cause_first(&error)
+                ))
+            }
+        },
+    };
+    match client.admit(&request).await {
+        crate::daemon_client::AdmitDispatch::Answered(response) => match response.report {
+            // A refused pass is an answer and it is not an admission. Reporting
+            // it as one would put the whole defect back, one layer down.
+            Some(report) if report.admitted => StatusAdmission::Took(Box::new(report)),
+            Some(report) => StatusAdmission::Skipped(format!(
+                "the admission of the working copy failed ({}), so what follows describes graph                  truth from before it",
+                report.failure.as_deref().unwrap_or("no cause recorded")
+            )),
+            None => StatusAdmission::Skipped(
+                "this repository's daemon answered the admission with no report, so whether the                  working copy was admitted is unknown"
+                    .to_string(),
+            ),
+        },
+        crate::daemon_client::AdmitDispatch::Refused(error) => StatusAdmission::Skipped(format!(
+            "this repository's daemon refused to admit the working copy ({})",
+            crate::error::cause_first(&error)
+        )),
+        crate::daemon_client::AdmitDispatch::Unanswered(error) => StatusAdmission::Skipped(format!(
+            "the admission of the working copy did not answer ({}), so whether it ran is unknown",
+            crate::error::cause_first(&error)
+        )),
+    }
 }
 
 /// The `Tree:` line's verdict, and the basis it rests on.
@@ -1146,6 +1251,7 @@ pub fn build_command_status_response(
 fn workspace_state_phrase(
     dirty: bool,
     admission: &LastAdmissionRead,
+    pass: &StatusAdmission,
     now: chrono::DateTime<Utc>,
 ) -> String {
     // Kept as a comparison against the base change rather than as "clean" or
@@ -1158,6 +1264,15 @@ fn workspace_state_phrase(
     } else {
         "matching its base change"
     };
+    // Ahead of the clock, because it outranks it. An age says how old a reading
+    // is; this says whether one was taken at all, and a verdict with nothing
+    // behind it is not a verdict about the working copy. Measured with the
+    // daemon stopped, the untracked line read "no daemon is running" while this
+    // line directly above it read "matching its base change as admitted 0s ago"
+    // (FIR-2961).
+    if let StatusAdmission::Skipped(why) = pass {
+        return format!("{verdict} as last admitted, not measured against the working copy: {why}");
+    }
     match admission {
         LastAdmissionRead::Recorded(recorded) => format!(
             "{verdict} as admitted {} ago",
@@ -1197,8 +1312,10 @@ fn render_text(
     footprint: Option<&StoreFootprint>,
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
+    pass: &StatusAdmission,
 ) -> String {
-    let workspace_state = workspace_state_phrase(report.workspace.dirty, admission, Utc::now());
+    let workspace_state =
+        workspace_state_phrase(report.workspace.dirty, admission, pass, Utc::now());
     let enrichment = match report.semantic_enrichment.presence {
         SemanticEnrichmentPresence::Absent => "absent",
         SemanticEnrichmentPresence::Present => "present",
@@ -1410,8 +1527,15 @@ mod tests {
             payload.snapshot_bytes + payload.acknowledged_delta_bytes
         );
         assert!(
-            render_text(&report, None, None, None, &LastAdmissionRead::Absent)
-                .contains("Authority payload read: "),
+            render_text(
+                &report,
+                None,
+                None,
+                None,
+                &LastAdmissionRead::Absent,
+                &skipped_pass()
+            )
+            .contains("Authority payload read: "),
             "text status must state the payload the open read"
         );
 
@@ -1712,7 +1836,14 @@ mod tests {
             EmbeddingCoverage::unobserved(EmbeddingCoverageUnobserved::NoVectorIndexAttached),
         )
         .unwrap();
-        let rendered = render_text(&unobserved, None, None, None, &LastAdmissionRead::Absent);
+        let rendered = render_text(
+            &unobserved,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &skipped_pass(),
+        );
         assert!(
             rendered.contains(
                 "Live embedding coverage: not observed (the live graph carries no vector index)"
@@ -1736,10 +1867,24 @@ mod tests {
         )
         .unwrap();
         assert!(
-            render_text(&observed, None, None, None, &LastAdmissionRead::Absent)
-                .contains("Live embedding coverage: 41/57 indexed, 16 pending (live query graph)"),
+            render_text(
+                &observed,
+                None,
+                None,
+                None,
+                &LastAdmissionRead::Absent,
+                &skipped_pass()
+            )
+            .contains("Live embedding coverage: 41/57 indexed, 16 pending (live query graph)"),
             "{}",
-            render_text(&observed, None, None, None, &LastAdmissionRead::Absent)
+            render_text(
+                &observed,
+                None,
+                None,
+                None,
+                &LastAdmissionRead::Absent,
+                &skipped_pass()
+            )
         );
     }
 
@@ -1751,6 +1896,97 @@ mod tests {
     /// fabricated zero or a "not measured" that nobody asked for. The report
     /// itself carries no store size in either case, which is what keeps
     /// authority status byte-identical across checkout drift.
+    /// The admission arm every existing render test wants: none was taken,
+    /// because these tests drive the formatter and not a daemon.
+    /// A pass that ran, so the arms that grade the admission's AGE are reachable.
+    /// Built through the admit fixture rather than by hand, so a field added
+    /// there has to be considered here too.
+    fn took_pass() -> StatusAdmission {
+        StatusAdmission::Took(Box::new(crate::commands::admit::AdmitReport {
+            schema: crate::commands::admit::ADMIT_SCHEMA.to_string(),
+            repository_id: RepositoryId::new("status-admission").unwrap(),
+            tracked_before: 2,
+            tracked_after: 2,
+            entities_before: 3,
+            entities_after: 3,
+            embeddings_indexed: 6,
+            embeddings_total: 6,
+            reconcile: crate::commands::resources::ReconcileHealth::default(),
+            tree_moved: Some(false),
+            admitted: true,
+            failure: None,
+        }))
+    }
+
+    fn skipped_pass() -> StatusAdmission {
+        StatusAdmission::Skipped("no daemon is running for this repository".to_string())
+    }
+
+    /// The arm this PR exists for. A verdict with no admission behind it is not
+    /// a verdict about the working copy, and the age of an older admission does
+    /// not make it one: measured with the daemon stopped, this line read
+    /// `matching its base change as admitted 0s ago` while the untracked line
+    /// directly below it correctly said nothing had measured anything.
+    #[test]
+    fn a_verdict_with_no_admission_behind_it_says_it_was_not_measured() {
+        let now = Utc::now();
+        let recorded =
+            LastAdmissionRead::Recorded(kin_core::last_admission::LastAdmission::new(now, 8));
+        // The marker is as fresh as it gets, which is the trap: a zero age is
+        // what a skipped pass is most likely to be sitting next to.
+        let phrase = workspace_state_phrase(false, &recorded, &skipped_pass(), now);
+        assert!(
+            phrase.contains("not measured against the working copy"),
+            "{phrase}"
+        );
+        assert!(phrase.contains("no daemon is running"), "{phrase}");
+        assert!(
+            !phrase.contains("as admitted 0s ago"),
+            "a skipped pass must not borrow the clock of an older admission: {phrase}"
+        );
+        // The control, over the same marker: a pass that DID run reaches the age.
+        let took = workspace_state_phrase(false, &recorded, &took_pass(), now);
+        assert!(took.contains("as admitted 0s ago"), "{took}");
+    }
+
+    /// The untracked line reads the pass this status already took. Two readings
+    /// of one working copy is how two lines about it come to disagree.
+    #[test]
+    fn the_untracked_line_reads_the_admission_this_status_took() {
+        let took = untracked_host_content_line(&took_pass());
+        assert!(took.starts_with("Untracked host content:"), "{took}");
+        // A default ReconcileHealth carries no observation age, which is the
+        // "measured nothing" arm rather than an all-clear.
+        assert!(took.contains("not measured"), "{took}");
+
+        let skipped = untracked_host_content_line(&skipped_pass());
+        assert!(skipped.contains("no daemon is running"), "{skipped}");
+    }
+
+    /// A refused admission is an answer and it is not an admission. Reporting it
+    /// as one puts the whole defect back one layer down.
+    #[test]
+    fn a_failed_admission_is_not_treated_as_a_pass() {
+        let now = Utc::now();
+        let recorded =
+            LastAdmissionRead::Recorded(kin_core::last_admission::LastAdmission::new(now, 8));
+        let refused = StatusAdmission::Skipped(
+            "the admission of the working copy failed (host entry changed), so what follows \
+             describes graph truth from before it"
+                .to_string(),
+        );
+        let phrase = workspace_state_phrase(false, &recorded, &refused, now);
+        assert!(
+            phrase.contains("not measured against the working copy"),
+            "{phrase}"
+        );
+        assert!(phrase.contains("host entry changed"), "{phrase}");
+        assert!(
+            refused.reconcile().is_none(),
+            "a skipped pass carries no probes"
+        );
+    }
+
     /// FIR-2961. `Tree: ... (matching its base change)` was read as a statement
     /// about the working copy, because with no clock beside it there is nothing
     /// else to read it as. A stranger running the everyday loop with no Git saw
@@ -1773,14 +2009,14 @@ mod tests {
             8,
         ));
 
-        let clean = workspace_state_phrase(false, &recorded, now);
+        let clean = workspace_state_phrase(false, &recorded, &took_pass(), now);
         assert!(clean.contains("matching its base change"), "{clean}");
         assert!(
             clean.contains("admitted 2m ago"),
             "the verdict has to carry when the graph last looked: {clean}"
         );
 
-        let dirty = workspace_state_phrase(true, &recorded, now);
+        let dirty = workspace_state_phrase(true, &recorded, &took_pass(), now);
         assert!(dirty.contains("ahead of its base change"), "{dirty}");
         assert!(dirty.contains("admitted 2m ago"), "{dirty}");
     }
@@ -1793,7 +2029,7 @@ mod tests {
     fn an_unknown_admission_basis_is_never_rendered_as_a_bare_verdict() {
         let now = Utc::now();
 
-        let absent = workspace_state_phrase(false, &LastAdmissionRead::Absent, now);
+        let absent = workspace_state_phrase(false, &LastAdmissionRead::Absent, &took_pass(), now);
         assert!(
             absent.contains("no complete admission"),
             "an absent marker has to say so: {absent}"
@@ -1803,6 +2039,7 @@ mod tests {
         let unreadable = workspace_state_phrase(
             false,
             &LastAdmissionRead::Unreadable("trailing bytes".to_string()),
+            &took_pass(),
             now,
         );
         assert!(unreadable.contains("will not parse"), "{unreadable}");
@@ -1824,7 +2061,14 @@ mod tests {
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
         let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
 
-        let rendered = render_text(&report, None, None, None, &LastAdmissionRead::Absent);
+        let rendered = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &skipped_pass(),
+        );
         let tree_line = rendered
             .lines()
             .find(|line| line.starts_with("Tree: "))
@@ -1842,7 +2086,14 @@ mod tests {
         let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
         let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
 
-        let without = render_text(&report, None, None, None, &LastAdmissionRead::Absent);
+        let without = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &skipped_pass(),
+        );
         assert!(
             !without.contains("Store size"),
             "an unmeasured status must print no store line at all: {without}"
