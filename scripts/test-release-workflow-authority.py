@@ -524,7 +524,7 @@ REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
         ${{ !cancelled()
         && needs.changes.outputs.docs_only != 'true'
         && github.event_name != 'pull_request' }}
-      runs-on: ubuntu-latest
+      runs-on: kin-16core
       timeout-minutes: 60
       env:
         CARGO_INCREMENTAL: "0"
@@ -560,7 +560,13 @@ UBUNTU_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
     """
 ).rstrip()
 # Indented as `classifier_active_job_source` renders a dedented job block.
-UBUNTU_SHARD_RUNNER = "  runs-on: ubuntu-latest"
+# The `check` job runner, pinned here as well as inside
+# REAL_CHECK_JOB_AUTHORITY, because `shards` binds to blocks.get("check"),
+# so one job is pinned in two places and both have to move together.
+# Moved to the larger runner under the founder's 2026-08-26 ruling. The
+# aggregate is deliberately NOT moved: it compiles nothing and runs in
+# seconds, so it stays on ubuntu-latest.
+UBUNTU_SHARD_RUNNER = "  runs-on: kin-16core"
 UBUNTU_SHARD_INDEPENDENT_LEGS = "    fail-fast: false"
 UBUNTU_SHARD_MATRIX = "      shard: [1, 2]"
 UBUNTU_SHARD_PARTITION = (
@@ -13750,8 +13756,12 @@ def main() -> None:
             "      fail-fast: true",
         ),
         (
-            "the ubuntu shards leave ubuntu",
-            "    runs-on: ubuntu-latest",
+            # The shards no longer run on ubuntu-latest, so mutating away from it
+            # stopped identifying anything the day the runner moved. What the arm
+            # has always meant is "the shards leave their pinned runner", so it
+            # names the pinned value rather than the historical one.
+            "the ubuntu shards leave their pinned runner",
+            "    runs-on: kin-16core",
             "    runs-on: macos-latest",
         ),
         (
@@ -13909,8 +13919,11 @@ def main() -> None:
             "    needs: dco",
         ),
         (
+            # The real check job moved to the larger runner; the pull-request
+            # stub above did not, which is why only this arm changes and the
+            # stub's two arms still name ubuntu-latest.
             "real Check & Test runner detached from its shard matrix",
-            "    runs-on: ubuntu-latest",
+            "    runs-on: kin-16core",
             "    runs-on: ${{ matrix.os }}",
         ),
         (
