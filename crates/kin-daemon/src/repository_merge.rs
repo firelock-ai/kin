@@ -1400,13 +1400,19 @@ fn project_artifacts_from_settled_entities(
         if inside.is_empty() {
             continue;
         }
-        if decisions_a_side_drops(*side, &inside, base_state, ours_state, theirs_state).is_empty() {
+        let (specific, bulk) = split_specific_from_bulk(&inside, base_state, ours_state, theirs_state);
+        if specific.is_empty() {
+            continue;
+        }
+        if decisions_a_side_drops(*side, &specific, base_state, ours_state, theirs_state)
+            .is_empty()
+        {
             continue;
         }
 
         let mut carried: Vec<(MergeSide, Option<&ResolvedArtifact>)> = Vec::new();
         for candidate in [MergeSide::Ours, MergeSide::Theirs, MergeSide::Base] {
-            if !decisions_a_side_drops(candidate, &inside, base_state, ours_state, theirs_state)
+            if !decisions_a_side_drops(candidate, &specific, base_state, ours_state, theirs_state)
                 .is_empty()
             {
                 continue;
@@ -1429,7 +1435,7 @@ fn project_artifacts_from_settled_entities(
         }
 
         if carried.len() != 1 {
-            let decisions = name_decisions(&inside);
+            let decisions = name_decisions(&specific);
             let why = if carried.is_empty() {
                 format!(
                     "no side of {path} carries every one of those entity decisions, and a kin \
@@ -1475,13 +1481,22 @@ fn project_artifacts_from_settled_entities(
                 None => merged_entities.remove(&settled.entity),
             };
         }
+        let subsumed = if bulk.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", and the {} settlement(s) covering the whole of {path} follow it, because a \
+                 settlement naming a container never overrides one naming something inside it",
+                bulk.len()
+            )
+        };
         projections.push(format!(
-            "Projected {} from the `{}` side rather than the `{}` it was settled to, because {}; \
-             a file's bytes follow the entities settled inside it.",
+            "Projected {} from the `{}` side rather than the `{}` it was settled to, because {}\
+             {subsumed}; a file's bytes follow the entities settled inside it.",
             render_subject(entry),
             side_flag(projected),
             side_flag(*side),
-            name_decisions(&inside),
+            name_decisions(&specific),
         ));
     }
     Ok(projections)
@@ -1574,6 +1589,67 @@ fn entities_agree(left: Option<&kin_model::Entity>, right: Option<&kin_model::En
         }
         _ => false,
     }
+}
+
+/// Split settlements at one path into the SPECIFIC ones, which constrain what
+/// the file's bytes may be, and the BULK ones, which do not.
+///
+/// A settlement naming a container is bulk relative to a settlement naming
+/// something inside it. That is the founder's rule one level down from the
+/// artifact: an artifact conflict exists beside the entities inside it only
+/// while the file is still a unit of conflict, and a file's module entity is
+/// the same shape. Settling the module `--ours` says "the whole file is ours",
+/// which is exactly the claim a `--theirs` on one function inside it overrides.
+///
+/// Containment is read from span enclosure within one side, and this is a
+/// different use of the field than the one `entities_agree` refuses. An
+/// absolute offset is a projection fact and cannot say whether two sides agree.
+/// One span enclosing another INSIDE one side is a structural fact about that
+/// side's own text, and it is the only containment the graph carries here:
+/// measured on the stranger's fixture, a commit of that file produced four
+/// entities and zero relations, so a rule keyed on a `Contains` edge could
+/// never have fired.
+fn split_specific_from_bulk<'a>(
+    inside: &[&'a SettledEntity<'a>],
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+) -> (Vec<&'a SettledEntity<'a>>, Vec<&'a SettledEntity<'a>>) {
+    let mut specific = Vec::new();
+    let mut bulk = Vec::new();
+    for outer in inside {
+        let contains_another = inside.iter().any(|inner| {
+            inner.entity != outer.entity
+                && [base_state, ours_state, theirs_state].iter().any(|state| {
+                    match (
+                        state.entities.get(&outer.entity),
+                        state.entities.get(&inner.entity),
+                    ) {
+                        (Some(outer), Some(inner)) => encloses(outer, inner),
+                        _ => false,
+                    }
+                })
+        });
+        if contains_another {
+            bulk.push(*outer);
+        } else {
+            specific.push(*outer);
+        }
+    }
+    (specific, bulk)
+}
+
+/// Whether one entity's span strictly encloses another's, in one side's own
+/// text. Equal ranges are not enclosure, so two readings of one entity never
+/// make each other bulk.
+fn encloses(outer: &kin_model::Entity, inner: &kin_model::Entity) -> bool {
+    let (Some(outer), Some(inner)) = (outer.span.as_ref(), inner.span.as_ref()) else {
+        return false;
+    };
+    outer.file == inner.file
+        && outer.start_byte <= inner.start_byte
+        && outer.end_byte >= inner.end_byte
+        && (outer.start_byte, outer.end_byte) != (inner.start_byte, inner.end_byte)
 }
 
 /// Name entity decisions the way the caller made them, so a refusal quotes the
