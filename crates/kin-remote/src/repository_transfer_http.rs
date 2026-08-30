@@ -78,6 +78,13 @@ pub struct RepositoryTransferEndpoint {
     pub base_url: String,
     pub auth_token: Option<String>,
     pub timeout_secs: u64,
+    /// The hosted organization this peer's repository belongs to.
+    ///
+    /// `None` is another Kin daemon, which serves the seam at its own root and
+    /// has no organizations. `Some` is a hosted KinLab peer, whose seam is org
+    /// scoped, and the two are different route spaces rather than one route
+    /// with an optional segment.
+    pub organization_id: Option<String>,
 }
 
 /// Written by hand so a bearer token cannot reach a log through any derived
@@ -103,11 +110,24 @@ impl RepositoryTransferEndpoint {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             auth_token: None,
             timeout_secs,
+            organization_id: None,
         }
     }
 
     pub fn with_auth(mut self, token: impl Into<String>) -> Self {
         self.auth_token = Some(token.into());
+        self
+    }
+
+    /// Address this peer as a hosted organization's repository.
+    ///
+    /// An empty or whitespace organization is not an organization, and taking
+    /// it would build `/orgs//repos/...`, which a host answers as some other
+    /// route or as a 404 that reads like a missing repository. Refusing it here
+    /// keeps the endpoint on the daemon peer route it already had.
+    pub fn with_organization(mut self, organization_id: impl Into<String>) -> Self {
+        let organization_id = organization_id.into().trim().to_string();
+        self.organization_id = (!organization_id.is_empty()).then_some(organization_id);
         self
     }
 
@@ -151,12 +171,37 @@ impl HttpRepositoryTransferTransport {
         &self.endpoint.base_url
     }
 
+    /// Where one leaf of the seam lives on this peer.
+    ///
+    /// Two route spaces, chosen by whether the peer is a hosted organization.
+    ///
+    /// A daemon serves the seam at its own root, so a daemon peer keeps
+    /// `/repos/{id}/transfer/{leaf}`. A hosted peer serves it under the
+    /// versioned, org-scoped template the shared contract declares, and
+    /// addressing a hosted peer the daemon way is not a 404: on kinlab.ai every
+    /// path outside `/api/` falls through the edge to the static bucket, which
+    /// answers a POST with Google Cloud Storage XML. A user pushing then reads
+    /// `InvalidArgument ... POST object expects Content-Type multipart/form-data`
+    /// and has no way to tell that nothing of Kin's ever saw the request
+    /// (FIR-2945).
+    ///
+    /// The template is `/api/v1/orgs/{orgId}/repos/{repoId}/transfer/{leaf}`,
+    /// pinned in `packages/boundary-contracts` and asserted against it by the
+    /// contract suite, so this spelling and the server's are one document.
     fn url(&self, repository_id: &RepositoryId, leaf: &str) -> String {
-        format!(
-            "{}/repos/{}/transfer/{leaf}",
-            self.endpoint.base_url,
-            urlencoded(repository_id.as_str())
-        )
+        match self.endpoint.organization_id.as_deref() {
+            Some(organization_id) => format!(
+                "{}/api/v1/orgs/{}/repos/{}/transfer/{leaf}",
+                self.endpoint.base_url,
+                urlencoded(organization_id),
+                urlencoded(repository_id.as_str())
+            ),
+            None => format!(
+                "{}/repos/{}/transfer/{leaf}",
+                self.endpoint.base_url,
+                urlencoded(repository_id.as_str())
+            ),
+        }
     }
 
     fn get_json<R: serde::de::DeserializeOwned>(
@@ -413,6 +458,129 @@ mod tests {
         assert_eq!(
             transport.url(&repository_id, "receive"),
             "http://127.0.0.1:4010/repos/org%2Frepo%20name/transfer/receive"
+        );
+    }
+
+    /// The seam contract itself, so the route is not spelled twice.
+    ///
+    /// `packages/boundary-contracts` is the one document both halves of this
+    /// seam read. Hardcoding the hosted template here as well would leave the
+    /// Rust client and the control plane free to drift apart while both suites
+    /// stayed green, which is the failure this file is fixing.
+    const SEAM_CONTRACT: &str = include_str!(
+        "../../../packages/boundary-contracts/schemas/hosted-repository-transfer.schema.json"
+    );
+
+    fn contract_route_template() -> String {
+        let contract: serde_json::Value =
+            serde_json::from_str(SEAM_CONTRACT).expect("the seam contract is valid JSON");
+        contract["definitions"]["seam"]["const"]["routeTemplate"]
+            .as_str()
+            .expect("the seam contract declares a routeTemplate")
+            .to_string()
+    }
+
+    /// Render the contract's own template, so the expected URL is derived from
+    /// the contract rather than typed beside it.
+    fn expected_hosted_url(
+        base_url: &str,
+        organization_id: &str,
+        repo_id: &str,
+        leaf: &str,
+    ) -> String {
+        let rendered = contract_route_template()
+            .replace("{orgId}", organization_id)
+            .replace("{repoId}", repo_id)
+            .replace("{leaf}", leaf);
+        format!("{base_url}{rendered}")
+    }
+
+    #[test]
+    fn a_hosted_peer_is_addressed_at_the_contract_route() {
+        // The defect this pins: without the organization scope the client built
+        // `{base}/repos/{id}/transfer/{leaf}`, which on kinlab.ai is outside
+        // `/api/` and falls through the edge to the static bucket, so a push
+        // came back as Google Cloud Storage XML (FIR-2945).
+        let transport = HttpRepositoryTransferTransport::new(
+            RepositoryTransferEndpoint::new("https://kinlab.ai").with_organization("acme"),
+        );
+        let repository_id = RepositoryId::new("kin").unwrap();
+        assert_eq!(
+            transport.url(&repository_id, "receive"),
+            expected_hosted_url("https://kinlab.ai", "acme", "kin", "receive"),
+        );
+        // The literal, so a contract template that changed shape without anyone
+        // noticing cannot be satisfied by a renderer that changed with it.
+        assert_eq!(
+            transport.url(&repository_id, "receive"),
+            "https://kinlab.ai/api/v1/orgs/acme/repos/kin/transfer/receive",
+        );
+    }
+
+    #[test]
+    fn every_contract_leaf_is_addressed_under_api_v1() {
+        // The join over the real set rather than one sampled leaf: a leaf added
+        // to the contract that this client cannot address is the drift the
+        // shared document exists to prevent.
+        let contract: serde_json::Value =
+            serde_json::from_str(SEAM_CONTRACT).expect("the seam contract is valid JSON");
+        let leaves = contract["definitions"]["seam"]["const"]["leaves"]
+            .as_array()
+            .expect("the seam contract declares its leaves");
+        assert_eq!(leaves.len(), 4, "the seam has four leaves");
+        let transport = HttpRepositoryTransferTransport::new(
+            RepositoryTransferEndpoint::new("https://kinlab.ai").with_organization("acme"),
+        );
+        let repository_id = RepositoryId::new("kin").unwrap();
+        for leaf in leaves {
+            let leaf = leaf["leaf"].as_str().expect("every leaf is named");
+            let url = transport.url(&repository_id, leaf);
+            assert_eq!(
+                url,
+                expected_hosted_url("https://kinlab.ai", "acme", "kin", leaf)
+            );
+            assert!(
+                url.starts_with("https://kinlab.ai/api/"),
+                "leaf {leaf} is addressed outside /api/, where the edge serves the bucket: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_peer_daemon_keeps_the_unscoped_route() {
+        // A daemon has no organizations and serves the seam at its own root.
+        // This is the case an org-scoped rewrite would have broken silently.
+        let transport = transport("http://127.0.0.1:4010");
+        let repository_id = RepositoryId::new("kin").unwrap();
+        assert_eq!(
+            transport.url(&repository_id, "advertise"),
+            "http://127.0.0.1:4010/repos/kin/transfer/advertise"
+        );
+    }
+
+    #[test]
+    fn a_blank_organization_is_not_an_organization() {
+        // `/orgs//repos/...` is a different route, and a host answers it as
+        // something else or as a 404 that reads like a missing repository.
+        let transport = HttpRepositoryTransferTransport::new(
+            RepositoryTransferEndpoint::new("https://kinlab.ai").with_organization("   "),
+        );
+        let repository_id = RepositoryId::new("kin").unwrap();
+        assert_eq!(
+            transport.url(&repository_id, "status"),
+            "https://kinlab.ai/repos/kin/transfer/status"
+        );
+    }
+
+    #[test]
+    fn a_hosted_organization_is_percent_encoded() {
+        let transport = HttpRepositoryTransferTransport::new(
+            RepositoryTransferEndpoint::new("https://kinlab.ai").with_organization("a c/me"),
+        );
+        let repository_id = RepositoryId::new("kin").unwrap();
+        assert_eq!(
+            transport.url(&repository_id, "export"),
+            "https://kinlab.ai/api/v1/orgs/a%20c%2Fme/repos/kin/transfer/export"
         );
     }
 

@@ -252,6 +252,30 @@ pub(crate) fn resolve_native_remote_target(
     })
 }
 
+/// The hosted target a native-Kin remote URL names, when it names one.
+///
+/// Only a locator carries an organization: `kinlab://<org>/<repo>`,
+/// `https://<default-host>/<org>/<repo>`, or any base ending
+/// `/api/orgs/<org>/repos/<repo>`. A bare base URL such as
+/// `https://kinlab.ai` or `http://127.0.0.1:4010` names none, and answering
+/// `None` there is the point: the caller decides whether a missing organization
+/// is a peer daemon, which has no organizations at all, or a hosted remote that
+/// cannot be addressed without one.
+///
+/// The whole target is returned rather than the organization alone, because the
+/// two have to be taken together. A locator's base URL is the part BEFORE
+/// `/api/orgs/...`, so a caller that kept the locator as its base and took only
+/// the organization from here would address
+/// `<base>/api/orgs/<org>/repos/<repo>/api/v1/orgs/<org>/repos/<repo>/transfer/...`,
+/// which is nobody's route.
+pub(crate) fn native_remote_locator(url: &str) -> Option<NativeRemoteTarget> {
+    let target = parse_native_remote_locator(url)?;
+    if target.organization_id.trim().is_empty() || target.base_url.trim().is_empty() {
+        return None;
+    }
+    Some(target)
+}
+
 pub(crate) fn default_cli_actor_id(base_url: &str) -> String {
     auth::default_cli_actor_id(base_url)
 }
