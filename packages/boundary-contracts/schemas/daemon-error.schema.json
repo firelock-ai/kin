@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "kin://contracts/daemon-error",
+  "title": "DaemonError",
+  "description": "The body a daemon returns when it refuses a non-idempotent command. `refused_before_write` is present only when the daemon raised the refusal before its first authority write; absent means the daemon says nothing, which a caller must read as indeterminate.",
+  "type": "object",
+  "required": ["message"],
+  "properties": {
+    "message": {
+      "type": "string",
+      "description": "The refusal in the daemon's own words, rendered to the caller verbatim."
+    },
+    "refused_before_write": {
+      "type": "boolean",
+      "description": "True only when nothing was published. Absent is the safe default and means unknown."
+    }
+  },
+  "additionalProperties": false
+}

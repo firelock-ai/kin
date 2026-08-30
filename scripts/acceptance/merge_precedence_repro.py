@@ -30,7 +30,7 @@ carries all of them the merge refuses and names both decisions. Nothing is
 synthesized, because kin has no textual line merge to build a third body from,
 so a projection is a choice among sides this merge already bound.
 
-Nine checks over ten repositories, run in order because two of them are
+Ten checks over eleven repositories, run in order because two of them are
 destructive: they publish the merge the earlier assertions are about. The first
 four grade FIR-2958's precedence rule; the last two grade rc062j finding (2),
 which is the same authority reporting conflicts that are not conflicts.
@@ -96,6 +96,7 @@ GRANULARITY_TICKET = "FIR-2960"
 BODIES_TICKET = "FIR-2960"
 # The rc062k merge-workflow items: the exit code and the selector.
 WORKFLOW_TICKET = "FIR-2960"
+REFUSAL_TICKET = "FIR-3018"
 EXIT_MERGE_CONFLICTED = 8
 
 print = functools.partial(print, flush=True)
@@ -755,6 +756,50 @@ def grade_parked_output_names_its_code(out, err, code):
     return (PASS, "the parked merge names exit %d where it fires" % code)
 
 
+def grade_refusal_says_what_is_true(rc, out, err, published_before, published_after):
+    """rc062k F-25. An ordinary refusal must not warn about a write.
+
+    Four claims graded together, because three of them pass on their own for
+    the wrong reasons: a run that printed nothing carries no false warning, and
+    a run that never refused publishes nothing either.
+    """
+    text = (err or "") + (out or "")
+    if rc is None or not text.strip():
+        return (UNREADABLE, "`kin resolve --continue` produced nothing to read")
+    problems = []
+    if rc == 0:
+        problems.append("the refusal did not refuse")
+    if "may already have committed" in text:
+        problems.append("it still warns the daemon may have committed")
+    if "indeterminate" in text:
+        problems.append("it still calls a determinate refusal indeterminate")
+    if "unresolved conflict" not in text:
+        problems.append("it does not carry the daemon's own reason")
+    if published_before != published_after:
+        problems.append("something WAS published, so the marker would be a lie")
+    if problems:
+        return (FAIL, "; ".join(problems))
+    return (PASS, "the refusal names its reason, warns of no write, and published nothing")
+
+
+def check_wrotenothing(suite):
+    """FIR-3018. The daemon says it wrote nothing and the CLI says so too.
+
+    Not called `refusal`: FIR-2958's check already owns that id, and two checks
+    sharing one collapse in the gate's map so only the later is graded. The
+    suite's own self-test caught it, which is what that gate-shape assertion is
+    for.
+    """
+    repo = suite.repo("wrotenothing", BODY_FILES)
+    suite.kin_run(["merge", "feature"], repo)
+    before = suite.kin_run(["log", "-n", "1"], repo)[1]
+    rc, out, err = suite.kin_run(["resolve", "--continue"], repo)
+    after = suite.kin_run(["log", "-n", "1"], repo)[1]
+    return _combine("wrotenothing", [
+        ("said", grade_refusal_says_what_is_true(rc, out, err, before, after)),
+    ], ticket=REFUSAL_TICKET)
+
+
 def check_exitcode(suite):
     """rc062k. A merge that parks conflicts must not report success, and one
     that publishes must not report failure. Both arms, because a build that
@@ -860,6 +905,7 @@ CHECKS = [
     ("bodies", check_bodies),
     ("exitcode", check_exitcode),
     ("byname", check_byname),
+    ("wrotenothing", check_wrotenothing),
 ]
 
 
@@ -1144,6 +1190,24 @@ def self_test():
            FAIL)
     expect("named cannot read empty output",
            grade_parked_output_names_its_code("", "", 8), UNREADABLE)
+
+    good_refusal = ("Error: merging refs/heads/feature into refs/heads/main still has 3 "
+                    "unresolved conflict(s): entity summarize in pkg/core.py")
+    old_refusal = ("Error: daemon command outcome is indeterminate for operation abc at "
+                   "/commands/resolve: daemon returned HTTP 409: still has 3 unresolved "
+                   "conflict(s); the daemon may already have committed it")
+    expect("refusal passes a refusal that names its reason and warns of no write",
+           grade_refusal_says_what_is_true(1, "", good_refusal, "change a", "change a"), PASS)
+    expect("refusal fails the shipped indeterminate wrapper",
+           grade_refusal_says_what_is_true(1, "", old_refusal, "change a", "change a"), FAIL)
+    expect("refusal fails a run that did not refuse",
+           grade_refusal_says_what_is_true(0, "", good_refusal, "change a", "change a"), FAIL)
+    # CONTROL: the marker is a claim about the repository, so a run that DID
+    # publish must fail even when every word of the message is right.
+    expect("CONTROL refusal fails when something was published after all",
+           grade_refusal_says_what_is_true(1, "", good_refusal, "change a", "change b"), FAIL)
+    expect("refusal cannot read empty output",
+           grade_refusal_says_what_is_true(1, "", "", "change a", "change a"), UNREADABLE)
 
     expect("a relative kin path is absolutized by this suite",
            (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)

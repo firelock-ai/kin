@@ -93,21 +93,81 @@ pub(crate) fn merge_bad_request(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(MergeBadRequest(message.into()))
 }
 
+/// A refusal from a non-idempotent command, and whether anything was written.
+///
+/// A transport sees a status and some bytes. It cannot know whether a proxy
+/// answered, or whether this daemon acted and then failed to report, so it
+/// treats every non-2xx as an indeterminate write and tells the caller the
+/// daemon may already have committed. For an ordinary refusal that is alarming
+/// and false, and the daemon is the only party that can say otherwise.
+///
+/// So it says so here. `From<(StatusCode, String)>` produces the silent form,
+/// which is today's behaviour, and a site marks itself with `before_write` only
+/// when it is reached before this command's first authority write. Silence is
+/// the default in both directions: a body with no marker, a body that does not
+/// parse, and a proxy that replaced the body all mean the caller learns nothing.
+pub(crate) struct CommandRefusal {
+    status: StatusCode,
+    body: kin_cli::daemon_error::DaemonErrorBody,
+}
+
+impl CommandRefusal {
+    /// A refusal raised before this command's first authority write.
+    ///
+    /// Only correct above the `finalize_local_repository_commit` call, which is
+    /// where both of these commands publish. Applying it below that line is the
+    /// mutation the tests for this exist to catch.
+    pub(crate) fn before_write((status, message): (StatusCode, String)) -> Self {
+        Self {
+            status,
+            body: kin_cli::daemon_error::DaemonErrorBody::before_write(message),
+        }
+    }
+}
+
+impl From<(StatusCode, String)> for CommandRefusal {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self {
+            status,
+            body: kin_cli::daemon_error::DaemonErrorBody::unknown(message),
+        }
+    }
+}
+
+impl axum::response::IntoResponse for CommandRefusal {
+    fn into_response(self) -> axum::response::Response {
+        (
+            self.status,
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/json; charset=utf-8",
+            )],
+            self.body.to_wire(),
+        )
+            .into_response()
+    }
+}
+
 pub(crate) fn execute(
     state: &DaemonState,
     request: &MergeRequest,
-) -> std::result::Result<MergeResponse, (StatusCode, String)> {
+) -> std::result::Result<MergeResponse, CommandRefusal> {
     let graph_mutation = state.begin_graph_authority_mutation();
     let persistence = state.persist_lock.lock().map_err(|_| {
-        (
+        CommandRefusal::from((
             StatusCode::INTERNAL_SERVER_ERROR,
             "daemon persistence lock poisoned".to_string(),
-        )
+        ))
     })?;
     let previous_graph_root = hex::encode(state.graph.compute_root_hash());
-    let authority =
-        ActiveLocalRepositoryAuthority::open_bound(state).map_err(merge_bind_refusal)?;
-    let outcome = plan_and_publish(state, &authority, request).map_err(classify_merge_error)?;
+    // Everything from here to `finalize_local_repository_commit` below runs
+    // before this command's first authority write, so a refusal raised in it
+    // published nothing and says so. Below that call the marker is never
+    // applied, because by then the daemon cannot promise it.
+    let authority = ActiveLocalRepositoryAuthority::open_bound(state)
+        .map_err(|refusal| CommandRefusal::before_write(merge_bind_refusal(refusal)))?;
+    let outcome = plan_and_publish(state, &authority, request)
+        .map_err(|error| CommandRefusal::before_write(classify_merge_error(error)))?;
     let execution = match outcome {
         MergeCommandOutcome::Commit(execution) => execution,
         MergeCommandOutcome::ReadOnly(response) => {

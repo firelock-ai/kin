@@ -368,18 +368,25 @@ fn slice_span(text: &str, start: usize, end: usize) -> Option<String> {
 pub(crate) fn execute_resolve(
     state: &DaemonState,
     request: &ResolveRequest,
-) -> std::result::Result<ResolveResponse, (StatusCode, String)> {
+) -> std::result::Result<ResolveResponse, crate::repository_merge::CommandRefusal> {
+    use crate::repository_merge::CommandRefusal;
     let graph_mutation = state.begin_graph_authority_mutation();
     let persistence = state.persist_lock.lock().map_err(|_| {
-        (
+        CommandRefusal::from((
             StatusCode::INTERNAL_SERVER_ERROR,
             "daemon persistence lock poisoned".to_string(),
-        )
+        ))
     })?;
     let previous_graph_root = hex::encode(state.graph.compute_root_hash());
-    let authority =
-        ActiveLocalRepositoryAuthority::open_bound(state).map_err(merge_bind_refusal)?;
-    let execution = plan_resolution(state, &authority, request).map_err(classify_merge_error)?;
+    // Same boundary as the merge: everything to `finalize_local_repository_commit`
+    // below runs before this command's first authority write. `plan_resolution`
+    // is where a settlement is refused and where `resolve --continue` refuses
+    // with conflicts outstanding, which is the refusal that was being reported
+    // as a possible write.
+    let authority = ActiveLocalRepositoryAuthority::open_bound(state)
+        .map_err(|refusal| CommandRefusal::before_write(merge_bind_refusal(refusal)))?;
+    let execution = plan_resolution(state, &authority, request)
+        .map_err(|error| CommandRefusal::before_write(classify_merge_error(error)))?;
     let finalization = state
         .finalize_local_repository_commit(
             &execution.receipt,

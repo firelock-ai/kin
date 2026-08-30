@@ -17,6 +17,7 @@ const schemaFiles = {
   directoryList: 'directory-list.schema.json',
   fileContent: 'file-content.schema.json',
   commandAck: 'command-ack.schema.json',
+  daemonError: 'daemon-error.schema.json',
   kinCommandResult: 'kin-command-result.schema.json',
   scmSnapshot: 'scm-snapshot.schema.json',
   scmResourceGroups: 'scm-resource-groups.schema.json',
