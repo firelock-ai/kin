@@ -39,7 +39,8 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use kin_core::last_admission::LastAdmissionRead;
 use kin_model::{
-    Hash256, RefName, RefTarget, RepositoryId, RootBundle, WorkspaceHead, WorkspaceId,
+    Hash256, MergeTransactionRecord, RefName, RefTarget, RepositoryId, RootBundle, WorkspaceHead,
+    WorkspaceId,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -986,6 +987,7 @@ pub async fn run(json: bool, wait_quiesce: std::time::Duration) -> Result<()> {
                 crate::daemon_death::recorded_for_store(layout.root()).as_ref(),
                 &kin_core::last_admission::read(&layout),
                 &pass,
+                merge.as_ref()
             )
         );
         // Which projection served the files this status describes. Appended
@@ -1108,8 +1110,17 @@ pub fn build_command_status_response(
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
     pass: &StatusAdmission,
+    merge: Option<&MergeInProgress>,
 ) -> Result<CommandStatusResponse> {
-    let text = render_text(&report, build.as_ref(), footprint, death, admission, pass);
+    let text = render_text(
+        &report,
+        build.as_ref(),
+        footprint,
+        death,
+        admission,
+        pass,
+        merge,
+    );
     let json = json
         .then(|| serde_json::to_string(&report))
         .transpose()
@@ -1120,6 +1131,83 @@ pub fn build_command_status_response(
         text,
         json,
     })
+}
+
+/// A merge this workspace is holding open.
+///
+/// Only the fields a status line needs. The full account is `kin conflicts`, and
+/// duplicating it here would give a reader two versions of one merge that can
+/// come to disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeInProgress {
+    pub source_ref: String,
+    pub target_ref: String,
+    pub transaction: String,
+    pub settled: usize,
+    pub total: usize,
+}
+
+/// The merge this workspace is holding open, when it is holding one.
+///
+/// `kin status` said nothing at all during a merge that had left seventy-six
+/// conflicts unresolved, and reported the tree as matching its base change while
+/// it did (FIR-2961). Kin holds a merge in an authority transaction rather than
+/// smearing conflict markers across the working copy, which is the better design
+/// and is exactly why the working copy cannot tell you a merge is open: there is
+/// nothing on disk to see. Walk away, come back, and the only surface that knows
+/// is one you have to already suspect you need.
+///
+/// Read off the authority lease, from the same durable record `kin conflicts`
+/// reads, so the two cannot disagree and neither needs a daemon or a filesystem
+/// read. A terminated record is not a merge in progress and is skipped here,
+/// because "the last merge" and "a merge waiting on you" are the two states this
+/// line exists to separate.
+pub fn merge_in_progress(
+    binding: &kin_core::LocalRepositoryAuthorityBinding,
+) -> Result<Option<MergeInProgress>> {
+    let authority = ActiveRepositoryAuthority::open(binding)?;
+    let lease = authority.manager().read_authority();
+    let workspace_id = authority.workspace_id;
+    Ok(lease
+        .metadata()
+        .merge_transactions
+        .iter()
+        .find(|record| record.workspace_id == workspace_id && record.state.is_in_progress())
+        .map(summarize_merge))
+}
+
+fn summarize_merge(record: &MergeTransactionRecord) -> MergeInProgress {
+    let unresolved = record.unresolved().count();
+    MergeInProgress {
+        source_ref: record.binding.source_ref.to_string(),
+        target_ref: record.binding.target_ref.to_string(),
+        transaction: record.hash.to_string(),
+        settled: record.entries.len().saturating_sub(unresolved),
+        total: record.entries.len(),
+    }
+}
+
+/// The merge banner, worded so the next command is in the sentence.
+///
+/// Rendered directly under the heading rather than appended at the end, because
+/// the reason this line exists is that a reader who does not already suspect a
+/// merge is open will not scroll for it. `git status` puts "You have unmerged
+/// paths" at the top for the same reason.
+fn merge_line(merge: &MergeInProgress) -> String {
+    let remaining = merge.total.saturating_sub(merge.settled);
+    if remaining == 0 {
+        format!(
+            "Merge in progress: {} into {} as merge transaction {}, every one of {} conflict(s) \
+             settled; publish it with `kin resolve --continue`",
+            merge.source_ref, merge.target_ref, merge.transaction, merge.total
+        )
+    } else {
+        format!(
+            "Merge in progress: {} into {} as merge transaction {}, {} of {} conflict(s) settled; \
+             `kin conflicts` lists what is outstanding, and nothing below describes it",
+            merge.source_ref, merge.target_ref, merge.transaction, merge.settled, merge.total
+        )
+    }
 }
 
 /// Graph truth caught up with the working copy, or the reason it could not be.
@@ -1318,6 +1406,7 @@ fn render_text(
     death: Option<&kin_daemon_spawn::DaemonKillRecord>,
     admission: &LastAdmissionRead,
     pass: &StatusAdmission,
+    merge: Option<&MergeInProgress>,
 ) -> String {
     let workspace_state =
         workspace_state_phrase(report.workspace.dirty, admission, pass, Utc::now());
@@ -1387,6 +1476,9 @@ fn render_text(
     ];
     if let Some(footprint) = footprint {
         lines.push(format!("Store size: {}", footprint.render()));
+    }
+    if let Some(merge) = merge {
+        lines.insert(1, merge_line(merge));
     }
     if let Some(build) = build {
         lines.push(format!(
@@ -1538,7 +1630,8 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
-                &skipped_pass()
+                &skipped_pass(),
+                None
             )
             .contains("Authority payload read: "),
             "text status must state the payload the open read"
@@ -1848,6 +1941,7 @@ mod tests {
             None,
             &LastAdmissionRead::Absent,
             &skipped_pass(),
+            None,
         );
         assert!(
             rendered.contains(
@@ -1878,7 +1972,8 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
-                &skipped_pass()
+                &skipped_pass(),
+                None
             )
             .contains("Live embedding coverage: 41/57 indexed, 16 pending (live query graph)"),
             "{}",
@@ -1888,7 +1983,8 @@ mod tests {
                 None,
                 None,
                 &LastAdmissionRead::Absent,
-                &skipped_pass()
+                &skipped_pass(),
+                None
             )
         );
     }
@@ -1925,6 +2021,103 @@ mod tests {
 
     fn skipped_pass() -> StatusAdmission {
         StatusAdmission::Skipped("no daemon is running for this repository".to_string())
+    }
+
+    fn merge_fixture(settled: usize, total: usize) -> MergeInProgress {
+        MergeInProgress {
+            source_ref: "refs/heads/pretty".to_string(),
+            target_ref: "refs/heads/main".to_string(),
+            transaction: "1f2f0ae2".to_string(),
+            settled,
+            total,
+        }
+    }
+
+    /// FIR-2961. During a merge that had left seventy-six conflicts unresolved,
+    /// `kin status` said nothing at all and reported the tree as matching its
+    /// base change while it did. Kin holds a merge in an authority transaction
+    /// rather than smearing markers across the working copy, which is the better
+    /// design and is exactly why the working copy cannot tell you: there is
+    /// nothing on disk to see.
+    #[test]
+    fn a_held_merge_is_named_with_what_it_waits_on() {
+        let line = merge_line(&merge_fixture(2, 76));
+        assert!(line.starts_with("Merge in progress:"), "{line}");
+        assert!(line.contains("refs/heads/pretty"), "{line}");
+        assert!(line.contains("refs/heads/main"), "{line}");
+        assert!(line.contains("1f2f0ae2"), "{line}");
+        assert!(line.contains("2 of 76 conflict(s) settled"), "{line}");
+        assert!(line.contains("kin conflicts"), "{line}");
+    }
+
+    /// Every conflict settled is a different state and a different next command.
+    /// A banner that said the same thing in both would send a reader to
+    /// `kin conflicts` to be told there is nothing outstanding.
+    #[test]
+    fn a_fully_settled_merge_names_the_publish_step_instead() {
+        let line = merge_line(&merge_fixture(76, 76));
+        assert!(
+            line.contains("every one of 76 conflict(s) settled"),
+            "{line}"
+        );
+        assert!(line.contains("kin resolve --continue"), "{line}");
+        assert!(
+            !line.contains("kin conflicts"),
+            "a settled merge must not send the reader to a list of nothing: {line}"
+        );
+    }
+
+    /// Placement is half the fix. `git status` puts "You have unmerged paths" at
+    /// the top, and a banner printed at the bottom of forty lines is one a reader
+    /// who does not already suspect a merge will never see. So this grades the
+    /// rendered position, not the wording.
+    #[test]
+    fn the_merge_banner_renders_directly_under_the_heading() {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&init.layout).unwrap();
+        let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
+        let merge = merge_fixture(2, 76);
+
+        let rendered = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &skipped_pass(),
+            Some(&merge),
+        );
+        let lines: Vec<&str> = rendered.lines().collect();
+        assert_eq!(lines[0], "Kin repository-v6 status", "{rendered}");
+        assert!(
+            lines[1].starts_with("Merge in progress:"),
+            "the banner has to be the line under the heading, not somewhere below: {}",
+            lines[1]
+        );
+
+        // The control, and it is the half that matters: no merge, no banner, and
+        // the line under the heading is the one that was always there. A fix that
+        // printed the banner unconditionally would pass the assertion above.
+        let quiet = render_text(
+            &report,
+            None,
+            None,
+            None,
+            &LastAdmissionRead::Absent,
+            &skipped_pass(),
+            None,
+        );
+        assert!(
+            !quiet.contains("Merge in progress:"),
+            "a repository with no held merge must not claim one: {quiet}"
+        );
+        let quiet_lines: Vec<&str> = quiet.lines().collect();
+        assert!(
+            quiet_lines[1].starts_with("Repository: "),
+            "{}",
+            quiet_lines[1]
+        );
     }
 
     /// The arm this PR exists for. A verdict with no admission behind it is not
@@ -2067,11 +2260,19 @@ mod tests {
         let report = inspect(&init.layout, &binding, unobserved_fixture()).unwrap();
 
         let tree_line_of = |pass: &StatusAdmission| {
-            render_text(&report, None, None, None, &LastAdmissionRead::Absent, pass)
-                .lines()
-                .find(|line| line.starts_with("Tree: "))
-                .unwrap_or_default()
-                .to_string()
+            render_text(
+                &report,
+                None,
+                None,
+                None,
+                &LastAdmissionRead::Absent,
+                pass,
+                None,
+            )
+            .lines()
+            .find(|line| line.starts_with("Tree: "))
+            .unwrap_or_default()
+            .to_string()
         };
 
         // Read-after-admit outranks the marker, so with no pass behind it the
@@ -2112,6 +2313,7 @@ mod tests {
             None,
             &LastAdmissionRead::Absent,
             &skipped_pass(),
+            None,
         );
         assert!(
             !without.contains("Store size"),
@@ -2126,6 +2328,7 @@ mod tests {
             None,
             &LastAdmissionRead::Absent,
             &skipped_pass(),
+            None,
         );
         assert!(
             with.contains("Store size: ") && with.contains("under .kin/"),
