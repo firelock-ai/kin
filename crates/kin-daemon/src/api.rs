@@ -34751,6 +34751,28 @@ mod tests {
             commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
         assert_eq!(branch_change(&state), regression);
 
+        // PRECONDITION, proved rather than assumed: this daemon's projection is
+        // populated BEFORE the publication. That is the condition the defect
+        // needs, and a check that publishes into an empty projection passes on
+        // the unpatched binary, which is the single most likely way this test
+        // could fail to fail. Forcing a graph-replaying read here both creates
+        // the state and records that it existed.
+        //
+        // A failure HERE is not a verdict on the property. It says the fixture
+        // never reached the state under test, and its message says so, because
+        // a precondition red and a property red are different news and a reader
+        // of a stack trace cannot tell them apart from the line number alone.
+        state
+            .graph
+            .resolve_graph_at(&regression)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOT RUN, precondition unmet rather than property refuted: this daemon's \
+                     graph could not replay to the change it just published, so the projection \
+                     was never populated and publishing into it proves nothing: {error}"
+                )
+            });
+
         let (status, body) =
             rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
         assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
