@@ -12,13 +12,13 @@ use std::collections::{BTreeSet, HashMap};
 
 use anyhow::{anyhow, bail, Context, Result};
 use kin_model::{
-    compute_resolved_tree_hash, ChangeStore, Entity, EntityDelta, EntityId, GitObjectId, Hash256,
-    RefName, RefTarget, Relation, RelationDelta, RelationId, RepositoryId, ResolvedTree,
-    RootBundle, SemanticChangeId, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId,
+    compute_resolved_tree_hash, ChangeStore, Entity, EntityDelta, EntityId, Hash256, RefName,
+    RefTarget, Relation, RelationDelta, RelationId, RepositoryId, ResolvedTree, RootBundle,
+    SemanticChangeId, TreeDelta, TreeEntry, WorkspaceHead, WorkspaceId,
 };
 use serde::{Deserialize, Serialize};
 
-use super::repository_authority::{parse_git_object_id, parse_ref_name, ActiveRepositoryAuthority};
+use super::repository_authority::ActiveRepositoryAuthority;
 
 pub const DIFF_SCHEMA: &str = "kin.diff.v1";
 
@@ -444,6 +444,19 @@ fn derive_workspace_semantics(
     })
 }
 
+/// The state one endpoint selector names.
+///
+/// `WORKSPACE` is answered here and everything else is handed to
+/// [`super::ref_grammar`], the one grammar `kin blame --ref` and
+/// `kin history --ref` also speak. FIR-3015: this function used to carry a
+/// second parser, which knew `@`, `ref:` and `ref-hex:` and did not know
+/// `HEAD~N`, `kin:`, `branch:` or a short change id, so `kin diff` refused
+/// three forms in a row that its own sibling commands had just printed or
+/// accepted.
+///
+/// `WORKSPACE` stays local because it is not a point in history. It names the
+/// uncommitted working tree, there is no change id behind it, and it carries an
+/// entity and relation snapshot the history arms have to derive.
 fn resolve_endpoint(
     lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
     workspace: &kin_model::WorkspaceState,
@@ -492,116 +505,41 @@ fn resolve_endpoint(
                 relations: snapshot.relations,
             });
         }
-        "HEAD" | "@" => {
-            let Some(target) = workspace.base_target.clone() else {
-                return EndpointState::empty(DiffEndpointSource::Head, requested);
-            };
-            let change_id = lease
-                .resolve_target_change_id(&target)
-                .context("resolve repository-v6 HEAD target")?;
-            return state_at_change(
-                history,
-                DiffEndpoint {
-                    source: DiffEndpointSource::Head,
-                    requested,
-                    ref_name: match &workspace.head {
-                        WorkspaceHead::Symbolic { target } => Some(target.clone()),
-                        WorkspaceHead::Detached { .. } => None,
-                    },
-                    target: Some(target),
-                    change_id: Some(change_id),
-                    workspace_generation: None,
-                    workspace_head: None,
-                    tree_hash: Hash256::from_bytes([0; 32]),
-                    artifact_count: 0,
-                    entity_count: 0,
-                    relation_count: 0,
-                },
-                change_id,
-            );
+        // A repository with no commits yet has an empty base rather than a
+        // missing one, so `kin diff` against a fresh HEAD shows the whole
+        // workspace as added. The shared resolver refuses an unborn HEAD, which
+        // is right for blame and wrong here, so the case is answered before it.
+        "HEAD" | "@" if workspace.base_target.is_none() => {
+            return EndpointState::empty(DiffEndpointSource::Head, requested);
         }
         _ => {}
     }
 
-    if let Some(hex_name) = selector.strip_prefix("ref-hex:") {
-        if hex_name.is_empty()
-            || hex_name != hex_name.to_ascii_lowercase()
-            || !hex_name.bytes().all(|byte| byte.is_ascii_hexdigit())
-        {
-            bail!("ref-hex selector must use non-empty canonical lowercase hexadecimal bytes");
-        }
-        let bytes = hex::decode(hex_name).context("decode ref-hex selector")?;
-        let name = RefName::from_bytes(bytes)
-            .map_err(|error| anyhow!("invalid ref-hex selector: {error}"))?;
-        return state_at_ref(lease, history, name, requested);
-    }
-
-    if let Some(value) = selector.strip_prefix("ref:") {
-        return state_at_ref(lease, history, parse_ref_name(value)?, requested);
-    }
-    if let Some(value) = selector.strip_prefix("change:") {
-        let change_id = parse_change_id(value)?;
-        require_change(history, change_id)?;
-        return state_at_change(
-            history,
-            endpoint_descriptor(DiffEndpointSource::Change, requested, Some(change_id)),
-            change_id,
-        );
-    }
-    if let Some(value) = selector.strip_prefix("git:") {
-        return state_at_git_object(lease, history, parse_git_object_id(value)?, requested);
-    }
-
-    // Bare values prefer exact refs, matching Git's ordinary branch UX while
-    // avoiding revision-string heuristics. A 64-hex branch remains a branch if
-    // it exists; otherwise it may identify a Kin change or Git SHA-256 object.
-    if let Ok(name) = parse_ref_name(selector) {
-        if lease.resolve_ref_target(&name)?.is_some() {
-            return state_at_ref(lease, history, name, requested);
-        }
-    }
-    if selector.len() == 64 && selector.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        if let Ok(change_id) = parse_change_id(selector) {
-            if history.get_change(&change_id)?.is_some() {
-                return state_at_change(
-                    history,
-                    endpoint_descriptor(DiffEndpointSource::Change, requested, Some(change_id)),
-                    change_id,
-                );
-            }
-        }
-    }
-    if matches!(selector.len(), 40 | 64) && selector.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-        return state_at_git_object(lease, history, parse_git_object_id(selector)?, requested);
-    }
-
-    bail!(
-        "diff endpoint '{selector}' is not an authority ref, semantic change, Git object, HEAD, \
-         or WORKSPACE"
-    )
-}
-
-fn state_at_ref(
-    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
-    history: &kin_db::InMemoryGraph,
-    name: RefName,
-    requested: Option<String>,
-) -> Result<EndpointState> {
-    let target = lease
-        .resolve_ref_target(&name)
-        .with_context(|| format!("resolve repository ref '{name}'"))?
-        .ok_or_else(|| anyhow!("repository ref '{name}' was not found"))?;
-    let change_id = lease
-        .resolve_target_change_id(&target)
-        .with_context(|| format!("resolve repository ref '{name}' semantic target"))?;
+    let authority = super::ref_grammar::Authority::held(lease, &workspace.workspace_id);
+    let resolved = super::ref_grammar::resolve(&authority, history, selector)?;
+    let source = match resolved.kind {
+        super::ref_grammar::SelectorKind::Head => DiffEndpointSource::Head,
+        super::ref_grammar::SelectorKind::Ref => DiffEndpointSource::Ref,
+        super::ref_grammar::SelectorKind::Change => DiffEndpointSource::Change,
+        super::ref_grammar::SelectorKind::GitObject => DiffEndpointSource::GitObject,
+    };
+    // HEAD reports the ref the workspace is standing on, which the resolver does
+    // not know: it answers about history and this is a property of the workspace.
+    let ref_name = match resolved.kind {
+        super::ref_grammar::SelectorKind::Head => match &workspace.head {
+            WorkspaceHead::Symbolic { target } => Some(target.clone()),
+            WorkspaceHead::Detached { .. } => None,
+        },
+        _ => resolved.ref_name.clone(),
+    };
     state_at_change(
         history,
         DiffEndpoint {
-            source: DiffEndpointSource::Ref,
+            source,
             requested,
-            ref_name: Some(name),
-            target: Some(target),
-            change_id: Some(change_id),
+            ref_name,
+            target: resolved.target.clone(),
+            change_id: Some(resolved.change_id),
             workspace_generation: None,
             workspace_head: None,
             tree_hash: Hash256::from_bytes([0; 32]),
@@ -609,77 +547,8 @@ fn state_at_ref(
             entity_count: 0,
             relation_count: 0,
         },
-        change_id,
+        resolved.change_id,
     )
-}
-
-fn state_at_git_object(
-    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
-    history: &kin_db::InMemoryGraph,
-    oid: GitObjectId,
-    requested: Option<String>,
-) -> Result<EndpointState> {
-    let target = lease
-        .metadata()
-        .external_objects
-        .iter()
-        .find(|record| record.object.oid == oid)
-        .map(|record| RefTarget::external_object(record.object))
-        .or_else(|| {
-            lease
-                .metadata()
-                .aliases
-                .iter()
-                .find(|alias| alias.oid == oid)
-                .map(|alias| RefTarget::change(alias.change_id))
-        })
-        .ok_or_else(|| {
-            anyhow!(
-                "Git object '{oid}' was never imported into this repository, so there is nothing \
-                 to diff it against; import it with `kin init` in the source checkout, or name a \
-                 ref kin already holds"
-            )
-        })?;
-    let change_id = lease
-        .resolve_target_change_id(&target)
-        .with_context(|| format!("resolve Git object '{oid}' semantic target"))?;
-    state_at_change(
-        history,
-        DiffEndpoint {
-            source: DiffEndpointSource::GitObject,
-            requested,
-            ref_name: None,
-            target: Some(target),
-            change_id: Some(change_id),
-            workspace_generation: None,
-            workspace_head: None,
-            tree_hash: Hash256::from_bytes([0; 32]),
-            artifact_count: 0,
-            entity_count: 0,
-            relation_count: 0,
-        },
-        change_id,
-    )
-}
-
-fn endpoint_descriptor(
-    source: DiffEndpointSource,
-    requested: Option<String>,
-    change_id: Option<SemanticChangeId>,
-) -> DiffEndpoint {
-    DiffEndpoint {
-        source,
-        requested,
-        ref_name: None,
-        target: change_id.map(RefTarget::change),
-        change_id,
-        workspace_generation: None,
-        workspace_head: None,
-        tree_hash: Hash256::from_bytes([0; 32]),
-        artifact_count: 0,
-        entity_count: 0,
-        relation_count: 0,
-    }
 }
 
 fn state_at_change(
@@ -716,12 +585,6 @@ fn require_change(history: &kin_db::InMemoryGraph, change_id: SemanticChangeId) 
         );
     }
     Ok(())
-}
-
-fn parse_change_id(value: &str) -> Result<SemanticChangeId> {
-    let hash = Hash256::from_hex(value)
-        .map_err(|error| anyhow!("invalid semantic change ID '{value}': {error}"))?;
-    Ok(SemanticChangeId::from_hash(hash))
 }
 
 fn diff_trees(base: &ResolvedTree, head: &ResolvedTree) -> Vec<TreeDelta> {

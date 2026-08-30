@@ -220,17 +220,6 @@ impl ActiveRepositoryAuthority {
         Ok((workspace, lease.roots().clone()))
     }
 
-    pub(crate) fn resolve_named_ref(&self, name: &RefName) -> Result<SemanticChangeId> {
-        let lease = self.manager.read_authority();
-        let target = lease
-            .resolve_ref_target(name)
-            .with_context(|| format!("resolve repository ref '{name}'"))?
-            .ok_or_else(|| anyhow!("repository ref '{name}' was not found"))?;
-        lease
-            .resolve_target_change_id(&target)
-            .with_context(|| format!("resolve repository ref '{name}' semantic target"))
-    }
-
     pub(crate) fn current_change_id(&self) -> Result<Option<SemanticChangeId>> {
         let lease = self.manager.read_authority();
         let workspace = lease
@@ -250,23 +239,6 @@ impl ActiveRepositoryAuthority {
             .as_ref()
             .map(|target| resolve_target_in_authority(&lease, target))
             .transpose()
-    }
-
-    pub(crate) fn resolve_git_oid(&self, oid: &GitObjectId) -> Result<SemanticChangeId> {
-        let lease = self.manager.read_authority();
-        lease
-            .metadata()
-            .aliases
-            .iter()
-            .find(|alias| &alias.oid == oid)
-            .map(|alias| alias.change_id)
-            .ok_or_else(|| {
-                anyhow!(
-                    "Git commit '{oid}' was never imported into this repository, so kin holds no \
-                     semantic change for it; import it with `kin init` in the source checkout, or \
-                     name a ref kin already holds"
-                )
-            })
     }
 
     pub(crate) fn load_source_blob(&self, digest: kin_model::Hash256) -> Result<Vec<u8>> {
