@@ -7684,8 +7684,18 @@ mod tests {
     #[test]
     fn a_health_change_mid_session_is_announced_again() {
         let repo = "/tmp/fir3037-change";
-        assert!(super::should_report_health(repo, "attention"));
-        assert!(!super::should_report_health(repo, "attention"));
+        // Named, not bare. A silent `assert!` is red under any mutation and
+        // tells the falsification grid nothing about WHICH one it caught, which
+        // is the difference between a mutant that was caught and one that
+        // happened to break something.
+        assert!(
+            super::should_report_health(repo, "attention"),
+            "the first sighting of a degraded daemon is news"
+        );
+        assert!(
+            !super::should_report_health(repo, "attention"),
+            "and repeating it is not"
+        );
 
         // The daemon recovers. `validate_health_repo` clears the memory on any
         // other serving status, which is what this models.
