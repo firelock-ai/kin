@@ -29,7 +29,7 @@ here, and it grades both directions: a surface that qualifies every answer it
 gives is as useless as one that qualifies none, so the all-clear has its own
 check and must still arrive.
 
-Six checks, one seeded repository, run in order because the experiment is
+Seven checks, one seeded repository, run in order because the experiment is
 destructive: each one sets up the next, and the last stops the daemon.
 
   basis        the `Tree:` line names when graph truth last caught up, rather
@@ -47,6 +47,15 @@ destructive: each one sets up the next, and the last stops the daemon.
                are satisfied by a product that hedges every sentence
   diff_scope   a workspace diff names what its entity and relation counts cannot
                show, rather than printing three zeroes that cannot move
+  held_merge   a real conflicting merge is opened and `kin status` must name it.
+               Kin holds a merge in an authority transaction rather than smearing
+               conflict markers across the files, which is the better design and
+               is exactly why the status line is the only place this can live:
+               there is nothing on disk to see. `kin conflicts` is the positive
+               control, and it is not decoration, because a fixture that never
+               opened a merge must read UNREADABLE rather than FAIL. Runs before
+               `unadmitted`, which stops the daemon both `kin merge` and
+               `kin conflicts` need
   unadmitted   with the daemon stopped, the verdict names itself unmeasured
                instead of borrowing the clock of an older admission. A fresh
                marker beside no admission at all is the most convincing form of
@@ -105,6 +114,31 @@ def total_by(entries, key):
     buckets = {}
     for entry in entries:
         buckets[entry[key]] = round(buckets.get(entry[key], 0) + entry["amount"], 2)
+    return buckets
+'''
+
+
+# Same declaration, two different bodies. A merge of two different FILES is clean
+# and would grade nothing, so both branches rewrite `total_by`.
+MODULE_SIDELINE = '''"""Roll ledger entries up into totals."""
+
+
+def total_by(entries, key):
+    """Sum amounts under one key, in cents."""
+    buckets = {}
+    for entry in entries:
+        buckets[entry[key]] = buckets.get(entry[key], 0) + int(entry["amount"] * 100)
+    return buckets
+'''
+
+MODULE_MAINLINE = '''"""Roll ledger entries up into totals."""
+
+
+def total_by(entries, key):
+    """Sum amounts under one key, with a currency symbol."""
+    buckets = {}
+    for entry in entries:
+        buckets[entry[key]] = "$%.2f" % (buckets.get(entry[key], 0) + entry["amount"])
     return buckets
 '''
 
@@ -216,6 +250,35 @@ def grade_verdict_without_an_admission_says_so(text):
                 "basis as though one had: %s" % line
             )
     return FAIL, "the verdict states no basis at all: %s" % line
+
+
+def grade_status_names_a_held_merge(text, conflicts_text):
+    """A merge Kin is holding cannot be seen from the working copy at all.
+
+    Kin holds a merge in an authority transaction rather than smearing conflict
+    markers across the files, which is the better design and is exactly why the
+    status line is the only place this can live: there is nothing on disk to see.
+    `kin status` said nothing during a merge that had left seventy-six conflicts
+    unresolved (FIR-2961).
+
+    `conflicts_text` is the positive control, and it is not decoration: if
+    `kin conflicts` does not report a merge either, the fixture never reached the
+    state this grades and the answer is UNREADABLE rather than FAIL.
+    """
+    body = text or ""
+    control = conflicts_text or ""
+    if "in progress" not in control.lower() and "merging" not in control.lower():
+        return UNREADABLE, (
+            "kin conflicts reports no held merge, so the fixture never reached the state "
+            "this check is about: %s" % control.strip()[:200]
+        )
+    if "Merge in progress:" in body:
+        line = next(l for l in body.splitlines() if l.startswith("Merge in progress:"))
+        return PASS, "kin status names the held merge: %s" % line
+    return FAIL, (
+        "kin conflicts reports a held merge and kin status says nothing about it, so a "
+        "reader who walks away is told the tree is clean and current"
+    )
 
 
 def grade_diff_discloses_its_semantic_scope(text):
@@ -338,6 +401,9 @@ class Suite(object):
     def edit_tracked_module(self):
         self._write(self.repo(), TRACKED_MODULE, MODULE_AFTER)
 
+    def write_tracked_module(self, body):
+        self._write(self.repo(), TRACKED_MODULE, body)
+
     def status_text(self):
         rc, out, err = self.kin_run(["status"])
         return out if rc == 0 else (out + err)
@@ -360,6 +426,51 @@ def check_saw_the_edit(suite):
     suite.edit_tracked_module()
     status, detail = grade_status_saw_the_edit(before, suite.status_text())
     return Result("saw_the_edit", status, "%s %s" % (TICKET, detail))
+
+
+def check_held_merge(suite):
+    """Open a real conflicting merge and ask kin status about it.
+
+    Destructive and it runs late for that reason: it leaves the workspace holding
+    a merge transaction, which nothing after it would survive.
+    """
+    steps = [
+        ["commit", "-m", "settle before branching"],
+        ["branch", "create", "sideline"],
+        ["branch", "switch", "sideline"],
+    ]
+    for args in steps:
+        rc, out, err = suite.kin_run(args)
+        if rc != 0:
+            return Result("held_merge", UNREADABLE,
+                          "%s `kin %s` exited %s: %s"
+                          % (TICKET, " ".join(args), rc, (err or out)[-200:]))
+    # Same declaration, two different bodies, one on each branch. That is the
+    # shape that conflicts; two different files would merge clean and grade
+    # nothing.
+    suite.write_tracked_module(MODULE_SIDELINE)
+    rc, out, err = suite.kin_run(["commit", "-m", "round on the sideline"])
+    if rc != 0:
+        return Result("held_merge", UNREADABLE,
+                      "%s the sideline commit failed: %s" % (TICKET, (err or out)[-200:]))
+    for args in (["branch", "switch", "main"],):
+        rc, out, err = suite.kin_run(args)
+        if rc != 0:
+            return Result("held_merge", UNREADABLE,
+                          "%s switching back failed: %s" % (TICKET, (err or out)[-200:]))
+    suite.write_tracked_module(MODULE_MAINLINE)
+    rc, out, err = suite.kin_run(["commit", "-m", "round on main"])
+    if rc != 0:
+        return Result("held_merge", UNREADABLE,
+                      "%s the mainline commit failed: %s" % (TICKET, (err or out)[-200:]))
+    # kin merge exits 0 on a conflicted merge today (a separate finding), so the
+    # exit code is not the signal here and kin conflicts is.
+    suite.kin_run(["merge", "sideline"])
+    _, conflicts_out, conflicts_err = suite.kin_run(["conflicts"])
+    status, detail = grade_status_names_a_held_merge(
+        suite.status_text(), conflicts_out or conflicts_err
+    )
+    return Result("held_merge", status, "%s %s" % (TICKET, detail))
 
 
 def check_unadmitted(suite):
@@ -408,6 +519,7 @@ CHECKS = (
     ("content", check_content),
     ("settled", check_settled),
     ("diff_scope", check_diff_scope),
+    ("held_merge", check_held_merge),
     ("unadmitted", check_unadmitted),
 )
 
@@ -486,6 +598,25 @@ DIFF_WITH_SCOPE = DIFF_WITHOUT_SCOPE + (
     "count above cannot move for work in the working copy however many artifacts or relations "
     "do; commit it and diff change to change to see entity movement.\n"
 )
+STATUS_WITH_MERGE = (
+    "Kin repository-v6 status\n"
+    "Merge in progress: refs/heads/sideline into refs/heads/main as merge transaction "
+    "1f2f0ae2, 2 of 76 conflict(s) settled; `kin conflicts` lists what is outstanding, and "
+    "nothing below describes it\n"
+    "Tree: efcc91dc (11 artifacts, matching its base change as admitted 0s ago)\n"
+)
+# The literal shape the stranger saw: a held 76-conflict merge, and a status that
+# reports the tree as current and says nothing else.
+STATUS_SILENT_DURING_MERGE = (
+    "Kin repository-v6 status\n"
+    "Tree: efcc91dc (11 artifacts, matching its base change)\n"
+)
+CONFLICTS_HELD = (
+    "Merging refs/heads/sideline into refs/heads/main is in progress as merge transaction "
+    "1f2f0ae2 (2 of 76 conflict(s) settled)\n"
+)
+CONFLICTS_NONE = "No merge has opened on workspace 004e239e; there is nothing to resolve\n"
+
 DIFF_NO_ENTITIES_LINE = "Kin repository-v6 diff\nArtifacts: +0 ~1 -0\n"
 
 ADMIT_NO_OP_CLAIM = (
@@ -531,6 +662,16 @@ def self_test():
         ("diffscope/present", grade_diff_discloses_its_semantic_scope, DIFF_WITH_SCOPE, PASS),
         ("diffscope/no-entities", grade_diff_discloses_its_semantic_scope,
          DIFF_NO_ENTITIES_LINE, UNREADABLE),
+        # The grader takes a pair, so these rows carry a tuple. The UNREADABLE row
+        # is the one that keeps this check honest: a silent status over a fixture
+        # that never opened a merge is a setup failure, not a product defect, and
+        # scoring it FAIL would make the check fire on its own broken fixture.
+        ("heldmerge/silent", grade_status_names_a_held_merge,
+         (STATUS_SILENT_DURING_MERGE, CONFLICTS_HELD), FAIL),
+        ("heldmerge/named", grade_status_names_a_held_merge,
+         (STATUS_WITH_MERGE, CONFLICTS_HELD), PASS),
+        ("heldmerge/no-merge-opened", grade_status_names_a_held_merge,
+         (STATUS_SILENT_DURING_MERGE, CONFLICTS_NONE), UNREADABLE),
         ("content/no-op-claim", grade_admit_does_not_claim_a_no_op, ADMIT_NO_OP_CLAIM, FAIL),
         ("content/moved", grade_admit_does_not_claim_a_no_op, ADMIT_CONTENT_MOVED, PASS),
         ("content/unmeasured", grade_admit_does_not_claim_a_no_op, ADMIT_UNMEASURED, FAIL),

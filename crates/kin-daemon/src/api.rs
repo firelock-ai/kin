@@ -4374,6 +4374,10 @@ async fn command_status(
         daemon_source_known: daemon_build.source_known,
         daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
+    let merge = kin_core::LocalRepositoryAuthorityBinding::from_layout(&state.layout)
+        .ok()
+        .and_then(|binding| kin_cli::commands::status::merge_in_progress(&binding).ok())
+        .flatten();
     let response = kin_cli::commands::status::build_command_status_response(
         report,
         request.json,
@@ -4397,6 +4401,10 @@ async fn command_status(
              `/commands/admit` first for an answer measured against the working copy"
                 .to_string(),
         ),
+        // A merge this workspace is holding open, read off the authority lease.
+        // Never fatal: a status route that 500s because it could not check for a
+        // merge is worse than one that answers and does not mention it.
+        merge.as_ref(),
     )
     .map_err(internal_error)?;
     Ok(Json(response))

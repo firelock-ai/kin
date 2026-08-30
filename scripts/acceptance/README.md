@@ -378,6 +378,16 @@ every answer passes a one-directional check while helping nobody. The
 `--self-test` cases are the literal pre-fix output the stranger saw and the
 post-fix output beside it, so a grader that cannot fail is caught here.
 
+It also covers what `kin status` does NOT say. Kin holds a merge in an authority
+transaction rather than smearing conflict markers across the working copy, which
+is the better design and the stranger preferred it to Git's markers; it is also
+why the working copy cannot tell you a merge is open, so the status line is the
+only place it can live. During a merge that had left seventy-six conflicts
+unresolved, `kin status` said nothing and reported the tree as matching its base
+change. The `held_merge` check opens a real conflicting merge and asks, with
+`kin conflicts` as its positive control so a fixture that never reached that state
+reads UNREADABLE rather than FAIL.
+
 `working_copy_freshness_repro.py` covers what the product says about a working
 copy it has not read, which the v0.6.1 yardstick run caught three surfaces
 getting wrong at once (FIR-2820). The stranger wrote a module, did not commit it,
