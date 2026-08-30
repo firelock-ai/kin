@@ -118,7 +118,9 @@ fn read_conflicts(authority: &ActiveLocalRepositoryAuthority) -> Result<Conflict
                                 .to_string(),
                         );
                     } else {
-                        lines.extend(render_conflict_lines(record));
+                        lines.extend(render_conflict_lines(
+                            &record.unresolved().collect::<Vec<_>>(),
+                        ));
                     }
                 }
                 MergeTransactionState::Committed { merge_change, .. } => lines.push(format!(
@@ -352,7 +354,9 @@ fn settle(
     if unresolved == 0 {
         lines.push("Publish the merge with `kin resolve --continue`".to_string());
     } else {
-        lines.extend(render_conflict_lines(&next));
+        lines.extend(render_conflict_lines(
+            &next.unresolved().collect::<Vec<_>>(),
+        ));
     }
     Ok(record_execution(
         lines,
