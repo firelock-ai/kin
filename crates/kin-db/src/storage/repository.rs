@@ -2361,9 +2361,7 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityManager<B> {
             )
         })
     }
-}
 
-impl RepositoryAuthorityManager<LocalFileBackend> {
     /// Commit one complete local repository transaction and return a freeze
     /// that still holds the exact backend lock used for its durable CAS.
     ///
@@ -2415,7 +2413,9 @@ impl RepositoryAuthorityManager<LocalFileBackend> {
             )
         })
     }
+}
 
+impl RepositoryAuthorityManager<LocalFileBackend> {
     pub fn commit_repository_transaction_and_freeze(
         &self,
         transaction: RepositoryTransaction,
@@ -19671,6 +19671,44 @@ mod native_admission_lineage {
             Vec::new(),
         )
         .expect("a one-source shared policy is valid")
+    }
+
+    /// Call the transferred-commit entry through a GENERIC bound.
+    ///
+    /// This exists because of how 0.7.72 shipped broken. The method landed in
+    /// `impl RepositoryAuthorityManager<LocalFileBackend>` instead of the
+    /// generic impl, so it was reachable only from one concrete backend. Every
+    /// kin-db gate passed: a concrete impl is valid Rust, and every test in this
+    /// module holds a `LocalFileBackend` manager, so none of them could tell the
+    /// difference. kin's receive path is generic over the backend and could not
+    /// see the method at all.
+    ///
+    /// **The guard is that this does not compile if the method is not generic.**
+    /// A monomorphic call site cannot express the requirement; a generic one
+    /// makes the bound itself the assertion, and it fails at build time rather
+    /// than in a consumer's repository one publish later.
+    fn commit_transferred_through_a_generic_bound<B: StorageBackend + ?Sized + 'static>(
+        manager: &RepositoryAuthorityManager<B>,
+        transaction: RepositoryTransaction,
+        case: Option<crate::admission::AdmissionCase>,
+    ) -> Result<RepositoryCommitReceipt, KinDbError> {
+        manager.commit_transferred_repository_transaction(transaction, case)
+    }
+
+    /// The transferred-commit entry is reachable from a generic backend.
+    ///
+    /// The assertion that matters is the one the compiler makes on the helper
+    /// above. This test also runs it, so the path is exercised rather than only
+    /// type-checked.
+    #[test]
+    fn the_transferred_commit_entry_is_reachable_from_any_backend() {
+        let (_directory, manager, tree_deltas) = transfer_fixture();
+        let shared = SharedAdmissionPolicy::empty(0);
+        let changes = chained_history(&shared, &tree_deltas);
+        let transaction = transaction_shell(&manager, 3, changes);
+
+        commit_transferred_through_a_generic_bound(&manager, transaction, None)
+            .expect("a transferred introduction must be admitted through a generic bound");
     }
 
     /// THE PROPERTY. What a local publish is refused for, a transfer is admitted
