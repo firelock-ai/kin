@@ -1097,6 +1097,27 @@ pub(crate) fn publish_resolved_merge(
         ))
         .into());
     }
+    // The repository transaction is durable authority. The in-process graph is a
+    // derived query view, and a published merge never reached it: the two
+    // `create_change` calls in this file both go into a detached
+    // `InMemoryGraph::from_snapshot` replay copy that exists to prove the merge
+    // replays to the desired tree, and `state.graph.create_change` appeared
+    // nowhere in this file or in `repository_merge_state.rs`.
+    //
+    // So after the CAS the authority held the merge change and the running
+    // daemon's graph did not. `kin log`, `kin diff` and `kin status` answered
+    // anyway because they read authority, while `kin blame` and `kin history`
+    // went through the live projection and failed, first with "the active graph
+    // projection does not hold" and then with a bare `change not found`, until a
+    // restart rebuilt the graph from authority. A later commit installed only
+    // its own change and did not heal it.
+    //
+    // Install the exact immutable changes only after the authority CAS
+    // succeeds, which is what the commit path does at `command_commit_after_admission`
+    // under this same named phase. Captured before the CAS because the
+    // transaction is moved into it. A fast-forward carries no change and
+    // installs nothing.
+    let published_changes = transaction.changes.clone();
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),
@@ -1111,6 +1132,17 @@ pub(crate) fn publish_resolved_merge(
                 record.binding.source_ref, record.binding.target_ref
             )
         })?;
+    for change in &published_changes {
+        crate::mcp_commit::timed_commit_phase("install_live_graph", || {
+            state.graph.create_change(change)
+        })
+        .with_context(|| {
+            format!(
+                "install published change {} into the live query graph",
+                change.id
+            )
+        })?;
+    }
 
     let resolved_count = terminated.entries.len();
     let report = kin_cli::commands::resolve::ResolveReport {
@@ -2032,6 +2064,27 @@ fn publish(
         ))
         .into());
     }
+    // The repository transaction is durable authority. The in-process graph is a
+    // derived query view, and a published merge never reached it: the two
+    // `create_change` calls in this file both go into a detached
+    // `InMemoryGraph::from_snapshot` replay copy that exists to prove the merge
+    // replays to the desired tree, and `state.graph.create_change` appeared
+    // nowhere in this file or in `repository_merge_state.rs`.
+    //
+    // So after the CAS the authority held the merge change and the running
+    // daemon's graph did not. `kin log`, `kin diff` and `kin status` answered
+    // anyway because they read authority, while `kin blame` and `kin history`
+    // went through the live projection and failed, first with "the active graph
+    // projection does not hold" and then with a bare `change not found`, until a
+    // restart rebuilt the graph from authority. A later commit installed only
+    // its own change and did not heal it.
+    //
+    // Install the exact immutable changes only after the authority CAS
+    // succeeds, which is what the commit path does at `command_commit_after_admission`
+    // under this same named phase. Captured before the CAS because the
+    // transaction is moved into it. A fast-forward carries no change and
+    // installs nothing.
+    let published_changes = transaction.changes.clone();
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),
@@ -2046,6 +2099,17 @@ fn publish(
                 request.source, plan.target_ref
             )
         })?;
+    for change in &published_changes {
+        crate::mcp_commit::timed_commit_phase("install_live_graph", || {
+            state.graph.create_change(change)
+        })
+        .with_context(|| {
+            format!(
+                "install published change {} into the live query graph",
+                change.id
+            )
+        })?;
+    }
     let line = match outcome {
         MergeOutcome::FastForward => format!(
             "Fast-forwarded {} to change {} ({} projected entries, authority generation {})",
