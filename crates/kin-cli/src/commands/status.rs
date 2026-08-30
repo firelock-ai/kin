@@ -2111,6 +2111,7 @@ mod tests {
             Some(&footprint),
             None,
             &LastAdmissionRead::Absent,
+            &skipped_pass(),
         );
         assert!(
             with.contains("Store size: ") && with.contains("under .kin/"),
