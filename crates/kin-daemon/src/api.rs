@@ -34727,8 +34727,27 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial(repository_commit)]
     async fn a_published_merge_reaches_the_live_graph_without_a_restart() {
-        let (state, _layout, _repository, main_change, _feature_change) =
+        let (state, _layout, repository, _base_change, _feature_change) =
             universal_branch_test_state("merge-live-graph");
+        let app = router(Arc::clone(&state));
+
+        // Diverge the active branch AFTER the split, so the merge must author a
+        // merge change rather than fast-forwarding. Without this the merge moves
+        // the ref onto the feature change, publishes nothing, and every
+        // assertion below passes on a binary with the install removed: measured,
+        // this arm survived all three mutations of the merge-side installs until
+        // the divergence was added.
+        std::fs::write(
+            repository.join("selected/diverge.txt"),
+            b"a change on the active branch after the split\n",
+        )
+        .unwrap();
+        let main_change = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "diverge the active branch so the merge is not a fast-forward",
+        )
+        .await;
 
         // PRECONDITION, proved: this daemon's projection is populated before the
         // publication. A failure here is NOT a verdict on the property.
@@ -34788,6 +34807,29 @@ mod tests {
             published, main_change,
             "the merge must move the branch off its pre-merge change, or nothing was published \
              and the assertions below would grade an unchanged store"
+        );
+        // A FAST-FORWARD moves the ref onto an existing change and publishes
+        // nothing, so every assertion below would pass on an unpatched binary
+        // for a change that was already in the graph. This arm grades nothing
+        // unless a genuine merge change was authored, and the tell is that the
+        // published change is neither side's tip and carries both as parents.
+        assert_ne!(
+            published, _feature_change,
+            "NOT RUN, precondition unmet: the merge fast-forwarded onto the feature change rather \
+             than authoring a merge change, so nothing was published and this arm cannot see the \
+             defect it exists for"
+        );
+        let parents = state
+            .graph
+            .get_change(&published)
+            .unwrap()
+            .map(|change| change.parents.len())
+            .unwrap_or(0);
+        assert_eq!(
+            parents, 2,
+            "NOT RUN, precondition unmet: the published change carries {parents} parent(s) rather \
+             than two, so it is not a merge change and this arm graded a publication of a \
+             different kind"
         );
 
         // The assertion this arm exists for. No restart between publication and
