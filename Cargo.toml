@@ -125,7 +125,7 @@ rustix = { version = "1", features = ["fs"] }
 # Testing
 tempfile = "3"
 pretty_assertions = "1"
-serial_test = "3"
+serial_test = "4"
 
 # Internal crates
 kin-model = { version = "=0.7.22", registry = "kin" }
