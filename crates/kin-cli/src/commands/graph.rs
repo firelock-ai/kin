@@ -4305,6 +4305,76 @@ mod tests {
         }
     }
 
+    /// A status report reads the ENVELOPE, and opens no store at all.
+    ///
+    /// `graph status` needs one workspace tree and the bodies its structured
+    /// facets name. It used to get both by opening the whole repository
+    /// authority, which decodes every domain the snapshot carries and
+    /// re-verifies every persisted body; on a converted repository that is the
+    /// repository, and a cold status read took a daemon serving 861 entities
+    /// from 5.8 GiB to 15.9 GiB and got it OOM-killed at 16 (FIR-2955).
+    ///
+    /// Two things make the zero below evidence rather than decoration.
+    ///
+    /// The CONTROL comes first: one deliberate `ActiveRepositoryAuthority::open`
+    /// on this same fixture must move the counter by exactly one. Without it a
+    /// zero is equally consistent with a counter that never moves, which is the
+    /// shape of a check that cannot fail.
+    ///
+    /// And the report has to be REAL. A collector that returned an empty
+    /// coverage would also open nothing, so the assertions below require the
+    /// authority tree it read to carry the fixture's artifacts. A zero over an
+    /// empty report is not the property this test is for.
+    #[test]
+    fn a_status_report_reads_the_envelope_and_opens_no_store() {
+        const SOURCE: &[u8] = b"fn target() {}\n";
+        let fixture = graph_source_fixture(Some(SOURCE));
+        let entity = source_entity("target", fixture.file_id.clone(), 0, SOURCE.len() - 1);
+        commit_source_entity(&fixture, &entity);
+        let opens = super::super::repository_authority::repository_authority_opens_on_this_thread;
+        let entities = fixture
+            .graph
+            .list_all_entities()
+            .expect("the fixture graph lists its entities");
+
+        let before = opens();
+        drop(
+            super::super::repository_authority::ActiveRepositoryAuthority::open(&fixture.binding)
+                .expect("open the whole store once, deliberately"),
+        );
+        assert_eq!(
+            opens() - before,
+            1,
+            "the counter must be able to see a whole-store open on this fixture, or the zero \
+             below proves nothing"
+        );
+
+        let before = opens();
+        let report = super::super::graph_health::inspect_graph_with_entities(
+            &fixture.authority(),
+            &fixture.graph,
+            &entities,
+            None,
+        )
+        .expect("build the status report");
+        assert_eq!(
+            opens() - before,
+            0,
+            "a status report must answer from the authority envelope, never by opening the \
+             whole store"
+        );
+        assert!(
+            report.repository_artifact_coverage.authority_artifact_count > 0,
+            "the report must have read a real authority tree; a zero open over an empty \
+             coverage is not the property under test"
+        );
+        assert!(
+            report.repository_artifact_coverage.repository_tree_in_sync,
+            "the envelope's tree must be the one the graph carries, or the envelope read \
+             resolved the wrong workspace"
+        );
+    }
+
     /// A batch of source resolutions costs ONE authority open, not one each.
     ///
     /// `get_entity_sources` resolves source per entity, and every resolution

@@ -14,7 +14,7 @@
 //! replica holds.
 
 use anyhow::{bail, Context, Result};
-use kin_core::{KinConfig, KinLayout, RemoteTransportKind};
+use kin_core::{KinConfig, KinLayout, RemoteHostKind, RemoteTransportKind};
 use kin_model::RefName;
 use kin_remote::repository_transfer_negotiation::{
     RepositoryPushPlan, RepositoryTransferDirection, RepositoryTransferOutcome,
@@ -29,6 +29,14 @@ pub struct CommandTransferRequest {
     pub remote_base_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_token: Option<String>,
+    /// The hosted organization whose repository this transfer addresses.
+    ///
+    /// Absent means a peer daemon, which serves the seam at its own root. A
+    /// daemon that predates this field defaults it to absent and so keeps
+    /// addressing peers exactly as it did, which is why the absent case has to
+    /// stay the daemon route rather than becoming an error.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_organization_id: Option<String>,
     /// Defaults to the repository this daemon serves.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_id: Option<String>,
@@ -140,6 +148,32 @@ pub struct CommandTransferPlanResponse {
 pub(crate) struct TransferPeer {
     pub(crate) base_url: String,
     pub(crate) token: Option<String>,
+    /// The hosted organization whose repository this transfer addresses.
+    ///
+    /// `None` is a peer daemon, which serves the seam at its own root and has
+    /// no organizations. A hosted remote always resolves to `Some`, because
+    /// `resolve_peer` refuses one it cannot name an organization for rather
+    /// than addressing it as though it were a daemon.
+    pub(crate) organization_id: Option<String>,
+}
+
+/// Split a peer URL into the base the seam is served from and the organization
+/// it names, if any.
+///
+/// A locator carries both, and they must be taken together: its base URL is the
+/// part before `/api/orgs/...`, so keeping the whole locator as the base and
+/// lifting only the organization out of it addresses
+/// `<base>/api/orgs/<org>/repos/<repo>/api/v1/orgs/<org>/...`, which is nobody's
+/// route. Anything that is not a locator is a peer daemon base with no
+/// organization.
+pub(crate) fn peer_base_and_organization(url: &str) -> (String, Option<String>) {
+    match crate::commands::remote::native_remote_locator(url) {
+        Some(target) => (
+            target.base_url.trim_end_matches('/').to_string(),
+            Some(target.organization_id),
+        ),
+        None => (url.trim().trim_end_matches('/').to_string(), None),
+    }
 }
 
 /// Resolve the peer from an explicit URL or a configured native-Kin remote.
@@ -153,9 +187,15 @@ pub(crate) fn resolve_peer(
     explicit_url: Option<&str>,
 ) -> Result<TransferPeer> {
     if let Some(url) = explicit_url.map(str::trim).filter(|url| !url.is_empty()) {
+        // An explicit `--url` is taken literally. A locator naming an
+        // organization addresses that hosted repository; anything else is a
+        // peer daemon, which is what `--url http://127.0.0.1:<port>` has always
+        // meant and must keep meaning.
+        let (base_url, organization_id) = peer_base_and_organization(url);
         return Ok(TransferPeer {
-            base_url: url.trim_end_matches('/').to_string(),
-            token: crate::commands::remote::native_remote_bearer_token(url),
+            token: crate::commands::remote::native_remote_bearer_token(&base_url),
+            base_url,
+            organization_id,
         });
     }
 
@@ -203,10 +243,45 @@ pub(crate) fn resolve_peer(
                 selected.name
             )
         })?;
-    let base_url = base_url.trim_end_matches('/').to_string();
+    // A locator names both the base and the organization, so split it here
+    // rather than treating the whole locator as a base URL.
+    let (base_url, located_organization) = peer_base_and_organization(base_url);
+
+    // A KinLab remote is hosted, and a hosted seam is org scoped. The
+    // organization comes from the remote's own locator, or from KIN_ORG_ID, and
+    // nowhere else: the server never infers one from a bare repository id, so
+    // nothing crosses an organization boundary because a default was convenient
+    // (founder decision, 2026-08-29).
+    //
+    // Refusing beats falling back to the daemon route. That route on a hosted
+    // host is outside `/api/`, where kinlab.ai's edge serves the static bucket,
+    // and the push dies in Google Cloud Storage XML that names neither Kin nor
+    // the organization the user forgot to set (FIR-2945).
+    let organization_id = match selected.host {
+        RemoteHostKind::KinLab => Some(
+            located_organization
+                .or_else(|| {
+                    std::env::var("KIN_ORG_ID")
+                        .ok()
+                        .map(|value| value.trim().to_string())
+                        .filter(|value| !value.is_empty())
+                })
+                .with_context(|| {
+                    format!(
+                        "native-kin remote {} is hosted on KinLab, whose transfer seam is scoped \
+                         to an organization, and {base_url} names none. Re-add it with a full \
+                         locator like `--url kinlab://<org>/<repo>`, or set KIN_ORG_ID.",
+                        selected.name
+                    )
+                })?,
+        ),
+        _ => None,
+    };
+
     Ok(TransferPeer {
         token: crate::commands::remote::native_remote_bearer_token(&base_url),
         base_url,
+        organization_id,
     })
 }
 
@@ -254,6 +329,7 @@ fn build_request(
     Ok(CommandTransferRequest {
         remote_base_url: peer.base_url,
         remote_token: peer.token,
+        remote_organization_id: peer.organization_id,
         repository_id: None,
         source_ref,
         destination_ref,
@@ -458,6 +534,41 @@ mod tests {
     }
 
     #[test]
+    fn a_locator_gives_up_its_base_and_its_organization_together() {
+        // The bug this pins: taking the organization from a locator while
+        // keeping the whole locator as the base URL builds
+        // `<base>/api/orgs/o/repos/r/api/v1/orgs/o/repos/r/transfer/...`.
+        let (base, org) =
+            peer_base_and_organization("http://127.0.0.1:8080/api/orgs/acme/repos/kin");
+        assert_eq!(base, "http://127.0.0.1:8080");
+        assert_eq!(org.as_deref(), Some("acme"));
+        // Said as the property rather than as two literals: the base must not
+        // still contain the organization path the locator carried.
+        assert!(
+            !base.contains("/api/orgs/"),
+            "the base still carries the locator's own org path: {base}"
+        );
+    }
+
+    #[test]
+    fn a_bare_peer_base_names_no_organization() {
+        let (base, org) = peer_base_and_organization("http://127.0.0.1:4010/");
+        assert_eq!(base, "http://127.0.0.1:4010");
+        assert_eq!(org, None);
+    }
+
+    #[test]
+    fn a_kinlab_scheme_locator_names_an_organization_and_the_default_host() {
+        let (base, org) = peer_base_and_organization("kinlab://acme/kin");
+        assert_eq!(org.as_deref(), Some("acme"));
+        assert!(!base.is_empty(), "a locator must still resolve a base URL");
+        assert!(
+            !base.contains("/api/orgs/"),
+            "base carries an org path: {base}"
+        );
+    }
+
+    #[test]
     fn an_absent_or_blank_ref_stays_absent_so_the_daemon_picks_the_default() {
         assert_eq!(parse_ref(None).unwrap(), None);
         assert_eq!(parse_ref(Some("   ")).unwrap(), None);
@@ -468,6 +579,7 @@ mod tests {
         let peer = TransferPeer {
             base_url: "http://127.0.0.1:4010".to_string(),
             token: None,
+            organization_id: None,
         };
         let request = build_request(peer, Some("main"), None).unwrap();
         assert_eq!(request.source_ref, request.destination_ref);

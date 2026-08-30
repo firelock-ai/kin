@@ -2197,24 +2197,88 @@ const FOOTPRINT_PUBLISH_INTERVAL: Duration = Duration::from_secs(30);
 /// idle-shutdown against, or leak. A level change publishes at once: the rung
 /// is the part a reader acts on, and delaying it by up to half a minute would
 /// be the one field worth having promptly.
+/// When this daemon last published a standing, and at what level.
+///
+/// Hoisted out of [`publish_footprint_standing`] so the idle path can ask
+/// whether the interval alone owes a publish WITHOUT paying for a pressure
+/// read first. That question has to be cheap: it is asked on a tick that found
+/// nothing to do, at the loop's poll cadence.
+static FOOTPRINT_LAST_PUBLISH: std::sync::OnceLock<
+    std::sync::Mutex<Option<(Instant, kin_core::memory_pressure::PressureLevel)>>,
+> = std::sync::OnceLock::new();
+
+fn footprint_last_publish(
+) -> &'static std::sync::Mutex<Option<(Instant, kin_core::memory_pressure::PressureLevel)>> {
+    FOOTPRINT_LAST_PUBLISH.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Whether the interval alone owes a publish.
+///
+/// Pure over the one fact that decides it, so the cadence is gradeable without
+/// a daemon, a clock or a process table. `None` is "never published", which is
+/// owed: a store whose daemon has published nothing has no standing to read.
+fn interval_owes_publish(since_last: Option<Duration>) -> bool {
+    match since_last {
+        None => true,
+        Some(elapsed) => elapsed >= FOOTPRINT_PUBLISH_INTERVAL,
+    }
+}
+
+/// Whether a publish is owed, over the two facts that decide it.
+///
+/// A level change publishes immediately because the number a reader acts on has
+/// moved; otherwise the interval decides.
+fn publish_is_owed(since_last: Option<Duration>, level_changed: bool) -> bool {
+    level_changed || interval_owes_publish(since_last)
+}
+
+/// Publish a standing on a tick that found nothing to admit.
+///
+/// The defect this exists for, measured on 2026-08-29 into 2026-08-30: the
+/// reconciliation loop returns early at its empty-pending-events guard, well
+/// above the publish at the end of the tick, so a store nobody is editing
+/// published no standing from the ambient tick at all. On a host with no
+/// language server nothing else publishes either, since the enrichment sweep
+/// is what covers that case elsewhere, and the record simply stops advancing
+/// for the life of the daemon.
+///
+/// That is the wrong contract twice over. Memory pressure moves with nothing on
+/// disk moving, and a daemon sitting quiet on a large repository is exactly
+/// when its standing matters most: the reader wanting it is the one deciding
+/// whether this machine can serve the store at all.
+///
+/// The interval is checked BEFORE the pressure read rather than after, which is
+/// the whole reason this is a separate function. `pressure_verdict` documents
+/// itself as safe at the top of a loop, and it is, but "safe" is not "free" at
+/// a hundred millisecond poll, and the answer it would return is thrown away on
+/// twenty-nine of every thirty seconds.
+pub(crate) fn publish_footprint_standing_on_idle_tick(state: &DaemonState) {
+    let since_last = match footprint_last_publish().lock() {
+        Ok(guard) => guard.as_ref().map(|(published, _)| published.elapsed()),
+        // A poisoned lock is not a reason to publish; the busy path holds the
+        // same lock and will report its own failure.
+        Err(_) => return,
+    };
+    if !interval_owes_publish(since_last) {
+        return;
+    }
+    let call = pressure_verdict(kin_core::memory_pressure::HeavyWork::AmbientAdmission);
+    publish_footprint_standing(state, &call);
+}
+
 pub(crate) fn publish_footprint_standing(state: &DaemonState, call: &PressureCall) {
     let Some(standing) = call.standing.as_ref() else {
         return;
     };
-    static LAST: std::sync::OnceLock<
-        std::sync::Mutex<Option<(Instant, kin_core::memory_pressure::PressureLevel)>>,
-    > = std::sync::OnceLock::new();
-    let cell = LAST.get_or_init(|| std::sync::Mutex::new(None));
+    let cell = footprint_last_publish();
     let Ok(mut guard) = cell.lock() else {
         return;
     };
-    let due = match guard.as_ref() {
-        Some((published, level)) => {
-            *level != call.level || published.elapsed() >= FOOTPRINT_PUBLISH_INTERVAL
-        }
-        None => true,
+    let (since_last, level_changed) = match guard.as_ref() {
+        Some((published, level)) => (Some(published.elapsed()), *level != call.level),
+        None => (None, false),
     };
-    if !due {
+    if !publish_is_owed(since_last, level_changed) {
         return;
     }
     *guard = Some((Instant::now(), call.level));
@@ -2692,6 +2756,73 @@ where
 /// throughout while a first boot ran them together. Arithmetic was never the
 /// gap. These tests drive the gate's own loop with a synthetic pending count
 /// and small bounds, so the rule is exercised rather than the constants.
+#[cfg(test)]
+mod footprint_cadence_tests {
+    use super::{interval_owes_publish, publish_is_owed, FOOTPRINT_PUBLISH_INTERVAL};
+    use std::time::Duration;
+
+    /// A quiet tick publishes once the interval has elapsed, and not before.
+    ///
+    /// The defect: the reconciliation loop returned early at its
+    /// empty-pending-events guard, above the publish at the end of the tick, so
+    /// a store nobody was editing published no standing from this loop at all.
+    /// On a host with no language server nothing else published either, and
+    /// `memory_pressure_refusal.py` check 12 spent its whole two minute bound
+    /// waiting for a record that could never be minted. Six consecutive
+    /// Acceptance runs on main were red on it.
+    ///
+    /// Graded over the decision rather than over a daemon, so the cadence is
+    /// falsifiable without a clock, a process table or a store.
+    #[test]
+    fn an_idle_tick_is_owed_a_publish_only_once_the_interval_elapses() {
+        assert!(
+            interval_owes_publish(Some(FOOTPRINT_PUBLISH_INTERVAL)),
+            "exactly the interval is elapsed"
+        );
+        assert!(
+            interval_owes_publish(Some(FOOTPRINT_PUBLISH_INTERVAL + Duration::from_secs(1))),
+            "past the interval is elapsed"
+        );
+        // The control, and the half that can fail quietly: a publish on every
+        // idle tick would satisfy the assertion above and put a pressure read
+        // on the loop's poll cadence.
+        assert!(
+            !interval_owes_publish(Some(FOOTPRINT_PUBLISH_INTERVAL - Duration::from_millis(1))),
+            "one millisecond short of the interval is NOT owed"
+        );
+        assert!(
+            !interval_owes_publish(Some(Duration::from_secs(0))),
+            "a publish that just happened is not owed another"
+        );
+    }
+
+    /// A store whose daemon has published nothing is owed one immediately.
+    ///
+    /// `None` is not "recently published", it is "no standing exists to read",
+    /// and a reader asking what this daemon holds gets nothing until the first
+    /// one lands.
+    #[test]
+    fn a_daemon_that_has_never_published_is_owed_one_at_once() {
+        assert!(interval_owes_publish(None));
+        assert!(publish_is_owed(None, false));
+    }
+
+    /// A level change still publishes before the interval, which is the
+    /// behaviour the busy path had and must keep.
+    #[test]
+    fn a_level_change_publishes_without_waiting_for_the_interval() {
+        let recent = Some(Duration::from_secs(1));
+        assert!(
+            publish_is_owed(recent, true),
+            "the number a reader acts on moved, so it publishes"
+        );
+        assert!(
+            !publish_is_owed(recent, false),
+            "and an unchanged level one second in still waits"
+        );
+    }
+}
+
 #[cfg(test)]
 mod sweep_backfill_gate_tests {
     use super::{
@@ -3629,9 +3760,15 @@ pub async fn run_with_authority_on(
             state.lsp_enrichment_tx = Some(tx);
             Some(rx)
         } else {
+            // Built from the shared marker rather than spelled here, because a
+            // remedy in kin-daemon-spawn keys on this sentence to know that
+            // offering KIN_DAEMON_DISABLE_LSP would be advice nobody can take.
+            // Two copies of the words would let this one drift and disarm that
+            // remedy silently.
             info!(
-                "no LSP servers found, so enrichment is disabled for the life of this daemon; \
-                 install one and restart to enable it"
+                "{}, so enrichment is disabled for the life of this daemon; install one and \
+                 restart to enable it",
+                kin_daemon_spawn::ENRICHMENT_UNAVAILABLE_MARKER
             );
             None
         }
@@ -6141,6 +6278,7 @@ async fn select_with_signals(
 
 #[cfg(all(test, unix))]
 mod tests {
+
     use super::{
         await_watch_armed, coverage_drain_verdict, drain_pending_flush, embed_work_outstanding,
         format_singleton_contention, next_embed_error_backoff, parse_duration_secs,

@@ -1349,8 +1349,19 @@ where
     // is never left describing history it now holds by a record that predates
     // it.
     before_authority_commit().map_err(storage)?;
+    // Admitted as a transfer, not as a local publish. A receiver performed no
+    // publication, so it is not asked to name a workspace it never had; it is
+    // held instead to the shared admission policy it resolves from the
+    // transferred history, with the full sensitive-content check run on every
+    // introduced artifact because nothing here was already tracked.
+    //
+    // `None` is the publisher's admission case not travelling yet. kin-db
+    // accepts that only where it cannot decide anything, which is a shared
+    // policy with no rule sources, and refuses by name otherwise rather than
+    // choosing matching semantics on the publisher's behalf. Carrying the case
+    // in the pack is the follow-on that lifts that limit.
     let receipt = authority
-        .commit_repository_transaction(transaction)
+        .commit_transferred_repository_transaction(transaction, None)
         .map_err(repository_commit)?;
     let outcome = match receipt.outcome {
         RepositoryCommitOutcome::Committed => RepositoryTransferApplyOutcome::Committed,
@@ -2347,10 +2358,11 @@ mod tests {
     /// Commit one artifact-free native root change, so a publisher exists that
     /// has history and no imported-Git authority at all.
     ///
-    /// Artifact-free on purpose: a Native change that introduces an artifact
-    /// needs a bound workspace admission context and a transfer's receive
-    /// transaction carries none, which is a different bound entirely and not
-    /// what this control is about.
+    /// Artifact-free on purpose. This helper publishes through the LOCAL path,
+    /// where a Native change introducing an artifact still needs a bound
+    /// workspace admission context, and this control is not about that bound.
+    /// A transfer's receive no longer needs one: it is admitted as a transfer
+    /// and held to the shared policy instead (FIR-2959).
     fn seed_native_line(manager: &TestManager, main: &RefName) {
         let change = native_change(Vec::new(), "native root", Vec::new());
         let lease = manager.read_authority();

@@ -357,6 +357,37 @@ dies of something that is not the network, the check reports UNREADABLE and says
 which reason it got, because a classifier that was never asked the question has
 not answered it.
 
+`vcs_read_surfaces_repro.py` covers the everyday read surfaces, which the first
+stranger run with a version control arm caught answering wrongly on a project
+that has never been a Git repository (FIR-2961). `kin status` printed
+`Tree: 70fda9ae... (8 artifacts, matching its base change)` over a tracked file
+edited twenty-two seconds earlier and repeated it across seven more readings,
+and `kin admit` printed `nothing changed` on a pass that moved the workspace
+tree hash from `70fda9ae` to `c078181f` and its generation from 5 to 6, both
+visible three lines apart in its own output.
+
+Neither verdict was wrong about the graph, which is what makes this class hard
+to grade. `dirty` compares the admitted workspace tree against the tree of the
+change it is based on; the admit wording compares two cardinalities, and a
+content-only edit moves neither. Both sentences were true and both were read as
+statements about the files on disk, because nothing beside them said what they
+rested on. So the suite never grades the verdict, it grades whether the basis
+travels with it, and it grades both directions: `settled` requires the all-clear
+to still arrive over a genuinely settled tree, because a surface that hedges
+every answer passes a one-directional check while helping nobody. The
+`--self-test` cases are the literal pre-fix output the stranger saw and the
+post-fix output beside it, so a grader that cannot fail is caught here.
+
+It also covers what `kin status` does NOT say. Kin holds a merge in an authority
+transaction rather than smearing conflict markers across the working copy, which
+is the better design and the stranger preferred it to Git's markers; it is also
+why the working copy cannot tell you a merge is open, so the status line is the
+only place it can live. During a merge that had left seventy-six conflicts
+unresolved, `kin status` said nothing and reported the tree as matching its base
+change. The `held_merge` check opens a real conflicting merge and asks, with
+`kin conflicts` as its positive control so a fixture that never reached that state
+reads UNREADABLE rather than FAIL.
+
 `working_copy_freshness_repro.py` covers what the product says about a working
 copy it has not read, which the v0.6.1 yardstick run caught three surfaces
 getting wrong at once (FIR-2820). The stranger wrote a module, did not commit it,
@@ -498,6 +529,33 @@ unknown provider to be refused with the valid names printed and, the assertion
 that matters, with the stub recording zero requests, since a refusal that reaches
 the sign-in page comes back only as a redirect no terminal shows.
 
+`merge_precedence_repro.py` grades the merge defect the rc062a stranger run
+called "a wrong answer reported as a right one" (FIR-2958). Settling one entity
+`--theirs` and then settling the rest `--all-ours` reported all 76 conflicts
+resolved and published the `--ours` bytes, with the merge change recording
+`tree=0`: the source branch contributed nothing while every decision read as
+applied. A settled entity and a settled artifact land in two independent maps and
+only the artifact map becomes file bytes, so both were honoured and the one the
+reader sees won.
+
+Check `precedence` does the stranger's three commands and grades two things at
+once, because either alone passes on a build that merely fails differently: the
+merged file holds the body the entity decision chose, and the published merge
+carries a nonzero tree delta read off `kin log`'s own `Deltas:` line. Check
+`bulk` is the control on that same merge, requiring the file no entity decision
+covers to still hold the `--ours` bytes, so the rule reads as precedence rather
+than as take-theirs. Check `refusal` settles two entities in one file to opposite
+sides, which no side's committed bytes can carry, and requires the merge to
+refuse naming the file and both decisions and to move no ref. Check `uniform` is
+the control that keeps the other three honest: an ordinary `--all-theirs` merge
+must still publish, so a build that refused every merge would satisfy `refusal`
+and lose nothing else.
+
+The self-test drives every grader against one fixture per assertion. A merge log
+reading `tree=0` must fail, a one-parent change must read UNREADABLE rather than
+graded, and a refusal that names the file but neither entity, or both entities
+but only one side, must each fail on their own assertion.
+
 `brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
 exercise their verdict graders on fixed payloads and need no binary and no
 corpus. Each case is paired with its inverse, so a grader that cannot tell its
@@ -547,6 +605,10 @@ python3 scripts/acceptance/working_copy_freshness_repro.py \
 python3 scripts/acceptance/bridge_reach_repro.py \
   --kin target/release/kin \
   --json acceptance/bridge_reach.json --verbose
+
+python3 scripts/acceptance/merge_precedence_repro.py \
+  --kin target/release/kin --daemon target/release/kin-daemon \
+  --json acceptance/merge_precedence.json --verbose
 ```
 
 Release, not debug. Release is what ships, so it is what an acceptance answer

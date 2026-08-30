@@ -171,6 +171,43 @@ pub enum BudgetVerdict {
         forecast_bytes: u64,
         ceiling_bytes: u64,
     },
+    /// The forecast fits the ceiling, but not the daemon's share of it.
+    ///
+    /// `kin init` does not end when the conversion ends. It starts a repository
+    /// daemon on the store it just wrote, and that daemon is allowed half this
+    /// same ceiling by [`memory_pressure::FootprintBudget`]. A forecast under
+    /// [`TIGHT_FRACTION`] of the ceiling but over that half is the band where
+    /// the conversion succeeds and the daemon it starts arrives already past
+    /// what it is allowed to hold.
+    ///
+    /// Measured on psf/requests at 6493 commits inside a 12 GiB container: the
+    /// forecast was 0.61 of the ceiling, so this module said nothing, all
+    /// seventeen phases completed, and the daemon was then killed four times
+    /// across `kin init` and three `kin graph status` attempts. The same corpus
+    /// in a 9 GiB container held 8.351 GiB of resident set in the daemon
+    /// against 5.518 GiB in the conversion, so the daemon is the larger of the
+    /// two and it is the one nothing was forecasting.
+    ///
+    /// No new coefficient pays for this. Both numbers already exist: the
+    /// conversion forecast and the allowance. What makes the first a usable
+    /// floor for the second is measured rather than assumed. The daemon's cost
+    /// to load that store was read at three different ceilings and came back
+    /// 8.351 GiB by resident set at 9 GiB, 8.0 GiB by the daemon's own footprint
+    /// accounting at 12 GiB, and 7.9 GiB by the same accounting at 16 GiB, the
+    /// last of those being the only one taken with room to spare. The forecast
+    /// for the same repository is 7.26 GiB, so it sits just under the load,
+    /// understating it by about eight percent, which is the direction a floor
+    /// should err in.
+    ///
+    /// A per-commit rate is deliberately NOT quoted here. The obvious one is
+    /// wrong: the two largest runs both peaked at exactly their cap, so a rate
+    /// derived from them measures the caps rather than the daemon.
+    DaemonAllowance {
+        survey: HistorySurvey,
+        forecast_bytes: u64,
+        ceiling_bytes: u64,
+        allowance_bytes: u64,
+    },
     /// The forecast is over the ceiling. The conversion refuses here.
     Exceeds {
         survey: HistorySurvey,
@@ -193,6 +230,20 @@ impl BudgetVerdict {
     /// `None` for every other verdict, including the refusal, whose prose is
     /// several lines and lives in [`Self::refusal_lines`].
     pub fn advisory_line(&self) -> Option<String> {
+        if let Self::DaemonAllowance {
+            survey,
+            forecast_bytes,
+            ceiling_bytes,
+            allowance_bytes,
+        } = self
+        {
+            return Some(Self::daemon_allowance_line(
+                survey,
+                *forecast_bytes,
+                *ceiling_bytes,
+                *allowance_bytes,
+            ));
+        }
         let Self::Tight {
             survey,
             forecast_bytes,
@@ -221,6 +272,66 @@ impl BudgetVerdict {
             survey.tracked_artifacts,
             human_bytes(*forecast_bytes),
         ))
+    }
+
+    /// The line for a conversion that fits the machine but not the daemon's
+    /// share of it.
+    ///
+    /// Its own wording rather than the [`Self::Tight`] sentence, because the
+    /// two say different things. Tight says the conversion might not finish.
+    /// This says the conversion will finish and the thing that serves it
+    /// afterward may not start, which is a worse outcome to be surprised by: it
+    /// leaves a store on disk that reports success and answers nothing.
+    ///
+    /// The sentence states the allowance as a number and does not say where the
+    /// number came from. It is half the ceiling when Kin derived it and it is
+    /// whatever an operator typed when they set
+    /// `KIN_DAEMON_MEMORY_BUDGET_BYTES`, so a sentence that named one of those
+    /// provenances would be false in the other case.
+    ///
+    /// The remedy is stated as a number the reader can act on rather than as a
+    /// direction. Below the derived budget's own ceiling the allowance is half
+    /// the machine, so twice the forecast is the size that leaves the daemon
+    /// room. Above it the allowance is capped whatever the machine has, so more
+    /// memory is not a remedy and the line says so instead of sending a reader
+    /// to buy some. Nothing here offers `KIN_DAEMON_MEMORY_BUDGET_BYTES`:
+    /// raising a self-imposed allowance does not create memory, and advice that
+    /// cannot work is the defect this product already has one ticket for.
+    fn daemon_allowance_line(
+        survey: &HistorySurvey,
+        forecast_bytes: u64,
+        ceiling_bytes: u64,
+        allowance_bytes: u64,
+    ) -> String {
+        let remedy = if forecast_bytes <= memory_pressure::DERIVED_BUDGET_CEILING_BYTES {
+            format!(
+                "give this {} more than {}",
+                ceiling_noun(),
+                human_bytes(forecast_bytes.saturating_mul(2))
+            )
+        } else {
+            format!(
+                "no machine size fixes this, because one repository daemon is never allowed more                  than {}, so this store needs less history",
+                human_bytes(memory_pressure::DERIVED_BUDGET_CEILING_BYTES)
+            )
+        };
+        format!(
+            "  this conversion is expected to hold about {}, which fits the {} this {} allows. \
+             The daemon `kin init` starts on the finished store is a different matter: one \
+             repository daemon here is allowed {}, and {} commits over {} tracked files is \
+             forecast above that. So the conversion will probably finish and \
+             the daemon that serves it afterward starts already past its allowance, which stops \
+             its background work and can end with the kernel stopping the daemon, leaving a \
+             store that reports success and answers nothing. To leave it room, {}, or convert a \
+             repository with less history",
+            human_bytes(forecast_bytes),
+            human_bytes(ceiling_bytes),
+            ceiling_noun(),
+            human_bytes(allowance_bytes),
+            survey.commits,
+            survey.tracked_artifacts,
+            remedy,
+        )
     }
 
     /// The refusal, as the lines an operator reads.
@@ -400,7 +511,15 @@ pub fn assess(source: &Path) -> BudgetVerdict {
         Ok(survey) => survey,
         Err(reason) => return BudgetVerdict::Unmeasured { reason },
     };
-    verdict_for(survey, ceiling_bytes)
+    // The allowance the daemon will actually run under, not merely the one
+    // this ceiling would derive. An operator who set
+    // `KIN_DAEMON_MEMORY_BUDGET_BYTES` has named the daemon's share outright,
+    // and forecasting against a number the daemon will not use would be a
+    // check measuring a machine nobody is running on.
+    let allowance_bytes = memory_pressure::FootprintBudget::resolve(Some(ceiling_bytes))
+        .map(|budget| budget.bytes)
+        .unwrap_or_else(|| memory_pressure::FootprintBudget::derived_from(ceiling_bytes));
+    verdict_for_with_allowance(survey, ceiling_bytes, allowance_bytes)
 }
 
 /// The decision itself, over numbers rather than over a repository.
@@ -408,6 +527,24 @@ pub fn assess(source: &Path) -> BudgetVerdict {
 /// Separated so the thresholds are testable without a Git repository and
 /// without a machine of any particular size.
 pub fn verdict_for(survey: HistorySurvey, ceiling_bytes: u64) -> BudgetVerdict {
+    verdict_for_with_allowance(
+        survey,
+        ceiling_bytes,
+        memory_pressure::FootprintBudget::derived_from(ceiling_bytes),
+    )
+}
+
+/// The same decision, with the daemon's allowance named rather than derived.
+///
+/// Separate from [`verdict_for`] so that function stays a pure function of two
+/// numbers and its tests keep needing no environment. Only [`assess`] passes an
+/// allowance it read from the environment, because only [`assess`] is running on
+/// the machine the daemon will start on.
+pub fn verdict_for_with_allowance(
+    survey: HistorySurvey,
+    ceiling_bytes: u64,
+    allowance_bytes: u64,
+) -> BudgetVerdict {
     let forecast_bytes = survey.forecast_peak_bytes();
     if forecast_bytes as f64 > ceiling_bytes as f64 * REFUSE_MULTIPLE {
         return BudgetVerdict::Exceeds {
@@ -421,6 +558,28 @@ pub fn verdict_for(survey: HistorySurvey, ceiling_bytes: u64) -> BudgetVerdict {
             survey,
             forecast_bytes,
             ceiling_bytes,
+        };
+    }
+    // The conversion is not the whole command. Below TIGHT_FRACTION the
+    // conversion has room, and the question that remains is whether the daemon
+    // this command starts on the finished store has any. A forecast over the
+    // allowance describes a store that daemon cannot hold within its own share
+    // of this machine. The share is half the ceiling when Kin derived it and
+    // whatever an operator named when they set the budget outright, which is
+    // why it arrives as an argument rather than being computed here.
+    //
+    // Checked against every case this module has measured. requests at 6493
+    // commits moves from silent to spoken at a 12 GiB ceiling, which is the one
+    // band where the conversion succeeded and the daemon died. axum at 46
+    // percent of an 8 GiB ceiling stays silent, because 46 percent is under the
+    // half. flask and prometheus are unaffected, being already Tight and
+    // already Exceeds.
+    if forecast_bytes > allowance_bytes {
+        return BudgetVerdict::DaemonAllowance {
+            survey,
+            forecast_bytes,
+            ceiling_bytes,
+            allowance_bytes,
         };
     }
     BudgetVerdict::Fits {
@@ -676,6 +835,156 @@ mod tests {
                 "{name}'s advisory does not state what it expects to hold"
             );
         }
+    }
+
+    /// The band the measurement opened: the conversion fits and the daemon
+    /// does not.
+    ///
+    /// psf/requests at 6493 commits over 130 tracked files inside a 12 GiB
+    /// container is the exact case that was silent and should not have been.
+    /// The conversion completed all seventeen phases there and the repository
+    /// daemon was then killed, four times across `kin init` and three
+    /// `kin graph status` attempts, on the v0.6.2 candidate bytes.
+    #[test]
+    fn a_conversion_that_fits_the_machine_but_not_the_daemon_says_so() {
+        const CEILING: u64 = 12 * 1024 * 1024 * 1024;
+        let survey = survey(6_493, 130);
+        let verdict = verdict_for(survey, CEILING);
+        assert!(
+            matches!(verdict, BudgetVerdict::DaemonAllowance { .. }),
+            "requests at a 12 GiB ceiling should speak about the daemon, got {verdict:?}"
+        );
+        assert!(!verdict.refuses(), "this band warns, it does not refuse");
+
+        // The two figures that make the case are both in the sentence, because
+        // a reader who is told only one of them cannot see why it applies.
+        let line = verdict
+            .advisory_line()
+            .expect("this band prints its one line");
+        for phrase in ["repository daemon", "is allowed", "6493 commits"] {
+            assert!(line.contains(phrase), "line was: {line}");
+        }
+        // And it does not reuse the Tight sentence, whose claim is about the
+        // conversion rather than about what runs after it.
+        assert!(
+            !line.contains("It will probably finish. If the kernel stops it"),
+            "the daemon band borrowed the Tight wording: {line}"
+        );
+    }
+
+    /// The lower edge of the new band is the allowance, to the byte.
+    ///
+    /// Written as a pair rather than as one assertion, because a band whose
+    /// floor is never crossed in either direction is a rule nothing exercises.
+    #[test]
+    fn the_daemon_band_starts_exactly_at_the_allowance() {
+        let survey = survey(6_493, 130);
+        let forecast = survey.forecast_peak_bytes();
+        // A ceiling whose half is exactly the forecast leaves the daemon room,
+        // because the comparison is strictly greater.
+        let roomy = forecast * 2;
+        assert_eq!(
+            memory_pressure::FootprintBudget::derived_from(roomy),
+            forecast,
+            "this test's arithmetic assumes the allowance is half the ceiling here"
+        );
+        assert!(
+            matches!(verdict_for(survey, roomy), BudgetVerdict::Fits { .. }),
+            "a ceiling of exactly twice the forecast should be silent"
+        );
+        // One byte of ceiling less puts the forecast over the allowance.
+        assert!(
+            matches!(
+                verdict_for(survey, roomy - 2),
+                BudgetVerdict::DaemonAllowance { .. }
+            ),
+            "two bytes below twice the forecast should speak"
+        );
+    }
+
+    /// A forecast no machine size can give the daemon room for is told that,
+    /// rather than told to find a bigger machine.
+    ///
+    /// The derived allowance is capped at [`memory_pressure::DERIVED_BUDGET_CEILING_BYTES`]
+    /// regardless of the host, so above that cap "give it more memory" is
+    /// advice that cannot work, which is the failure mode this product already
+    /// carries a ticket for on its OOM recovery text.
+    #[test]
+    fn a_forecast_past_the_allowance_cap_does_not_send_a_reader_to_buy_memory() {
+        // Large enough that twice the forecast is still short of what the
+        // allowance would need, and the ceiling is large enough that the
+        // conversion itself has room.
+        let survey = survey(20_000, 100);
+        let forecast = survey.forecast_peak_bytes();
+        assert!(
+            forecast > memory_pressure::DERIVED_BUDGET_CEILING_BYTES,
+            "this test needs a forecast past the allowance cap"
+        );
+        let ceiling = forecast * 4;
+        let verdict = verdict_for(survey, ceiling);
+        let line = verdict
+            .advisory_line()
+            .expect("this band prints its one line");
+        assert!(
+            line.contains("no machine size fixes this"),
+            "line was: {line}"
+        );
+        assert!(
+            !line.contains("give this"),
+            "a capped allowance was still told to find more memory: {line}"
+        );
+    }
+
+    /// The new band does not swallow the silence the old one guaranteed.
+    ///
+    /// axum sits at 46.4 percent of an 8 GiB ceiling, which is under the half
+    /// by about seven percent. That margin is small, so it is pinned here as
+    /// well as in the band test above: a change that widened the daemon rule
+    /// would make an ordinary conversion narrate itself, which is the noise
+    /// TIGHT_FRACTION's own comment exists to prevent.
+    #[test]
+    fn the_daemon_band_leaves_an_ordinary_conversion_silent() {
+        const CEILING: u64 = 8 * 1024 * 1024 * 1024;
+        let survey = survey(1_983, 503);
+        let allowance = memory_pressure::FootprintBudget::derived_from(CEILING);
+        assert!(
+            survey.forecast_peak_bytes() < allowance,
+            "axum's forecast must sit under the allowance for this to be silence rather than luck"
+        );
+        let verdict = verdict_for(survey, CEILING);
+        assert!(
+            matches!(verdict, BudgetVerdict::Fits { .. }),
+            "axum should stay silent, got {verdict:?}"
+        );
+        assert_eq!(verdict.advisory_line(), None);
+    }
+
+    /// A named allowance decides the band, so an operator who gave the daemon
+    /// a different share is judged against the share the daemon will have.
+    ///
+    /// The pair matters more than either half. The same survey and the same
+    /// ceiling land in two different verdicts depending only on the allowance,
+    /// which is what makes this a real input rather than a value the function
+    /// could have derived and ignored.
+    #[test]
+    fn the_named_allowance_and_not_the_ceiling_decides_the_daemon_band() {
+        const CEILING: u64 = 8 * 1024 * 1024 * 1024;
+        let survey = survey(1_983, 503);
+        let forecast = survey.forecast_peak_bytes();
+        assert!(
+            matches!(
+                verdict_for_with_allowance(survey, CEILING, forecast + 1),
+                BudgetVerdict::Fits { .. }
+            ),
+            "an allowance above the forecast leaves the daemon room"
+        );
+        assert!(
+            matches!(
+                verdict_for_with_allowance(survey, CEILING, forecast - 1),
+                BudgetVerdict::DaemonAllowance { .. }
+            ),
+            "an allowance below the forecast does not"
+        );
     }
 
     /// An operator ceiling Kin cannot read refuses rather than falling back.

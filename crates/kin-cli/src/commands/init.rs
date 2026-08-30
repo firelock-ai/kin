@@ -1347,7 +1347,10 @@ fn embed_refusal_for(root: &std::path::Path) -> Option<kin_core::memory_pressure
     )
 }
 
-fn embedding_model_notice(
+/// Visible to the crate so `health.rs` can grade its own row against what
+/// this function actually says, rather than against a second copy of the
+/// sentence. See `doctor_and_init_agree_about_the_model_fetch`.
+pub(crate) fn embedding_model_notice(
     fetch: &crate::embed_model::EmbedModelFetch,
     present_before: bool,
     refusal: Option<&kin_core::memory_pressure::PressureRefusal>,

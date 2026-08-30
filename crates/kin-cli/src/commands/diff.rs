@@ -623,8 +623,24 @@ fn summarize(
     summary
 }
 
-pub fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()> {
+pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
+    // Admit, THEN diff, for the same reason `kin status` does and by the same
+    // founder-owned decision relayed 2026-08-30. A diff whose WORKSPACE endpoint
+    // is the graph as it was before your edit reports `+0 ~0 -0` over a file you
+    // just wrote, which is the answer that sent a stranger looking for a lost
+    // module (FIR-2499) and told another that a rewritten function body had not
+    // changed (FIR-2961). Reading the working copy to ADMIT it is ingestion at
+    // an explicit input boundary, not answering from files.
+    //
+    // Only when a workspace endpoint is actually involved. A diff between two
+    // changes is history, and walking the tree to answer it would be a cost with
+    // nothing behind it.
+    let pass = if endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref()) {
+        Some(crate::commands::status::admit_before_reading(&layout).await)
+    } else {
+        None
+    };
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     let report = inspect(&binding, base.as_deref(), head.as_deref())?;
     if json {
@@ -633,9 +649,70 @@ pub fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()>
         for line in render_lines(&report) {
             println!("{line}");
         }
+        if let Some(line) = semantic_scope_line(&report) {
+            println!("{line}");
+        }
+        if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
+            println!("Admission scope: this diff was not measured against the working copy: {why}");
+        }
         println!("{}", admitted_scope_line(&layout));
     }
     Ok(())
+}
+
+/// Whether a requested endpoint spelling names the workspace.
+///
+/// `None` is the workspace on the head side and HEAD on the base side, and the
+/// defaults are applied inside `inspect`, so this asks about the SPELLING a
+/// caller used and errs toward admitting: a bare `kin diff` is the everyday
+/// call and its head endpoint is the workspace.
+fn endpoint_is_workspace(requested: Option<&str>) -> bool {
+    matches!(requested, None | Some("WORKSPACE") | Some("workspace"))
+}
+
+/// What the ENTITY count above cannot show on a workspace endpoint.
+///
+/// Narrower than it first shipped, and the narrowing matters. A workspace
+/// endpoint's semantic side is its base change's entities and relations plus the
+/// workspace semantic overlay. Nothing ever writes an ENTITY delta into that
+/// overlay: the admission seam publishes
+/// `semantic_delta: WorkspaceSemanticDelta::default()` unconditionally, and the
+/// enrichment writer computes its delta with the authority entities as BOTH the
+/// base and the desired side (`kin-daemon/src/state.rs`), so an entity delta is
+/// structurally impossible from either. RELATION deltas do reach it, from that
+/// same enrichment writer, whose relation arguments are not the same value twice.
+///
+/// So `Entities: +0 ~0 -0` beside a moving `Relations` line is not a
+/// contradiction, and saying so is the point. Two independent runs read the pair
+/// as an answer and went looking for a broken semantic layer: one over a
+/// rewritten function body against a fully settled graph (`kin graph status`: 78
+/// of 78 embeddings indexed, 8 of 8 files at 100% coverage), and one over an
+/// appended top-level function that read `Artifacts: +0 ~1 -0`,
+/// `Relations: +0 ~9 -0`, `Entities: +0 ~0 -0`, unchanged twenty seconds later at
+/// the same authority generation, while `kin status` already counted the entity
+/// and the commit that followed recorded ten of them (FIR-2961).
+///
+/// Silent on a diff between two changes, where the entity delta is computed and
+/// means what it says.
+fn semantic_scope_line(report: &DiffReport) -> Option<String> {
+    let base_is_workspace = matches!(report.base.source, DiffEndpointSource::Workspace);
+    let head_is_workspace = matches!(report.head.source, DiffEndpointSource::Workspace);
+    if !base_is_workspace && !head_is_workspace {
+        return None;
+    }
+    let side = if base_is_workspace && head_is_workspace {
+        "Both endpoints are"
+    } else if head_is_workspace {
+        "The head endpoint is"
+    } else {
+        "The base endpoint is"
+    };
+    Some(format!(
+        "Semantic scope: {side} the workspace, whose entities are its base change's plus a \
+         workspace semantic overlay that nothing writes an entity delta into, so the entity \
+         count above cannot move for work in the working copy however many artifacts or \
+         relations do; commit it and diff change to change to see entity movement."
+    ))
 }
 
 /// What this diff does not cover, and when the graph last caught up.

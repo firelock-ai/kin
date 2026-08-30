@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-08-29
+
+### Changed
+
+- Name the collection a locate page answers with (#1218)
+- Stamp hydration semantics at store creation and disclose it consistently (#1220)
+- Run the kin-vfs compat guard on a pull request, and read every home of the pin (#1226)
+- Document the code scanning triage policy and its one-call discriminator (#1228)
+- Make hosted semantic calls repository-scoped for locate, context and trace (#1212)
+- Route every dead-code surface through one fail-closed arrival authority (#1190)
+- Enforce the hosted producer allowlist and carry query producer evidence into the verdict (#1217)
+- Correct the CodeQL triage discriminator to open alerts (#1229)
+- Refuse a conversion the machine cannot hold, and stop exiting 0 on a killed daemon (#1232)
+- Install a language server without the toolchain the recipe names (#1230)
+- Accept a superseded bearer token during a bounded, durable credential rotation window (#1224)
+- Gate #1217's feature-only items, and stop grading an unclassifiable pid as a killed daemon (#1234)
+- Serve initialize outside a repository, and name what a sweep skipped (#1233)
+- Read the request before answering it in the language server install fixture (#1237)
+- Say what each CLI answer rests on, and report the waits that were silent (#1231)
+- Repair and compose the durable spine compare-and-swap, publication lease and stage TTL (#1227)
+- Make overall health the join over the component states (#1236)
+- Tolerate the first relation census still filling in the Unix install-proof legs (#1238)
+- Admit the GCS emulator smoke under the image identity it just built (#1239)
+- Write the init budget acceptance report under the key the gate reads (#1240)
+- Complete the rollout acquisition before the gcs fence admission probe (#1243)
+- Answer hosted repository reads from the generation the daemon already holds (#1242)
+- Discover the daemon a transfer runs in, and let a login choose its provider (#1241)
+- Name the read view's authority accessor so the file-search guard can see it (#1246)
+- Point the agent-install docs at the MCP entry Kin's own health check calls canonical (#1247)
+- Grade check 12 against a record and a tree from one instant (#1245)
+- Record v0.6.1 as an abandoned release tag (#1248)
+
+
 ## [0.6.1] - 2026-08-27
 
 ### Changed

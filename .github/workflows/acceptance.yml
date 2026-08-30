@@ -260,6 +260,15 @@ jobs:
       - name: Falsify the working-copy freshness graders
         run: python3 scripts/acceptance/working_copy_freshness_repro.py --self-test
 
+      # The graders here separate a true sentence from a misleading one, and the
+      # two look identical from outside: every verdict this suite grades was
+      # right about the graph. So each grader is driven against the literal
+      # pre-fix output the stranger saw and the post-fix output beside it, with
+      # the all-clear as its own must-pass case, because a surface that hedges
+      # every answer satisfies a one-directional check.
+      - name: Falsify the vcs read-surface graders
+        run: python3 scripts/acceptance/vcs_read_surfaces_repro.py --self-test
+
       # The graders here decide two verdicts that read alike from outside: a
       # refusal that fires with no remedy behind it, and a conversion with room
       # that narrates its memory anyway. Both are driven against their inverse,
@@ -277,6 +286,38 @@ jobs:
       # single-value read cannot see: two providers on one URL.
       - name: Falsify the bridge reach graders
         run: python3 scripts/acceptance/bridge_reach_repro.py --self-test
+
+      # FIR-2918. `kin locate` has no daemonless arm, so a prose-only query that
+      # retrieves nothing through one daemon and its file through another is one
+      # code path answering differently depending on which process is up. The
+      # graders here decide two things that look alike from outside: whether two
+      # daemon states named the same files, and whether an answer that could not
+      # read the lexical index said so. Each is handed the input it must refuse,
+      # including the mutation that matters, a gap reader that accepts any
+      # degradation at all and would therefore pass on every query in a suite
+      # that runs with no vector index.
+      - name: Falsify the prose-query parity graders
+        run: python3 scripts/acceptance/prose_query_parity_repro.py --self-test
+      # FIR-2964. Written blind to which cheap coverage path is in the tree, so
+      # it grades the envelope read and whatever replaces it without being
+      # rewritten. The pair is the point: a clean store must read in sync and a
+      # diverged one must not, because the shortcut any of these designs can
+      # take is serving the graph's own tree as durable truth, which reports
+      # coherence on every clean fixture. The diverged arm returns UNREADABLE
+      # rather than PASS when the divergence did not take, since that state and
+      # the defect are not separable from outside.
+      # FIR-2958. Two settlements over one file are the case, and the two that
+      # decide it read alike from outside: a projection that took the side
+      # carrying the entity decision, and a bulk settle that overrode it. The
+      # graders are driven against the exact `tree=0` signature the rc062a
+      # stranger recorded, and against a one-parent change whose deltas say
+      # nothing about a merge at all, so a log that could not be read is never
+      # graded as a merge that moved bytes.
+      - name: Falsify the merge precedence graders
+        run: python3 scripts/acceptance/merge_precedence_repro.py --self-test
+
+      - name: Falsify the coverage read graders
+        run: python3 scripts/acceptance/coverage_read_open.py --self-test
 
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
@@ -864,6 +905,31 @@ jobs:
             echo "::warning title=Working-copy freshness acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: VCS read-surface acceptance suite (verdict comes from the gate step)
+        id: vcsreadsurfaces
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/vcs_read_surfaces_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/vcs_read_surfaces.json \
+            --verbose >acceptance/vcs_read_surfaces.log 2>&1 || rc=$?
+          cat acceptance/vcs_read_surfaces.log
+          {
+            echo "### VCS read-surface acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/vcs_read_surfaces.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=VCS read-surface acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       - name: Init budget acceptance suite (verdict comes from the gate step)
         id: initbudget
         if: always()
@@ -888,6 +954,31 @@ jobs:
             echo "::warning title=Init budget acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Coverage read acceptance suite (verdict comes from the gate step)
+        id: coverageread
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/coverage_read_open.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/coverage_read.json \
+            --verbose >acceptance/coverage_read.log 2>&1 || rc=$?
+          cat acceptance/coverage_read.log
+          {
+            echo "### Coverage read acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/coverage_read.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Coverage read acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       - name: Bridge reach acceptance suite (verdict comes from the gate step)
         id: bridgereach
         if: always()
@@ -910,6 +1001,66 @@ jobs:
           echo "rc=$rc" >> "$GITHUB_OUTPUT"
           if [ "$rc" -ne 0 ]; then
             echo "::warning title=Bridge reach acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
+      # FIR-2918. A stranger installs Kin, commits some code and asks an English
+      # question, and the daemon that answers is the long-lived one that was up
+      # while the code was ingested. This asks one docstring-only term through
+      # that daemon and through a daemon started after `kin daemon stop`, and
+      # requires the same files back. Its own controls decide whether it graded
+      # anything: a symbol the fixture defines must retrieve in both states, and
+      # a fabricated term in neither.
+      - name: Prose-query parity suite (verdict comes from the gate step)
+        id: proseparity
+        if: always()
+        env:
+          KIN_ACCEPTANCE_LABEL: ${{ github.event_name }}-${{ github.sha }}
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/prose_query_parity_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/prose_parity.json \
+            --label "$KIN_ACCEPTANCE_LABEL" \
+            --verbose >acceptance/prose_parity.log 2>&1 || rc=$?
+          cat acceptance/prose_parity.log
+          {
+            echo "### Prose-query parity suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/prose_parity.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Prose-query parity suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
+      - name: Merge precedence acceptance suite (verdict comes from the gate step)
+        id: mergeprecedence
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/merge_precedence_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/merge_precedence.json \
+            --verbose >acceptance/merge_precedence.log 2>&1 || rc=$?
+          cat acceptance/merge_precedence.log
+          {
+            echo "### Merge precedence acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/merge_precedence.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Merge precedence acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
       # Always, including on a cancelled or timed-out run: the reports are how a
@@ -958,6 +1109,10 @@ jobs:
             --report first_query=acceptance/first_query.json \
             --report verdict_limits=acceptance/verdict_limits.json \
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
+            --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
             --report init_budget=acceptance/init_budget.json \
+            --report coverage_read=acceptance/coverage_read.json \
             --report bridge_reach=acceptance/bridge_reach.json \
+            --report prose_parity=acceptance/prose_parity.json \
+            --report merge_precedence=acceptance/merge_precedence.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'

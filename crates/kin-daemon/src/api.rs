@@ -223,6 +223,12 @@ pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
     query: std::sync::Mutex<Option<HeldQueryAuthority>>,
     command: std::sync::Mutex<Option<HeldCommandAuthority>>,
+    /// The authority ENVELOPE, which is not a fourth wrapper over the same
+    /// read: it is a much smaller read of the same bytes, keyed the same way.
+    /// A reader that needs refs, workspaces or the roots and then some bodies
+    /// by content address takes this, and never decodes the history a converted
+    /// repository's snapshot mostly consists of.
+    envelope: std::sync::Mutex<Option<HeldEnvelopeAuthority>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -255,6 +261,14 @@ struct HeldCommandAuthority {
     /// [`HeldProjectionAuthority::published`] and for the same reason.
     published: LocalPublicationIdentity,
     authority: Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
+}
+
+#[derive(Clone)]
+struct HeldEnvelopeAuthority {
+    /// Read strictly before the envelope it labels was loaded, exactly as for
+    /// [`HeldProjectionAuthority::published`] and for the same reason.
+    published: LocalPublicationIdentity,
+    envelope: Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>,
 }
 
 impl ProjectionAuthorityCache {
@@ -335,10 +349,32 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    fn reuse_envelope(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>> {
+        lock_recover(&self.envelope)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| Arc::clone(&held.envelope))
+    }
+
+    fn install_envelope(
+        &self,
+        published: LocalPublicationIdentity,
+        envelope: Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>,
+    ) {
+        *lock_recover(&self.envelope) = Some(HeldEnvelopeAuthority {
+            published,
+            envelope,
+        });
+    }
+
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
         *lock_recover(&self.command) = None;
+        *lock_recover(&self.envelope) = None;
     }
 }
 
@@ -551,6 +587,75 @@ fn command_repository_authority(
         "command repository authority loaded"
     );
     Ok(authority)
+}
+
+/// The repository-authority ENVELOPE for one request, cached per publication.
+///
+/// Every obligation [`command_repository_authority`] discharges, discharged the
+/// same way and in the same order: the pinned namespace is confirmed, the
+/// publication record is read BEFORE the load it labels, the load gate
+/// serializes a burst of cold requests, and the label installed beside the
+/// envelope is the one taken before it.
+///
+/// What differs is what gets loaded. A full open decodes every domain the
+/// snapshot carries and re-verifies every persisted body; on a converted
+/// repository that is the whole store, and a cold `graph status` paid it to
+/// print counters. The envelope read walks the same bytes, verifies the same
+/// frame checksum, and allocates nothing for the history it skips.
+///
+/// `Ok(None)` is KinDB declining to answer the envelope cheaply for these
+/// bytes. The caller falls back to the full open, so this is a cost decision
+/// and never a correctness one. It does not count into
+/// [`ProjectionAuthorityCache::loads`], because that counter means whole-store
+/// opens and an envelope read is not one.
+fn command_repository_envelope(
+    state: &DaemonState,
+) -> Result<
+    Option<Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>>,
+    (StatusCode, String),
+> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let binding = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let repository_id = binding.repository_id().clone();
+
+    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
+        state.projection_authority.invalidate();
+        return Err(error);
+    }
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(envelope) = state.projection_authority.reuse_envelope(&published) {
+        return Ok(Some(envelope));
+    }
+
+    let _load = lock_recover(&state.projection_authority.load_gate);
+    // Re-read under the gate, for the reason the full open re-reads: the
+    // publication may have moved while this request waited, and the label
+    // installed below must be the one taken before the load it describes.
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(envelope) = state.projection_authority.reuse_envelope(&published) {
+        return Ok(Some(envelope));
+    }
+    let Some(envelope) = binding
+        .open_authority_metadata()
+        .map_err(repository_authority_error)?
+    else {
+        return Ok(None);
+    };
+    let envelope = Arc::new(envelope);
+    state
+        .projection_authority
+        .install_envelope(published, Arc::clone(&envelope));
+    tracing::debug!(
+        repository = %repository_id,
+        generation = envelope.generation(),
+        "command repository authority envelope loaded"
+    );
+    Ok(Some(envelope))
 }
 
 /// Hand a command helper an authority this daemon already resolved.
@@ -4374,6 +4479,10 @@ async fn command_status(
         daemon_source_known: daemon_build.source_known,
         daemon_dependency_provenance: daemon_build.dependency_provenance.to_string(),
     };
+    let merge = kin_core::LocalRepositoryAuthorityBinding::from_layout(&state.layout)
+        .ok()
+        .and_then(|binding| kin_cli::commands::status::merge_in_progress(&binding).ok())
+        .flatten();
     let response = kin_cli::commands::status::build_command_status_response(
         report,
         request.json,
@@ -4383,6 +4492,24 @@ async fn command_status(
         // killed. Read from the store rather than remembered by this process,
         // because the daemon that died is by definition not this one.
         kin_cli::daemon_death::recorded_for_store(state.layout.root()).as_ref(),
+        // When graph truth last caught up with the working copy. Read from the
+        // durable marker rather than from this daemon's own probes, which reset
+        // on restart and then report every store as never admitted (FIR-2961).
+        &kin_core::last_admission::read(&state.layout),
+        // This endpoint stays a pure read. The CLI admits before it reads, which
+        // is where the founder's 2026-08-30 decision applies, and a caller of
+        // this route drives its own admission through `/commands/admit`. Saying
+        // so here rather than leaving the verdict unqualified is the point: a
+        // report that did not admit must not present as one that did.
+        &kin_cli::commands::status::StatusAdmission::Skipped(
+            "this report came from the daemon's status route, which does not admit; drive \
+             `/commands/admit` first for an answer measured against the working copy"
+                .to_string(),
+        ),
+        // A merge this workspace is holding open, read off the authority lease.
+        // Never fatal: a status route that 500s because it could not check for a
+        // merge is worse than one that answers and does not mention it.
+        merge.as_ref(),
     )
     .map_err(internal_error)?;
     Ok(Json(response))
@@ -4592,6 +4719,7 @@ async fn command_graph(
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
     let resolver_state = Arc::clone(&state);
+    let envelope_state = Arc::clone(&state);
     let repository_authority =
         kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
             binding,
@@ -4599,7 +4727,15 @@ async fn command_graph(
                 command_repository_authority(&resolver_state)
                     .map_err(|(_, message)| anyhow::anyhow!(message))
             }),
-        );
+        )
+        // `graph status` reads one workspace tree and then bodies by content
+        // address, and neither needs the history the same snapshot carries.
+        // Without this it resolves the envelope through the binding on every
+        // request; with it, a warm request pays nothing.
+        .with_envelope_resolver(Arc::new(move || {
+            command_repository_envelope(&envelope_state)
+                .map_err(|(_, message)| anyhow::anyhow!(message))
+        }));
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     // Read here rather than inside the renderer, for the reason the freshness
     // marker is read in the CLI: the record is a property of the store on disk,
@@ -13933,6 +14069,44 @@ impl TransferCommandContext {
     }
 }
 
+/// Where this transfer's peer is, and how to address it.
+///
+/// The authentication and the organization scope are applied here rather than
+/// inline at the one call site, so neither can be dropped on its own: an
+/// endpoint is not optional, and this is the only place that builds one. A
+/// separate `if let` beside the constructor was deletable without breaking any
+/// build, and a falsification arm that deleted it passed every test.
+///
+/// A request naming an organization addresses a hosted KinLab peer, whose seam
+/// is org scoped. One naming none is a peer daemon, which serves the seam at
+/// its own root, so the endpoint keeps the route it already had. A daemon that
+/// predates the field sends none and so keeps addressing peers exactly as it
+/// did.
+fn transfer_endpoint(
+    base_url: &str,
+    request: &kin_cli::commands::transfer::CommandTransferRequest,
+) -> kin_remote::repository_transfer_http::RepositoryTransferEndpoint {
+    let mut endpoint =
+        kin_remote::repository_transfer_http::RepositoryTransferEndpoint::new(base_url);
+    if let Some(token) = request
+        .remote_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+    {
+        endpoint = endpoint.with_auth(token);
+    }
+    if let Some(organization_id) = request
+        .remote_organization_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|organization_id| !organization_id.is_empty())
+    {
+        endpoint = endpoint.with_organization(organization_id);
+    }
+    endpoint
+}
+
 /// Resolve the repository, refs, and peer for one transfer command.
 ///
 /// An absent source ref means the repository's own default ref, which is the
@@ -13970,16 +14144,7 @@ fn transfer_command_context(
         .clone()
         .or_else(|| source_ref.clone());
 
-    let mut endpoint =
-        kin_remote::repository_transfer_http::RepositoryTransferEndpoint::new(base_url);
-    if let Some(token) = request
-        .remote_token
-        .as_deref()
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        endpoint = endpoint.with_auth(token);
-    }
+    let endpoint = transfer_endpoint(base_url, request);
 
     Ok(TransferCommandContext {
         repository_id,
@@ -17212,6 +17377,44 @@ mod tests {
     /// embedding worker has failed while `impact_analysis` refuses on the same
     /// instant. Human surface more confident than agent surface is the exact
     /// divergence this ticket closes.
+    /// One transfer request, carrying only what these tests vary.
+    fn transfer_request_for(
+        organization_id: Option<&str>,
+    ) -> kin_cli::commands::transfer::CommandTransferRequest {
+        kin_cli::commands::transfer::CommandTransferRequest {
+            remote_base_url: "https://kinlab.ai".to_string(),
+            remote_token: None,
+            remote_organization_id: organization_id.map(str::to_string),
+            repository_id: None,
+            source_ref: None,
+            destination_ref: None,
+        }
+    }
+
+    #[test]
+    fn a_request_naming_an_organization_scopes_the_endpoint_to_it() {
+        // The daemon is where a transfer runs, so the organization the CLI
+        // resolved has to survive the trip into the endpoint. A daemon that
+        // dropped it would address a hosted peer on the daemon route, which on
+        // kinlab.ai is outside /api/ and answers from the static bucket.
+        let endpoint = transfer_endpoint("https://kinlab.ai", &transfer_request_for(Some("acme")));
+        assert_eq!(endpoint.organization_id.as_deref(), Some("acme"));
+    }
+
+    #[test]
+    fn a_request_naming_no_organization_stays_on_the_peer_daemon_route() {
+        let endpoint = transfer_endpoint("http://127.0.0.1:4010", &transfer_request_for(None));
+        assert_eq!(endpoint.organization_id, None);
+    }
+
+    #[test]
+    fn a_blank_organization_on_the_wire_is_not_an_organization() {
+        // A caller that sends an empty string is not naming an organization,
+        // and taking it would build `/orgs//repos/...`.
+        let endpoint = transfer_endpoint("https://kinlab.ai", &transfer_request_for(Some("   ")));
+        assert_eq!(endpoint.organization_id, None);
+    }
+
     #[test]
     fn the_impact_envelope_carries_the_daemons_degraded_signals() {
         let health = serde_json::json!({
@@ -23574,6 +23777,9 @@ mod tests {
 
         let destination_url = serve_replica(Arc::clone(&destination_state)).await;
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: destination_url.clone(),
             remote_token: None,
             repository_id: Some(repo_id.clone()),
@@ -23754,6 +23960,9 @@ mod tests {
         let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
 
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: hosted_url,
             remote_token: None,
             repository_id: Some(hosted_id.clone()),
@@ -23831,6 +24040,9 @@ mod tests {
         let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
 
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: hosted_url,
             remote_token: None,
             // Left unset on purpose, so the push sends what the store actually
@@ -23903,6 +24115,9 @@ mod tests {
         let source_state = Arc::new(DaemonState::open_with_repo_id(init.layout, None).unwrap());
 
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: hosted_url,
             remote_token: None,
             repository_id: Some(hosted_id.clone()),
@@ -24709,6 +24924,9 @@ mod tests {
             );
 
             let request = kin_cli::commands::transfer::CommandTransferRequest {
+                // A peer daemon serves the seam at its own root and has no
+                // organizations; only a hosted KinLab peer is org scoped.
+                remote_organization_id: None,
                 remote_base_url: hosted_url,
                 remote_token: None,
                 repository_id: Some(hosted_id.clone()),
@@ -24856,6 +25074,9 @@ mod tests {
         let source_state =
             Arc::new(DaemonState::open_with_repo_id(fixture.layout.clone(), None).unwrap());
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: hosted_url,
             remote_token: None,
             // Left unset so the push sends what the store actually holds.
@@ -26036,6 +26257,9 @@ mod tests {
         repo_id: &str,
     ) -> kin_cli::commands::transfer::CommandTransferRequest {
         kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: url.to_string(),
             remote_token: None,
             repository_id: Some(repo_id.to_string()),
@@ -26634,6 +26858,9 @@ mod tests {
             .store(u64::MAX, std::sync::atomic::Ordering::SeqCst);
 
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: source_url,
             remote_token: None,
             repository_id: Some(repo_id.clone()),
@@ -26739,6 +26966,9 @@ mod tests {
 
         let destination_url = serve_replica(Arc::clone(&destination_state)).await;
         let request = kin_cli::commands::transfer::CommandTransferRequest {
+            // A peer daemon serves the seam at its own root and has no
+            // organizations; only a hosted KinLab peer is org scoped.
+            remote_organization_id: None,
             remote_base_url: destination_url,
             remote_token: None,
             repository_id: Some(repo_id.clone()),
@@ -38077,7 +38307,26 @@ mod tests {
         let result: kin_cli::commands::search::DaemonSearchResponse =
             serde_json::from_slice(&body).unwrap();
 
-        assert!(result.records.is_empty(), "the query must match nothing");
+        // FIR-2918. This assertion used to read `records.is_empty()`, and it
+        // held for the wrong reason: the fixture's lexical index was never
+        // committed, so every query returned nothing. Now that the query path
+        // brings the index current, the disjunctive fallback answers with the
+        // index's NEAREST document rather than a match, measured here as
+        // `definitelyNoSuchSymbol` retrieving `present` at 0.45 because `def`
+        // occurs in `def present()` and is a substring of `definitely`, over a
+        // corpus holding no token of the query.
+        //
+        // So the property this test is about is unchanged and is now stated
+        // directly: nothing matched BY NAME. `text_fallback` is the product's
+        // own name for that, and it is true only when the answer is non-empty
+        // and every row is a fallback row. The qualifier assertions below are
+        // untouched, and they are what this test exists for; making them survive
+        // a labelled-fallback answer is the fix this change carries.
+        assert!(
+            result.text_fallback,
+            "nothing may match this query by name; an answer with a name match would make the \
+             qualifier assertions below vacuous: {result:?}"
+        );
         let qualifier = result.absence_qualifier.join(" ");
         assert!(
             qualifier.contains("Kin cannot rule out"),

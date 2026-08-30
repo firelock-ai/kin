@@ -66,6 +66,7 @@ pub fn repository_authority_opens_on_this_thread() -> u64 {
 pub struct RequestRepositoryAuthority {
     binding: kin_core::LocalRepositoryAuthorityBinding,
     shared: Option<SharedAuthorityResolver>,
+    envelope: Option<SharedEnvelopeResolver>,
 }
 
 /// A server's promise to produce authority for the publication a request reads
@@ -73,12 +74,24 @@ pub struct RequestRepositoryAuthority {
 pub type SharedAuthorityResolver =
     std::sync::Arc<dyn Fn() -> Result<std::sync::Arc<ActiveRepositoryAuthority>> + Send + Sync>;
 
+/// The same promise for the authority ENVELOPE, which is a different and much
+/// smaller read than the authority itself.
+///
+/// `Ok(None)` means KinDB declined to answer the envelope cheaply for these
+/// bytes and the caller must open in full; it is never a wrong answer.
+pub type SharedEnvelopeResolver =
+    std::sync::Arc<dyn Fn() -> Result<Option<std::sync::Arc<AuthorityEnvelope>>> + Send + Sync>;
+
+/// The repository-authority envelope, opened without the history beside it.
+pub type AuthorityEnvelope = kin_db::RepositoryAuthorityMetadata<kin_db::LocalFileBackend>;
+
 impl RequestRepositoryAuthority {
     /// Authority this command opens for itself.
     pub fn pinned(binding: kin_core::LocalRepositoryAuthorityBinding) -> Self {
         Self {
             binding,
             shared: None,
+            envelope: None,
         }
     }
 
@@ -98,6 +111,39 @@ impl RequestRepositoryAuthority {
         Self {
             binding,
             shared: Some(resolve),
+            envelope: None,
+        }
+    }
+
+    /// Let a server resolve the authority ENVELOPE for this request too.
+    ///
+    /// The envelope carries refs, workspaces and the roots, and reading it does
+    /// not decode the history the same snapshot bytes carry. A server that can
+    /// cache one per publication supplies this so a warm request pays nothing;
+    /// without it, [`Self::open_envelope`] reads through the binding, which is
+    /// correct and costs one parse of the snapshot body with no allocation for
+    /// the domains it skips.
+    ///
+    /// The freshness obligation is exactly [`Self::shared`]'s, for the same
+    /// reason and with the same failure mode.
+    #[must_use]
+    pub fn with_envelope_resolver(mut self, resolve: SharedEnvelopeResolver) -> Self {
+        self.envelope = Some(resolve);
+        self
+    }
+
+    /// The authority envelope to read this command from, when one answers.
+    ///
+    /// `None` is KinDB declining to answer cheaply, and the caller's obligation
+    /// is to fall back to [`Self::open`] rather than to report an absence.
+    pub(crate) fn open_envelope(&self) -> Result<Option<std::sync::Arc<AuthorityEnvelope>>> {
+        match &self.envelope {
+            Some(resolve) => resolve(),
+            None => Ok(self
+                .binding
+                .open_authority_metadata()
+                .context("read repository authority envelope")?
+                .map(std::sync::Arc::new)),
         }
     }
 
@@ -118,6 +164,11 @@ impl RequestRepositoryAuthority {
     /// per entity — costs one open for the whole batch on the shared arm and one
     /// per item on the pinned arm, which is exactly the one-shot behavior that
     /// arm is for.
+    /// `#[track_caller]` so the log at the open names the READ that wanted an
+    /// authority rather than this wrapper. Without it every pinned open in the
+    /// product attributes to one line here, which is attribution being useless
+    /// in the most convincing way.
+    #[track_caller]
     pub(crate) fn open(&self) -> Result<std::sync::Arc<ActiveRepositoryAuthority>> {
         match &self.shared {
             Some(resolve) => resolve(),
@@ -134,8 +185,38 @@ impl ActiveRepositoryAuthority {
     /// asked for. `pub` so a long-lived server can pay for one open and hand it
     /// to the requests that read at that publication, through
     /// [`RequestRepositoryAuthority::shared`].
+    #[track_caller]
     pub fn open(binding: &kin_core::LocalRepositoryAuthorityBinding) -> Result<Self> {
-        REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| opens.set(opens.get() + 1));
+        let opens = REPOSITORY_AUTHORITY_OPENS_ON_THREAD.with(|opens| {
+            opens.set(opens.get() + 1);
+            opens.get()
+        });
+        // Who asked, in the product's own log, at the moment of asking.
+        //
+        // kin-db already logs `repository authority open` with its timings, and
+        // one `kin graph status` on a converted repository produced twelve of
+        // them with nine concurrent, each decoding the whole snapshot and
+        // re-verifying every persisted body. That count says the cost is a
+        // multiplier rather than a working set. It says nothing about WHICH
+        // callers make it, and that is the difference between fixing one site
+        // and fixing the mechanism.
+        //
+        // `#[track_caller]` names the call site rather than a backtrace and
+        // costs nothing at runtime, so attributing those twelve is a grep over
+        // one run instead of an argument from source. The counter beside it is
+        // the same thread-local the tests assert on, so a burst on one thread
+        // is visible without correlating timestamps.
+        //
+        // Deliberately `info` and not `debug`: the count is what an operator
+        // needs when a read is slow, and a level nobody turns on is a line
+        // nobody reads.
+        let caller = std::panic::Location::caller();
+        tracing::info!(
+            repository = %binding.repository_id(),
+            caller = %format_args!("{}:{}", caller.file(), caller.line()),
+            opens_on_this_thread = opens,
+            "opening repository authority, which re-verifies every persisted body"
+        );
         let repository_id = binding.repository_id().clone();
         let workspace_id = binding.workspace_id();
         let (manager, payload_stats) = binding

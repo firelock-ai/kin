@@ -290,6 +290,7 @@ impl LocalRepositoryAuthorityBinding {
     /// so naming a replaced namespace as such costs no second recovery. KinDB
     /// may separately persist a reusable history-validation proof after a full
     /// replay; that does not reload authority or decide whether a record exists.
+    #[track_caller]
     pub fn open_manager(
         &self,
     ) -> std::result::Result<RepositoryAuthorityManager<LocalFileBackend>, kin_db::KinDbError> {
@@ -314,6 +315,7 @@ impl LocalRepositoryAuthorityBinding {
     /// The optional shape remains for callers that already expose KinDB's
     /// payload-receipt type; use KinDB directly when deliberately constructing
     /// an unpersisted repository before its first commit.
+    #[track_caller]
     pub fn open_manager_with_payload_stats(
         &self,
     ) -> std::result::Result<
@@ -329,6 +331,32 @@ impl LocalRepositoryAuthorityBinding {
         )
         .map(|(manager, payload_stats)| (manager, Some(payload_stats)))
     }
+
+    /// Read the repository-authority envelope without materializing the
+    /// history the same bytes carry.
+    ///
+    /// A full open decodes every domain the snapshot holds, and on a converted
+    /// repository that is the repository: psf/requests at 6493 commits writes a
+    /// 1051.5 MiB snapshot whose change map dominates it. A caller that needs
+    /// the envelope and then some bodies by content address does not need any
+    /// of that, and this is the read for it.
+    ///
+    /// `None` means the envelope cannot be answered cheaply and correctly, so
+    /// the caller must open in full. It is never a wrong answer: KinDB returns
+    /// it when no persisted authority exists, when the acknowledged journal
+    /// head is past the snapshot base, or when the snapshot carries no
+    /// envelope.
+    pub fn open_authority_metadata(
+        &self,
+    ) -> std::result::Result<
+        Option<kin_db::RepositoryAuthorityMetadata<LocalFileBackend>>,
+        kin_db::KinDbError,
+    > {
+        kin_db::RepositoryAuthorityMetadata::open(
+            self.repository_id.clone(),
+            Arc::clone(&self.backend),
+        )
+    }
 }
 
 /// Open an already initialized local repository through one coherent recovery.
@@ -338,11 +366,32 @@ impl LocalRepositoryAuthorityBinding {
 /// record when constructing an unpersisted generation-zero repository, so this
 /// boundary uses the payload receipt from the same recovery to retain the
 /// stricter reopen contract without paying for a second load or lock.
+#[track_caller]
 pub fn open_persisted_local_repository_authority<B: StorageBackend + ?Sized + 'static>(
     repository_id: RepositoryId,
     backend: Arc<B>,
 ) -> std::result::Result<(RepositoryAuthorityManager<B>, AuthorityPayloadStats), kin_db::KinDbError>
 {
+    // The funnel, and the reason the attribution lives here rather than only on
+    // kin-cli's wrapper.
+    //
+    // Measured on a converted psf/requests store: one `kin graph status`
+    // performs twelve whole-store authority opens, and instrumenting kin-cli's
+    // `ActiveRepositoryAuthority::open` attributed two of twenty-six across a
+    // run. The other twenty-four never reach that type. Every path into kin-db's
+    // recovery does reach THIS function, so a caller named here is a caller
+    // named for all of them.
+    //
+    // `#[track_caller]` names the call site rather than a backtrace and costs
+    // nothing at runtime. Info rather than debug, for the same reason as the
+    // wrapper's: the count is what an operator needs when a read is slow, and a
+    // level nobody turns on is a line nobody reads.
+    let caller = std::panic::Location::caller();
+    tracing::info!(
+        repository = %repository_id,
+        caller = %format_args!("{}:{}", caller.file(), caller.line()),
+        "opening persisted repository authority, which re-verifies every persisted body"
+    );
     let missing_repository_id = repository_id.clone();
     let (manager, payload_stats) =
         RepositoryAuthorityManager::open_with_payload_stats(repository_id, backend)?;
