@@ -30,7 +30,7 @@ carries all of them the merge refuses and names both decisions. Nothing is
 synthesized, because kin has no textual line merge to build a third body from,
 so a projection is a choice among sides this merge already bound.
 
-Six checks over five repositories, run in order because two of them are
+Seven checks over six repositories, run in order because two of them are
 destructive: they publish the merge the earlier assertions are about. The first
 four grade FIR-2958's precedence rule; the last two grade rc062j finding (2),
 which is the same authority reporting conflicts that are not conflicts.
@@ -54,6 +54,9 @@ which is the same authority reporting conflicts that are not conflicts.
   genuine     the control for `removals`: a real removal, still pointed at by
               the other side, is still reported. Without it a merge that dropped
               every relation row would satisfy `removals` and lose nothing else
+  bodies      rc062j finding (1): a conflict's three sides render as source,
+              every printed side hashed back to its recorded digest, and the
+              listing that did not ask for bodies still carries none
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when one could not
 be read, and 3 when the run could not be set up. `--self-test` exercises every
@@ -89,6 +92,8 @@ TICKET = "FIR-2958"
 # merge authority, graded here rather than in a second suite because a second
 # copy of this scaffolding is only ever wrong in a way that looks like a pass.
 GRANULARITY_TICKET = "FIR-2960"
+# rc062j finding (1), the conflict bodies. Same authority, same suite.
+BODIES_TICKET = "FIR-2960"
 
 print = functools.partial(print, flush=True)
 
@@ -126,6 +131,11 @@ def _gran_module(name):
     return ("from pkg.core import summarize, helper\n\n\n"
             "def use_%s(rows):\n    return summarize(rows) + helper(1)\n" % name).encode()
 
+
+BODY_CORE_BASE = b"def summarize(rows):\n    return len(rows)\n"
+BODY_CORE_OURS = b"def summarize(rows):\n    return OURSMARKER(rows)\n"
+BODY_CORE_THEIRS = b"def summarize(rows):\n    return THEIRSMARKER(rows)\n"
+BODY_FILES = {"pkg/core.py": (BODY_CORE_BASE, BODY_CORE_OURS, BODY_CORE_THEIRS)}
 
 GRAN_FILES = {"pkg/core.py": (GRAN_CORE_BASE, GRAN_CORE_OURS, GRAN_CORE_THEIRS)}
 for _name in ("a", "b", "c"):
@@ -651,6 +661,76 @@ def check_genuine(suite):
     ], ticket=GRANULARITY_TICKET)
 
 
+def grade_show_renders_both_sides(show_text):
+    """rc062j (1). Both branches' source must appear, as a diff against base.
+
+    Keyed on source the fixture wrote rather than on the presence of a hunk
+    header, because a renderer that emitted headers over empty bodies would
+    satisfy a header check and show the reader nothing.
+    """
+    if not isinstance(show_text, str) or not show_text.strip():
+        return (UNREADABLE, "`kin conflicts --show` printed nothing")
+    missing = [marker for marker in ("OURSMARKER", "THEIRSMARKER")
+               if marker not in show_text]
+    if missing:
+        return (FAIL, "the rendering never shows %s" % ", ".join(missing))
+    if "base -> ours" not in show_text or "base -> theirs" not in show_text:
+        return (FAIL, "both sides appear but neither is labelled as a departure from base")
+    return (PASS, "both sides render as a diff against the common ancestor")
+
+
+def grade_every_printed_side_was_verified(show_text):
+    """Every side offered was hashed back to the digest the record holds.
+
+    A side that failed that check is named rather than printed, so the property
+    is that the rendering carries no such line WHILE carrying real source. The
+    two halves are graded together on purpose: a run that printed nothing at all
+    would also carry no refusal line.
+    """
+    if not isinstance(show_text, str) or not show_text.strip():
+        return (UNREADABLE, "`kin conflicts --show` printed nothing")
+    if "OURSMARKER" not in show_text and "THEIRSMARKER" not in show_text:
+        return (UNREADABLE, "nothing was rendered, so nothing was verified")
+    refusals = show_text.count("not shown, because")
+    if refusals:
+        return (FAIL, "%d side(s) failed the digest re-check on a healthy merge" % refusals)
+    return (PASS, "every rendered side hashed back to its recorded digest")
+
+
+def grade_default_listing_carries_no_bodies(json_text):
+    """The control on cost. Reading bodies resolves three graphs and reads a
+    blob per side, so a listing that did it unasked would have changed what
+    every existing caller pays."""
+    if not isinstance(json_text, str) or not json_text.strip():
+        return (UNREADABLE, "the default listing printed nothing")
+    try:
+        payload = json.loads(json_text)
+    except ValueError:
+        return (UNREADABLE, "the default listing did not parse")
+    bodies = payload.get("bodies")
+    if bodies:
+        return (FAIL, "the default listing carried %d body row(s) nobody asked for" % len(bodies))
+    return (PASS, "the default listing carries no bodies")
+
+
+def check_bodies(suite):
+    """rc062j (1). A conflict's three sides, readable.
+
+    Measured before the change on the same shape: all three sides read as 32
+    bytes of digest, the JSON listing carried zero bytes of source, and
+    `kin conflicts` had no flag that would print one.
+    """
+    repo = suite.repo("bodies", BODY_FILES)
+    suite.kin_run(["merge", "feature"], repo)
+    show = suite.kin_run(["conflicts", "--show"], repo)[1]
+    plain = suite.kin_run(["conflicts", "--json"], repo)[1]
+    return _combine("bodies", [
+        ("render", grade_show_renders_both_sides(show)),
+        ("verified", grade_every_printed_side_was_verified(show)),
+        ("default", grade_default_listing_carries_no_bodies(plain)),
+    ], ticket=BODIES_TICKET)
+
+
 def _combine(ident, verdicts, ticket=None):
     """Report every arm, never the first bad one, because knowing which arm
     broke is the whole value of grading several claims in one check.
@@ -676,6 +756,7 @@ CHECKS = [
     ("uniform", check_uniform),
     ("removals", check_removals),
     ("genuine", check_genuine),
+    ("bodies", check_bodies),
 ]
 
 
@@ -894,6 +975,37 @@ def self_test():
            grade_no_false_removals(plain_relation), PASS)
     expect("CONTROL kinds still names that same relation row",
            grade_conflict_kinds(plain_relation, "relation"), FAIL)
+
+    # rc062j (1). Each body grader gets a payload that must pass and one that
+    # must fail, so a grader that answers PASS over anything is caught here.
+    good_show = ("summarize in pkg/core.py (entity 1)\n"
+                 "  base -> ours:\n    -x\n    +OURSMARKER(rows)\n"
+                 "  base -> theirs:\n    -x\n    +THEIRSMARKER(rows)\n")
+    refused_show = good_show + "  ours: not shown, because the value re-read from the graph\n"
+    headers_only = ("summarize in pkg/core.py (entity 1)\n"
+                    "  base -> ours:\n    @@ -1,1 +1,1 @@\n"
+                    "  base -> theirs:\n    @@ -1,1 +1,1 @@\n")
+    expect("render passes a rendering carrying both sides' source",
+           grade_show_renders_both_sides(good_show), PASS)
+    expect("render fails a rendering of hunk headers over empty bodies",
+           grade_show_renders_both_sides(headers_only), FAIL)
+    expect("render cannot read empty output",
+           grade_show_renders_both_sides(""), UNREADABLE)
+    expect("verified passes a rendering with no refused side",
+           grade_every_printed_side_was_verified(good_show), PASS)
+    expect("verified fails a rendering that refused a side on a healthy merge",
+           grade_every_printed_side_was_verified(refused_show), FAIL)
+    # CONTROL: a run that rendered nothing must not read as verified. Without
+    # this, "no refusal line" would pass over silence.
+    expect("CONTROL verified cannot read a rendering that shows no source at all",
+           grade_every_printed_side_was_verified(headers_only), UNREADABLE)
+    expect("default passes a listing with no bodies",
+           grade_default_listing_carries_no_bodies('{"unresolved_count": 3}'), PASS)
+    expect("default fails a listing that carried bodies unasked",
+           grade_default_listing_carries_no_bodies('{"bodies": [{"subject": "entity 1"}]}'),
+           FAIL)
+    expect("default cannot read text that is not json",
+           grade_default_listing_carries_no_bodies("nope"), UNREADABLE)
 
     expect("a relative kin path is absolutized by this suite",
            (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)
