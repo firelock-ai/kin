@@ -66,7 +66,6 @@ pub fn repository_authority_opens_on_this_thread() -> u64 {
 pub struct RequestRepositoryAuthority {
     binding: kin_core::LocalRepositoryAuthorityBinding,
     shared: Option<SharedAuthorityResolver>,
-    envelope: Option<SharedEnvelopeResolver>,
 }
 
 /// A server's promise to produce authority for the publication a request reads
@@ -74,24 +73,12 @@ pub struct RequestRepositoryAuthority {
 pub type SharedAuthorityResolver =
     std::sync::Arc<dyn Fn() -> Result<std::sync::Arc<ActiveRepositoryAuthority>> + Send + Sync>;
 
-/// The same promise for the authority ENVELOPE, which is a different and much
-/// smaller read than the authority itself.
-///
-/// `Ok(None)` means KinDB declined to answer the envelope cheaply for these
-/// bytes and the caller must open in full; it is never a wrong answer.
-pub type SharedEnvelopeResolver =
-    std::sync::Arc<dyn Fn() -> Result<Option<std::sync::Arc<AuthorityEnvelope>>> + Send + Sync>;
-
-/// The repository-authority envelope, opened without the history beside it.
-pub type AuthorityEnvelope = kin_db::RepositoryAuthorityMetadata<kin_db::LocalFileBackend>;
-
 impl RequestRepositoryAuthority {
     /// Authority this command opens for itself.
     pub fn pinned(binding: kin_core::LocalRepositoryAuthorityBinding) -> Self {
         Self {
             binding,
             shared: None,
-            envelope: None,
         }
     }
 
@@ -111,39 +98,6 @@ impl RequestRepositoryAuthority {
         Self {
             binding,
             shared: Some(resolve),
-            envelope: None,
-        }
-    }
-
-    /// Let a server resolve the authority ENVELOPE for this request too.
-    ///
-    /// The envelope carries refs, workspaces and the roots, and reading it does
-    /// not decode the history the same snapshot bytes carry. A server that can
-    /// cache one per publication supplies this so a warm request pays nothing;
-    /// without it, [`Self::open_envelope`] reads through the binding, which is
-    /// correct and costs one parse of the snapshot body with no allocation for
-    /// the domains it skips.
-    ///
-    /// The freshness obligation is exactly [`Self::shared`]'s, for the same
-    /// reason and with the same failure mode.
-    #[must_use]
-    pub fn with_envelope_resolver(mut self, resolve: SharedEnvelopeResolver) -> Self {
-        self.envelope = Some(resolve);
-        self
-    }
-
-    /// The authority envelope to read this command from, when one answers.
-    ///
-    /// `None` is KinDB declining to answer cheaply, and the caller's obligation
-    /// is to fall back to [`Self::open`] rather than to report an absence.
-    pub(crate) fn open_envelope(&self) -> Result<Option<std::sync::Arc<AuthorityEnvelope>>> {
-        match &self.envelope {
-            Some(resolve) => resolve(),
-            None => Ok(self
-                .binding
-                .open_authority_metadata()
-                .context("read repository authority envelope")?
-                .map(std::sync::Arc::new)),
         }
     }
 

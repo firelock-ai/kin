@@ -223,12 +223,6 @@ pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
     query: std::sync::Mutex<Option<HeldQueryAuthority>>,
     command: std::sync::Mutex<Option<HeldCommandAuthority>>,
-    /// The authority ENVELOPE, which is not a fourth wrapper over the same
-    /// read: it is a much smaller read of the same bytes, keyed the same way.
-    /// A reader that needs refs, workspaces or the roots and then some bodies
-    /// by content address takes this, and never decodes the history a converted
-    /// repository's snapshot mostly consists of.
-    envelope: std::sync::Mutex<Option<HeldEnvelopeAuthority>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -261,14 +255,6 @@ struct HeldCommandAuthority {
     /// [`HeldProjectionAuthority::published`] and for the same reason.
     published: LocalPublicationIdentity,
     authority: Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
-}
-
-#[derive(Clone)]
-struct HeldEnvelopeAuthority {
-    /// Read strictly before the envelope it labels was loaded, exactly as for
-    /// [`HeldProjectionAuthority::published`] and for the same reason.
-    published: LocalPublicationIdentity,
-    envelope: Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>,
 }
 
 impl ProjectionAuthorityCache {
@@ -349,32 +335,10 @@ impl ProjectionAuthorityCache {
         });
     }
 
-    fn reuse_envelope(
-        &self,
-        published: &LocalPublicationIdentity,
-    ) -> Option<Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>> {
-        lock_recover(&self.envelope)
-            .as_ref()
-            .filter(|held| &held.published == published)
-            .map(|held| Arc::clone(&held.envelope))
-    }
-
-    fn install_envelope(
-        &self,
-        published: LocalPublicationIdentity,
-        envelope: Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>,
-    ) {
-        *lock_recover(&self.envelope) = Some(HeldEnvelopeAuthority {
-            published,
-            envelope,
-        });
-    }
-
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
         *lock_recover(&self.command) = None;
-        *lock_recover(&self.envelope) = None;
     }
 }
 
@@ -587,75 +551,6 @@ fn command_repository_authority(
         "command repository authority loaded"
     );
     Ok(authority)
-}
-
-/// The repository-authority ENVELOPE for one request, cached per publication.
-///
-/// Every obligation [`command_repository_authority`] discharges, discharged the
-/// same way and in the same order: the pinned namespace is confirmed, the
-/// publication record is read BEFORE the load it labels, the load gate
-/// serializes a burst of cold requests, and the label installed beside the
-/// envelope is the one taken before it.
-///
-/// What differs is what gets loaded. A full open decodes every domain the
-/// snapshot carries and re-verifies every persisted body; on a converted
-/// repository that is the whole store, and a cold `graph status` paid it to
-/// print counters. The envelope read walks the same bytes, verifies the same
-/// frame checksum, and allocates nothing for the history it skips.
-///
-/// `Ok(None)` is KinDB declining to answer the envelope cheaply for these
-/// bytes. The caller falls back to the full open, so this is a cost decision
-/// and never a correctness one. It does not count into
-/// [`ProjectionAuthorityCache::loads`], because that counter means whole-store
-/// opens and an envelope read is not one.
-fn command_repository_envelope(
-    state: &DaemonState,
-) -> Result<
-    Option<Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>>,
-    (StatusCode, String),
-> {
-    let backend = state.local_repository_backend().ok_or_else(|| {
-        repository_authority_error("local daemon is missing its startup storage capability")
-    })?;
-    let binding = state
-        .local_repository_authority_binding()
-        .map_err(repository_authority_error)?;
-    let repository_id = binding.repository_id().clone();
-
-    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
-        state.projection_authority.invalidate();
-        return Err(error);
-    }
-
-    let published = read_local_publication_identity(&backend, &repository_id)?;
-    if let Some(envelope) = state.projection_authority.reuse_envelope(&published) {
-        return Ok(Some(envelope));
-    }
-
-    let _load = lock_recover(&state.projection_authority.load_gate);
-    // Re-read under the gate, for the reason the full open re-reads: the
-    // publication may have moved while this request waited, and the label
-    // installed below must be the one taken before the load it describes.
-    let published = read_local_publication_identity(&backend, &repository_id)?;
-    if let Some(envelope) = state.projection_authority.reuse_envelope(&published) {
-        return Ok(Some(envelope));
-    }
-    let Some(envelope) = binding
-        .open_authority_metadata()
-        .map_err(repository_authority_error)?
-    else {
-        return Ok(None);
-    };
-    let envelope = Arc::new(envelope);
-    state
-        .projection_authority
-        .install_envelope(published, Arc::clone(&envelope));
-    tracing::debug!(
-        repository = %repository_id,
-        generation = envelope.generation(),
-        "command repository authority envelope loaded"
-    );
-    Ok(Some(envelope))
 }
 
 /// Hand a command helper an authority this daemon already resolved.
@@ -4719,7 +4614,6 @@ async fn command_graph(
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
     let resolver_state = Arc::clone(&state);
-    let envelope_state = Arc::clone(&state);
     let repository_authority =
         kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
             binding,
@@ -4727,15 +4621,7 @@ async fn command_graph(
                 command_repository_authority(&resolver_state)
                     .map_err(|(_, message)| anyhow::anyhow!(message))
             }),
-        )
-        // `graph status` reads one workspace tree and then bodies by content
-        // address, and neither needs the history the same snapshot carries.
-        // Without this it resolves the envelope through the binding on every
-        // request; with it, a warm request pays nothing.
-        .with_envelope_resolver(Arc::new(move || {
-            command_repository_envelope(&envelope_state)
-                .map_err(|(_, message)| anyhow::anyhow!(message))
-        }));
+        );
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     // Read here rather than inside the renderer, for the reason the freshness
     // marker is read in the CLI: the record is a property of the store on disk,
