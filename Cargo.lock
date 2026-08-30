@@ -3289,9 +3289,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.76"
+version = "0.7.77"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "03dd5d93e70900752bf8577f1b38a3354e2d4588d2c9de63a176fdfd59495817"
+checksum = "bb78d778724f05b4409c43c48c7a47abdb653c048435fe416a974293d3e98e06"
 dependencies = [
  "bincode",
  "bstr",
@@ -3712,9 +3712,9 @@ dependencies = [
 
 [[package]]
 name = "kin-search"
-version = "0.1.5"
+version = "0.1.6"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "90b1943f2fa86bf338b63f662229f2fc009dff069a5851b928db1f7c0ebab5c1"
+checksum = "e84e12c18955d50c27efb5f36aaf4b64b076022f87a7c4760d5de91691a4bd16"
 dependencies = [
  "bincode",
  "parking_lot",

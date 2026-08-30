@@ -38434,25 +38434,29 @@ mod tests {
         let result: kin_cli::commands::search::DaemonSearchResponse =
             serde_json::from_slice(&body).unwrap();
 
-        // FIR-2918. This assertion used to read `records.is_empty()`, and it
-        // held for the wrong reason: the fixture's lexical index was never
-        // committed, so every query returned nothing. Now that the query path
-        // brings the index current, the disjunctive fallback answers with the
-        // index's NEAREST document rather than a match, measured here as
-        // `definitelyNoSuchSymbol` retrieving `present` at 0.45 because `def`
-        // occurs in `def present()` and is a substring of `definitely`, over a
-        // corpus holding no token of the query.
+        // This assertion has been right, then wrong, then right again, and the
+        // reason matters more than the line.
         //
-        // So the property this test is about is unchanged and is now stated
-        // directly: nothing matched BY NAME. `text_fallback` is the product's
-        // own name for that, and it is true only when the answer is non-empty
-        // and every row is a fallback row. The qualifier assertions below are
-        // untouched, and they are what this test exists for; making them survive
-        // a labelled-fallback answer is the fix this change carries.
+        // Originally `records.is_empty()`, and it held for the WRONG reason: the
+        // fixture's lexical index was never committed, so every query returned
+        // nothing (FIR-2918). Bringing the index current at query time made the
+        // disjunctive fallback answer with the index's nearest document, and
+        // this assertion moved to `text_fallback` to state the property it
+        // always meant, that nothing matched BY NAME.
+        //
+        // kin-search 0.1.6 then removed the thing that produced that row. It
+        // refuses a reverse substring match carrying too little of the query, so
+        // `definitelyNoSuchSymbol` no longer reaches `def present()` through
+        // `def` sitting inside `definitely` (FIR-2968). Measured on this pin:
+        // `text_fallback: false, total_matches: 0, records: []`. So the original
+        // assertion is correct again, and now for the reason it always claimed:
+        // the query matches nothing because the index holds nothing for it.
+        //
+        // The `|| text_fallback` half of the absence gate is no longer exercised
+        // here, which is why the sibling below exists.
         assert!(
-            result.text_fallback,
-            "nothing may match this query by name; an answer with a name match would make the \
-             qualifier assertions below vacuous: {result:?}"
+            result.records.is_empty(),
+            "a query whose terms the index does not hold must match nothing: {result:?}"
         );
         let qualifier = result.absence_qualifier.join(" ");
         assert!(
@@ -38470,6 +38474,75 @@ mod tests {
         assert!(
             !qualifier.contains("cross-file"),
             "a scope-gated surface must not claim an edge class: {qualifier:?}"
+        );
+    }
+
+    /// An all-fallback answer is an absence and must qualify like one.
+    ///
+    /// This exists because the pin to kin-search 0.1.6 took the coverage away
+    /// from the test above. That test used to reach the `|| text_fallback` half
+    /// of the absence gate through a WRONG answer, a nearest document returned
+    /// for a query the index held nothing for; 0.1.6 refuses that, so it now
+    /// reaches the `records.is_empty()` half instead and the other half would
+    /// ship unguarded.
+    ///
+    /// So this drives the same gate through a RIGHT answer. `socket` is not any
+    /// entity's name here, so nothing matches by name, but it is a real token in
+    /// one doc summary, so the text pass answers with a labelled fallback row.
+    /// That is a legitimate all-fallback answer, it is still an absence as far
+    /// as the caller's query is concerned, and the degradation has to reach the
+    /// verdict rather than being silenced by the presence of a row.
+    #[tokio::test]
+    async fn an_all_fallback_search_still_carries_the_degradation() {
+        let state = test_state();
+        let mut described = test_entity("handler", "src/net.py");
+        described.doc_summary =
+            Some("Opens a socket and speaks to a server over the network.".to_string());
+        state.graph.upsert_entity(&described).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "query": "socket" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::search::DaemonSearchResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        // The fixture has to actually produce the state under test, or the
+        // assertion below is about a case that never happened.
+        assert!(
+            result.text_fallback,
+            "this fixture must produce an ALL-FALLBACK answer, or it is not exercising the \
+             half of the absence gate it exists for: {result:?}"
+        );
+        assert!(
+            !result.records.is_empty(),
+            "an all-fallback answer is non-empty by definition: {result:?}"
+        );
+        let qualifier = result.absence_qualifier.join(" ");
+        assert!(
+            qualifier.contains("Kin cannot rule out"),
+            "a row that matched nothing by name must not silence the degradation: {qualifier:?}"
+        );
+        assert!(
+            qualifier.contains("embed_worker_failed"),
+            "the line names the signal the verdict disclosed: {qualifier:?}"
         );
     }
 
