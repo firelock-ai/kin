@@ -431,9 +431,13 @@ fn conflicting_merge_is_parked_as_a_durable_transaction_and_names_what_conflicte
     let generation_before = authority_generation(&layout);
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
-    assert!(
-        merged.status.success(),
-        "a conflicting merge is parked, not refused: stderr={}",
+    // The code, not merely success: a parked merge and a published one shared
+    // an exit status until this was fixed, so `success()` could not tell them
+    // apart and this assertion could not see the case it names.
+    assert_eq!(
+        merged.status.code(),
+        Some(kin_cli::commands::merge::EXIT_MERGE_CONFLICTED),
+        "a conflicting merge is parked, not refused and not published: stderr={}",
         String::from_utf8_lossy(&merged.stderr)
     );
     let stdout = String::from_utf8_lossy(&merged.stdout);
@@ -515,9 +519,13 @@ fn merge_of_disjoint_edits_to_one_file_is_parked_atomically() {
     let generation_before = authority_generation(&layout);
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
-    assert!(
-        merged.status.success(),
-        "disjoint edits to one file are parked, not refused: stderr={}",
+    // The code, not merely success: a parked merge and a published one shared
+    // an exit status until this was fixed, so `success()` could not tell them
+    // apart and this assertion could not see the case it names.
+    assert_eq!(
+        merged.status.code(),
+        Some(kin_cli::commands::merge::EXIT_MERGE_CONFLICTED),
+        "disjoint edits to one file are parked, not refused and not published: stderr={}",
         String::from_utf8_lossy(&merged.stderr)
     );
     let stdout = String::from_utf8_lossy(&merged.stdout);
@@ -573,9 +581,13 @@ fn merge_of_a_move_against_an_edit_is_parked_atomically() {
     let generation_before = authority_generation(&layout);
 
     let merged = run_kin(&runtime, &repo, &["merge", "feature"]);
-    assert!(
-        merged.status.success(),
-        "a move against an edit is parked, not refused: stderr={}",
+    // The code, not merely success: a parked merge and a published one were the
+    // same exit status until this was fixed, so `success()` could not tell them
+    // apart and this assertion could not see the case it names.
+    assert_eq!(
+        merged.status.code(),
+        Some(kin_cli::commands::merge::EXIT_MERGE_CONFLICTED),
+        "a move against an edit is parked, not refused and not published: stderr={}",
         String::from_utf8_lossy(&merged.stderr)
     );
     let stdout = String::from_utf8_lossy(&merged.stdout);
