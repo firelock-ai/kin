@@ -4006,8 +4006,9 @@ fn embedding_model_check_from(
         (None, false, _) => (
             HealthStatus::Pending,
             format!(
-                "{model} is not in the cache{location}; `kin init` starts the first embed pass, \
-                 which fetches {download} from {host} before it records anything"
+                "{model} is not in the cache{location}; `kin init` starts the first embed \
+                 pass, which fetches {download} from {host}, and it reports whether that \
+                 pass ran or left the fetch for `kin embed`"
             ),
         ),
     };
@@ -10943,6 +10944,15 @@ mod tests {
             "the detail names what starts the fetch: {}",
             check.detail
         );
+        // FIR-2957: naming `kin init` is right and promising the fetch lands
+        // inside it is not. `kin init` records first and may leave the fetch
+        // for `kin embed`, and its own notice says which happened, so this row
+        // may not tell the reader to expect the download before init returns.
+        assert!(
+            !check.detail.contains("before it records anything"),
+            "the row must not promise the fetch completes inside init: {}",
+            check.detail
+        );
         assert!(
             !check.detail.contains("a later embed pass fetches"),
             "the check must be able to fail: {}",
@@ -10957,6 +10967,58 @@ mod tests {
             check.manual_fix
         );
         assert!(!blocks_readiness(&check));
+    }
+
+    /// The two commands that describe one fetch must not describe it
+    /// differently.
+    ///
+    /// This is a join, not two endpoint checks. `kin doctor` and `kin init`
+    /// each own a sentence about the same embedding-model state, they were
+    /// written at different times, and on the v0.6.2 candidate they disagreed:
+    /// init had been corrected to say it records without fetching, and
+    /// doctor still told the reader the fetch happens before init records
+    /// anything. Two tests asserting two hardcoded strings could not have seen
+    /// that, because each was right about its own half. So this one reads what
+    /// init actually produces for a state and requires doctor's row for the
+    /// same state to be consistent with it, and the one literal both sides are
+    /// checked against is written here once.
+    #[test]
+    #[serial]
+    fn doctor_and_init_agree_about_the_model_fetch() {
+        let _endpoint = EnvVarGuard::unset("HF_ENDPOINT");
+        let absent = absent_model();
+
+        // The state under test: absent when the command opened and absent when
+        // it closed, which is what a cold container with no egress budget gets.
+        let init_line = crate::commands::init::embedding_model_notice(&absent, false, None);
+        let doctor = embedding_model_check_from(&absent, Some(true));
+
+        assert!(
+            init_line.contains("did not fetch it"),
+            "the fixture must be the state where init records without fetching, \
+             or this test is grading the wrong pair: {init_line}"
+        );
+
+        // Read the fallback out of init's own sentence rather than trusting a
+        // second copy of it, then require doctor to name the same one.
+        const FALLBACK: &str = "`kin embed`";
+        assert!(
+            init_line.contains(FALLBACK),
+            "init names the command that does the fetch: {init_line}"
+        );
+        assert!(
+            doctor.detail.contains(FALLBACK),
+            "doctor names the same fallback init does, so a reader who follows \
+             either command lands in the same place: {}",
+            doctor.detail
+        );
+
+        // And doctor may not contradict init about when the download happens.
+        assert!(
+            !doctor.detail.contains("before it records anything"),
+            "doctor promises a fetch init's own line says may not have happened: {}",
+            doctor.detail
+        );
     }
 
     /// A machine without the weights that cannot reach the host fails loud and
