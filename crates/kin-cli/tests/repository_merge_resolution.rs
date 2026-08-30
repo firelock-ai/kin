@@ -51,6 +51,38 @@ fn run_kin(
         .expect("run kin")
 }
 
+/// `kin`, with the LSP enrichment sweep off for the daemon this call spawns.
+///
+/// The Python fixture's `kin init` fails on a loaded host, and the product's own
+/// record names both the cause and the remedy: "The daemon for this store was
+/// killed ... start a daemon yourself with the enrichment sweep off
+/// (`KIN_DAEMON_DISABLE_LSP=1 kin graph status`)". `kin init` then exits
+/// `EXIT_ENRICHMENT_UNATTESTED`, which is 7, so every assertion after it reads
+/// as a merge failure. Measured on this suite: six of six runs of the Python
+/// fixture hit it while the Rust fixtures hit it zero times, because Rust has no
+/// language server installed here to sweep with.
+///
+/// Turning the sweep off is not papering over that. This test asserts entity
+/// values, artifact bytes and tree deltas, and enrichment contributes none of
+/// them: it adds cross-file reference and import EDGES, which nothing here
+/// reads. A daemon captures the lever at process start from the command that
+/// spawns it, so it goes on the call that starts the daemon.
+fn run_kin_without_enrichment(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .current_dir(repo)
+        .output()
+        .expect("run kin")
+}
+
 fn ok(output: &std::process::Output, what: &str) -> String {
     assert!(
         output.status.success(),
@@ -141,6 +173,24 @@ fn change_parents(
         .expect("read the change store")
         .expect("the published merge change exists in history");
     found.parents
+}
+
+/// How many tree deltas a published change carries against its first parent.
+///
+/// Zero is the exact signature the rc062a stranger recorded: `tree=0` means the
+/// merged tree is byte-identical to the target branch, so the source branch
+/// contributed nothing while every conflict read as settled.
+fn change_tree_delta_count(layout: &kin_core::KinLayout, change: &SemanticChangeId) -> usize {
+    let manager = open_authority(layout);
+    let lease = manager.read_authority();
+    let graph = kin_db::InMemoryGraph::from_snapshot(lease.snapshot().clone())
+        .expect("prepare graph-owned history");
+    drop(lease);
+    kin_db::ChangeStore::get_change(&graph, change)
+        .expect("read the change store")
+        .expect("the published merge change exists in history")
+        .tree_deltas
+        .len()
 }
 
 fn conflicts_report(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
@@ -982,6 +1032,116 @@ fn a_bulk_artifact_settle_does_not_override_a_named_entity_settle() {
         "the span graph truth records for `mate`, {start}..{end}, must select `mate` inside the \
          {} bytes kin published",
         published.len()
+    );
+}
+
+/// A Python module, so the file's own module entity is in the conflict set.
+///
+/// This is the shape the rc062a stranger actually hit and the one a Rust fixture
+/// does NOT produce. A `.py` file yields a Module entity spanning the whole
+/// file, whose behaviour hash is the whole file's text, so a bulk settle records
+/// a decision about the WHOLE FILE beside the decision about one function inside
+/// it. `alpha` is edited to a different length on each branch so `beta`'s span
+/// moves on each branch too, and the module entity conflicts on all three sides.
+fn container_settle_repository(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    run_git(&repo, &["init", "--initial-branch=main"]);
+    run_git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Kin"]);
+    fs::create_dir_all(repo.join("ledger")).expect("create package directory");
+    fs::write(
+        repo.join("ledger/report.py"),
+        b"ENTRIES = [1, 2]\n\n\ndef alpha(rows):\n    return len(rows)\n\n\ndef beta(x):\n    return x + 1\n",
+    )
+    .expect("write base source");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "base"]);
+
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(
+        repo.join("ledger/report.py"),
+        b"ENTRIES = [1, 2]\n\n\ndef alpha(rows):\n    return len(rows) - 7\n\n\ndef beta(x):\n    return x + 1\n",
+    )
+    .expect("edit source on feature");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature work"]);
+
+    run_git(&repo, &["switch", "main"]);
+    fs::write(
+        repo.join("ledger/report.py"),
+        b"ENTRIES = [1, 2]\n\n\ndef alpha(rows):\n    return len(rows) + 1000000\n\n\ndef beta(x):\n    return x + 1\n",
+    )
+    .expect("edit source on main");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main work"]);
+    repo
+}
+
+/// A settlement naming a CONTAINER must not override one naming something
+/// inside it, which is the same precedence rule one level down from the artifact.
+///
+/// The file's module entity spans the whole file, so `--all-ours` records a
+/// decision about the whole file beside the `--theirs` on one function inside
+/// it. Judged as a peer of that function, no side carries both and the merge
+/// refuses, which is the wrong answer: this is exactly the case the founder's
+/// ruling says must project. The first version of the rule refused it, and its
+/// own refusal named the module entity as the reason.
+///
+/// A Rust fixture cannot see this. `src/lib.rs` produces no conflicting module
+/// entity, so the container half of the rule survived every mutation of it until
+/// this test existed. That is what the falsification grid found: M5, which
+/// disables the container split, was green all the way across.
+#[test]
+fn a_container_settle_does_not_override_a_settle_inside_it() {
+    let root = tempdir().expect("temp root");
+    let repo = container_settle_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // This one call starts the daemon, so it is where the lever belongs.
+    let init = run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]);
+    ok(&init, "kin init");
+    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    let parked = conflicts_report(&runtime, &repo);
+    let alpha = entity_conflict(&parked, "alpha");
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--theirs", &alpha]),
+        "settle the function to the source branch",
+    );
+    // Settles beta, ENTRIES, the module entity for the whole file, and the
+    // artifact, all to the active branch.
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--all-ours"]),
+        "settle the rest to the active branch, including the module entity",
+    );
+    // The refusal this test exists for happens here: a build that treats the
+    // module entity as a peer of the function inside it cannot publish at all.
+    let published = ok(
+        &run_kin(&runtime, &repo, &["resolve", "--continue"]),
+        "kin resolve --continue",
+    );
+
+    assert_eq!(
+        fs::read(repo.join("ledger/report.py")).expect("the merged source is on disk"),
+        b"ENTRIES = [1, 2]\n\n\ndef alpha(rows):\n    return len(rows) - 7\n\n\ndef beta(x):\n    return x + 1\n",
+        "the function settled --theirs decides the bytes, and the module settled --ours follows it"
+    );
+    // And the merge says so, which is the half that makes it not silent. A build
+    // that projected correctly and said nothing would pass the assertion above.
+    assert!(
+        published.contains("Projected") && published.contains("container"),
+        "the merge names the projection and why the bulk settlement followed it: {published}"
+    );
+    // The source branch contributed bytes, which an empty tree delta would deny.
+    let merge_change = branch_change(&layout, "main");
+    assert_ne!(
+        change_tree_delta_count(&layout, &merge_change),
+        0,
+        "the published merge carries the bytes the entity decision chose"
     );
 }
 
