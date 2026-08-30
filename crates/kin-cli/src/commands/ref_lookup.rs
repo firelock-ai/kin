@@ -2,11 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{anyhow, bail, Result};
-use kin_model::{
-    Entity, EntityFilter, EntityId, EntityRevision, GraphStore, Hash256, SemanticChangeId,
-};
-
-use super::repository_authority::ActiveRepositoryAuthority;
+use kin_model::{Entity, EntityFilter, EntityId, EntityRevision, GraphStore, SemanticChangeId};
 
 /// A reference did not resolve through repository-v6 authority.
 #[derive(Debug)]
@@ -186,14 +182,13 @@ where
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
     let reference = reference.unwrap_or("HEAD");
-    let authority = ActiveRepositoryAuthority::open(binding).map_err(|error| {
-        ref_error(
-            reference,
-            format!("this repository's authority could not be opened: {error:#}"),
-        )
-    })?;
-    let lease = authority.manager().read_authority();
-    let resolved = super::ref_grammar::resolve(&lease, graph, &authority.workspace_id, reference)
+    // Deferred rather than opened here. An explicit `kin:<id>` or `change:<id>`
+    // is graph-owned truth and resolves without repository authority at all;
+    // opening it eagerly turned that into a hard requirement and broke
+    // `explicit_semantic_change_and_parent_hops_need_no_file_or_git_fallback`,
+    // which is pinning exactly the right thing.
+    let authority = super::ref_grammar::Authority::deferred(binding);
+    let resolved = super::ref_grammar::resolve(&authority, graph, reference)
         .map_err(|error| ref_error(reference, format!("{error:#}")))?;
 
     if graph
@@ -366,7 +361,7 @@ mod tests {
     use std::sync::Arc;
 
     use kin_db::LocalFileBackend;
-    use kin_model::{AuthorId, ChangeOrigin, ChangeStore, SemanticChange, Timestamp};
+    use kin_model::{AuthorId, ChangeOrigin, ChangeStore, Hash256, SemanticChange, Timestamp};
 
     /// Build a change whose declared identity matches its immutable payload.
     ///

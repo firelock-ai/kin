@@ -515,7 +515,8 @@ fn resolve_endpoint(
         _ => {}
     }
 
-    let resolved = super::ref_grammar::resolve(lease, history, &workspace.workspace_id, selector)?;
+    let authority = super::ref_grammar::Authority::held(lease, &workspace.workspace_id);
+    let resolved = super::ref_grammar::resolve(&authority, history, selector)?;
     let source = match resolved.kind {
         super::ref_grammar::SelectorKind::Head => DiffEndpointSource::Head,
         super::ref_grammar::SelectorKind::Ref => DiffEndpointSource::Ref,

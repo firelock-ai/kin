@@ -52,11 +52,13 @@ by the early ones.
   refusal_names_it  a refusal quotes the selector the user typed. A shared
                grammar that refused with a generic sentence would leave an
                operator no way to tell which of two endpoints was the bad one
-  ambiguity    a prefix short enough to match more than one change is refused as
-               ambiguous rather than resolved to whichever came first. Reported
-               UNREADABLE, not FAIL, when the fixture's history happens to
-               produce no colliding prefix, because a check that grades an
-               absence it did not construct grades nothing
+  short_prefix a four-character prefix off a real change id resolves when it is
+               unique and is refused, naming itself, when it is not. Both arms
+               are graded every run, because which one applies is a property of
+               the fixture's own ids. An ambiguity-only check would have read
+               UNREADABLE four runs in five, and gate.py fails an unallowed
+               UNREADABLE, so it would have been red for a reason that has
+               nothing to do with the product
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when none failed
 but one could not be read, and 3 when the run could not be set up. `--self-test`
@@ -90,11 +92,21 @@ TRACKED_MODULE = "ledger.py"
 # Three bodies, each adding one declaration, so the fixture has three changes and
 # `biggest` has a history to blame. Declarations are added rather than only
 # edited so `kin history biggest` has rows to print ids from.
+# `biggest` is present in every commit on purpose. The parity check uses
+# `kin blame --ref <form>` as its reference set, and blame has to find the entity
+# at that ref as well as resolve the ref. An entity absent from an earlier commit
+# would make blame refuse for a reason that is nothing to do with the grammar,
+# and the grader would read that as a form blame refuses and then fail diff for
+# accepting it. With the entity everywhere, only the ref can be the discriminator.
 MODULE_ONE = '''"""A tiny expense ledger."""
 
 
 def parse_line(line):
     return line.strip().split(",")
+
+
+def biggest(rows):
+    return rows[0]
 '''
 
 MODULE_TWO = '''"""A tiny expense ledger."""
@@ -294,29 +306,41 @@ def grade_refusal_names_the_selector(selector, text):
     )
 
 
-def grade_ambiguous_prefix_is_refused(prefix, text, collisions):
-    """A prefix matching more than one change is refused, not silently picked.
+def grade_short_prefix(prefix, text, matches):
+    """A short prefix resolves when it is unique and is refused when it is not.
 
-    UNREADABLE rather than FAIL when this fixture's history produced no
-    colliding prefix. A check that grades an absence it did not construct grades
-    nothing, and three short changes rarely collide even at four hex characters.
+    Both arms are graded in every run, because which one applies is a property
+    of the fixture's own change ids and not something the suite gets to choose.
+    Written as one grader rather than as an ambiguity check with an UNREADABLE
+    escape: three changes collide on four hex characters about one run in five,
+    so an ambiguity-only check would have spent four runs in five reporting that
+    it could not be read, and `gate.py` fails an UNREADABLE that carries no
+    allowance. A check that usually cannot answer is a check nobody trusts.
     """
-    if collisions < 2:
+    if matches < 1:
         return UNREADABLE, (
-            "no prefix in this fixture matches two changes (%d candidate(s) for %r), so "
-            "the ambiguous case was never reached" % (collisions, prefix)
+            "no change id in this fixture begins with %r, so the fixture never produced "
+            "the case this grades" % prefix
+        )
+    if matches == 1:
+        if diff_carries_content(text):
+            return PASS, "the unique %d-character prefix %r resolves" % (len(prefix), prefix)
+        return FAIL, (
+            "prefix %r names exactly one change and kin diff will not resolve it: %s"
+            % (prefix, " ".join((text or "").split())[:220])
         )
     if diff_carries_content(text):
         return FAIL, (
             "prefix %r matches %d changes and kin diff resolved it anyway, so it picked "
-            "one without saying which" % (prefix, collisions)
+            "one without saying which" % (prefix, matches)
         )
     if prefix not in (text or ""):
         return FAIL, (
-            "kin diff refused ambiguous prefix %r without naming it: %s"
-            % (prefix, " ".join((text or "").split())[:220])
+            "kin diff refused ambiguous prefix %r without naming it, so an operator cannot "
+            "tell which endpoint to lengthen: %s" % (prefix, " ".join((text or "").split())[:220])
         )
-    return PASS, "ambiguous prefix %r (%d changes) is refused and named" % (prefix, collisions)
+    return PASS, "ambiguous prefix %r (%d changes) is refused and named" % (prefix, matches)
+
 
 
 HEX12 = re.compile(r"\b[0-9a-f]{12}\b")
@@ -402,14 +426,22 @@ class Suite(object):
         return self._printed_id
 
     def changes(self):
-        """Every full change id this fixture's log holds, newest first."""
+        """Every full change id this fixture holds, newest first.
+
+        Read from `kin log` AND `kin blame`, because a parse that keys on one
+        surface printing full ids is a check that cannot fail the day that
+        surface starts abbreviating the way `kin history` already does. blame.rs
+        prints `change.id` unabbreviated, so it is the backstop; the union is
+        deduplicated and an empty one is reported rather than proceeded on.
+        """
         if self._changes is not None:
             return self._changes
-        _, text = self.answer(["log", "-n", "20"])
         seen = []
-        for value in HEX64.findall(text):
-            if value not in seen:
-                seen.append(value)
+        for args in (["log", "-n", "20"], ["blame", "biggest"]):
+            _, text = self.answer(args)
+            for value in HEX64.findall(text):
+                if value not in seen:
+                    seen.append(value)
         self._changes = seen
         return self._changes
 
@@ -483,26 +515,15 @@ def check_refusal_names_it(suite):
     return Result("refusal_names_it", status, "%s %s" % (TICKET, detail))
 
 
-def check_ambiguity(suite):
+def check_short_prefix(suite):
     changes = suite.changes()
-    prefix, collisions = "", 0
-    # The shortest prefix this fixture's own ids collide on, if any. Derived from
-    # the fixture rather than assumed, because three changes usually do not
-    # collide and asserting they do would grade a coincidence.
-    for width in range(1, 8):
-        buckets = {}
-        for value in changes:
-            buckets.setdefault(value[:width], []).append(value)
-        clashing = [(key, group) for key, group in buckets.items() if len(group) > 1]
-        if clashing:
-            prefix, group = clashing[0]
-            collisions = len(group)
-            break
+    prefix = changes[0][:4] if changes else ""
+    matches = sum(1 for value in changes if value.startswith(prefix)) if prefix else 0
     text = ""
-    if collisions >= 2:
+    if prefix:
         _, text = suite.answer(["diff", prefix, "HEAD"])
-    status, detail = grade_ambiguous_prefix_is_refused(prefix, text, collisions)
-    return Result("ambiguity", status, "%s %s" % (TICKET, detail))
+    status, detail = grade_short_prefix(prefix, text, matches)
+    return Result("short_prefix", status, "%s %s" % (TICKET, detail))
 
 
 CHECKS = (
@@ -510,7 +531,7 @@ CHECKS = (
     ("relative", check_relative),
     ("parity", check_parity),
     ("refusal_names_it", check_refusal_names_it),
-    ("ambiguity", check_ambiguity),
+    ("short_prefix", check_short_prefix),
 )
 
 
@@ -686,17 +707,19 @@ def self_test():
     expect("refusal/content-is-unreadable",
            grade_refusal_names_the_selector("1971f659d7aa", DIFF_CONTENT_AFTER), UNREADABLE)
 
-    # ambiguity
-    expect("ambiguity/no-collision-is-unreadable",
-           grade_ambiguous_prefix_is_refused("abcd", "", 1), UNREADABLE)
-    expect("ambiguity/AFTER-refuses-and-names",
-           grade_ambiguous_prefix_is_refused(
-               "abcd", "Error: 'abcd' matches 2 changes; use more characters\n", 2), PASS)
-    expect("ambiguity/CONTROL-silently-resolved-fails",
-           grade_ambiguous_prefix_is_refused("abcd", DIFF_CONTENT_AFTER, 2), FAIL)
-    expect("ambiguity/CONTROL-unnamed-refusal-fails",
-           grade_ambiguous_prefix_is_refused(
-               "abcd", "Error: that prefix matches more than one change\n", 2), FAIL)
+    # short_prefix, both arms, because which one applies is the fixture's choice
+    expect("short_prefix/unique-resolves", grade_short_prefix("abcd", DIFF_CONTENT_AFTER, 1), PASS)
+    expect("short_prefix/BEFORE-unique-refused",
+           grade_short_prefix("abcd", REFUSAL_BEFORE, 1), FAIL)
+    expect("short_prefix/ambiguous-refused-and-named",
+           grade_short_prefix("abcd", "Error: 'abcd' is ambiguous: 2 changes begin with it\n", 2),
+           PASS)
+    expect("short_prefix/CONTROL-ambiguous-silently-resolved-fails",
+           grade_short_prefix("abcd", DIFF_CONTENT_AFTER, 2), FAIL)
+    expect("short_prefix/CONTROL-ambiguous-unnamed-refusal-fails",
+           grade_short_prefix("abcd", "Error: that prefix matches more than one change\n", 2),
+           FAIL)
+    expect("short_prefix/no-match-is-unreadable", grade_short_prefix("abcd", "", 0), UNREADABLE)
 
     gate_ran, gate_broken = check_the_gate_reads_this_suites_report()
     ran += gate_ran
@@ -707,7 +730,7 @@ def self_test():
         return 1
     # A self-test that graded nothing is a failure, not a pass. The floor is the
     # count of expect() calls above, so deleting one has to be deliberate.
-    if ran < 22:
+    if ran < 24:
         print("SELFTEST %s BROKEN only %d case(s) ran; the self-test lost coverage"
               % (TICKET, ran))
         return 1

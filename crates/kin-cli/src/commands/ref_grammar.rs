@@ -60,6 +60,94 @@ const AMBIGUITY_PREVIEW: usize = 4;
 pub(crate) const UNRESOLVABLE: &str =
     "is not a ref, a semantic change or its unique prefix, an imported Git object, or HEAD";
 
+/// Repository authority, opened only if an arm of the grammar asks for it.
+///
+/// The two callers arrive differently and the difference is load-bearing.
+/// `kin diff` already holds an open lease, so re-opening would be waste. `kin
+/// blame --ref` holds only a binding, and `explicit_semantic_change_and_parent_
+/// hops_need_no_file_or_git_fallback` pins the property that a `kin:<id>` or
+/// `change:<id>` selector resolves from the graph alone: an explicit semantic
+/// change is graph-owned truth and reaching for the authority envelope to
+/// confirm it would be a file-first fallback on a path that does not need one.
+///
+/// Opening eagerly here is what broke that test, and the test was right.
+pub(crate) enum Authority<'a> {
+    Held {
+        lease: &'a kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+        workspace_id: &'a WorkspaceId,
+    },
+    Deferred {
+        binding: &'a kin_core::LocalRepositoryAuthorityBinding,
+        opened: std::cell::OnceCell<OpenedAuthority>,
+    },
+}
+
+/// An authority this module opened itself, kept alive beside its lease.
+pub(crate) struct OpenedAuthority {
+    lease: kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+    workspace_id: WorkspaceId,
+    // Held so the manager outlives the lease taken from it, rather than relying
+    // on the lease's Arc alone.
+    _authority: super::repository_authority::ActiveRepositoryAuthority,
+}
+
+impl<'a> Authority<'a> {
+    pub(crate) fn held(
+        lease: &'a kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+        workspace_id: &'a WorkspaceId,
+    ) -> Self {
+        Self::Held {
+            lease,
+            workspace_id,
+        }
+    }
+
+    pub(crate) fn deferred(binding: &'a kin_core::LocalRepositoryAuthorityBinding) -> Self {
+        Self::Deferred {
+            binding,
+            opened: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn parts(
+        &self,
+        original: &str,
+    ) -> Result<(
+        &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+        &WorkspaceId,
+    )> {
+        match self {
+            Self::Held {
+                lease,
+                workspace_id,
+            } => Ok((lease, workspace_id)),
+            Self::Deferred { binding, opened } => {
+                if opened.get().is_none() {
+                    let authority =
+                        super::repository_authority::ActiveRepositoryAuthority::open(binding)
+                            .map_err(|error| {
+                                ref_error(
+                            original,
+                            format!("this repository's authority could not be opened: {error:#}"),
+                        )
+                            })?;
+                    let lease = authority.manager().read_authority();
+                    let workspace_id = authority.workspace_id.clone();
+                    let _ = opened.set(OpenedAuthority {
+                        lease,
+                        workspace_id,
+                        _authority: authority,
+                    });
+                }
+                let held = opened
+                    .get()
+                    .expect("repository authority was just placed in the cell");
+                Ok((&held.lease, &held.workspace_id))
+            }
+        }
+    }
+}
+
 /// Which arm of the grammar answered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SelectorKind {
@@ -369,12 +457,7 @@ where
 /// because a branch is a thing a person named on purpose. The prefix arm is last
 /// for the same reason in reverse: it is the only arm that can be ambiguous, so
 /// nothing that can be resolved exactly should ever reach it.
-pub(crate) fn resolve<G>(
-    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
-    graph: &G,
-    workspace_id: &WorkspaceId,
-    input: &str,
-) -> Result<ResolvedRef>
+pub(crate) fn resolve<G>(authority: &Authority<'_>, graph: &G, input: &str) -> Result<ResolvedRef>
 where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
@@ -387,7 +470,7 @@ where
     }
 
     let (core, hops) = split_relative_hops(input)?;
-    let resolved = resolve_core(lease, graph, workspace_id, input, core)?;
+    let resolved = resolve_core(authority, graph, input, core)?;
     if hops.is_empty() {
         return Ok(resolved);
     }
@@ -405,9 +488,8 @@ where
 }
 
 fn resolve_core<G>(
-    lease: &kin_db::AuthorityReadLease<kin_db::RepositoryAuthorityState>,
+    authority: &Authority<'_>,
     graph: &G,
-    workspace_id: &WorkspaceId,
     original: &str,
     core: &str,
 ) -> Result<ResolvedRef>
@@ -415,7 +497,35 @@ where
     G: GraphStore,
     <G as GraphStore>::Error: std::fmt::Display + Send + Sync + 'static,
 {
+    // First, and deliberately: an explicit semantic change is graph-owned truth.
+    // Its full-id form is answered without opening repository authority at all,
+    // which is the property `explicit_semantic_change_and_parent_hops_need_no_
+    // file_or_git_fallback` pins. Only the prefix half needs the authority
+    // snapshot, because a prefix is a search rather than a name.
+    if let Some(value) = core
+        .strip_prefix("kin:")
+        .or_else(|| core.strip_prefix("change:"))
+    {
+        let change_id = if value.len() == CHANGE_ID_HEX {
+            parse_change_id(value).map_err(|error| ref_error(original, error.to_string()))?
+        } else if is_change_prefix(value) {
+            let (lease, _) = authority.parts(original)?;
+            resolve_change_prefix(lease, original, value)?
+        } else {
+            return Err(ref_error(
+                original,
+                format!(
+                    "'{value}' is not a semantic change id or a prefix of one; ids are \
+                     {CHANGE_ID_HEX} lowercase hexadecimal characters and a prefix must be at \
+                     least {MIN_PREFIX}"
+                ),
+            ));
+        };
+        return resolve_present_change(graph, original, change_id);
+    }
+
     if matches!(core, "HEAD" | "@") {
+        let (lease, workspace_id) = authority.parts(original)?;
         let change_id = workspace_head(lease, workspace_id)?.ok_or_else(|| {
             ref_error(
                 original,
@@ -441,6 +551,7 @@ where
         let bytes = hex::decode(hex_name).context("decode ref-hex selector")?;
         let name = RefName::from_bytes(bytes)
             .map_err(|error| anyhow!("invalid ref-hex selector: {error}"))?;
+        let (lease, _) = authority.parts(original)?;
         return resolve_named(lease, original, name);
     }
 
@@ -448,36 +559,19 @@ where
         .strip_prefix("ref:")
         .or_else(|| core.strip_prefix("branch:"))
     {
+        let (lease, _) = authority.parts(original)?;
         return resolve_named(lease, original, parse_ref_name(value)?);
     }
 
-    if let Some(value) = core
-        .strip_prefix("kin:")
-        .or_else(|| core.strip_prefix("change:"))
-    {
-        let change_id = if value.len() == CHANGE_ID_HEX {
-            parse_change_id(value).map_err(|error| ref_error(original, error.to_string()))?
-        } else if is_change_prefix(value) {
-            resolve_change_prefix(lease, original, value)?
-        } else {
-            return Err(ref_error(
-                original,
-                format!(
-                    "'{value}' is not a semantic change id or a prefix of one; ids are {CHANGE_ID_HEX} \
-                     lowercase hexadecimal characters and a prefix must be at least {MIN_PREFIX}"
-                ),
-            ));
-        };
-        return resolve_present_change(graph, original, change_id);
-    }
-
     if let Some(value) = core.strip_prefix("git:") {
+        let (lease, _) = authority.parts(original)?;
         return resolve_git_object(lease, original, parse_git_object_id(value)?);
     }
 
     // A bare value prefers an exact ref, so a branch someone named stays a
     // branch even when its name happens to look like hexadecimal.
     if let Ok(name) = parse_ref_name(core) {
+        let (lease, _) = authority.parts(original)?;
         if lease.resolve_ref_target(&name)?.is_some() {
             return resolve_named(lease, original, name);
         }
@@ -500,10 +594,12 @@ where
     // prefix arm cannot help a value that is already full width.
     if matches!(core.len(), 40 | CHANGE_ID_HEX) && core.bytes().all(|byte| byte.is_ascii_hexdigit())
     {
+        let (lease, _) = authority.parts(original)?;
         return resolve_git_object(lease, original, parse_git_object_id(core)?);
     }
 
     if is_change_prefix(core) {
+        let (lease, _) = authority.parts(original)?;
         let change_id = resolve_change_prefix(lease, original, core)?;
         return resolve_present_change(graph, original, change_id);
     }
