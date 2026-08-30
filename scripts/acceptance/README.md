@@ -357,6 +357,27 @@ dies of something that is not the network, the check reports UNREADABLE and says
 which reason it got, because a classifier that was never asked the question has
 not answered it.
 
+`vcs_read_surfaces_repro.py` covers the everyday read surfaces, which the first
+stranger run with a version control arm caught answering wrongly on a project
+that has never been a Git repository (FIR-2961). `kin status` printed
+`Tree: 70fda9ae... (8 artifacts, matching its base change)` over a tracked file
+edited twenty-two seconds earlier and repeated it across seven more readings,
+and `kin admit` printed `nothing changed` on a pass that moved the workspace
+tree hash from `70fda9ae` to `c078181f` and its generation from 5 to 6, both
+visible three lines apart in its own output.
+
+Neither verdict was wrong about the graph, which is what makes this class hard
+to grade. `dirty` compares the admitted workspace tree against the tree of the
+change it is based on; the admit wording compares two cardinalities, and a
+content-only edit moves neither. Both sentences were true and both were read as
+statements about the files on disk, because nothing beside them said what they
+rested on. So the suite never grades the verdict, it grades whether the basis
+travels with it, and it grades both directions: `settled` requires the all-clear
+to still arrive over a genuinely settled tree, because a surface that hedges
+every answer passes a one-directional check while helping nobody. The
+`--self-test` cases are the literal pre-fix output the stranger saw and the
+post-fix output beside it, so a grader that cannot fail is caught here.
+
 `working_copy_freshness_repro.py` covers what the product says about a working
 copy it has not read, which the v0.6.1 yardstick run caught three surfaces
 getting wrong at once (FIR-2820). The stranger wrote a module, did not commit it,

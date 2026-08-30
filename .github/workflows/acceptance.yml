@@ -260,6 +260,15 @@ jobs:
       - name: Falsify the working-copy freshness graders
         run: python3 scripts/acceptance/working_copy_freshness_repro.py --self-test
 
+      # The graders here separate a true sentence from a misleading one, and the
+      # two look identical from outside: every verdict this suite grades was
+      # right about the graph. So each grader is driven against the literal
+      # pre-fix output the stranger saw and the post-fix output beside it, with
+      # the all-clear as its own must-pass case, because a surface that hedges
+      # every answer satisfies a one-directional check.
+      - name: Falsify the vcs read-surface graders
+        run: python3 scripts/acceptance/vcs_read_surfaces_repro.py --self-test
+
       # The graders here decide two verdicts that read alike from outside: a
       # refusal that fires with no remedy behind it, and a conversion with room
       # that narrates its memory anyway. Both are driven against their inverse,
@@ -864,6 +873,31 @@ jobs:
             echo "::warning title=Working-copy freshness acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: VCS read-surface acceptance suite (verdict comes from the gate step)
+        id: vcsreadsurfaces
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/vcs_read_surfaces_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/vcs_read_surfaces.json \
+            --verbose >acceptance/vcs_read_surfaces.log 2>&1 || rc=$?
+          cat acceptance/vcs_read_surfaces.log
+          {
+            echo "### VCS read-surface acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/vcs_read_surfaces.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=VCS read-surface acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       - name: Init budget acceptance suite (verdict comes from the gate step)
         id: initbudget
         if: always()
@@ -958,6 +992,7 @@ jobs:
             --report first_query=acceptance/first_query.json \
             --report verdict_limits=acceptance/verdict_limits.json \
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
+            --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
             --report init_budget=acceptance/init_budget.json \
             --report bridge_reach=acceptance/bridge_reach.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'
