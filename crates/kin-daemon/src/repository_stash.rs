@@ -639,7 +639,7 @@ fn return_to_base(
     )
     .context("validate the exact workspace projection before returning it to its base")?;
     if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::ProjectionConflict(format!(
+        return Err(kin_core::KinError::projection_conflict(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; the \
              workspace state is already sealed as {}",
             drift.len(),
@@ -854,7 +854,7 @@ fn pop(
     )
     .context("validate the exact workspace projection before restoring a stash")?;
     if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::ProjectionConflict(format!(
+        return Err(kin_core::KinError::projection_conflict(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
              reconcile them into graph authority before restoring a stash",
             drift.len()
@@ -1299,7 +1299,7 @@ fn classify_stash_error(error: anyhow::Error) -> (StatusCode, String) {
     if let Some(kin_core::KinError::ProjectionConflict(message)) =
         error.downcast_ref::<kin_core::KinError>()
     {
-        return (StatusCode::CONFLICT, message.clone());
+        return (StatusCode::CONFLICT, message.message.clone());
     }
     for cause in error.chain() {
         if let Some(model) = cause.downcast_ref::<kin_model::ModelError>() {

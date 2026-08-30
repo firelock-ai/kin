@@ -424,7 +424,7 @@ fn plan_and_commit(
     )
     .context("validate the exact workspace projection before rolling back")?;
     if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::ProjectionConflict(format!(
+        return Err(kin_core::KinError::projection_conflict(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
              reconcile them into graph authority or discard them before rolling back",
             drift.len()

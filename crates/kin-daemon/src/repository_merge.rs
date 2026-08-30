@@ -1201,7 +1201,7 @@ pub(crate) fn publish_resolved_merge(
     )
     .context("validate exact workspace projection before publishing the merge")?;
     if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::ProjectionConflict(format!(
+        return Err(kin_core::KinError::projection_conflict(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
              reconcile them into graph authority or discard them before publishing this merge",
             drift.len()
@@ -2210,7 +2210,7 @@ fn publish(
     )
     .context("validate exact workspace projection before merging")?;
     if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::ProjectionConflict(format!(
+        return Err(kin_core::KinError::projection_conflict(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
              reconcile them into graph authority or discard them before merging",
             drift.len()

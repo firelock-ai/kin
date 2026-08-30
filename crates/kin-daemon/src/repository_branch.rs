@@ -105,6 +105,9 @@ impl std::error::Error for WorkspaceTracksAnotherRef {}
 enum WorkspaceMutationRefusal {
     /// A refusal a client is told, as the status and message it is told with.
     Client(StatusCode, String),
+    /// The same, for the one refusal an admission pass clears: a TRACKED path
+    /// whose working copy moved away from the projection the graph holds.
+    ClientClearsWithAdmission(StatusCode, String),
     /// This workspace stands on a different ref than the one a transfer moved.
     TracksAnotherRef(String),
 }
@@ -115,16 +118,62 @@ impl From<(StatusCode, String)> for WorkspaceMutationRefusal {
     }
 }
 
+/// A refusal a branch command answers with, and whether one admission clears it.
+///
+/// The flag is read from the projection conflict's own kind rather than from
+/// its wording. A predicate on the sentence is a check a copy edit breaks in
+/// silence, and these two refusals differ by exactly one word in a paragraph.
+pub(crate) struct BranchRefusal {
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+    /// True only for a TRACKED path whose content moved away from the
+    /// projection: the graph has not been told, and one admission pass tells
+    /// it. An untracked path standing where a member must go is never this, and
+    /// no admission makes it carry.
+    pub(crate) clears_with_admission: bool,
+}
+
+impl From<(StatusCode, String)> for BranchRefusal {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self {
+            status,
+            message,
+            clears_with_admission: false,
+        }
+    }
+}
+
+impl From<BranchRefusal> for (StatusCode, String) {
+    fn from(refusal: BranchRefusal) -> Self {
+        (refusal.status, refusal.message)
+    }
+}
+
 impl WorkspaceMutationRefusal {
-    /// Answer a client. A branch command always transitions under
-    /// `TransitionPolicy::Switch`, which never raises the tracks-another-ref
-    /// case, so this arm is unreachable from a branch route; it maps to a
-    /// conflict rather than panicking, because an answer that is merely wrong
-    /// beats one that takes the daemon down.
-    fn into_client_response(self) -> (StatusCode, String) {
+    /// Answer a client, carrying whether one admission pass would clear it.
+    ///
+    /// A branch command always transitions under `TransitionPolicy::Switch`,
+    /// which never raises the tracks-another-ref case, so that arm is
+    /// unreachable from a branch route; it maps to a conflict rather than
+    /// panicking, because an answer that is merely wrong beats one that takes
+    /// the daemon down.
+    fn into_client_refusal(self) -> BranchRefusal {
         match self {
-            Self::Client(status, message) => (status, message),
-            Self::TracksAnotherRef(detail) => (StatusCode::CONFLICT, detail),
+            Self::Client(status, message) => BranchRefusal {
+                status,
+                message,
+                clears_with_admission: false,
+            },
+            Self::ClientClearsWithAdmission(status, message) => BranchRefusal {
+                status,
+                message,
+                clears_with_admission: true,
+            },
+            Self::TracksAnotherRef(detail) => BranchRefusal {
+                status: StatusCode::CONFLICT,
+                message: detail,
+                clears_with_admission: false,
+            },
         }
     }
 }
@@ -239,11 +288,11 @@ pub(crate) fn workspace_behind_ref(state: &DaemonState, name: &RefName) -> Resul
 pub(crate) fn execute(
     state: &DaemonState,
     request: &BranchRequest,
-) -> std::result::Result<BranchResponse, (StatusCode, String)> {
+) -> std::result::Result<BranchResponse, BranchRefusal> {
     if matches!(request, BranchRequest::List) {
-        let authority =
-            ActiveLocalRepositoryAuthority::open_bound(state).map_err(branch_bind_refusal)?;
-        return list(&authority).map_err(internal_branch_error);
+        let authority = ActiveLocalRepositoryAuthority::open_bound(state)
+            .map_err(|refusal| BranchRefusal::from(branch_bind_refusal(refusal)))?;
+        return list(&authority).map_err(|error| BranchRefusal::from(internal_branch_error(error)));
     }
 
     run_workspace_mutation(state, |state, authority| match request {
@@ -271,7 +320,7 @@ pub(crate) fn execute(
             TransitionPolicy::Switch,
         ),
     })
-    .map_err(WorkspaceMutationRefusal::into_client_response)
+    .map_err(WorkspaceMutationRefusal::into_client_refusal)
 }
 
 /// Move the graph-owned workspace onto the current target of the ref it already
@@ -313,6 +362,13 @@ pub(crate) fn follow_moved_ref(
             WorkspaceFollow::NotApplicable { detail }
         }
         Err(WorkspaceMutationRefusal::Client(_, detail)) => WorkspaceFollow::Behind { detail },
+        // A follow is not a switch and never admits, so the one refusal an
+        // admission would clear is reported here exactly as any other client
+        // refusal is. Spelled out rather than folded into the arm above, because
+        // the compiler asking this question is the point of the variant.
+        Err(WorkspaceMutationRefusal::ClientClearsWithAdmission(_, detail)) => {
+            WorkspaceFollow::Behind { detail }
+        }
     }
 }
 
@@ -898,6 +954,18 @@ fn switch(
                 &workspace.tree,
                 &authority.manager,
             )
+            // A switch to the ref this workspace already tracks is not a
+            // transition, so there is nothing for pending work to carry onto and
+            // an admission clears nothing the caller asked for. It would still
+            // publish, moving the authority generation as a side effect of a
+            // command that changes nothing, so the drift refusal keeps its plain
+            // kind here and the retry never sees it.
+            //
+            // Measured, not assumed: this is where the same-target drift refusal
+            // is actually raised. `preflight_switch_delta` above never refuses
+            // on it, which a probe said and a reading of the two call sites did
+            // not.
+            .map_err(forget_that_admission_would_clear_it)
             .with_context(|| format!("verify exact projection for already-active branch {name}"))?;
         let generation = authority_freeze.roots().generation;
         drop(authority_freeze);
@@ -989,7 +1057,13 @@ fn switch(
     )
     .with_context(|| format!("validate exact workspace projection before moving onto {name}"))?;
     if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::ProjectionConflict(format!(
+        // Tracked drift by construction, which the comment above states as this
+        // reader's contract: it reads only paths the workspace tree already
+        // tracks, and untracked host paths are never read. Naming the kind here
+        // is what lets one admission pass clear this refusal, and the aggregate
+        // is where it has to be named, because the per-path kinds are collected
+        // as messages and this error is a new one built from them.
+        return Err(kin_core::KinError::tracked_projection_drift(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
              reconcile them into graph authority or discard them {}",
             drift.len(),
@@ -1459,7 +1533,44 @@ fn render_target(target: &RefTarget) -> String {
     }
 }
 
+/// The projection conflict's kind, wherever in the chain it sits.
+///
+/// Walks the causes rather than reading only the head, because these errors
+/// travel wrapped in context by the time a route classifies them.
+fn projection_conflict_kind(error: &anyhow::Error) -> Option<kin_core::ProjectionConflictKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<kin_core::KinError>())
+        .and_then(kin_core::KinError::projection_conflict_kind)
+}
+
+/// Drop the claim that one admission pass would clear this refusal.
+///
+/// For a refusal raised where no transition is being made, the claim is true
+/// and useless: admitting would publish and change the generation while the
+/// caller's command still does nothing. Everything else about the error, its
+/// status and its sentence, is untouched.
+fn forget_that_admission_would_clear_it(error: kin_core::KinError) -> kin_core::KinError {
+    match error {
+        kin_core::KinError::ProjectionConflict(detail) => {
+            kin_core::KinError::projection_conflict(detail.message)
+        }
+        other => other,
+    }
+}
+
 fn classify_branch_error(error: anyhow::Error) -> WorkspaceMutationRefusal {
+    // Read the kind BEFORE the error is flattened to a status and a sentence,
+    // because that is the last moment it exists. Tracked drift is the one
+    // refusal an admission pass clears; every other projection conflict, and
+    // every other error, keeps the answer it has always had.
+    if matches!(
+        projection_conflict_kind(&error),
+        Some(kin_core::ProjectionConflictKind::TrackedDrift)
+    ) {
+        let (status, message) = client_branch_refusal(error);
+        return WorkspaceMutationRefusal::ClientClearsWithAdmission(status, message);
+    }
     // Nothing to do is not a failure, and a follow tells it apart from one by
     // the variant rather than by reading a message it would have to
     // pattern-match. It is raised only under `TransitionPolicy::FollowMovedRef`,

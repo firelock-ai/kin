@@ -662,8 +662,13 @@ pub fn report_repository_workspace_projection_drift(
         for entry in &entries {
             match projection.projection.validate_frozen_entry_unchanged(entry) {
                 Ok(_) => {}
-                Err(KinError::ProjectionConflict(message)) => {
-                    drift.push(message);
+                Err(KinError::ProjectionConflict(detail)) => {
+                    // The message alone, exactly as before. This collector is
+                    // why the kind rides INSIDE the variant rather than in a new
+                    // one: a second variant would have fallen through to the
+                    // `Err(error)` arm below and turned every tracked drift into
+                    // a hard failure instead of a collected one.
+                    drift.push(detail.message);
                     drifted_paths.push(entry.file_id.clone());
                 }
                 Err(error) => return Err(error),
@@ -9306,7 +9311,7 @@ impl ProjectionRoot {
                         break;
                     }
                     Ok(_) => {
-                        return Err(KinError::ProjectionConflict(format!(
+                        return Err(KinError::untracked_path_blocks(format!(
                             "untracked working-copy path {} blocks exact workspace target {}",
                             self.display_root.join(&relative).display(),
                             entry.file_id
@@ -9332,7 +9337,7 @@ impl ProjectionRoot {
                     if previous.relation(&relative) != TrackedPathRelation::Ancestor
                         || removed.relation(&relative) != TrackedPathRelation::Ancestor
                     {
-                        return Err(KinError::ProjectionConflict(format!(
+                        return Err(KinError::projection_conflict(format!(
                             "untracked working-copy directory {} conflicts with exact workspace target {}",
                             self.display_root.join(&relative).display(),
                             entry.file_id
@@ -9347,7 +9352,7 @@ impl ProjectionRoot {
                 }
                 Ok(_) if previous.relation(&relative) == TrackedPathRelation::Exact => {}
                 Ok(_) => {
-                    return Err(KinError::ProjectionConflict(format!(
+                    return Err(KinError::untracked_path_blocks(format!(
                         "untracked working-copy path {} conflicts with exact workspace target {}",
                         self.display_root.join(&relative).display(),
                         entry.file_id
@@ -9381,7 +9386,7 @@ impl ProjectionRoot {
                 .map_err(|error| KinError::io(self.display_root.join(&relative), error))?;
             if metadata.is_dir() && !metadata_is_reparse(&metadata) {
                 if removed.relation(&relative) != TrackedPathRelation::Ancestor {
-                    return Err(KinError::ProjectionConflict(format!(
+                    return Err(KinError::projection_conflict(format!(
                         "untracked working-copy directory {} blocks exact workspace reconciliation",
                         self.display_root.join(&relative).display()
                     )));
@@ -9389,7 +9394,7 @@ impl ProjectionRoot {
                 let child = self.open_existing_directory(directory, &name, &relative)?;
                 self.validate_removable_directory_contents(&child, &relative, removed)?;
             } else if removed.relation(&relative) != TrackedPathRelation::Exact {
-                return Err(KinError::ProjectionConflict(format!(
+                return Err(KinError::untracked_path_blocks(format!(
                     "untracked working-copy path {} blocks exact workspace reconciliation",
                     self.display_root.join(&relative).display()
                 )));
@@ -9433,7 +9438,7 @@ impl ProjectionRoot {
                     )?;
                 }
                 Ok(_) => {
-                    return Err(KinError::ProjectionConflict(format!(
+                    return Err(KinError::projection_conflict(format!(
                         "selected checkout path {} is blocked by a non-directory working-copy ancestor {}; select that ancestor explicitly",
                         file_id,
                         self.display_root.join(&relative).display()
@@ -9452,7 +9457,7 @@ impl ProjectionRoot {
             Ok(metadata) => metadata,
         };
         if metadata.is_dir() && !metadata_is_reparse(&metadata) {
-            return Err(KinError::ProjectionConflict(format!(
+            return Err(KinError::projection_conflict(format!(
                 "selected tracked checkout path {} became a real directory; refusing to remove possibly untracked descendants",
                 self.display_root.join(&relative).display()
             )));
@@ -9462,7 +9467,7 @@ impl ProjectionRoot {
         } else if metadata.is_file() {
             ExistingObjectKind::File
         } else {
-            return Err(KinError::ProjectionConflict(format!(
+            return Err(KinError::projection_conflict(format!(
                 "selected checkout path {} has an unsupported working-copy object kind",
                 self.display_root.join(&relative).display()
             )));
@@ -9510,7 +9515,7 @@ impl ProjectionRoot {
                             )?;
                         }
                         Ok(_) => {
-                            return Err(KinError::ProjectionConflict(format!(
+                            return Err(KinError::projection_conflict(format!(
                                 "working-copy ancestor {} appeared after selected checkout preflight",
                                 self.display_root.join(&relative).display()
                             )));
@@ -9521,7 +9526,7 @@ impl ProjectionRoot {
                 match parent.symlink_metadata(name) {
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Err(error) => Err(KinError::io(self.display_root.join(path), error)),
-                    Ok(_) => Err(KinError::ProjectionConflict(format!(
+                    Ok(_) => Err(KinError::projection_conflict(format!(
                         "working-copy path {} appeared after selected checkout preflight",
                         self.display_root.join(path).display()
                     ))),
@@ -9546,7 +9551,7 @@ impl ProjectionRoot {
                     &self.display_root.join(relative),
                 )?;
                 if actual_identity != *identity || actual_state != *state {
-                    return Err(KinError::ProjectionConflict(format!(
+                    return Err(KinError::projection_conflict(format!(
                         "selected working-copy path {} changed after exact checkout preflight",
                         self.display_root.join(relative).display()
                     )));
@@ -9569,7 +9574,7 @@ impl ProjectionRoot {
         for (entry, expected_identity) in entries.iter().zip(expected_identities) {
             let actual_identity = self.validate_tracked_entry_unchanged(entry)?;
             if actual_identity != *expected_identity {
-                return Err(KinError::ProjectionConflict(format!(
+                return Err(KinError::projection_conflict(format!(
                     "tracked working-copy path {} changed object identity after exact workspace preflight; reconciliation refused",
                     self.display_root
                         .join(projection_path(entry.file_id)?)
@@ -9604,7 +9609,7 @@ impl ProjectionRoot {
             let actual_identity = self.validate_frozen_entry_unchanged(entry)?;
             if actual_identity != *expected_identity {
                 let path = validate_projection_proof_path(entry.file_id)?;
-                return Err(KinError::ProjectionConflict(format!(
+                return Err(KinError::projection_conflict(format!(
                     "tracked working-copy path {} changed object identity after exact projection verification",
                     self.display_root.join(path.relative).display()
                 )));
@@ -9647,14 +9652,14 @@ impl ProjectionRoot {
                     .metadata()
                     .map_err(|error| KinError::io(display, error))?;
                 if !metadata.is_file() {
-                    return Err(KinError::ProjectionConflict(format!(
+                    return Err(KinError::projection_conflict(format!(
                         "exact-source object {} changed kind",
                         display.display()
                     )));
                 }
                 #[cfg(windows)]
                 if metadata_is_reparse(&metadata) {
-                    return Err(KinError::ProjectionConflict(format!(
+                    return Err(KinError::projection_conflict(format!(
                         "exact-source object {} became a reparse point",
                         display.display()
                     )));
@@ -9664,7 +9669,7 @@ impl ProjectionRoot {
                     use std::os::unix::fs::PermissionsExt;
 
                     if (metadata.permissions().mode() & 0o111 != 0) != executable {
-                        return Err(KinError::ProjectionConflict(format!(
+                        return Err(KinError::projection_conflict(format!(
                             "exact-source object {} changed executable mode",
                             display.display()
                         )));
@@ -9675,7 +9680,7 @@ impl ProjectionRoot {
                 if !reader_matches_bytes(&mut file, entry.content)
                     .map_err(|error| KinError::io(display, error))?
                 {
-                    return Err(KinError::ProjectionConflict(format!(
+                    return Err(KinError::projection_conflict(format!(
                         "exact-source object {} changed content",
                         display.display()
                     )));
@@ -9696,7 +9701,7 @@ impl ProjectionRoot {
                         .symlink_metadata(name)
                         .map_err(|error| KinError::io(display, error))?;
                     if !metadata_is_reparse(&metadata) {
-                        return Err(KinError::ProjectionConflict(format!(
+                        return Err(KinError::projection_conflict(format!(
                             "exact-source object {} changed kind",
                             display.display()
                         )));
@@ -9704,7 +9709,7 @@ impl ProjectionRoot {
                     let target = rustix::fs::readlinkat(parent, name, Vec::new())
                         .map_err(|error| KinError::io(display, error.into()))?;
                     if target.as_bytes() != entry.content {
-                        return Err(KinError::ProjectionConflict(format!(
+                        return Err(KinError::projection_conflict(format!(
                             "exact-source symbolic link {} changed target",
                             display.display()
                         )));
@@ -11222,7 +11227,7 @@ impl ProjectionRoot {
     ) -> Result<TrackedEntryIdentity> {
         let display = self.display_root.join(&path.relative);
         let conflict = |reason: &str| {
-            KinError::ProjectionConflict(format!(
+            KinError::tracked_projection_drift(format!(
                 "tracked working-copy path {} differs from prior workspace source ({reason}); exact workspace reconciliation refused",
                 display.display()
             ))
