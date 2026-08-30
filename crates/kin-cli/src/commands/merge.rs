@@ -157,6 +157,16 @@ pub async fn run(source: String, json: bool) -> Result<i32> {
         for line in response.lines {
             println!("{line}");
         }
+        if conflicted {
+            // Printed by the CLI rather than composed into the daemon's lines,
+            // because the exit code is the CLI's to name and the daemon has no
+            // business knowing it. A reader meets the number where it fires,
+            // which is the only place they can act on it.
+            println!(
+                "Exit {EXIT_MERGE_CONFLICTED}: the merge is parked with conflicts; \
+                 `kin conflicts` lists them"
+            );
+        }
     }
     Ok(if conflicted { EXIT_MERGE_CONFLICTED } else { 0 })
 }
