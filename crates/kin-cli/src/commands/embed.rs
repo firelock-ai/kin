@@ -172,7 +172,7 @@ fn embed_completion_line(
     // than picking one, since neither is established here.
     format!(
         "Done. This run embedded nothing and the daemon reports nothing pending, but this store \
-         reads {indexed_after}/{total} indexed. Run `kin health` to see why coverage and the \
+         reads {indexed_after}/{total} indexed. Run `kin doctor` to see why coverage and the \
          queue disagree"
     )
 }

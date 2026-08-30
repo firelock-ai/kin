@@ -796,7 +796,7 @@ pub fn inspect(
         anyhow::bail!(
             "this repository's store reported two different root generations for one lease, which \
              means another process wrote it while this command was reading; re-run `kin status`, \
-             and run `kin health` if it repeats"
+             and run `kin doctor` if it repeats"
         );
     }
 
@@ -840,7 +840,7 @@ pub fn inspect(
     report.validate().map_err(|error| {
         anyhow::anyhow!(
             "kin built a status report this build considers invalid ({error}), so it refused \
-                 to print it; run `kin health`, and `kin --version` against `kin daemon status` if \
+                 to print it; run `kin doctor`, and `kin --version` against `kin daemon status` if \
                  the two are on different builds"
         )
     })?;
