@@ -902,7 +902,21 @@ jobs:
   # string GitHub publishes or the string a ruleset has to name.
   fast-gate-lint:
     name: Fast gate lint and policy
-    runs-on: ubuntu-latest
+    # The heavy-runner switch, and the one place its value is chosen.
+    # `vars.KIN_HEAVY_RUNNER` names the runner every compile-heavy job in this
+    # workflow uses. When it is unset or empty this resolves to `ubuntu-latest`,
+    # so the workflow is always runnable without it, and flipping the whole set
+    # between runners is a variable edit rather than a workflow change.
+    #
+    # That indirection is the availability half, and it was bought the hard way:
+    # on 2026-08-30 the `kin-16core` pool stopped assigning runners at 14:54:39Z
+    # and every job pinned to it queued with no runner and no error, including
+    # main's Product Acceptance, which is the only grader kin has. A hardcoded
+    # label has no way back from that; this has one.
+    #
+    # Read the runner a run actually resolved from the jobs API `labels` field,
+    # never from this line.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 20
     # FIR-2744. This job shares `check`'s cargo cache key, and with
     # `add-rust-environment-hash-key` off nothing else would notice the two
@@ -1102,7 +1116,8 @@ jobs:
     name: Fast gate test shard
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.docs_only != 'true' }}
-    runs-on: ubuntu-latest
+    # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 30
     env:
       CARGO_INCREMENTAL: "0"
@@ -1226,6 +1241,12 @@ jobs:
     name: Fast gate build and tests
     needs: [changes, fast-gate-tests]
     if: ${{ !cancelled() }}
+    # Deliberately a literal `ubuntu-latest` rather than the heavy-runner switch,
+    # for the reason `check-aggregate` is not on one either. This job compiles
+    # nothing and decides in a two-second shell `if`, but it sits directly on the
+    # required context's critical path, so a larger runner's provisioning wait
+    # would raise the one number this gate is measured on. Measured same-run,
+    # that wait was 4 to 99 seconds against `ubuntu-latest`'s 4 to 20.
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -1309,7 +1330,8 @@ jobs:
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
       && github.event_name != 'pull_request' }}
-    runs-on: kin-16core
+    # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     # The all-features clippy/build/test sequence can otherwise retain more
     # than a hosted runner's available disk in incremental objects and debug
@@ -2311,7 +2333,8 @@ jobs:
     # sha release-tag.yml sweeps, where a non-required failure is terminal even
     # though nothing gated on it. A job that never starts cannot conclude.
     if: ${{ github.event_name != 'pull_request' && github.event_name != 'merge_group' }}
-    runs-on: kin-16core
+    # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -2372,7 +2395,8 @@ jobs:
       ${{ !cancelled()
       && needs.changes.outputs.docs_only != 'true'
       && github.event_name != 'pull_request' }}
-    runs-on: kin-16core
+    # The heavy-runner switch; see `fast-gate-lint` for what it resolves to.
+    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

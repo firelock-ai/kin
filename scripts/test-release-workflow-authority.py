@@ -524,7 +524,7 @@ REAL_CHECK_JOB_AUTHORITY = textwrap.dedent(
         ${{ !cancelled()
         && needs.changes.outputs.docs_only != 'true'
         && github.event_name != 'pull_request' }}
-      runs-on: kin-16core
+      runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}
       timeout-minutes: 60
       env:
         CARGO_INCREMENTAL: "0"
@@ -563,10 +563,14 @@ UBUNTU_SHARD_AGGREGATE_AUTHORITY = textwrap.dedent(
 # The `check` job runner, pinned here as well as inside
 # REAL_CHECK_JOB_AUTHORITY, because `shards` binds to blocks.get("check"),
 # so one job is pinned in two places and both have to move together.
-# Moved to the larger runner under the founder's 2026-08-26 ruling. The
-# aggregate is deliberately NOT moved: it compiles nothing and runs in
-# seconds, so it stays on ubuntu-latest.
-UBUNTU_SHARD_RUNNER = "  runs-on: kin-16core"
+# The value is the heavy-runner switch rather than a label: the job reads
+# `vars.KIN_HEAVY_RUNNER` and falls back to ubuntu-latest when it is unset,
+# so what is pinned here is that the shards keep reading the switch. A
+# hardcoded label cannot fall back, and on 2026-08-30 the kin-16core pool
+# stopped assigning runners and left every job pinned to it queued forever.
+# The aggregate is deliberately NOT on the switch: it compiles nothing and
+# runs in seconds, so it stays on ubuntu-latest.
+UBUNTU_SHARD_RUNNER = "  runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}"
 UBUNTU_SHARD_INDEPENDENT_LEGS = "    fail-fast: false"
 UBUNTU_SHARD_MATRIX = "      shard: [1, 2]"
 UBUNTU_SHARD_PARTITION = (
@@ -13877,7 +13881,7 @@ def main() -> None:
             # has always meant is "the shards leave their pinned runner", so it
             # names the pinned value rather than the historical one.
             "the ubuntu shards leave their pinned runner",
-            "    runs-on: kin-16core",
+            "    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}",
             "    runs-on: macos-latest",
         ),
         (
@@ -14098,7 +14102,7 @@ def main() -> None:
             # stub above did not, which is why only this arm changes and the
             # stub's two arms still name ubuntu-latest.
             "real Check & Test runner detached from its shard matrix",
-            "    runs-on: kin-16core",
+            "    runs-on: ${{ vars.KIN_HEAVY_RUNNER || 'ubuntu-latest' }}",
             "    runs-on: ${{ matrix.os }}",
         ),
         (
