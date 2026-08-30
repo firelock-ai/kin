@@ -518,6 +518,69 @@ fn classify_pinned_namespace_probe(
 }
 
 #[cfg(test)]
+mod source_blob_digest_tests {
+    use super::*;
+
+    fn digest_of(body: &[u8]) -> kin_model::Hash256 {
+        kin_model::Hash256::from_bytes(<[u8; 32]>::from(
+            <sha2::Sha256 as sha2::Digest>::digest(body),
+        ))
+    }
+
+    /// The bytes a digest names are admitted.
+    #[test]
+    fn bytes_that_hash_to_their_own_name_are_admitted() {
+        let body = b"fn target() {}\n";
+        assert!(verify_source_blob_digest(digest_of(body), body).is_ok());
+    }
+
+    /// An empty body is a real body, and its digest is not a special case.
+    ///
+    /// Worth its own arm because the natural bug here is treating an empty read
+    /// as "nothing to check", which would admit any digest for an empty file.
+    #[test]
+    fn an_empty_body_is_checked_against_its_own_digest() {
+        assert!(verify_source_blob_digest(digest_of(b""), b"").is_ok());
+        assert!(verify_source_blob_digest(digest_of(b"x"), b"").is_err());
+    }
+
+    /// One flipped bit is a different body, and the refusal says so.
+    ///
+    /// The single-bit case rather than a wholly different body, because a
+    /// comparison that truncated or sampled the hash would still separate two
+    /// unrelated bodies and would pass a test built from them.
+    #[test]
+    fn one_flipped_bit_is_refused_and_both_names_are_reported() {
+        let body = b"fn target() {}\n";
+        let mut tampered = body.to_vec();
+        tampered[0] ^= 0x01;
+        let named = digest_of(body);
+        let error = verify_source_blob_digest(named, &tampered)
+            .expect_err("bytes that are not the ones this digest names must be refused");
+        assert!(
+            error.contains(&named.to_string()),
+            "the refusal names the digest that was asked for: {error}"
+        );
+        assert!(
+            error.contains(&digest_of(&tampered).to_string()),
+            "and the one the bytes actually hash to, so a reader can tell which is which: \
+             {error}"
+        );
+    }
+
+    /// Two different bodies of the same length do not verify against each
+    /// other's digest, which a length check alone would admit.
+    #[test]
+    fn equal_length_bodies_do_not_satisfy_each_others_digest() {
+        let left = b"aaaaaaaa";
+        let right = b"bbbbbbbb";
+        assert_eq!(left.len(), right.len());
+        assert!(verify_source_blob_digest(digest_of(left), right).is_err());
+        assert!(verify_source_blob_digest(digest_of(right), left).is_err());
+    }
+}
+
+#[cfg(test)]
 mod payload_receipt_tests {
     use super::*;
 
