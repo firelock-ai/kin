@@ -292,7 +292,7 @@ jobs:
       # condition unconditional, so the artifacts survive a red run or a
       # cancelled one.
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744. `rust-cache` hashes EVERY toolchain `rustup toolchain
           # list` reports, not the one this repository pins, so two jobs in one
@@ -470,7 +470,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744, and see the note on the first cache step in this file.
           add-rust-environment-hash-key: false
@@ -539,7 +539,7 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744, and see the note on the first cache step in this file.
           add-rust-environment-hash-key: false
@@ -947,7 +947,7 @@ jobs:
       # branch that is allowed to write it. Read the cache line in THIS step's
       # log rather than the caches API listing, which is not an inventory.
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744. These two jobs share `check`'s cache key, which is exactly
           # the case this setting exists for: without it `rust-cache` hashes
@@ -1131,7 +1131,7 @@ jobs:
           if grep -q '^\[patch\.kin\]' .cargo/config.toml; then echo "::error::[patch.kin] git pins must be removed. kin-* resolve from the Kin registry"; exit 1; fi
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744. These two jobs share `check`'s cache key, which is exactly
           # the case this setting exists for: without it `rust-cache` hashes
@@ -1558,7 +1558,7 @@ jobs:
       # save only from main. This is the pull-request critical path, so a warm
       # dependency graph here is what a round actually costs.
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744, and see the note on the first cache step in this file.
           add-rust-environment-hash-key: false
@@ -1853,7 +1853,7 @@ jobs:
       # only from main. Both shards restore the same main entry, so the second
       # one is not paying for the first one's warmth.
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744, and see the note on the first cache step in this file.
           add-rust-environment-hash-key: false
@@ -2217,7 +2217,7 @@ jobs:
       # API listing, which is not an inventory and omitted every macOS entry
       # while a job log showed a full match on one of them.
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744, and see the note on the first cache step in this file.
           add-rust-environment-hash-key: false
@@ -2390,7 +2390,7 @@ jobs:
         run: scripts/ci-apt-install.sh musl-tools
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # FIR-2744, and see the note on the first cache step in this file.
           add-rust-environment-hash-key: false
