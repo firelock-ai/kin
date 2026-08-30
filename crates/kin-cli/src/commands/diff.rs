@@ -364,10 +364,11 @@ fn derive_workspace_semantics(
             file_path: Some(kin_model::FilePathId::new(text)),
             ..Default::default()
         };
-        // `query_entities` is a `GraphStore` method, and the trait is imported at
+        // `query_entities` is an `EntityStore` method, not an inherent one and not
+        // `GraphStore`'''s, which is what the compiler had to tell me. Imported at
         // the call rather than at the module head so a reader sees which surface
         // this read comes from.
-        use kin_model::GraphStore as _;
+        use kin_model::EntityStore as _;
         let Ok(found) = graph.query_entities(&filter) else {
             continue;
         };
