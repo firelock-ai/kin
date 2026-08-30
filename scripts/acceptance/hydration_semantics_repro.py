@@ -1244,14 +1244,15 @@ def check_native_transfer(suite):
       replicas, or a destination that has admitted nothing; Git-authority
       divergence is not adapted". An adopting receiver on a bare directory holds
       no Git authority at all.
-    - A native source holding real content: refused at pack validation, "native
-      change ... introduces artifacts without a bound workspace admission
-      context". crates/kin-remote/src/repository_transfer.rs states the rule
-      outright at its seed_native_line helper: a native change that introduces
-      an artifact needs a bound workspace admission context and a transfer's
-      receive transaction carries none. Every kin commit of a real file
-      introduces artifacts, and the CLI exposes no way to author an
-      artifact-free change.
+    - A native source holding real content: admitted since FIR-2959. A transfer
+      is now admitted as a transfer rather than as a local publish, so the
+      receiver is held to the shared admission policy it resolves from the
+      transferred history instead of to a workspace it never had. This fixture
+      stays artifact-free because what it grades is the hydration creation
+      record, not what a transfer may carry, and an artifact-free change keeps
+      that one variable isolated. The one remaining limit: a repository whose
+      shared admission policy carries rule sources refuses by name until the
+      publisher's admission case travels in the pack.
     - A native clone: kin clone is Git transport only, and reject_native_remote
       in crates/kin-cli/src/commands/clone.rs fail-closes on a native remote.
 
