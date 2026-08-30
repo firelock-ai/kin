@@ -104,9 +104,10 @@ pub async fn run(json: bool, show: bool) -> Result<()> {
             println!("{line}");
         }
         if show {
-            let report = response.report.as_ref().ok_or_else(|| {
-                anyhow::anyhow!("daemon conflicts response omitted its report")
-            })?;
+            let report = response
+                .report
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("daemon conflicts response omitted its report"))?;
             for body in &report.bodies {
                 print_body(body);
             }
