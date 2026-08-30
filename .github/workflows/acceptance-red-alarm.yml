@@ -1,0 +1,81 @@
+name: Acceptance Red Alarm
+
+# `Product Acceptance` is not a required context on main, so a red Acceptance
+# blocks no landing, and until this workflow existed nothing watched it after the
+# landing either. Read live from `GET /repos/firelock-ai/kin/rules/branches/main`
+# on 2026-08-30, main requires six contexts, cargo-deny, DCO Sign-off, Fast gate
+# build and tests, Fast gate lint and policy, gitleaks (full history) and PR text
+# hygiene, which is FIR-2815's thinned fast gate. Acceptance is not among them.
+# Do not take that sentence on trust: `acceptance.yml`'s own header asserted the
+# opposite as of 2026-08-27 and was already stale by the same afternoon, and its
+# text records an earlier inversion in the other direction. Read the endpoint.
+#
+# What the blind spot cost, measured on 2026-08-30: twelve consecutive red
+# Acceptance runs on main, `00d655370` at 2026-08-29T20:46:51Z through
+# `56f79f193` at 2026-08-30T03:53:44Z, last green `cc72a66e5`. Twelve landings
+# crossed a red gate and nothing said so.
+#
+# `workflow_run` is the right trigger rather than an `if: failure()` job inside
+# acceptance.yml, for the reason merge-queue-ejection-notice.yml gives about the
+# same choice: the run that needs reporting is frequently not the one anybody
+# would think to edit, and a job inside a workflow cannot report that workflow's
+# own cancellation or infrastructure failure.
+#
+# The judgement lives in `scripts/acceptance_red_alarm.py`, not here, so it can
+# be run against any historical run id from a laptop. That is how it is
+# falsified: `--self-test` for the classifier and `--run <id> --dry-run` against
+# real runs, both of which a reviewer can repeat. `workflow_run` executes the
+# workflow from the DEFAULT BRANCH, so a branch cannot test the trigger itself
+# and the script is the part a branch can prove.
+on:
+  workflow_run:
+    workflows: ["Acceptance"]
+    types: [completed]
+    # Filter at the TRIGGER, not only in the job's `if`. Acceptance runs on every
+    # pull request too, and a job-level `if` still creates a run with a skipped
+    # job for each of them. FIR-2886 is that failure already observed here: the
+    # Merge Queue Ejection Notice fired 47 times on one main commit, every firing
+    # `skipped`, and it buried the Acceptance run for that sha past a watcher's
+    # `--limit 30` so the watcher reported "no run" against a concluded one. A
+    # notice that makes the run list unreadable defeats the next watcher after it.
+    # `head_branch` is the PR's own branch on a pull_request run and
+    # `gh-readonly-queue/...` on a merge_group one, so main's pushes are what
+    # survive this. The job's `if` below is the correctness check, not this.
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  alarm:
+    name: Report a red Acceptance on main
+    # Only main's own push runs. A pull request or merge_group Acceptance failure
+    # already reports on the pull request, where somebody is looking; this exists
+    # for the landing nobody watches.
+    if: >-
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    # Headroom, not a deadline. The work is three API reads, one log download and
+    # at most one issue write.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      # The tracking issue is the alarm. It is the only write this job performs.
+      issues: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Run the controls in the same job that acts on their verdict. A judge
+      # whose self-test lives only in another workflow can drift from the bytes
+      # doing the judging, and this one is cheap.
+      - name: Prove the judge still grades its own fixtures
+        run: python3 scripts/acceptance_red_alarm.py --self-test
+
+      - name: Judge the Acceptance run and tell somebody
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 scripts/acceptance_red_alarm.py \
+            --run "${{ github.event.workflow_run.id }}"

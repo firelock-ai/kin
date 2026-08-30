@@ -699,6 +699,12 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
     # census is what would otherwise let a new workflow's job NAME appear
     # unreviewed. The job id and display name are stable on purpose: renaming
     # either is what ejects unrelated queue entries.
+    # The red-Acceptance alarm. It triggers only on `workflow_run` once
+    # Acceptance concludes, so it runs on no pull-request or merge-group event and
+    # can never claim a required context. Its only write is one tracking issue.
+    ".github/workflows/acceptance-red-alarm.yml": {
+        "alarm": "Report a red Acceptance on main",
+    },
     ".github/workflows/acceptance.yml": {
         "acceptance": "Product Acceptance",
     },
