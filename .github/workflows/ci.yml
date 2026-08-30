@@ -1241,7 +1241,13 @@ jobs:
               raise SystemExit(1)
           LISTING
 
+      # DIAGNOSTIC, on a branch that never lands. FIR-3045's first fix was
+      # refuted by its own acceptance: phase 2 still recompiled four crates.
+      # This names the input cargo considers dirty instead of guessing a second
+      # time. Remove before this branch could ever merge; it does not.
       - name: Test
+        env:
+          CARGO_LOG: cargo::core::compiler::fingerprint=info
         run: |
           set -euo pipefail
           readarray -t SCOPE < "$RUNNER_TEMP/scope.args"
