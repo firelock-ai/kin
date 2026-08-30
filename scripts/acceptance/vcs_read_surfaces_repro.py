@@ -35,9 +35,16 @@ destructive: the third edits the file the first two are about.
   basis      the `Tree:` line names when graph truth last caught up, rather
              than rendering a bare verdict a reader takes for a statement
              about the files on disk
-  stale      with a tracked file edited and nothing admitted since, that line
-             still carries its age, so the reader can see the graph's picture
-             predates the edit without running a second command
+  persists   with a tracked file edited and nothing admitted since, that line
+             still carries its basis rather than reverting to a bare verdict.
+             Note what this does NOT prove: measured on macOS, the ambient
+             watcher takes about two seconds to admit such an edit, and inside
+             that window the line reads `matching its base change as admitted 0s
+             ago` over a tree that has not moved. A clock cannot separate an
+             admission that ran before the edit from one that ran after it, so
+             the age is necessary and not sufficient. The check that closes that
+             hole is the one over an UNOBSERVED working copy, and it arrives with
+             the fix it grades
   content    `kin admit` over that content-only edit does not report
              "nothing changed"
   settled    the control: a second `kin admit` with nothing left to take says
@@ -224,13 +231,17 @@ class Suite(object):
         if self._repo:
             return self._repo
         path = os.path.realpath(os.path.join(self.workdir, "ledger"))
-        os.makedirs(os.path.join(path, "ledger"))
-        self._write(path, TRACKED_MODULE, MODULE_BEFORE)
-        self._write(path, "ledger/__init__.py", '"""A tiny expense ledger."""\n')
+        os.makedirs(path)
         self._repo = path
+        # `kin init` refuses a non-empty directory for a non-Git repository, on
+        # the stated grounds that it will not derive authority from filesystem
+        # contents nothing admitted. So the store comes first and the files are
+        # written into it, which is also the order the stranger used.
         rc, out, err = run([self.kin, "init"], cwd=path, env=self.env, timeout=600)
         if rc != 0:
             raise RuntimeError("kin init failed: %s" % ((err or out)[-400:]))
+        self._write(path, TRACKED_MODULE, MODULE_BEFORE)
+        self._write(path, "ledger/__init__.py", '"""A tiny expense ledger."""\n')
         rc, out, err = self.kin_run(["commit", "-m", "Report totals grouped by key"])
         if rc != 0:
             raise RuntimeError("the seeding commit failed: %s" % ((err or out)[-400:]))
@@ -265,10 +276,15 @@ def check_basis(suite):
     return Result("basis", status, "%s %s" % (TICKET, detail))
 
 
-def check_stale(suite):
+def check_persists(suite):
     suite.edit_tracked_module()
     status, detail = grade_tree_line_carries_its_basis(suite.status_text())
-    return Result("stale", status, "%s over an unadmitted edit, %s" % (TICKET, detail))
+    return Result(
+        "persists",
+        status,
+        "%s the basis survives an edit (not a claim that the verdict saw it), %s"
+        % (TICKET, detail),
+    )
 
 
 def check_content(suite):
@@ -291,7 +307,7 @@ def check_settled(suite):
 
 CHECKS = (
     ("basis", check_basis),
-    ("stale", check_stale),
+    ("persists", check_persists),
     ("content", check_content),
     ("settled", check_settled),
 )

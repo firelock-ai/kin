@@ -664,6 +664,11 @@ mod tests {
         settled.tracked_before = 4210;
         settled.entities_before = 9977;
         settled.embeddings_indexed = 14187;
+        // The tree stood still too, which this fixture has to say now that the
+        // wording rests on three readings rather than two. Equal counts alone
+        // are what a content-only edit also produces, and that case is the one
+        // `a_content_only_admission_is_not_reported_as_nothing_changed` grades.
+        settled.tree_moved = Some(false);
         let text = summary_lines(&settled).join("\n");
         assert!(text.contains("nothing changed"), "{text}");
         assert!(!text.contains("failed"), "{text}");
