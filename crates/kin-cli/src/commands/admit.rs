@@ -111,6 +111,17 @@ pub struct AdmitReport {
     /// the two answers this field exists to keep apart.
     #[serde(default)]
     pub tree_moved: Option<bool>,
+    /// Wall-clock time of the admission that ran BEFORE this pass, RFC 3339.
+    ///
+    /// Read on the daemon before this pass records its own success, because the
+    /// probes keep one last-success clock and this pass overwrites it. Present
+    /// so a settled answer can name what settled it: the watch loop admits on a
+    /// 100ms poll, so an operator who edits a file and immediately runs
+    /// `kin admit` is often told nothing changed by a pass that is correct and
+    /// unhelpful. `None` means no earlier admission is recorded, which is not
+    /// the same as one having happened at an unknown time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prior_admission_at: Option<String>,
     /// False when the pass itself failed. The request still returns its report
     /// so the operator sees the counters and the recorded cause; the CLI exits
     /// nonzero.
@@ -202,11 +213,25 @@ pub fn summary_lines(report: &AdmitReport) -> Vec<String> {
                  added or removed. {} tracked artifacts, {} entities.",
                 report.tracked_after, report.entities_after
             )),
-            Some(false) => lines.push(format!(
-                "Admitted the complete exact tree; nothing changed. {} tracked artifacts, {} \
-                 entities.",
-                report.tracked_after, report.entities_after
-            )),
+            Some(false) => lines.push(match report.prior_admission_at.as_deref() {
+                // Naming the basis rather than only the verdict, the way
+                // kin#1254 did for the `Tree:` line. "Nothing changed" is true
+                // and reads as "your edit was not taken" to the one reader most
+                // likely to see it: someone who just edited a file. What settles
+                // that is WHEN the tree became current, so say it.
+                Some(at) => format!(
+                    "Admitted the complete exact tree; nothing was left to admit, because the \
+                     working copy was already admitted at {at}. {} tracked artifacts, {} \
+                     entities.",
+                    report.tracked_after, report.entities_after
+                ),
+                None => format!(
+                    "Admitted the complete exact tree; nothing changed, and no earlier \
+                     admission is recorded to say when the tree became current. {} tracked \
+                     artifacts, {} entities.",
+                    report.tracked_after, report.entities_after
+                ),
+            }),
             None => lines.push(format!(
                 "Admitted the complete exact tree. {} tracked artifacts, {} entities, and \
                  neither count moved; this daemon does not report whether content moved, so \
@@ -468,6 +493,7 @@ mod tests {
             embeddings_total: 14187,
             reconcile: ReconcileHealth::default(),
             tree_moved: Some(true),
+            prior_admission_at: None,
             admitted,
             failure: (!admitted)
                 .then(|| "host entry changed after exact-tree admission".to_string()),
@@ -512,6 +538,48 @@ mod tests {
         let text = summary_lines(&content_only_pass(Some(false))).join("\n");
         assert!(text.contains("nothing changed"), "{text}");
         assert!(!text.contains("content changed"), "{text}");
+    }
+
+    /// A settled pass names WHEN the tree became current.
+    ///
+    /// "Nothing changed" is true and reads as "your edit was not taken" to the
+    /// one reader most likely to see it, someone who edited a file a second
+    /// earlier. Measured on kin 0.6.2 at 510be53f9: the watch loop drains its
+    /// file watcher every 100ms and admits what it finds, so an admit issued
+    /// 1.0s after a write reported nothing changed 6 times out of 6, while one
+    /// issued immediately reported the content change 6 out of 6. The pass was
+    /// right both times. What was missing was the basis, so this asserts the
+    /// clock is named AND that the bare wording is gone, because a branch that
+    /// appended a time without replacing the sentence would pass a weaker test.
+    #[test]
+    fn a_settled_pass_names_when_the_tree_became_current() {
+        let mut settled = content_only_pass(Some(false));
+        settled.prior_admission_at = Some("2026-08-30T20:04:00Z".to_string());
+        let text = summary_lines(&settled).join("\n");
+        assert!(
+            text.contains("already admitted at 2026-08-30T20:04:00Z"),
+            "a settled pass must name when the tree became current: {text}"
+        );
+        assert!(
+            !text.contains("nothing changed"),
+            "the basis replaces the bare wording rather than sitting beside it: {text}"
+        );
+    }
+
+    /// And the third answer stays three-way. No recorded admission is not the
+    /// same as one at an unknown time, so the absence is named rather than
+    /// rendered as a bare "nothing changed" that a reader would take for a
+    /// basis it does not have.
+    #[test]
+    fn a_settled_pass_with_no_recorded_admission_says_so_rather_than_inventing_one() {
+        let settled = content_only_pass(Some(false));
+        assert!(settled.prior_admission_at.is_none(), "fixture precondition");
+        let text = summary_lines(&settled).join("\n");
+        assert!(
+            text.contains("no earlier admission is recorded"),
+            "an absent clock must be named as absent: {text}"
+        );
+        assert!(!text.contains("already admitted at"), "{text}");
     }
 
     /// An unmeasured tree is the third answer and must render as neither of the

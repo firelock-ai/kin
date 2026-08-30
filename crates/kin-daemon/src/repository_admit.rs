@@ -218,6 +218,19 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
     // outcome on the surfaces that answer for the store.
     let now = Instant::now();
     let probes = state.background_work.reconcile();
+
+    // Read the PREVIOUS admission's clock before this pass records its own.
+    // `record_admission_success` below overwrites it and the report is built
+    // afterwards, so reading it there names this very pass at an age of zero,
+    // which says nothing about why there was nothing left to admit. The watch
+    // loop drains its file watcher every 100ms and admits what it finds, so a
+    // write can be admitted between an operator's edit and the `kin admit` they
+    // run about it; this is the clock that lets the summary say so.
+    let prior_admission_at = state
+        .background_work
+        .reconcile_report(now)
+        .last_admission_success_at;
+
     let failure = match &outcome {
         Ok(()) => {
             probes.record_admission_success(now);
@@ -262,6 +275,7 @@ async fn run_pass(state: &DaemonState) -> Result<AdmitResponse> {
         // identically.
         reconcile: state.background_work.reconcile_report(now),
         tree_moved: tree_moved(&before, &after),
+        prior_admission_at,
         admitted: failure.is_none(),
         failure,
     };
