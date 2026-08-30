@@ -961,6 +961,18 @@ fn switch(
                 &workspace.tree,
                 &authority.manager,
             )
+            // A switch to the ref this workspace already tracks is not a
+            // transition, so there is nothing for pending work to carry onto and
+            // an admission clears nothing the caller asked for. It would still
+            // publish, moving the authority generation as a side effect of a
+            // command that changes nothing, so the drift refusal keeps its plain
+            // kind here and the retry never sees it.
+            //
+            // Measured, not assumed: this is where the same-target drift refusal
+            // is actually raised. `preflight_switch_delta` above never refuses
+            // on it, which a probe said and a reading of the two call sites did
+            // not.
+            .map_err(forget_that_admission_would_clear_it)
             .with_context(|| format!("verify exact projection for already-active branch {name}"))?;
         let generation = authority_freeze.roots().generation;
         drop(authority_freeze);
@@ -1531,6 +1543,21 @@ fn projection_conflict_kind(error: &anyhow::Error) -> Option<kin_core::Projectio
         .chain()
         .find_map(|cause| cause.downcast_ref::<kin_core::KinError>())
         .and_then(kin_core::KinError::projection_conflict_kind)
+}
+
+/// Drop the claim that one admission pass would clear this refusal.
+///
+/// For a refusal raised where no transition is being made, the claim is true
+/// and useless: admitting would publish and change the generation while the
+/// caller's command still does nothing. Everything else about the error, its
+/// status and its sentence, is untouched.
+fn forget_that_admission_would_clear_it(error: kin_core::KinError) -> kin_core::KinError {
+    match error {
+        kin_core::KinError::ProjectionConflict(detail) => {
+            kin_core::KinError::projection_conflict(detail.message)
+        }
+        other => other,
+    }
 }
 
 fn classify_branch_error(error: anyhow::Error) -> WorkspaceMutationRefusal {
