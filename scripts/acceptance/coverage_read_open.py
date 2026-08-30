@@ -36,9 +36,13 @@ cannot be arranged on this host it returns UNREADABLE rather than PASS, because
 an arm that never reached its own condition has graded nothing, and the
 substitution it exists for reports in-sync too.
 
-``instrument`` guards the attribution itself: every authority open logs the
-caller that asked for it, and an instrument that silently stopped logging is
-worse than none, because the count it feeds keeps being quoted.
+``instrument`` guards the attribution itself, at BOTH depths. Every authority
+open logs the caller that asked for it, and an instrument that silently stopped
+logging is worse than none because the count it feeds keeps being quoted. Both
+depths are required because they cover different populations: instrumenting only
+kin-cli's wrapper attributed two of twenty-six opens on a measured run, so a
+suite happy with the wrapper alone would certify an attribution covering an
+unknown and small fraction.
 
 Each check prints:
 
@@ -71,7 +75,16 @@ IN_SYNC = "repository_tree_in_sync"
 
 # What an authority open logs about itself. Matched as substrings, because the
 # line carries a repository id, a caller and a count that all vary.
+#
+# TWO lines, at two depths, and both are required. The wrapper line comes from
+# kin-cli's `ActiveRepositoryAuthority::open`; the funnel line comes from
+# `kin_core::open_persisted_local_repository_authority`, which every path into
+# kin-db's recovery reaches. Measured on a converted store, the wrapper
+# attributed two of twenty-six opens in one run, so a suite asserting only the
+# wrapper would pass a build whose funnel instrument had been removed and would
+# certify an attribution covering a small fraction of the opens.
 OPEN_LINE = "opening repository authority"
+FUNNEL_LINE = "opening persisted repository authority"
 OPEN_CALLER_FIELD = "caller="
 
 
@@ -188,19 +201,34 @@ def instrument_problems(log_text):
     if log_text is None:
         return None
     clean = strip_ansi(log_text)
-    lines = [line for line in clean.splitlines() if OPEN_LINE in line]
-    if not lines:
+    # The funnel line contains the wrapper line's text as a substring, so it has
+    # to be separated before either is counted, or every funnel open would be
+    # scored as a wrapper open and the two-depth check would collapse to one.
+    funnel = [line for line in clean.splitlines() if FUNNEL_LINE in line]
+    wrapper = [
+        line
+        for line in clean.splitlines()
+        if OPEN_LINE in line and FUNNEL_LINE not in line
+    ]
+    problems = []
+    if not funnel:
+        problems.append(
+            "no persisted-authority open was logged at all, so this build carries no funnel "
+            "instrument and any attribution from it would cover an unknown fraction"
+        )
+    if not funnel and not wrapper:
         return [
-            "no authority open was logged at all, so the count these lines feed cannot be "
-            "attributed to any caller"
+            "no authority open of either depth was logged, so the count these lines feed "
+            "cannot be attributed to any caller"
         ]
-    unattributed = [line for line in lines if OPEN_CALLER_FIELD not in line]
-    if unattributed:
-        return [
-            "%d of %d authority opens logged no caller, so they cannot be attributed"
-            % (len(unattributed), len(lines))
-        ]
-    return []
+    for label, lines in (("funnel", funnel), ("wrapper", wrapper)):
+        bare = [line for line in lines if OPEN_CALLER_FIELD not in line]
+        if bare:
+            problems.append(
+                "%d of %d %s opens logged no caller, so they cannot be attributed"
+                % (len(bare), len(lines), label)
+            )
+    return problems
 
 
 class Suite(object):
@@ -366,14 +394,27 @@ def self_test():
 
     good = "INFO %s repository=r caller=graph_health.rs:201 opens_on_this_thread=1" % OPEN_LINE
     bare = "INFO %s repository=r opens_on_this_thread=1" % OPEN_LINE
-    expect(instrument_problems(good) == [], "an attributed open passes")
-    expect(instrument_problems(bare) != [], "an open with no caller fails")
-    expect(instrument_problems(good + "\n" + bare) != [], "one bare open among many fails")
+    funnel = "INFO %s repository=r caller=state.rs:4676" % FUNNEL_LINE
+    bare_funnel = "INFO %s repository=r" % FUNNEL_LINE
+    both = funnel + "\n" + good
+    expect(instrument_problems(both) == [], "both depths attributed passes")
+    expect(
+        instrument_problems(good) != [],
+        "the wrapper alone fails, because a build with no funnel instrument attributes an "
+        "unknown fraction",
+    )
+    expect(instrument_problems(funnel) == [], "the funnel alone passes")
+    expect(instrument_problems(funnel + "\n" + bare) != [], "a bare wrapper open fails")
+    expect(instrument_problems(bare_funnel) != [], "a bare funnel open fails")
     expect(instrument_problems("nothing here") != [], "no open logged at all fails")
     expect(instrument_problems(None) is None, "an unreadable log is unknown")
     expect(
-        instrument_problems("\x1b[32m" + good + "\x1b[0m") == [],
+        instrument_problems("\x1b[32m" + both + "\x1b[0m") == [],
         "ANSI escapes do not hide the caller",
+    )
+    expect(
+        instrument_problems(funnel) == [] and instrument_problems(funnel + "\n" + good) == [],
+        "the funnel line is not miscounted as a wrapper open despite containing its text",
     )
 
     print("SELFTEST PASS %d assertions over 3 graders" % asserts)
