@@ -329,6 +329,68 @@ impl LocalRepositoryAuthorityBinding {
         )
         .map(|(manager, payload_stats)| (manager, Some(payload_stats)))
     }
+
+    /// Read one immutable source body by content address, without opening the
+    /// authority.
+    ///
+    /// The two opens above recover the whole repository: they read the
+    /// authoritative snapshot into memory and decode it, which on a converted
+    /// repository is dominated by the change map. A caller that wants a handful
+    /// of bodies by digest needs none of that, and paying for it is what made a
+    /// read cost the whole store.
+    ///
+    /// This is not a weaker read. A body is admitted only when its bytes hash to
+    /// the digest that named them, which is the same content-address rule the
+    /// manager applies, computed here rather than borrowed because kin-db keeps
+    /// its verifier crate-private. `verify_source_blob_digest` below is that
+    /// rule and has its own tests; a mismatch is a hard error rather than a
+    /// `None`, because bytes that do not hash to their own name are corruption
+    /// and not absence.
+    pub fn load_source_blob(
+        &self,
+        digest: kin_model::Hash256,
+    ) -> Result<Option<Vec<u8>>> {
+        let body = self
+            .backend
+            .load_source_blob_bounded(
+                self.repository_id.as_str(),
+                *digest.as_bytes(),
+                kin_db::MAX_SOURCE_BLOB_BYTES,
+            )
+            .map_err(|error| {
+                KinError::Graph(format!(
+                    "read immutable source blob {digest} for repository {}: {error}",
+                    self.repository_id
+                ))
+            })?;
+        let Some(body) = body else {
+            return Ok(None);
+        };
+        verify_source_blob_digest(digest, &body).map_err(KinError::Graph)?;
+        Ok(Some(body))
+    }
+}
+
+/// Whether these bytes are the ones this digest names.
+///
+/// Its own function, and public to the crate, because it is the whole safety
+/// argument for reading a body without opening the authority that would
+/// otherwise have checked it. A read that skipped this would be trusting a path
+/// on disk instead of a content address, which is the file-first behaviour the
+/// graph-first rule exists to keep out of runtime answers.
+pub(crate) fn verify_source_blob_digest(
+    digest: kin_model::Hash256,
+    body: &[u8],
+) -> std::result::Result<(), String> {
+    let actual = kin_model::Hash256::from_bytes(
+        <[u8; 32]>::from(<sha2::Sha256 as sha2::Digest>::digest(body)),
+    );
+    if actual != digest {
+        return Err(format!(
+            "immutable source blob {digest} does not hash to its own name; the bytes on disk              hash to {actual}"
+        ));
+    }
+    Ok(())
 }
 
 /// Open an already initialized local repository through one coherent recovery.

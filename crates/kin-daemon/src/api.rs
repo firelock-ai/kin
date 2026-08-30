@@ -136,7 +136,7 @@ const MAX_AUTHORITY_PUBLICATION_RECORD_BYTES: u64 = 1024 * 1024;
 /// whether an already-loaded authority may be reused, and every answer served
 /// still comes from repository-v6 graph truth.
 #[derive(Clone, PartialEq, Eq)]
-enum LocalPublicationIdentity {
+pub(crate) enum LocalPublicationIdentity {
     /// The repository has persisted no authority yet, so its authority is the
     /// unpublished generation-zero state.
     Unpublished,
@@ -150,6 +150,20 @@ enum LocalPublicationIdentity {
 /// request and pay the full load only when the publication has actually moved
 /// — including when it moved under a separate process such as a CLI ingest or
 /// commit running beside the daemon.
+/// The publication identity, for a caller with no HTTP response to return.
+///
+/// Startup uses this to label the workspace tree it retains. `None` means the
+/// record could not be read, and the caller must then retain nothing: a tree
+/// with no publication label cannot be shown to describe the current one, and
+/// serving it anyway would be the file-first guess this whole path exists to
+/// avoid. Losing the label costs a slower first coverage read and nothing else.
+pub(crate) fn read_local_publication_identity_or_none(
+    backend: &LocalFileBackend,
+    repository_id: &RepositoryId,
+) -> Option<LocalPublicationIdentity> {
+    read_local_publication_identity(backend, repository_id).ok()
+}
+
 fn read_local_publication_identity(
     backend: &LocalFileBackend,
     repository_id: &RepositoryId,
@@ -223,6 +237,14 @@ pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
     query: std::sync::Mutex<Option<HeldQueryAuthority>>,
     command: std::sync::Mutex<Option<HeldCommandAuthority>>,
+    /// The durable workspace tree, for the reads that need only that.
+    ///
+    /// Its own slot rather than a field of the command authority, because the
+    /// point is to hold it WITHOUT holding the authority it came from. The
+    /// daemon reads it during startup, from the authority it opens and then
+    /// drops, so a coverage read costs nothing after that and the daemon's
+    /// steady state gains a tree rather than a store.
+    coverage_tree: std::sync::Mutex<Option<HeldCoverageTree>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -239,6 +261,19 @@ struct HeldProjectionAuthority {
     /// the commit that replaced them.
     published: LocalPublicationIdentity,
     authority: ActiveApiRepositoryAuthority,
+}
+
+/// One durable workspace tree and the publication it was read at.
+#[derive(Clone)]
+struct HeldCoverageTree {
+    /// Read strictly before the authority this tree came out of was loaded,
+    /// exactly as for [`HeldProjectionAuthority::published`] and for the same
+    /// reason. A label taken afterwards can name a publication that landed
+    /// during the load, which would let a coverage read compare the graph
+    /// against a tree from before the commit that replaced it and report
+    /// coherence.
+    published: LocalPublicationIdentity,
+    tree: Arc<kin_model::ResolvedTree>,
 }
 
 #[derive(Clone)]
@@ -335,10 +370,34 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    /// The retained tree, only when it describes the publication named.
+    pub(crate) fn reuse_coverage_tree(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<Arc<kin_model::ResolvedTree>> {
+        lock_recover(&self.coverage_tree)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| Arc::clone(&held.tree))
+    }
+
+    pub(crate) fn install_coverage_tree(
+        &self,
+        published: LocalPublicationIdentity,
+        tree: Arc<kin_model::ResolvedTree>,
+    ) {
+        *lock_recover(&self.coverage_tree) = Some(HeldCoverageTree { published, tree });
+    }
+
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
         *lock_recover(&self.command) = None;
+        // The tree is invalidated with the rest. It is keyed on the publication
+        // and would refuse a moved one on its own, but a namespace that failed
+        // revalidation is not a moved publication, it is a store this daemon can
+        // no longer vouch for, and nothing read from it may be reused.
+        *lock_recover(&self.coverage_tree) = None;
     }
 }
 
@@ -551,6 +610,39 @@ fn command_repository_authority(
         "command repository authority loaded"
     );
     Ok(authority)
+}
+
+/// Give a request the retained workspace tree, when it still describes storage.
+///
+/// `None` means it does not, or that none was retained, and the caller keeps
+/// the request it had. Both outcomes are logged rather than silent: a fast path
+/// that quietly stopped applying reads exactly like one that is working, and
+/// the cost of that is a memory regression nobody can see. FIR-2964.
+fn attach_coverage_tree(
+    state: &DaemonState,
+    request: kin_cli::commands::repository_authority::RequestRepositoryAuthority,
+) -> Option<kin_cli::commands::repository_authority::RequestRepositoryAuthority> {
+    let backend = state.local_repository_backend()?;
+    let repository_id = state.local_repository_authority_binding().ok()?.repository_id().clone();
+    let published = read_local_publication_identity_or_none(&backend, &repository_id)?;
+    match state.projection_authority.reuse_coverage_tree(&published) {
+        Some(tree) => {
+            tracing::debug!(
+                repository = %repository_id,
+                workspace_artifacts = tree.len(),
+                "coverage read served from the retained workspace tree, no authority open"
+            );
+            Some(request.with_workspace_tree(tree))
+        }
+        None => {
+            tracing::info!(
+                repository = %repository_id,
+                "no retained workspace tree describes this publication, so the coverage read \
+                 opens this repository's authority; that open costs the whole store"
+            );
+            None
+        }
+    }
 }
 
 /// Hand a command helper an authority this daemon already resolved.
@@ -4594,12 +4686,25 @@ async fn command_graph(
     let resolver_state = Arc::clone(&state);
     let repository_authority =
         kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
-            binding,
+            binding.clone(),
             Arc::new(move || {
                 command_repository_authority(&resolver_state)
                     .map_err(|(_, message)| anyhow::anyhow!(message))
             }),
         );
+    // The coverage read wants the durable workspace tree and a few bodies by
+    // digest, and nothing else. Both are reachable without an open, so hand the
+    // tree over when this daemon still has one that describes what storage
+    // holds now, and let the resolver above serve every other read unchanged.
+    //
+    // Re-reading the publication here rather than trusting the retained label
+    // is the whole freshness argument: the tree was read at a publication, and
+    // a commit since then means it describes bytes that are no longer current,
+    // so it is refused and the slow path answers.
+    let repository_authority = match attach_coverage_tree(&state, repository_authority) {
+        Some(with_tree) => with_tree,
+        None => repository_authority,
+    };
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     // Read here rather than inside the renderer, for the reason the freshness
     // marker is read in the CLI: the record is a property of the store on disk,

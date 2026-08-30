@@ -4292,6 +4292,16 @@ impl DaemonState {
             .unwrap_or(false)
     }
 
+    /// Whether an operator asked this daemon not to retain the workspace tree.
+    fn coverage_tree_disabled() -> bool {
+        std::env::var("KIN_DAEMON_NO_COVERAGE_TREE")
+            .map(|value| {
+                let value = value.trim().to_ascii_lowercase();
+                matches!(value.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false)
+    }
+
     fn locate_only_snapshot_mode() -> bool {
         std::env::var("KIN_DAEMON_LOCATE_ONLY")
             .ok()
@@ -4672,6 +4682,23 @@ impl DaemonState {
         // of an unpersisted generation-zero authority. Use the receipt from
         // this same recovery to refuse an intact namespace whose authority
         // record disappeared without paying for a second load or lock.
+        // Read BEFORE the open below, never after, which is the same ordering
+        // every other publication label in this daemon is taken under: a label
+        // read afterwards can name a publication that landed during the load,
+        // which would mark older bytes as current.
+        //
+        // The opt-out exists so the cost this removes can be reproduced on
+        // demand: an acceptance check drives both arms with it, and a
+        // falsification that could not turn the fast path off would be grading
+        // one observation twice.
+        let coverage_published = if Self::coverage_tree_disabled() {
+            None
+        } else {
+            crate::api::read_local_publication_identity_or_none(
+                &local_repository_backend,
+                &repository_id,
+            )
+        };
         let (authority, _authority_payload_stats) = phases
             .record("authority_open", || {
                 kin_core::open_persisted_local_repository_authority(
@@ -4766,6 +4793,29 @@ impl DaemonState {
                     repository_id, workspace_id
                 )))
             })?;
+        // The durable workspace tree, taken from the authority metadata while
+        // this startup still holds it open.
+        //
+        // NOT `workspace_snapshot.resolved_tree`, which is the tree the query
+        // graph is built from three lines below. A coverage read's first act is
+        // to ask whether the graph's tree and the authority's agree, so handing
+        // it the graph's own tree would compare the graph to itself and report
+        // coherence whatever is on disk. This is the same field
+        // `ActiveRepositoryAuthority::workspace()` returns, read from the same
+        // metadata, so a coverage read served from it answers exactly what an
+        // open would have answered at this publication.
+        let coverage_tree = coverage_published.clone().and_then(|published| {
+            let workspace = lease
+                .metadata()
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.workspace_id == workspace_id)?;
+            // Validated here for the same reason the coverage read validates
+            // what it opens. A tree that would have been refused on the slow
+            // path must not be served on the fast one.
+            workspace.validate().ok()?;
+            Some((published, Arc::new(workspace.tree.clone())))
+        });
         let text_index_path = layout.text_index_dir();
         let locate_only = Self::locate_only_snapshot_mode();
         let generation = lease.roots().generation;
@@ -4876,7 +4926,31 @@ impl DaemonState {
             hosted_authority_flush_refusals: AtomicU64::new(0),
             local_repository_backend: Some(local_repository_backend),
             local_kindb_capability: Some(local_kindb_capability),
-            projection_authority: crate::api::ProjectionAuthorityCache::default(),
+            projection_authority: {
+                // Installed at construction rather than on the first request,
+                // which is the whole point: the authority this tree came out of
+                // was opened and dropped above, so a coverage read after this
+                // costs a tree lookup instead of a second whole-store open.
+                let cache = crate::api::ProjectionAuthorityCache::default();
+                if let Some((published, tree)) = coverage_tree {
+                    let artifacts = tree.len();
+                    cache.install_coverage_tree(published, tree);
+                    info!(
+                        repository = %cached_repo_id,
+                        workspace = %workspace_id,
+                        workspace_artifacts = artifacts,
+                        "retained the durable workspace tree for coverage reads"
+                    );
+                } else {
+                    info!(
+                        repository = %cached_repo_id,
+                        workspace = %workspace_id,
+                        "no durable workspace tree was retained, so a coverage read will open \
+                         this repository's authority for itself"
+                    );
+                }
+                cache
+            },
             registered_local_repository_authorities,
             registered_local_repository_authority_incomplete,
             spine_disabled,

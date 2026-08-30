@@ -66,6 +66,20 @@ pub fn repository_authority_opens_on_this_thread() -> u64 {
 pub struct RequestRepositoryAuthority {
     binding: kin_core::LocalRepositoryAuthorityBinding,
     shared: Option<SharedAuthorityResolver>,
+    /// The durable workspace tree, when a server resolved it without an open.
+    ///
+    /// Separate from `shared`, and it is worth saying why they are not one
+    /// thing. `shared` hands back a whole opened authority, which is the right
+    /// answer for a read that needs history. A coverage read needs the durable
+    /// tree and a few bodies by digest and nothing else, and on a converted
+    /// repository the change map it would decode to reach them is about
+    /// nineteen twentieths of the store. So the cheap answer is its own field
+    /// rather than a cheaper way to build the expensive one.
+    ///
+    /// The freshness obligation is the same as `shared`'s and is the server's:
+    /// this tree must have been read at a publication the server confirmed is
+    /// the one local storage still holds, confirmed BEFORE the read it labels.
+    workspace_tree: Option<std::sync::Arc<kin_model::ResolvedTree>>,
 }
 
 /// A server's promise to produce authority for the publication a request reads
@@ -79,6 +93,7 @@ impl RequestRepositoryAuthority {
         Self {
             binding,
             shared: None,
+            workspace_tree: None,
         }
     }
 
@@ -98,7 +113,43 @@ impl RequestRepositoryAuthority {
         Self {
             binding,
             shared: Some(resolve),
+            workspace_tree: None,
         }
+    }
+
+    /// Add the durable workspace tree this server already holds.
+    ///
+    /// A coverage read served from this opens nothing. Every other read on the
+    /// same value still goes through `shared`, so adding it can only remove
+    /// work and never redirect a read that needs history to a tree.
+    pub fn with_workspace_tree(
+        mut self,
+        workspace_tree: std::sync::Arc<kin_model::ResolvedTree>,
+    ) -> Self {
+        self.workspace_tree = Some(workspace_tree);
+        self
+    }
+
+    /// The durable tree and body reader a coverage read needs, when they can be
+    /// had without opening the authority.
+    ///
+    /// `None` means the caller must open, which is the one-shot CLI's normal
+    /// path and a server's fallback when its retained tree does not describe
+    /// the current publication.
+    pub(crate) fn coverage_without_open(
+        &self,
+    ) -> Option<(
+        std::sync::Arc<kin_model::ResolvedTree>,
+        impl Fn(kin_model::Hash256) -> Result<Vec<u8>> + '_,
+    )> {
+        let tree = self.workspace_tree.clone()?;
+        let binding = &self.binding;
+        Some((tree, move |digest: kin_model::Hash256| {
+            binding
+                .load_source_blob(digest)
+                .with_context(|| format!("load immutable repository source blob {digest}"))?
+                .ok_or_else(|| anyhow!("immutable repository source blob {digest} is absent"))
+        }))
     }
 
     /// The startup-pinned identity and storage capability behind this authority,

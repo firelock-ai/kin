@@ -188,16 +188,35 @@ struct EnrichmentFacets {
 
 /// Coverage against the authority this request reads at.
 ///
-/// Takes the request's authority rather than its binding because
-/// [`ActiveRepositoryAuthority::open`] re-verifies every persisted body against
-/// its content address, so it costs whatever the whole store is worth. A server
-/// that has already paid for one open at the publication this request reads
-/// hands it over here; a one-shot caller still opens for itself.
+/// Two things come out of the authority here and nothing else: the durable
+/// workspace tree, and a few bodies by content address for the structured
+/// facets. No entity, no relation, no change.
+///
+/// That matters because [`ActiveRepositoryAuthority::open`] re-verifies every
+/// persisted body against its content address and decodes the whole authority
+/// to do it, so it costs whatever the store is worth. On a converted repository
+/// the change map this read never touches is about nineteen twentieths of that.
+/// A server that can supply the tree and reach the bodies by digest therefore
+/// answers this without opening at all; a server that has already paid for an
+/// open hands it over; a one-shot caller opens for itself.
+///
+/// The durable tree cannot be replaced by the graph's own, which is the obvious
+/// shortcut and a wrong one: the first thing computed below is whether the two
+/// AGREE, so serving the durable side from the graph compares the graph to
+/// itself and reports coherence no matter what is on disk.
 fn collect_repository_artifact_coverage(
     authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     graph_tree: &ResolvedTree,
 ) -> Result<RepositoryArtifactCoverage> {
+    if let Some((workspace_tree, read_body)) = authority.coverage_without_open() {
+        return collect_repository_artifact_coverage_for_tree(
+            &workspace_tree,
+            graph,
+            graph_tree,
+            &read_body,
+        );
+    }
     let authority = authority.open()?;
     let workspace = authority.workspace()?;
     workspace.validate()?;
