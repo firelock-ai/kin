@@ -1590,6 +1590,49 @@ async fn revive_mcp_daemon() -> Result<String, String> {
     revived
 }
 
+/// The route a revival polls to decide the daemon it started can serve a call.
+///
+/// Named rather than inlined so a test can stand a server in front of it and
+/// prove the choice, and so changing it back to a liveness route is a visible
+/// edit to a constant rather than a character inside a format string.
+const REVIVAL_READINESS_ROUTE: &str = "/readiness";
+
+/// What one poll of [`REVIVAL_READINESS_ROUTE`] observed.
+///
+/// Three states rather than a bool, because the two failing ones are different
+/// news and the timeout report says which. A daemon answering the route with
+/// 503 is bound and openly not ready; one answering nothing has published a
+/// port and has not begun serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadinessPoll {
+    /// The daemon answered with success, so it can serve this caller's next call.
+    Ready,
+    /// The daemon answered and said it is not ready yet.
+    NotReady,
+    /// Nothing answered.
+    Unreachable,
+}
+
+/// Ask a just-started daemon whether it can serve, once.
+///
+/// This exists as its own function so the endpoint choice is testable. Polling
+/// `/health` here instead would report [`ReadinessPoll::Ready`] against a daemon
+/// that is bound and has not opened its store, which is the defect this seam was
+/// extracted to make falsifiable: the test beside it serves 200 on `/health` and
+/// 503 on `/readiness` from one socket, so an endpoint that reads liveness
+/// cannot pass it.
+async fn poll_revival_readiness(probe: &reqwest::Client, base: &str) -> ReadinessPoll {
+    match probe
+        .get(format!("{base}{REVIVAL_READINESS_ROUTE}"))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => ReadinessPoll::Ready,
+        Ok(_) => ReadinessPoll::NotReady,
+        Err(_) => ReadinessPoll::Unreachable,
+    }
+}
+
 /// Wait for a just-started MCP daemon to report its port and serve health.
 ///
 /// Split from the spawn so the child handle outlives every exit this can take
@@ -1621,7 +1664,24 @@ async fn await_revived_daemon(
         .await
         .map_err(|e| format!("MCP revival: {e}"))?;
 
-    // Poll /health until the daemon is ready, under the same patience.
+    // Poll /readiness until the daemon can actually serve, under the same
+    // patience.
+    //
+    // This polled `/health`, and `/health` is liveness. The daemon says so in
+    // its own words: a repo-scoped query to it is refused with "/health is
+    // liveness-only and will not lazy-load repo graphs". It answers 200 as soon
+    // as the HTTP server binds, which is before the store is open, so a revival
+    // that returned on it handed the caller a URL and the caller's very next
+    // tool call failed against a daemon that was still loading. A stranger run
+    // measured exactly that: `/health` answered 200 in 7 ms on the revived
+    // daemon while `/mcp/tools/call` refused, and the retry failed on a daemon
+    // that answered the same call correctly minutes later.
+    //
+    // `/readiness` is the endpoint that answers the question this loop is
+    // asking. It is registered on this same router beside `/health` and returns
+    // 200 only once `is_initialized` is set, which happens after a snapshot load
+    // or a completed reconciliation cycle. An empty but initialized workspace is
+    // ready, so this does not wait on content the repository does not have.
     let new_base = format!("http://127.0.0.1:{port}");
     let probe = reqwest::Client::builder()
         .connect_timeout(Duration::from_millis(300))
@@ -1629,9 +1689,13 @@ async fn await_revived_daemon(
         .build()
         .map_err(|e| format!("MCP revival: build probe client: {e}"))?;
     let deadline = tokio::time::Instant::now() + patience;
+    // Whether the daemon ever answered the readiness route at all, which
+    // separates "bound and openly not ready" from "not answering yet". Both are
+    // retryable and they are not the same news, so the timeout says which.
+    let mut answered_readiness = false;
     loop {
-        if let Ok(resp) = probe.get(format!("{new_base}/health")).send().await {
-            if resp.status().is_success() {
+        match poll_revival_readiness(&probe, &new_base).await {
+            ReadinessPoll::Ready => {
                 // A daemon the supervisor does not know about is unroutable to
                 // every other client, so registration is part of starting one.
                 if let Err(error) =
@@ -1640,16 +1704,20 @@ async fn await_revived_daemon(
                     tracing::warn!(
                         url = %new_base,
                         %error,
-                        "MCP revival: daemon is healthy but supervisor registration failed"
+                        "MCP revival: daemon is ready but supervisor registration failed"
                     );
                 }
                 // Route all subsequent delegate calls at the revived daemon.
                 if let Ok(mut guard) = DAEMON_URL_OVERRIDE.lock() {
                     *guard = Some(new_base.clone());
                 }
-                tracing::info!(url = %new_base, "MCP revival: daemon is healthy");
+                tracing::info!(url = %new_base, "MCP revival: daemon is ready");
                 return Ok(new_base);
             }
+            // Any answer at all, including the 503 this route returns while the
+            // store is opening, proves the server is bound and talking.
+            ReadinessPoll::NotReady => answered_readiness = true,
+            ReadinessPoll::Unreachable => {}
         }
 
         // The child reporting a port then failing to serve is still a startup
@@ -1662,7 +1730,7 @@ async fn await_revived_daemon(
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(still_starting_message(port, patience));
+            return Err(still_starting_message(port, patience, answered_readiness));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1686,10 +1754,34 @@ async fn await_revived_daemon(
 /// [`kin_daemon_spawn::PortWaitError::StillStarting`] on the port half of the
 /// same revival: the child is alive and was left running, so retrying is the
 /// remedy and killing it is not.
-fn still_starting_message(port: u16, patience: Duration) -> String {
+///
+/// The sentence carries [`DAEMON_STILL_STARTING`] verbatim, and that is
+/// load-bearing rather than stylistic. [`is_still_starting_error`] is the only
+/// reader of that constant, and the caller at the retry branch uses it to decide
+/// whether to tell an agent "retry, do not restart `kin mcp start`". This
+/// message used to read `daemon on port {port} is still starting`, which does
+/// not contain `daemon is still starting`, so the branch could never fire for
+/// this half of the revival while firing correctly for the port half, whose text
+/// in `kin-daemon-spawn` carries the constant. The two halves of one revival
+/// disagreed about whether their own outcome was retryable, and the test beside
+/// this asserts through `is_still_starting_error` rather than through a loose
+/// substring, because a substring assertion is what let the gap survive.
+///
+/// `answered_readiness` separates the two ways a daemon can miss the deadline
+/// while alive. Both are retryable and they are not the same news: a daemon
+/// answering `/readiness` with 503 is bound and openly not ready, so the store
+/// open is what remains, while one answering nothing has published a port and
+/// not begun serving. Reporting them identically would make the two states
+/// indistinguishable to a reader and to any check that grades this text.
+fn still_starting_message(port: u16, patience: Duration, answered_readiness: bool) -> String {
+    let observed = if answered_readiness {
+        "it is serving and reports itself not ready, so the store open is what remains"
+    } else {
+        "it has published a port and is not answering yet"
+    };
     format!(
-        "MCP revival: daemon on port {port} is still starting after {}s and was left running \
-         rather than killed. Retry this call, or raise {} to wait longer",
+        "MCP revival: {DAEMON_STILL_STARTING} on port {port} after {}s and was left running \
+         rather than killed ({observed}). Retry this call, or raise {} to wait longer",
         patience.as_secs(),
         kin_daemon_spawn::DAEMON_STARTUP_PATIENCE_ENV
     )
@@ -2605,8 +2697,8 @@ mod tests {
     /// seconds and must not name the other's.
     #[test]
     fn the_still_starting_report_names_the_bound_it_actually_waited() {
-        let short = still_starting_message(40713, Duration::from_secs(15));
-        let real = still_starting_message(40713, Duration::from_secs(300));
+        let short = still_starting_message(40713, Duration::from_secs(15), true);
+        let real = still_starting_message(40713, Duration::from_secs(300), true);
         assert!(
             short.contains("after 15s"),
             "a 15 s wait must report 15 s: {short}"
@@ -2634,7 +2726,7 @@ mod tests {
     /// or the caller has no move but the one that loses the daemon.
     #[test]
     fn the_still_starting_report_offers_a_retry_and_the_lever_that_widens_the_wait() {
-        let message = still_starting_message(40713, Duration::from_secs(300));
+        let message = still_starting_message(40713, Duration::from_secs(300), true);
         assert!(message.contains("still starting"), "{message}");
         assert!(message.contains("left running"), "{message}");
         assert!(message.contains("Retry this call"), "{message}");
@@ -2645,6 +2737,178 @@ mod tests {
         assert!(
             message.contains("40713"),
             "the report names no port: {message}"
+        );
+    }
+
+    /// The health half's timeout must classify as still-starting, and the test
+    /// has to ask the classifier rather than the words.
+    ///
+    /// This is the assertion whose absence let a dead branch live. The sibling
+    /// test above asserts `contains("still starting")`, which held while
+    /// [`is_still_starting_error`] returned false, because the sentence read
+    /// `daemon on port N is still starting` and the constant it is matched
+    /// against is `daemon is still starting`. The port half of the same revival
+    /// carried the constant and classified correctly, so one revival had two
+    /// halves disagreeing about whether their own outcome was retryable, and
+    /// every substring assertion in the file passed throughout.
+    ///
+    /// Both observations are asserted, because a fix that classified only the
+    /// one the author happened to test would leave the other silent.
+    #[test]
+    fn the_still_starting_report_is_classified_as_still_starting() {
+        for answered_readiness in [true, false] {
+            let message =
+                still_starting_message(40713, Duration::from_secs(300), answered_readiness);
+            assert!(
+                is_still_starting_error(&message),
+                "the revival's own still-starting report is not classified as one, so the retry \
+                 branch keyed on it cannot fire (answered_readiness={answered_readiness}): {message}"
+            );
+        }
+        // The control: an unrelated revival failure must NOT classify as
+        // still-starting, or the classifier would be answering yes to
+        // everything and the assertion above would prove nothing.
+        assert!(
+            !is_still_starting_error(
+                "MCP revival: daemon exited during startup with status 1 (port 40713)"
+            ),
+            "a daemon that exited is not still starting"
+        );
+    }
+
+    /// Serve one socket that answers `/health` 200 and `/readiness` with
+    /// `ready_status`, for as many requests as arrive, until the returned guard
+    /// is dropped.
+    ///
+    /// Hand-rolled on a `TcpListener` rather than pulled from a framework
+    /// because the property under test is which path the prober asks for, and a
+    /// server that answers two paths differently is the whole fixture. It adds
+    /// no dependency to a crate that ships.
+    async fn serve_health_and_readiness(
+        ready_status: u16,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = vec![0u8; 2048];
+                    let Ok(n) = stream.read(&mut buf).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                    // `/health` is always 200 here, which is exactly what the
+                    // real daemon does while its store is still opening.
+                    let status = if request.starts_with("GET /health") {
+                        200
+                    } else if request.starts_with("GET /readiness") {
+                        ready_status
+                    } else {
+                        404
+                    };
+                    let body = format!("{{\"stub_status\":{status}}}");
+                    let response = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        (base, handle)
+    }
+
+    /// The revival's probe must read readiness, and a liveness route must not
+    /// pass this.
+    ///
+    /// This is the arm the ticket's falsification names: point the probe back at
+    /// `/health` and it reds. The fixture answers 200 on `/health` and 503 on
+    /// `/readiness` from one socket, which is the state a real daemon is in
+    /// between binding and finishing its store open, and it is the state a
+    /// stranger run measured on the candidate (`/health` 200 in 7 ms while the
+    /// tool call refused).
+    ///
+    /// Both directions are asserted. A prober that answered `NotReady` to
+    /// everything would pass the first arm while breaking revival entirely, so
+    /// the same fixture serving 200 on `/readiness` must report `Ready`.
+    #[tokio::test]
+    async fn the_revival_probe_reads_readiness_and_not_liveness() {
+        let probe = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+
+        let (base, serving) = serve_health_and_readiness(503).await;
+        // The control that gives the assertion its meaning: this very socket
+        // says 200 on the liveness route at the same instant.
+        let liveness = probe.get(format!("{base}/health")).send().await.unwrap();
+        assert!(
+            liveness.status().is_success(),
+            "fixture is wrong: /health must answer 200 for this test to mean anything"
+        );
+        assert_eq!(
+            poll_revival_readiness(&probe, &base).await,
+            ReadinessPoll::NotReady,
+            "the revival probe reported a daemon ready while its readiness route said 503 and \
+             only its liveness route said 200, which is the window a tool call fails in"
+        );
+        serving.abort();
+
+        let (ready_base, ready_serving) = serve_health_and_readiness(200).await;
+        assert_eq!(
+            poll_revival_readiness(&probe, &ready_base).await,
+            ReadinessPoll::Ready,
+            "the probe never reports ready, so revival would never return"
+        );
+        ready_serving.abort();
+
+        // Nothing listening at all is a third state, and it must not be
+        // confused with a daemon that answered.
+        assert_eq!(
+            poll_revival_readiness(&probe, "http://127.0.0.1:1").await,
+            ReadinessPoll::Unreachable,
+            "a closed port must read Unreachable rather than NotReady"
+        );
+    }
+
+    /// The two ways a live daemon misses the deadline are told apart.
+    ///
+    /// A daemon answering `/readiness` with 503 is bound and openly not ready,
+    /// so what remains is the store open. One answering nothing has published a
+    /// port and has not begun serving. Both are retryable, and reporting them
+    /// with the same sentence would make a mutation that swaps the two arms
+    /// invisible: the field a reader keys on would be identical either way.
+    /// Each arm is asserted to carry its own clause and not the other's.
+    #[test]
+    fn the_still_starting_report_separates_serving_from_silent() {
+        let serving = still_starting_message(40713, Duration::from_secs(300), true);
+        let silent = still_starting_message(40713, Duration::from_secs(300), false);
+
+        assert!(
+            serving.contains("reports itself not ready"),
+            "a daemon that answered readiness must be reported as serving: {serving}"
+        );
+        assert!(
+            !serving.contains("is not answering yet"),
+            "the serving report carries the silent report's clause: {serving}"
+        );
+        assert!(
+            silent.contains("is not answering yet"),
+            "a daemon that never answered must be reported as silent: {silent}"
+        );
+        assert!(
+            !silent.contains("reports itself not ready"),
+            "the silent report carries the serving report's clause: {silent}"
+        );
+        assert_ne!(
+            serving, silent,
+            "the two observations produce one sentence, so nothing can tell them apart"
         );
     }
 
