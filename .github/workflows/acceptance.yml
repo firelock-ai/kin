@@ -956,6 +956,10 @@ jobs:
             grep -E '^CHECK ' acceptance/blame_attribution.log || echo '(no CHECK line was printed)'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Blame-attribution acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
 
       - name: Diff-content acceptance suite (verdict comes from the gate step)
         id: diffcontent
@@ -977,6 +981,10 @@ jobs:
             grep -E '^CHECK ' acceptance/diff_content.log || echo '(no CHECK line was printed)'
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Diff-content acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
 
       - name: VCS read-surface acceptance suite (verdict comes from the gate step)
         id: vcsreadsurfaces
@@ -1182,9 +1190,9 @@ jobs:
             --report first_query=acceptance/first_query.json \
             --report verdict_limits=acceptance/verdict_limits.json \
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
-            --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
-            --report diff_content=acceptance/diff_content.json \
             --report blame_attribution=acceptance/blame_attribution.json \
+            --report diff_content=acceptance/diff_content.json \
+            --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
             --report init_budget=acceptance/init_budget.json \
             --report coverage_read=acceptance/coverage_read.json \
             --report bridge_reach=acceptance/bridge_reach.json \

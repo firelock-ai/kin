@@ -123,6 +123,16 @@ EXPECTED_SUITES = (
         "acceptance/working_copy_freshness.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/blame_attribution_repro.py",
+        "blame_attribution",
+        "acceptance/blame_attribution.json",
+    ),
+    ExpectedSuite(
+        "scripts/acceptance/diff_content_repro.py",
+        "diff_content",
+        "acceptance/diff_content.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/vcs_read_surfaces_repro.py",
         "vcs_read_surfaces",
         "acceptance/vcs_read_surfaces.json",
