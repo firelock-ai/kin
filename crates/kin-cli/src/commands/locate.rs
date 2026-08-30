@@ -2160,13 +2160,40 @@ fn record_vector_index_degradation(
             ),
             "run 'kin embed' until kin status reports full embedding coverage".to_string(),
         )
+    } else if kin_daemon_spawn::auto_embed_enabled_from(
+        std::env::var(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        // An attached index reading zero is a fill that has started and not yet
+        // landed a vector, which is what the doc comment above already says and
+        // what the message used to deny. A stranger followed the old
+        // remediation, ran `kin embed`, and got "already fully covered at 53/53
+        // when this pass started, so the work was finished before it ran" in
+        // 0.059 s: the index was not empty, the query had sampled it about eight
+        // seconds after a commit, and the advice was spent before it was read
+        // (FIR-3035). Naming the command here is the defect, not a detail, so
+        // this arm names the wait and the counter instead.
+        (
+            "filling",
+            format!(
+                "vector index still filling: 0/{} entities embedded at the instant this query \
+                 sampled it, so semantic ranking is off for this answer and only lexical and \
+                 graph signals ranked it",
+                coverage.total
+            ),
+            "the background embedding pass is building this index; re-run the query once it \
+             finishes, and 'kin status' reports the coverage it has reached"
+                .to_string(),
+        )
     } else {
         (
             "empty",
             format!(
-                "vector index empty: 0/{} entities embedded, so semantic ranking is off \
-                 and only lexical and graph signals ranked this query",
-                coverage.total
+                "vector index empty: 0/{} entities embedded, and {} opts out of the background \
+                 embedding pass, so nothing will fill it on its own",
+                coverage.total,
+                kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV
             ),
             "run 'kin embed' until kin status reports full embedding coverage".to_string(),
         )
@@ -22477,13 +22504,107 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             reasons,
-            vec!["absent", "empty", "partial"],
-            "the same 0/12 counters must read as absent or empty depending on the index"
+            vec!["absent", "filling", "partial"],
+            "the same 0/12 counters must read as absent, filling or partial depending on the \
+             index and on whether a pass is coming"
         );
         assert!(
             sink[0].remediation.contains("kin embed"),
             "an unbuilt index must name the command that builds it: {}",
             sink[0].remediation
+        );
+    }
+
+    /// FIR-3035. An attached index reading zero is being FILLED, and saying
+    /// "empty" beside a `kin embed` remediation sends the reader to a command
+    /// that is already a no-op.
+    ///
+    /// A stranger followed that advice on a 53-entity store and `kin embed`
+    /// answered in 0.059 s: "already fully covered at 53/53 indexed when this
+    /// pass started, so the work was finished before it ran". The envelope was
+    /// honest about the instant it sampled and wrong as guidance, because the
+    /// state model had no value between never-built and done.
+    ///
+    /// The three arms are the whole point. Only the middle one changes, and the
+    /// two either side must keep naming `kin embed`, because a fill nothing is
+    /// driving really does need it.
+    #[cfg(feature = "vector")]
+    #[test]
+    #[serial_test::serial]
+    fn a_mid_fill_index_names_the_fill_and_not_a_command_that_would_no_op() {
+        let unfilled = kin_db::EmbeddingStatus {
+            pending: 53,
+            indexed: 0,
+            total: 53,
+        };
+
+        // The arm under test: attached, zero indexed, a pass on its way.
+        let mut filling = Vec::new();
+        {
+            let _on =
+                kin_core::test_env::EnvVarGuard::unset(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+            record_vector_index_degradation(
+                &coverage_from_status(&unfilled, true),
+                true,
+                &mut filling,
+            );
+        }
+        assert_eq!(filling[0].reason, "filling", "{:?}", filling[0]);
+        assert!(
+            filling[0].detail.contains("still filling"),
+            "the reader has to learn a pass is running: {}",
+            filling[0].detail
+        );
+        assert!(
+            !filling[0].remediation.contains("kin embed"),
+            "naming a command that has already finished is the defect: {}",
+            filling[0].remediation
+        );
+
+        // Control one, named by the ticket: an index nothing has built. `absent`
+        // and the `kin embed` remediation must both survive.
+        let mut absent = Vec::new();
+        {
+            let _on =
+                kin_core::test_env::EnvVarGuard::unset(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV);
+            record_vector_index_degradation(
+                &coverage_from_status(&unfilled, false),
+                false,
+                &mut absent,
+            );
+        }
+        assert_eq!(absent[0].reason, "absent", "{:?}", absent[0]);
+        assert!(
+            absent[0].remediation.contains("kin embed"),
+            "an index nobody built still needs the command that builds it: {}",
+            absent[0].remediation
+        );
+
+        // Control two: attached and zero, with the background pass opted OUT.
+        // Nothing is filling this one, so it is genuinely empty and the old
+        // wording is the right wording.
+        let mut opted_out = Vec::new();
+        {
+            let _off =
+                kin_core::test_env::EnvVarGuard::set(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV, "0");
+            record_vector_index_degradation(
+                &coverage_from_status(&unfilled, true),
+                true,
+                &mut opted_out,
+            );
+        }
+        assert_eq!(opted_out[0].reason, "empty", "{:?}", opted_out[0]);
+        assert!(
+            opted_out[0].remediation.contains("kin embed"),
+            "with no pass coming, the command is the only way out: {}",
+            opted_out[0].remediation
+        );
+        assert!(
+            opted_out[0]
+                .detail
+                .contains(kin_daemon_spawn::DAEMON_AUTO_EMBED_ENV),
+            "and the lever that decided it must be named: {}",
+            opted_out[0].detail
         );
     }
 
