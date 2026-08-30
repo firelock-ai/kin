@@ -4758,7 +4758,10 @@ pub(crate) fn validate_health_repo(health: &HealthResponse, working_dir: &Path) 
         RepoIdentity::Rejected(reason) | RepoIdentity::Indeterminate(reason) => bail!(reason),
     }
     if health.status == "attention" {
-        warn_on_health_change(health.repo_root.as_deref().unwrap_or("<unknown>"), "attention");
+        warn_on_health_change(
+            health.repo_root.as_deref().unwrap_or("<unknown>"),
+            "attention",
+        );
     } else {
         // Any other serving status clears the memory, so a daemon that returns
         // to attention later is announced again. Without this the notice would
@@ -4781,9 +4784,8 @@ pub(crate) fn validate_health_repo(health: &HealthResponse, working_dir: &Path) 
 ///
 /// Keyed by repo root because one process can talk to more than one repository,
 /// and a second repository going degraded is its own news.
-static REPORTED_HEALTH: std::sync::Mutex<
-    Option<std::collections::HashMap<String, &'static str>>,
-> = std::sync::Mutex::new(None);
+static REPORTED_HEALTH: std::sync::Mutex<Option<std::collections::HashMap<String, &'static str>>> =
+    std::sync::Mutex::new(None);
 
 /// Whether this status is news for this repository root.
 ///
@@ -11311,7 +11313,6 @@ mod tests {
     }
 
     #[cfg(windows)]
-
     #[test]
     fn windows_directory_handle_can_preserve_bounded_rollback_timestamp() {
         let dir = tempfile::tempdir().unwrap();

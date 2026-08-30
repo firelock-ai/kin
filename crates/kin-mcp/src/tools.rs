@@ -389,7 +389,8 @@ pub fn annotate_unserved_cross_references(
     for tool in &mut list.tools {
         let named = unserved_tools_named_in(&tool.description, registered, served);
         if !named.is_empty() {
-            tool.description.push_str(&unserved_cross_reference_note(&named));
+            tool.description
+                .push_str(&unserved_cross_reference_note(&named));
         }
     }
 }
@@ -1729,7 +1730,9 @@ mod tests {
             .find(|tool| tool.name == "find_references")
             .expect("find_references is in agent-default");
         assert!(
-            find_references.description.contains("bulk_check_references"),
+            find_references
+                .description
+                .contains("bulk_check_references"),
             "the batch advice is worth keeping: {}",
             find_references.description
         );
@@ -1781,14 +1784,12 @@ mod tests {
         );
 
         // And a name nothing registers is prose, not a tool.
-        assert!(
-            unserved_tools_named_in(
-                "the same unit `kin refs` prints, per zzz_fab_tool.",
-                &registered,
-                &served,
-            )
-            .is_empty(),
-        );
+        assert!(unserved_tools_named_in(
+            "the same unit `kin refs` prints, per zzz_fab_tool.",
+            &registered,
+            &served,
+        )
+        .is_empty(),);
     }
 
     /// The other control: a profile that withholds nothing gets no note at all.
