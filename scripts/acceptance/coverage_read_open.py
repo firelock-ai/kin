@@ -379,6 +379,44 @@ def self_test():
             print("SELFTEST FAIL %s" % label)
             sys.exit(1)
 
+    # The report this suite writes, read back through the gate's OWN loader.
+    # Every earlier occurrence of this bug shipped a suite whose graders were all
+    # correct and whose report the verdict step could not read, so no grader
+    # assertion could ever have caught it. This loads the real file with the real
+    # loader.
+    import importlib.util
+    import tempfile as _selftest_tempfile
+
+    gate_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.py")
+    spec = importlib.util.spec_from_file_location("acceptance_gate", gate_path)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+    scratch = _selftest_tempfile.mkdtemp(prefix="coverage-read-selftest-")
+
+    sample = Result(1, "a sample check")
+    sample.ok("the shape this suite writes")
+    written = os.path.join(scratch, "report.json")
+    with open(written, "w") as handle:
+        json.dump(report_payload([sample], None), handle)
+    loaded = None
+    try:
+        loaded = gate.load_report(written)
+    except Exception as error:  # noqa: BLE001 - the point is that it must not raise
+        print("SELFTEST FAIL gate loader refused this suite's own report: %s" % error)
+        sys.exit(1)
+    expect(bool(loaded), "the gate loader reads the report this suite writes")
+
+    # The control. A report keyed the old way must still be refused, or the row
+    # above would pass for a loader that accepts anything.
+    wrong = os.path.join(scratch, "wrong.json")
+    with open(wrong, "w") as handle:
+        json.dump({"ticket": TICKET, "checks": [{"id": 1, "status": PASS}]}, handle)
+    refused = False
+    try:
+        gate.load_report(wrong)
+    except Exception:  # noqa: BLE001 - refusing is the expected outcome
+        refused = True
+    expect(refused, "the gate loader still refuses a report keyed `checks`")
     expect(sync_problems({IN_SYNC: True}, True) == [], "in sync passes the clean arm")
     expect(sync_problems({IN_SYNC: False}, True) != [], "out of sync fails the clean arm")
     expect(sync_problems({IN_SYNC: False}, False) == [], "out of sync passes the diverged arm")
@@ -421,6 +459,62 @@ def self_test():
     return 0
 
 
+def report_payload(results, label):
+    """The report shape `scripts/acceptance/gate.py` reads.
+
+    The key is `results` and not `checks`. That is not a style choice: the gate
+    calls `payload.get("results")` and refuses anything else, and its own refusal
+    text records four suites that shipped the wrong key before this one, which
+    would have made this the fifth.
+
+    Extracted from `main` rather than left inline, because a shape built inside
+    `main` cannot be exercised without running the whole suite, and that is
+    precisely how four earlier occurrences reached main with every grader
+    correct. The self-test loads what this returns back through the gate's own
+    loader.
+    """
+    return {
+        "label": label,
+        "ticket": TICKET,
+        "results": [
+            {
+                "id": r.id,
+                "title": r.title,
+                "status": r.status,
+                "detail": r.detail,
+                "asserts": r.asserts,
+            }
+            for r in results
+        ],
+    }
+
+
+def absolute_binary(path):
+    """Resolve a binary path before anything changes directory.
+
+    Every suite in this job is invoked with `--kin target/release/kin`, a
+    RELATIVE path, and every one of them runs that binary with `cwd=` set to a
+    `mkdtemp` fixture. A relative path survives the existence check at the
+    repository root and then resolves against the fixture, where nothing of that
+    name exists.
+
+    That is what happened on main's Acceptance run 33295001248:
+    `setup error: [Errno 2] No such file or directory: 'target/release/kin'`,
+    exit 3 swallowed by the step's `|| rc=$?`, and the gate then failing on a
+    report that was never written. The siblings did not fail because they
+    resolve first; `vcs_read_surfaces_repro.py` and
+    `working_copy_freshness_repro.py` both carry this function. This suite was
+    the only one in the job without it.
+
+    Returns the path unchanged when it does not exist, so the caller's refusal
+    names what the operator actually typed.
+    """
+    if not path:
+        return None
+    resolved = os.path.abspath(path)
+    return resolved if os.path.exists(resolved) else path
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kin", default=os.environ.get("KIN_BIN"))
@@ -437,8 +531,16 @@ def main():
     if not args.kin:
         print("setup error: --kin or KIN_BIN must name the binary under test", file=sys.stderr)
         return 3
+    # Resolved BEFORE the check, so the refusal names the path actually looked
+    # for, and before any fixture changes directory under it.
+    args.kin = absolute_binary(args.kin)
+    args.daemon = absolute_binary(args.daemon)
     if not os.path.isfile(args.kin) or not os.access(args.kin, os.X_OK):
-        print("setup error: %s is not an executable file" % args.kin, file=sys.stderr)
+        print(
+            "setup error: %s is not an executable file (resolved from the invocation's "
+            "working directory, %s)" % (args.kin, os.getcwd()),
+            file=sys.stderr,
+        )
         return 3
 
     workdir = tempfile.mkdtemp(prefix="kin-coverage-read-")
@@ -463,24 +565,7 @@ def main():
 
     if args.json_path:
         with open(args.json_path, "w") as handle:
-            json.dump(
-                {
-                    "label": args.label,
-                    "ticket": TICKET,
-                    "checks": [
-                        {
-                            "id": r.id,
-                            "title": r.title,
-                            "status": r.status,
-                            "detail": r.detail,
-                            "asserts": r.asserts,
-                        }
-                        for r in results
-                    ],
-                },
-                handle,
-                indent=2,
-            )
+            json.dump(report_payload(results, args.label), handle, indent=2)
 
     if any(r.status == FAIL for r in results):
         return 1
