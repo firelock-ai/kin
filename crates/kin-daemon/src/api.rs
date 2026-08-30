@@ -5965,7 +5965,9 @@ struct CommandCommitRequest {
 #[derive(Debug, Serialize)]
 struct CommandCommitResponse {
     change_id: String,
-    branch: String,
+    /// The branch this change was published onto, or `null` when the workspace
+    /// head is detached and the head itself advanced instead.
+    branch: Option<String>,
     entity_count: usize,
     relation_count: usize,
     file_count: usize,
@@ -6111,7 +6113,7 @@ fn command_commit_after_admission(
         return Err(refusal);
     }
     let change_id = plan.change.id;
-    let branch_name = plan.branch.clone();
+    let branch_name = plan.target.branch().map(|name| name.to_string());
     let entity_count = plan.entity_count;
     let relation_count = plan.relation_count;
     let file_count = plan.file_count;
@@ -6224,7 +6226,7 @@ fn command_commit_after_admission(
 
     Ok(Json(CommandCommitResponse {
         change_id: change_id.to_string(),
-        branch: branch_name.to_string(),
+        branch: branch_name,
         entity_count,
         relation_count,
         file_count,

@@ -516,6 +516,26 @@ macro_rules! authority_not_git_note {
 /// reads as a commit that silently did nothing.
 pub const AUTHORITY_NOT_GIT_NOTE: &str = authority_not_git_note!();
 
+/// The extra line a `kin commit` prints when the workspace head is detached.
+///
+/// A repository converted while Git's own HEAD was detached, which is where
+/// `git checkout <tag>` and every bisect leaves you, carries a detached Kin
+/// workspace head from admission onward. Committing there advances that head
+/// and moves no branch, exactly as it would with no Git in the picture at all.
+///
+/// The change is not adrift: the workspace head names it, and the workspace is
+/// durable authority rather than a ref that a later checkout forgets. It is
+/// still worth one sentence, because a reader who types `kin branch list` will
+/// find nothing there and should be told where the work went and how to give it
+/// a name.
+/// It also settles the line above it. `AUTHORITY_NOT_GIT_NOTE` ends in "push
+/// this branch to a Kin remote", and on a detached head there is no branch, so
+/// the two read as a contradiction unless this one says so outright. Measured
+/// on the shipped output before it did.
+pub const DETACHED_HEAD_NOTE: &str =
+    "The workspace head advanced to this change and no branch names it, so there is nothing \
+     to push yet. `kin branch create <name>` puts it on a branch.";
+
 /// The long help `kin commit --help` prints, ending in the line above.
 ///
 /// The commit-time line was the only surface carrying the fact, and a commit is
