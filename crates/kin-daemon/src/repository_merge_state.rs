@@ -587,7 +587,25 @@ fn settle(
     ))
 }
 
-/// Abandon the merge, proving the workspace still equals its restore point.
+/// Abandon the merge, whatever the workspace has done since it opened.
+///
+/// This used to refuse unless the workspace still equalled the restore point,
+/// on the reasoning that abandoning could not prove the workspace it restores.
+/// It restores no workspace. The transaction below is documented as moving only
+/// the merge record, and it is: `workspace_mutation: None`, no ref mutations and
+/// no changes, and `record_execution` hands the finalizer the same tree for
+/// `previous_tree` and `desired_tree` with an empty delta, so nothing is
+/// projected either. The gate was keeping one sentence true, not guarding an
+/// operation, and it refused the one command whose whole job is getting out.
+///
+/// Measured on the rc063a stranger's shape: hand-edit a conflicted file and
+/// `resolve --continue`, `resolve --abort` and `merge` all answer 409 while
+/// `status` and `conflicts` keep advertising the merge. `stash push --yes` and
+/// `stash pop` both succeed and leave the merge exactly as parked, so they are
+/// not a way out either. The only recovery was `kin checkout --change`.
+///
+/// So it abandons, and the line it prints says what is true rather than what
+/// used to be. What it must never do is claim to have put anything back.
 fn abort(
     authority: &ActiveLocalRepositoryAuthority,
     request: &ResolveRequest,
@@ -595,15 +613,7 @@ fn abort(
     workspace: WorkspaceState,
     record: MergeTransactionRecord,
 ) -> Result<ResolveExecution> {
-    let current = restore_point(&workspace);
-    if current != record.restore {
-        return Err(merge_conflict(format!(
-            "workspace {} no longer equals the restore point this merge recorded, so abandoning \
-             it cannot prove the workspace it restores; reconcile the workspace into graph \
-             authority first",
-            workspace.workspace_id
-        )));
-    }
+    let workspace_moved = restore_point(&workspace) != record.restore;
     let next = record
         .terminate(MergeTransactionState::Aborted {
             operation_id: request.operation_id,
@@ -623,14 +633,26 @@ fn abort(
         .context("validate the merge abort transaction")?;
     let (receipt, authority_freeze) = commit_and_freeze_exact(&authority.manager, transaction)
         .context("abandon the merge transaction")?;
-    let lines = vec![format!(
-        "Abandoned the merge of {} into {}; workspace {} is unchanged at the recorded restore \
-         point (authority generation {})",
-        record.binding.source_ref,
-        record.binding.target_ref,
-        workspace.workspace_id,
-        receipt.generation
-    )];
+    let lines = vec![if workspace_moved {
+        format!(
+            "Abandoned the merge of {} into {}; workspace {} has moved since the merge opened \
+             and is left exactly as it is, because abandoning a merge restores nothing \
+             (authority generation {})",
+            record.binding.source_ref,
+            record.binding.target_ref,
+            workspace.workspace_id,
+            receipt.generation
+        )
+    } else {
+        format!(
+            "Abandoned the merge of {} into {}; workspace {} is unchanged at the recorded \
+             restore point (authority generation {})",
+            record.binding.source_ref,
+            record.binding.target_ref,
+            workspace.workspace_id,
+            receipt.generation
+        )
+    }];
     Ok(record_execution(
         lines,
         workspace,
