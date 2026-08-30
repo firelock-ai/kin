@@ -789,15 +789,37 @@ fn summarize(
 
 pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
+    let workspace_endpoint =
+        endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref());
+
+    // ADMIT FIRST, before anything reads, including before the daemon route
+    // below. The order is the whole point and I got it wrong once: routing to the
+    // daemon ahead of the admission answered from a graph that had not seen the
+    // edit, and the resident-set measurement caught it printing
+    // `Artifacts: +0 ~0 -0` over a file written a moment earlier, which is the
+    // very defect kin#1258 landed to fix.
+    //
+    // Admission is what makes the answer about the working copy; the daemon route
+    // is what makes its entity half real. Both are needed and this one is first.
+    //
+    // Only when a workspace endpoint is involved. A diff between two changes is
+    // history, and walking the tree to answer it would be a cost with nothing
+    // behind it. Reading the working copy to ADMIT it is ingestion at an explicit
+    // input boundary, not answering from files.
+    let pass = if workspace_endpoint {
+        Some(crate::commands::status::admit_before_reading(&layout).await)
+    } else {
+        None
+    };
+
     // A workspace endpoint's entities are DERIVED, and the daemon's graph is the
-    // only place they exist, so a workspace diff asks the daemon. A
-    // change-to-change diff is history and answers from durable authority right
-    // here, with no round trip and nothing to derive.
+    // only place they exist, so a workspace diff asks the daemon once the
+    // admission above has landed.
     //
     // Never fatal. If the daemon is absent or refuses, this falls through to the
     // local answer, which names its own gap rather than printing a zero that
     // reads like an answer.
-    if !json && (endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref())) {
+    if !json && workspace_endpoint {
         if let Some(response) = daemon_diff(&layout, &base, &head).await {
             for line in response.lines {
                 println!("{line}");
@@ -807,26 +829,15 @@ pub async fn run(base: Option<String>, head: Option<String>, json: bool) -> Resu
                     println!("{line}");
                 }
             }
+            if let Some(crate::commands::status::StatusAdmission::Skipped(why)) = pass.as_ref() {
+                println!(
+                    "Admission scope: this diff was not measured against the working copy: {why}"
+                );
+            }
             println!("{}", admitted_scope_line(&layout));
             return Ok(());
         }
     }
-    // Admit, THEN diff, for the same reason `kin status` does and by the same
-    // founder-owned decision relayed 2026-08-30. A diff whose WORKSPACE endpoint
-    // is the graph as it was before your edit reports `+0 ~0 -0` over a file you
-    // just wrote, which is the answer that sent a stranger looking for a lost
-    // module (FIR-2499) and told another that a rewritten function body had not
-    // changed (FIR-2961). Reading the working copy to ADMIT it is ingestion at
-    // an explicit input boundary, not answering from files.
-    //
-    // Only when a workspace endpoint is actually involved. A diff between two
-    // changes is history, and walking the tree to answer it would be a cost with
-    // nothing behind it.
-    let pass = if endpoint_is_workspace(base.as_deref()) || endpoint_is_workspace(head.as_deref()) {
-        Some(crate::commands::status::admit_before_reading(&layout).await)
-    } else {
-        None
-    };
     let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(&layout)?;
     // No live graph on this path: the CLI opens durable authority in-process and
     // the entities a workspace endpoint needs live in the daemon's graph. So this
