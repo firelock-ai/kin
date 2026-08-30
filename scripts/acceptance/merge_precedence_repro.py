@@ -30,8 +30,10 @@ carries all of them the merge refuses and names both decisions. Nothing is
 synthesized, because kin has no textual line merge to build a third body from,
 so a projection is a choice among sides this merge already bound.
 
-Four checks, three repositories, run in order because two of them are
-destructive: they publish the merge the earlier assertions are about.
+Six checks over five repositories, run in order because two of them are
+destructive: they publish the merge the earlier assertions are about. The first
+four grade FIR-2958's precedence rule; the last two grade rc062j finding (2),
+which is the same authority reporting conflicts that are not conflicts.
 
   precedence  the entity settled `--theirs` decides the bytes of the artifact
               holding it, even though a later `--all-ours` settled that artifact,
@@ -46,6 +48,12 @@ destructive: they publish the merge the earlier assertions are about.
               `--all-theirs` merge still publishes, with the source bytes on
               disk and a nonzero tree delta. Without it a product that refused
               every merge would satisfy the refusal check and lose nothing else.
+  removals    one changed function parks no row saying a branch removed an
+              identity it did not remove. Measured at 18 such rows of 22 before
+              the fix, on this same fixture
+  genuine     the control for `removals`: a real removal, still pointed at by
+              the other side, is still reported. Without it a merge that dropped
+              every relation row would satisfy `removals` and lose nothing else
 
 Exit status is 0 when every check passed, 1 when one failed, 2 when one could not
 be read, and 3 when the run could not be set up. `--self-test` exercises every
@@ -77,6 +85,10 @@ FAIL = "FAIL"
 UNREADABLE = "UNREADABLE"
 
 TICKET = "FIR-2958"
+# The granularity checks are rc062j finding (2), a different ticket in the same
+# merge authority, graded here rather than in a second suite because a second
+# copy of this scaffolding is only ever wrong in a way that looks like a pass.
+GRANULARITY_TICKET = "FIR-2960"
 
 print = functools.partial(print, flush=True)
 
@@ -100,6 +112,40 @@ THEIRS_SHARED = b"feature shared\n"
 
 # The contradictory fixture: two entities in one file, both moved on both
 # branches, so settling them to opposite sides leaves no side carrying both.
+# The granularity fixtures, rc062j finding (2). Python, because a Rust
+# `src/lib.rs` produces no module entity and no import edges, so it has nothing
+# to strand. `summarize` is called from three sibling modules, so it carries real
+# incoming edges, and both sides edit it to a DIFFERENT LENGTH, which is what
+# moves `helper` below it to a different byte offset on each side.
+GRAN_CORE_BASE = b"def summarize(rows):\n    return len(rows)\n\n\ndef helper(x):\n    return x + 1\n"
+GRAN_CORE_OURS = b"def summarize(rows):\n    return len(rows) + 100\n\n\ndef helper(x):\n    return x + 1\n"
+GRAN_CORE_THEIRS = b"def summarize(rows):\n    return len(rows) * 2\n\n\ndef helper(x):\n    return x + 1\n"
+
+
+def _gran_module(name):
+    return ("from pkg.core import summarize, helper\n\n\n"
+            "def use_%s(rows):\n    return summarize(rows) + helper(1)\n" % name).encode()
+
+
+GRAN_FILES = {"pkg/core.py": (GRAN_CORE_BASE, GRAN_CORE_OURS, GRAN_CORE_THEIRS)}
+for _name in ("a", "b", "c"):
+    _body = _gran_module(_name)
+    GRAN_FILES["pkg/mod_%s.py" % _name] = (_body, _body, _body)
+
+# The control fixture: one side genuinely REMOVES `helper` while the other side
+# adds an edge to it. That endpoint is absent from one side, so its row is
+# predictive rather than false, and it must survive. Without this check a merge
+# that dropped every relation row would pass `removals` and lose nothing else.
+GENUINE_CORE_BASE = GRAN_CORE_BASE
+GENUINE_CORE_OURS = b"def summarize(rows):\n    return len(rows)\n"
+GENUINE_CORE_THEIRS = GRAN_CORE_BASE
+GENUINE_MOD_BASE = b"from pkg.core import summarize\n\n\ndef use_a(rows):\n    return summarize(rows)\n"
+GENUINE_MOD_THEIRS = _gran_module("a")
+GENUINE_FILES = {
+    "pkg/core.py": (GENUINE_CORE_BASE, GENUINE_CORE_OURS, GENUINE_CORE_THEIRS),
+    "pkg/mod_a.py": (GENUINE_MOD_BASE, GENUINE_MOD_BASE, GENUINE_MOD_THEIRS),
+}
+
 BASE_PAIR = b"pub fn alpha() {}\npub fn beta() {}\n"
 OURS_PAIR = b"pub fn alpha(count: u64) {}\npub fn beta(count: u64) {}\n"
 THEIRS_PAIR = b"pub fn alpha(v: i32) {}\npub fn beta(v: i32) {}\n"
@@ -307,6 +353,14 @@ class Suite(object):
         rc, out, err = self.kin_run(["init", "."], path)
         if rc != 0:
             raise RuntimeError("kin init failed in %s: %s" % (path, (err or out)[-300:]))
+        # `kin init` can leave a pending semantic overlay, and a merge refuses to
+        # publish into a workspace holding one. It happens on the Python fixtures
+        # and not on the Rust ones, so a builder that skipped this worked for
+        # four checks and made the other two UNREADABLE. Not graded: a workspace
+        # with nothing pending reports nothing to commit, which is the same clean
+        # state under another name, and a merge that still refuses says so in the
+        # check's own detail line.
+        self.kin_run(["commit", "-m", "settle the post-init overlay"], path)
         self._repos[name] = path
         return path
 
@@ -366,10 +420,19 @@ class Suite(object):
 
 
 class Result(object):
-    def __init__(self, ident, status, detail):
+    """One graded check.
+
+    `ticket` defaults to this suite's own. It exists because the CHECK line and
+    the detail string used to be able to disagree: the printer hardcoded the
+    suite ticket while `_combine` wrote whichever ticket the check passed, so a
+    granularity row announced FIR-2958 and then explained FIR-2960.
+    """
+
+    def __init__(self, ident, status, detail, ticket=None):
         self.ident = ident
         self.status = status
         self.detail = detail
+        self.ticket = ticket or TICKET
 
 
 MIXED_FILES = {
@@ -481,15 +544,127 @@ def check_uniform(suite):
     return _combine("uniform", verdicts)
 
 
-def _combine(ident, verdicts):
+ROW_ENTITY_CHANGED = '{"subject": {"subject": "entity"}, "divergence": {"divergence": "changed_both_sides"}}'
+ROW_ARTIFACT_CHANGED = '{"subject": {"subject": "artifact"}, "divergence": {"divergence": "changed_both_sides"}}'
+ROW_RELATION_DANGLING = '{"subject": {"subject": "relation"}, "divergence": {"divergence": "dangling_endpoint"}}'
+ROW_RELATION_CHANGED = '{"subject": {"subject": "relation"}, "divergence": {"divergence": "changed_both_sides"}}'
+
+def dangling_rows(conflicts_json_text):
+    """Every parked conflict row whose divergence is a stranded endpoint.
+
+    Returns None when the listing cannot be read or names no parked merge,
+    because "no rows describing a removal" and "no merge at all" are the same
+    empty list and only one of them is the property being graded.
+    """
+    if not isinstance(conflicts_json_text, str) or not conflicts_json_text.strip():
+        return None
+    try:
+        payload = json.loads(conflicts_json_text)
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    record = payload.get("record")
+    if not isinstance(record, dict):
+        return None
+    entries = record.get("entries")
+    if not isinstance(entries, list) or not entries:
+        return None
+    rows = []
+    for entry in entries:
+        divergence = (entry or {}).get("divergence")
+        if isinstance(divergence, dict) and divergence.get("divergence") == "dangling_endpoint":
+            rows.append(entry)
+    return rows
+
+
+def grade_no_false_removals(conflicts_json_text):
+    """rc062j (2). One changed function must strand nothing.
+
+    Every identity in this fixture survives whichever side settles, so a row
+    saying one branch removed something is false on its face.
+    """
+    rows = dangling_rows(conflicts_json_text)
+    if rows is None:
+        return (UNREADABLE, "no readable parked merge to count rows in")
+    if rows:
+        return (FAIL, "%d row(s) describe a removal neither branch performed" % len(rows))
+    return (PASS, "no row describes a removal neither branch performed")
+
+
+def grade_reports_a_genuine_removal(conflicts_json_text):
+    """The control. A real removal the other side still points at must be named."""
+    rows = dangling_rows(conflicts_json_text)
+    if rows is None:
+        return (UNREADABLE, "no readable parked merge to count rows in")
+    if not rows:
+        return (FAIL, "a genuine stranded endpoint went unreported")
+    return (PASS, "%d genuine stranded endpoint row(s) reported" % len(rows))
+
+
+def grade_conflict_kinds(conflicts_json_text, forbidden):
+    """The kinds of subject the parked listing names, and whether `forbidden`
+    is among them. Read beside the row count so "zero removal rows" and "zero
+    relation rows of any kind" stay distinguishable."""
+    if not isinstance(conflicts_json_text, str) or not conflicts_json_text.strip():
+        return (UNREADABLE, "no listing to read subject kinds from")
+    try:
+        payload = json.loads(conflicts_json_text)
+        entries = (payload.get("record") or {}).get("entries") or []
+    except (ValueError, AttributeError):
+        return (UNREADABLE, "the listing did not parse")
+    if not entries:
+        return (UNREADABLE, "the listing names no parked merge")
+    kinds = {}
+    for entry in entries:
+        kind = ((entry or {}).get("subject") or {}).get("subject")
+        kinds[kind] = kinds.get(kind, 0) + 1
+    if forbidden in kinds:
+        return (FAIL, "the listing still carries %d %s row(s): %s"
+                % (kinds[forbidden], forbidden, kinds))
+    return (PASS, "subject kinds are %s" % kinds)
+
+
+def check_removals(suite):
+    """rc062j (2). One changed function, and no row claiming a removal.
+
+    Measured before the fix on this exact fixture: 22 rows, of which 18 said one
+    branch removed an identity the other still relates to, and every one of those
+    identities is present on both sides.
+    """
+    repo = suite.repo("granularity", GRAN_FILES)
+    suite.kin_run(["merge", "feature"], repo)
+    listing = suite.kin_run(["conflicts", "--json"], repo)[1]
+    return _combine("removals", [
+        ("rows", grade_no_false_removals(listing)),
+        ("kinds", grade_conflict_kinds(listing, "relation")),
+    ], ticket=GRANULARITY_TICKET)
+
+
+def check_genuine(suite):
+    """The control for `removals`. A real removal must still be reported."""
+    repo = suite.repo("genuine", GENUINE_FILES)
+    suite.kin_run(["merge", "feature"], repo)
+    listing = suite.kin_run(["conflicts", "--json"], repo)[1]
+    return _combine("genuine", [
+        ("rows", grade_reports_a_genuine_removal(listing)),
+    ], ticket=GRANULARITY_TICKET)
+
+
+def _combine(ident, verdicts, ticket=None):
     """Report every arm, never the first bad one, because knowing which arm
-    broke is the whole value of grading several claims in one check."""
+    broke is the whole value of grading several claims in one check.
+
+    `ticket` defaults to this suite's own, and the granularity checks pass
+    their own, so a detail line never cites a ticket the row is not about.
+    """
+    ticket = ticket or TICKET
     detail = "; ".join("%s %s %s" % (name, status, note) for name, (status, note) in verdicts)
     if any(status == FAIL for _, (status, _) in verdicts):
-        return Result(ident, FAIL, "%s %s" % (TICKET, detail))
+        return Result(ident, FAIL, detail, ticket=ticket)
     if any(status == UNREADABLE for _, (status, _) in verdicts):
-        return Result(ident, UNREADABLE, "%s %s" % (TICKET, detail))
-    return Result(ident, PASS, "%s %s" % (TICKET, detail))
+        return Result(ident, UNREADABLE, detail, ticket=ticket)
+    return Result(ident, PASS, detail, ticket=ticket)
 
 
 # Ordered, and the order is load bearing: `precedence` publishes the merge
@@ -499,6 +674,8 @@ CHECKS = [
     ("bulk", check_bulk),
     ("refusal", check_refusal),
     ("uniform", check_uniform),
+    ("removals", check_removals),
+    ("genuine", check_genuine),
 ]
 
 
@@ -567,7 +744,7 @@ def report_payload(results):
     the gate's own loader over this payload rather than a copy of its rules.
     """
     return {"suite": "merge_precedence", "ticket": TICKET,
-            "results": [{"id": r.ident, "ticket": TICKET, "status": r.status,
+            "results": [{"id": r.ident, "ticket": r.ticket, "status": r.status,
                          "detail": r.detail} for r in results]}
 
 
@@ -679,6 +856,45 @@ def self_test():
         finally:
             shutil.rmtree(scratch, ignore_errors=True)
 
+    # rc062j (2). Every granularity grader gets an input that must pass and one
+    # that must fail, so a grader that answers PASS over anything is caught here
+    # rather than in CI with no binary to blame.
+    clean = '{"record": {"entries": [%s, %s]}}' % (
+        ROW_ENTITY_CHANGED, ROW_ARTIFACT_CHANGED)
+    stranded = '{"record": {"entries": [%s, %s]}}' % (
+        ROW_ENTITY_CHANGED, ROW_RELATION_DANGLING)
+    expect("removals passes a listing with no stranded row",
+           grade_no_false_removals(clean), PASS)
+    expect("removals fails the shipped listing carrying stranded rows",
+           grade_no_false_removals(stranded), FAIL)
+    expect("removals cannot read an empty listing",
+           grade_no_false_removals(""), UNREADABLE)
+    expect("removals cannot read a listing with no parked merge",
+           grade_no_false_removals('{"record": {"entries": []}}'), UNREADABLE)
+    expect("removals cannot read text that is not json",
+           grade_no_false_removals("nope"), UNREADABLE)
+
+    expect("genuine passes a listing that reports a real stranded endpoint",
+           grade_reports_a_genuine_removal(stranded), PASS)
+    expect("genuine fails a listing that reports none",
+           grade_reports_a_genuine_removal(clean), FAIL)
+    expect("genuine cannot read an empty listing",
+           grade_reports_a_genuine_removal(""), UNREADABLE)
+
+    expect("kinds passes a listing carrying no relation row",
+           grade_conflict_kinds(clean, "relation"), PASS)
+    expect("kinds fails a listing that still carries one",
+           grade_conflict_kinds(stranded, "relation"), FAIL)
+    expect("kinds cannot read a listing with no parked merge",
+           grade_conflict_kinds('{"record": {"entries": []}}', "relation"), UNREADABLE)
+    # CONTROL: the two graders must not be the same reading. A relation row that
+    # is NOT a stranded endpoint is fine by `removals` and named by `kinds`.
+    plain_relation = '{"record": {"entries": [%s]}}' % ROW_RELATION_CHANGED
+    expect("CONTROL removals accepts a relation row that strands nothing",
+           grade_no_false_removals(plain_relation), PASS)
+    expect("CONTROL kinds still names that same relation row",
+           grade_conflict_kinds(plain_relation, "relation"), FAIL)
+
     expect("a relative kin path is absolutized by this suite",
            (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)
     expect("and an absent binary stays absent rather than becoming the cwd",
@@ -731,7 +947,8 @@ def main(argv):
             except Exception as error:  # noqa: BLE001 - a setup failure is not a verdict
                 results.append(Result(ident, UNREADABLE, "%s check raised: %s" % (TICKET, error)))
         for result in results:
-            print("CHECK %s %s %s %s" % (result.ident, TICKET, result.status, result.detail))
+            print("CHECK %s %s %s %s" % (result.ident, result.ticket, result.status,
+                                         result.detail))
         asked = [ident for ident, _ in CHECKS]
         answered = [result.ident for result in results]
         # Written before the asked/answered guard below, not after it. Four
