@@ -670,22 +670,27 @@ fn endpoint_is_workspace(requested: Option<&str>) -> bool {
     matches!(requested, None | Some("WORKSPACE") | Some("workspace"))
 }
 
-/// What the entity and relation counts above cannot show on a workspace endpoint.
+/// What the ENTITY count above cannot show on a workspace endpoint.
 ///
-/// A workspace endpoint's semantic side is its base change's entities and
-/// relations plus the workspace semantic overlay, and no writer in the daemon
-/// ever puts an entity delta into that overlay. The admission seam publishes
-/// with `semantic_delta: WorkspaceSemanticDelta::default()`, unconditionally,
-/// and the one other overlay writer computes its delta with the authority
-/// entities as BOTH the base and the desired side, so it cannot emit an entity
-/// delta either. `Entities: +0 ~0 -0` on a HEAD-to-WORKSPACE diff is therefore
-/// structural rather than an answer about the edit.
+/// Narrower than it first shipped, and the narrowing matters. A workspace
+/// endpoint's semantic side is its base change's entities and relations plus the
+/// workspace semantic overlay. Nothing ever writes an ENTITY delta into that
+/// overlay: the admission seam publishes
+/// `semantic_delta: WorkspaceSemanticDelta::default()` unconditionally, and the
+/// enrichment writer computes its delta with the authority entities as BOTH the
+/// base and the desired side (`kin-daemon/src/state.rs`), so an entity delta is
+/// structurally impossible from either. RELATION deltas do reach it, from that
+/// same enrichment writer, whose relation arguments are not the same value twice.
 ///
-/// A stranger read the pair as an answer, checked it against a fully settled
-/// graph (`kin graph status`: 78 of 78 embeddings indexed, 8 of 8 files at 100%
-/// coverage), and concluded the semantic layer had silently skipped a rewrite of
-/// a function body (FIR-2961). Naming the scope beside the counts is what tells a
-/// real zero apart from one nothing could have moved.
+/// So `Entities: +0 ~0 -0` beside a moving `Relations` line is not a
+/// contradiction, and saying so is the point. Two independent runs read the pair
+/// as an answer and went looking for a broken semantic layer: one over a
+/// rewritten function body against a fully settled graph (`kin graph status`: 78
+/// of 78 embeddings indexed, 8 of 8 files at 100% coverage), and one over an
+/// appended top-level function that read `Artifacts: +0 ~1 -0`,
+/// `Relations: +0 ~9 -0`, `Entities: +0 ~0 -0`, unchanged twenty seconds later at
+/// the same authority generation, while `kin status` already counted the entity
+/// and the commit that followed recorded ten of them (FIR-2961).
 ///
 /// Silent on a diff between two changes, where the entity delta is computed and
 /// means what it says.
@@ -703,11 +708,10 @@ fn semantic_scope_line(report: &DiffReport) -> Option<String> {
         "The base endpoint is"
     };
     Some(format!(
-        "Semantic scope: {side} the workspace, whose entities and relations are its base \
-         change's plus a workspace semantic overlay that no admission writes entity or relation \
-         deltas into. So semantic movement made in the working copy since its base change \
-         appears in neither count above, whatever the artifact rows show; commit it and diff \
-         change to change to see it."
+        "Semantic scope: {side} the workspace, whose entities are its base change's plus a \
+         workspace semantic overlay that nothing writes an entity delta into, so the entity \
+         count above cannot move for work in the working copy however many artifacts or \
+         relations do; commit it and diff change to change to see entity movement."
     ))
 }
 

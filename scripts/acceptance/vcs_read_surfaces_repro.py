@@ -481,9 +481,10 @@ DIFF_WITHOUT_SCOPE = (
     "M  ledger/reporting.py -> ledger/reporting.py [ce183603] blob f53cc41c -> blob d712bc3d\n"
 )
 DIFF_WITH_SCOPE = DIFF_WITHOUT_SCOPE + (
-    "Semantic scope: The head endpoint is the workspace, whose entities and relations are its "
-    "base change's plus a workspace semantic overlay that no admission writes entity or "
-    "relation deltas into.\n"
+    "Semantic scope: The head endpoint is the workspace, whose entities are its base change's "
+    "plus a workspace semantic overlay that nothing writes an entity delta into, so the entity "
+    "count above cannot move for work in the working copy however many artifacts or relations "
+    "do; commit it and diff change to change to see entity movement.\n"
 )
 DIFF_NO_ENTITIES_LINE = "Kin repository-v6 diff\nArtifacts: +0 ~1 -0\n"
 
