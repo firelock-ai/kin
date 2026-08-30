@@ -34711,6 +34711,185 @@ mod tests {
         assert_eq!(carried[0].content_hash, approved_digest);
     }
 
+    /// A merge published through `resolve --continue` must reach the live graph
+    /// too, and this is the arm the plain-merge one below cannot cover.
+    ///
+    /// The two merge publications are different code: `publish` authors a clean
+    /// merge, `publish_resolved_merge` publishes one whose conflicts were
+    /// settled. kin#1287 installs on both. The plain-merge arm below drives only
+    /// the first, proven by its own mutation grid: removing the first install
+    /// leaves that arm GREEN. So this arm exists because a grid said the other
+    /// one does not cover it, rather than because two arms felt tidier.
+    ///
+    /// The fixture is the work here. Both sides must edit the SAME artifact, or
+    /// the merge is clean, `publish` runs, and this arm silently grades the
+    /// path the other arm already covers. `selected/compose.yaml` is written by
+    /// the fixture on main and rewritten on feature, so editing it again on the
+    /// active branch after the split is what makes the conflict real.
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_merge_published_through_resolve_reaches_the_live_graph_without_a_restart() {
+        let (state, _layout, repository, _base_change, _feature_change) =
+            universal_branch_test_state("resolve-live-graph");
+        let app = router(Arc::clone(&state));
+
+        // Conflict on purpose: the feature branch rewrote this same file.
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: active-branch-after-the-split\n",
+        )
+        .unwrap();
+        let pre_merge = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "edit the file the other side also changed",
+        )
+        .await;
+
+        // PRECONDITION, proved: the projection is populated before publication.
+        state
+            .graph
+            .resolve_graph_at(&pre_merge)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOT RUN, precondition unmet rather than property refuted: the projection \
+                     could not replay to the pre-merge change: {error}"
+                )
+            });
+
+        let backend = state.local_repository_backend().unwrap();
+        let repository_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .repository_id()
+            .clone();
+        let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+
+        let post = |path: &'static str, body: Vec<u8>| {
+            let app = router(Arc::clone(&state));
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::post(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+                    .await
+                    .unwrap();
+                (status, bytes.to_vec())
+            }
+        };
+
+        let merge = kin_cli::commands::merge::MergeRequest {
+            source: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-live-graph-test"),
+        };
+        let (_merge_status, merge_body) =
+            post("/commands/merge", serde_json::to_vec(&merge).unwrap()).await;
+        let merge_response: kin_cli::commands::merge::MergeResponse =
+            serde_json::from_slice(&merge_body).unwrap();
+        // The merge must have CONFLICTED, or this arm drove `publish` and covers
+        // nothing the plain-merge arm does not.
+        //
+        // Keyed on the outcome rather than on `mutated`, which was the first
+        // thing tried and is wrong: a conflicted merge reports `mutated: true`
+        // because it wrote the merge transaction record, so `!mutated` refuses a
+        // run that conflicted exactly as intended. The response carries the
+        // answer directly and there is no reason to infer it from a side effect.
+        let outcome = merge_response
+            .report
+            .as_ref()
+            .map(|report| report.outcome)
+            .expect("the merge response must carry a report to read its outcome from");
+        assert!(
+            matches!(outcome, kin_cli::commands::merge::MergeOutcome::Conflicted),
+            "NOT RUN, precondition unmet: the merge reported {outcome:?} rather than Conflicted, \
+             so this arm drove `publish` rather than `publish_resolved_merge` and covers nothing \
+             the plain-merge arm does not: {}",
+            String::from_utf8_lossy(&merge_body)
+        );
+
+        let settle = kin_cli::commands::resolve::ResolveRequest {
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-live-graph-test"),
+            action: kin_cli::commands::resolve::ResolveAction::Settle {
+                directives: Vec::new(),
+                all: Some(kin_model::MergeSide::Theirs),
+            },
+            expected_record: None,
+        };
+        let (settle_status, settle_body) =
+            post("/commands/resolve", serde_json::to_vec(&settle).unwrap()).await;
+        assert_eq!(
+            settle_status,
+            StatusCode::OK,
+            "settling every conflict from one side must succeed: {}",
+            String::from_utf8_lossy(&settle_body)
+        );
+
+        let continue_request = kin_cli::commands::resolve::ResolveRequest {
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-live-graph-test"),
+            action: kin_cli::commands::resolve::ResolveAction::Continue,
+            expected_record: None,
+        };
+        let (continue_status, continue_body) = post(
+            "/commands/resolve",
+            serde_json::to_vec(&continue_request).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            continue_status,
+            StatusCode::OK,
+            "the resolved merge must publish for this arm to grade anything: {}",
+            String::from_utf8_lossy(&continue_body)
+        );
+
+        let published = branch_change(&state);
+        assert_ne!(
+            published, pre_merge,
+            "the resolved merge must move the branch off its pre-merge change"
+        );
+
+        // The property, through the LIVE projection and owning the absence, so
+        // a missing change is reported as missing rather than mapped onto a
+        // parent count that reads like a publication of the wrong kind.
+        let held = state.graph.get_change(&published).unwrap().expect(
+            "the live graph does not hold the change `resolve --continue` just published, so \
+             every read that replays the graph to it fails until the daemon restarts; authority \
+             holds it and the derived query view does not",
+        );
+        assert_eq!(
+            held.parents.len(),
+            2,
+            "NOT RUN, precondition unmet: the published change carries {} parent(s) rather than \
+             two, so it is not a merge change",
+            held.parents.len()
+        );
+        state
+            .graph
+            .resolve_graph_at(&published)
+            .expect("a graph holding the published merge change must replay to it");
+
+        // OVER-INVALIDATION guard.
+        state.graph.resolve_graph_at(&pre_merge).expect(
+            "the graph can no longer replay to a change it held before the merge, so the \
+             projection was discarded rather than added to",
+        );
+
+        let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before != identity_after,
+            "the publication identity did not move across a resolved-merge publication"
+        );
+    }
+
     /// A published MERGE must reach the live graph too, by the same contract
     /// and with the same three guards as the rollback arm below.
     ///
