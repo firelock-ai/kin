@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Firelock, LLC
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::Result;
 use kin_model::{
     ArtifactKind, EntityStore, FilePathId, GraphStats, Hash256, RepoPath, ResolvedTree, TreeEntry,
 };
@@ -188,61 +188,16 @@ struct EnrichmentFacets {
 
 /// Coverage against the authority this request reads at.
 ///
-/// This reads two things: one workspace tree out of the authority envelope, and
-/// the bodies its structured facets name, by content address. Neither needs the
-/// history the same snapshot carries, and on a converted repository that history
-/// IS the snapshot: psf/requests at 6493 commits writes 1051.5 MiB whose change
-/// map dominates it. A full [`ActiveRepositoryAuthority::open`] decodes all of
-/// it and re-verifies all 8242 sealed bodies, so a cold `graph status` cost the
-/// whole store to print counters and took a daemon serving 861 entities to
-/// 15.9 GiB (FIR-2955).
-///
-/// So the envelope read comes first. It walks the same bytes, verifies the same
-/// frame checksum, and allocates nothing for the domains it skips, and every
-/// body it returns is verified against its own content address exactly as the
-/// manager's is. The full open stays as the fallback for the cases KinDB
-/// declines to answer cheaply, and it is still the only thing that audits every
-/// persisted body.
-///
-/// A server that can cache one envelope per publication supplies a resolver, so
-/// a warm request pays nothing; without one the envelope is read through the
-/// binding, which costs one parse of the body and no allocation for the domains
-/// it skips.
+/// Takes the request's authority rather than its binding because
+/// [`ActiveRepositoryAuthority::open`] re-verifies every persisted body against
+/// its content address, so it costs whatever the whole store is worth. A server
+/// that has already paid for one open at the publication this request reads
+/// hands it over here; a one-shot caller still opens for itself.
 fn collect_repository_artifact_coverage(
     authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     graph_tree: &ResolvedTree,
 ) -> Result<RepositoryArtifactCoverage> {
-    if let Some(envelope) = authority.open_envelope()? {
-        let binding = authority.binding();
-        let workspace_id = binding.workspace_id();
-        let workspace = envelope
-            .metadata()
-            .workspaces
-            .iter()
-            .find(|workspace| workspace.workspace_id == workspace_id)
-            .cloned()
-            .ok_or_else(|| {
-                anyhow!(
-                    "repository {} has no workspace {} in its authority",
-                    binding.repository_id(),
-                    workspace_id
-                )
-            })?;
-        workspace.validate()?;
-        return collect_repository_artifact_coverage_for_tree(
-            &workspace.tree,
-            graph,
-            graph_tree,
-            &|hash| {
-                envelope
-                    .load_source_blob(hash)
-                    .with_context(|| format!("load immutable repository source blob {hash}"))?
-                    .ok_or_else(|| anyhow!("immutable repository source blob {hash} is absent"))
-            },
-        );
-    }
-
     let authority = authority.open()?;
     let workspace = authority.workspace()?;
     workspace.validate()?;
