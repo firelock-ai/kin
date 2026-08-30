@@ -524,9 +524,8 @@ pub(crate) fn current_authority_admission(
     kin_model::RootBundle,
     Option<kin_index::ResolvedAdmissionMatcher>,
 )> {
-    crate::api::cached_authority_admission(state).map_err(|(_status, message)| {
-        DaemonError::Io(std::io::Error::other(message))
-    })
+    crate::api::cached_authority_admission(state)
+        .map_err(|(_status, message)| DaemonError::Io(std::io::Error::other(message)))
 }
 
 /// Measure host content graph truth does not carry, right now.
