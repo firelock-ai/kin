@@ -3629,9 +3629,15 @@ pub async fn run_with_authority_on(
             state.lsp_enrichment_tx = Some(tx);
             Some(rx)
         } else {
+            // Built from the shared marker rather than spelled here, because a
+            // remedy in kin-daemon-spawn keys on this sentence to know that
+            // offering KIN_DAEMON_DISABLE_LSP would be advice nobody can take.
+            // Two copies of the words would let this one drift and disarm that
+            // remedy silently.
             info!(
-                "no LSP servers found, so enrichment is disabled for the life of this daemon; \
-                 install one and restart to enable it"
+                "{}, so enrichment is disabled for the life of this daemon; install one and \
+                 restart to enable it",
+                kin_daemon_spawn::ENRICHMENT_UNAVAILABLE_MARKER
             );
             None
         }
