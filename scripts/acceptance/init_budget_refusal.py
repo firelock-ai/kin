@@ -426,6 +426,20 @@ class Suite(object):
         self.repos[name] = repo
         return repo
 
+    def commit_count(self, repo):
+        """Commits reachable from HEAD, or None when git will not say.
+
+        None rather than 0, because a failed count and an empty repository are
+        different facts and only one of them is a measurement.
+        """
+        rc, out = self.git(["rev-list", "--count", "HEAD"], repo)
+        if rc != 0:
+            return None
+        try:
+            return int(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return None
+
     def store_exists(self, repo):
         return os.path.isdir(os.path.join(repo, ".kin"))
 
@@ -761,11 +775,42 @@ def check_5(suite):
     else:
         result.ok("a store was written")
 
+    # A "no band at all" outcome is graded FAIL here, deliberately, and an
+    # earlier draft of this check got that wrong in a way worth recording.
+    #
+    # That draft treated silence as UNREADABLE on the theory that a pin which
+    # failed to apply would produce it. It does. So does the defect: an
+    # unpatched binary has no band to print. The two are indistinguishable from
+    # the output, so the guard excused the exact behaviour this check exists to
+    # catch, and against the shipped v0.6.2 candidate it reported UNREADABLE
+    # where it had previously reported FAIL. A guard that cannot separate its
+    # two causes is worse than no guard, because it renames a defect as an
+    # environment problem.
+    #
+    # What actually rules the runner out is source, not output. `ceiling()`
+    # returns the pinned value before consulting the host at all, and
+    # `FootprintBudget::resolve` returns an operator value unclamped and
+    # unconditionally. Neither reads this machine when the variable is set. And
+    # checks 0 and 2 already prove the ceiling pin applies wherever this suite
+    # runs: one refuses under a tiny ceiling and one is silent under a roomy
+    # one, on every host that has ever run them.
     missing = [p for p in REQUIRED_DAEMON_BAND_PHRASES if p not in out]
     if missing:
         result.bad("the line does not say %s: %s" % (", ".join(missing), tail(out, 900)))
     else:
         result.ok("the line names the daemon, its allowance and what a reader can do")
+
+    # And prove the line is about THIS fixture rather than some other forecast,
+    # by requiring the survey it was computed from. Only this repository's
+    # commit count produces this number.
+    commits = suite.commit_count(repo)
+    if commits is None:
+        result.unknown("could not count the fixture's commits, so the line's survey is unchecked")
+    elif ("%d commits" % commits) not in out:
+        result.bad("the line does not name this fixture's %d commits, so it is reporting a "
+                   "forecast for something else: %s" % (commits, tail(out, 700)))
+    else:
+        result.ok("the line names this fixture's own %d commits" % commits)
 
     # The Tight sentence claims the CONVERSION might not finish. Borrowing it
     # here would send a reader to watch the wrong half of the command.
