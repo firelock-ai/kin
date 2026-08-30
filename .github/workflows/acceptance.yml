@@ -278,6 +278,16 @@ jobs:
       - name: Falsify the bridge reach graders
         run: python3 scripts/acceptance/bridge_reach_repro.py --self-test
 
+      # FIR-2964. The three graders here decide which path a coverage read took,
+      # whether the two paths agree, and whether both still see a repository out
+      # of sync. The third is the one driven hardest: the substitution worth
+      # catching is serving the graph's own tree as durable truth, which reports
+      # coherence on every clean store and so passes an agreement grader, and
+      # the divergence grader has to return UNREADABLE rather than PASS when
+      # neither arm reached the condition it exists to grade.
+      - name: Falsify the coverage read graders
+        run: python3 scripts/acceptance/coverage_read_open.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -888,6 +898,30 @@ jobs:
             echo "::warning title=Init budget acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Coverage read acceptance suite (verdict comes from the gate step)
+        id: coverageread
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/coverage_read_open.py \
+            --kin target/release/kin \
+            --json acceptance/coverage_read.json \
+            --verbose >acceptance/coverage_read.log 2>&1 || rc=$?
+          cat acceptance/coverage_read.log
+          {
+            echo "### Coverage read acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/coverage_read.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Coverage read acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       - name: Bridge reach acceptance suite (verdict comes from the gate step)
         id: bridgereach
         if: always()
@@ -960,4 +994,5 @@ jobs:
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
             --report init_budget=acceptance/init_budget.json \
             --report bridge_reach=acceptance/bridge_reach.json \
+            --report coverage_read=acceptance/coverage_read.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'
