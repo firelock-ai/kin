@@ -128,6 +128,11 @@ EXPECTED_SUITES = (
         "acceptance/vcs_read_surfaces.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/ref_grammar_repro.py",
+        "ref_grammar",
+        "acceptance/ref_grammar.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/diff_content_repro.py",
         "diff_content",
         "acceptance/diff_content.json",
