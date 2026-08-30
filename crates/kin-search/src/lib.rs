@@ -701,6 +701,47 @@ fn remove_doc_from_index<Id: DocId>(
 /// trigram index only needs to hold tokens of at least this length.
 const MIN_SUBSTRING_LEN: usize = 3;
 
+/// Numerator and denominator of the length floor a REVERSE substring match must
+/// clear, as integers so the predicate has no float in it.
+///
+/// The two substring directions are not symmetric and only one of them was
+/// sound. `token.contains(qt)` is ordinary prefix and infix search: a query
+/// `pres` finds `present`, and the query is the shorter, more specific side.
+/// `qt.contains(token)` is the reverse, where the INDEXED term is shorter than
+/// what the caller typed, and unbounded it returns a document for a query whose
+/// terms it does not hold: measured on kin, `definitelyNoSuchSymbol` retrieved an
+/// entity whose signature is `fn present()` at 0.45, because `def` is in that
+/// vocabulary and is a substring of `definitely` (FIR-2968).
+///
+/// The floor is chosen from measurement rather than taste, over this crate's own
+/// test corpus. Every reverse pair that corpus produces was enumerated with its
+/// ratio; the useful ones are morphological variants the tokenizer does not split
+/// (`users` to `user`, `usernames` to `username`) and they cluster at 0.778 and
+/// above, while the ones below are camel-case joins (`getuserbyid` to `get` at
+/// 0.273, `rebuiltdoc` to `doc` at 0.300) whose parts the tokenizer ALREADY emits
+/// as exact postings for the same query, making the reverse match a half-weight
+/// duplicate of an exact one. 3/4 sits in the widest gap in that table, between
+/// 0.714 and 0.778, and refuses the 0.300 case by a wide margin.
+///
+/// One thing the ratio cannot do, and it is why the corpus mattered:
+/// `rebuiltdoc` to `doc` is 0.300, the SAME ratio as `definitely` to `def`, so no
+/// floor separates those two. What justifies refusing both is the redundancy
+/// above, not the ratio.
+const REVERSE_SUBSTRING_MIN_NUM: usize = 3;
+const REVERSE_SUBSTRING_MIN_DEN: usize = 4;
+
+/// Whether a reverse substring match, where the indexed `token` sits inside the
+/// query token `qt`, carries enough of `qt` to be a match rather than a
+/// coincidence.
+///
+/// Integer arithmetic on purpose: this predicate decides which postings enter the
+/// scoring set, and that set's order is what makes the parallel and serial
+/// accumulations bit-identical, so it must not depend on a float comparison.
+fn reverse_substring_admits(qt: &str, token: &str) -> bool {
+    qt.contains(token)
+        && token.len() * REVERSE_SUBSTRING_MIN_DEN >= qt.len() * REVERSE_SUBSTRING_MIN_NUM
+}
+
 /// Total scored token occurrences at or above which BM25 scoring fans out across
 /// the ambient rayon pool. Below it, the serial single-pass path avoids both the
 /// candidate-set collection and the parallel dispatch overhead, which dominate at
@@ -1451,7 +1492,8 @@ impl<Id: DocId> TextIndex<Id> {
                     .filter_map(|&token_id| {
                         let token = trigram.tokens[token_id as usize].as_ref();
                         (token != qt.as_str()
-                            && (token.contains(qt.as_str()) || qt.contains(token)))
+                            && (token.contains(qt.as_str())
+                                || reverse_substring_admits(qt.as_str(), token)))
                         .then_some(token)
                     })
                     .collect();
@@ -2250,6 +2292,273 @@ mod tests {
             kind: kind.to_string(),
         };
         (id, doc)
+    }
+
+    /// FIR-2968 measurement, not a guard. Prints every reverse-direction
+    /// substring match this crate's own test corpus produces, with the length
+    /// ratio for each, so the floor below is chosen from what the corpus
+    /// actually contains rather than from taste.
+    ///
+    /// The two directions are not symmetric. `token.contains(qt)` is ordinary
+    /// prefix and infix search: a query `pres` finding `present`. The reverse,
+    /// `qt.contains(token)`, is what returned a wrong answer: the query token
+    /// `definitely` found the vocabulary term `def`, which `fn present()` put in
+    /// the vocabulary, and `MIN_SUBSTRING_LEN` of 3 does not exclude it because
+    /// `def` is exactly 3 bytes.
+    ///
+    /// Run with `--nocapture` to read the table.
+    #[test]
+    fn measure_reverse_substring_ratios() {
+        use std::collections::BTreeSet;
+
+        // The corpus every other test in this module builds from `make_doc`.
+        let corpus = [
+            ("alpha", "src/alpha.rs", "Function"),
+            ("alphaHandler", "src/lib.rs", "Function"),
+            ("beta", "src/beta.rs", "Function"),
+            ("debugMe", "src/debug.rs", "Function"),
+            ("deletePost", "src/posts.rs", "Function"),
+            ("foo", "src/auth/login.rs", "Function"),
+            ("getUserById", "src/users.rs", "Function"),
+            ("myFunction", "src/lib.rs", "Function"),
+            ("persistMe", "src/persist.rs", "Function"),
+            ("QdpReader", "src/io/qdp.py", "Function"),
+            ("rebuiltDoc", "src/rebuilt.rs", "Function"),
+        ];
+
+        let mut vocab: BTreeSet<String> = BTreeSet::new();
+        for (name, file, kind) in corpus {
+            for field in [
+                name.to_string(),
+                format!("fn {name}()"),
+                file.to_string(),
+                kind.to_string(),
+            ] {
+                for token in tokenize(&field) {
+                    vocab.insert(token);
+                }
+            }
+        }
+        println!("VOCAB {} tokens: {:?}", vocab.len(), vocab);
+
+        // The decision cases, beside the corpus's own tokens as queries.
+        let mut queries: BTreeSet<String> = vocab.clone();
+        for extra in [
+            "definitelyNoSuchSymbol",
+            "definitely",
+            "usernames",
+            "pres",
+            "username",
+            "present",
+        ] {
+            for token in tokenize(extra) {
+                queries.insert(token);
+            }
+            queries.insert(extra.to_lowercase());
+        }
+
+        println!("--- reverse direction: the QUERY token contains the vocabulary term ---");
+        for q in &queries {
+            if q.len() < MIN_SUBSTRING_LEN {
+                continue;
+            }
+            for t in &vocab {
+                if t == q || t.len() < MIN_SUBSTRING_LEN {
+                    continue;
+                }
+                if q.contains(t.as_str()) && !t.contains(q.as_str()) {
+                    println!(
+                        "REVERSE q={:<24} t={:<12} ratio={:.3}",
+                        q,
+                        t,
+                        t.len() as f32 / q.len() as f32
+                    );
+                }
+            }
+        }
+
+        println!("--- the pairs the fix must separate, both directions ---");
+        for (q, t) in [
+            ("definitely", "def"),
+            ("usernames", "username"),
+            ("pres", "present"),
+            ("definitelynosuchsymbol", "def"),
+        ] {
+            let forward = t.contains(q);
+            let reverse = q.contains(t);
+            let (short, long) = if t.len() < q.len() { (t, q) } else { (q, t) };
+            println!(
+                "PAIR q={:<24} t={:<10} forward={:<5} reverse={:<5} ratio={:.3}",
+                q,
+                t,
+                forward,
+                reverse,
+                short.len() as f32 / long.len() as f32
+            );
+        }
+        println!("--- tokenize of the ticket's query ---");
+        println!("TOKENS {:?}", tokenize("definitelyNoSuchSymbol"));
+
+        // Whether refusing a low-ratio reverse match costs anything depends on
+        // one question the ratio cannot answer: is that vocabulary term ALREADY
+        // an exact posting for this same query? For a camel-case name it is,
+        // because the tokenizer emits the parts beside the joined form, so the
+        // reverse match is a half-weight duplicate of an exact match. For a
+        // plural it is not, and the reverse match is the only thing connecting
+        // the two.
+        println!("--- is the reverse term already an exact token of the query? ---");
+        for original in [
+            "rebuiltDoc",
+            "getUserById",
+            "debugMe",
+            "users",
+            "usernames",
+            "definitelyNoSuchSymbol",
+        ] {
+            println!(
+                "REDUNDANCY {:<24} tokenize -> {:?}",
+                original,
+                tokenize(original)
+            );
+        }
+    }
+
+    /// FIR-2968. The row this fix exists to stop, reproduced at this layer.
+    ///
+    /// Measured on kin before the fix: `definitelyNoSuchSymbol` retrieved an
+    /// entity whose only text is `present`, `fn present()` and `src/a.py`, with
+    /// `match_kind: TextFallback` and score 0.45207196, over a corpus holding no
+    /// token of the query. The mechanism is `def`, which the signature puts in
+    /// the vocabulary and which is a substring of the query token `definitely`.
+    ///
+    /// This is the whole corpus from that reproduction, so the test fails on the
+    /// bare `contains` and passes on the floor.
+    #[test]
+    fn a_query_whose_terms_the_index_does_not_hold_retrieves_nothing() {
+        let index = TextIndex::<TestId>::open(None).expect("open");
+        // NOT `make_doc`, and that is the whole fixture. `make_doc` writes a
+        // signature of `fn {name}()`, which puts `fn` in the vocabulary and
+        // never `def`. kin's reproduction was a Python entity whose signature is
+        // `def present()`, and `def` is the token that sits inside `definitely`.
+        // Built through `make_doc` this test passed with the defect restored,
+        // because the term it is about was never indexed: the falsification
+        // caught it as a green cell under M1 where a red was required.
+        let id = next_id();
+        let doc = TestDoc {
+            name: "present".to_string(),
+            signature: "def present()".to_string(),
+            file_path: "src/a.py".to_string(),
+            kind: "Function".to_string(),
+        };
+        index.upsert(id, &doc.search_fields()).expect("upsert");
+        index.commit().expect("commit");
+
+        // The term the defect travelled through has to actually be in the
+        // vocabulary, or the absence below is about a corpus that could never
+        // have matched.
+        assert!(
+            tokenize(&doc.signature).contains(&"def".to_string()),
+            "the fixture must index the token `def`, which is what sits inside `definitely`: {:?}",
+            tokenize(&doc.signature)
+        );
+
+        // The positive control: without it, a search layer that answers nothing
+        // to everything would pass the assertion below.
+        let held = index.fuzzy_search("present", 10).expect("search");
+        assert!(
+            !held.is_empty(),
+            "the fixture must be searchable at all, or the absence below means nothing"
+        );
+
+        let hits = index
+            .fuzzy_search("definitelyNoSuchSymbol", 10)
+            .expect("search");
+        assert!(
+            hits.is_empty(),
+            "a query whose tokens this index does not hold retrieved {} row(s); the corpus is \
+             'present', 'def present()', 'src/a.py' and 'Function', and the query shares only the \
+             vocabulary term 'def' sitting inside 'definitely': {hits:?}",
+            hits.len()
+        );
+    }
+
+    /// The control that keeps the floor from becoming a mute button.
+    ///
+    /// A reverse substring match is the ONLY thing connecting a plural to its
+    /// singular, because the tokenizer does not split it: `tokenize("usernames")`
+    /// emits `["usernames"]` and nothing else. Refusing this pair would trade one
+    /// wrong answer for a missing right one, so the floor has to keep it.
+    #[test]
+    fn a_plural_still_retrieves_its_singular_through_the_reverse_match() {
+        let index = TextIndex::<TestId>::open(None).expect("open");
+        let (id, doc) = make_doc("username", "src/users.rs", "Function");
+        index.upsert(id, &doc.search_fields()).expect("upsert");
+        index.commit().expect("commit");
+
+        assert_eq!(
+            tokenize("usernames"),
+            vec!["usernames".to_string()],
+            "this control assumes the tokenizer does not split the plural; if that changes, the \
+             reverse match is no longer what connects these two and this test is measuring \
+             something else"
+        );
+
+        let hits = index.fuzzy_search("usernames", 10).expect("search");
+        assert!(
+            !hits.is_empty(),
+            "the plural lost its singular: 'username' is 8 of 9 bytes of 'usernames', well above \
+             the floor, and the reverse match is the only path between them"
+        );
+    }
+
+    /// The floor's own arithmetic, stated as the pairs rather than as a number.
+    ///
+    /// Integer comparison on purpose: this predicate decides which postings enter
+    /// the scoring set, and that set's order is what makes the parallel and
+    /// serial accumulations bit-identical.
+    #[test]
+    fn the_reverse_floor_admits_variants_and_refuses_coincidences() {
+        // Kept: morphological variants the tokenizer does not split.
+        for (qt, token) in [
+            ("usernames", "username"),
+            ("users", "user"),
+            ("posts", "post"),
+            ("myfunction", "function"),
+            ("persistme", "persist"),
+        ] {
+            assert!(
+                reverse_substring_admits(qt, token),
+                "{qt} contains {token} at {:.3} and must be admitted",
+                token.len() as f32 / qt.len() as f32
+            );
+        }
+        // Refused: the coincidence this fix exists for, and the camel-case joins
+        // whose parts the tokenizer already emits as exact postings.
+        for (qt, token) in [
+            ("definitely", "def"),
+            ("definitelynosuchsymbol", "def"),
+            ("rebuiltdoc", "doc"),
+            ("getuserbyid", "get"),
+            ("qdpreader", "qdp"),
+            ("debugme", "debug"),
+        ] {
+            assert!(
+                !reverse_substring_admits(qt, token),
+                "{qt} contains {token} at {:.3} and must be refused",
+                token.len() as f32 / qt.len() as f32
+            );
+        }
+        // The forward direction is untouched, and this is the pair that proves
+        // the fix did not simply disable substring matching.
+        assert!(
+            "present".contains("pres"),
+            "the forward direction is a plain contains and stays that way"
+        );
+        assert!(
+            !reverse_substring_admits("pres", "present"),
+            "the reverse predicate must not fire when the QUERY is the shorter side; that case \
+             belongs to the forward branch"
+        );
     }
 
     #[test]
@@ -3997,9 +4306,18 @@ mod tests {
                 let mut matched: Vec<&String> = index
                     .keys()
                     .filter(|t| {
+                        // Calls the SAME predicate the trigram path calls, on
+                        // purpose. This reference scan had its own copy of it,
+                        // and when the floor was added to one home only, this
+                        // test caught the divergence as a score-bit mismatch at
+                        // rank 0. Two hand-synced copies would have made the
+                        // test a comparison of two predicates rather than of the
+                        // trigram path against a full scan, which is what it
+                        // exists to compare.
                         t.as_str() != qt.as_str()
                             && t.len() >= 3
-                            && (t.contains(qt.as_str()) || qt.contains(t.as_str()))
+                            && (t.contains(qt.as_str())
+                                || reverse_substring_admits(qt.as_str(), t.as_str()))
                     })
                     .collect();
                 matched.sort_unstable();
