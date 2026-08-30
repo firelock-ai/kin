@@ -350,6 +350,15 @@ jobs:
       - name: Falsify the coverage read graders
         run: python3 scripts/acceptance/coverage_read_open.py --self-test
 
+      # FIR-3012. The two mutations that survived the first version of these
+      # graders are why this step exists rather than being taken on trust: each
+      # was caught one line later by a different check in the same grader, which
+      # left the arm red and the mutant alive. The fixtures now carry the phrase
+      # the shadowing check wanted, and each arm asserts WHICH assertion fired,
+      # so a red for the wrong reason is not a pass.
+      - name: Falsify the detached-head commit graders
+        run: python3 scripts/acceptance/detached_head_commit_repro.py --self-test
+
       - name: Install Rust toolchain
         uses: ./.github/actions/rust-toolchain
 
@@ -1144,6 +1153,31 @@ jobs:
             echo "::warning title=Merge precedence acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Detached-head commit acceptance suite (verdict comes from the gate step)
+        id: detachedhead
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/detached_head_commit_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/detached_head.json \
+            --verbose >acceptance/detached_head.log 2>&1 || rc=$?
+          cat acceptance/detached_head.log
+          {
+            echo "### Detached-head commit acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/detached_head.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Detached-head commit acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -1198,4 +1232,5 @@ jobs:
             --report bridge_reach=acceptance/bridge_reach.json \
             --report prose_parity=acceptance/prose_parity.json \
             --report merge_precedence=acceptance/merge_precedence.json \
+            --report detached_head=acceptance/detached_head.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'

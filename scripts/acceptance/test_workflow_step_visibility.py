@@ -162,6 +162,11 @@ EXPECTED_SUITES = (
         "merge_precedence",
         "acceptance/merge_precedence.json",
     ),
+    ExpectedSuite(
+        "scripts/acceptance/detached_head_commit_repro.py",
+        "detached_head",
+        "acceptance/detached_head.json",
+    ),
 )
 
 

@@ -28,6 +28,37 @@ use crate::source_cas::read_publishable_source;
 
 type ProjectionEntry = (kin_model::RepoPath, kin_model::TreeEntry, Arc<[u8]>);
 
+/// Where one native commit publishes.
+///
+/// A workspace whose head names a branch publishes onto that branch: the branch
+/// is what moves, and the head goes on naming it. A workspace whose head is
+/// detached owns its own head, because nothing else in the repository names
+/// where it stands, so the head itself advances to the new change and no ref is
+/// invented on the author's behalf.
+///
+/// This is graph vocabulary rather than a Git shape borrowed for convenience. A
+/// workspace parked at a change with no branch is expressible with no file and
+/// no Git in the picture, `kin_model::WorkspaceHead::Detached` already accepts a
+/// `RefTarget::Change`, and the change keeps its parent, so provenance is
+/// unbroken either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NativeCommitTarget {
+    /// The branch the workspace head names, which this commit fast-forwards.
+    Branch(RefName),
+    /// The workspace's own detached head, which this commit advances.
+    DetachedHead,
+}
+
+impl NativeCommitTarget {
+    /// The branch this commit moves, or `None` on a detached head.
+    pub fn branch(&self) -> Option<&RefName> {
+        match self {
+            Self::Branch(name) => Some(name),
+            Self::DetachedHead => None,
+        }
+    }
+}
+
 /// Complete immutable plan for one native repository transaction.
 ///
 /// `source_hashes` name bodies already present in the daemon's admitted blob
@@ -46,7 +77,7 @@ type ProjectionEntry = (kin_model::RepoPath, kin_model::TreeEntry, Arc<[u8]>);
 pub struct NativeCommitPlan {
     pub change: SemanticChange,
     pub transaction: RepositoryTransaction,
-    pub branch: RefName,
+    pub target: NativeCommitTarget,
     pub entity_count: usize,
     pub relation_count: usize,
     pub file_count: usize,
@@ -68,7 +99,7 @@ pub struct NativeCommitPlan {
 pub struct NativeCommitResult {
     pub change: SemanticChange,
     pub receipt: RepositoryCommitReceipt,
-    pub branch: RefName,
+    pub target: NativeCommitTarget,
     pub entity_count: usize,
     pub relation_count: usize,
     pub file_count: usize,
@@ -804,8 +835,8 @@ fn plan_native_commit_inner(
         )));
     }
 
-    let (branch, current_ref_target, parent) =
-        resolve_symbolic_commit_base(metadata, &workspace.head, workspace.base_target.as_ref())?;
+    let (commit_target, current_ref_target, parent) =
+        resolve_commit_base(metadata, &workspace.head, workspace.base_target.as_ref())?;
     let parent_policy = match parent {
         Some(parent) => Some(
             metadata
@@ -935,6 +966,28 @@ fn plan_native_commit_inner(
         ))
     })?;
     let new_target = RefTarget::change(change.id);
+    // A branch commit leaves the head naming its branch and moves the branch. A
+    // detached commit moves the head itself and touches no ref, which is what
+    // keeps the head equal to the base that advanced beneath it.
+    let (new_head, ref_mutations) = match &commit_target {
+        NativeCommitTarget::Branch(branch) => (
+            workspace.head.clone(),
+            vec![RefMutation {
+                name: branch.clone(),
+                expected: current_ref_target
+                    .map(|target| RefExpectation::MustEqual { target })
+                    .unwrap_or(RefExpectation::MustNotExist),
+                new_target: Some(new_target.clone()),
+                policy: RefUpdatePolicy::FastForwardOnly,
+            }],
+        ),
+        NativeCommitTarget::DetachedHead => (
+            WorkspaceHead::Detached {
+                target: new_target.clone(),
+            },
+            Vec::new(),
+        ),
+    };
     let workspace_mutation = WorkspaceMutation {
         workspace_id,
         expected: WorkspaceExpectation::MustEqual {
@@ -947,7 +1000,7 @@ fn plan_native_commit_inner(
             admission_policy: workspace.admission_policy,
         },
         new_generation: workspace_generation,
-        new_head: workspace.head.clone(),
+        new_head,
         new_base_target: Some(new_target.clone()),
         new_base_tree_hash: Some(tree_hash),
         tree_deltas: workspace_tree_deltas,
@@ -958,14 +1011,6 @@ fn plan_native_commit_inner(
             shared: shared_policy.stamp(),
             local: workspace.admission_policy.local,
         },
-    };
-    let ref_mutation = RefMutation {
-        name: branch.clone(),
-        expected: current_ref_target
-            .map(|target| RefExpectation::MustEqual { target })
-            .unwrap_or(RefExpectation::MustNotExist),
-        new_target: Some(new_target),
-        policy: RefUpdatePolicy::FastForwardOnly,
     };
     let transaction = RepositoryTransaction {
         schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
@@ -979,7 +1024,7 @@ fn plan_native_commit_inner(
         git_authority_delta: None,
         changes: vec![change.clone()],
         aliases: Vec::new(),
-        ref_mutations: vec![ref_mutation],
+        ref_mutations,
         default_ref_mutation: None,
         workspace_mutation: Some(workspace_mutation),
         local_overlay_delta: None,
@@ -1005,7 +1050,7 @@ fn plan_native_commit_inner(
     Ok(NativeCommitPlan {
         change,
         transaction,
-        branch,
+        target: commit_target,
         entity_count,
         relation_count,
         file_count,
@@ -1103,19 +1148,38 @@ pub(crate) fn recover_native_commit(
         .ref_mutations
         .iter()
         .filter_map(|mutation| match mutation.new_target.as_ref() {
-            Some(RefTarget::Change { change_id }) => Some((mutation.name.clone(), *change_id)),
+            Some(RefTarget::Change { change_id }) => Some((
+                NativeCommitTarget::Branch(mutation.name.clone()),
+                *change_id,
+            )),
             _ => None,
         });
-    let (branch, change_id) = native_targets.next().ok_or_else(|| {
-        invalid(format!(
-            "repository receipt for MCP operation {operation_id} has no native change target"
-        ))
-    })?;
-    if native_targets.next().is_some() {
+    let first = native_targets.next();
+    if first.is_some() && native_targets.next().is_some() {
         return Err(invalid(format!(
             "repository receipt for MCP operation {operation_id} has multiple native change targets"
         )));
     }
+    // A detached commit moves no ref, so its change is named by the head the
+    // workspace mutation advanced rather than by a ref mutation. Reading only
+    // the ref mutations here would make an operation that landed look like one
+    // that never ran, which is precisely the reading this recovery exists to
+    // prevent.
+    let (target, change_id) = first
+        .or(match &receipt.operation.workspace_mutation {
+            Some(workspace) => match &workspace.new_head {
+                WorkspaceHead::Detached {
+                    target: RefTarget::Change { change_id },
+                } => Some((NativeCommitTarget::DetachedHead, *change_id)),
+                _ => None,
+            },
+            None => None,
+        })
+        .ok_or_else(|| {
+            invalid(format!(
+                "repository receipt for MCP operation {operation_id} has no native change target"
+            ))
+        })?;
     let change = lease
         .snapshot()
         .changes
@@ -1132,7 +1196,7 @@ pub(crate) fn recover_native_commit(
         file_count: change.tree_deltas.len(),
         change,
         receipt,
-        branch,
+        target,
     }))
 }
 
@@ -1166,7 +1230,7 @@ pub(crate) fn commit_native_plan(
     Ok(NativeCommitResult {
         change: plan.change,
         receipt,
-        branch: plan.branch,
+        target: plan.target,
         entity_count: plan.entity_count,
         relation_count: plan.relation_count,
         file_count: plan.file_count,
@@ -1372,7 +1436,7 @@ fn commit_native_plan_with_working_copy_proof(
     Ok(NativeCommitResult {
         change: plan.change,
         receipt,
-        branch: plan.branch,
+        target: plan.target,
         entity_count: plan.entity_count,
         relation_count: plan.relation_count,
         file_count: plan.file_count,
@@ -1429,50 +1493,91 @@ fn materializable_artifact_count(tree: &kin_model::ResolvedTree) -> Result<usize
     Ok(count)
 }
 
-fn resolve_symbolic_commit_base(
+/// Where a prospective native commit publishes, and what its parent is.
+///
+/// The second element is the compare-and-swap expectation for the branch ref a
+/// symbolic commit fast-forwards, and is always `None` on a detached head,
+/// which moves no ref at all.
+///
+/// A detached workspace used to be refused here outright. It is not refused any
+/// more, because the refusal answered a question the model had already
+/// answered: `kin_model`'s `validate_head_base` accepts a detached head whose
+/// target is a `RefTarget::Change`, and requires that head to equal the
+/// workspace base. A commit advances the base to the new change, so a detached
+/// head that stayed put would contradict its own base and the transaction would
+/// be refused one layer down. That is what made the old refusal load-bearing,
+/// and it is also what says the fix: the head moves with the base.
+fn resolve_commit_base(
     metadata: &kin_db::PersistedRepositoryAuthority,
     head: &WorkspaceHead,
     workspace_base: Option<&RefTarget>,
-) -> Result<(RefName, Option<RefTarget>, Option<SemanticChangeId>)> {
-    let WorkspaceHead::Symbolic { target: branch } = head else {
-        return Err(invalid(
-            "native repository commit requires a symbolic workspace HEAD",
-        ));
-    };
-    let current = metadata
-        .ref_state
-        .refs
-        .iter()
-        .find(|repository_ref| repository_ref.name == *branch)
-        .map(|repository_ref| repository_ref.target.clone());
-    if current.as_ref() != workspace_base {
-        return Err(invalid(format!(
-            "workspace base does not match current symbolic ref {branch}; refresh or rebase before commit"
-        )));
-    }
-    let parent = match current.as_ref() {
-        None => None,
-        Some(RefTarget::Change { change_id }) => Some(*change_id),
-        Some(RefTarget::ExternalObject { object }) => Some(
-            metadata
-                .aliases
+) -> Result<(
+    NativeCommitTarget,
+    Option<RefTarget>,
+    Option<SemanticChangeId>,
+)> {
+    match head {
+        WorkspaceHead::Symbolic { target: branch } => {
+            let current = metadata
+                .ref_state
+                .refs
                 .iter()
-                .find(|alias| alias.oid == object.oid)
-                .map(|alias| alias.change_id)
-                .ok_or_else(|| {
-                    invalid(format!(
-                        "workspace base external commit {} has no semantic alias",
-                        object.oid
-                    ))
-                })?,
-        ),
-        Some(RefTarget::Symbolic { target }) => {
-            return Err(invalid(format!(
-                "native commit does not yet mutate symbolic ref chain {branch} -> {target}"
-            )));
+                .find(|repository_ref| repository_ref.name == *branch)
+                .map(|repository_ref| repository_ref.target.clone());
+            if current.as_ref() != workspace_base {
+                return Err(invalid(format!(
+                    "workspace base does not match current symbolic ref {branch}; refresh or rebase before commit"
+                )));
+            }
+            let parent = match current.as_ref() {
+                None => None,
+                Some(target) => Some(parent_change_at(metadata, target)?),
+            };
+            Ok((NativeCommitTarget::Branch(branch.clone()), current, parent))
         }
-    };
-    Ok((branch.clone(), current, parent))
+        WorkspaceHead::Detached { target } => {
+            // Durable authority already binds these two together, so a
+            // disagreement is a store nobody should commit onto rather than a
+            // choice between two readings of where the workspace stands.
+            if workspace_base != Some(target) {
+                return Err(invalid(
+                    "detached workspace HEAD does not match the workspace base; refresh before commit",
+                ));
+            }
+            let parent = parent_change_at(metadata, target)?;
+            Ok((NativeCommitTarget::DetachedHead, None, Some(parent)))
+        }
+    }
+}
+
+/// The semantic change one resolved authority target names.
+///
+/// A change names itself. An external Git commit names the change it was
+/// admitted as, and a commit with no alias is a store that cannot describe its
+/// own base. A symbolic target is not resolved at all, which durable authority
+/// already refuses for both a workspace base and a detached head, so this arm
+/// is a refusal rather than an assumption.
+fn parent_change_at(
+    metadata: &kin_db::PersistedRepositoryAuthority,
+    target: &RefTarget,
+) -> Result<SemanticChangeId> {
+    match target {
+        RefTarget::Change { change_id } => Ok(*change_id),
+        RefTarget::ExternalObject { object } => metadata
+            .aliases
+            .iter()
+            .find(|alias| alias.oid == object.oid)
+            .map(|alias| alias.change_id)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "workspace base external commit {} has no semantic alias",
+                    object.oid
+                ))
+            }),
+        RefTarget::Symbolic { target } => Err(invalid(format!(
+            "native commit does not yet mutate symbolic ref chain ending at {target}"
+        ))),
+    }
 }
 
 fn invalid(message: impl Into<String>) -> DaemonError {
@@ -2306,7 +2411,13 @@ mod tests {
         );
         assert_eq!(
             authority
-                .get_repository_ref(&init.repository_id, &result.branch)
+                .get_repository_ref(
+                    &init.repository_id,
+                    result
+                        .target
+                        .branch()
+                        .expect("a workspace on a branch publishes onto that branch"),
+                )
                 .unwrap()
                 .unwrap()
                 .target,
@@ -2379,12 +2490,333 @@ mod tests {
         );
         assert_eq!(
             authority
-                .get_repository_ref(&init.repository_id, &result.branch)
+                .get_repository_ref(
+                    &init.repository_id,
+                    result
+                        .target
+                        .branch()
+                        .expect("a workspace on a branch publishes onto that branch"),
+                )
                 .unwrap()
                 .unwrap()
                 .target,
             RefTarget::change(result.change.id)
         );
+    }
+
+    /// Park the workspace on its own base with no branch naming it.
+    ///
+    /// This is where a repository converted while Git's HEAD was detached
+    /// stands from admission onward: `init.rs` maps a direct raw Git HEAD onto
+    /// `WorkspaceHead::Detached`, and nothing re-reads Git afterwards. Reaching
+    /// that state through an ordinary workspace mutation rather than through a
+    /// Git conversion keeps these tests in one crate, and the state is the same
+    /// state because durable authority is what both produce.
+    fn detach_workspace_head(layout: &kin_core::KinLayout) {
+        let context = test_authority_context(layout);
+        let authority = context.open().unwrap();
+        let lease = authority.read_authority();
+        let metadata = lease.metadata();
+        let workspace = metadata
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == context.workspace_id())
+            .expect("the test repository has one workspace")
+            .clone();
+        let base = workspace
+            .base_target
+            .clone()
+            .expect("a detached head binds a base, so commit at least once first");
+        let base_change = lease.resolve_target_change_id(&base).unwrap();
+        let shared = metadata
+            .admission_policies
+            .iter()
+            .find(|resolved| resolved.change_id == base_change)
+            .and_then(|resolved| resolved.policy.clone())
+            .expect("the base change carries a resolved shared admission policy");
+        let roots = lease.roots().clone();
+        drop(lease);
+        let transaction = RepositoryTransaction {
+            schema_version: REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+            operation_id: OperationId::new(),
+            repository_id: context.repository_id().clone(),
+            expected_generation: roots.generation,
+            expected_roots: roots,
+            actor: AuthorId::new("detach"),
+            reason: "park this workspace on its base with no branch".to_string(),
+            external_objects: Vec::new(),
+            git_authority_delta: None,
+            changes: Vec::new(),
+            aliases: Vec::new(),
+            ref_mutations: Vec::new(),
+            default_ref_mutation: None,
+            workspace_mutation: Some(WorkspaceMutation {
+                workspace_id: workspace.workspace_id,
+                expected: WorkspaceExpectation::MustEqual {
+                    generation: workspace.generation,
+                    head: workspace.head.clone(),
+                    base_target: workspace.base_target.clone(),
+                    base_tree_hash: workspace.base_tree_hash,
+                    tree_hash: workspace.tree_hash,
+                    semantic_overlay_hash: workspace.semantic_overlay_hash,
+                    admission_policy: workspace.admission_policy,
+                },
+                new_generation: workspace.generation + 1,
+                new_head: WorkspaceHead::Detached {
+                    target: base.clone(),
+                },
+                new_base_target: Some(base),
+                new_base_tree_hash: workspace.base_tree_hash,
+                tree_deltas: Vec::new(),
+                new_tree_hash: workspace.tree_hash,
+                semantic_delta: WorkspaceSemanticDelta::default(),
+                new_shared_admission_policy: shared.clone(),
+                new_admission_policy: EffectiveAdmissionPolicyStamp {
+                    shared: shared.stamp(),
+                    local: workspace.admission_policy.local,
+                },
+            }),
+            local_overlay_delta: None,
+            merge_transaction_delta: None,
+            sealed_observation: None,
+        };
+        authority
+            .commit_repository_transaction(transaction)
+            .expect("parking a workspace on its own base is a legal workspace mutation");
+    }
+
+    /// The state both arms below start from: one committed change on
+    /// `refs/heads/main`, with a second artifact staged for the commit under
+    /// test.
+    fn repository_with_one_change() -> (
+        tempfile::TempDir,
+        kin_core::InitResult,
+        kin_blobs::BlobStore,
+        kin_db::InMemoryGraph,
+        SemanticChangeId,
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let init = kin_core::init(root.path()).unwrap();
+        let blobs = kin_blobs::BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let graph = kin_db::InMemoryGraph::new();
+        add_artifact(&graph, &blobs, b"first.txt", b"one\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("author"),
+            "first change".to_string(),
+        )
+        .unwrap();
+        let first_change = commit_native_plan_with_projection(&init.layout, &blobs, plan)
+            .unwrap()
+            .change
+            .id;
+        (root, init, blobs, graph, first_change)
+    }
+
+    /// Stage a second artifact and plan the commit under test.
+    fn plan_second_commit(
+        init: &kin_core::InitResult,
+        blobs: &kin_blobs::BlobStore,
+        graph: &kin_db::InMemoryGraph,
+    ) -> Result<NativeCommitPlan> {
+        add_artifact(graph, blobs, b"second.txt", b"two\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        plan_native_commit(
+            &init.layout,
+            graph,
+            blobs,
+            OperationId::new(),
+            fixed_timestamp(),
+            AuthorId::new("author"),
+            "second change".to_string(),
+        )
+    }
+
+    fn workspace_state(init: &kin_core::InitResult) -> kin_model::WorkspaceState {
+        let authority = reopen(init);
+        let lease = authority.read_authority();
+        let state = lease
+            .metadata()
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.workspace_id == init.workspace_id)
+            .unwrap()
+            .clone();
+        state
+    }
+
+    /// The control. A workspace whose head names a branch keeps naming it, and
+    /// the branch is what moves.
+    ///
+    /// It is written beside the detached arm on purpose: the two differ in
+    /// exactly the three facts asserted here, and a change that moved a branch
+    /// commit onto the detached path would pass every assertion in the arm
+    /// below while failing this one.
+    #[test]
+    fn a_commit_on_a_branch_moves_the_branch_and_leaves_the_head_naming_it() {
+        let (_root, init, blobs, graph, first_change) = repository_with_one_change();
+        let plan = plan_second_commit(&init, &blobs, &graph).unwrap();
+        assert_eq!(
+            plan.target,
+            NativeCommitTarget::Branch(
+                kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap()
+            ),
+            "a workspace head naming a branch publishes onto that branch"
+        );
+        assert_eq!(
+            plan.transaction.ref_mutations.len(),
+            1,
+            "a branch commit fast-forwards exactly one ref"
+        );
+        let result = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        let workspace = workspace_state(&init);
+        assert_eq!(
+            workspace.head,
+            WorkspaceHead::Symbolic {
+                target: kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap()
+            },
+            "the head goes on naming its branch"
+        );
+        assert_eq!(
+            reopen(&init)
+                .get_repository_ref(
+                    &init.repository_id,
+                    &kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .target,
+            RefTarget::change(result.change.id),
+            "the branch advanced to the new change"
+        );
+        assert_eq!(result.change.parents, vec![first_change]);
+    }
+
+    /// FIR-3012. A workspace parked on its own base commits, advancing that
+    /// head to the change it just made and moving no branch.
+    ///
+    /// This is the everyday state after `git clone` then `git checkout <tag>`
+    /// then `kin init`, which used to refuse every commit forever with
+    /// `native repository commit requires a symbolic workspace HEAD`, after
+    /// paying the whole planning cost first.
+    #[test]
+    fn a_detached_workspace_head_advances_to_the_change_it_commits() {
+        let (_root, init, blobs, graph, first_change) = repository_with_one_change();
+        detach_workspace_head(&init.layout);
+        let before = workspace_state(&init);
+        assert_eq!(
+            before.head,
+            WorkspaceHead::Detached {
+                target: RefTarget::change(first_change)
+            },
+            "the fixture must actually be detached, or this test asserts about nothing"
+        );
+
+        let plan = plan_second_commit(&init, &blobs, &graph).unwrap();
+        assert_eq!(
+            plan.target,
+            NativeCommitTarget::DetachedHead,
+            "a detached workspace publishes onto its own head"
+        );
+        assert!(
+            plan.transaction.ref_mutations.is_empty(),
+            "a detached commit invents no ref on the author's behalf"
+        );
+        let result = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+
+        assert_eq!(
+            result.change.parents,
+            vec![first_change],
+            "the detached commit descends from the change the head stood on"
+        );
+        let workspace = workspace_state(&init);
+        assert_eq!(
+            workspace.head,
+            WorkspaceHead::Detached {
+                target: RefTarget::change(result.change.id)
+            },
+            "the detached head advanced to the change it just made"
+        );
+        assert_eq!(
+            workspace.base_target,
+            Some(RefTarget::change(result.change.id)),
+            "the base advanced with the head, which is the invariant validate_head_base binds"
+        );
+        assert_eq!(
+            reopen(&init)
+                .get_repository_ref(
+                    &init.repository_id,
+                    &kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap()
+                )
+                .unwrap()
+                .unwrap()
+                .target,
+            RefTarget::change(first_change),
+            "no branch moved, so the branch the fixture left behind is where it was"
+        );
+
+        // The join with kin-cli. `landed_change_in` there reads exactly these
+        // two fields off the operation record to answer "did my commit land",
+        // and it can only be right if this is the shape a detached commit
+        // writes. Asserting it here means neither side is trusting a string the
+        // other side also wrote down.
+        assert!(
+            result.receipt.operation.ref_mutations.is_empty(),
+            "the record a recovery reads carries no ref mutation"
+        );
+        assert_eq!(
+            result
+                .receipt
+                .operation
+                .workspace_mutation
+                .as_ref()
+                .map(|workspace| workspace.new_head.clone()),
+            Some(WorkspaceHead::Detached {
+                target: RefTarget::change(result.change.id)
+            }),
+            "the record names the change on the head the workspace mutation advanced"
+        );
+    }
+
+    /// A detached commit is recoverable by the operation id that made it.
+    ///
+    /// The recovery path used to read only ref mutations, so a detached commit,
+    /// which has none, would have read as an operation that never landed. That
+    /// is the worst possible answer here: the caller reaching this code has
+    /// already lost the reply and is deciding whether to commit again.
+    #[test]
+    fn a_detached_commit_is_recovered_by_its_operation_id() {
+        let (_root, init, blobs, graph, _first_change) = repository_with_one_change();
+        detach_workspace_head(&init.layout);
+        add_artifact(&graph, &blobs, b"second.txt", b"two\n", |hash| {
+            TreeEntry::blob(hash, false)
+        });
+        let operation_id = OperationId::new();
+        let plan = plan_native_commit(
+            &init.layout,
+            &graph,
+            &blobs,
+            operation_id,
+            fixed_timestamp(),
+            AuthorId::new("author"),
+            "second change".to_string(),
+        )
+        .unwrap();
+        let committed = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+
+        let recovered =
+            super::recover_native_commit(&test_authority_context(&init.layout), operation_id)
+                .unwrap()
+                .expect("a landed detached commit is recoverable by its operation id");
+        assert_eq!(recovered.change.id, committed.change.id);
+        assert_eq!(recovered.target, NativeCommitTarget::DetachedHead);
     }
 
     #[test]
