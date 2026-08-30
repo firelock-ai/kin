@@ -4305,6 +4305,78 @@ mod tests {
         }
     }
 
+    /// A coverage read handed the durable tree opens NO authority, and answers
+    /// the same thing as the read that opens one.
+    ///
+    /// Both halves are load-bearing and neither is sufficient.
+    ///
+    /// The counter half needs the pinned arm beside it, because a zero on the
+    /// fast arm means "the open was removed" only if the counter can still see
+    /// an open at all. The pinned arm climbing by one is what proves it can.
+    ///
+    /// The agreement half is what catches the substitution anybody would reach
+    /// for first. The cheap tree to hand over is the one the daemon already
+    /// holds, which is the tree its query graph was built from, and the first
+    /// thing this read computes is whether the graph's tree and the authority's
+    /// agree. Serving the graph's own tree makes that the graph against itself,
+    /// which reports coherence on every store whatever is on disk. This fixture
+    /// is clean, so agreement alone would not separate them either; what does
+    /// is that the durable tree is taken from authority metadata and compared
+    /// field by field against what the opening path produced.
+    #[test]
+    fn a_coverage_read_with_a_retained_tree_opens_no_authority() {
+        const SOURCE: &[u8] = b"fn target() {}\n";
+        let fixture = graph_source_fixture(Some(SOURCE));
+        let opens = super::super::repository_authority::repository_authority_opens_on_this_thread;
+        let graph_tree = fixture.graph.resolved_tree();
+
+        // Taken outside both measured windows, and from authority METADATA,
+        // which is the same field the opening path reads. Not the graph's tree.
+        let durable_tree = {
+            let authority =
+                super::super::repository_authority::ActiveRepositoryAuthority::open(
+                    &fixture.binding,
+                )
+                .expect("open authority to read the durable workspace tree");
+            let workspace = authority.workspace().expect("durable workspace");
+            std::sync::Arc::new(workspace.tree)
+        };
+
+        let pinned = fixture.authority();
+        let before_pinned = opens();
+        let opened = super::super::graph_health::collect_repository_artifact_coverage(
+            &pinned,
+            &fixture.graph,
+            &graph_tree,
+        )
+        .expect("coverage through an authority this call opens");
+        let pinned_opens = opens() - before_pinned;
+        assert_eq!(
+            pinned_opens, 1,
+            "the opening path must still cost exactly one open, or a zero on the arm below \
+             measures a broken counter rather than a removed open"
+        );
+
+        let with_tree = fixture.authority().with_workspace_tree(durable_tree);
+        let before_fast = opens();
+        let served = super::super::graph_health::collect_repository_artifact_coverage(
+            &with_tree,
+            &fixture.graph,
+            &graph_tree,
+        )
+        .expect("coverage through the retained workspace tree");
+        assert_eq!(
+            opens() - before_fast,
+            0,
+            "a coverage read handed the durable tree opened the authority anyway"
+        );
+
+        assert_eq!(
+            served, opened,
+            "the two paths disagree, so one of them is not reading durable truth"
+        );
+    }
+
     /// A batch of source resolutions costs ONE authority open, not one each.
     ///
     /// `get_entity_sources` resolves source per entity, and every resolution

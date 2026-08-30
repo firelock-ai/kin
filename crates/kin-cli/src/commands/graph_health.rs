@@ -204,7 +204,7 @@ struct EnrichmentFacets {
 /// shortcut and a wrong one: the first thing computed below is whether the two
 /// AGREE, so serving the durable side from the graph compares the graph to
 /// itself and reports coherence no matter what is on disk.
-fn collect_repository_artifact_coverage(
+pub(crate) fn collect_repository_artifact_coverage(
     authority: &RequestRepositoryAuthority,
     graph: &kin_db::InMemoryGraph,
     graph_tree: &ResolvedTree,
