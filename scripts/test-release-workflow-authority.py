@@ -4394,7 +4394,7 @@ FAST_GATE_SHARD_STEPS = (
     "cargo nextest run --locked",
     "run: python3 scripts/check-quarantine.py --report-junit",
 )
-FAST_GATE_SHARD_MATRIX = "shard: [1, 2, 3]"
+FAST_GATE_SHARD_MATRIX = "shard: [1, 2, 3, 4, 5]"
 FAST_GATE_SHARD_INDEPENDENT_LEGS = "fail-fast: false"
 FAST_GATE_AGGREGATE_ALWAYS_RUNS = "if: ${{ !cancelled() }}"
 FAST_GATE_AGGREGATE_NEEDS = "needs: [changes, fast-gate-tests]"
@@ -4455,6 +4455,45 @@ def assert_fast_gate_authority(workflow: str) -> None:
                 "shard cancelling its siblings makes the aggregate report one "
                 "cause where there may be three"
             )
+
+    # The matrix list and the partition denominator are one fact written in two
+    # places, so they are checked against EACH OTHER rather than both pinned to
+    # a number. Pinning both would let a reviewer satisfy the guard by writing
+    # the same digit twice while the two lines still disagreed about what ran.
+    #
+    # Only one direction is dangerous. A denominator BELOW the matrix length
+    # fails loudly, because nextest refuses a partition index above the count.
+    # A denominator ABOVE it is silent: `shard: [1, 2, 3]` against
+    # `count:${{ matrix.shard }}/5` runs three fifths of the selection, every
+    # shard passes, and the aggregate reports the required context green. That
+    # is the same grades-nothing-and-exits-0 shape the listing assertion above
+    # exists to catch, arriving through the matrix instead of through a filter.
+    shard_text = "\n".join(shard_lines)
+    matrix_match = re.search(r"shard: \[([0-9,\s]+)\]", shard_text)
+    if matrix_match is None:
+        raise AssertionError(
+            "the admission core's shards lost their matrix list, so the "
+            "selection no longer has a declared number of parts"
+        )
+    shards = [int(value) for value in matrix_match.group(1).split(",")]
+    partition_match = re.search(
+        r"--partition count:\$\{\{ matrix\.shard \}\}/([0-9]+)", shard_text
+    )
+    if partition_match is None:
+        raise AssertionError(
+            "the admission core's shards must partition by their matrix index; "
+            "without `--partition count:${{ matrix.shard }}/<n>` every shard "
+            "runs the whole selection and the gate pays for it N times over"
+        )
+    denominator = int(partition_match.group(1))
+    if shards != list(range(1, len(shards) + 1)) or denominator != len(shards):
+        raise AssertionError(
+            "the admission core's shard matrix and partition denominator are "
+            f"one fact in two places and they disagree: matrix {shards} against "
+            f"denominator {denominator}. A denominator above the matrix length "
+            "silently drops that fraction of the selection and still reports "
+            "success"
+        )
 
     aggregate = jobs["fast-gate-tests-aggregate"]
     aggregate_lines = active_lines(aggregate)
@@ -13715,6 +13754,23 @@ def main() -> None:
             "        run: python3 scripts/check-quarantine.py\n",
             "        run: true\n",
             "lint and policy half must keep running",
+        ),
+        (
+            # The DENOMINATOR moves and the matrix does not, which is the
+            # mutation only the join can catch. Mutating the matrix instead
+            # would red on FAST_GATE_SHARD_MATRIX one assertion earlier and
+            # prove nothing about this one; that arm was written first and the
+            # falsification loop's own wrong-reason check rejected it.
+            #
+            # Its effect is the silent kind. Matrix [1..5] against
+            # `count:${{ matrix.shard }}/7` means parts 6 and 7 are never
+            # dispatched, so two sevenths of the selection never runs, all five
+            # shards pass, and the required context reports success.
+            "the partition denominator drifts above the shard matrix",
+            "fast-gate-tests",
+            "--partition count:${{ matrix.shard }}/5",
+            "--partition count:${{ matrix.shard }}/7",
+            "one fact in two places and they disagree",
         ),
     ):
         # Scoped to the owning job block rather than the whole file: two jobs

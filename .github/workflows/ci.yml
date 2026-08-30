@@ -1129,7 +1129,21 @@ jobs:
       # aggregate report one cause where there may be three.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+      # Five, not three, because the gate's wall time is its slowest shard and
+      # three put the required context at 10.08 to 11.17 minutes end to end
+      # across five consecutive main runs, all of them over the bar. Measured
+      # per step across nine shard jobs, a shard costs 34 s of job setup plus
+      # 168 s of `cargo nextest list`, which compiles the whole selection and
+      # so does NOT shrink when shards are added, against 930 to 989 s of test
+      # work per run that does. Five is where that 201 s floor stops paying:
+      # six buys about 0.6 min more and eight about 1.4, so the count is
+      # chosen on the floor rather than on how far it can be pushed.
+      #
+      # This list and the `--partition count:.../5` denominator below are one
+      # fact in two places. The guard checks them against each other, because
+      # a matrix SHORTER than the denominator runs that fraction of the
+      # selection and still reports success.
+        shard: [1, 2, 3, 4, 5]
     steps:
       # The scope read diffs a base against a head, so it needs both.
       - uses: actions/checkout@v7
@@ -1222,7 +1236,7 @@ jobs:
         run: |
           set -euo pipefail
           readarray -t SCOPE < "$RUNNER_TEMP/scope.args"
-          cargo nextest run --locked "${SCOPE[@]}" --partition count:${{ matrix.shard }}/3
+          cargo nextest run --locked "${SCOPE[@]}" --partition count:${{ matrix.shard }}/5
 
       # The reporting verdict. The run above graded a quarantined flake as
       # passing, which is what keeps it off the critical path; this reads the
