@@ -3220,7 +3220,14 @@ fn main() -> Result<()> {
                 },
                 Command::Merge { branch, json } => {
                     commands::capabilities::require_ready("merge")?;
-                    commands::merge::run(branch, json).await
+                    // A parked merge is not an error and its report is already
+                    // printed, so the outcome travels in the exit code the way
+                    // `kin init` reports an unattested conversion.
+                    let code = commands::merge::run(branch, json).await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
                 }
                 Command::Conflicts { json, show } => {
                     commands::capabilities::require_ready("conflicts")?;

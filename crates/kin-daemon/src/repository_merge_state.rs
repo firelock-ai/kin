@@ -748,10 +748,25 @@ fn entry_matches(entry: &kin_model::MergeConflictEntry, needle: &str) -> bool {
     if by_identity {
         return true;
     }
-    match &entry.label {
-        Some(label) => label == needle,
-        None => false,
+    let Some(label) = entry.label.as_deref() else {
+        return false;
+    };
+    if label == needle {
+        return true;
     }
+    // The name on its own, which is what `kin conflicts` prints beside the
+    // identity and therefore what a caller reaches for. An entity's label is
+    // composed as `<name> in <file>` wherever it carries a span, so the name is
+    // the segment before the first ` in `, and a label with no span is already
+    // the bare name and matched above.
+    //
+    // Widening the match cannot settle the wrong identity: `select_subject`
+    // refuses anything matching more than one entry and names every candidate,
+    // so a name shared by two files asks the caller to pick rather than
+    // guessing for them.
+    label
+        .split_once(" in ")
+        .is_some_and(|(name, _file)| name == needle)
 }
 
 fn resolution_for(

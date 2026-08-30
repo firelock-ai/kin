@@ -30,7 +30,7 @@ carries all of them the merge refuses and names both decisions. Nothing is
 synthesized, because kin has no textual line merge to build a third body from,
 so a projection is a choice among sides this merge already bound.
 
-Seven checks over six repositories, run in order because two of them are
+Nine checks over ten repositories, run in order because two of them are
 destructive: they publish the merge the earlier assertions are about. The first
 four grade FIR-2958's precedence rule; the last two grade rc062j finding (2),
 which is the same authority reporting conflicts that are not conflicts.
@@ -94,6 +94,9 @@ TICKET = "FIR-2958"
 GRANULARITY_TICKET = "FIR-2960"
 # rc062j finding (1), the conflict bodies. Same authority, same suite.
 BODIES_TICKET = "FIR-2960"
+# The rc062k merge-workflow items: the exit code and the selector.
+WORKFLOW_TICKET = "FIR-2960"
+EXIT_MERGE_CONFLICTED = 8
 
 print = functools.partial(print, flush=True)
 
@@ -136,6 +139,16 @@ BODY_CORE_BASE = b"def summarize(rows):\n    return len(rows)\n"
 BODY_CORE_OURS = b"def summarize(rows):\n    return OURSMARKER(rows)\n"
 BODY_CORE_THEIRS = b"def summarize(rows):\n    return THEIRSMARKER(rows)\n"
 BODY_FILES = {"pkg/core.py": (BODY_CORE_BASE, BODY_CORE_OURS, BODY_CORE_THEIRS)}
+
+# Two files each defining `summarize`, both conflicting, so a bare name matches
+# two entries. The selector must refuse and name them rather than pick one.
+AMBIG_A_BASE = b"def summarize(rows):\n    return len(rows)\n"
+AMBIG_A_OURS = b"def summarize(rows):\n    return len(rows) + 1\n"
+AMBIG_A_THEIRS = b"def summarize(rows):\n    return len(rows) * 3\n"
+AMBIG_FILES = {
+    "pkg/one.py": (AMBIG_A_BASE, AMBIG_A_OURS, AMBIG_A_THEIRS),
+    "pkg/two.py": (AMBIG_A_BASE, AMBIG_A_OURS, AMBIG_A_THEIRS),
+}
 
 GRAN_FILES = {"pkg/core.py": (GRAN_CORE_BASE, GRAN_CORE_OURS, GRAN_CORE_THEIRS)}
 for _name in ("a", "b", "c"):
@@ -713,6 +726,76 @@ def grade_default_listing_carries_no_bodies(json_text):
     return (PASS, "the default listing carries no bodies")
 
 
+def grade_exit_code(actual, expected, what):
+    """`kin merge` reported success on an unresolved merge.
+
+    Graded on the code rather than on a phrase in the output, because a phrase
+    is a proxy for the outcome and a script reads `$?`.
+    """
+    if actual is None:
+        return (UNREADABLE, "no exit code was captured for %s" % what)
+    if actual != expected:
+        return (FAIL, "%s exited %s, wanted %s" % (what, actual, expected))
+    return (PASS, "%s exited %s" % (what, actual))
+
+
+def check_exitcode(suite):
+    """rc062k. A merge that parks conflicts must not report success, and one
+    that publishes must not report failure. Both arms, because a build that
+    always exited nonzero would satisfy the first alone."""
+    repo = suite.repo("exitcode", BODY_FILES)
+    conflicted = suite.kin_run(["merge", "feature"], repo)[0]
+    publishing = suite.repo("exitcode-clean", MIXED_FILES)
+    suite.kin_run(["merge", "feature"], publishing)
+    suite.kin_run(["resolve", "--all-theirs"], publishing)
+    settled = suite.kin_run(["resolve", "--continue"], publishing)[0]
+    return _combine("exitcode", [
+        ("parked", grade_exit_code(conflicted, EXIT_MERGE_CONFLICTED, "a merge that parked")),
+        ("published", grade_exit_code(settled, 0, "a merge that published")),
+    ], ticket=WORKFLOW_TICKET)
+
+
+def grade_name_selector(rc, out, err, marker):
+    """The selector took only the UUID while `kin conflicts` printed the name."""
+    if rc is None:
+        return (UNREADABLE, "the selector run produced no exit code")
+    if rc != 0:
+        return (FAIL, "a bare entity name was refused: %s" % ((err or out)[-200:]).strip())
+    if marker not in (out or "") and marker not in (err or ""):
+        return (PASS, "the bare name settled")
+    return (PASS, "the bare name settled")
+
+
+def grade_ambiguous_name_refuses_with_candidates(rc, out, err):
+    """The control. A name two files share must refuse and say which two, or the
+    widened match would settle whichever entry happened to sort first."""
+    text = (err or "") + (out or "")
+    if rc is None:
+        return (UNREADABLE, "the ambiguous run produced no exit code")
+    if rc == 0:
+        return (FAIL, "an ambiguous name settled something instead of refusing")
+    if "matches 2 recorded merge conflicts" not in text:
+        return (FAIL, "the refusal does not say how many it matched: %s" % text[-200:].strip())
+    if "pkg/one.py" not in text or "pkg/two.py" not in text:
+        return (FAIL, "the refusal does not name both candidates: %s" % text[-200:].strip())
+    return (PASS, "an ambiguous name refuses and names both candidates")
+
+
+def check_byname(suite):
+    """rc062k. `kin resolve --theirs <name>` must accept the name `kin
+    conflicts` prints beside the identity."""
+    repo = suite.repo("byname", BODY_FILES)
+    suite.kin_run(["merge", "feature"], repo)
+    rc, out, err = suite.kin_run(["resolve", "--theirs", "summarize"], repo)
+    ambiguous = suite.repo("byname-ambiguous", AMBIG_FILES)
+    suite.kin_run(["merge", "feature"], ambiguous)
+    arc, aout, aerr = suite.kin_run(["resolve", "--theirs", "summarize"], ambiguous)
+    return _combine("byname", [
+        ("accepted", grade_name_selector(rc, out, err, "summarize")),
+        ("ambiguous", grade_ambiguous_name_refuses_with_candidates(arc, aout, aerr)),
+    ], ticket=WORKFLOW_TICKET)
+
+
 def check_bodies(suite):
     """rc062j (1). A conflict's three sides, readable.
 
@@ -757,6 +840,8 @@ CHECKS = [
     ("removals", check_removals),
     ("genuine", check_genuine),
     ("bodies", check_bodies),
+    ("exitcode", check_exitcode),
+    ("byname", check_byname),
 ]
 
 
@@ -1006,6 +1091,31 @@ def self_test():
            FAIL)
     expect("default cannot read text that is not json",
            grade_default_listing_carries_no_bodies("nope"), UNREADABLE)
+
+    expect("exit code passes the code the outcome calls for",
+           grade_exit_code(8, 8, "a parked merge"), PASS)
+    expect("exit code fails the zero that reported success on a parked merge",
+           grade_exit_code(0, 8, "a parked merge"), FAIL)
+    expect("exit code fails a published merge that reported failure",
+           grade_exit_code(8, 0, "a published merge"), FAIL)
+    expect("exit code cannot read a missing code",
+           grade_exit_code(None, 8, "a parked merge"), UNREADABLE)
+
+    ambiguous_good = ("summarize matches 2 recorded merge conflicts; name one exactly: "
+                      "entity summarize in pkg/one.py (a), entity summarize in pkg/two.py (b)")
+    expect("ambiguity passes a refusal naming both candidates",
+           grade_ambiguous_name_refuses_with_candidates(1, "", ambiguous_good), PASS)
+    expect("ambiguity fails a run that settled instead of refusing",
+           grade_ambiguous_name_refuses_with_candidates(0, "", ambiguous_good), FAIL)
+    expect("ambiguity fails a refusal that names neither candidate",
+           grade_ambiguous_name_refuses_with_candidates(1, "", "summarize matches 2 recorded "
+                                                              "merge conflicts; name one exactly"),
+           FAIL)
+    expect("selector fails a bare name that was refused",
+           grade_name_selector(1, "", "no recorded merge conflict matches summarize",
+                               "summarize"), FAIL)
+    expect("selector passes a bare name that settled",
+           grade_name_selector(0, "Settled 1 conflict(s)", "", "summarize"), PASS)
 
     expect("a relative kin path is absolutized by this suite",
            (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)
