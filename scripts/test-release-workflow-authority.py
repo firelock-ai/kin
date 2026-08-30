@@ -13936,10 +13936,17 @@ def main() -> None:
             "          add-rust-environment-hash-key: true",
         ),
         (
+            # Target the `shared-key` line itself rather than one job's
+            # expression. Unsharing a SINGLE job stopped falsifying this the day
+            # main added a second and third job keyed on `check`: the group was
+            # no longer emptied, the survivors still agreed, and the guard
+            # correctly stayed green while the arm expected red. Commenting out
+            # every shared-key leaves nothing sharing at all, which is what the
+            # label claims and what the refusal above is for, and it cannot be
+            # broken again by a new sharer arriving.
             "the shared-key expression stops naming a job, so nothing shares",
-            "          shared-key: ${{ matrix.os == 'macos-latest' "
-            "&& 'check-macos' || 'check' }}",
-            "          shared-key: unshared-by-anything",
+            "          shared-key: ",
+            "          # falsification removed shared-key: ",
         ),
         (
             "the action is renamed, so the extraction silently finds no cache step",

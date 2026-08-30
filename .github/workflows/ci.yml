@@ -904,6 +904,15 @@ jobs:
     name: Fast gate lint and policy
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # FIR-2744. This job shares `check`'s cargo cache key, and with
+    # `add-rust-environment-hash-key` off nothing else would notice the two
+    # declaring different cargo profiles, so they must declare the same one or
+    # they are sharing a cache built under settings neither agreed to. Added on
+    # rebase: this job arrived on main after the change was written.
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     permissions:
       actions: read
       contents: read
@@ -940,6 +949,13 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744. These two jobs share `check`'s cache key, which is exactly
+          # the case this setting exists for: without it `rust-cache` hashes
+          # every toolchain the runner happens to carry, so two jobs in one run
+          # that drew different images ask for different keys and share nothing.
+          # Added on rebase, because both jobs arrived on main after this change
+          # was written and its own guard refuses any cache step that omits it.
+          add-rust-environment-hash-key: false
           shared-key: check
           save-if: false
 
@@ -1117,6 +1133,13 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
+          # FIR-2744. These two jobs share `check`'s cache key, which is exactly
+          # the case this setting exists for: without it `rust-cache` hashes
+          # every toolchain the runner happens to carry, so two jobs in one run
+          # that drew different images ask for different keys and share nothing.
+          # Added on rebase, because both jobs arrived on main after this change
+          # was written and its own guard refuses any cache step that omits it.
+          add-rust-environment-hash-key: false
           shared-key: check
           save-if: false
 
