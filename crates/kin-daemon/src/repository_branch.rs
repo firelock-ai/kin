@@ -105,6 +105,9 @@ impl std::error::Error for WorkspaceTracksAnotherRef {}
 enum WorkspaceMutationRefusal {
     /// A refusal a client is told, as the status and message it is told with.
     Client(StatusCode, String),
+    /// The same, for the one refusal an admission pass clears: a TRACKED path
+    /// whose working copy moved away from the projection the graph holds.
+    ClientClearsWithAdmission(StatusCode, String),
     /// This workspace stands on a different ref than the one a transfer moved.
     TracksAnotherRef(String),
 }
@@ -112,6 +115,37 @@ enum WorkspaceMutationRefusal {
 impl From<(StatusCode, String)> for WorkspaceMutationRefusal {
     fn from((status, message): (StatusCode, String)) -> Self {
         Self::Client(status, message)
+    }
+}
+
+/// A refusal a branch command answers with, and whether one admission clears it.
+///
+/// The flag is read from the projection conflict's own kind rather than from
+/// its wording. A predicate on the sentence is a check a copy edit breaks in
+/// silence, and these two refusals differ by exactly one word in a paragraph.
+pub(crate) struct BranchRefusal {
+    pub(crate) status: StatusCode,
+    pub(crate) message: String,
+    /// True only for a TRACKED path whose content moved away from the
+    /// projection: the graph has not been told, and one admission pass tells
+    /// it. An untracked path standing where a member must go is never this, and
+    /// no admission makes it carry.
+    pub(crate) clears_with_admission: bool,
+}
+
+impl From<(StatusCode, String)> for BranchRefusal {
+    fn from((status, message): (StatusCode, String)) -> Self {
+        Self {
+            status,
+            message,
+            clears_with_admission: false,
+        }
+    }
+}
+
+impl From<BranchRefusal> for (StatusCode, String) {
+    fn from(refusal: BranchRefusal) -> Self {
+        (refusal.status, refusal.message)
     }
 }
 
@@ -124,7 +158,29 @@ impl WorkspaceMutationRefusal {
     fn into_client_response(self) -> (StatusCode, String) {
         match self {
             Self::Client(status, message) => (status, message),
+            Self::ClientClearsWithAdmission(status, message) => (status, message),
             Self::TracksAnotherRef(detail) => (StatusCode::CONFLICT, detail),
+        }
+    }
+
+    /// The same answer, carrying whether one admission pass would clear it.
+    fn into_client_refusal(self) -> BranchRefusal {
+        match self {
+            Self::Client(status, message) => BranchRefusal {
+                status,
+                message,
+                clears_with_admission: false,
+            },
+            Self::ClientClearsWithAdmission(status, message) => BranchRefusal {
+                status,
+                message,
+                clears_with_admission: true,
+            },
+            Self::TracksAnotherRef(detail) => BranchRefusal {
+                status: StatusCode::CONFLICT,
+                message: detail,
+                clears_with_admission: false,
+            },
         }
     }
 }
@@ -239,11 +295,11 @@ pub(crate) fn workspace_behind_ref(state: &DaemonState, name: &RefName) -> Resul
 pub(crate) fn execute(
     state: &DaemonState,
     request: &BranchRequest,
-) -> std::result::Result<BranchResponse, (StatusCode, String)> {
+) -> std::result::Result<BranchResponse, BranchRefusal> {
     if matches!(request, BranchRequest::List) {
-        let authority =
-            ActiveLocalRepositoryAuthority::open_bound(state).map_err(branch_bind_refusal)?;
-        return list(&authority).map_err(internal_branch_error);
+        let authority = ActiveLocalRepositoryAuthority::open_bound(state)
+            .map_err(|refusal| BranchRefusal::from(branch_bind_refusal(refusal)))?;
+        return list(&authority).map_err(|error| BranchRefusal::from(internal_branch_error(error)));
     }
 
     run_workspace_mutation(state, |state, authority| match request {
@@ -271,7 +327,7 @@ pub(crate) fn execute(
             TransitionPolicy::Switch,
         ),
     })
-    .map_err(WorkspaceMutationRefusal::into_client_response)
+    .map_err(WorkspaceMutationRefusal::into_client_refusal)
 }
 
 /// Move the graph-owned workspace onto the current target of the ref it already
@@ -313,6 +369,13 @@ pub(crate) fn follow_moved_ref(
             WorkspaceFollow::NotApplicable { detail }
         }
         Err(WorkspaceMutationRefusal::Client(_, detail)) => WorkspaceFollow::Behind { detail },
+        // A follow is not a switch and never admits, so the one refusal an
+        // admission would clear is reported here exactly as any other client
+        // refusal is. Spelled out rather than folded into the arm above, because
+        // the compiler asking this question is the point of the variant.
+        Err(WorkspaceMutationRefusal::ClientClearsWithAdmission(_, detail)) => {
+            WorkspaceFollow::Behind { detail }
+        }
     }
 }
 
@@ -989,7 +1052,7 @@ fn switch(
     )
     .with_context(|| format!("validate exact workspace projection before moving onto {name}"))?;
     if let Some(first) = drift.first() {
-        return Err(kin_core::KinError::ProjectionConflict(format!(
+        return Err(kin_core::KinError::projection_conflict(format!(
             "{first}; {} tracked path(s) diverge from the graph-owned workspace projection; \
              reconcile them into graph authority or discard them {}",
             drift.len(),
@@ -1459,7 +1522,29 @@ fn render_target(target: &RefTarget) -> String {
     }
 }
 
+/// The projection conflict's kind, wherever in the chain it sits.
+///
+/// Walks the causes rather than reading only the head, because these errors
+/// travel wrapped in context by the time a route classifies them.
+fn projection_conflict_kind(error: &anyhow::Error) -> Option<kin_core::ProjectionConflictKind> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<kin_core::KinError>())
+        .and_then(kin_core::KinError::projection_conflict_kind)
+}
+
 fn classify_branch_error(error: anyhow::Error) -> WorkspaceMutationRefusal {
+    // Read the kind BEFORE the error is flattened to a status and a sentence,
+    // because that is the last moment it exists. Tracked drift is the one
+    // refusal an admission pass clears; every other projection conflict, and
+    // every other error, keeps the answer it has always had.
+    if matches!(
+        projection_conflict_kind(&error),
+        Some(kin_core::ProjectionConflictKind::TrackedDrift)
+    ) {
+        let (status, message) = client_branch_refusal(error);
+        return WorkspaceMutationRefusal::ClientClearsWithAdmission(status, message);
+    }
     // Nothing to do is not a failure, and a follow tells it apart from one by
     // the variant rather than by reading a message it would have to
     // pattern-match. It is raised only under `TransitionPolicy::FollowMovedRef`,

@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -5220,13 +5220,57 @@ async fn command_branch(
 
     let requires_authority_gate =
         !matches!(&request, kin_cli::commands::branch::BranchRequest::List);
-    let _coordination = if requires_authority_gate {
-        Some(state.coordination_gate.lock().await)
-    } else {
-        None
+    let attempt = |state: &Arc<DaemonState>| crate::repository_branch::execute(state, &request);
+
+    // Scoped so the gate is RELEASED before any admission runs below. The
+    // admission seam takes this same gate and the mutex is not reentrant, so a
+    // retry that held it would deadlock rather than admit.
+    let first = {
+        let _coordination = if requires_authority_gate {
+            Some(state.coordination_gate.lock().await)
+        } else {
+            None
+        };
+        attempt(&state)
     };
 
-    let response = crate::repository_branch::execute(&state, &request)?;
+    let response = match first {
+        Ok(response) => response,
+        // Retried only for the one refusal an admission clears: a TRACKED path
+        // whose working copy moved away from the projection the graph holds, so
+        // the switch refused on a view of the workspace that was simply not
+        // current. Read from the refusal's typed kind, not from its wording.
+        //
+        // An untracked path standing where a member must go never reaches here,
+        // which is the whole reason this is a retry on a named refusal rather
+        // than an admission ahead of the command: admitting first also absorbed
+        // untracked files, turning a user's own file into tracked pending work
+        // as a side effect of changing branches.
+        Err(refusal)
+            if refusal.clears_with_admission
+                && matches!(
+                    &request,
+                    kin_cli::commands::branch::BranchRequest::Switch { .. }
+                )
+                && admission_seam_would_skip(&state).is_none() =>
+        {
+            if let Err(error) = crate::repository_admit::execute(&state).await {
+                // A pass that established no outcome does not get to change the
+                // answer. The switch already refused, and that refusal stands.
+                warn!(%error, "the admission before a retried switch reported no outcome");
+                return Err(refusal.into());
+            }
+            let _coordination = if requires_authority_gate {
+                Some(state.coordination_gate.lock().await)
+            } else {
+                None
+            };
+            // Once. A second refusal is the answer, whatever its kind, because
+            // an admission that did not clear it will not clear it next time.
+            attempt(&state)?
+        }
+        Err(refusal) => return Err(refusal.into()),
+    };
     Ok(Json(response))
 }
 
