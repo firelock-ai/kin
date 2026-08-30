@@ -306,6 +306,16 @@ jobs:
       # coherence on every clean fixture. The diverged arm returns UNREADABLE
       # rather than PASS when the divergence did not take, since that state and
       # the defect are not separable from outside.
+      # FIR-2958. Two settlements over one file are the case, and the two that
+      # decide it read alike from outside: a projection that took the side
+      # carrying the entity decision, and a bulk settle that overrode it. The
+      # graders are driven against the exact `tree=0` signature the rc062a
+      # stranger recorded, and against a one-parent change whose deltas say
+      # nothing about a merge at all, so a log that could not be read is never
+      # graded as a merge that moved bytes.
+      - name: Falsify the merge precedence graders
+        run: python3 scripts/acceptance/merge_precedence_repro.py --self-test
+
       - name: Falsify the coverage read graders
         run: python3 scripts/acceptance/coverage_read_open.py --self-test
 
@@ -1028,6 +1038,31 @@ jobs:
             echo "::warning title=Prose-query parity suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
           fi
 
+      - name: Merge precedence acceptance suite (verdict comes from the gate step)
+        id: mergeprecedence
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p acceptance
+          rc=0
+          python3 scripts/acceptance/merge_precedence_repro.py \
+            --kin target/release/kin \
+            --daemon target/release/kin-daemon \
+            --json acceptance/merge_precedence.json \
+            --verbose >acceptance/merge_precedence.log 2>&1 || rc=$?
+          cat acceptance/merge_precedence.log
+          {
+            echo "### Merge precedence acceptance suite (exit $rc)"
+            echo ''
+            echo '```'
+            grep -E '^CHECK ' acceptance/merge_precedence.log || echo '(no CHECK line was printed)'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          if [ "$rc" -ne 0 ]; then
+            echo "::warning title=Merge precedence acceptance suite returned nonzero::suite process exit $rc; verdict deferred to the Acceptance verdict step"
+          fi
+
       # Always, including on a cancelled or timed-out run: the reports are how a
       # failure is diagnosed without re-running the job.
       - name: Upload the acceptance reports
@@ -1076,7 +1111,8 @@ jobs:
             --report working_copy_freshness=acceptance/working_copy_freshness.json \
             --report vcs_read_surfaces=acceptance/vcs_read_surfaces.json \
             --report init_budget=acceptance/init_budget.json \
+            --report coverage_read=acceptance/coverage_read.json \
             --report bridge_reach=acceptance/bridge_reach.json \
             --report prose_parity=acceptance/prose_parity.json \
-            --report coverage_read=acceptance/coverage_read.json \
+            --report merge_precedence=acceptance/merge_precedence.json \
             --allow-unreadable 'brownfield:4=FIR-2593: the express app.handle walk is truncated on ubuntu-latest, and its clipped_steps metadata confirms dropped callee and cross-file rows. This check therefore cannot distinguish an absent required edge from one the walk dropped. Any FAIL or other UNREADABLE still fails the gate, and the moment this check passes the allowance announces itself stale and can go.'

@@ -133,6 +133,11 @@ EXPECTED_SUITES = (
         "acceptance/init_budget.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/coverage_read_open.py",
+        "coverage_read",
+        "acceptance/coverage_read.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/bridge_reach_repro.py",
         "bridge_reach",
         "acceptance/bridge_reach.json",
@@ -141,6 +146,11 @@ EXPECTED_SUITES = (
         "scripts/acceptance/prose_query_parity_repro.py",
         "prose_parity",
         "acceptance/prose_parity.json",
+    ),
+    ExpectedSuite(
+        "scripts/acceptance/merge_precedence_repro.py",
+        "merge_precedence",
+        "acceptance/merge_precedence.json",
     ),
 )
 
