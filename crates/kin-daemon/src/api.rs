@@ -49228,6 +49228,211 @@ mod tests {
         );
         assert_eq!(mcp_result_text(&after), text);
     }
+
+    /// The digest re-check must be able to FAIL, or it is a check nothing grades.
+    ///
+    /// On a healthy merge every side hashes back to its recorded digest, so
+    /// deleting the verification entirely changes nothing a fixture built
+    /// through the product can observe. That is a green arm proving nothing.
+    /// Here the record is handed a digest that disagrees with the graph, which
+    /// is the state the check exists for, and the assertions separate the three
+    /// outcomes that matter: the bad side is NAMED, the bad side is NOT PRINTED,
+    /// and the good sides are UNAFFECTED, so a blanket refusal cannot pass.
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_side_that_does_not_hash_back_to_the_record_is_named_and_not_printed() {
+        let (state, _layout, _repository, main_change, feature_change) =
+            universal_branch_test_state("bodies-artifact-digest");
+        let at_main = state.graph.resolve_graph_at(&main_change).unwrap();
+        let at_feature = state.graph.resolve_graph_at(&feature_change).unwrap();
+
+        let path = kin_model::RepoPath::from_utf8("selected/compose.yaml".to_string()).unwrap();
+        let on_main = at_main
+            .tree
+            .artifact_at_path(&path)
+            .expect("the fixture tracks selected/compose.yaml on main");
+        let on_feature = at_feature
+            .tree
+            .artifact_at_path(&path)
+            .expect("the fixture tracks selected/compose.yaml on feature");
+        let main_side = kin_model::MergeSideValue::artifact(Some(on_main)).unwrap();
+        let feature_side = kin_model::MergeSideValue::artifact(Some(on_feature)).unwrap();
+        // The precondition, asserted rather than assumed: if the two sides
+        // hashed the same, swapping one for the other below would be no
+        // tampering at all and the arm would pass while grading nothing.
+        assert_ne!(
+            main_side, feature_side,
+            "the fixture must hold this artifact differently on the two branches"
+        );
+
+        let entry = |ours: kin_model::MergeSideValue| kin_model::MergeConflictEntry {
+            subject: kin_model::MergeConflictSubject::Artifact {
+                artifact: on_main.artifact_id,
+            },
+            divergence: kin_model::MergeDivergence::ChangedBothSides,
+            base: main_side.clone(),
+            ours,
+            theirs: feature_side.clone(),
+            label: Some("selected/compose.yaml".to_string()),
+            resolution: kin_model::MergeEntryResolution::Unresolved,
+        };
+
+        let intact = crate::repository_merge_state::materialize_bodies_at(
+            &state,
+            &main_change,
+            &main_change,
+            &feature_change,
+            &[entry(main_side.clone())],
+        );
+        assert_eq!(intact.len(), 1);
+        assert!(
+            intact[0].unverified.is_empty(),
+            "a record that agrees with the graph refuses nothing: {:?}",
+            intact[0].unverified
+        );
+        assert!(
+            intact[0].ours.is_some(),
+            "the control arm must render, or the tampered arm's silence means nothing"
+        );
+
+        // The tampering: the record claims `ours` holds what THEIRS holds, so
+        // the value re-read at the ours change cannot hash back to it. A real
+        // digest from the same repository rather than a fabricated one, so the
+        // arm cannot pass because the value was merely unparseable.
+        let tampered = crate::repository_merge_state::materialize_bodies_at(
+            &state,
+            &main_change,
+            &main_change,
+            &feature_change,
+            &[entry(feature_side.clone())],
+        );
+        assert_eq!(tampered.len(), 1);
+        assert_eq!(
+            tampered[0].unverified,
+            vec!["ours".to_string()],
+            "the side whose digest disagrees must be named"
+        );
+        assert!(
+            tampered[0].ours.is_none(),
+            "and it must not be printed: {:?}",
+            tampered[0].ours
+        );
+        assert!(
+            tampered[0].base.is_some() && tampered[0].theirs.is_some(),
+            "while the sides that still agree are unaffected, so the refusal is \
+             scoped to the side that failed rather than to the whole subject"
+        );
+    }
+
+    /// A side whose stored bytes are GONE is named too, not quietly omitted.
+    ///
+    /// This grades the other refusal in the same materializer, and it can only
+    /// be graded here. Removing a source blob and going back through the CLI
+    /// does not reach the rendering at all: the daemon refuses to start, with
+    /// "Git external authority body validation failed", so the store's own
+    /// startup validation makes the CLI route unreachable and this path is
+    /// defensive code that only an already-open state can exercise.
+    ///
+    /// It matters because a body quietly missing reads exactly like an identity
+    /// that is absent on that side, and those are opposite facts.
+    #[cfg(unix)]
+    #[test]
+    fn a_side_whose_stored_bytes_are_gone_is_named_and_not_printed() {
+        let (state, _layout, _repository, main_change, feature_change) =
+            universal_branch_test_state("bodies-missing-blob");
+        let at_main = state.graph.resolve_graph_at(&main_change).unwrap();
+        let at_feature = state.graph.resolve_graph_at(&feature_change).unwrap();
+        let path = kin_model::RepoPath::from_utf8("selected/compose.yaml".to_string()).unwrap();
+        let on_main = at_main.tree.artifact_at_path(&path).unwrap();
+        let on_feature = at_feature.tree.artifact_at_path(&path).unwrap();
+        let kin_model::TreeEntry::Blob { hash, .. } = &on_main.entry else {
+            panic!("the fixture tracks this path as a blob");
+        };
+        let digest = hash.to_string();
+
+        let entry = kin_model::MergeConflictEntry {
+            subject: kin_model::MergeConflictSubject::Artifact {
+                artifact: on_main.artifact_id,
+            },
+            divergence: kin_model::MergeDivergence::ChangedBothSides,
+            base: kin_model::MergeSideValue::artifact(Some(on_main)).unwrap(),
+            ours: kin_model::MergeSideValue::artifact(Some(on_main)).unwrap(),
+            theirs: kin_model::MergeSideValue::artifact(Some(on_feature)).unwrap(),
+            label: Some("selected/compose.yaml".to_string()),
+            resolution: kin_model::MergeEntryResolution::Unresolved,
+        };
+
+        let intact = crate::repository_merge_state::materialize_bodies_at(
+            &state,
+            &main_change,
+            &main_change,
+            &feature_change,
+            std::slice::from_ref(&entry),
+        );
+        assert!(
+            intact[0].ours.is_some() && intact[0].unverified.is_empty(),
+            "the control arm must render before the bytes are removed: {:?}",
+            intact[0]
+        );
+
+        // Remove the blob this side's bytes live in. Named by its own digest,
+        // found by walking rather than by composing a path, because the store's
+        // layout is not this test's to encode.
+        let mut removed = 0_usize;
+        let mut stack = vec![state.layout.kindb_dir()];
+        while let Some(dir) = stack.pop() {
+            let Ok(read) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for item in read.flatten() {
+                let item_path = item.path();
+                if item_path.is_dir() {
+                    stack.push(item_path);
+                } else if item_path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == digest)
+                {
+                    std::fs::remove_file(&item_path).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        // The precondition, asserted: with nothing removed the arm below would
+        // pass for the wrong reason, since both sides would still render.
+        assert_eq!(
+            removed, 1,
+            "exactly one stored body named {digest} should have been removed"
+        );
+
+        let after = crate::repository_merge_state::materialize_bodies_at(
+            &state,
+            &main_change,
+            &main_change,
+            &feature_change,
+            std::slice::from_ref(&entry),
+        );
+        // Every side is named, including the one whose own bytes are intact.
+        // That is not sloppiness in the materializer: the store validates its
+        // bodies when it is opened, so one missing body refuses every read
+        // against that store. Measured here rather than assumed, and it is the
+        // same validation that stops the daemon starting at all, which is why
+        // the CLI cannot reach this path.
+        //
+        // Scoping is graded by the digest test above, where the refusal really
+        // is per side and `base` and `theirs` keep rendering. Asserting scoping
+        // here as well would assert a property this input does not have.
+        assert_eq!(
+            after[0].unverified,
+            vec!["base".to_string(), "ours".to_string(), "theirs".to_string()],
+            "a store that cannot open names every side rather than omitting any"
+        );
+        assert!(
+            after[0].base.is_none() && after[0].ours.is_none() && after[0].theirs.is_none(),
+            "and prints none of them, because a body quietly missing reads exactly \
+             like an identity that is absent on that side"
+        );
+    }
 }
 
 #[cfg(test)]
