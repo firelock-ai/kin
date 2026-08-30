@@ -34831,15 +34831,11 @@ mod tests {
         // authority-backed surface: `kin log` and `kin status` answered rc=0 on
         // the unpatched binary throughout, so a check reading only those would
         // pass on both builds. The split is the whole tell.
-        let held = state
-            .graph
-            .get_change(&published)
-            .unwrap()
-            .expect(
-                "the live graph does not hold the change the merge just published, so every read \
+        let held = state.graph.get_change(&published).unwrap().expect(
+            "the live graph does not hold the change the merge just published, so every read \
                  that replays the graph to it fails until the daemon restarts; authority holds it \
                  and the derived query view does not",
-            );
+        );
         // Only now, on a change the graph actually holds, is the KIND readable.
         assert_eq!(
             held.parents.len(),
@@ -34906,12 +34902,18 @@ mod tests {
         let app = router(Arc::clone(&state));
         std::fs::create_dir_all(root.join("notekeeper")).unwrap();
 
-        std::fs::write(root.join("notekeeper/client.py"), b"def normalize(term):\n    return 1\n")
-            .unwrap();
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return 1\n",
+        )
+        .unwrap();
         let restored =
             commit_through_api(&app, kin_model::OperationId::new(), "publish the base").await;
-        std::fs::write(root.join("notekeeper/client.py"), b"def normalize(term):\n    return 2\n")
-            .unwrap();
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return 2\n",
+        )
+        .unwrap();
         let regression =
             commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
         assert_eq!(branch_change(&state), regression);
@@ -35020,16 +35022,12 @@ mod tests {
         // resolving the change fine while blame and history cannot), and
         // nothing guarded them. This is their equivalent one layer down: the
         // PRE-publication change must still replay after the publication.
-        state
-            .graph
-            .resolve_graph_at(&regression)
-            .expect(
-                "the graph can no longer replay to a change it held before this publication, so \
+        state.graph.resolve_graph_at(&regression).expect(
+            "the graph can no longer replay to a change it held before this publication, so \
                  the projection was discarded rather than added to and every read that worked \
                  across the original defect now fails",
-            );
+        );
     }
-
 
     /// An operation id is matched before any history validation runs, and an
     /// ordinary commit publishes the same receipt shape a rollback does. Only
