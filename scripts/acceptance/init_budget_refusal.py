@@ -46,8 +46,21 @@ serving it, which is what a host with no language server does, it writes the sam
 record naming a pid confirmed not to be running. Either route exercises the
 product's own grading path; neither fabricates a verdict.
 
+Check 5 grades the band the release measurement opened. `kin init` does not end
+when the conversion ends: it starts a repository daemon on the store it just
+wrote, and that daemon has its own share of the same machine. A forecast that
+fits the ceiling but exceeds that share is the band where the conversion
+succeeds and the daemon it starts cannot, which on psf/requests inside a 12 GiB
+container meant seventeen completed phases, a 1.2 GB store, and four OOM kills,
+with nothing said before the run. It pins the daemon's share with
+`KIN_DAEMON_MEMORY_BUDGET_BYTES` for the same reason checks 0 to 3 pin the
+ceiling, and it carries a silent arm, because a band that fired on everything
+would satisfy every assertion in its loud arm.
+
 It does NOT measure how much memory a conversion really needs, and nothing here
-should be read as calibrating the forecast. The forecast's coefficient was fitted
+should be read as calibrating the forecast. Check 5 in particular grades the
+decision and its wording, never a resident set: what a daemon holds is
+FIR-2955's structural half and no check in this workspace gates it. The forecast's coefficient was fitted
 to sampled cgroup readings from full conversions of real repositories and that
 measurement lives in the lane report, not here. What this asserts is that the
 decision is made, disclosed and acted on.
@@ -92,6 +105,7 @@ UNREADABLE = "UNREADABLE"
 TICKET_SILENCE = "FIR-2639"
 TICKET_EXIT = "FIR-2650"
 TICKET_REPORT = "FIR-2929"
+TICKET_DAEMON = "FIR-2955"
 
 # What a seeded row says before its check answers. Named once, because the
 # self-test reads it back to prove `main` replaced the row rather than shipping
@@ -100,6 +114,11 @@ TICKET_REPORT = "FIR-2929"
 PENDING_MARKER = "did not answer"
 
 CEILING_ENV = "KIN_INIT_MEMORY_CEILING_BYTES"
+# The daemon's own share, which `kin init` forecasts against because the daemon
+# it starts at the end runs under it. Pinned rather than produced, for the same
+# reason every other limit here is: a test that fills a machine to prove Kin
+# noticed takes the runner down beside every other job.
+DAEMON_BUDGET_ENV = "KIN_DAEMON_MEMORY_BUDGET_BYTES"
 
 # A ceiling no conversion of anything can fit under, so the refusal is decided by
 # the comparison rather than by the fixture's size. One byte rather than zero,
@@ -109,6 +128,25 @@ TINY_CEILING = "1"
 # Room for any fixture this suite builds, so check 2's silence is the product
 # choosing to say nothing rather than the check failing to look.
 ROOMY_CEILING = str(512 * 1024 * 1024 * 1024)
+# A daemon share smaller than any fixture this suite builds will produce, so
+# check 5's band is entered by the comparison rather than by the fixture's size.
+# The four-commit fixture forecasts 4,800,000 bytes, one BYTES_PER_COMMIT term
+# per commit, so anything well under that works and this is two orders below.
+TIGHT_DAEMON_BUDGET = str(64 * 1024)
+# And a share no fixture can exceed, for the silent control.
+ROOMY_DAEMON_BUDGET = str(512 * 1024 * 1024 * 1024)
+
+# What the daemon-allowance band owes a reader. It is a different sentence from
+# the Tight one on purpose: Tight says the conversion might not finish, and this
+# says the conversion will finish and the thing that serves it afterward may not
+# start. A reader told the first when the second is true goes looking in the
+# wrong place.
+REQUIRED_DAEMON_BAND_PHRASES = [
+    "repository daemon",
+    "is allowed",
+    "answers nothing",
+    "convert a repository with less history",
+]
 
 # Every phrase the refusal owes an operator. A refusal that fires and does not
 # say what to do next leaves the reader exactly where the silence did.
@@ -332,6 +370,9 @@ class Suite(object):
         self.env["HOME"] = self.home
         self.env["GIT_CONFIG_NOSYSTEM"] = "1"
         self.env.pop(CEILING_ENV, None)
+        # Same reason as the line above. A machine that already exports a daemon
+        # share would decide check 5's control arm instead of the check doing it.
+        self.env.pop(DAEMON_BUDGET_ENV, None)
         self.repos = {}
 
     def git(self, args, cwd):
@@ -646,7 +687,98 @@ def check_4(suite):
     return result
 
 
-CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3), ("4", check_4)]
+def check_5(suite):
+    """A conversion that fits the machine but not the daemon's share says so.
+
+    The stranger finding this exists for, measured on the v0.6.2 candidate on
+    2026-08-29. psf/requests at 6493 commits inside a 12 GiB container: the
+    forecast was 7.3 GB, which is 0.61 of the ceiling and under TIGHT_FRACTION,
+    so `kin init` printed nothing about memory at all. All seventeen phases then
+    completed, a 1.2 GB store was written, and the repository daemon the same
+    command starts was OOM-killed. Four kills across that init and three
+    `kin graph status` attempts. The user is left with a store that reports
+    success and answers nothing.
+
+    Per-process sampling separated the two: the conversion peaked at 5.518 GiB
+    and the daemon at 8.351 GiB, sequentially, so the daemon is the larger of
+    the two and it was the one nothing forecast. The forecast is a conversion
+    forecast by its own constants and had no daemon term.
+
+    WHAT THIS GRADES, and what it does not. It grades the DECISION and its
+    wording, not the memory. Nothing here measures what a daemon holds, and a
+    green run says only that a conversion whose store exceeds the daemon's
+    share is told so before it starts. The resident-set cost itself is
+    FIR-2955's structural half and no check in this workspace gates it.
+
+    Both levers are pinned, which is this suite's standing pattern: the ceiling
+    so the conversion has room, the daemon share so the band is entered by the
+    comparison rather than by the fixture's size. The silent arm is the half
+    that can fail quietly, because a band wired to fire on everything would
+    satisfy every assertion above it and make an ordinary conversion narrate
+    itself.
+    """
+    result = Result("5", TICKET_DAEMON,
+                    "a conversion that fits the machine but not the daemon's share says so")
+
+    # The silent control first, so a band that fires on everything is caught
+    # before its own arm can pass.
+    quiet_repo = suite.fixture("daemonroom")
+    try:
+        rc, out = suite.kin_run(["init", "."], quiet_repo, ceiling=ROOMY_CEILING,
+                                extra_env={DAEMON_BUDGET_ENV: ROOMY_DAEMON_BUDGET})
+    except subprocess.TimeoutExpired:
+        result.unknown("the silent control's `kin init` did not finish inside the timeout")
+        return result
+    if rc != 0:
+        result.bad("the silent control exited %d: %s" % (rc, tail(out, 900)))
+        return result
+    chatter = memory_chatter(out)
+    if chatter:
+        result.bad("a conversion with room in both budgets narrated its memory: %s"
+                   % ", ".join(chatter))
+    else:
+        result.ok("a conversion with room in both budgets said nothing")
+
+    # And the band itself.
+    repo = suite.fixture("daemontight")
+    try:
+        rc, out = suite.kin_run(["init", "."], repo, ceiling=ROOMY_CEILING,
+                                extra_env={DAEMON_BUDGET_ENV: TIGHT_DAEMON_BUDGET})
+    except subprocess.TimeoutExpired:
+        result.unknown("`kin init` did not finish inside the timeout")
+        return result
+
+    # This band warns. A refusal here would cost a user a conversion that does
+    # complete, which is the opposite error and a worse one.
+    if rc != 0:
+        result.bad("a conversion that fits the machine was stopped, exit %d: %s"
+                   % (rc, tail(out, 900)))
+    else:
+        result.ok("`kin init` exited 0, so the band warns rather than refusing")
+
+    if not suite.store_exists(repo):
+        result.bad("the conversion was allowed to proceed and wrote no store")
+    else:
+        result.ok("a store was written")
+
+    missing = [p for p in REQUIRED_DAEMON_BAND_PHRASES if p not in out]
+    if missing:
+        result.bad("the line does not say %s: %s" % (", ".join(missing), tail(out, 900)))
+    else:
+        result.ok("the line names the daemon, its allowance and what a reader can do")
+
+    # The Tight sentence claims the CONVERSION might not finish. Borrowing it
+    # here would send a reader to watch the wrong half of the command.
+    if "It will probably finish. If the kernel stops it" in out:
+        result.bad("the daemon band printed the Tight sentence, whose claim is about the "
+                   "conversion rather than about what runs after it: %s" % tail(out, 700))
+    else:
+        result.ok("the daemon band does not borrow the Tight wording")
+    return result
+
+
+CHECKS = [("0", check_0), ("1", check_1), ("2", check_2), ("3", check_3), ("4", check_4),
+          ("5", check_5)]
 
 
 # ------------------------------------------------------------------ self test
