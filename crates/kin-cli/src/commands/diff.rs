@@ -364,6 +364,10 @@ fn derive_workspace_semantics(
             file_path: Some(kin_model::FilePathId::new(text)),
             ..Default::default()
         };
+        // `query_entities` is a `GraphStore` method, and the trait is imported at
+        // the call rather than at the module head so a reader sees which surface
+        // this read comes from.
+        use kin_model::GraphStore as _;
         let Ok(found) = graph.query_entities(&filter) else {
             continue;
         };
@@ -1186,7 +1190,7 @@ mod tests {
 
     fn updated_delta(path: &str) -> kin_model::TreeDelta {
         let entry = kin_model::LocatedEntry {
-            path: RepoPath::new(path).unwrap(),
+            path: RepoPath::from_utf8(path).unwrap(),
             entry: kin_model::TreeEntry::Blob {
                 hash: Hash256::from_bytes([7; 32]),
                 executable: false,
