@@ -223,6 +223,18 @@ pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
     query: std::sync::Mutex<Option<HeldQueryAuthority>>,
     command: std::sync::Mutex<Option<HeldCommandAuthority>>,
+    /// The admission pair every reconcile task needs, which is not a fourth
+    /// wrapper over the authority but two small values read out of one.
+    ///
+    /// `current_authority_admission` wants a root bundle and a compiled
+    /// admission matcher, and neither can differ between tasks inside one
+    /// publication: the matcher's own type is documented as "a compiled,
+    /// immutable admission-policy generation". Before this slot each
+    /// concurrent task opened the whole store for its own copy, and on a
+    /// converted psf/requests store six tokio workers were measured inside
+    /// that function at one instant, serialized at 2.2 seconds per open
+    /// because an open is O(store).
+    admission: std::sync::Mutex<Option<HeldAdmission>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -255,6 +267,16 @@ struct HeldCommandAuthority {
     /// [`HeldProjectionAuthority::published`] and for the same reason.
     published: LocalPublicationIdentity,
     authority: Arc<kin_cli::commands::repository_authority::ActiveRepositoryAuthority>,
+}
+
+#[derive(Clone)]
+struct HeldAdmission {
+    /// Read strictly before the authority these values came out of was loaded,
+    /// exactly as for [`HeldProjectionAuthority::published`] and for the same
+    /// reason.
+    published: LocalPublicationIdentity,
+    roots: kin_model::RootBundle,
+    policy: Option<kin_index::ResolvedAdmissionMatcher>,
 }
 
 impl ProjectionAuthorityCache {
@@ -311,6 +333,32 @@ impl ProjectionAuthorityCache {
         *lock_recover(&self.query) = Some(HeldQueryAuthority {
             published,
             authority,
+        });
+    }
+
+    fn reuse_admission(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<(
+        kin_model::RootBundle,
+        Option<kin_index::ResolvedAdmissionMatcher>,
+    )> {
+        lock_recover(&self.admission)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| (held.roots.clone(), held.policy.clone()))
+    }
+
+    fn install_admission(
+        &self,
+        published: LocalPublicationIdentity,
+        roots: kin_model::RootBundle,
+        policy: Option<kin_index::ResolvedAdmissionMatcher>,
+    ) {
+        *lock_recover(&self.admission) = Some(HeldAdmission {
+            published,
+            roots,
+            policy,
         });
     }
 
@@ -551,6 +599,75 @@ fn command_repository_authority(
         "command repository authority loaded"
     );
     Ok(authority)
+}
+
+/// The admission pair for the current publication, from one open per
+/// publication rather than one per task.
+///
+/// Same shape as [`command_repository_authority`] above and deliberately so: a
+/// reviewer should be able to diff the two. Read the publication, try the slot,
+/// take the load gate, re-read under it because the publication may have moved
+/// while this request waited, try again, and only then pay for the open.
+///
+/// What this replaces: `loop_runner::current_authority_admission` opened the
+/// whole store on every call, and its three callers reach it independently from
+/// concurrent tasks. Measured on a converted psf/requests store, six tokio
+/// workers sat inside it at one instant, each in a whole-store open serialized
+/// at 2.205 seconds, which is what one open costs warm there. Neither value it
+/// reads can differ between tasks inside one publication, so the cost was paid
+/// per arrival for an answer that could not vary.
+pub(crate) fn cached_authority_admission(
+    state: &DaemonState,
+) -> Result<
+    (
+        kin_model::RootBundle,
+        Option<kin_index::ResolvedAdmissionMatcher>,
+    ),
+    (StatusCode, String),
+> {
+    let backend = state.local_repository_backend().ok_or_else(|| {
+        repository_authority_error("local daemon is missing its startup storage capability")
+    })?;
+    let binding = state
+        .local_repository_authority_binding()
+        .map_err(repository_authority_error)?;
+    let repository_id = binding.repository_id().clone();
+
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(pair) = state.projection_authority.reuse_admission(&published) {
+        return Ok(pair);
+    }
+
+    let _load = lock_recover(&state.projection_authority.load_gate);
+    // Re-read under the gate: the publication may have moved while this request
+    // waited, and the label installed below must be the one taken before the
+    // open it describes.
+    let published = read_local_publication_identity(&backend, &repository_id)?;
+    if let Some(pair) = state.projection_authority.reuse_admission(&published) {
+        return Ok(pair);
+    }
+
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .map_err(|error| repository_authority_error(error.to_string()))?;
+    let authority = context
+        .open()
+        .map_err(|error| repository_authority_error(error.to_string()))?;
+    state.projection_authority.record_load();
+    let roots = authority.read_authority().roots().clone();
+    let policy = authority
+        .workspace_admission_snapshot(context.repository_id(), &context.workspace_id())
+        .map_err(|error| repository_authority_error(error.to_string()))?
+        .map(|snapshot| snapshot.matcher);
+    state
+        .projection_authority
+        .install_admission(published, roots.clone(), policy.clone());
+    tracing::debug!(
+        repository = %repository_id,
+        loads = state.projection_authority.loads(),
+        "admission pair loaded"
+    );
+    Ok((roots, policy))
 }
 
 /// Hand a command helper an authority this daemon already resolved.
@@ -37981,6 +38098,83 @@ mod tests {
         assert!(
             state.projection_authority.loads() > before,
             "a focal that resolves still opens the authority its bodies are read through"
+        );
+    }
+
+    /// The admission pair costs one authority open per publication, not one per
+    /// caller, and concurrency does not change that.
+    ///
+    /// `current_authority_admission` has three callers that reach it
+    /// independently from concurrent tasks, and before the cache each opened
+    /// the whole store for its own copy. An open decodes the entire persisted
+    /// authority and re-verifies every body in repository CAS, so on a
+    /// converted psf/requests store six concurrent tasks were measured inside
+    /// that function at once, serialized at 2.205 seconds each.
+    ///
+    /// Two arms because they fail differently. Sequential proves the slot is
+    /// consulted at all; concurrent proves the load gate holds a burst to one
+    /// load rather than admitting a thundering herd that each miss and open.
+    ///
+    /// Every call is asserted to have SUCCEEDED before the count is read. A
+    /// count that did not move is the same reading whether the cache worked or
+    /// every call failed early, and only one of those is the property.
+    #[tokio::test]
+    async fn the_admission_pair_costs_one_open_per_publication() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"def handler():\n    return 1\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Warm the publication once so the count below measures reuse rather
+        // than the first load, which every path has to pay.
+        cached_authority_admission(&state).expect("the fixture store must resolve an admission");
+        let before = state.projection_authority.loads();
+
+        for call in 0..8 {
+            cached_authority_admission(&state)
+                .unwrap_or_else(|(_, message)| panic!("sequential call {call} failed: {message}"));
+        }
+        assert_eq!(
+            state.projection_authority.loads(),
+            before,
+            "eight sequential admission reads at one publication must load the authority zero              further times; each load decodes the whole store and re-verifies every CAS body"
+        );
+
+        // The concurrent arm gets a COLD state of its own, and that is the
+        // whole point of it. Written against the warm state above, eight tasks
+        // all hit the populated slot and never reach the load gate, so removing
+        // the gate left it green across three runs: an arm that could not fail
+        // for the reason it was written. Cold, the eight race into an empty
+        // slot and only the gate holds them to one load between them.
+        let cold = test_state();
+        install_repository_file(&cold, "src/lib.py", b"def handler():\n    return 1\n");
+        cold.is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let cold_before = cold.projection_authority.loads();
+
+        // No join_all: this crate carries futures-util rather than futures, and
+        // a hand-rolled join needs no dependency at all here.
+        let mut tasks = Vec::new();
+        for call in 0..8 {
+            let cold = Arc::clone(&cold);
+            tasks.push(tokio::task::spawn_blocking(move || {
+                cached_authority_admission(&cold)
+                    .map(|_| call)
+                    .map_err(|(_, message)| format!("concurrent call {call} failed: {message}"))
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("the task must not panic")
+                .expect("every concurrent call must succeed");
+        }
+        assert_eq!(
+            cold.projection_authority.loads(),
+            cold_before + 1,
+            "eight CONCURRENT admission reads racing into a COLD slot must pay one load between \
+             them, not one each; the load gate is what makes that true, and this is the only \
+             arm that can watch it go"
         );
     }
 
