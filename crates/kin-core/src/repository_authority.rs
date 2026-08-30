@@ -331,6 +331,32 @@ impl LocalRepositoryAuthorityBinding {
         )
         .map(|(manager, payload_stats)| (manager, Some(payload_stats)))
     }
+
+    /// Read the repository-authority envelope without materializing the
+    /// history the same bytes carry.
+    ///
+    /// A full open decodes every domain the snapshot holds, and on a converted
+    /// repository that is the repository: psf/requests at 6493 commits writes a
+    /// 1051.5 MiB snapshot whose change map dominates it. A caller that needs
+    /// the envelope and then some bodies by content address does not need any
+    /// of that, and this is the read for it.
+    ///
+    /// `None` means the envelope cannot be answered cheaply and correctly, so
+    /// the caller must open in full. It is never a wrong answer: KinDB returns
+    /// it when no persisted authority exists, when the acknowledged journal
+    /// head is past the snapshot base, or when the snapshot carries no
+    /// envelope.
+    pub fn open_authority_metadata(
+        &self,
+    ) -> std::result::Result<
+        Option<kin_db::RepositoryAuthorityMetadata<LocalFileBackend>>,
+        kin_db::KinDbError,
+    > {
+        kin_db::RepositoryAuthorityMetadata::open(
+            self.repository_id.clone(),
+            Arc::clone(&self.backend),
+        )
+    }
 }
 
 /// Open an already initialized local repository through one coherent recovery.
