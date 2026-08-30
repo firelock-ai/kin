@@ -10,6 +10,11 @@ pub struct HistoryRequest {
     pub entity: String,
     #[serde(default)]
     pub reference: Option<String>,
+    /// List every file-level revision, not only the ones that changed this
+    /// entity. `#[serde(default)]` because this crosses the daemon wire and an
+    /// older peer sends none, which means the trimmed default.
+    #[serde(default)]
+    pub all_revisions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,9 +99,17 @@ fn render_revision_rows(rows: &[RevisionRow]) -> Vec<String> {
         .collect()
 }
 
-pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
+pub async fn run(entity: String, reference: Option<String>, all_revisions: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
-    let response = run_daemon_history(&layout, &HistoryRequest { entity, reference }).await?;
+    let response = run_daemon_history(
+        &layout,
+        &HistoryRequest {
+            entity,
+            reference,
+            all_revisions,
+        },
+    )
+    .await?;
     for line in response.lines {
         println!("{}", crate::output_style::paint_history_line(&line));
     }
@@ -133,11 +146,16 @@ pub fn execute_history_request(
             graph,
             &request.entity,
             &head,
+            request.reference.as_deref(),
         )?,
         None => {
             let target = crate::commands::ref_lookup::resolve_entity_query(graph, &request.entity)?;
-            let revisions =
-                crate::commands::ref_lookup::resolve_entity_revisions_at(graph, &target.id, &head)?;
+            let revisions = crate::commands::ref_lookup::resolve_entity_revisions_at(
+                graph,
+                &target.id,
+                &head,
+                request.reference.as_deref(),
+            )?;
             (target, revisions)
         }
     };
@@ -156,6 +174,13 @@ pub fn execute_history_request(
     if revisions.is_empty() {
         lines.push("  No history recorded".to_string());
     } else {
+        // Same rule as blame, from the same function, so the two surfaces cannot
+        // disagree about which revisions are this entity's own.
+        let (revisions, withheld) = if request.all_revisions {
+            (revisions, Vec::new())
+        } else {
+            crate::commands::ref_lookup::split_own_revisions(&revisions)
+        };
         let mut rows = Vec::with_capacity(revisions.len());
         for revision in &revisions {
             let change = graph.get_change(&revision.introduced_by)?;
@@ -175,6 +200,9 @@ pub fn execute_history_request(
             });
         }
         lines.extend(render_revision_rows(&rows));
+        if let Some(line) = crate::commands::ref_lookup::withheld_line(withheld.len()) {
+            lines.push(line);
+        }
     }
 
     Ok(HistoryResponse { lines })

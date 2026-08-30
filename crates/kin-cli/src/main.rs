@@ -178,6 +178,9 @@ enum Command {
         /// Output the exact authority-backed report as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
+        /// Carry each changed artifact's full old and new body, not just hunks
+        #[arg(long, default_value_t = false)]
+        full_bodies: bool,
     },
     /// Verify graph-derived projection, install exact Git, and detach Kin.
     ///
@@ -511,6 +514,10 @@ enum Command {
         /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
+        /// List every file-level revision, including ones that did not change
+        /// this entity
+        #[arg(long, default_value_t = false)]
+        all_revisions: bool,
     },
     /// Find dead code (whole-repo scan, or seeded by semantic query)
     DeadCode {
@@ -670,6 +677,10 @@ enum Command {
         /// and semantic changes as `kin:<id>`, `change:<id>`, or bare change IDs.
         #[arg(long = "ref", value_name = "REF")]
         reference: Option<String>,
+        /// List every file-level revision, including ones that did not change
+        /// this entity
+        #[arg(long, default_value_t = false)]
+        all_revisions: bool,
     },
     /// MCP server commands
     Mcp {
@@ -2708,7 +2719,12 @@ fn main() -> Result<()> {
                         .await
                     }
                 },
-                Command::Diff { base, head, json } => commands::diff::run(base, head, json).await,
+                Command::Diff {
+                    base,
+                    head,
+                    json,
+                    full_bodies,
+                } => commands::diff::run(base, head, json, full_bodies).await,
                 Command::Eject { yes } => commands::eject::run(yes).await,
                 Command::Impact {
                     entity,
@@ -3154,9 +3170,11 @@ fn main() -> Result<()> {
                         commands::review::run(change, entities, files, changes).await
                     }
                 }
-                Command::History { entity, reference } => {
-                    commands::history::run(entity, reference).await
-                }
+                Command::History {
+                    entity,
+                    reference,
+                    all_revisions,
+                } => commands::history::run(entity, reference, all_revisions).await,
                 Command::DeadCode {
                     seed,
                     limit,
@@ -3238,9 +3256,11 @@ fn main() -> Result<()> {
                     StashAction::Pop => commands::stash::pop().await,
                     StashAction::List { json } => commands::stash::list(json).await,
                 },
-                Command::Blame { entity, reference } => {
-                    commands::blame::run(entity, reference).await
-                }
+                Command::Blame {
+                    entity,
+                    reference,
+                    all_revisions,
+                } => commands::blame::run(entity, reference, all_revisions).await,
                 Command::Agent { action } => {
                     // The agent loop is blocking, and a blocking HTTP client builds and
                     // drops its own runtime. Dropping one inside an async context panics,

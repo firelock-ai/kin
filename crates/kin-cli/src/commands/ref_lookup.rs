@@ -34,6 +34,132 @@ fn ref_error(reference: impl Into<String>, reason: impl Into<String>) -> anyhow:
     })
 }
 
+/// The graph cannot replay to a change the caller already resolved.
+///
+/// Distinct from `RefResolutionError`, which is a bad ref. Here the ref was
+/// fine: it resolved to a real change that `kin log`, `kin diff` and
+/// `kin git export` all hold. What failed is replaying the live graph to it.
+///
+/// It exists because the failure had no type. Both replay sites wrapped their
+/// error with `anyhow!(error.to_string())`, which flattens a
+/// `ModelError::ChangeNotFound` into a bare string, so the daemon's handler
+/// could not classify it and fell through to a 500 carrying the RESOLVED change
+/// id rather than the ref the user typed. That is why every ref form reported
+/// the same id on the rc062j stranger run: they all resolve to the same tip and
+/// the failure is downstream of resolution.
+#[derive(Debug)]
+pub struct GraphProjectionError {
+    pub reference: String,
+    pub resolved: String,
+    pub reason: String,
+}
+
+impl std::fmt::Display for GraphProjectionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "ref '{}' resolves to semantic change {}, which this daemon's live graph \
+             projection does not hold, so its history cannot be replayed; durable history \
+             is intact and `kin log` and `kin diff` still read it. Restart the repository \
+             daemon with `kin daemon stop` and run the command again. Underlying cause: {}",
+            self.reference, self.resolved, self.reason
+        )
+    }
+}
+
+impl std::error::Error for GraphProjectionError {}
+
+/// Wrap a replay failure so it carries what the user asked for.
+///
+/// Unconditional at the replay sites rather than keyed on the inner cause,
+/// because the bound on `GraphStore::Error` is `Display` only, so the concrete
+/// type is not visible there. Matching the message text would be a string
+/// comparison against another crate's wording. Every failure of a replay to an
+/// ALREADY-RESOLVED head means one user-facing thing regardless of its cause,
+/// which is what this says.
+fn projection_error(
+    reference: Option<&str>,
+    resolved: &SemanticChangeId,
+    reason: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::Error::new(GraphProjectionError {
+        reference: reference.unwrap_or("HEAD").to_string(),
+        resolved: resolved.to_string(),
+        reason: reason.to_string(),
+    })
+}
+
+/// Split revisions into those that changed THIS entity and those that did not.
+///
+/// Returns `(own, withheld)`, oldest first, `own` always including the entity's
+/// introduction.
+///
+/// THE one rule, so blame and history cannot drift into disagreeing about which
+/// revisions are the entity's own. Two implementations of this would be two
+/// answers to the same question, and the one nobody reads would be the wrong one.
+///
+/// Why the over-report exists, and why the fix belongs here rather than in the
+/// minting: `reconciler.rs` stamps the whole FILE's blob hash into every
+/// entity's `metadata.extra`, and commit compares the complete `Entity`, so
+/// every entity in a touched file compares unequal and mints a revision. Span
+/// shifts do it a second way. That behaviour is pinned deliberately by
+/// `commit_publishes_an_entity_whose_provenance_moved_without_its_fingerprint`,
+/// and the revisions it mints are real: they are what the file did. What was
+/// wrong is reporting them as changes to an entity that did not change.
+///
+/// `behavior_hash` is the discriminator because kin-model documents it as the
+/// hash of the entity's full source text, changing on any body edit. It is a
+/// field of `SemanticFingerprint`, computed from source, and is not touched by
+/// the `metadata.extra` stamp that causes the over-report, so an entity whose
+/// own text did not move carries the same one across a file-level revision.
+pub(crate) fn split_own_revisions(
+    revisions: &[EntityRevision],
+) -> (Vec<EntityRevision>, Vec<EntityRevision>) {
+    let mut own = Vec::new();
+    let mut withheld = Vec::new();
+    let mut last: Option<kin_model::Hash256> = None;
+    for revision in revisions {
+        let behavior = revision.entity.fingerprint.behavior_hash;
+        match last {
+            // The introduction is always the entity's own: there is nothing
+            // before it for its text to be unchanged FROM.
+            None => {
+                own.push(revision.clone());
+                last = Some(behavior);
+            }
+            Some(previous) if previous == behavior => withheld.push(revision.clone()),
+            Some(_) => {
+                own.push(revision.clone());
+                last = Some(behavior);
+            }
+        }
+    }
+    (own, withheld)
+}
+
+/// The line naming what a trimmed listing did not show.
+///
+/// Named rather than silent. The withheld revisions are real, they are what the
+/// file did, and a reader who cannot see that they exist has lost information
+/// rather than been spared noise.
+pub(crate) fn withheld_line(withheld: usize) -> Option<String> {
+    if withheld == 0 {
+        return None;
+    }
+    let plural = if withheld == 1 { "" } else { "s" };
+    Some(format!(
+        "{withheld} file-level revision{plural} did not change this entity; \
+         --all-revisions lists them"
+    ))
+}
+
+/// Whether an error is a live-graph replay miss, for a handler classifying it.
+pub fn is_graph_projection_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<GraphProjectionError>().is_some())
+}
+
 pub fn is_ref_resolution_error(error: &anyhow::Error) -> bool {
     error
         .chain()
@@ -113,6 +239,7 @@ pub(crate) fn resolve_entity_with_revisions_at<G>(
     graph: &G,
     entity_query: &str,
     head: &SemanticChangeId,
+    reference: Option<&str>,
 ) -> Result<(Entity, Vec<EntityRevision>)>
 where
     G: GraphStore,
@@ -120,7 +247,7 @@ where
 {
     let mut state = graph
         .resolve_graph_at(head)
-        .map_err(|error| anyhow!(error.to_string()))?;
+        .map_err(|error| projection_error(reference, head, error))?;
     let entities = state
         .entities
         .values()
@@ -150,6 +277,7 @@ pub(crate) fn resolve_entity_revisions_at<G>(
     graph: &G,
     entity_id: &EntityId,
     head: &SemanticChangeId,
+    reference: Option<&str>,
 ) -> Result<Vec<EntityRevision>>
 where
     G: GraphStore,
@@ -157,7 +285,7 @@ where
 {
     let mut state = graph
         .resolve_graph_at(head)
-        .map_err(|error| anyhow!(error.to_string()))?;
+        .map_err(|error| projection_error(reference, head, error))?;
     Ok(state.entity_revisions.remove(entity_id).unwrap_or_default())
 }
 
@@ -596,7 +724,7 @@ mod tests {
             graph.create_change(entry).unwrap();
         }
 
-        let revisions = resolve_entity_revisions_at(&graph, &alpha, &revise_alpha.id)
+        let revisions = resolve_entity_revisions_at(&graph, &alpha, &revise_alpha.id, None)
             .expect("a sound history must not report a conflict for an unqueried entity");
 
         assert_eq!(revisions.len(), 2);

@@ -639,6 +639,34 @@ fn init_from_git_with_hooks(
         seal = %sealed_observation.fingerprint,
         "admitted exact Git repository as graph-owned Kin authority"
     );
+
+    // Everything past here is teardown, and it is not free. The ladder guard's
+    // `total_ms` is `started.elapsed()` taken after this function RETURNS, so
+    // every local's Drop runs inside the timed region and outside every span.
+    // Measured on a full-history conversion under contention that stretch was
+    // 3.1 to 3.4 seconds with no phase open, flat across a 2x range of init
+    // totals, and an unnamed stretch is memory a profile charges to no phase
+    // (FIR-2980; the guard's own message records a 6,733-commit measurement
+    // discarded for exactly that).
+    //
+    // The expensive one is `capture_dir`: `GitCaptureStaging::drop` calls
+    // `remove_staging_tree`, a `remove_dir_all` with retries over the whole Git
+    // capture, including the `objects` tree the ephemeral capture blob store
+    // filled. That is filesystem work, not allocator work, which is why 12 cores
+    // of CPU load did not reproduce it. Dropping these explicitly inside a span
+    // is what puts the work on the ladder; it changes no behaviour, since both
+    // would drop at the closing brace a few instructions later.
+    //
+    // This span deliberately does NOT cover the in-memory drops that follow
+    // (`snapshot`, `admitted`, `semantic_plan`, `source_proof`, `transaction`,
+    // `git_authority`), so a residual gap is expected rather than a failure. The
+    // residual is the measurement of the other half.
+    {
+        let _span = info_span!("kin.init.release_capture_staging").entered();
+        drop(capture_store);
+        drop(capture_dir);
+    }
+
     Ok(result)
 }
 

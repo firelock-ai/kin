@@ -252,8 +252,59 @@ fn read_merge_plan(
         )));
     }
     if workspace.is_dirty() {
+        // `is_dirty` is two clauses and the old refusal named neither, so a
+        // caller met "has graph-owned changes" while `kin status` and the
+        // workspace tree both read clean, with nothing to act on. The rc062j
+        // stranger hit that twice. Say which clause refused and what clears it,
+        // because the two readers disagreeing is only a problem when the
+        // disagreement is invisible.
+        // Mirrors `WorkspaceState::is_dirty` clause for clause. Its second arm
+        // is a `map_or`, so an unborn head with any tree at all is dirty for a
+        // third reason that neither of the others names.
+        let overlay_pending = !workspace.semantic_overlay.is_empty();
+        let tree_moved = workspace
+            .base_tree_hash
+            .is_some_and(|base| base != workspace.tree_hash);
+        let unborn_with_tree = workspace.base_tree_hash.is_none() && !workspace.tree.is_empty();
+        let commit_or_stash = "commit it with `kin commit`, or set it aside with `kin stash`";
+        let (what, remedy) = match (overlay_pending, tree_moved, unborn_with_tree) {
+            (true, true, _) => (
+                "a pending semantic overlay AND a working tree that has moved off its base change"
+                    .to_string(),
+                "commit them with `kin commit`, or set them aside with `kin stash`",
+            ),
+            (true, false, false) => (
+                "a pending semantic overlay, while its working tree still matches its base \
+                 change, which is why a tree-only reader such as `kin status` can call this \
+                 workspace clean at the same moment"
+                    .to_string(),
+                commit_or_stash,
+            ),
+            (true, _, true) => (
+                "a pending semantic overlay on a branch with no commit yet".to_string(),
+                commit_or_stash,
+            ),
+            (false, true, _) => (
+                "a working tree that has moved off its base change".to_string(),
+                commit_or_stash,
+            ),
+            (false, false, true) => (
+                "a working tree on a branch with no commit yet".to_string(),
+                commit_or_stash,
+            ),
+            // Unreachable while `is_dirty` is those clauses. A wrong sentence
+            // here would be worse than an honest one, so it says so instead.
+            (false, false, false) => (
+                "graph-owned changes this refusal could not attribute to the semantic overlay, \
+                 the working tree or an unborn head, which is a defect in the refusal rather \
+                 than in your repository; please report it"
+                    .to_string(),
+                "read `kin graph status`",
+            ),
+        };
         return Err(merge_conflict(format!(
-            "workspace {} has graph-owned changes; commit or discard them before merging",
+            "workspace {} holds {what}; a merge publishes into a workspace that holds neither, \
+             so {remedy}, then merge again",
             workspace.workspace_id
         )));
     }
@@ -1097,6 +1148,27 @@ pub(crate) fn publish_resolved_merge(
         ))
         .into());
     }
+    // The repository transaction is durable authority. The in-process graph is a
+    // derived query view, and a published merge never reached it: the two
+    // `create_change` calls in this file both go into a detached
+    // `InMemoryGraph::from_snapshot` replay copy that exists to prove the merge
+    // replays to the desired tree, and `state.graph.create_change` appeared
+    // nowhere in this file or in `repository_merge_state.rs`.
+    //
+    // So after the CAS the authority held the merge change and the running
+    // daemon's graph did not. `kin log`, `kin diff` and `kin status` answered
+    // anyway because they read authority, while `kin blame` and `kin history`
+    // went through the live projection and failed, first with "the active graph
+    // projection does not hold" and then with a bare `change not found`, until a
+    // restart rebuilt the graph from authority. A later commit installed only
+    // its own change and did not heal it.
+    //
+    // Install the exact immutable changes only after the authority CAS
+    // succeeds, which is what the commit path does at `command_commit_after_admission`
+    // under this same named phase. Captured before the CAS because the
+    // transaction is moved into it. A fast-forward carries no change and
+    // installs nothing.
+    let published_changes = transaction.changes.clone();
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),
@@ -1111,6 +1183,17 @@ pub(crate) fn publish_resolved_merge(
                 record.binding.source_ref, record.binding.target_ref
             )
         })?;
+    for change in &published_changes {
+        crate::mcp_commit::timed_commit_phase("install_live_graph", || {
+            state.graph.create_change(change)
+        })
+        .with_context(|| {
+            format!(
+                "install published change {} into the live query graph",
+                change.id
+            )
+        })?;
+    }
 
     let resolved_count = terminated.entries.len();
     let report = kin_cli::commands::resolve::ResolveReport {
@@ -1802,6 +1885,48 @@ fn collect_dangling_endpoints(
     theirs: &kin_model::graph::ResolvedGraphState,
     conflicts: &mut Vec<MergeConflictEntry>,
 ) -> Result<()> {
+    // An identity that CONFLICTED is absent from the composed maps for a reason
+    // that is not removal: `compose` records the conflict and continues without
+    // inserting. Reading that absence as a removal is what turned one changed
+    // function into forty-five relation rows on the rc062j store, every one of
+    // them saying "one branch removed summarize" about a removal neither branch
+    // performed, and the stranger's note is that believing it resolves the merge
+    // wrongly.
+    //
+    // A value conflict exists on BOTH sides, so whichever side settles it the
+    // endpoint survives and the edge is never dangling. Only an identity absent
+    // from the side actually taken can strand an edge, and that is decided after
+    // `apply_resolution`, which is what the publish-time call of this function
+    // sees. That call passes an empty vec, so `unsettled` is empty there and its
+    // behaviour is unchanged: this narrowing applies to the opening composition
+    // and the recomposition, which must move together or `require_same_conflicts`
+    // refuses every merge.
+    // Narrower than "conflicted", on purpose. An identity present on BOTH sides
+    // survives whichever side is settled, so its edge can never strand and the
+    // row is always false. An identity absent from one side, a
+    // `ChangedOursRemovedTheirs` or its mirror, genuinely strands if the
+    // settlement takes the side that lacks it, so its row is predictive and
+    // stays. Where a row is dropped the publish-time call of this function is
+    // the net that still catches it, because by then `apply_resolution` has put
+    // the settled values in the maps and the answer actually exists.
+    let mut survives_either_side_entities: BTreeSet<kin_model::EntityId> = BTreeSet::new();
+    let mut survives_either_side_artifacts: BTreeSet<kin_model::ArtifactId> = BTreeSet::new();
+    for entry in conflicts.iter() {
+        match &entry.subject {
+            MergeConflictSubject::Entity { entity } => {
+                if ours.entities.contains_key(entity) && theirs.entities.contains_key(entity) {
+                    survives_either_side_entities.insert(*entity);
+                }
+            }
+            MergeConflictSubject::Artifact { artifact } => {
+                if ours.tree.get(artifact).is_some() && theirs.tree.get(artifact).is_some() {
+                    survives_either_side_artifacts.insert(*artifact);
+                }
+            }
+            MergeConflictSubject::Relation { .. } | MergeConflictSubject::Path { .. } => {}
+        }
+    }
+
     let mut dangling: BTreeMap<kin_model::RelationId, (kin_model::GraphNodeId, String)> =
         BTreeMap::new();
     for (id, relation) in relations {
@@ -1810,7 +1935,7 @@ fn collect_dangling_endpoints(
                 let survives = entities.contains_key(&entity);
                 let existed =
                     ours.entities.contains_key(&entity) || theirs.entities.contains_key(&entity);
-                if !survives && existed {
+                if !survives && existed && !survives_either_side_entities.contains(&entity) {
                     dangling.entry(*id).or_insert_with(|| {
                         let name = describe_entity(&ours.entities, &theirs.entities, &entity);
                         (
@@ -1828,7 +1953,7 @@ fn collect_dangling_endpoints(
                 let survives = artifacts.contains_key(&artifact);
                 let existed =
                     ours.tree.get(&artifact).is_some() || theirs.tree.get(&artifact).is_some();
-                if !survives && existed {
+                if !survives && existed && !survives_either_side_artifacts.contains(&artifact) {
                     dangling.entry(*id).or_insert_with(|| {
                         let path = ours
                             .tree
@@ -2032,6 +2157,27 @@ fn publish(
         ))
         .into());
     }
+    // The repository transaction is durable authority. The in-process graph is a
+    // derived query view, and a published merge never reached it: the two
+    // `create_change` calls in this file both go into a detached
+    // `InMemoryGraph::from_snapshot` replay copy that exists to prove the merge
+    // replays to the desired tree, and `state.graph.create_change` appeared
+    // nowhere in this file or in `repository_merge_state.rs`.
+    //
+    // So after the CAS the authority held the merge change and the running
+    // daemon's graph did not. `kin log`, `kin diff` and `kin status` answered
+    // anyway because they read authority, while `kin blame` and `kin history`
+    // went through the live projection and failed, first with "the active graph
+    // projection does not hold" and then with a bare `change not found`, until a
+    // restart rebuilt the graph from authority. A later commit installed only
+    // its own change and did not heal it.
+    //
+    // Install the exact immutable changes only after the authority CAS
+    // succeeds, which is what the commit path does at `command_commit_after_admission`
+    // under this same named phase. Captured before the CAS because the
+    // transaction is moved into it. A fast-forward carries no change and
+    // installs nothing.
+    let published_changes = transaction.changes.clone();
     let (materialized, receipt, authority_freeze) =
         kin_core::tree::transition_repository_workspace_tree_and_commit_repository_transaction(
             state.layout.working_dir(),
@@ -2046,6 +2192,17 @@ fn publish(
                 request.source, plan.target_ref
             )
         })?;
+    for change in &published_changes {
+        crate::mcp_commit::timed_commit_phase("install_live_graph", || {
+            state.graph.create_change(change)
+        })
+        .with_context(|| {
+            format!(
+                "install published change {} into the live query graph",
+                change.id
+            )
+        })?;
+    }
     let line = match outcome {
         MergeOutcome::FastForward => format!(
             "Fast-forwarded {} to change {} ({} projected entries, authority generation {})",
@@ -2866,11 +3023,18 @@ mod tests {
             artifact(anchor_id, "src/anchor.rs", 0x20),
             relation.clone(),
         );
-        let theirs_state = graph_state(
-            artifact(target_id, "src/target.rs", 0x12),
-            artifact(anchor_id, "src/anchor.rs", 0x20),
-            relation.clone(),
-        );
+        // The source branch REMOVES the target, which is the divergence that can
+        // actually strand this edge. It used to be enough to change the target on
+        // both sides, but an identity present on both sides survives whichever
+        // side is settled, so that shape reported a removal neither branch
+        // performed. The rc062j stranger met forty-five of those rows for one
+        // changed function.
+        let theirs_state = ResolvedGraphState {
+            relations: [(relation.id, relation.clone())].into(),
+            tree: ResolvedTree::from_artifacts([artifact(anchor_id, "src/anchor.rs", 0x20)])
+                .unwrap(),
+            ..ResolvedGraphState::default()
+        };
 
         let base_artifacts = artifacts_by_id(&base_state.tree);
         let ours_artifacts = artifacts_by_id(&ours_state.tree);
@@ -2946,6 +3110,118 @@ mod tests {
         )
         .unwrap();
         assert_eq!(merged_relations.get(&relation.id), Some(&relation));
+    }
+
+    /// An identity CONFLICTED on both sides is not a removal, and an edge to it
+    /// never strands.
+    ///
+    /// `compose` records a conflict and continues without inserting, so a
+    /// conflicted identity is absent from the composed map for a reason that is
+    /// not removal. Reading that absence as a removal is what turned one changed
+    /// function into forty-five relation rows on the rc062j store, each one
+    /// saying "one branch removed `summarize`" about a removal neither branch
+    /// performed, and the stranger's note is that believing them resolves the
+    /// merge wrongly.
+    #[test]
+    fn an_endpoint_conflicted_on_both_sides_reports_no_removal() {
+        let target_id = ArtifactId::new();
+        let anchor_id = ArtifactId::new();
+        let relation = Relation {
+            id: RelationId::new(),
+            kind: RelationKind::References,
+            src: GraphNodeId::Artifact(anchor_id),
+            dst: GraphNodeId::Artifact(target_id),
+            confidence: 1.0,
+            origin: RelationOrigin::Manual,
+            created_in: None,
+            import_source: None,
+            evidence: Vec::new(),
+        };
+        // Changed on both sides and removed by neither, which is the shape the
+        // stranger's one edited function produced.
+        let base_state = graph_state(
+            artifact(target_id, "src/target.rs", 0x10),
+            artifact(anchor_id, "src/anchor.rs", 0x20),
+            relation.clone(),
+        );
+        let ours_state = graph_state(
+            artifact(target_id, "src/target.rs", 0x11),
+            artifact(anchor_id, "src/anchor.rs", 0x20),
+            relation.clone(),
+        );
+        let theirs_state = graph_state(
+            artifact(target_id, "src/target.rs", 0x12),
+            artifact(anchor_id, "src/anchor.rs", 0x20),
+            relation.clone(),
+        );
+
+        let base_artifacts = artifacts_by_id(&base_state.tree);
+        let ours_artifacts = artifacts_by_id(&ours_state.tree);
+        let theirs_artifacts = artifacts_by_id(&theirs_state.tree);
+        let mut conflicts = Vec::new();
+        let merged_artifacts = compose(
+            &base_artifacts,
+            &ours_artifacts,
+            &theirs_artifacts,
+            |artifact| MergeConflictSubject::Artifact {
+                artifact: *artifact,
+            },
+            MergeSideValue::artifact,
+            |_| None,
+            &mut conflicts,
+        )
+        .unwrap();
+        let merged_relations = compose(
+            &base_state.relations,
+            &ours_state.relations,
+            &theirs_state.relations,
+            |relation| MergeConflictSubject::Relation {
+                relation: *relation,
+            },
+            MergeSideValue::relation,
+            |_| None,
+            &mut conflicts,
+        )
+        .unwrap();
+
+        // The artifact really did conflict, so the fixture is the case it claims
+        // to be rather than a merge with nothing in it.
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "exactly one conflict, the artifact itself: {conflicts:#?}"
+        );
+        assert!(matches!(
+            conflicts[0].subject,
+            MergeConflictSubject::Artifact { .. }
+        ));
+        assert!(!merged_artifacts.contains_key(&target_id));
+
+        collect_dangling_endpoints(
+            &merged_relations,
+            &HashMap::new(),
+            &merged_artifacts,
+            &base_state,
+            &ours_state,
+            &theirs_state,
+            &mut conflicts,
+        )
+        .unwrap();
+
+        let removals: Vec<&MergeConflictEntry> = conflicts
+            .iter()
+            .filter(|entry| matches!(entry.divergence, MergeDivergence::DanglingEndpoint { .. }))
+            .collect();
+        assert!(
+            removals.is_empty(),
+            "an endpoint present on both sides survives whichever side settles, so no row may \
+             describe a removal: {removals:#?}"
+        );
+        assert_eq!(
+            conflicts.len(),
+            1,
+            "the one real conflict is still the only one reported: {conflicts:#?}"
+        );
     }
 
     fn rule_source_fixture() -> (

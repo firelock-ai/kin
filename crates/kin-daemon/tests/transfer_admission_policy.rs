@@ -115,3 +115,71 @@ fn both_native_receivers_admit_through_the_wrapper() {
         );
     }
 }
+
+/// The receiver admits under a case, and never under none.
+///
+/// This is the one property of the receiver-own-case change that an end-to-end
+/// run cannot see, and that is measured rather than assumed. The lane's harness
+/// puts a LOCAL kin daemon behind the hosted control plane, so its receiver has a
+/// pinned workspace id and reads its overlay's case; the fallback a hosted
+/// object-storage daemon depends on is never reached. A mutation deleting that
+/// fallback came back GREEN through the whole stack, push included, which is
+/// exactly the shape of a check that cannot fail.
+///
+/// What it protects: kin-db refuses a `None` case wherever the shared admission
+/// policy has any rule source, and one `.gitignore` rule is one source. A hosted
+/// receiver that claimed no case would therefore refuse every push that
+/// introduces a file into a repository converted from git, which is the
+/// brownfield adoption path.
+///
+/// Both halves are asserted as invocations inside the wrapper, not as mentions,
+/// so replacing the whole binding with a bare `None` drops both counts to zero.
+#[test]
+fn the_transfer_receiver_always_admits_under_a_case() {
+    const FALLBACK: &str = ".unwrap_or(kin_model::AdmissionCase::Sensitive)";
+    const OWN_CASE: &str = "kin_remote::repository_transfer::receiver_admission_case(";
+
+    assert_eq!(
+        occurrences(
+            API_SOURCE,
+            "AdmissionCase::NoSuchCaseThisDaemonHasEverCarried"
+        ),
+        0,
+        "the must-miss control matched, so a hit below proves nothing"
+    );
+
+    for (needle, why) in [
+        (
+            OWN_CASE,
+            "the receiver must read the case from the overlay of the workspace this daemon \
+             pinned at startup, because authority is replicated and can hold overlays recorded \
+             on several hosts with different cases",
+        ),
+        (
+            FALLBACK,
+            "a receiver with no workspace overlay must still admit under a case, and Sensitive \
+             is what a hosted replica's byte-exact object storage actually does",
+        ),
+    ] {
+        let count = occurrences(API_SOURCE, needle);
+        assert_eq!(count, 1, "{needle} appears {count} times in api.rs; {why}");
+    }
+
+    let wrapper_start = API_SOURCE
+        .find(WRAPPER)
+        .expect("the wrapper definition was asserted present above");
+    let wrapper_end = API_SOURCE[wrapper_start..]
+        .find("\n}\n")
+        .map(|offset| wrapper_start + offset)
+        .expect("the wrapper definition has no closing brace");
+    for needle in [OWN_CASE, FALLBACK] {
+        let at = API_SOURCE
+            .find(needle)
+            .expect("presence was asserted immediately above");
+        assert!(
+            at > wrapper_start && at < wrapper_end,
+            "{needle} sits outside the admission wrapper (wrapper spans {wrapper_start}..\
+             {wrapper_end}, found at {at}), so the receiver that actually admits may not use it"
+        );
+    }
+}

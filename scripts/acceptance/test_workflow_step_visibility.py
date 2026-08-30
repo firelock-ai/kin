@@ -128,6 +128,16 @@ EXPECTED_SUITES = (
         "acceptance/vcs_read_surfaces.json",
     ),
     ExpectedSuite(
+        "scripts/acceptance/diff_content_repro.py",
+        "diff_content",
+        "acceptance/diff_content.json",
+    ),
+    ExpectedSuite(
+        "scripts/acceptance/blame_attribution_repro.py",
+        "blame_attribution",
+        "acceptance/blame_attribution.json",
+    ),
+    ExpectedSuite(
         "scripts/acceptance/init_budget_refusal.py",
         "init_budget",
         "acceptance/init_budget.json",

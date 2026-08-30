@@ -223,12 +223,18 @@ pub(crate) struct ProjectionAuthorityCache {
     held: std::sync::Mutex<Option<HeldProjectionAuthority>>,
     query: std::sync::Mutex<Option<HeldQueryAuthority>>,
     command: std::sync::Mutex<Option<HeldCommandAuthority>>,
-    /// The authority ENVELOPE, which is not a fourth wrapper over the same
-    /// read: it is a much smaller read of the same bytes, keyed the same way.
-    /// A reader that needs refs, workspaces or the roots and then some bodies
-    /// by content address takes this, and never decodes the history a converted
-    /// repository's snapshot mostly consists of.
-    envelope: std::sync::Mutex<Option<HeldEnvelopeAuthority>>,
+    /// The admission pair every reconcile task needs, which is not a fourth
+    /// wrapper over the authority but two small values read out of one.
+    ///
+    /// `current_authority_admission` wants a root bundle and a compiled
+    /// admission matcher, and neither can differ between tasks inside one
+    /// publication: the matcher's own type is documented as "a compiled,
+    /// immutable admission-policy generation". Before this slot each
+    /// concurrent task opened the whole store for its own copy, and on a
+    /// converted psf/requests store six tokio workers were measured inside
+    /// that function at one instant, serialized at 2.2 seconds per open
+    /// because an open is O(store).
+    admission: std::sync::Mutex<Option<HeldAdmission>>,
     /// Serializes misses so a burst of concurrent cold requests pays for one
     /// full load rather than one per request.
     load_gate: std::sync::Mutex<()>,
@@ -264,11 +270,13 @@ struct HeldCommandAuthority {
 }
 
 #[derive(Clone)]
-struct HeldEnvelopeAuthority {
-    /// Read strictly before the envelope it labels was loaded, exactly as for
-    /// [`HeldProjectionAuthority::published`] and for the same reason.
+struct HeldAdmission {
+    /// Read strictly before the authority these values came out of was loaded,
+    /// exactly as for [`HeldProjectionAuthority::published`] and for the same
+    /// reason.
     published: LocalPublicationIdentity,
-    envelope: Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>,
+    roots: kin_model::RootBundle,
+    policy: Option<kin_index::ResolvedAdmissionMatcher>,
 }
 
 impl ProjectionAuthorityCache {
@@ -328,6 +336,32 @@ impl ProjectionAuthorityCache {
         });
     }
 
+    fn reuse_admission(
+        &self,
+        published: &LocalPublicationIdentity,
+    ) -> Option<(
+        kin_model::RootBundle,
+        Option<kin_index::ResolvedAdmissionMatcher>,
+    )> {
+        lock_recover(&self.admission)
+            .as_ref()
+            .filter(|held| &held.published == published)
+            .map(|held| (held.roots.clone(), held.policy.clone()))
+    }
+
+    fn install_admission(
+        &self,
+        published: LocalPublicationIdentity,
+        roots: kin_model::RootBundle,
+        policy: Option<kin_index::ResolvedAdmissionMatcher>,
+    ) {
+        *lock_recover(&self.admission) = Some(HeldAdmission {
+            published,
+            roots,
+            policy,
+        });
+    }
+
     fn reuse_command(
         &self,
         published: &LocalPublicationIdentity,
@@ -349,32 +383,10 @@ impl ProjectionAuthorityCache {
         });
     }
 
-    fn reuse_envelope(
-        &self,
-        published: &LocalPublicationIdentity,
-    ) -> Option<Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>> {
-        lock_recover(&self.envelope)
-            .as_ref()
-            .filter(|held| &held.published == published)
-            .map(|held| Arc::clone(&held.envelope))
-    }
-
-    fn install_envelope(
-        &self,
-        published: LocalPublicationIdentity,
-        envelope: Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>,
-    ) {
-        *lock_recover(&self.envelope) = Some(HeldEnvelopeAuthority {
-            published,
-            envelope,
-        });
-    }
-
     fn invalidate(&self) {
         *lock_recover(&self.held) = None;
         *lock_recover(&self.query) = None;
         *lock_recover(&self.command) = None;
-        *lock_recover(&self.envelope) = None;
     }
 }
 
@@ -589,29 +601,28 @@ fn command_repository_authority(
     Ok(authority)
 }
 
-/// The repository-authority ENVELOPE for one request, cached per publication.
+/// The admission pair for the current publication, from one open per
+/// publication rather than one per task.
 ///
-/// Every obligation [`command_repository_authority`] discharges, discharged the
-/// same way and in the same order: the pinned namespace is confirmed, the
-/// publication record is read BEFORE the load it labels, the load gate
-/// serializes a burst of cold requests, and the label installed beside the
-/// envelope is the one taken before it.
+/// Same shape as [`command_repository_authority`] above and deliberately so: a
+/// reviewer should be able to diff the two. Read the publication, try the slot,
+/// take the load gate, re-read under it because the publication may have moved
+/// while this request waited, try again, and only then pay for the open.
 ///
-/// What differs is what gets loaded. A full open decodes every domain the
-/// snapshot carries and re-verifies every persisted body; on a converted
-/// repository that is the whole store, and a cold `graph status` paid it to
-/// print counters. The envelope read walks the same bytes, verifies the same
-/// frame checksum, and allocates nothing for the history it skips.
-///
-/// `Ok(None)` is KinDB declining to answer the envelope cheaply for these
-/// bytes. The caller falls back to the full open, so this is a cost decision
-/// and never a correctness one. It does not count into
-/// [`ProjectionAuthorityCache::loads`], because that counter means whole-store
-/// opens and an envelope read is not one.
-fn command_repository_envelope(
+/// What this replaces: `loop_runner::current_authority_admission` opened the
+/// whole store on every call, and its three callers reach it independently from
+/// concurrent tasks. Measured on a converted psf/requests store, six tokio
+/// workers sat inside it at one instant, each in a whole-store open serialized
+/// at 2.205 seconds, which is what one open costs warm there. Neither value it
+/// reads can differ between tasks inside one publication, so the cost was paid
+/// per arrival for an answer that could not vary.
+pub(crate) fn cached_authority_admission(
     state: &DaemonState,
 ) -> Result<
-    Option<Arc<kin_cli::commands::repository_authority::AuthorityEnvelope>>,
+    (
+        kin_model::RootBundle,
+        Option<kin_index::ResolvedAdmissionMatcher>,
+    ),
     (StatusCode, String),
 > {
     let backend = state.local_repository_backend().ok_or_else(|| {
@@ -622,40 +633,41 @@ fn command_repository_envelope(
         .map_err(repository_authority_error)?;
     let repository_id = binding.repository_id().clone();
 
-    if let Err(error) = confirm_pinned_projection_namespace(&backend, &repository_id) {
-        state.projection_authority.invalidate();
-        return Err(error);
-    }
-
     let published = read_local_publication_identity(&backend, &repository_id)?;
-    if let Some(envelope) = state.projection_authority.reuse_envelope(&published) {
-        return Ok(Some(envelope));
+    if let Some(pair) = state.projection_authority.reuse_admission(&published) {
+        return Ok(pair);
     }
 
     let _load = lock_recover(&state.projection_authority.load_gate);
-    // Re-read under the gate, for the reason the full open re-reads: the
-    // publication may have moved while this request waited, and the label
-    // installed below must be the one taken before the load it describes.
+    // Re-read under the gate: the publication may have moved while this request
+    // waited, and the label installed below must be the one taken before the
+    // open it describes.
     let published = read_local_publication_identity(&backend, &repository_id)?;
-    if let Some(envelope) = state.projection_authority.reuse_envelope(&published) {
-        return Ok(Some(envelope));
+    if let Some(pair) = state.projection_authority.reuse_admission(&published) {
+        return Ok(pair);
     }
-    let Some(envelope) = binding
-        .open_authority_metadata()
-        .map_err(repository_authority_error)?
-    else {
-        return Ok(None);
-    };
-    let envelope = Arc::new(envelope);
+
+    let context =
+        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)
+            .map_err(|error| repository_authority_error(error.to_string()))?;
+    let authority = context
+        .open()
+        .map_err(|error| repository_authority_error(error.to_string()))?;
+    state.projection_authority.record_load();
+    let roots = authority.read_authority().roots().clone();
+    let policy = authority
+        .workspace_admission_snapshot(context.repository_id(), &context.workspace_id())
+        .map_err(|error| repository_authority_error(error.to_string()))?
+        .map(|snapshot| snapshot.matcher);
     state
         .projection_authority
-        .install_envelope(published, Arc::clone(&envelope));
+        .install_admission(published, roots.clone(), policy.clone());
     tracing::debug!(
         repository = %repository_id,
-        generation = envelope.generation(),
-        "command repository authority envelope loaded"
+        loads = state.projection_authority.loads(),
+        "admission pair loaded"
     );
-    Ok(Some(envelope))
+    Ok((roots, policy))
 }
 
 /// Hand a command helper an authority this daemon already resolved.
@@ -4719,7 +4731,6 @@ async fn command_graph(
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
     let resolver_state = Arc::clone(&state);
-    let envelope_state = Arc::clone(&state);
     let repository_authority =
         kin_cli::commands::repository_authority::RequestRepositoryAuthority::shared(
             binding,
@@ -4727,15 +4738,7 @@ async fn command_graph(
                 command_repository_authority(&resolver_state)
                     .map_err(|(_, message)| anyhow::anyhow!(message))
             }),
-        )
-        // `graph status` reads one workspace tree and then bodies by content
-        // address, and neither needs the history the same snapshot carries.
-        // Without this it resolves the envelope through the binding on every
-        // request; with it, a warm request pays nothing.
-        .with_envelope_resolver(Arc::new(move || {
-            command_repository_envelope(&envelope_state)
-                .map_err(|(_, message)| anyhow::anyhow!(message))
-        }));
+        );
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
     // Read here rather than inside the renderer, for the reason the freshness
     // marker is read in the CLI: the record is a property of the store on disk,
@@ -5076,8 +5079,15 @@ async fn command_diff(
     let repository_authority = state
         .local_repository_authority_binding()
         .map_err(repository_authority_error)?;
-    let response = kin_cli::commands::diff::build_diff_response(&repository_authority, &request)
-        .map_err(internal_error)?;
+    // The live graph, which is the whole point of routing a workspace diff here:
+    // a workspace endpoint's entities are DERIVED, and this process is the only
+    // one that holds them. Read per moved path rather than snapshot-cloned.
+    let response = kin_cli::commands::diff::build_diff_response(
+        &repository_authority,
+        &request,
+        Some(state.graph.as_ref()),
+    )
+    .map_err(internal_error)?;
     Ok(Json(response))
 }
 
@@ -8200,7 +8210,15 @@ async fn blame(
         &req,
     )
     .map_err(|error| {
-        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+        // A live-graph replay miss is the CALLER'S news, not an internal fault.
+        // The ref was fine and the change is durable; this daemon's projection
+        // cannot replay to it. It reached `internal_error` below, so the user
+        // got a 500 carrying the RESOLVED change id rather than the ref they
+        // typed, which is an internal invariant leaking. rc062j saw exactly
+        // that after a merge, on every ref form, always naming the same id.
+        if kin_cli::commands::ref_lookup::is_graph_projection_error(&error) {
+            (StatusCode::CONFLICT, crate::error::cause_first(&error))
+        } else if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
             (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
@@ -8236,7 +8254,15 @@ async fn history(
         &req,
     )
     .map_err(|error| {
-        if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
+        // A live-graph replay miss is the CALLER'S news, not an internal fault.
+        // The ref was fine and the change is durable; this daemon's projection
+        // cannot replay to it. It reached `internal_error` below, so the user
+        // got a 500 carrying the RESOLVED change id rather than the ref they
+        // typed, which is an internal invariant leaking. rc062j saw exactly
+        // that after a merge, on every ref form, always naming the same id.
+        if kin_cli::commands::ref_lookup::is_graph_projection_error(&error) {
+            (StatusCode::CONFLICT, crate::error::cause_first(&error))
+        } else if kin_cli::commands::ref_lookup::is_ref_resolution_error(&error) {
             (StatusCode::BAD_REQUEST, crate::error::cause_first(&error))
         } else {
             internal_error(error)
@@ -13805,6 +13831,45 @@ fn apply_received_repository_transfer_pack(
         .is_none()
         .then(|| state.local_kindb_capability())
         .flatten();
+    // This replica's OWN admission case, read from the overlay of the workspace
+    // this daemon pinned at startup.
+    //
+    // Which workspace is "this replica's" is the whole difficulty, and it is why
+    // the case cannot be inferred inside the transfer code. Authority is
+    // replicated, so `local_overlays` can hold overlays from several hosts with
+    // different cases: a macOS replica records `FoldAscii`, a Linux one records
+    // `Sensitive`, and both live in one authority record. Only the daemon knows
+    // which of them is its own, because it pinned that workspace id when it
+    // started rather than rediscovering it from mutable control files.
+    //
+    // The recorded case is read rather than the filesystem re-probed, and that is
+    // deliberate. `AdmissionCase` is persisted in the overlay identity so that
+    // reopen and later scans stay on one matcher; a fresh probe could disagree
+    // with the case this replica's own commits are already enforcing, and then one
+    // store would apply two rules depending on whether content arrived locally or
+    // over the wire.
+    //
+    // A daemon with no workspace overlay to read admits under `Sensitive`, and
+    // that is not a guess. `DaemonState::open_with_backend`, the hosted path,
+    // leaves `cached_workspace_id` unset, so there is no overlay; what a hosted
+    // replica actually stores artifacts in is byte-exact object storage, where two
+    // paths differing only in case are two objects. Case-sensitive matching is
+    // what that store does, so admitting under it describes this replica rather
+    // than choosing on the publisher's behalf.
+    //
+    // Passing `None` here would be the honest-looking answer and the wrong one.
+    // kin-db refuses `None` wherever the shared policy has any rule source, and
+    // one `.gitignore` rule is one source, measured. A hosted receiver claiming no
+    // case would therefore refuse every brownfield push that introduces a file,
+    // which is the defect this change exists to remove.
+    let receiver_case = Some(
+        state
+            .local_repository_workspace_id()
+            .and_then(|workspace_id| {
+                kin_remote::repository_transfer::receiver_admission_case(authority, workspace_id)
+            })
+            .unwrap_or(kin_model::AdmissionCase::Sensitive),
+    );
     kin_remote::repository_transfer::apply_repository_transfer_pack_with_pre_commit(
         authority,
         repository_id,
@@ -13812,6 +13877,7 @@ fn apply_received_repository_transfer_pack(
         actor,
         pack,
         &configured_transfer_limits(),
+        receiver_case,
         || match local_kindb {
             Some(kindb) => kindb.invalidate_for_unversioned_transfer(),
             None => Ok(()),
@@ -34645,6 +34711,503 @@ mod tests {
         assert_eq!(carried[0].content_hash, approved_digest);
     }
 
+    /// A merge published through `resolve --continue` must reach the live graph
+    /// too, and this is the arm the plain-merge one below cannot cover.
+    ///
+    /// The two merge publications are different code: `publish` authors a clean
+    /// merge, `publish_resolved_merge` publishes one whose conflicts were
+    /// settled. kin#1287 installs on both. The plain-merge arm below drives only
+    /// the first, proven by its own mutation grid: removing the first install
+    /// leaves that arm GREEN. So this arm exists because a grid said the other
+    /// one does not cover it, rather than because two arms felt tidier.
+    ///
+    /// The fixture is the work here. Both sides must edit the SAME artifact, or
+    /// the merge is clean, `publish` runs, and this arm silently grades the
+    /// path the other arm already covers. `selected/compose.yaml` is written by
+    /// the fixture on main and rewritten on feature, so editing it again on the
+    /// active branch after the split is what makes the conflict real.
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_merge_published_through_resolve_reaches_the_live_graph_without_a_restart() {
+        let (state, _layout, repository, _base_change, _feature_change) =
+            universal_branch_test_state("resolve-live-graph");
+        let app = router(Arc::clone(&state));
+
+        // Conflict on purpose: the feature branch rewrote this same file.
+        std::fs::write(
+            repository.join("selected/compose.yaml"),
+            b"services:\n  api:\n    image: active-branch-after-the-split\n",
+        )
+        .unwrap();
+        let pre_merge = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "edit the file the other side also changed",
+        )
+        .await;
+
+        // PRECONDITION, proved: the projection is populated before publication.
+        state
+            .graph
+            .resolve_graph_at(&pre_merge)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOT RUN, precondition unmet rather than property refuted: the projection \
+                     could not replay to the pre-merge change: {error}"
+                )
+            });
+
+        let backend = state.local_repository_backend().unwrap();
+        let repository_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .repository_id()
+            .clone();
+        let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+
+        let post = |path: &'static str, body: Vec<u8>| {
+            let app = router(Arc::clone(&state));
+            async move {
+                let response = app
+                    .oneshot(
+                        Request::post(path)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 512 * 1024)
+                    .await
+                    .unwrap();
+                (status, bytes.to_vec())
+            }
+        };
+
+        let merge = kin_cli::commands::merge::MergeRequest {
+            source: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-live-graph-test"),
+        };
+        let (_merge_status, merge_body) =
+            post("/commands/merge", serde_json::to_vec(&merge).unwrap()).await;
+        let merge_response: kin_cli::commands::merge::MergeResponse =
+            serde_json::from_slice(&merge_body).unwrap();
+        // The merge must have CONFLICTED, or this arm drove `publish` and covers
+        // nothing the plain-merge arm does not.
+        //
+        // Keyed on the outcome rather than on `mutated`, which was the first
+        // thing tried and is wrong: a conflicted merge reports `mutated: true`
+        // because it wrote the merge transaction record, so `!mutated` refuses a
+        // run that conflicted exactly as intended. The response carries the
+        // answer directly and there is no reason to infer it from a side effect.
+        let outcome = merge_response
+            .report
+            .as_ref()
+            .map(|report| report.outcome)
+            .expect("the merge response must carry a report to read its outcome from");
+        assert!(
+            matches!(outcome, kin_cli::commands::merge::MergeOutcome::Conflicted),
+            "NOT RUN, precondition unmet: the merge reported {outcome:?} rather than Conflicted, \
+             so this arm drove `publish` rather than `publish_resolved_merge` and covers nothing \
+             the plain-merge arm does not: {}",
+            String::from_utf8_lossy(&merge_body)
+        );
+
+        let settle = kin_cli::commands::resolve::ResolveRequest {
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-live-graph-test"),
+            action: kin_cli::commands::resolve::ResolveAction::Settle {
+                directives: Vec::new(),
+                all: Some(kin_model::MergeSide::Theirs),
+            },
+            expected_record: None,
+        };
+        let (settle_status, settle_body) =
+            post("/commands/resolve", serde_json::to_vec(&settle).unwrap()).await;
+        assert_eq!(
+            settle_status,
+            StatusCode::OK,
+            "settling every conflict from one side must succeed: {}",
+            String::from_utf8_lossy(&settle_body)
+        );
+
+        let continue_request = kin_cli::commands::resolve::ResolveRequest {
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("resolve-live-graph-test"),
+            action: kin_cli::commands::resolve::ResolveAction::Continue,
+            expected_record: None,
+        };
+        let (continue_status, continue_body) = post(
+            "/commands/resolve",
+            serde_json::to_vec(&continue_request).unwrap(),
+        )
+        .await;
+        assert_eq!(
+            continue_status,
+            StatusCode::OK,
+            "the resolved merge must publish for this arm to grade anything: {}",
+            String::from_utf8_lossy(&continue_body)
+        );
+
+        let published = branch_change(&state);
+        assert_ne!(
+            published, pre_merge,
+            "the resolved merge must move the branch off its pre-merge change"
+        );
+
+        // The property, through the LIVE projection and owning the absence, so
+        // a missing change is reported as missing rather than mapped onto a
+        // parent count that reads like a publication of the wrong kind.
+        let held = state.graph.get_change(&published).unwrap().expect(
+            "the live graph does not hold the change `resolve --continue` just published, so \
+             every read that replays the graph to it fails until the daemon restarts; authority \
+             holds it and the derived query view does not",
+        );
+        assert_eq!(
+            held.parents.len(),
+            2,
+            "NOT RUN, precondition unmet: the published change carries {} parent(s) rather than \
+             two, so it is not a merge change",
+            held.parents.len()
+        );
+        state
+            .graph
+            .resolve_graph_at(&published)
+            .expect("a graph holding the published merge change must replay to it");
+
+        // OVER-INVALIDATION guard.
+        state.graph.resolve_graph_at(&pre_merge).expect(
+            "the graph can no longer replay to a change it held before the merge, so the \
+             projection was discarded rather than added to",
+        );
+
+        let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before != identity_after,
+            "the publication identity did not move across a resolved-merge publication"
+        );
+    }
+
+    /// A published MERGE must reach the live graph too, by the same contract
+    /// and with the same three guards as the rollback arm below.
+    ///
+    /// Its own arm rather than a second assertion in that one, because the two
+    /// publications reach the live graph through different code: kin#1287
+    /// installs on both merge publish paths, `publish` and
+    /// `publish_resolved_merge`, and this drives the first. A single arm
+    /// covering both would go red without saying which path regressed.
+    ///
+    /// The precondition is proved rather than assumed for the reason the
+    /// rollback arm states: a daemon whose projection was never populated holds
+    /// the change either way, so a check that publishes into an empty
+    /// projection passes on the unpatched binary.
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_published_merge_reaches_the_live_graph_without_a_restart() {
+        let (state, _layout, repository, _base_change, _feature_change) =
+            universal_branch_test_state("merge-live-graph");
+        let app = router(Arc::clone(&state));
+
+        // Diverge the active branch AFTER the split, so the merge must author a
+        // merge change rather than fast-forwarding. Without this the merge moves
+        // the ref onto the feature change, publishes nothing, and every
+        // assertion below passes on a binary with the install removed: measured,
+        // this arm survived all three mutations of the merge-side installs until
+        // the divergence was added.
+        std::fs::write(
+            repository.join("selected/diverge.txt"),
+            b"a change on the active branch after the split\n",
+        )
+        .unwrap();
+        let main_change = commit_through_api(
+            &app,
+            kin_model::OperationId::new(),
+            "diverge the active branch so the merge is not a fast-forward",
+        )
+        .await;
+
+        // PRECONDITION, proved: this daemon's projection is populated before the
+        // publication. A failure here is NOT a verdict on the property.
+        state
+            .graph
+            .resolve_graph_at(&main_change)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOT RUN, precondition unmet rather than property refuted: the projection \
+                     could not replay to the pre-merge change, so publishing into it proves \
+                     nothing: {error}"
+                )
+            });
+
+        let backend = state.local_repository_backend().unwrap();
+        let repository_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .repository_id()
+            .clone();
+        let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        // CONTROL: two reads with no publication between must be the SAME, or
+        // the comparison below cannot be evidence that a publication moved it.
+        let identity_again = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before == identity_again,
+            "the publication identity differs between two reads with no publication between them"
+        );
+
+        let request = kin_cli::commands::merge::MergeRequest {
+            source: kin_model::RefName::branch(b"feature").unwrap(),
+            operation_id: kin_model::OperationId::new(),
+            actor: AuthorId::new("merge-live-graph-test"),
+        };
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/commands/merge")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 256 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the merge must publish for this arm to grade anything: {}",
+            String::from_utf8_lossy(&body)
+        );
+
+        let published = branch_change(&state);
+        assert_ne!(
+            published, main_change,
+            "the merge must move the branch off its pre-merge change, or nothing was published \
+             and the assertions below would grade an unchanged store"
+        );
+        // A FAST-FORWARD moves the ref onto an existing change and publishes
+        // nothing, so every assertion below would pass on an unpatched binary
+        // for a change that was already in the graph. This arm grades nothing
+        // unless a genuine merge change was authored, and the tell is that the
+        // published change is neither side's tip and carries both as parents.
+        assert_ne!(
+            published, _feature_change,
+            "NOT RUN, precondition unmet: the merge fast-forwarded onto the feature change rather \
+             than authoring a merge change, so nothing was published and this arm cannot see the \
+             defect it exists for"
+        );
+        // The property assertion comes FIRST, because it owns the absence. An
+        // earlier read that mapped a missing change onto a parent count of zero
+        // reported this defect as "not a merge change", which is a precondition
+        // refusal wearing the property's clothes: measured, the install-removed
+        // arms failed here saying the publication was the wrong KIND when the
+        // truth is the change is missing from the graph. Never map a failed read
+        // onto a value a real answer could take.
+        //
+        // It also goes through the LIVE projection rather than an
+        // authority-backed surface: `kin log` and `kin status` answered rc=0 on
+        // the unpatched binary throughout, so a check reading only those would
+        // pass on both builds. The split is the whole tell.
+        let held = state.graph.get_change(&published).unwrap().expect(
+            "the live graph does not hold the change the merge just published, so every read \
+                 that replays the graph to it fails until the daemon restarts; authority holds it \
+                 and the derived query view does not",
+        );
+        // Only now, on a change the graph actually holds, is the KIND readable.
+        assert_eq!(
+            held.parents.len(),
+            2,
+            "NOT RUN, precondition unmet: the published change carries {} parent(s) rather than \
+             two, so it is not a merge change and this arm graded a publication of a different \
+             kind",
+            held.parents.len()
+        );
+
+        // The assertion this arm exists for. No restart between publication and
+        // this read, and it goes through the LIVE projection rather than an
+        // authority-backed surface: `kin log` and `kin status` answered rc=0 on
+        // the unpatched binary throughout, so a check reading only those would
+        // pass on both builds. The split is the whole tell.
+        state
+            .graph
+            .resolve_graph_at(&published)
+            .expect("a graph holding the published merge change must replay to it");
+
+        // OVER-INVALIDATION guard: discarding the projection would satisfy every
+        // assertion above while destroying what it already held.
+        state.graph.resolve_graph_at(&main_change).expect(
+            "the graph can no longer replay to a change it held before the merge, so the \
+             projection was discarded rather than added to",
+        );
+
+        let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before != identity_after,
+            "the publication identity did not move across a merge publication, so every authority \
+             slot keyed on it stays valid across the merge and concurrent readers admit against \
+             pre-merge roots"
+        );
+    }
+
+    /// A published rollback must reach the LIVE graph, not only durable
+    /// authority, without restarting the daemon.
+    ///
+    /// The transaction publishes an inverse change to repository authority and
+    /// the in-process graph is a derived query view over it. This path
+    /// published and never installed, so `graph.get_change` returned `None` for
+    /// a change the authority resolved, and every read that replays the graph
+    /// to it failed until a restart rebuilt the graph from authority. A further
+    /// commit did not heal it, because a commit installs its OWN change and not
+    /// the missing one.
+    ///
+    /// The daemon here has LIVED THROUGH the publications, which is the
+    /// condition that makes the defect visible: this one `state` performs the
+    /// commits and then the rollback, exactly as a running daemon does. A fresh
+    /// state built after the publication rebuilds its graph from authority and
+    /// therefore holds the change either way, which is why the original report
+    /// did not reproduce on its first attempt against a new daemon.
+    ///
+    /// The reads that already worked are asserted too. They answer from
+    /// authority rather than by replaying the graph, so a fix that invalidated
+    /// the projection instead of installing into it could break them while
+    /// leaving this test's first assertion green.
+    #[tokio::test]
+    #[serial_test::serial(repository_commit)]
+    async fn a_published_rollback_reaches_the_live_graph_without_a_restart() {
+        let state = test_state();
+        let root = state.layout.working_dir().to_path_buf();
+        let app = router(Arc::clone(&state));
+        std::fs::create_dir_all(root.join("notekeeper")).unwrap();
+
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return 1\n",
+        )
+        .unwrap();
+        let restored =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish the base").await;
+        std::fs::write(
+            root.join("notekeeper/client.py"),
+            b"def normalize(term):\n    return 2\n",
+        )
+        .unwrap();
+        let regression =
+            commit_through_api(&app, kin_model::OperationId::new(), "publish a regression").await;
+        assert_eq!(branch_change(&state), regression);
+
+        // PRECONDITION, proved rather than assumed: this daemon's projection is
+        // populated BEFORE the publication. That is the condition the defect
+        // needs, and a check that publishes into an empty projection passes on
+        // the unpatched binary, which is the single most likely way this test
+        // could fail to fail. Forcing a graph-replaying read here both creates
+        // the state and records that it existed.
+        //
+        // A failure HERE is not a verdict on the property. It says the fixture
+        // never reached the state under test, and its message says so, because
+        // a precondition red and a property red are different news and a reader
+        // of a stack trace cannot tell them apart from the line number alone.
+        state
+            .graph
+            .resolve_graph_at(&regression)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "NOT RUN, precondition unmet rather than property refuted: this daemon's \
+                     graph could not replay to the change it just published, so the projection \
+                     was never populated and publishing into it proves nothing: {error}"
+                )
+            });
+
+        let backend = state.local_repository_backend().unwrap();
+        let repository_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .repository_id()
+            .clone();
+        let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        // CONTROL for the comparison below: read the identity twice with no
+        // publication between and require it to be the SAME. Without this, an
+        // identity that differed on every read would make the across-publication
+        // assertion pass while proving nothing about publications.
+        let identity_again = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before == identity_again,
+            "the publication identity differs between two reads with no publication between them, \
+             so it cannot be evidence that a publication moved it"
+        );
+        let loads_before = state.projection_authority.loads();
+
+        let (status, body) =
+            rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
+        assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
+
+        let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let _ = loads_before;
+
+        let published = branch_change(&state);
+        assert_ne!(
+            published, regression,
+            "the rollback must move the branch off the regression"
+        );
+
+        // MEASUREMENT, recorded in the test rather than in a report: does the
+        // publication identity that `ProjectionAuthorityCache` keys on actually
+        // MOVE across a publication that never calls
+        // `record_repository_authority_commit`?
+        //
+        // Neither this path nor the merge paths call it, so `snapshot_generation`
+        // does not advance across either. The cache does not key on that
+        // counter: `LocalPublicationIdentity::Published` is the SHA-256 of the
+        // durable publication record's bytes, so it moves whenever the record
+        // is rewritten, whatever the in-memory counter did. If it did NOT move,
+        // an admission pair cached before this publication would stay valid
+        // after it and every concurrent task would admit against pre-publication
+        // roots, which is a defect in the cache rather than in this path.
+        // `assert!` rather than `assert_ne!`: the identity is deliberately not
+        // `Debug`, since printing a publication digest into a panic is not
+        // something a test should teach the type to allow.
+        assert!(
+            identity_before != identity_after,
+            "the publication identity did not move across a publication, so every authority slot \
+             keyed on it stays valid across the change and concurrent readers admit against \
+             pre-publication roots"
+        );
+
+        // The assertion this test exists for. No restart between the
+        // publication and this read.
+        assert!(
+            state.graph.get_change(&published).unwrap().is_some(),
+            "the live graph does not hold the change the rollback just published, so every read \
+             that replays the graph to it fails until the daemon restarts; authority holds it and \
+             the derived query view does not"
+        );
+
+        // The reads that already answered must still answer. `resolve_graph_at`
+        // is what a graph-replaying read does, and the branch change is what
+        // the authority resolves to.
+        state
+            .graph
+            .resolve_graph_at(&published)
+            .expect("a graph holding the published change must replay to it");
+
+        // OVER-INVALIDATION guard, and it is the assertion a fix of the wrong
+        // shape fails. Installing into the projection is one way to close this
+        // defect; discarding the projection so the next read rebuilds is
+        // another, and it would satisfy every assertion above while destroying
+        // the changes the projection already held. Lane vcsreads measured which
+        // reads keep working across the unpatched defect (`kin log`,
+        // `kin diff <change> HEAD`, `kin status`, `kin graph status`, all
+        // resolving the change fine while blame and history cannot), and
+        // nothing guarded them. This is their equivalent one layer down: the
+        // PRE-publication change must still replay after the publication.
+        state.graph.resolve_graph_at(&regression).expect(
+            "the graph can no longer replay to a change it held before this publication, so \
+                 the projection was discarded rather than added to and every read that worked \
+                 across the original defect now fails",
+        );
+    }
+
     /// An operation id is matched before any history validation runs, and an
     /// ordinary commit publishes the same receipt shape a rollback does. Only
     /// the restored content separates them, so reusing a commit's operation id
@@ -38051,6 +38614,83 @@ mod tests {
         );
     }
 
+    /// The admission pair costs one authority open per publication, not one per
+    /// caller, and concurrency does not change that.
+    ///
+    /// `current_authority_admission` has three callers that reach it
+    /// independently from concurrent tasks, and before the cache each opened
+    /// the whole store for its own copy. An open decodes the entire persisted
+    /// authority and re-verifies every body in repository CAS, so on a
+    /// converted psf/requests store six concurrent tasks were measured inside
+    /// that function at once, serialized at 2.205 seconds each.
+    ///
+    /// Two arms because they fail differently. Sequential proves the slot is
+    /// consulted at all; concurrent proves the load gate holds a burst to one
+    /// load rather than admitting a thundering herd that each miss and open.
+    ///
+    /// Every call is asserted to have SUCCEEDED before the count is read. A
+    /// count that did not move is the same reading whether the cache worked or
+    /// every call failed early, and only one of those is the property.
+    #[tokio::test]
+    async fn the_admission_pair_costs_one_open_per_publication() {
+        let state = test_state();
+        install_repository_file(&state, "src/lib.py", b"def handler():\n    return 1\n");
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // Warm the publication once so the count below measures reuse rather
+        // than the first load, which every path has to pay.
+        cached_authority_admission(&state).expect("the fixture store must resolve an admission");
+        let before = state.projection_authority.loads();
+
+        for call in 0..8 {
+            cached_authority_admission(&state)
+                .unwrap_or_else(|(_, message)| panic!("sequential call {call} failed: {message}"));
+        }
+        assert_eq!(
+            state.projection_authority.loads(),
+            before,
+            "eight sequential admission reads at one publication must load the authority zero              further times; each load decodes the whole store and re-verifies every CAS body"
+        );
+
+        // The concurrent arm gets a COLD state of its own, and that is the
+        // whole point of it. Written against the warm state above, eight tasks
+        // all hit the populated slot and never reach the load gate, so removing
+        // the gate left it green across three runs: an arm that could not fail
+        // for the reason it was written. Cold, the eight race into an empty
+        // slot and only the gate holds them to one load between them.
+        let cold = test_state();
+        install_repository_file(&cold, "src/lib.py", b"def handler():\n    return 1\n");
+        cold.is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let cold_before = cold.projection_authority.loads();
+
+        // No join_all: this crate carries futures-util rather than futures, and
+        // a hand-rolled join needs no dependency at all here.
+        let mut tasks = Vec::new();
+        for call in 0..8 {
+            let cold = Arc::clone(&cold);
+            tasks.push(tokio::task::spawn_blocking(move || {
+                cached_authority_admission(&cold)
+                    .map(|_| call)
+                    .map_err(|(_, message)| format!("concurrent call {call} failed: {message}"))
+            }));
+        }
+        for task in tasks {
+            task.await
+                .expect("the task must not panic")
+                .expect("every concurrent call must succeed");
+        }
+        assert_eq!(
+            cold.projection_authority.loads(),
+            cold_before + 1,
+            "eight CONCURRENT admission reads racing into a COLD slot must pay one load between \
+             them, not one each; the load gate is what makes that true, and this is the only \
+             arm that can watch it go"
+        );
+    }
+
     /// A trace request must not be the only thing this daemon can be doing.
     ///
     /// The walk now runs on the blocking pool, so the runtime stays free to
@@ -38307,25 +38947,29 @@ mod tests {
         let result: kin_cli::commands::search::DaemonSearchResponse =
             serde_json::from_slice(&body).unwrap();
 
-        // FIR-2918. This assertion used to read `records.is_empty()`, and it
-        // held for the wrong reason: the fixture's lexical index was never
-        // committed, so every query returned nothing. Now that the query path
-        // brings the index current, the disjunctive fallback answers with the
-        // index's NEAREST document rather than a match, measured here as
-        // `definitelyNoSuchSymbol` retrieving `present` at 0.45 because `def`
-        // occurs in `def present()` and is a substring of `definitely`, over a
-        // corpus holding no token of the query.
+        // This assertion has been right, then wrong, then right again, and the
+        // reason matters more than the line.
         //
-        // So the property this test is about is unchanged and is now stated
-        // directly: nothing matched BY NAME. `text_fallback` is the product's
-        // own name for that, and it is true only when the answer is non-empty
-        // and every row is a fallback row. The qualifier assertions below are
-        // untouched, and they are what this test exists for; making them survive
-        // a labelled-fallback answer is the fix this change carries.
+        // Originally `records.is_empty()`, and it held for the WRONG reason: the
+        // fixture's lexical index was never committed, so every query returned
+        // nothing (FIR-2918). Bringing the index current at query time made the
+        // disjunctive fallback answer with the index's nearest document, and
+        // this assertion moved to `text_fallback` to state the property it
+        // always meant, that nothing matched BY NAME.
+        //
+        // kin-search 0.1.6 then removed the thing that produced that row. It
+        // refuses a reverse substring match carrying too little of the query, so
+        // `definitelyNoSuchSymbol` no longer reaches `def present()` through
+        // `def` sitting inside `definitely` (FIR-2968). Measured on this pin:
+        // `text_fallback: false, total_matches: 0, records: []`. So the original
+        // assertion is correct again, and now for the reason it always claimed:
+        // the query matches nothing because the index holds nothing for it.
+        //
+        // The `|| text_fallback` half of the absence gate is no longer exercised
+        // here, which is why the sibling below exists.
         assert!(
-            result.text_fallback,
-            "nothing may match this query by name; an answer with a name match would make the \
-             qualifier assertions below vacuous: {result:?}"
+            result.records.is_empty(),
+            "a query whose terms the index does not hold must match nothing: {result:?}"
         );
         let qualifier = result.absence_qualifier.join(" ");
         assert!(
@@ -38343,6 +38987,75 @@ mod tests {
         assert!(
             !qualifier.contains("cross-file"),
             "a scope-gated surface must not claim an edge class: {qualifier:?}"
+        );
+    }
+
+    /// An all-fallback answer is an absence and must qualify like one.
+    ///
+    /// This exists because the pin to kin-search 0.1.6 took the coverage away
+    /// from the test above. That test used to reach the `|| text_fallback` half
+    /// of the absence gate through a WRONG answer, a nearest document returned
+    /// for a query the index held nothing for; 0.1.6 refuses that, so it now
+    /// reaches the `records.is_empty()` half instead and the other half would
+    /// ship unguarded.
+    ///
+    /// So this drives the same gate through a RIGHT answer. `socket` is not any
+    /// entity's name here, so nothing matches by name, but it is a real token in
+    /// one doc summary, so the text pass answers with a labelled fallback row.
+    /// That is a legitimate all-fallback answer, it is still an absence as far
+    /// as the caller's query is concerned, and the degradation has to reach the
+    /// verdict rather than being silenced by the presence of a row.
+    #[tokio::test]
+    async fn an_all_fallback_search_still_carries_the_degradation() {
+        let state = test_state();
+        let mut described = test_entity("handler", "src/net.py");
+        described.doc_summary =
+            Some("Opens a socket and speaks to a server over the network.".to_string());
+        state.graph.upsert_entity(&described).unwrap();
+        state
+            .is_initialized
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        state
+            .embed_worker_failed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/search")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "query": "socket" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let result: kin_cli::commands::search::DaemonSearchResponse =
+            serde_json::from_slice(&body).unwrap();
+
+        // The fixture has to actually produce the state under test, or the
+        // assertion below is about a case that never happened.
+        assert!(
+            result.text_fallback,
+            "this fixture must produce an ALL-FALLBACK answer, or it is not exercising the \
+             half of the absence gate it exists for: {result:?}"
+        );
+        assert!(
+            !result.records.is_empty(),
+            "an all-fallback answer is non-empty by definition: {result:?}"
+        );
+        let qualifier = result.absence_qualifier.join(" ");
+        assert!(
+            qualifier.contains("Kin cannot rule out"),
+            "a row that matched nothing by name must not silence the degradation: {qualifier:?}"
+        );
+        assert!(
+            qualifier.contains("embed_worker_failed"),
+            "the line names the signal the verdict disclosed: {qualifier:?}"
         );
     }
 

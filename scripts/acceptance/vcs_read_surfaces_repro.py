@@ -72,6 +72,7 @@ from __future__ import print_function
 
 import argparse
 import functools
+import importlib.util
 import json
 import os
 import re
@@ -139,6 +140,21 @@ def total_by(entries, key):
     buckets = {}
     for entry in entries:
         buckets[entry[key]] = "$%.2f" % (buckets.get(entry[key], 0) + entry["amount"])
+    return buckets
+'''
+
+
+# A THIRD body, for `check_content` alone. Same declarations, same count, body
+# only, like MODULE_AFTER; distinct from it so an edit reaches `kin admit` that no
+# earlier status read has already taken.
+MODULE_FOR_ADMIT = '''"""Roll ledger entries up into totals."""
+
+
+def total_by(entries, key):
+    """Sum amounts under one key, rounded to whole units."""
+    buckets = {}
+    for entry in entries:
+        buckets[entry[key]] = round(buckets.get(entry[key], 0) + entry["amount"])
     return buckets
 '''
 
@@ -492,6 +508,20 @@ def check_diff_scope(suite):
 
 
 def check_content(suite):
+    """`kin admit` over a content-only edit must not report a no-op.
+
+    Makes its OWN edit, and that is the whole correction. Since kin#1258
+    `kin status` admits before it reads, so `check_saw_the_edit` above does not
+    merely observe the edit, it TAKES it: the tree hash moving is exactly how that
+    check passes. By the time this one ran, there was nothing left to admit and
+    `kin admit` correctly said so, which failed this check on every main
+    Acceptance run after kin#1258 landed.
+
+    The check that proves read-after-admit works was consuming the state the next
+    check grades. A read that mutates has to be treated as a mutation when
+    ordering an experiment around it.
+    """
+    suite.write_tracked_module(MODULE_FOR_ADMIT)
     rc, out, err = suite.kin_run(["admit"])
     if rc != 0:
         return Result("content", UNREADABLE,
@@ -509,10 +539,15 @@ def check_settled(suite):
     return Result("settled", status, "%s %s" % (TICKET, detail))
 
 
-# Order is load-bearing and the experiment is destructive. `saw_the_edit` makes
-# the edit the next two are about, `content` admits it, `settled` re-admits a
-# settled tree, `diff_scope` reads a workspace diff over it, and `unadmitted`
-# stops the daemon, which nothing after it could survive.
+# Order is load-bearing and the experiment is destructive, and since kin#1258
+# every `kin status` in it is a MUTATION: status admits before it reads. So each
+# check that grades an unadmitted state has to create that state itself, after
+# the last status call, rather than inherit one from the check above.
+# `basis` and `saw_the_edit` both read status and therefore both admit;
+# `saw_the_edit` takes the edit it makes, which is exactly how it passes.
+# `content` writes its own edit for that reason, `settled` re-admits the settled
+# tree `content` left, `diff_scope` reads a workspace diff over it, and
+# `unadmitted` stops the daemon, which nothing after it could survive.
 CHECKS = (
     ("basis", check_basis),
     ("saw_the_edit", check_saw_the_edit),
@@ -525,9 +560,15 @@ CHECKS = (
 
 
 def report_payload(results):
+    # The key is `results` because that is the one `gate.py:load_report` reads.
+    # This file shipped it as `checks`, so the gate refused the report with
+    # "carries no results list" and none of the graders below was ever consulted
+    # (FIR-2985, the same class as FIR-2929 in init_budget). The self-test proves
+    # the join by handing this payload to the real loader rather than by naming
+    # the key a second time, because a string written twice drifts the same way.
     return {
         "ticket": TICKET,
-        "checks": [
+        "results": [
             {"id": result.ident, "status": result.status, "detail": result.detail}
             for result in results
         ],
@@ -635,6 +676,84 @@ ADMIT_UNMEASURED = (
 ADMIT_REFUSED = "Complete exact-tree admission failed: host entry changed\n"
 
 
+def check_the_gate_reads_this_suites_report():
+    """Hand this suite's own report to `gate.py`'s loader and require it back.
+
+    FIR-2985. This file emitted its rows under `checks` while `gate.py`'s
+    `load_report` reads `results`, so the gate refused the report with "carries
+    no results list" and every grader above went ungraded from the moment the
+    suite was wired in. The run stayed red, which is the good half, but it was
+    red for a plumbing fault wearing a product failure's clothes.
+
+    The same class had already been fixed once, in init_budget under FIR-2929,
+    and `working_copy_freshness_repro.py` already carries this exact check. It
+    is per-suite, which is precisely why the class came back here. This is that
+    proven check copied, not a new invention.
+
+    Asserting the literal key would write the string twice and drift the same
+    way. Importing the real consumer cannot: if the gate stops reading
+    `results`, or this file stops writing it, this goes red.
+
+    Returns (cases_run, broken).
+    """
+    ran = 0
+    broken = 0
+
+    def expect(name, got, want):
+        nonlocal ran, broken
+        ran += 1
+        ok = got == want
+        if not ok:
+            broken += 1
+        print("SELFTEST %s %s expected=%s got=%s"
+              % (name, "ok" if ok else "BROKEN", want, got))
+
+    gate_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gate.py")
+    if not os.path.exists(gate_path):
+        print("SELFTEST gate/beside BROKEN gate.py is not beside this file, "
+              "so the report shape went unchecked")
+        return 1, 1
+
+    spec = importlib.util.spec_from_file_location("acceptance_gate", gate_path)
+    gate = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(gate)
+
+    scratch = tempfile.mkdtemp(prefix="vcs-read-surfaces-selftest-")
+    try:
+        rows = [Result(ident, UNREADABLE, "%s check raised: fabricated" % TICKET)
+                for ident, _ in CHECKS]
+        good = os.path.join(scratch, "good.json")
+        with open(good, "w") as handle:
+            json.dump(report_payload(rows), handle)
+        try:
+            loaded = gate.load_report(good)
+            expect("gate/reads-every-row", sorted(loaded),
+                   sorted(ident for ident, _ in CHECKS))
+            expect("gate/reads-a-status", loaded[CHECKS[0][0]].get("status"), UNREADABLE)
+        except Exception as exc:  # noqa: BLE001 - a refusal is the finding
+            ran += 1
+            broken += 1
+            print("SELFTEST gate/reads-every-row BROKEN the gate refused this "
+                  "suite's own report: %s" % exc)
+
+        # CONTROL: the shape that shipped must still be refused, or the two
+        # assertions above would pass over any payload at all.
+        bad = os.path.join(scratch, "bad.json")
+        with open(bad, "w") as handle:
+            json.dump({"ticket": TICKET,
+                       "checks": [{"id": ident, "status": UNREADABLE}
+                                  for ident, _ in CHECKS]}, handle)
+        try:
+            gate.load_report(bad)
+            refused = False
+        except Exception:  # noqa: BLE001 - the refusal is what is wanted
+            refused = True
+        expect("gate/CONTROL-still-refuses-the-checks-shape", refused, True)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    return ran, broken
+
+
 def self_test():
     """Drive every grader against a payload that must pass and one that must fail.
 
@@ -698,7 +817,9 @@ def self_test():
             failures += 1
         print("SELFTEST %s %s expected=%s got=%s %s"
               % (name, "ok" if ok else "BROKEN", expected, got, detail))
-    print("SELFTEST %d case(s), %d broken" % (len(cases), failures))
+    gate_cases, gate_broken = check_the_gate_reads_this_suites_report()
+    failures += gate_broken
+    print("SELFTEST %d case(s), %d broken" % (len(cases) + gate_cases, failures))
     return 1 if failures else 0
 
 

@@ -43,7 +43,9 @@ import functools
 import io
 import json
 import os
+import shutil
 import sys
+import tempfile
 
 PASS = "PASS"
 FAIL = "FAIL"
@@ -97,6 +99,23 @@ def load_report(path):
         raise GateError("report %s is not JSON: %s" % (path, exc))
     results = payload.get("results")
     if not isinstance(results, list):
+        # Name the remedy in the failing log rather than in a sibling file. Four
+        # suites have now shipped their rows under `checks`: same_owner_call
+        # first, working_copy_freshness second (kin#1205's squash printed four
+        # CHECK lines over a report this loader could not read), init_budget
+        # third under FIR-2929, and vcs_read_surfaces fourth under FIR-2985. Each
+        # author had to rediscover the key from this message, which said only
+        # what was missing and never what to do about it.
+        if isinstance(payload.get("checks"), list):
+            raise GateError(
+                "report %s carries its rows under `checks`; this gate reads "
+                "`results`. Rename the top-level key in that suite's "
+                "`report_payload`, then add the self-test row that loads the "
+                "written report back through this loader, which is what stops "
+                "it drifting again; "
+                "`scripts/acceptance/working_copy_freshness_repro.py`'s "
+                "`report_payload` docstring prescribes both and records the "
+                "earlier occurrences" % path)
         raise GateError("report %s carries no results list" % path)
     if not results:
         raise GateError("report %s carries an empty results list; a suite that "
@@ -267,6 +286,46 @@ def self_test():
         "acceptance gate FAILED on 1 finding(s)" in missing_run_output,
         True,
     )
+
+    # The `checks`-key branch and the no-key branch both refuse, and a field-level
+    # assertion cannot tell them apart, so each arm is asserted on its exact
+    # MESSAGE. A mutation that merely redirects between the two branches leaves
+    # both refusing and would survive a check that only asked whether it raised.
+    scratch = tempfile.mkdtemp(prefix="acceptance-gate-self-test-")
+    try:
+        def write(name, payload):
+            target = os.path.join(scratch, name)
+            with open(target, "w") as handle:
+                json.dump(payload, handle)
+            return target
+
+        rows = [{"id": "one", "status": PASS, "detail": "self-test"}]
+
+        checks_keyed = write("checks.json", {"ticket": "FIR-0", "checks": rows})
+        try:
+            load_report(checks_keyed)
+            problems.append("a `checks`-keyed report was accepted")
+        except GateError as exc:
+            expect("a `checks`-keyed report names the remedy",
+                   "Rename the top-level key" in str(exc), True)
+            expect("a `checks`-keyed report names the prescribing docstring",
+                   "working_copy_freshness_repro.py" in str(exc), True)
+
+        neither = write("neither.json", {"ticket": "FIR-0", "rows": rows})
+        try:
+            load_report(neither)
+            problems.append("a report with neither key was accepted")
+        except GateError as exc:
+            expect("a report with neither key keeps the plain message",
+                   str(exc).endswith("carries no results list"), True)
+            expect("CONTROL the plain message does NOT name the remedy",
+                   "Rename the top-level key" in str(exc), False)
+
+        good = write("good.json", {"ticket": "FIR-0", "results": rows})
+        expect("CONTROL a `results`-keyed report is still accepted",
+               sorted(load_report(good)), ["one"])
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
     for line in problems:
         print("SELF-TEST FAIL %s" % line)

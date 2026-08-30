@@ -510,24 +510,22 @@ fn mass_deletion_refused(removed: u64, total_graph_files: u64) -> DaemonError {
 /// A repository with no local workspace — a hosted snapshot daemon — has no
 /// policy to resolve and reports `None`. Nothing is filtered in that case, and
 /// nothing is published from a host walk there either.
+///
+/// One open per PUBLICATION rather than one per call, which is the whole cost
+/// of this function. It used to open the whole store every time, and its three
+/// callers reach it independently on concurrent tasks, so a burst paid one
+/// O(store) open each and serialized behind kin-db. Neither value can differ
+/// between tasks inside one publication, so the answer is resolved once and
+/// shared through the daemon's `ProjectionAuthorityCache`, invalidated the way
+/// every other slot there is: by the publication identity moving.
 pub(crate) fn current_authority_admission(
     state: &DaemonState,
 ) -> Result<(
     kin_model::RootBundle,
     Option<kin_index::ResolvedAdmissionMatcher>,
 )> {
-    let authority_context =
-        crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(state)?;
-    let authority = authority_context.open().map_err(DaemonError::Graph)?;
-    let roots = authority.read_authority().roots().clone();
-    let policy = authority
-        .workspace_admission_snapshot(
-            authority_context.repository_id(),
-            &authority_context.workspace_id(),
-        )
-        .map_err(DaemonError::Graph)?
-        .map(|snapshot| snapshot.matcher);
-    Ok((roots, policy))
+    crate::api::cached_authority_admission(state)
+        .map_err(|(_status, message)| DaemonError::Io(std::io::Error::other(message)))
 }
 
 /// Measure host content graph truth does not carry, right now.

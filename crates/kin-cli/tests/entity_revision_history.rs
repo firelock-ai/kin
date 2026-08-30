@@ -167,6 +167,11 @@ fn history_reports_both_revisions_across_a_mixed_add_remove_change() {
     let request = HistoryRequest {
         entity: "alpha".to_string(),
         reference: Some(format!("kin:{}", fixture.head)),
+        // The DEFAULT, deliberately. These two tests exist for a change that
+        // also touches another entity, which is exactly the shape the trim
+        // reasons about, so they must hold under the default rather than be
+        // exempted from it.
+        all_revisions: false,
     };
 
     let response = execute_history_request(&absent_binding(), &fixture.graph, &request)
@@ -210,6 +215,11 @@ fn blame_reports_both_revisions_across_a_mixed_add_remove_change() {
     let request = BlameRequest {
         entity: "alpha".to_string(),
         reference: Some(format!("kin:{}", fixture.head)),
+        // The DEFAULT, deliberately. These two tests exist for a change that
+        // also touches another entity, which is exactly the shape the trim
+        // reasons about, so they must hold under the default rather than be
+        // exempted from it.
+        all_revisions: false,
     };
 
     let response = execute_blame_request(&absent_binding(), &fixture.graph, &request)

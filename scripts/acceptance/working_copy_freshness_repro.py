@@ -202,24 +202,79 @@ def grade_durability_reads_clean_over_a_committed_tree(payload):
     return PASS, "recorded, 0 uncommitted, which is what a committed tree is"
 
 
-def grade_status_names_the_unadmitted_file(text, expected_path):
-    """`kin status` reads durable authority, which cannot see this file at all."""
+# A verdict that names what it rests on. Any ONE of these means the line said
+# where its answer came from; none of them means it stated a bare verdict, which
+# is the shape FIR-2820 exists to forbid.
+_STATUS_BASIS = (
+    "as admitted ",                          # an admission ran, and when
+    "not measured against the working copy",  # none could, and why
+    "no complete admission",                  # no durable marker at all
+    "will not parse",                         # the marker is unreadable
+)
+
+
+def grade_status_never_all_clears_an_unread_working_copy(text, expected_path):
+    """FIR-2820's rule, asserted directly rather than through its first remedy.
+
+    The rule is that the product never states an all-clear about a working copy it
+    has not read. When this check was written, the only way to honour that was to
+    NAME the unadmitted file, because `kin status` could not read the working copy
+    at all: it reported durable authority and nothing else.
+
+    kin#1258 changed the mechanism. `kin status` now admits before it reads, so the
+    working copy IS read and the all-clear is earned rather than assumed. The old
+    assertion became unreachable: with a daemon there is no unadmitted file left to
+    name, and without one the line says "not measured; no daemon is running", which
+    is FIR-2820's own fifth arm and an honest answer rather than the quiet product
+    that arm was written to expose.
+
+    So this grades the rule in both worlds. An all-clear must be earned by a basis
+    the line states. A gap must be named. A bare verdict fails either way, which is
+    what the original defect looked like and what the control below still proves
+    this catches.
+    """
     if not isinstance(text, str) or "Kin repository-v6 status" not in text:
         return UNREADABLE, "this is not a kin status rendering"
-    line = None
+    tree = None
+    untracked = None
     for candidate in text.splitlines():
-        if candidate.startswith("Untracked host content:"):
-            line = candidate
-            break
-    if line is None:
+        if candidate.startswith("Tree: "):
+            tree = candidate
+        elif candidate.startswith("Untracked host content:"):
+            untracked = candidate
+    if tree is None:
+        return UNREADABLE, "kin status carries no Tree: line"
+    if untracked is None:
+        # The original FIR-2820 defect: authority truth alone, with nothing at all
+        # said about host content. Still a failure and still caught here.
         return FAIL, "kin status carries no untracked host content line at all"
-    if "not measured" in line:
-        return FAIL, "kin status took no measurement: %r" % (line,)
-    if expected_path not in line:
-        return FAIL, "the line does not name the file: %r" % (line,)
-    if "measured" not in line:
-        return FAIL, "the line does not say when it was measured: %r" % (line,)
-    return PASS, line
+
+    stated_basis = next((token for token in _STATUS_BASIS if token in tree), None)
+    if stated_basis is None:
+        return FAIL, (
+            "the Tree verdict states no basis, so an all-clear rests on nothing a reader "
+            "can see: %r" % (tree,)
+        )
+
+    # The old world, and the control keeps it graded: when the working copy holds a
+    # path authority has not taken, saying so is the answer.
+    if expected_path and expected_path in untracked:
+        return PASS, "names the unadmitted path, and the verdict states its basis: %r" % (tree,)
+
+    unread = "not measured against the working copy" in tree
+    if "not measured" in untracked:
+        if not unread:
+            return FAIL, (
+                "the untracked count was not measured while the verdict claims an admission, "
+                "so two lines about one working copy disagree: %r / %r" % (tree, untracked)
+            )
+        return PASS, "nothing read the working copy and both lines say so: %r" % (untracked,)
+    if unread:
+        return FAIL, (
+            "the verdict says nothing measured the working copy while the untracked line "
+            "reports on it anyway: %r / %r" % (tree, untracked)
+        )
+    return PASS, "the all-clear is earned by a stated basis: %r / %r" % (tree, untracked)
 
 
 def grade_status_reports_nothing_untracked(text):
@@ -246,12 +301,26 @@ def negative_of(payload):
     return None
 
 
-def grade_absence_names_the_working_copy(payload):
-    """An absence over a graph the working copy has outrun is not authoritative.
+_WITHHELD_GAPS = (
+    "graph_behind_working_tree",
+    "cross_file_edges_absent",
+    "reference_enrichment",
+)
+
+
+def grade_absence_names_the_gap_it_is_withheld_for(payload):
+    """An absence over a graph with a gap is not authoritative, and says which gap.
 
     The `negative` block was never the wrong part on its own: the name really is
-    not in the graph. What it may not do is present that as settled while a module
-    declaring the name sits on disk unread.
+    not in the graph. What it may not do is present that as settled while something
+    it has not read could carry the name.
+
+    Written first against `graph_behind_working_tree`, which was the only gap that
+    could produce it: a module on disk the graph had never met. kin#1258 closed
+    that one by admitting before reading, so the honest reason on this fixture
+    moved to `cross_file_edges_absent`, the enrichment gap underneath. The rule did
+    not move. So this grades the rule: never certified over a gap, and when
+    withheld, the reason names which gap rather than leaving a reader to guess.
     """
     block = negative_of(payload)
     if block is None:
@@ -260,17 +329,17 @@ def grade_absence_names_the_working_copy(payload):
         return UNREADABLE, "the negative block does not answer the absence question"
     if block.get("safe_to_conclude_absent") is True:
         return FAIL, (
-            "the absence is certified over a graph that never read the declaring "
-            "module: trust %r, reason %r"
+            "the absence is certified over a graph with an unread gap: trust %r, reason %r"
             % (block.get("trust"), block.get("trust_reason"))
         )
     reason = "%s %s" % (block.get("trust_reason") or "", block.get("advice") or "")
-    if "graph_behind_working_tree" not in reason:
+    named = next((gap for gap in _WITHHELD_GAPS if gap in reason), None)
+    if named is None:
         return FAIL, (
-            "the answer is withheld without naming the working copy as why: %r"
+            "the answer is withheld without naming which gap it is withheld for: %r"
             % (block.get("trust_reason"),)
         )
-    return PASS, "not certified, and the reason names graph_behind_working_tree"
+    return PASS, "not certified, and the reason names %s" % named
 
 
 def grade_absence_stays_authoritative_over_a_committed_tree(payload):
@@ -453,13 +522,15 @@ def check_durability(suite):
 
 def check_status(suite):
     text = suite.status_text()
-    status, detail = grade_status_names_the_unadmitted_file(text, suite.unadmitted_path)
+    status, detail = grade_status_never_all_clears_an_unread_working_copy(
+        text, suite.unadmitted_path
+    )
     return Result("status", status, "%s %s" % (TICKET, detail))
 
 
 def check_absence(suite):
     payloads = suite.mcp([("find_references", {"query": SYMBOL})])
-    status, detail = grade_absence_names_the_working_copy(payloads.get(2))
+    status, detail = grade_absence_names_the_gap_it_is_withheld_for(payloads.get(2))
     return Result("absence", status, "%s %s" % (TICKET, detail))
 
 
@@ -562,6 +633,36 @@ STATUS_NAMING_UNDATED = STATUS_HEAD + (
     "Untracked host content: 1 host path(s) on disk that graph truth does not carry "
     "(linkgraph/predicates.py); nothing above describes them\n")
 
+# The read-after-admit shapes, from kin#1254 and kin#1258. The Tree verdict now
+# states what it rests on, which is what lets an all-clear be earned rather than
+# assumed.
+# The 02:01Z shape: names the unadmitted path AND states its basis, because
+# kin#1254 landed the clock at 01:57Z. This is the control the rewrite has to keep
+# passing.
+STATUS_NAMING_ADMITTED = (
+    "Kin repository-v6 status\nTree: abc (3 artifacts, matching its base change as admitted "
+    "0s ago)\n"
+    "Untracked host content: 1 host path(s) on disk that graph truth does not carry "
+    "(linkgraph/predicates.py), measured 0s ago; nothing above describes them\n")
+
+STATUS_HEAD_ADMITTED = (
+    "Kin repository-v6 status\nTree: abc (3 artifacts, matching its base change as admitted "
+    "0s ago)\n")
+STATUS_HEAD_UNREAD = (
+    "Kin repository-v6 status\nTree: abc (3 artifacts, matching its base change as last "
+    "admitted, not measured against the working copy: no daemon is running for this "
+    "repository)\n")
+# Earned: an admission ran and the count is measured.
+STATUS_ADMITTED_CLEAN = STATUS_HEAD_ADMITTED + "Untracked host content: none, measured 0s ago\n"
+# Honest: nothing read it and BOTH lines say so.
+STATUS_UNREAD_UNMEASURED = STATUS_HEAD_UNREAD + (
+    "Untracked host content: not measured; no daemon is running for this repository\n")
+# The two disagreements, which are the shapes this rewrite exists to catch.
+STATUS_UNREAD_BUT_CLEAN = STATUS_HEAD_UNREAD + (
+    "Untracked host content: none, measured 0s ago\n")
+STATUS_ADMITTED_BUT_UNMEASURED = STATUS_HEAD_ADMITTED + (
+    "Untracked host content: not measured; this repository's daemon did not answer\n")
+
 CERTIFIED = {"negative": {
     "safe_to_conclude_absent": True, "trust": "authoritative",
     "trust_reason": "structural_authoritative: daemon graph initialized and loaded, with no "
@@ -571,6 +672,14 @@ WITHHELD = {"negative": {
     "safe_to_conclude_absent": False, "trust": "inconclusive",
     "trust_reason": "graph_behind_working_tree: 1 host path(s) on disk have never been admitted",
     "advice": "graph_behind_working_tree: 1 host path(s) on disk have never been admitted"}}
+# Quoted from what the product actually answered on this fixture after kin#1258,
+# not written by hand: an invented reason cannot tell you what the producer says.
+WITHHELD_ENRICHMENT = {"negative": {
+    "safe_to_conclude_absent": False, "trust": "inconclusive",
+    "trust_reason": "cross_file_edges_absent: the graph holds no cross-file references edges "
+                    "for Python, so a use that reaches the target through references could "
+                    "not have been found",
+    "advice": "the enrichment sweep is what to look at, not the build's capability"}}
 WITHHELD_UNEXPLAINED = {"negative": {
     "safe_to_conclude_absent": False, "trust": "inconclusive",
     "trust_reason": "some other reason entirely", "advice": "some other reason entirely"}}
@@ -641,41 +750,56 @@ def self_test():
     expect("durability control cannot read a response with no envelope",
            grade_durability_reads_clean_over_a_committed_tree({}), UNREADABLE)
 
-    expect("status passes a line naming the file",
-           grade_status_names_the_unadmitted_file(STATUS_NAMING, "linkgraph/predicates.py"), PASS)
-    expect("status fails a status with no such line",
-           grade_status_names_the_unadmitted_file(STATUS_SILENT, "linkgraph/predicates.py"), FAIL)
-    expect("status fails a line that measured nothing",
-           grade_status_names_the_unadmitted_file(STATUS_UNMEASURED, "linkgraph/predicates.py"),
-           FAIL)
-    expect("status fails a line naming a different file",
-           grade_status_names_the_unadmitted_file(STATUS_NAMING, "other/module.py"), FAIL)
+    # The 02:01Z control set. These are the shapes the OLD form graded, kept
+    # verbatim so the rewrite is shown to grade the same rule when the old
+    # condition holds rather than merely to stop failing.
+    expect("status passes a line naming the file, as it always did",
+           grade_status_never_all_clears_an_unread_working_copy(
+               STATUS_NAMING_ADMITTED, "linkgraph/predicates.py"), PASS)
+    # And the sharper half: naming the file does NOT excuse a bare verdict. The
+    # pre-kin#1254 head is kept for exactly this, because a rule about all-clears
+    # has to bite on the verdict independently of the untracked line.
+    expect("status fails a bare verdict even when the untracked line names the file",
+           grade_status_never_all_clears_an_unread_working_copy(
+               STATUS_NAMING, "linkgraph/predicates.py"), FAIL)
+    expect("status fails a status with no untracked line at all",
+           grade_status_never_all_clears_an_unread_working_copy(
+               STATUS_SILENT, "linkgraph/predicates.py"), FAIL)
     expect("status cannot read something that is not a status",
-           grade_status_names_the_unadmitted_file("nope", "linkgraph/predicates.py"), UNREADABLE)
-    expect("status fails an unmeasured line that does name the file",
-           grade_status_names_the_unadmitted_file(STATUS_UNMEASURED_NAMING,
-                                                  "linkgraph/predicates.py"), FAIL)
-    expect("status fails a line that names the file and never says when",
-           grade_status_names_the_unadmitted_file(STATUS_NAMING_UNDATED,
-                                                  "linkgraph/predicates.py"), FAIL)
+           grade_status_never_all_clears_an_unread_working_copy(
+               "nope", "linkgraph/predicates.py"), UNREADABLE)
+    # The bare verdict, which is the original defect and the one shape that must
+    # never pass in either world.
+    expect("status fails a verdict that states no basis",
+           grade_status_never_all_clears_an_unread_working_copy(
+               STATUS_CLEAN, "linkgraph/predicates.py"), FAIL)
+    # The read-after-admit world.
+    expect("status passes an all-clear earned by a stated admission",
+           grade_status_never_all_clears_an_unread_working_copy(
+               STATUS_ADMITTED_CLEAN, "linkgraph/predicates.py"), PASS)
+    expect("status passes a daemon-down answer where both lines say nothing read it",
+           grade_status_never_all_clears_an_unread_working_copy(
+               STATUS_UNREAD_UNMEASURED, "linkgraph/predicates.py"), PASS)
+    expect("status fails an all-clear over a working copy the verdict says it never read",
+           grade_status_never_all_clears_an_unread_working_copy(
+               STATUS_UNREAD_BUT_CLEAN, "linkgraph/predicates.py"), FAIL)
+    expect("status fails two lines about one working copy that disagree",
+           grade_status_never_all_clears_an_unread_working_copy(
+               STATUS_ADMITTED_BUT_UNMEASURED, "linkgraph/predicates.py"), FAIL)
 
-    expect("status control passes a clean measured tree",
-           grade_status_reports_nothing_untracked(STATUS_CLEAN), PASS)
-    expect("status control fails a tree still naming a file",
-           grade_status_reports_nothing_untracked(STATUS_NAMING), FAIL)
-    expect("status control fails a status with no such line",
-           grade_status_reports_nothing_untracked(STATUS_SILENT), FAIL)
-    expect("status control cannot read something that is not a status",
-           grade_status_reports_nothing_untracked(""), UNREADABLE)
-
-    expect("absence passes a withheld answer that names the working copy",
-           grade_absence_names_the_working_copy(WITHHELD), PASS)
+    # The 02:01Z control: the gap this check was written for still passes.
+    expect("absence passes a withheld answer naming graph_behind_working_tree",
+           grade_absence_names_the_gap_it_is_withheld_for(WITHHELD), PASS)
+    # And the gap read-after-admit leaves behind, which is what the fixture now
+    # reaches. Same rule, different gap named.
+    expect("absence passes a withheld answer naming the enrichment gap",
+           grade_absence_names_the_gap_it_is_withheld_for(WITHHELD_ENRICHMENT), PASS)
     expect("absence fails the shipped certified answer",
-           grade_absence_names_the_working_copy(CERTIFIED), FAIL)
-    expect("absence fails an answer withheld for an unrelated reason",
-           grade_absence_names_the_working_copy(WITHHELD_UNEXPLAINED), FAIL)
+           grade_absence_names_the_gap_it_is_withheld_for(CERTIFIED), FAIL)
+    expect("absence fails an answer withheld for an unnamed reason",
+           grade_absence_names_the_gap_it_is_withheld_for(WITHHELD_UNEXPLAINED), FAIL)
     expect("absence cannot read a response with no negative block",
-           grade_absence_names_the_working_copy({"results": []}), UNREADABLE)
+           grade_absence_names_the_gap_it_is_withheld_for({"results": []}), UNREADABLE)
 
     expect("absence control passes a certified answer",
            grade_absence_stays_authoritative_over_a_committed_tree(CERTIFIED), PASS)

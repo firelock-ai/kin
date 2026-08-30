@@ -87,6 +87,25 @@ path = "junit.xml"
 
 # quarantine: ticket=FIR-2809 since=2026-08-27 last-flake=2026-08-27 source=crates/kin-core/tests/init_phase_ladder_contiguous.rs
 #
+# The dates above are correct and deliberately unchanged. On 2026-08-30 lane
+# daemonmem reproduced this guard red three times, at 3141, 3423 and 3442 ms
+# uncovered against a 2.0 percent bar, but those were LOCAL `cargo test` runs
+# under the full workspace suite, not nextest retries. The field above means the
+# most recent run in which this test needed a RETRY, read off nextest's own
+# summary, and CI has recorded none: runs 33292963787, 33293674768 and
+# 33293776932 on 2026-08-30 each report "test(s) recorded, none needed a retry"
+# with the junit-reporting invocation present. Writing a CI date that no CI run
+# produced would put local evidence into a field defined by the hosted summary.
+#
+# So expect the promotion arm to advise deletion from 2026-09-03, and read that
+# advice against this paragraph rather than acting on the date alone. The cause
+# was found and fixed under FIR-2980: the uncovered stretch was init's own
+# capture-staging teardown, `GitCaptureStaging::drop` calling `remove_dir_all`
+# over the whole Git capture, now inside a `kin.init.release_capture_staging`
+# span. That work measured 141 ms unloaded and 1140 ms under IO contention, and
+# CPU contention does not move it. If this row is still quiet after that fix has
+# had a week on main, the promotion is the right call rather than a premature one.
+#
 # Day-one intake, and the only row. It ejected pull request 1141 for a measured
 # 34 minutes on 2026-08-26. It has the evidence quarantine demands: the guard was
 # confirmed LOAD-SENSITIVE by the control that counts, same bytes, round one red
