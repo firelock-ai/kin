@@ -3614,8 +3614,9 @@ pub(crate) fn reference_edge_coverage_health(
         ))
     }
     .with_manual_fix(
-        "re-admit the repository so relation extraction runs again (`kin reconcile --admit`), and \
-         treat any \"unused\" answer as unverified until cross-file edges resolve",
+        "ask this repository's daemon to enrich again once the servers are installed (`kin \
+         daemon sweep`), and treat any \"unused\" answer as unverified until cross-file edges \
+         resolve",
     )
 }
 

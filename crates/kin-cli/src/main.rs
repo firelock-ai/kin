@@ -4145,6 +4145,102 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
 
+    /// Every flag a doctor fix line tells a user to type must exist.
+    ///
+    /// `kin doctor` shipped a fix line reading "`kin reconcile --admit`" from
+    /// v0.6.0 (FIR-3003). `reconcile` takes `session` and
+    /// `--confirm-mass-deletion`, so clap rejects `--admit` outright: the one
+    /// action the report offered could not be performed, and nothing noticed
+    /// for three minor versions because a fix line is prose to every test that
+    /// reads it.
+    ///
+    /// This asserts the prose against the parser. The strings live in the lib
+    /// and the clap definition lives in this binary, so the test reads
+    /// `health.rs` from disk rather than importing it; that is also why it
+    /// checks its own reading, since a scan that found nothing would pass.
+    #[test]
+    fn every_flag_a_doctor_fix_line_names_exists_in_the_cli() {
+        // `Cli::command()` builds the whole derive tree at once and overflows a
+        // test thread's default 2 MiB stack on this CLI, which ABORTS the
+        // process. An abort is a red that graded nothing, and from an exit code
+        // alone it reads exactly like a caught bug, so the body runs on a
+        // thread with room and the assertions below are actually reached.
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(fix_line_flags_exist)
+            .expect("spawn the checking thread")
+            .join()
+            .expect("the fix-line check must not panic in the harness thread");
+    }
+
+    fn fix_line_flags_exist() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/commands/health.rs"
+        ))
+        .expect("health.rs is readable from the crate it lives in");
+
+        // Backticked `kin ...` spans are how every fix line names a command.
+        let mut commands: Vec<String> = Vec::new();
+        for span in source.split('`').skip(1).step_by(2) {
+            let span = span.trim();
+            if let Some(rest) = span.strip_prefix("kin ") {
+                commands.push(rest.to_string());
+            }
+        }
+
+        // The scan must find something, or every assertion below is vacuous.
+        // Pinned by count rather than by emptiness so a refactor that quietly
+        // drops most of them is visible too.
+        assert!(
+            commands.len() >= 10,
+            "the scan found only {} backticked `kin ...` spans in health.rs, which is too few \
+             to be reading the file it thinks it is",
+            commands.len()
+        );
+
+        let root = Cli::command();
+        let mut offenders: Vec<String> = Vec::new();
+        for command in &commands {
+            // Walk the subcommand path, then check every flag against the
+            // command that path resolved to. A word that is not a known
+            // subcommand ends the path: it is a positional value, like the `.`
+            // in `kin init .`.
+            let mut node = &root;
+            let mut flags: Vec<&str> = Vec::new();
+            for word in command.split_whitespace() {
+                if let Some(flag) = word.strip_prefix("--") {
+                    let flag =
+                        flag.trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-');
+                    if !flag.is_empty() {
+                        flags.push(flag);
+                    }
+                    continue;
+                }
+                if flags.is_empty() {
+                    if let Some(next) = node.find_subcommand(word) {
+                        node = next;
+                    }
+                }
+            }
+            for flag in flags {
+                let known = node.get_arguments().any(|arg| arg.get_long() == Some(flag));
+                if !known {
+                    offenders.push(format!(
+                        "`kin {command}` names --{flag}, which `{}` does not take",
+                        node.get_name()
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "a doctor fix line tells a user to type a flag the CLI rejects:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     /// The admission commands must carry every configured target without
     /// `RUST_LOG` being set.
     #[test]
