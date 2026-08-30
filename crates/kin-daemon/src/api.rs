@@ -4383,6 +4383,10 @@ async fn command_status(
         // killed. Read from the store rather than remembered by this process,
         // because the daemon that died is by definition not this one.
         kin_cli::daemon_death::recorded_for_store(state.layout.root()).as_ref(),
+        // When graph truth last caught up with the working copy. Read from the
+        // durable marker rather than from this daemon's own probes, which reset
+        // on restart and then report every store as never admitted (FIR-2961).
+        &kin_core::last_admission::read(&state.layout),
     )
     .map_err(internal_error)?;
     Ok(Json(response))
