@@ -1014,6 +1014,19 @@ fn build_graph_status_response_for_store(
 
     // Warnings
     let mut warnings = health.warnings.clone();
+    // A missing language server is reported above as an indented detail under
+    // the coverage section, which is not where a reader asking "is this graph
+    // trustworthy" looks. Measured on one corpus with and without pyright, it
+    // costs relations rather than entities: 13 against 29, with a whole relation
+    // kind absent. So it belongs on the warning line, carrying the affected file
+    // count the coverage line already computes rather than any estimate of what
+    // a server would have found (FIR-2777).
+    if let Some(missing) = health
+        .reference_edge_coverage
+        .missing_language_server_warning()
+    {
+        warnings.push(missing);
+    }
     let criticals = health.critical_issues.clone();
     let all_relation_count = health
         .semantic_relation_count
