@@ -15,6 +15,13 @@ pub use kin_model::{
     SessionId, SpecId, TreeEntry, TreeStateError, WorkspaceId,
 };
 
+/// Committed graph state resolved at one semantic change.
+///
+/// Lives in `kin_model::graph` rather than at that crate's root, so it is
+/// re-exported here by its module path to keep every kin-db caller on one
+/// spelling.
+pub use kin_model::graph::ResolvedGraphState;
+
 // Entity types
 pub use kin_model::{
     Entity, EntityKind, EntityMetadata, EntityRevision, EntityRole, FingerprintAlgorithm,

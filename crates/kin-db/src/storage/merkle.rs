@@ -1072,6 +1072,13 @@ pub fn compute_repo_truth_hash(snapshot: &GraphSnapshot) -> MerkleHash {
         entity_revisions: _,
         repository_authority,
         external_references,
+        // A resolution of `changes` at one change, derived from data this
+        // digest already hashes in full, and legitimately present on one
+        // replica of a repository and absent on another without either being
+        // wrong. Hashing it would report two identical repositories as
+        // different the moment one of them wrote a section, which is the exact
+        // spurious mismatch the four bindings above exist to avoid.
+        materialized_graph: _,
     } = snapshot;
 
     let mut hasher = Sha256::new();

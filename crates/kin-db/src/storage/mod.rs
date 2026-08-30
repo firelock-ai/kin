@@ -46,7 +46,10 @@ pub use backend::{
 pub use delta::{
     apply_graph_delta, compute_graph_delta, CollectionDelta, GraphSnapshotDelta, VecDelta,
 };
-pub use format::{AuthorityEnvelopeSnapshot, CompactionStats, GraphSnapshot, WorkspaceGraphFacts};
+pub use format::{
+    AuthorityEnvelopeSnapshot, CompactionStats, GraphSnapshot, MaterializedGraphRefusal,
+    MaterializedGraphSection, WorkspaceGraphFacts, MATERIALIZED_GRAPH_SCHEMA_VERSION,
+};
 #[cfg(feature = "gcs")]
 pub use gcs::GcsBackend;
 pub use gcs_compatibility::{

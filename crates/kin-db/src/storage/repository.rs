@@ -52,8 +52,11 @@ use crate::storage::backend::{
 };
 use crate::storage::canonical_hash::canonical_hash_into;
 use crate::storage::change_validation::AdmittedChangeMap;
-use crate::storage::format::{GraphSnapshot, WorkspaceGraphFacts};
+use crate::storage::format::{
+    GraphSnapshot, MaterializedGraphRefusal, MaterializedGraphSection, WorkspaceGraphFacts,
+};
 use crate::storage::history_replay::{validate_first_parent_history, ReplayProgress};
+use crate::types::ResolvedGraphState;
 
 /// Persisted repository-envelope schema.
 pub const REPOSITORY_AUTHORITY_SCHEMA_VERSION: u32 = 3;
@@ -2057,6 +2060,21 @@ pub struct RepositoryAuthorityMetadata<B: StorageBackend + ?Sized> {
     backend: Arc<B>,
     metadata: PersistedRepositoryAuthority,
     generation: Generation,
+    /// The resolved graph the base snapshot carried, if any.
+    ///
+    /// This is where the two halves of the fix meet. The envelope read already
+    /// reaches field 33 without allocating the change map; a section at field
+    /// 35 rides along on the same walk. Together they answer a workspace graph
+    /// with neither a whole-store decode nor a fold over history, which is what
+    /// makes an open cost what the graph costs rather than what the history
+    /// costs.
+    ///
+    /// It is read from the BASE snapshot and journal frames do not carry one,
+    /// so an envelope advanced over frames serves the base's section. That is
+    /// correct rather than merely tolerable: a change id names its whole
+    /// ancestry, so an older section is either exactly the right answer for the
+    /// change being asked about or is refused by name.
+    materialized_graph: Option<MaterializedGraphSection>,
 }
 
 impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
@@ -2085,7 +2103,12 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
         let head_generation = authority.head_generation;
         drop(authority);
         let decode_at = started.elapsed();
-        let Some(metadata) = envelope.repository_authority else {
+        let crate::storage::format::AuthorityEnvelopeSnapshot {
+            version: _,
+            repository_authority,
+            materialized_graph,
+        } = envelope;
+        let Some(metadata) = repository_authority else {
             return Ok(None);
         };
         if metadata.repository_id != repository_id {
@@ -2128,12 +2151,31 @@ impl<B: StorageBackend + ?Sized + 'static> RepositoryAuthorityMetadata<B> {
             backend,
             metadata,
             generation,
+            materialized_graph,
         }))
     }
 
     /// The envelope this read resolved.
     pub const fn metadata(&self) -> &PersistedRepositoryAuthority {
         &self.metadata
+    }
+
+    /// The persisted graph at `change_id`, or the reason it cannot answer.
+    ///
+    /// A caller that gets `Ok` has the resolved entities, relations, revisions
+    /// and tree at that change without this read having decoded a single change
+    /// or folded any history. A caller that gets `Err` falls back to a full
+    /// open, which is what it would have done anyway.
+    pub fn materialized_graph_for(
+        &self,
+        change_id: &SemanticChangeId,
+    ) -> Result<&MaterializedGraphSection, MaterializedGraphRefusal> {
+        let section = self
+            .materialized_graph
+            .as_ref()
+            .ok_or(MaterializedGraphRefusal::Absent)?;
+        section.validate_for(change_id)?;
+        Ok(section)
     }
 
     /// The authority generation the envelope names.
@@ -5794,6 +5836,17 @@ thread_local! {
     /// transactions reaching it.
     static WORKSPACE_MUTATION_BASE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 
+    /// Base graphs answered from a persisted materialized graph section.
+    static BASE_GRAPHS_SERVED_FROM_SECTION: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
+    /// Base graphs folded out of history because no section answered.
+    ///
+    /// Counted separately from the serves rather than derived by subtraction.
+    /// A test asserting "no replay happened" needs a zero it can read directly,
+    /// and a zero computed as `total - served` is satisfied by an instrument
+    /// that counts nothing at all.
+    static BASE_GRAPHS_RESOLVED_FROM_HISTORY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+
     /// Changes carried by every base graph resolved on this thread, summed.
     ///
     /// Read only as the endpoints of a span, for the same reason the
@@ -5847,6 +5900,30 @@ enum WorkspaceBaseHistory<'a> {
     Omitted,
 }
 
+/// The resolved graph at `change_id` from a persisted section, or why not.
+///
+/// Every refusal falls back to folding the history, which is always available
+/// in the same file, so this can only ever cost time. That is the whole reason
+/// a stale section is not fatal: nothing here is authority, and the thing it
+/// memoizes is still sitting beside it.
+///
+/// What is deliberately NOT here is a re-derivation of the section to check it.
+/// Recomputing `resolve_graph_at` to decide whether to use a memo of
+/// `resolve_graph_at` would pay the entire cost this exists to avoid, every
+/// time, and conclude what the change id already proves. The writer's own
+/// obligation is checked where it can be acted on, on the write path.
+fn resolved_graph_from_section(
+    authority_snapshot: &GraphSnapshot,
+    change_id: &SemanticChangeId,
+) -> Result<ResolvedGraphState, MaterializedGraphRefusal> {
+    let section = authority_snapshot
+        .materialized_graph
+        .as_ref()
+        .ok_or(MaterializedGraphRefusal::Absent)?;
+    section.validate_for(change_id)?;
+    Ok(section.state.clone())
+}
+
 fn resolve_workspace_base_graph_snapshot(
     authority_snapshot: &GraphSnapshot,
     metadata: &PersistedRepositoryAuthority,
@@ -5864,10 +5941,52 @@ fn resolve_workspace_base_graph_snapshot(
     let resolved = match base_target {
         Some(target) => {
             let change_id = target_change_id(metadata, target)?;
-            let view = AuthorityHistoryView {
-                changes: &authority_snapshot.changes,
-            };
-            Some(view.resolve_graph_at(&change_id)?)
+            Some(
+                match resolved_graph_from_section(authority_snapshot, &change_id) {
+                    Ok(state) => {
+                        #[cfg(test)]
+                        BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.set(count.get() + 1));
+                        // Both paths are timed by the same `history_resolve_ms`
+                        // below, and a served base makes it small. Without a
+                        // line here a reader sees a small number and no way to
+                        // tell whether the fold got faster or never ran, which
+                        // is a measurement surface that cannot be read. Every
+                        // outcome now says which path produced the timing.
+                        tracing::debug!(
+                            change = %change_id,
+                            entities = state.entities.len(),
+                            relations = state.relations.len(),
+                            "served the workspace base from a materialized graph section"
+                        );
+                        state
+                    }
+                    Err(refusal) => {
+                        #[cfg(test)]
+                        BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.set(count.get() + 1));
+                        // Absent is the ordinary case on every store written
+                        // before v14 and on every workspace whose base has
+                        // moved since the last full snapshot, so it is not a
+                        // warning. The other reasons are, because each of them
+                        // means a section was written and is not being used.
+                        if matches!(refusal, MaterializedGraphRefusal::Absent) {
+                            tracing::trace!(
+                                change = %change_id,
+                                "no materialized graph section for this base; folding it from history"
+                            );
+                        } else {
+                            tracing::warn!(
+                                refusal = %refusal,
+                                change = %change_id,
+                                "refused the materialized graph section; folding the base from history instead"
+                            );
+                        }
+                        let view = AuthorityHistoryView {
+                            changes: &authority_snapshot.changes,
+                        };
+                        view.resolve_graph_at(&change_id)?
+                    }
+                },
+            )
         }
         None => None,
     };
@@ -5936,6 +6055,10 @@ fn resolve_workspace_base_graph_snapshot(
         entity_revisions,
         repository_authority: None,
         external_references,
+        // A workspace base is not a published authority snapshot: it carries no
+        // envelope, so there is no change it can claim to be the resolution at
+        // and nothing a reader could validate a section against.
+        materialized_graph: None,
     };
     let domain_clone_ms = timer.lap_ms();
     rebuild_snapshot_adjacency(&mut base);
@@ -15405,6 +15528,193 @@ mod tests {
         assert_eq!(viewed.external_references, replayed.external_references);
     }
 
+    use crate::storage::format::MATERIALIZED_GRAPH_SCHEMA_VERSION;
+
+    /// Resolve one workspace base and report which arm answered.
+    ///
+    /// The counters are read as the endpoints of a span rather than as running
+    /// totals, because open-time and admission validation resolve bases too.
+    fn resolve_base_counting_arms(
+        snapshot: &GraphSnapshot,
+        metadata: &PersistedRepositoryAuthority,
+        workspace: &WorkspaceState,
+    ) -> (GraphSnapshot, usize, usize) {
+        let served_before = BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.get());
+        let folded_before = BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.get());
+        let base = resolve_workspace_base_graph_snapshot(
+            snapshot,
+            metadata,
+            workspace.base_target.as_ref(),
+            WorkspaceBaseHistory::Carried(None),
+        )
+        .expect("a synthetic workspace base resolves");
+        let served = BASE_GRAPHS_SERVED_FROM_SECTION.with(|count| count.get()) - served_before;
+        let folded = BASE_GRAPHS_RESOLVED_FROM_HISTORY.with(|count| count.get()) - folded_before;
+        (base, served, folded)
+    }
+
+    /// Compare two resolved bases over the REAL SET rather than by counting.
+    ///
+    /// Counting entities would pass for a section that answered the right
+    /// number of the wrong ones, so this reads what one side actually produced
+    /// and requires the other to hold each of those, by id and by value.
+    fn assert_same_resolved_graph(left: &GraphSnapshot, right: &GraphSnapshot) {
+        assert_eq!(
+            left.entities.keys().collect::<BTreeSet<_>>(),
+            right.entities.keys().collect::<BTreeSet<_>>(),
+            "the two paths must resolve the same entity ids"
+        );
+        for (id, entity) in &left.entities {
+            assert_eq!(
+                Some(entity),
+                right.entities.get(id),
+                "entity {id} differs between the section and the fold"
+            );
+        }
+        assert_eq!(
+            left.relations.keys().collect::<BTreeSet<_>>(),
+            right.relations.keys().collect::<BTreeSet<_>>(),
+            "the two paths must resolve the same relation ids"
+        );
+        for (id, relation) in &left.relations {
+            assert_eq!(
+                Some(relation),
+                right.relations.get(id),
+                "relation {id} differs between the section and the fold"
+            );
+        }
+        assert_eq!(left.entity_revisions, right.entity_revisions);
+        assert_eq!(left.resolved_tree, right.resolved_tree);
+        assert_eq!(left.external_references, right.external_references);
+        assert_eq!(left.outgoing, right.outgoing);
+        assert_eq!(left.incoming, right.incoming);
+    }
+
+    /// A synthetic store, its workspace, and the change its base names.
+    fn synthetic_base_fixture() -> (
+        GraphSnapshot,
+        PersistedRepositoryAuthority,
+        WorkspaceState,
+        SemanticChangeId,
+    ) {
+        let store = build_synthetic_history_store(2, 8, 1, 3);
+        let lease = store.manager.read_authority();
+        let snapshot = lease.snapshot().clone();
+        let metadata = lease.metadata().clone();
+        let workspace = metadata.workspaces[0].clone();
+        let change_id = lease
+            .resolve_target_change_id(
+                workspace
+                    .base_target
+                    .as_ref()
+                    .expect("a synthetic workspace bases at head"),
+            )
+            .expect("the base target names a change");
+        drop(lease);
+        (snapshot, metadata, workspace, change_id)
+    }
+
+    #[test]
+    fn a_store_with_no_section_folds_its_base_out_of_history() {
+        // The control for every arm below. Without it, a zero on the fold
+        // counter in the served test would be satisfied by an instrument that
+        // never counts at all.
+        let (snapshot, metadata, workspace, _) = synthetic_base_fixture();
+        assert!(snapshot.materialized_graph.is_none());
+
+        let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(served, 0, "there is no section to serve");
+        assert_eq!(folded, 1, "so the base must be folded out of history");
+        assert!(
+            !base.entities.is_empty(),
+            "the fixture must resolve a non-empty graph, or every comparison below is vacuous"
+        );
+    }
+
+    #[test]
+    fn a_store_with_a_section_serves_its_base_without_folding_history() {
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, folded_first) =
+            resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(folded_first, 1, "the first pass must be the fold");
+
+        let state = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("the head resolves");
+        snapshot.materialized_graph = Some(MaterializedGraphSection {
+            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+            resolved_at: change_id,
+            state,
+        });
+
+        let (served_base, served, folded) =
+            resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(served, 1, "the section must answer");
+        assert_eq!(
+            folded, 0,
+            "and nothing may fold the history behind its back"
+        );
+        assert_same_resolved_graph(&served_base, &folded_base);
+    }
+
+    #[test]
+    fn a_section_resolving_at_another_change_is_refused_and_the_history_answers() {
+        // The mutation this catches is a reader that uses the section without
+        // validating it. That reader passes the test above, because there the
+        // section is correct; only a WRONG section separates the two.
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, _) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+
+        let mut wrong = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("the head resolves");
+        // Empty it, so a reader that serves this section without checking gives
+        // an answer that cannot be mistaken for the right one.
+        wrong.entities.clear();
+        wrong.relations.clear();
+        snapshot.materialized_graph = Some(MaterializedGraphSection {
+            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+            resolved_at: SemanticChangeId::from_hash(Hash256::from_bytes([0x5a; 32])),
+            state: wrong,
+        });
+
+        let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(served, 0, "a section for another change must not answer");
+        assert_eq!(folded, 1, "the history must answer instead");
+        assert_same_resolved_graph(&base, &folded_base);
+    }
+
+    #[test]
+    fn a_section_of_an_unknown_schema_is_refused_and_the_history_answers() {
+        // Separate from the target arm because the two can hide each other. A
+        // validator that dropped the schema check entirely would still pass
+        // the target test.
+        let (mut snapshot, metadata, workspace, change_id) = synthetic_base_fixture();
+        let (folded_base, _, _) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+
+        let mut wrong = AuthorityHistoryView {
+            changes: &snapshot.changes,
+        }
+        .resolve_graph_at(&change_id)
+        .expect("the head resolves");
+        wrong.entities.clear();
+        wrong.relations.clear();
+        snapshot.materialized_graph = Some(MaterializedGraphSection {
+            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION + 1,
+            resolved_at: change_id,
+            state: wrong,
+        });
+
+        let (base, served, folded) = resolve_base_counting_arms(&snapshot, &metadata, &workspace);
+        assert_eq!(served, 0, "an unknown schema must not answer");
+        assert_eq!(folded, 1, "the history must answer instead");
+        assert_same_resolved_graph(&base, &folded_base);
+    }
+
     #[test]
     fn authority_history_view_fails_closed_outside_replay() {
         let changes = HashMap::new();
@@ -15488,8 +15798,15 @@ mod tests {
             entity_revisions,
             repository_authority,
             external_references,
+            materialized_graph,
         } = served;
         assert_eq!(*version, fresh.version);
+        // `ResolvedGraphState` carries no `PartialEq`, so the two sections are
+        // compared through the exact MessagePack form they persist in.
+        assert_eq!(
+            rmp_serde::to_vec(materialized_graph).expect("a section encodes"),
+            rmp_serde::to_vec(&fresh.materialized_graph).expect("a section encodes"),
+        );
         assert_eq!(*entities, fresh.entities);
         assert_eq!(*relations, fresh.relations);
         assert_eq!(*outgoing, fresh.outgoing);

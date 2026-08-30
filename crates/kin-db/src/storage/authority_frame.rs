@@ -703,6 +703,22 @@ fn first_difference(reconstructed: &GraphSnapshot, next: &GraphSnapshot) -> Opti
         entity_revisions,
         repository_authority,
         external_references,
+        // Bound and not compared, and this is the one binding here that costs
+        // something, so the reason is written out. A frame does not carry the
+        // materialized graph: it is a resolution of the history at one change,
+        // the frame's job is to move the history by O(change), and carrying a
+        // whole resolved graph per frame is the cost that unit exists to
+        // avoid. So a frame-reconstructed snapshot keeps the base's section
+        // while `next` may carry a newer one, and requiring them equal would
+        // refuse every frame after the first section is written.
+        //
+        // Ignoring it is safe for a reason no other field here can claim: a
+        // section is trusted only when its `resolved_at` equals the change the
+        // reader wants, and a change id is a Merkle hash over its own deltas
+        // and parents. So an older section is either still exactly the right
+        // answer or is refused at read time. The worst a missed mutation costs
+        // here is a replay, never a wrong graph.
+        materialized_graph: _,
     } = reconstructed;
     let GraphSnapshot {
         version: next_version,
@@ -740,6 +756,7 @@ fn first_difference(reconstructed: &GraphSnapshot, next: &GraphSnapshot) -> Opti
         entity_revisions: next_entity_revisions,
         repository_authority: next_repository_authority,
         external_references: next_external_references,
+        materialized_graph: _,
     } = next;
     let checks = [
         ("versions", version == next_version),

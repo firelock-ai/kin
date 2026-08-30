@@ -2667,6 +2667,12 @@ impl InMemoryGraph {
             // manager, never by this in-place mutable graph.
             repository_authority: _,
             external_references,
+            // A persisted resolution of the graph, which is what this build
+            // PRODUCES rather than something it consumes. The entities and
+            // relations above are already that resolution when the caller
+            // served one; loading it again here would be reading the answer
+            // twice.
+            materialized_graph: _,
         } = snapshot;
         let entity_revisions: HashMap<EntityId, Vec<EntityRevision>> =
             if entity_revisions.is_empty() && !changes.is_empty() {
@@ -4128,6 +4134,9 @@ impl InMemoryGraph {
             downstream_warnings: ses.downstream_warnings,
             repository_authority: None,
             external_references: ent.external_references.into_iter().collect(),
+            // A live mutable graph has no published change to resolve at, so it
+            // has nothing to bind a section to. The publication path writes one.
+            materialized_graph: None,
         }
     }
 
@@ -14899,8 +14908,17 @@ mod tests {
             entity_revisions,
             repository_authority,
             external_references,
+            materialized_graph,
         } = served;
         assert_eq!(*version, fresh.version, "version");
+        // `ResolvedGraphState` carries no `PartialEq`, so the two are compared
+        // through the exact MessagePack form they would be persisted in, which
+        // is the comparison that matters for a section anyway.
+        assert_eq!(
+            rmp_serde::to_vec(materialized_graph).expect("a section encodes"),
+            rmp_serde::to_vec(&fresh.materialized_graph).expect("a section encodes"),
+            "materialized_graph"
+        );
         assert_eq!(*entities, fresh.entities, "entities");
         assert_eq!(*relations, fresh.relations, "relations");
         assert_eq!(*outgoing, fresh.outgoing, "outgoing");

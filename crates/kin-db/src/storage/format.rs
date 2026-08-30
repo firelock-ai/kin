@@ -311,6 +311,107 @@ pub(crate) struct GraphSnapshotRoundTripProof {
     pub(crate) entity_revisions: DrainMap<EntityId, Vec<EntityRevision>>,
     pub(crate) repository_authority: Option<PersistedRepositoryAuthority>,
     pub(crate) external_references: DrainMap<ExternalReferenceId, ExternalReference>,
+    /// Mirrors the appended v14 field, with the same `default` so this proof
+    /// reads a v13 body exactly as the real decoder does.
+    #[serde(default)]
+    pub(crate) materialized_graph: Option<MaterializedGraphSection>,
+}
+
+/// Schema of [`MaterializedGraphSection`] itself.
+///
+/// Separate from the snapshot format version because the two move for
+/// different reasons. The snapshot version changes when the positional body
+/// changes width; this changes when what a field inside the section MEANS
+/// moves. A section whose schema this binary does not know is ignored and the
+/// graph is replayed, which is always available, so an unknown schema costs
+/// time and never correctness.
+pub const MATERIALIZED_GRAPH_SCHEMA_VERSION: u32 = 1;
+
+/// The resolved graph at one change, persisted beside the history it was
+/// folded from.
+///
+/// A converted repository's snapshot IS its history: the `changes` map is
+/// most of the body, while the entities and relations a daemon actually serves
+/// are absent from the file and folded out of that history at every open by
+/// `ChangeStore::resolve_graph_at`. This section is that fold, written once by
+/// the publish that produced it and read directly afterwards.
+///
+/// It is derived state, not authority, and the distinction is load-bearing.
+/// Nothing here is hashed into any authority root, because the authority over a
+/// graph is the change it resolves at; adding a section therefore leaves a
+/// repository's roots, and so its replicated identity, byte for byte what they
+/// were. Every read checks the section against the change the caller wants
+/// before trusting it, so a section that is not this caller's answer is ignored
+/// rather than served.
+///
+/// `outgoing` and `incoming` are deliberately absent. Workspace
+/// materialization rebuilds adjacency from `relations` already, so persisting
+/// them would enlarge the section for no reader.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MaterializedGraphSection {
+    /// Schema of this section. See [`MATERIALIZED_GRAPH_SCHEMA_VERSION`].
+    pub schema_version: u32,
+    /// The change this graph is the resolution AT, and the whole binding.
+    ///
+    /// `kin_model::compute_semantic_change_id` hashes every immutable field of
+    /// a change except `id` itself, and `parents` is one of them, so the change
+    /// DAG is a Merkle DAG and an id determines its complete ancestry together
+    /// with every delta in it. `resolve_graph_at` folds exactly that ancestry
+    /// and reads nothing else. So naming the change names the graph: no other
+    /// history can produce this id, and a reader that matches this against the
+    /// target it wants has matched the content.
+    ///
+    /// An earlier draft also carried `RootBundle::history`, a hash over the
+    /// WHOLE change map. It was dropped rather than kept as defence in depth,
+    /// because it is not a weaker version of this check, it is a wrong one: a
+    /// change appended anywhere moves that root while leaving the graph at this
+    /// change identical, so a section that is still exactly correct would be
+    /// refused after every commit and after every authority frame. A check that
+    /// refuses correct answers is worse than no check when the remaining check
+    /// is complete.
+    ///
+    /// Not an `Option`. A repository with no base target resolves to five
+    /// empty maps and a default tree, which costs nothing to compute, so there
+    /// is nothing there worth memoizing and no case where an absent section
+    /// and an empty one have to be told apart.
+    pub resolved_at: SemanticChangeId,
+    /// Exactly what `ChangeStore::resolve_graph_at(resolved_at)` returns.
+    ///
+    /// Held whole rather than field by field so that the read path is a
+    /// substitution rather than a reconstruction: whatever that call produces
+    /// is what this carries, and a domain added to `ResolvedGraphState` later
+    /// is carried here without anyone remembering to add it. Tombstones and
+    /// entity revisions come along for the same reason, and the revisions
+    /// matter on their own, since a graph built over a base with none re-derives
+    /// a revision timeline across the whole history.
+    pub state: ResolvedGraphState,
+}
+
+/// Why a persisted section was not used, named one reason at a time.
+///
+/// A refusal is a diagnosis rather than a shrug, in the shape
+/// `PreparedWorkspaceGraphCache` already uses for the same class of decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaterializedGraphRefusal {
+    /// The snapshot carries no section. Every v13 store lands here.
+    Absent,
+    /// The section names a schema this binary does not know.
+    Schema { held: u32, found: u32 },
+    /// The section resolves at a different change than the caller asked for.
+    Target,
+}
+
+impl std::fmt::Display for MaterializedGraphRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Absent => formatter.write_str("absent"),
+            Self::Schema { held, found } => {
+                write!(formatter, "schema (holding {held}, section names {found})")
+            }
+            Self::Target => formatter.write_str("resolved_at"),
+        }
+    }
 }
 
 /// The serializable snapshot of the entire graph state.
@@ -369,6 +470,19 @@ pub struct GraphSnapshot {
     /// this struct positionally. Reordering an existing field would reinterpret
     /// persisted bytes instead of failing closed at the v13 format boundary.
     pub external_references: HashMap<ExternalReferenceId, ExternalReference>,
+    /// The resolved graph at one change, or `None` to derive it by replay.
+    ///
+    /// Appended after every v13 field, for the reason the field above records:
+    /// MessagePack encodes this struct positionally, so appending fails closed
+    /// at a format boundary while reordering would reinterpret persisted bytes.
+    ///
+    /// `serde(default)` is what lets ONE decoder read a v13 body and a v14
+    /// body: the v13 array runs out of elements here and the field takes
+    /// `None`. Nothing is skipped on serialize, so a v14 body is always 36
+    /// elements wide and width stays a function of version alone, which is the
+    /// property both partial decoders below use as their discriminator.
+    #[serde(default)]
+    pub materialized_graph: Option<MaterializedGraphSection>,
 }
 
 fn deserialize_required_repository_authority<'de, D>(
@@ -447,10 +561,22 @@ pub(crate) struct LocateGraphSnapshot {
 
 impl GraphSnapshot {
     /// Current format version.
-    pub const CURRENT_VERSION: u32 = 13;
+    ///
+    /// v14 APPENDS one element to the positional body, `materialized_graph`,
+    /// and moves nothing. That is the whole reason the bump is cheap: a v13
+    /// body is a v14 body with its last element missing, and the field's
+    /// `serde(default)` supplies it, so one decoder reads both widths and no
+    /// second copy of the field list exists to drift.
+    pub const CURRENT_VERSION: u32 = 14;
 
-    /// The only on-disk format version this pre-release binary accepts.
-    pub const MIN_SUPPORTED_VERSION: u32 = Self::CURRENT_VERSION;
+    /// The oldest on-disk format version this binary opens.
+    ///
+    /// Deliberately a literal rather than `Self::CURRENT_VERSION`. While the
+    /// two were one constant, every bump made every existing store unopenable
+    /// on the same commit, which is the wrong price for a change that only
+    /// appends a field. A store any shipped version wrote still opens here and
+    /// still derives its graph by replay.
+    pub const MIN_SUPPORTED_VERSION: u32 = 13;
 
     /// Magic bytes for the file header: "KNDB"
     pub const MAGIC: [u8; 4] = *b"KNDB";
@@ -465,6 +591,7 @@ impl GraphSnapshot {
 
     pub fn empty() -> Self {
         Self {
+            materialized_graph: None,
             version: Self::CURRENT_VERSION,
             entities: HashMap::new(),
             relations: HashMap::new(),
@@ -785,7 +912,7 @@ impl GraphSnapshot {
         let _span = tracing::info_span!("kindb.snapshot.prove_round_trip").entered();
         let frame = Self::decode_frame(data, true)?;
         match frame.version {
-            Self::CURRENT_VERSION => {
+            Self::MIN_SUPPORTED_VERSION..=Self::CURRENT_VERSION => {
                 let _span = tracing::info_span!("kindb.snapshot.decode_round_trip_proof").entered();
                 let proof: GraphSnapshotRoundTripProof = rmp_serde::from_slice(frame.body)
                     .map_err(|e| {
@@ -821,10 +948,29 @@ impl GraphSnapshot {
             let _span = tracing::info_span!("kindb.snapshot.decode_frame").entered();
             Self::decode_frame(data, verify_checksum)?
         };
-        let snapshot = match frame.version {
-            Self::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
+        let mut snapshot = match frame.version {
+            Self::MIN_SUPPORTED_VERSION..=Self::CURRENT_VERSION => {
+                Self::decode_current_snapshot(frame.body)?
+            }
             _ => unreachable!("decode_frame validates supported versions"),
         };
+        // The header and the body both carry a version and nothing made them
+        // agree. While there was one supported version the question could not
+        // arise; with two it can, and a decoder that dispatches on the header
+        // while trusting the body's own claim is a check that cannot fail.
+        if snapshot.version != frame.version {
+            return Err(crate::error::KinDbError::StorageError(format!(
+                "snapshot header declares v{} but its body declares v{}",
+                frame.version, snapshot.version
+            )));
+        }
+        // An older body decodes into the current in-memory shape with its
+        // appended field defaulted, so the value this returns IS a v14
+        // snapshot and says so. Leaving 13 here would make the very next
+        // `to_bytes` refuse its own decoded object. No root hashes the version,
+        // so raising it moves no authority: checked against every one of the
+        // six root functions, none reads `snapshot.version`.
+        snapshot.version = Self::CURRENT_VERSION;
         if validate_storage_admission {
             snapshot.validate_storage_admission()?;
         }
@@ -881,10 +1027,16 @@ impl GraphSnapshot {
         let body = &data[16..body_end];
 
         match version {
-            Self::CURRENT_VERSION => {
-                let checksum_end = Self::require_checksum_slot(data, body_len, "v13")?;
+            // Every version in the supported range shares one frame layout;
+            // they differ only in how wide the MessagePack body array is. The
+            // label is derived from the version rather than written as a
+            // literal, because a hardcoded "v13" in a v14 refusal names the
+            // wrong format at exactly the moment a reader needs the right one.
+            Self::MIN_SUPPORTED_VERSION..=Self::CURRENT_VERSION => {
+                let label = format!("v{version}");
+                let checksum_end = Self::require_checksum_slot(data, body_len, &label)?;
                 let body_checksum = if verify_checksum {
-                    Some(Self::verify_checksum(data, body_len, "v13")?)
+                    Some(Self::verify_checksum(data, body_len, &label)?)
                 } else {
                     None
                 };
@@ -1271,7 +1423,9 @@ impl LocateGraphSnapshot {
             GraphSnapshot::decode_frame(data, verify_checksum)?
         };
         let snapshot = match frame.version {
-            GraphSnapshot::CURRENT_VERSION => Self::decode_current_snapshot(frame.body)?,
+            GraphSnapshot::MIN_SUPPORTED_VERSION..=GraphSnapshot::CURRENT_VERSION => {
+                Self::decode_current_snapshot(frame.body)?
+            }
             _ => unreachable!("decode_frame validates supported versions"),
         };
         snapshot.validate_storage_admission()?;
@@ -1477,12 +1631,21 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                     });
                 }
 
-                if seq.size_hint() != Some(35) {
-                    return Err(serde::de::Error::invalid_length(
-                        seq.size_hint().unwrap_or_default(),
-                        &self,
-                    ));
-                }
+                // The canonical body is 35 elements at v13 and 36 at v14; the
+                // appended element is the materialized graph, which locate does
+                // not read. This used to be a bare `35`, which would have made
+                // every v14 store fail here with `invalid_length` while the
+                // named constant one screen up said 36.
+                let width = match seq.size_hint() {
+                    Some(width @ GRAPH_SNAPSHOT_V13_FIELD_COUNT)
+                    | Some(width @ GRAPH_SNAPSHOT_FIELD_COUNT) => width,
+                    other => {
+                        return Err(serde::de::Error::invalid_length(
+                            other.unwrap_or_default(),
+                            &self,
+                        ))
+                    }
+                };
 
                 let version = seq
                     .next_element()?
@@ -1542,6 +1705,11 @@ impl<'de> Deserialize<'de> for LocateGraphSnapshot {
                 let external_references = seq
                     .next_element()?
                     .ok_or_else(|| serde::de::Error::invalid_length(34, &self))?;
+                if width == GRAPH_SNAPSHOT_FIELD_COUNT {
+                    let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(MATERIALIZED_GRAPH_FIELD_INDEX, &self)
+                    })?;
+                }
 
                 Ok(LocateGraphSnapshot {
                     version,
@@ -1590,6 +1758,55 @@ pub struct AuthorityEnvelopeSnapshot {
     pub version: u32,
     /// The envelope. `None` is a legacy graph-only snapshot with no authority.
     pub repository_authority: Option<PersistedRepositoryAuthority>,
+    /// The resolved graph these bytes carry, if any.
+    ///
+    /// Read here rather than through a third partial decoder on purpose. A
+    /// second copy of a 36-element field list is only ever wrong in a way that
+    /// looks like a passing run, and this reader already walks past the section
+    /// to reach the envelope, so keeping it costs one more element.
+    pub materialized_graph: Option<MaterializedGraphSection>,
+}
+
+impl AuthorityEnvelopeSnapshot {
+    /// The section this envelope carries, or the reason it cannot be used.
+    ///
+    /// `resolved_at` is the change the caller intends to resolve the graph at,
+    /// which for a workspace is its `base_target`. Matching it is what makes
+    /// the answer this section's own, and the Merkle change id is what makes
+    /// matching it sufficient.
+    pub fn materialized_graph_for(
+        &self,
+        resolved_at: &SemanticChangeId,
+    ) -> Result<&MaterializedGraphSection, MaterializedGraphRefusal> {
+        let section = self
+            .materialized_graph
+            .as_ref()
+            .ok_or(MaterializedGraphRefusal::Absent)?;
+        section.validate_for(resolved_at)?;
+        Ok(section)
+    }
+}
+
+impl MaterializedGraphSection {
+    /// Whether this section may answer for the graph at `resolved_at`.
+    ///
+    /// Every arm returns a DIFFERENT refusal, so a falsification can read which
+    /// check answered rather than only that one did.
+    pub fn validate_for(
+        &self,
+        resolved_at: &SemanticChangeId,
+    ) -> Result<(), MaterializedGraphRefusal> {
+        if self.schema_version != MATERIALIZED_GRAPH_SCHEMA_VERSION {
+            return Err(MaterializedGraphRefusal::Schema {
+                held: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+                found: self.schema_version,
+            });
+        }
+        if &self.resolved_at != resolved_at {
+            return Err(MaterializedGraphRefusal::Target);
+        }
+        Ok(())
+    }
 }
 
 impl AuthorityEnvelopeSnapshot {
@@ -1600,7 +1817,7 @@ impl AuthorityEnvelopeSnapshot {
             GraphSnapshot::decode_frame(data, true)?
         };
         match frame.version {
-            GraphSnapshot::CURRENT_VERSION => {
+            GraphSnapshot::MIN_SUPPORTED_VERSION..=GraphSnapshot::CURRENT_VERSION => {
                 let _span = tracing::info_span!("kindb.snapshot.decode_envelope").entered();
                 rmp_serde::from_slice(frame.body).map_err(|e| {
                     crate::error::KinDbError::StorageError(format!(
@@ -1635,12 +1852,23 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 // `LocateGraphSnapshot`. The eleven-field locate projection
                 // carries no envelope at all, so it is refused by name here
                 // rather than silently decoding as an absent authority.
-                if seq.size_hint() != Some(GRAPH_SNAPSHOT_FIELD_COUNT) {
-                    return Err(serde::de::Error::invalid_length(
-                        seq.size_hint().unwrap_or_default(),
-                        &self,
-                    ));
-                }
+                // Width is the format discriminator and it is a function of
+                // the snapshot version alone: v13 bodies are 35 elements, v14
+                // bodies are 36, and nothing is skipped on serialize so the
+                // width never varies within a version. The eleven-field locate
+                // projection carries no envelope at all, so it is refused by
+                // width here rather than silently decoding as an absent
+                // authority.
+                let width = match seq.size_hint() {
+                    Some(width @ GRAPH_SNAPSHOT_V13_FIELD_COUNT)
+                    | Some(width @ GRAPH_SNAPSHOT_FIELD_COUNT) => width,
+                    other => {
+                        return Err(serde::de::Error::invalid_length(
+                            other.unwrap_or_default(),
+                            &self,
+                        ))
+                    }
+                };
 
                 let version = seq
                     .next_element()?
@@ -1656,10 +1884,18 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
                 let _: IgnoredAny = seq.next_element()?.ok_or_else(|| {
                     serde::de::Error::invalid_length(REPOSITORY_AUTHORITY_FIELD_INDEX + 1, &self)
                 })?;
+                let materialized_graph = if width == GRAPH_SNAPSHOT_FIELD_COUNT {
+                    seq.next_element()?.ok_or_else(|| {
+                        serde::de::Error::invalid_length(MATERIALIZED_GRAPH_FIELD_INDEX, &self)
+                    })?
+                } else {
+                    None
+                };
 
                 Ok(AuthorityEnvelopeSnapshot {
                     version,
                     repository_authority,
+                    materialized_graph,
                 })
             }
         }
@@ -1674,8 +1910,15 @@ impl<'de> Deserialize<'de> for AuthorityEnvelopeSnapshot {
 /// round-trip proof have to agree about the same array, and a field appended to
 /// `GraphSnapshot` moves the envelope. `the_envelope_index_names_the_authority`
 /// pins both against the struct itself.
-pub(crate) const GRAPH_SNAPSHOT_FIELD_COUNT: usize = 35;
+pub(crate) const GRAPH_SNAPSHOT_FIELD_COUNT: usize = 36;
+/// The v13 body's width, which is the current width minus the appended field.
+///
+/// Kept as its own constant rather than as `FIELD_COUNT - 1` so that a future
+/// append has to state what the older widths were instead of silently
+/// redefining one of them.
+pub(crate) const GRAPH_SNAPSHOT_V13_FIELD_COUNT: usize = 35;
 pub(crate) const REPOSITORY_AUTHORITY_FIELD_INDEX: usize = 33;
+pub(crate) const MATERIALIZED_GRAPH_FIELD_INDEX: usize = 35;
 
 struct SnapshotFrame<'a> {
     version: u32,
@@ -1742,10 +1985,10 @@ pub struct BorrowedGraphSnapshot<'a> {
 impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeStruct;
-        // Must produce exactly 35 fields in the same order as GraphSnapshot's
-        // derive(Serialize).  rmp_serde serializes structs as arrays, so
-        // position (not name) determines the mapping.
-        let mut state = serializer.serialize_struct("GraphSnapshot", 35)?;
+        // Must produce exactly GRAPH_SNAPSHOT_FIELD_COUNT fields in the same
+        // order as GraphSnapshot's derive(Serialize).  rmp_serde serializes
+        // structs as arrays, so position (not name) determines the mapping.
+        let mut state = serializer.serialize_struct("GraphSnapshot", GRAPH_SNAPSHOT_FIELD_COUNT)?;
 
         // 1. version
         state.serialize_field("version", &GraphSnapshot::CURRENT_VERSION)?;
@@ -1829,6 +2072,12 @@ impl<'a> Serialize for BorrowedGraphSnapshot<'a> {
         )?;
         // 35. Resolved external symbols (append-only v13 field).
         state.serialize_field("external_references", self.external_references)?;
+        // 36. A live mutable graph is not a published repository authority, so
+        // it has no history root to bind a section to and never carries one.
+        state.serialize_field(
+            "materialized_graph",
+            &Option::<MaterializedGraphSection>::None,
+        )?;
         state.end()
     }
 }
@@ -2850,7 +3099,12 @@ mod tests {
 
         snap.version = 1;
         let error = snap.to_bytes().unwrap_err();
-        assert!(error.to_string().contains("exactly v13"));
+        // Derived from the constant rather than typed, because a hardcoded
+        // version in an assertion goes stale on exactly the commit that most
+        // needs the assertion to still mean something.
+        assert!(error
+            .to_string()
+            .contains(&format!("exactly v{}", GraphSnapshot::CURRENT_VERSION)));
     }
 
     #[test]
@@ -2945,6 +3199,13 @@ mod tests {
         );
     }
 
+    /// The one field a v14 body may be missing, because a v13 body IS one.
+    ///
+    /// Named as a list rather than skipped inside the loop so that a second
+    /// defaulted field has to be added here deliberately. A `continue` on a
+    /// condition would have let the next one in silently.
+    const DELIBERATELY_DEFAULTED_FIELDS: [&str; 1] = ["materialized_graph"];
+
     #[test]
     fn current_snapshot_requires_every_persisted_field() {
         let encoded = serde_json::to_value(GraphSnapshot::empty()).unwrap();
@@ -2955,6 +3216,7 @@ mod tests {
             .cloned()
             .collect();
 
+        let mut required = 0;
         for field in fields {
             let mut missing = encoded.clone();
             missing
@@ -2962,12 +3224,28 @@ mod tests {
                 .expect("snapshot serializes as a map")
                 .remove(&field);
 
+            if DELIBERATELY_DEFAULTED_FIELDS.contains(&field.as_str()) {
+                serde_json::from_value::<GraphSnapshot>(missing).unwrap_or_else(|error| {
+                    panic!(
+                        "{field} is documented as defaulted and must decode when absent: {error}"
+                    )
+                });
+                continue;
+            }
+
             let error = serde_json::from_value::<GraphSnapshot>(missing).unwrap_err();
             assert!(
                 error.to_string().contains(&field),
                 "missing {field} should fail explicitly: {error}"
             );
+            required += 1;
         }
+        assert_eq!(
+            required,
+            GRAPH_SNAPSHOT_FIELD_COUNT - DELIBERATELY_DEFAULTED_FIELDS.len(),
+            "every field except the documented exemptions must be required, and the count is \
+             asserted so a field that stops being checked cannot pass as one that was exempt"
+        );
     }
 
     #[test]
@@ -3306,5 +3584,305 @@ mod tests {
         let mut data = vec![0u8; 64];
         data[0..4].copy_from_slice(b"XXXX");
         assert!(GraphSnapshot::from_bytes(&data).is_err());
+    }
+
+    // ---- the materialized graph section -----------------------------------
+
+    fn a_change_id(byte: u8) -> SemanticChangeId {
+        SemanticChangeId::from_hash(Hash256::from_bytes([byte; 32]))
+    }
+
+    /// A section resolving at `resolved_at` and carrying one named entity.
+    ///
+    /// The entity is not decoration. A section of empty maps round-trips
+    /// through a decoder that drops every domain, so the codec tests below
+    /// would pass on a reader that returned `ResolvedGraphState::default()`.
+    fn a_section(resolved_at: SemanticChangeId, entity_name: &str) -> MaterializedGraphSection {
+        let entity = test_entity(entity_name);
+        let mut state = ResolvedGraphState::default();
+        state.entities.insert(entity.id, entity);
+        MaterializedGraphSection {
+            schema_version: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+            resolved_at,
+            state,
+        }
+    }
+
+    fn only_entity_name(section: &MaterializedGraphSection) -> &str {
+        let mut names: Vec<&str> = section
+            .state
+            .entities
+            .values()
+            .map(|entity| entity.name.as_str())
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names.len(), 1, "the fixture carries exactly one entity");
+        names[0]
+    }
+
+    /// The exact bytes a v13 writer produced for `snapshot`.
+    ///
+    /// Built by editing the real encoding rather than by mirroring the v13
+    /// field list in a second struct. A second copy of a field list is only
+    /// ever wrong in a way that looks like a passing run, and the difference
+    /// between the two formats is precisely one array element, so that is the
+    /// one edit made here: the header loses a field and the trailing nil the
+    /// appended field encoded as goes with it. Every step asserts what it
+    /// found before changing it.
+    fn v13_frame(mut snapshot: GraphSnapshot) -> Vec<u8> {
+        assert!(
+            snapshot.materialized_graph.is_none(),
+            "a v13 body has no section, so there is none to drop"
+        );
+        snapshot.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
+        let mut body = rmp_serde::to_vec(&snapshot).expect("a snapshot serializes");
+        assert_eq!(
+            encoded_field_count(&body),
+            GRAPH_SNAPSHOT_FIELD_COUNT,
+            "the current encoding is what this edits down from"
+        );
+        assert_eq!(
+            body[0], 0xdc,
+            "both widths use the array16 header, so only its count changes"
+        );
+        assert_eq!(
+            body.pop(),
+            Some(0xc0),
+            "the appended field is absent and encodes as nil"
+        );
+        let v13 = u16::try_from(GRAPH_SNAPSHOT_V13_FIELD_COUNT).expect("a width fits u16");
+        body[1..3].copy_from_slice(&v13.to_be_bytes());
+        assert_eq!(encoded_field_count(&body), GRAPH_SNAPSHOT_V13_FIELD_COUNT);
+
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&GraphSnapshot::MAGIC);
+        frame.extend_from_slice(&GraphSnapshot::MIN_SUPPORTED_VERSION.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&body);
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        frame.extend_from_slice(&checksum);
+        frame
+    }
+
+    #[test]
+    fn a_v13_store_still_opens_and_carries_no_section() {
+        // The compatibility row that matters most: every store any shipped
+        // version wrote must still open. Its section reads absent, which is
+        // what routes it to replay.
+        let bytes = v13_frame(GraphSnapshot::empty());
+
+        let snapshot = GraphSnapshot::from_bytes(&bytes).expect("a v13 body still decodes");
+        assert!(
+            snapshot.materialized_graph.is_none(),
+            "a v13 body has no section and must not invent one"
+        );
+        assert_eq!(
+            snapshot.version,
+            GraphSnapshot::CURRENT_VERSION,
+            "an older body decodes into the current in-memory shape and says so, or the very \
+             next to_bytes refuses its own decoded object"
+        );
+
+        // The negative control for the width edit above: without it, this
+        // whole test would be reading a v14 body and proving nothing about v13.
+        let current = GraphSnapshot::empty().to_bytes().expect("serializes");
+        assert_eq!(
+            encoded_field_count(&current[16..]),
+            GRAPH_SNAPSHOT_FIELD_COUNT
+        );
+    }
+
+    #[test]
+    fn the_envelope_decode_reads_a_v13_body_too() {
+        // The partial decoder keys on width, so it needs both widths named or
+        // it refuses every store written before this change.
+        let bytes = v13_frame(GraphSnapshot::empty());
+        let envelope =
+            AuthorityEnvelopeSnapshot::from_bytes(&bytes).expect("the envelope decodes a v13 body");
+        assert!(envelope.materialized_graph.is_none());
+    }
+
+    #[test]
+    fn the_envelope_decode_reads_the_same_section_the_full_decode_reads() {
+        // The section sits one element past the envelope, so this pins
+        // MATERIALIZED_GRAPH_FIELD_INDEX to the struct the same way the
+        // envelope test above pins the authority index. Pointed one field
+        // earlier it would parse `external_references`, a map, as a struct.
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.materialized_graph = Some(a_section(a_change_id(0x11), "served"));
+        let bytes = snapshot
+            .to_bytes_pre_validated()
+            .expect("a snapshot with a section serializes");
+
+        let envelope = AuthorityEnvelopeSnapshot::from_bytes(&bytes).expect("the envelope decodes");
+        let from_envelope = envelope
+            .materialized_graph
+            .as_ref()
+            .expect("the envelope reads the section");
+        let full = GraphSnapshot::from_bytes(&bytes).expect("the full decode accepts these bytes");
+        let from_full = full
+            .materialized_graph
+            .as_ref()
+            .expect("the full decode reads the section");
+
+        assert_eq!(from_envelope.resolved_at, from_full.resolved_at);
+        assert_eq!(only_entity_name(from_envelope), only_entity_name(from_full));
+        assert_eq!(only_entity_name(from_envelope), "served");
+    }
+
+    #[test]
+    fn a_section_answers_only_for_the_change_it_resolves_at() {
+        // The whole binding. A change id is a Merkle hash over its own deltas
+        // and its parents, so matching it matches the content; NOT matching it
+        // must refuse, or the section answers one workspace's graph to another
+        // workspace at a different head.
+        let section = a_section(a_change_id(0x11), "served");
+        assert!(section.validate_for(&a_change_id(0x11)).is_ok());
+        assert_eq!(
+            section.validate_for(&a_change_id(0x22)),
+            Err(MaterializedGraphRefusal::Target),
+            "a section must refuse a change it is not the resolution at"
+        );
+    }
+
+    #[test]
+    fn a_section_of_an_unknown_schema_is_refused_by_schema() {
+        // Separated from the target arm because the two can hide each other:
+        // a test that only ever varies the target would pass against a
+        // validator that dropped the schema check entirely.
+        let mut section = a_section(a_change_id(0x11), "served");
+        section.schema_version = MATERIALIZED_GRAPH_SCHEMA_VERSION + 1;
+        assert_eq!(
+            section.validate_for(&a_change_id(0x11)),
+            Err(MaterializedGraphRefusal::Schema {
+                held: MATERIALIZED_GRAPH_SCHEMA_VERSION,
+                found: MATERIALIZED_GRAPH_SCHEMA_VERSION + 1,
+            }),
+            "an unknown schema must refuse by name, not fall through to the target check"
+        );
+    }
+
+    #[test]
+    fn an_envelope_with_no_section_refuses_as_absent() {
+        // The ordinary case, and it must be distinguishable from the two
+        // refusals above so a log can tell an old store from a stale section.
+        let snapshot = GraphSnapshot::empty();
+        let bytes = snapshot.to_bytes_pre_validated().expect("serializes");
+        let envelope = AuthorityEnvelopeSnapshot::from_bytes(&bytes).expect("the envelope decodes");
+        assert_eq!(
+            envelope
+                .materialized_graph_for(&a_change_id(0x11))
+                .expect_err("no section means a refusal"),
+            MaterializedGraphRefusal::Absent
+        );
+    }
+
+    #[test]
+    fn a_section_does_not_weaken_tamper_detection() {
+        // The asymmetry the design rests on: a stale section falls back, but
+        // bytes that are not what the writer wrote still refuse the whole
+        // snapshot. Flip one byte INSIDE the section and the frame checksum
+        // must catch it, with an untampered decode as the control.
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.materialized_graph = Some(a_section(a_change_id(0x11), "served"));
+        let bytes = snapshot.to_bytes_pre_validated().expect("serializes");
+        assert!(
+            GraphSnapshot::from_bytes(&bytes).is_ok(),
+            "the control must decode, or the tampered arm proves nothing"
+        );
+
+        // The section is the last thing in the body, and the body ends 32 bytes
+        // before the frame does.
+        let mut tampered = bytes.clone();
+        let last_body_byte = tampered.len() - GraphSnapshot::CHECKSUM_LEN - 1;
+        tampered[last_body_byte] ^= 0xff;
+        let error = GraphSnapshot::from_bytes(&tampered)
+            .expect_err("a tampered body must refuse")
+            .to_string();
+        assert!(
+            error.contains("checksum mismatch"),
+            "the frame checksum must be what refuses, got: {error}"
+        );
+    }
+
+    #[test]
+    fn a_body_whose_version_contradicts_its_frame_is_refused() {
+        // With one supported version this could not arise. With two it can,
+        // and a decoder that dispatches on the header while trusting the body
+        // is a check that cannot fail.
+        let mut snapshot = GraphSnapshot::empty();
+        snapshot.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
+        let body = rmp_serde::to_vec(&snapshot).expect("serializes");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&GraphSnapshot::MAGIC);
+        // The header says v14 while the body says v13.
+        frame.extend_from_slice(&GraphSnapshot::CURRENT_VERSION.to_le_bytes());
+        frame.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        frame.extend_from_slice(&body);
+        let checksum: [u8; 32] = Sha256::digest(&body).into();
+        frame.extend_from_slice(&checksum);
+
+        let error = GraphSnapshot::from_bytes(&frame)
+            .expect_err("a contradicting version must refuse")
+            .to_string();
+        assert!(
+            error.contains("header declares v14 but its body declares v13"),
+            "the refusal must name both versions, got: {error}"
+        );
+    }
+
+    #[test]
+    fn every_decoder_accepts_a_v13_body() {
+        // Five decode entry points share one frame reader, and on this change
+        // four of them were left keyed on CURRENT_VERSION alone while one was
+        // fixed. Counting `unreachable!` arms would not have caught that; each
+        // decoder has to be asked with the input only a two-version reader can
+        // answer. A v13 body is exactly that input.
+        let bytes = v13_frame(GraphSnapshot::empty());
+
+        GraphSnapshot::from_bytes(&bytes).expect("the full decode accepts a v13 body");
+        GraphSnapshot::from_bytes_reusing_exact_validation(&bytes)
+            .expect("the validation-reusing decode accepts a v13 body");
+        GraphSnapshot::prove_pre_validated_round_trip(&bytes)
+            .expect("the round-trip proof accepts a v13 body");
+        AuthorityEnvelopeSnapshot::from_bytes(&bytes)
+            .expect("the envelope decode accepts a v13 body");
+        LocateGraphSnapshot::from_bytes_with_persisted_root_hash(&bytes)
+            .expect("the locate decode accepts a v13 body");
+
+        // The control. A version outside the supported range must still be
+        // refused by every one of them, or "accepts a v13 body" would be
+        // satisfied by a reader that accepts anything.
+        let mut too_old = bytes.clone();
+        too_old[4..8].copy_from_slice(&12u32.to_le_bytes());
+        assert!(GraphSnapshot::from_bytes(&too_old).is_err());
+        assert!(AuthorityEnvelopeSnapshot::from_bytes(&too_old).is_err());
+    }
+
+    #[test]
+    fn the_section_index_and_both_widths_match_the_encoded_snapshot() {
+        // The arity tripwire, extended. A field appended after the section
+        // moves it, and this fails on the count before anyone debugs a decode
+        // error. The v13 width is asserted as a relation to the current one so
+        // it cannot drift into naming a width that never existed.
+        let snapshot = GraphSnapshot::empty();
+        let body = rmp_serde::to_vec(&snapshot).expect("empty snapshot serializes");
+        assert_eq!(encoded_field_count(&body), GRAPH_SNAPSHOT_FIELD_COUNT);
+        assert_eq!(
+            MATERIALIZED_GRAPH_FIELD_INDEX,
+            GRAPH_SNAPSHOT_FIELD_COUNT - 1,
+            "the section is the last element of the current body"
+        );
+        assert_eq!(
+            GRAPH_SNAPSHOT_V13_FIELD_COUNT,
+            GRAPH_SNAPSHOT_FIELD_COUNT - 1,
+            "v14 appends exactly one element to v13"
+        );
+        assert_eq!(
+            GraphSnapshot::MIN_SUPPORTED_VERSION + 1,
+            GraphSnapshot::CURRENT_VERSION,
+            "the two supported versions are adjacent, which is what makes one \
+             decoder with one defaulted field enough"
+        );
     }
 }
