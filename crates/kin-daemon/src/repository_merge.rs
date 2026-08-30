@@ -2584,7 +2584,7 @@ mod tests {
         let (subject, label) = match kind {
             "path" => (
                 MergeConflictSubject::Path {
-                    path: RepoPath::from_utf8(&format!("docs/note{index}.md")).unwrap(),
+                    path: RepoPath::from_utf8(format!("docs/note{index}.md")).unwrap(),
                 },
                 Some(format!("docs/note{index}.md")),
             ),
@@ -2712,7 +2712,7 @@ mod tests {
     /// that swapped two adjacent kinds would pass any single-pair assertion.
     #[test]
     fn a_listing_orders_by_what_a_reader_can_act_on() {
-        let entries = vec![
+        let entries = [
             entry_of("relation", 0),
             entry_of("entity", 0),
             entry_of("artifact", 0),
@@ -2740,7 +2740,7 @@ mod tests {
     /// truncation assertions above.
     #[test]
     fn a_small_listing_elides_nothing_and_adds_no_tail() {
-        let entries = vec![
+        let entries = [
             entry_of("entity", 0),
             entry_of("artifact", 0),
             entry_of("relation", 0),
