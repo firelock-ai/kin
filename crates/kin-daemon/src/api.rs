@@ -612,27 +612,28 @@ fn command_repository_authority(
     Ok(authority)
 }
 
-/// Give a request the retained workspace tree, when it still describes storage.
+/// The retained workspace tree, when it still describes what storage holds.
 ///
 /// `None` means it does not, or that none was retained, and the caller keeps
 /// the request it had. Both outcomes are logged rather than silent: a fast path
 /// that quietly stopped applying reads exactly like one that is working, and
 /// the cost of that is a memory regression nobody can see. FIR-2964.
-fn attach_coverage_tree(
-    state: &DaemonState,
-    request: kin_cli::commands::repository_authority::RequestRepositoryAuthority,
-) -> Option<kin_cli::commands::repository_authority::RequestRepositoryAuthority> {
+fn retained_coverage_tree(state: &DaemonState) -> Option<Arc<kin_model::ResolvedTree>> {
     let backend = state.local_repository_backend()?;
-    let repository_id = state.local_repository_authority_binding().ok()?.repository_id().clone();
+    let repository_id = state
+        .local_repository_authority_binding()
+        .ok()?
+        .repository_id()
+        .clone();
     let published = read_local_publication_identity_or_none(&backend, &repository_id)?;
     match state.projection_authority.reuse_coverage_tree(&published) {
         Some(tree) => {
-            tracing::debug!(
+            tracing::info!(
                 repository = %repository_id,
                 workspace_artifacts = tree.len(),
                 "coverage read served from the retained workspace tree, no authority open"
             );
-            Some(request.with_workspace_tree(tree))
+            Some(tree)
         }
         None => {
             tracing::info!(
@@ -4701,8 +4702,8 @@ async fn command_graph(
     // is the whole freshness argument: the tree was read at a publication, and
     // a commit since then means it describes bytes that are no longer current,
     // so it is refused and the slow path answers.
-    let repository_authority = match attach_coverage_tree(&state, repository_authority) {
-        Some(with_tree) => with_tree,
+    let repository_authority = match retained_coverage_tree(&state) {
+        Some(tree) => repository_authority.with_workspace_tree(tree),
         None => repository_authority,
     };
     let embedding_runtime = graph_status_embedding_runtime(&state, &graph);
