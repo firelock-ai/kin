@@ -51,6 +51,38 @@ fn run_kin(
         .expect("run kin")
 }
 
+/// `kin`, with the LSP enrichment sweep off for the daemon this call spawns.
+///
+/// The Python fixture's `kin init` fails on a loaded host, and the product's own
+/// record names both the cause and the remedy: "The daemon for this store was
+/// killed ... start a daemon yourself with the enrichment sweep off
+/// (`KIN_DAEMON_DISABLE_LSP=1 kin graph status`)". `kin init` then exits
+/// `EXIT_ENRICHMENT_UNATTESTED`, which is 7, so every assertion after it reads
+/// as a merge failure. Measured on this suite: six of six runs of the Python
+/// fixture hit it while the Rust fixtures hit it zero times, because Rust has no
+/// language server installed here to sweep with.
+///
+/// Turning the sweep off is not papering over that. This test asserts entity
+/// values, artifact bytes and tree deltas, and enrichment contributes none of
+/// them: it adds cross-file reference and import EDGES, which nothing here
+/// reads. A daemon captures the lever at process start from the command that
+/// spawns it, so it goes on the call that starts the daemon.
+fn run_kin_without_enrichment(
+    runtime: &common::IsolatedDaemonRuntime,
+    repo: &Path,
+    args: &[&str],
+) -> std::process::Output {
+    runtime
+        .kin_command()
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("KIN_DAEMON_BIN", runtime.daemon_bin())
+        .env("KIN_DAEMON_DISABLE_LSP", "1")
+        .current_dir(repo)
+        .output()
+        .expect("run kin")
+}
+
 fn ok(output: &std::process::Output, what: &str) -> String {
     assert!(
         output.status.success(),
@@ -141,6 +173,24 @@ fn change_parents(
         .expect("read the change store")
         .expect("the published merge change exists in history");
     found.parents
+}
+
+/// How many tree deltas a published change carries against its first parent.
+///
+/// Zero is the exact signature the rc062a stranger recorded: `tree=0` means the
+/// merged tree is byte-identical to the target branch, so the source branch
+/// contributed nothing while every conflict read as settled.
+fn change_tree_delta_count(layout: &kin_core::KinLayout, change: &SemanticChangeId) -> usize {
+    let manager = open_authority(layout);
+    let lease = manager.read_authority();
+    let graph = kin_db::InMemoryGraph::from_snapshot(lease.snapshot().clone())
+        .expect("prepare graph-owned history");
+    drop(lease);
+    kin_db::ChangeStore::get_change(&graph, change)
+        .expect("read the change store")
+        .expect("the published merge change exists in history")
+        .tree_deltas
+        .len()
 }
 
 fn conflicts_report(runtime: &common::IsolatedDaemonRuntime, repo: &Path) -> Value {
@@ -759,4 +809,405 @@ fn a_contested_path_listing_names_its_claimants() {
         !listing.contains("ArtifactId("),
         "the listing carries identities in the form the resolver accepts: {listing}"
     );
+}
+
+/// One file whose two entities both conflict, because editing the first to a
+/// different length on each branch moves the second's span on each branch too.
+///
+/// That shape is the whole difficulty. `mate` is semantically identical on both
+/// sides and still conflicts, so a bulk settle records a decision about it that
+/// only its byte offsets distinguish. The two bodies must stay different
+/// lengths or `mate` never conflicts and the fixture stops being the case.
+fn shifting_span_repository(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    run_git(&repo, &["init", "--initial-branch=main"]);
+    run_git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Kin"]);
+    fs::write(repo.join("shared.txt"), b"shared bytes\n").expect("write shared file");
+    fs::create_dir_all(repo.join("src")).expect("create source directory");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn base() {}\npub fn mate() {}\n",
+    )
+    .expect("write base source");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "base"]);
+
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(repo.join("shared.txt"), b"feature shared\n").expect("edit shared on feature");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn base(v: i32) {}\npub fn mate() {}\n",
+    )
+    .expect("edit source on feature");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature work"]);
+
+    run_git(&repo, &["switch", "main"]);
+    fs::write(repo.join("shared.txt"), b"main shared\n").expect("edit shared on main");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn base(count: u64) {}\npub fn mate() {}\n",
+    )
+    .expect("edit source on main");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main work"]);
+    repo
+}
+
+/// One file whose two entities BOTH change semantically on both branches, so
+/// settling them to opposite sides leaves no side carrying both decisions and
+/// no committed body to publish.
+fn opposed_entities_repository(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    run_git(&repo, &["init", "--initial-branch=main"]);
+    run_git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Kin"]);
+    fs::create_dir_all(repo.join("src")).expect("create source directory");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha() {}\npub fn beta() {}\n",
+    )
+    .expect("write base source");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "base"]);
+
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha(v: i32) {}\npub fn beta(v: i32) {}\n",
+    )
+    .expect("edit source on feature");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature work"]);
+
+    run_git(&repo, &["switch", "main"]);
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha(count: u64) {}\npub fn beta(count: u64) {}\n",
+    )
+    .expect("edit source on main");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main work"]);
+    repo
+}
+
+/// The identity of the one parked entity conflict named `name`, in the form
+/// `kin resolve` accepts back. Asserting there is exactly one keeps a fixture
+/// that grew a second entity of that name from settling the wrong conflict.
+fn entity_conflict(report: &Value, name: &str) -> String {
+    let prefix = format!("{name} in ");
+    let mut found: Vec<String> = report["record"]["entries"]
+        .as_array()
+        .expect("a parked merge lists its entries")
+        .iter()
+        .filter(|entry| entry["subject"]["subject"] == "entity")
+        .filter(|entry| {
+            entry["label"]
+                .as_str()
+                .is_some_and(|label| label.starts_with(&prefix))
+        })
+        .map(|entry| {
+            entry["subject"]["entity"]
+                .as_str()
+                .expect("an entity conflict names its identity")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one parked conflict names entity {name}: {report}"
+    );
+    found.pop().expect("checked immediately above")
+}
+
+/// The graph a published change resolves to, read from authority on disk.
+fn graph_at(
+    layout: &kin_core::KinLayout,
+    change: &SemanticChangeId,
+) -> kin_model::graph::ResolvedGraphState {
+    let manager = open_authority(layout);
+    let lease = manager.read_authority();
+    let mut snapshot = lease.snapshot().clone();
+    snapshot.repository_authority = None;
+    drop(lease);
+    let graph =
+        kin_db::InMemoryGraph::from_snapshot(snapshot).expect("prepare graph-owned history");
+    kin_db::ChangeStore::resolve_graph_at(&graph, change)
+        .expect("resolve the exact graph a change publishes")
+}
+
+/// The one span graph truth records for the entity named `name`, as the byte
+/// range it claims inside its file.
+fn entity_span(state: &kin_model::graph::ResolvedGraphState, name: &str) -> (String, usize, usize) {
+    let mut found: Vec<(String, usize, usize)> = state
+        .entities
+        .values()
+        .filter(|entity| entity.name == name)
+        .filter_map(|entity| {
+            entity
+                .span
+                .as_ref()
+                .map(|span| (span.file.to_string(), span.start_byte, span.end_byte))
+        })
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "exactly one entity named {name} carries a span in the merged graph"
+    );
+    found.pop().expect("checked immediately above")
+}
+
+/// FIR-2958. A bulk artifact settle must not override the entity decision
+/// already recorded inside that artifact.
+///
+/// Before the precedence rule, `--theirs` on one entity followed by `--all-ours`
+/// reported both settled and every conflict resolved, published the `ours`
+/// bytes, and recorded a merge whose tree delta against the first parent was
+/// empty. The source branch contributed nothing while every conflict read as
+/// settled, and nothing warned.
+#[test]
+fn a_bulk_artifact_settle_does_not_override_a_named_entity_settle() {
+    let root = tempdir().expect("temp root");
+    let repo = shifting_span_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+
+    // The specific decision: this one entity takes the source branch's value.
+    let parked = conflicts_report(&runtime, &repo);
+    let base = entity_conflict(&parked, "base");
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--theirs", &base]),
+        "settle the entity to the source branch",
+    );
+    // The bulk decision, which covers the artifact holding that entity and the
+    // sibling entity whose span the first edit moved.
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--all-ours"]),
+        "settle the rest to the active branch",
+    );
+    let stdout = ok(
+        &run_kin(&runtime, &repo, &["resolve", "--continue", "--json"]),
+        "kin resolve --continue",
+    );
+    let report: Value = serde_json::from_str(&stdout).expect("resolve report is JSON");
+    let merge_change: SemanticChangeId =
+        serde_json::from_value(report["merge_change"].clone()).expect("a published merge change");
+
+    // The entity decision reached the file: specific beats bulk.
+    let published = fs::read(repo.join("src/lib.rs")).expect("the merged source is on disk");
+    assert_eq!(
+        published, b"pub fn base(v: i32) {}\npub fn mate() {}\n",
+        "the entity settled --theirs decides the bytes of the artifact holding it"
+    );
+    // The bulk decision still owns every artifact no entity decision covers.
+    assert_eq!(
+        fs::read(repo.join("shared.txt")).unwrap(),
+        b"main shared\n",
+        "--all-ours still settles the artifacts no entity decision contradicts"
+    );
+
+    let state = graph_at(&layout, &merge_change);
+    // Graph truth and the published bytes describe the same file. `mate` was
+    // settled --ours and its span on that side points four bytes past where it
+    // sits in the bytes this merge published, so a projection that moved the
+    // artifact and left the entity spans behind fails right here.
+    let (file, start, end) = entity_span(&state, "mate");
+    assert!(
+        file.ends_with("lib.rs"),
+        "the merged `mate` still names its own file: {file}"
+    );
+    assert_eq!(
+        published.get(start..end).map(String::from_utf8_lossy),
+        Some(std::borrow::Cow::Borrowed("pub fn mate() {}")),
+        "the span graph truth records for `mate`, {start}..{end}, must select `mate` inside the \
+         {} bytes kin published",
+        published.len()
+    );
+}
+
+/// A Python module, so the file's own module entity is in the conflict set.
+///
+/// This is the shape the rc062a stranger actually hit and the one a Rust fixture
+/// does NOT produce. A `.py` file yields a Module entity spanning the whole
+/// file, whose behaviour hash is the whole file's text, so a bulk settle records
+/// a decision about the WHOLE FILE beside the decision about one function inside
+/// it. `alpha` is edited to a different length on each branch so `beta`'s span
+/// moves on each branch too, and the module entity conflicts on all three sides.
+fn container_settle_repository(root: &Path) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    run_git(&repo, &["init", "--initial-branch=main"]);
+    run_git(&repo, &["config", "user.email", "kin@example.invalid"]);
+    run_git(&repo, &["config", "user.name", "Kin"]);
+    fs::create_dir_all(repo.join("ledger")).expect("create package directory");
+    fs::write(
+        repo.join("ledger/report.py"),
+        b"ENTRIES = [1, 2]\n\n\ndef alpha(rows):\n    return len(rows)\n\n\ndef beta(x):\n    return x + 1\n",
+    )
+    .expect("write base source");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "base"]);
+
+    run_git(&repo, &["switch", "-c", "feature"]);
+    fs::write(
+        repo.join("ledger/report.py"),
+        b"ENTRIES = [1, 2]\n\n\ndef alpha(rows):\n    return len(rows) - 7\n\n\ndef beta(x):\n    return x + 1\n",
+    )
+    .expect("edit source on feature");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "feature work"]);
+
+    run_git(&repo, &["switch", "main"]);
+    fs::write(
+        repo.join("ledger/report.py"),
+        b"ENTRIES = [1, 2]\n\n\ndef alpha(rows):\n    return len(rows) + 1000000\n\n\ndef beta(x):\n    return x + 1\n",
+    )
+    .expect("edit source on main");
+    run_git(&repo, &["add", "--all"]);
+    run_git(&repo, &["commit", "-m", "main work"]);
+    repo
+}
+
+/// A settlement naming a CONTAINER must not override one naming something
+/// inside it, which is the same precedence rule one level down from the artifact.
+///
+/// The file's module entity spans the whole file, so `--all-ours` records a
+/// decision about the whole file beside the `--theirs` on one function inside
+/// it. Judged as a peer of that function, no side carries both and the merge
+/// refuses, which is the wrong answer: this is exactly the case the founder's
+/// ruling says must project. The first version of the rule refused it, and its
+/// own refusal named the module entity as the reason.
+///
+/// A Rust fixture cannot see this. `src/lib.rs` produces no conflicting module
+/// entity, so the container half of the rule survived every mutation of it until
+/// this test existed. That is what the falsification grid found: M5, which
+/// disables the container split, was green all the way across.
+#[test]
+fn a_container_settle_does_not_override_a_settle_inside_it() {
+    let root = tempdir().expect("temp root");
+    let repo = container_settle_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    // This one call starts the daemon, so it is where the lever belongs.
+    let init = run_kin_without_enrichment(&runtime, &repo, &["init", ".", "--json"]);
+    ok(&init, "kin init");
+    let layout = kin_core::KinLayout::discover(&repo).expect("discover exact layout");
+
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    let parked = conflicts_report(&runtime, &repo);
+    let alpha = entity_conflict(&parked, "alpha");
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--theirs", &alpha]),
+        "settle the function to the source branch",
+    );
+    // Settles beta, ENTRIES, the module entity for the whole file, and the
+    // artifact, all to the active branch.
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--all-ours"]),
+        "settle the rest to the active branch, including the module entity",
+    );
+    // The refusal this test exists for happens here: a build that treats the
+    // module entity as a peer of the function inside it cannot publish at all.
+    let published = ok(
+        &run_kin(&runtime, &repo, &["resolve", "--continue"]),
+        "kin resolve --continue",
+    );
+
+    assert_eq!(
+        fs::read(repo.join("ledger/report.py")).expect("the merged source is on disk"),
+        b"ENTRIES = [1, 2]\n\n\ndef alpha(rows):\n    return len(rows) - 7\n\n\ndef beta(x):\n    return x + 1\n",
+        "the function settled --theirs decides the bytes, and the module settled --ours follows it"
+    );
+    // And the merge says so, which is the half that makes it not silent. A build
+    // that projected correctly and said nothing would pass the assertion above.
+    assert!(
+        published.contains("Projected") && published.contains("container"),
+        "the merge names the projection and why the bulk settlement followed it: {published}"
+    );
+    // The source branch contributed bytes, which an empty tree delta would deny.
+    let merge_change = branch_change(&layout, "main");
+    assert_ne!(
+        change_tree_delta_count(&layout, &merge_change),
+        0,
+        "the published merge carries the bytes the entity decision chose"
+    );
+}
+
+/// Two entities in one file whose values both moved on both branches, settled
+/// to opposite sides, have no publishable projection: neither branch's
+/// committed bytes carry both decisions, and kin has no textual line merge to
+/// build a third body from. The merge refuses and names both decisions rather
+/// than honouring one of them in silence.
+#[test]
+fn contradictory_settlements_inside_one_artifact_refuse_and_name_both() {
+    let root = tempdir().expect("temp root");
+    let repo = opposed_entities_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+
+    let main_before = branch_change(&layout, "main");
+    ok(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+
+    let parked = conflicts_report(&runtime, &repo);
+    let alpha = entity_conflict(&parked, "alpha");
+    let beta = entity_conflict(&parked, "beta");
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--theirs", &alpha]),
+        "settle alpha to the source branch",
+    );
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--ours", &beta]),
+        "settle beta to the active branch",
+    );
+    ok(
+        &run_kin(&runtime, &repo, &["resolve", "--all-ours"]),
+        "settle the artifact in bulk",
+    );
+
+    let refused = run_kin(&runtime, &repo, &["resolve", "--continue"]);
+    assert!(
+        !refused.status.success(),
+        "an unprojectable mix does not publish: stdout={}",
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stderr),
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    // Both decisions, by name, and the file they disagree about.
+    assert!(
+        said.contains("src/lib.rs"),
+        "the refusal names the file: {said}"
+    );
+    assert!(
+        said.contains("alpha") && said.contains("beta"),
+        "the refusal names both entity decisions: {said}"
+    );
+    assert!(
+        said.contains("--theirs") && said.contains("--ours"),
+        "the refusal names the side each decision took: {said}"
+    );
+
+    // Nothing published, and the resolutions are still there to re-settle.
+    assert_eq!(branch_change(&layout, "main"), main_before);
+    assert!(persisted_record(&layout)
+        .expect("the merge is still parked")
+        .state
+        .is_in_progress());
 }

@@ -894,6 +894,20 @@ pub(crate) fn publish_resolved_merge(
         )?;
     }
 
+    // Two settlements can cover one file, and only one of them becomes bytes.
+    // This is the rule that decides which, and refuses when neither composes.
+    let projections = project_artifacts_from_settled_entities(
+        &record,
+        &base_state,
+        &ours_state,
+        &theirs_state,
+        &base_artifacts,
+        &ours_artifacts,
+        &theirs_artifacts,
+        &mut merged_entities,
+        &mut merged_artifacts,
+    )?;
+
     // The resolutions are the caller's, so a composition they leave broken is
     // named rather than parked again: the record already holds one settlement
     // per conflict, and re-opening would discard it.
@@ -1115,16 +1129,20 @@ pub(crate) fn publish_resolved_merge(
     Ok(MergeExecution {
         response: MergeResponse::default(),
         resolve_response: Some(kin_cli::commands::resolve::ResolveResponse {
-            lines: vec![format!(
-                "Merged {} into {} as change {} after settling {} conflict(s) ({} projected \
-                 entries, authority generation {})",
-                record.binding.source_ref,
-                record.binding.target_ref,
-                change.id,
-                resolved_count,
-                materialized,
-                receipt.generation
-            )],
+            lines: {
+                let mut lines = vec![format!(
+                    "Merged {} into {} as change {} after settling {} conflict(s) ({} projected \
+                     entries, authority generation {})",
+                    record.binding.source_ref,
+                    record.binding.target_ref,
+                    change.id,
+                    resolved_count,
+                    materialized,
+                    receipt.generation
+                )];
+                lines.extend(projections);
+                lines
+            },
             mutated: matches!(receipt.outcome, RepositoryCommitOutcome::Committed),
             report: Some(report),
             operation_id: Some(receipt.operation_id),
@@ -1210,11 +1228,8 @@ fn apply_resolution(
             };
         }
         (MergeConflictSubject::Artifact { artifact }, MergeEntryResolution::Side { side, .. }) => {
-            let side_artifacts = match side {
-                MergeSide::Base => base_artifacts,
-                MergeSide::Ours => ours_artifacts,
-                MergeSide::Theirs => theirs_artifacts,
-            };
+            let side_artifacts =
+                artifact_side(*side, base_artifacts, ours_artifacts, theirs_artifacts);
             let value = side_artifacts.get(artifact);
             require_recorded_side(entry, side, MergeSideValue::artifact(value)?)?;
             match value {
@@ -1310,6 +1325,385 @@ fn require_recorded_side(
         )));
     }
     Ok(())
+}
+
+/// An entity settlement, paired with the file paths that entity occupies on the
+/// sides this merge composed. The path is what joins an entity decision to the
+/// artifact decision that would otherwise overwrite it.
+struct SettledEntity<'a> {
+    entry: &'a MergeConflictEntry,
+    entity: kin_model::EntityId,
+    side: MergeSide,
+    paths: BTreeSet<String>,
+}
+
+/// The one precedence rule for two settlements that cover one file:
+/// **entity beats artifact, specific beats bulk.**
+///
+/// A file's bytes are a projection of graph truth, so settling one entity is a
+/// decision about that entity, and settling the artifact holding it is a
+/// decision about the whole file. Those land in two independent maps, and only
+/// the artifact map becomes file bytes. Before this rule both were honoured
+/// separately: a named `--theirs` on an entity followed by a bulk `--all-ours`
+/// reported every conflict settled, published the `ours` bytes, and recorded a
+/// merge whose tree delta against the first parent was empty. The source branch
+/// contributed nothing, and nothing said so.
+///
+/// The rule takes the file, and the entities settled inside it, from whichever
+/// side carries every one of those entity decisions. Nothing is synthesized:
+/// the candidates are the sides this merge already bound, so what publishes is
+/// a side's own committed blob, held to history by the same
+/// `require_recorded_side` check the settled side got. That matters because a
+/// kin merge composes at the granularity of a whole entity or artifact and
+/// never the line, so a choice among recorded sides is one kin can make
+/// honestly and a spliced third body is not.
+///
+/// Where no single side carries every decision, the settlements do not compose
+/// into any publishable file and the merge REFUSES, naming both decisions.
+/// Refusing is the fallback. Publishing one of two contradictory decisions in
+/// silence is the defect this rule exists to remove.
+///
+/// Founder ruling, 2026-08-30: entity beats artifact, a bulk artifact settle
+/// never overrides a recorded entity decision inside it, unprojectable mixes
+/// refuse naming both decisions, never silent.
+fn project_artifacts_from_settled_entities(
+    record: &MergeTransactionRecord,
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+    base_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    ours_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    theirs_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    merged_entities: &mut std::collections::HashMap<kin_model::EntityId, kin_model::Entity>,
+    merged_artifacts: &mut std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+) -> Result<Vec<String>> {
+    let settled_entities = settled_entities_by_path(record, base_state, ours_state, theirs_state);
+    if settled_entities.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut projections = Vec::new();
+    for entry in &record.entries {
+        let (MergeConflictSubject::Artifact { artifact }, MergeEntryResolution::Side { side, .. }) =
+            (&entry.subject, &entry.resolution)
+        else {
+            continue;
+        };
+        let Some(path) = artifact_path(artifact, base_artifacts, ours_artifacts, theirs_artifacts)
+        else {
+            continue;
+        };
+        let inside: Vec<&SettledEntity<'_>> = settled_entities
+            .iter()
+            .filter(|settled| settled.paths.contains(&path))
+            .collect();
+        if inside.is_empty() {
+            continue;
+        }
+        let (specific, bulk) =
+            split_specific_from_bulk(&inside, base_state, ours_state, theirs_state);
+        if specific.is_empty() {
+            continue;
+        }
+        if decisions_a_side_drops(*side, &specific, base_state, ours_state, theirs_state).is_empty()
+        {
+            continue;
+        }
+
+        let mut carried: Vec<(MergeSide, Option<&ResolvedArtifact>)> = Vec::new();
+        for candidate in [MergeSide::Ours, MergeSide::Theirs, MergeSide::Base] {
+            if !decisions_a_side_drops(candidate, &specific, base_state, ours_state, theirs_state)
+                .is_empty()
+            {
+                continue;
+            }
+            let value = artifact_side(candidate, base_artifacts, ours_artifacts, theirs_artifacts)
+                .get(artifact);
+            // Sides holding byte-identical artifacts are one choice, not
+            // several, so a base that never moved cannot make a projection
+            // ambiguous merely by existing.
+            let mut seen = false;
+            for (_, kept) in &carried {
+                if MergeSideValue::artifact(*kept)? == MergeSideValue::artifact(value)? {
+                    seen = true;
+                    break;
+                }
+            }
+            if !seen {
+                carried.push((candidate, value));
+            }
+        }
+
+        if carried.len() != 1 {
+            let decisions = name_decisions(&specific);
+            let why = if carried.is_empty() {
+                format!(
+                    "no side of {path} carries every one of those entity decisions, and a kin \
+                     merge composes at the granularity of a whole entity or artifact and never \
+                     the line, so there is no third body to publish"
+                )
+            } else {
+                format!(
+                    "{} sides of {path} carry every one of those entity decisions and their \
+                     bytes differ, so which body to publish is not determined by what was \
+                     settled",
+                    carried.len()
+                )
+            };
+            return Err(merge_conflict(format!(
+                "the recorded resolutions disagree about {path}: {} was settled `{}`, while \
+                 inside it {decisions}. {why}. Settle {path} to the side that carries those \
+                 entity decisions, or re-settle the entities, then continue.",
+                render_subject(entry),
+                side_flag(*side),
+            )));
+        }
+
+        let (projected, value) = carried[0];
+        // The projected side is held to history exactly as the settled one was:
+        // the value that side carries now must be the value the record bound.
+        require_recorded_side(entry, &projected, MergeSideValue::artifact(value)?)?;
+        match value {
+            Some(value) => merged_artifacts.insert(*artifact, value.clone()),
+            None => merged_artifacts.remove(artifact),
+        };
+        // The file and the entities settled inside it come from one side, so
+        // the spans graph truth records are the spans the published bytes have.
+        // Every one of these entities agrees semantically with its settlement
+        // on this side, which is what made the side a candidate at all, so no
+        // decision is lost by taking that side's copy of it.
+        for settled in &inside {
+            let taken = graph_side(&projected, base_state, ours_state, theirs_state)
+                .entities
+                .get(&settled.entity);
+            match taken {
+                Some(taken) => merged_entities.insert(settled.entity, taken.clone()),
+                None => merged_entities.remove(&settled.entity),
+            };
+        }
+        let subsumed = if bulk.is_empty() {
+            String::new()
+        } else {
+            format!(
+                ", and the {} settlement(s) covering the whole of {path} follow it, because a \
+                 settlement naming a container never overrides one naming something inside it",
+                bulk.len()
+            )
+        };
+        projections.push(format!(
+            "Projected {} from the `{}` side rather than the `{}` it was settled to, because {}\
+             {subsumed}; a file's bytes follow the entities settled inside it.",
+            render_subject(entry),
+            side_flag(projected),
+            side_flag(*side),
+            name_decisions(&specific),
+        ));
+    }
+    Ok(projections)
+}
+
+/// Every entity this merge settled by taking a side, with the file paths that
+/// entity occupies on the sides that were composed.
+fn settled_entities_by_path<'a>(
+    record: &'a MergeTransactionRecord,
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+) -> Vec<SettledEntity<'a>> {
+    let mut settled = Vec::new();
+    for entry in &record.entries {
+        let (MergeConflictSubject::Entity { entity }, MergeEntryResolution::Side { side, .. }) =
+            (&entry.subject, &entry.resolution)
+        else {
+            continue;
+        };
+        // An entity names its file in its span, which is the field the conflict
+        // listing labels it by. Reading every side covers an entity that moved:
+        // the decision binds wherever the identity is claimed.
+        let mut paths = BTreeSet::new();
+        for state in [base_state, ours_state, theirs_state] {
+            if let Some(found) = state.entities.get(entity) {
+                if let Some(span) = found.span.as_ref() {
+                    paths.insert(span.file.to_string());
+                }
+            }
+        }
+        if paths.is_empty() {
+            continue;
+        }
+        settled.push(SettledEntity {
+            entry,
+            entity: *entity,
+            side: *side,
+            paths,
+        });
+    }
+    settled
+}
+
+/// Which of these entity decisions one side's published state does not carry.
+fn decisions_a_side_drops<'a>(
+    side: MergeSide,
+    settled: &[&'a SettledEntity<'a>],
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+) -> Vec<&'a SettledEntity<'a>> {
+    settled
+        .iter()
+        .filter(|entity| {
+            let decided = graph_side(&entity.side, base_state, ours_state, theirs_state)
+                .entities
+                .get(&entity.entity);
+            let carried = graph_side(&side, base_state, ours_state, theirs_state)
+                .entities
+                .get(&entity.entity);
+            !entities_agree(decided, carried)
+        })
+        .copied()
+        .collect()
+}
+
+/// Whether two sides hold the same SEMANTIC value for one entity.
+///
+/// Byte offsets and the change a revision was recorded in are projection facts,
+/// not semantic ones. Editing one function moves the span of every entity below
+/// it, so a whole-value comparison would report every entity in that file as
+/// disagreeing when only one of them moved. That is the same fan-out the
+/// conflict listing already shows, twenty-two entity conflicts for one edited
+/// function, and judging agreement on it would refuse every mixed settle kin
+/// can honestly project. Agreement is judged on what the graph calls content:
+/// the fingerprint over normalized structure, signature, exact source text and
+/// behaviour class, beside the declaration facts around it.
+fn entities_agree(left: Option<&kin_model::Entity>, right: Option<&kin_model::Entity>) -> bool {
+    match (left, right) {
+        (None, None) => true,
+        (Some(left), Some(right)) => {
+            left.kind == right.kind
+                && left.name == right.name
+                && left.language == right.language
+                && left.fingerprint == right.fingerprint
+                && left.signature == right.signature
+                && left.visibility == right.visibility
+                && left.role == right.role
+        }
+        _ => false,
+    }
+}
+
+/// Split settlements at one path into the SPECIFIC ones, which constrain what
+/// the file's bytes may be, and the BULK ones, which do not.
+///
+/// A settlement naming a container is bulk relative to a settlement naming
+/// something inside it. That is the founder's rule one level down from the
+/// artifact: an artifact conflict exists beside the entities inside it only
+/// while the file is still a unit of conflict, and a file's module entity is
+/// the same shape. Settling the module `--ours` says "the whole file is ours",
+/// which is exactly the claim a `--theirs` on one function inside it overrides.
+///
+/// Containment is read from span enclosure within one side, and this is a
+/// different use of the field than the one `entities_agree` refuses. An
+/// absolute offset is a projection fact and cannot say whether two sides agree.
+/// One span enclosing another INSIDE one side is a structural fact about that
+/// side's own text, and it is the only containment the graph carries here:
+/// measured on the stranger's fixture, a commit of that file produced four
+/// entities and zero relations, so a rule keyed on a `Contains` edge could
+/// never have fired.
+fn split_specific_from_bulk<'a>(
+    inside: &[&'a SettledEntity<'a>],
+    base_state: &kin_model::graph::ResolvedGraphState,
+    ours_state: &kin_model::graph::ResolvedGraphState,
+    theirs_state: &kin_model::graph::ResolvedGraphState,
+) -> (Vec<&'a SettledEntity<'a>>, Vec<&'a SettledEntity<'a>>) {
+    let mut specific = Vec::new();
+    let mut bulk = Vec::new();
+    for outer in inside {
+        let contains_another = inside.iter().any(|inner| {
+            inner.entity != outer.entity
+                && [base_state, ours_state, theirs_state].iter().any(|state| {
+                    match (
+                        state.entities.get(&outer.entity),
+                        state.entities.get(&inner.entity),
+                    ) {
+                        (Some(outer), Some(inner)) => encloses(outer, inner),
+                        _ => false,
+                    }
+                })
+        });
+        if contains_another {
+            bulk.push(*outer);
+        } else {
+            specific.push(*outer);
+        }
+    }
+    (specific, bulk)
+}
+
+/// Whether one entity's span strictly encloses another's, in one side's own
+/// text. Equal ranges are not enclosure, so two readings of one entity never
+/// make each other bulk.
+fn encloses(outer: &kin_model::Entity, inner: &kin_model::Entity) -> bool {
+    let (Some(outer), Some(inner)) = (outer.span.as_ref(), inner.span.as_ref()) else {
+        return false;
+    };
+    outer.file == inner.file
+        && outer.start_byte <= inner.start_byte
+        && outer.end_byte >= inner.end_byte
+        && (outer.start_byte, outer.end_byte) != (inner.start_byte, inner.end_byte)
+}
+
+/// Name entity decisions the way the caller made them, so a refusal quotes the
+/// identity the listing showed and the flag that settled it.
+fn name_decisions(settled: &[&SettledEntity<'_>]) -> String {
+    settled
+        .iter()
+        .map(|entity| {
+            format!(
+                "{} was settled `{}`",
+                render_subject(entity.entry),
+                side_flag(entity.side)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The path an artifact identity occupies, preferring the branch being merged
+/// into, then the branch being merged in, then the base.
+fn artifact_path(
+    artifact: &kin_model::ArtifactId,
+    base_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    ours_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    theirs_artifacts: &std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+) -> Option<String> {
+    ours_artifacts
+        .get(artifact)
+        .or_else(|| theirs_artifacts.get(artifact))
+        .or_else(|| base_artifacts.get(artifact))
+        .map(|resolved| resolved.path.to_string())
+}
+
+fn artifact_side<'a>(
+    side: MergeSide,
+    base: &'a std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    ours: &'a std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+    theirs: &'a std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact>,
+) -> &'a std::collections::HashMap<kin_model::ArtifactId, ResolvedArtifact> {
+    match side {
+        MergeSide::Base => base,
+        MergeSide::Ours => ours,
+        MergeSide::Theirs => theirs,
+    }
+}
+
+/// The spelling of a side a caller actually types, so a refusal names the
+/// decision in the form that produced it rather than in a Rust variant name.
+fn side_flag(side: MergeSide) -> &'static str {
+    match side {
+        MergeSide::Base => "--base",
+        MergeSide::Ours => "--ours",
+        MergeSide::Theirs => "--theirs",
+    }
 }
 
 /// Compose one identity-keyed dimension of the three-way merge.
