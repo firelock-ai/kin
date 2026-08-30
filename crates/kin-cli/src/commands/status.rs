@@ -1197,7 +1197,7 @@ pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmissi
             Err(error) => {
                 return StatusAdmission::Skipped(format!(
                     "this store cannot name an author for an admission ({}), so nothing admitted                      the working copy",
-                    crate::error::cause_first(&error)
+                    crate::core::error::cause_first(&error)
                 ))
             }
         },
@@ -1218,11 +1218,11 @@ pub async fn admit_before_reading(layout: &kin_core::KinLayout) -> StatusAdmissi
         },
         crate::daemon_client::AdmitDispatch::Refused(error) => StatusAdmission::Skipped(format!(
             "this repository's daemon refused to admit the working copy ({})",
-            crate::error::cause_first(&error)
+            crate::core::error::cause_first(&error)
         )),
         crate::daemon_client::AdmitDispatch::Unanswered(error) => StatusAdmission::Skipped(format!(
             "the admission of the working copy did not answer ({}), so whether it ran is unknown",
-            crate::error::cause_first(&error)
+            crate::core::error::cause_first(&error)
         )),
     }
 }
