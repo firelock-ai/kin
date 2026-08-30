@@ -34711,6 +34711,36 @@ mod tests {
         assert_eq!(carried[0].content_hash, approved_digest);
     }
 
+    /// The daemon's generation counter and the authority's, read together with
+    /// a control proving the read itself does not move the counter.
+    ///
+    /// Reading `roots().generation` requires opening authority, and that open
+    /// could advance the counter and manufacture the equality a caller is
+    /// testing for. So the counter is read bare, then through the open, then
+    /// bare again, and the three must agree. Lane vcsreads added this control to
+    /// the probe that produced these assertions, and without it the pair is
+    /// unfalsifiable in the same way an unmeasured fixture is.
+    fn generation_pair(state: &Arc<DaemonState>) -> (u64, u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let bare = state.snapshot_generation.load(SeqCst);
+        let authority = ActiveApiRepositoryAuthority::open(state).unwrap();
+        let through_open = state.snapshot_generation.load(SeqCst);
+        let roots = authority.manager.read_authority().roots().generation;
+        drop(authority);
+        let bare_after = state.snapshot_generation.load(SeqCst);
+        assert_eq!(
+            bare, through_open,
+            "opening authority moved the daemon generation counter, so this read cannot be \
+             evidence about what a publication did to it"
+        );
+        assert_eq!(
+            through_open, bare_after,
+            "the daemon generation counter moved while authority was held open, so this read \
+             cannot be evidence about what a publication did to it"
+        );
+        (bare, roots)
+    }
+
     /// A merge published through `resolve --continue` must reach the live graph
     /// too, and this is the arm the plain-merge one below cannot cover.
     ///
@@ -34764,6 +34794,7 @@ mod tests {
             .repository_id()
             .clone();
         let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_before, roots_before) = generation_pair(&state);
 
         let post = |path: &'static str, body: Vec<u8>| {
             let app = router(Arc::clone(&state));
@@ -34884,6 +34915,36 @@ mod tests {
         );
 
         let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_after, roots_after) = generation_pair(&state);
+        // The daemon's counter moves by exactly what the authority's generation
+        // moves across a publication. Both are asserted rather than only their
+        // equality afterwards, because equal-after is consistent with two very
+        // different worlds: something advances the counter on a publish, or the
+        // counter and the roots both sat still. Only the DELTA separates them,
+        // which is the same reason a cgroup's oom_kill cannot separate a cap
+        // kill from an outside one while max and oom can.
+        //
+        // Measured by lane vcsreads before this became an assertion: counter 2
+        // to 3 and roots 2 to 3 across a merge publish. The advancing site is
+        // `finalize_local_repository_commit` calling
+        // `record_repository_authority_commit` at `state.rs:9062` under its CAS
+        // condition, reached from `repository_merge.rs:121` and
+        // `repository_rollback.rs:91`, which is one level above where a
+        // call-site count looks.
+        assert!(
+            roots_after > roots_before,
+            "the authority generation did not move across this publication, so the counter \
+             assertion below would grade a publication that did not happen"
+        );
+        assert_eq!(
+            counter_after - counter_before,
+            roots_after - roots_before,
+            "the daemon generation counter moved by {} while the authority generation moved by \
+             {}; they must move together, and a counter left behind is what makes every \
+             freshness guard reading it refuse or pass wrongly",
+            counter_after - counter_before,
+            roots_after - roots_before
+        );
         assert!(
             identity_before != identity_after,
             "the publication identity did not move across a resolved-merge publication"
@@ -34948,6 +35009,7 @@ mod tests {
             .repository_id()
             .clone();
         let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_before, roots_before) = generation_pair(&state);
         // CONTROL: two reads with no publication between must be the SAME, or
         // the comparison below cannot be evidence that a publication moved it.
         let identity_again = read_local_publication_identity(&backend, &repository_id).unwrap();
@@ -35043,6 +35105,36 @@ mod tests {
         );
 
         let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_after, roots_after) = generation_pair(&state);
+        // The daemon's counter moves by exactly what the authority's generation
+        // moves across a publication. Both are asserted rather than only their
+        // equality afterwards, because equal-after is consistent with two very
+        // different worlds: something advances the counter on a publish, or the
+        // counter and the roots both sat still. Only the DELTA separates them,
+        // which is the same reason a cgroup's oom_kill cannot separate a cap
+        // kill from an outside one while max and oom can.
+        //
+        // Measured by lane vcsreads before this became an assertion: counter 2
+        // to 3 and roots 2 to 3 across a merge publish. The advancing site is
+        // `finalize_local_repository_commit` calling
+        // `record_repository_authority_commit` at `state.rs:9062` under its CAS
+        // condition, reached from `repository_merge.rs:121` and
+        // `repository_rollback.rs:91`, which is one level above where a
+        // call-site count looks.
+        assert!(
+            roots_after > roots_before,
+            "the authority generation did not move across this publication, so the counter \
+             assertion below would grade a publication that did not happen"
+        );
+        assert_eq!(
+            counter_after - counter_before,
+            roots_after - roots_before,
+            "the daemon generation counter moved by {} while the authority generation moved by \
+             {}; they must move together, and a counter left behind is what makes every \
+             freshness guard reading it refuse or pass wrongly",
+            counter_after - counter_before,
+            roots_after - roots_before
+        );
         assert!(
             identity_before != identity_after,
             "the publication identity did not move across a merge publication, so every authority \
@@ -35126,6 +35218,7 @@ mod tests {
             .repository_id()
             .clone();
         let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_before, roots_before) = generation_pair(&state);
         // CONTROL for the comparison below: read the identity twice with no
         // publication between and require it to be the SAME. Without this, an
         // identity that differed on every read would make the across-publication
@@ -35143,6 +35236,36 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
 
         let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let (counter_after, roots_after) = generation_pair(&state);
+        // The daemon's counter moves by exactly what the authority's generation
+        // moves across a publication. Both are asserted rather than only their
+        // equality afterwards, because equal-after is consistent with two very
+        // different worlds: something advances the counter on a publish, or the
+        // counter and the roots both sat still. Only the DELTA separates them,
+        // which is the same reason a cgroup's oom_kill cannot separate a cap
+        // kill from an outside one while max and oom can.
+        //
+        // Measured by lane vcsreads before this became an assertion: counter 2
+        // to 3 and roots 2 to 3 across a merge publish. The advancing site is
+        // `finalize_local_repository_commit` calling
+        // `record_repository_authority_commit` at `state.rs:9062` under its CAS
+        // condition, reached from `repository_merge.rs:121` and
+        // `repository_rollback.rs:91`, which is one level above where a
+        // call-site count looks.
+        assert!(
+            roots_after > roots_before,
+            "the authority generation did not move across this publication, so the counter \
+             assertion below would grade a publication that did not happen"
+        );
+        assert_eq!(
+            counter_after - counter_before,
+            roots_after - roots_before,
+            "the daemon generation counter moved by {} while the authority generation moved by \
+             {}; they must move together, and a counter left behind is what makes every \
+             freshness guard reading it refuse or pass wrongly",
+            counter_after - counter_before,
+            roots_after - roots_before
+        );
         let _ = loads_before;
 
         let published = branch_change(&state);
