@@ -34773,14 +34773,59 @@ mod tests {
                 )
             });
 
+        let backend = state.local_repository_backend().unwrap();
+        let repository_id = state
+            .local_repository_authority_binding()
+            .unwrap()
+            .repository_id()
+            .clone();
+        let identity_before = read_local_publication_identity(&backend, &repository_id).unwrap();
+        // CONTROL for the comparison below: read the identity twice with no
+        // publication between and require it to be the SAME. Without this, an
+        // identity that differed on every read would make the across-publication
+        // assertion pass while proving nothing about publications.
+        let identity_again = read_local_publication_identity(&backend, &repository_id).unwrap();
+        assert!(
+            identity_before == identity_again,
+            "the publication identity differs between two reads with no publication between them, \
+             so it cannot be evidence that a publication moved it"
+        );
+        let loads_before = state.projection_authority.loads();
+
         let (status, body) =
             rollback_through_api(&app, kin_model::OperationId::new(), restored).await;
         assert_eq!(status, StatusCode::OK, "the rollback must publish: {body}");
+
+        let identity_after = read_local_publication_identity(&backend, &repository_id).unwrap();
+        let _ = loads_before;
 
         let published = branch_change(&state);
         assert_ne!(
             published, regression,
             "the rollback must move the branch off the regression"
+        );
+
+        // MEASUREMENT, recorded in the test rather than in a report: does the
+        // publication identity that `ProjectionAuthorityCache` keys on actually
+        // MOVE across a publication that never calls
+        // `record_repository_authority_commit`?
+        //
+        // Neither this path nor the merge paths call it, so `snapshot_generation`
+        // does not advance across either. The cache does not key on that
+        // counter: `LocalPublicationIdentity::Published` is the SHA-256 of the
+        // durable publication record's bytes, so it moves whenever the record
+        // is rewritten, whatever the in-memory counter did. If it did NOT move,
+        // an admission pair cached before this publication would stay valid
+        // after it and every concurrent task would admit against pre-publication
+        // roots, which is a defect in the cache rather than in this path.
+        // `assert!` rather than `assert_ne!`: the identity is deliberately not
+        // `Debug`, since printing a publication digest into a panic is not
+        // something a test should teach the type to allow.
+        assert!(
+            identity_before != identity_after,
+            "the publication identity did not move across a publication, so every authority slot \
+             keyed on it stays valid across the change and concurrent readers admit against \
+             pre-publication roots"
         );
 
         // The assertion this test exists for. No restart between the
