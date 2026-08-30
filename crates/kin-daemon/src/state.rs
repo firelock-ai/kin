@@ -1322,13 +1322,22 @@ pub struct LspEnrichmentRequest {
 
 /// Reusable graph/CAS source view for daemon-side enrichment.
 ///
-/// The authority manager is opened once per worker rather than once per file.
-/// Source bodies are immutable and addressed by the live graph entry hash, so
-/// later workspace admissions remain visible through the same manager without
-/// trusting a stale metadata snapshot.
+/// Holds the startup-pinned binding rather than an opened authority manager.
+/// The view's whole job is to turn a content address into source text, and a
+/// content-addressed body read needs the retained storage capability and the
+/// repository identity, not the decoded persisted authority.
+///
+/// The distinction is the difference between a handle and a copy of the store.
+/// This view lives for the whole life of the LSP enrichment worker, so an
+/// opened manager here is retained for the life of the daemon: measured on a
+/// converted psf/requests store, one open holds about 2.75 GiB resident, 93.8
+/// percent of which is a change map this path never reads. Source bodies are
+/// immutable and addressed by the live graph entry hash, so later workspace
+/// admissions stay visible through the binding exactly as they did through the
+/// manager, and no stale metadata snapshot is trusted either way.
 pub(crate) struct GraphOwnedSourceView {
     graph: Arc<kin_db::InMemoryGraph>,
-    authority: RepositoryAuthorityManager<LocalFileBackend>,
+    binding: kin_core::LocalRepositoryAuthorityBinding,
 }
 
 impl GraphOwnedSourceView {
@@ -1353,8 +1362,8 @@ impl GraphOwnedSourceView {
             )));
         };
         let data = self
-            .authority
-            .load_source_blob(hash)
+            .binding
+            .load_source_blob(*hash.as_bytes())
             .map_err(DaemonError::from)?
             .ok_or_else(|| {
                 exact_source_storage_error(format!(
@@ -3288,17 +3297,23 @@ impl DaemonState {
     /// The live graph selects the exact tree entry; repository-v6 immutable CAS
     /// supplies and verifies its bytes. The working filesystem and the derived
     /// ingestion CAS are never consulted, so a checkout drift or cache loss
-    /// cannot silently become semantic-relation authority. The manager is
-    /// opened through the startup-pinned storage capability, which refuses a
-    /// hosted daemon and preserves KinDB's device/inode root pin.
+    /// cannot silently become semantic-relation authority. Bodies are reached
+    /// through the startup-pinned storage capability, which refuses a hosted
+    /// daemon and preserves KinDB's device/inode root pin.
+    ///
+    /// This opens no repository authority. It revalidates the pinned namespace,
+    /// which is the refusal the authority open used to carry here and which
+    /// reads namespace identity from metadata alone, and then reads bodies by
+    /// content address. The view outlives every request that uses it, so an
+    /// opened manager in this position is retained for the life of the daemon.
     pub(crate) fn graph_owned_source_view(&self) -> Result<GraphOwnedSourceView> {
-        let authority =
-            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_state(self)?
-                .open()
-                .map_err(DaemonError::from)?;
+        let binding = self.local_repository_authority_binding()?;
+        binding
+            .revalidate_pinned_namespace()
+            .map_err(|refusal| DaemonError::Graph(refusal.into_error()))?;
         Ok(GraphOwnedSourceView {
             graph: Arc::clone(&self.graph),
-            authority,
+            binding,
         })
     }
 
@@ -15033,6 +15048,85 @@ mod tests {
                 .load_text(&FilePathId::new("src/lib.rs"))
                 .unwrap(),
             std::str::from_utf8(authority_bytes).unwrap()
+        );
+    }
+
+    /// The LSP source view is a handle, not a copy of the store.
+    ///
+    /// This view is built once and held for the whole life of the enrichment
+    /// worker, so an authority open inside it is retained for the life of the
+    /// daemon. An open is O(store): KinDB decodes the complete persisted
+    /// authority and re-verifies every body in repository CAS. On a converted
+    /// psf/requests store that is about 2.75 GiB resident, 93.8 percent of it
+    /// a change map this path never reads, and it was measured as the single
+    /// longest-lived copy in a daemon that reached 10.6 GiB (FIR-2955).
+    ///
+    /// The count is the invariant, not the timing, and on a fixture this small
+    /// the duplicate would be invisible in wall time. The counter is read at
+    /// kin-core's own funnel rather than at any wrapper, so an open
+    /// reintroduced through a different route still fails this: a counter on
+    /// one wrapper is a proxy, and the mutation that matters is one that moves
+    /// the thing while leaving the proxy still.
+    #[test]
+    fn lsp_source_view_reads_bodies_without_opening_the_repository_authority() {
+        let repo_dir = tempfile::tempdir().unwrap();
+        let init = kin_core::init(repo_dir.path()).unwrap();
+        let blobs = BlobStore::new(init.layout.ingest_cas_dir()).unwrap();
+        let authority_bytes = b"pub fn authority_owned() {}\n";
+        let hash = Hash256::from_bytes(blobs.write(authority_bytes).unwrap().0);
+        let desired = ResolvedTree::from_artifacts([ResolvedArtifact::new(
+            ArtifactId::new(),
+            RepoPath::from_utf8("src/lib.rs").unwrap(),
+            TreeEntry::blob(hash, false),
+        )])
+        .unwrap();
+        let context =
+            crate::local_repository_authority::LocalRepositoryAuthorityContext::from_layout_for_test(
+                &init.layout,
+            )
+            .unwrap();
+        let admitted = crate::repository_commit::admitted_workspace_tree_for_test(
+            init.layout.working_dir(),
+            context.open().unwrap().read_authority().roots().clone(),
+            ResolvedTree::default(),
+            desired.clone(),
+        );
+        crate::repository_commit::publish_workspace_tree(
+            &blobs,
+            &context,
+            &admitted,
+            kin_model::OperationId::new(),
+            kin_model::AuthorId::new("lsp-authority-test"),
+        )
+        .unwrap()
+        .expect("exact source admission must advance authority");
+
+        let state = DaemonState::open(init.layout).unwrap();
+
+        // Read the counter AFTER the state is open, because opening a daemon
+        // legitimately opens authority once and this test is about the view.
+        let before = kin_core::authority_opens();
+        let view = state.graph_owned_source_view().unwrap();
+        assert_eq!(
+            kin_core::authority_opens(),
+            before,
+            "building the LSP source view opened the repository authority; that open is \
+             retained for the life of the enrichment worker, and every one decodes the \
+             whole persisted authority"
+        );
+
+        // And the view still answers from repository CAS, so the count above is
+        // not zero because nothing happened.
+        assert_eq!(
+            view.load_text(&FilePathId::new("src/lib.rs")).unwrap(),
+            std::str::from_utf8(authority_bytes).unwrap(),
+            "the source view must still serve graph-owned bytes"
+        );
+        assert_eq!(
+            kin_core::authority_opens(),
+            before,
+            "loading source text opened the repository authority; a content address is \
+             enough to reach a body"
         );
     }
 
