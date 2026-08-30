@@ -141,8 +141,15 @@ fn print_body(body: &ConflictBody) {
             println!("    (absent on both sides)");
             continue;
         }
+        // Split on newlines rather than printing each returned element whole.
+        // The renderer returns a hunk header as one element and that hunk's
+        // body as another carrying embedded newlines, so indenting per element
+        // indented the header and left every `-` and `+` line at column zero,
+        // outside the block it belongs to.
         for line in crate::commands::diff::render_hunks(body.base.as_deref(), side.as_deref()) {
-            println!("    {line}");
+            for physical in line.split('\n') {
+                println!("    {physical}");
+            }
         }
     }
 }
