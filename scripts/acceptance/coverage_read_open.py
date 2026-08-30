@@ -58,6 +58,7 @@ from __future__ import print_function
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -83,6 +84,13 @@ IN_SYNC = "repository_tree_in_sync"
 # attributed two of twenty-six opens in one run, so a suite asserting only the
 # wrapper would pass a build whose funnel instrument had been removed and would
 # certify an attribution covering a small fraction of the opens.
+# `kin status`'s basis clause, the FIR-2820 shape. It lives in the TEXT surface
+# only: `kin status --json` carries no admission field and neither does
+# `kin support --json`, both measured on 2026-08-30. So the invariant check below
+# reads text for the basis and JSON for the counts, deliberately.
+ADMITTED_BASIS = re.compile(r"as admitted \d+[smhd]* ago")
+UNMEASURED_BASIS = "not measured against the working copy"
+
 OPEN_LINE = "opening repository authority"
 FUNNEL_LINE = "opening persisted repository authority"
 OPEN_CALLER_FIELD = "caller="
@@ -164,6 +172,13 @@ def coverage_of(report):
     """
     if not isinstance(report, dict):
         return None
+    # The surface that actually carries it. `kin support --json` nests the block
+    # under `health`, measured against a live store on 2026-08-30.
+    health = report.get("health")
+    if isinstance(health, dict):
+        nested = health.get("repository_artifact_coverage")
+        if isinstance(nested, dict) and IN_SYNC in nested:
+            return nested
     coverage = report.get("artifact_coverage")
     if isinstance(coverage, dict) and IN_SYNC in coverage:
         return coverage
@@ -194,6 +209,17 @@ def sync_problems(coverage, expect_in_sync):
             "is what serving the graph's own tree as durable truth looks like"
         ]
     return []
+
+
+def basis_clause(text):
+    """The basis clause out of a `kin status` tree line, for a failure detail.
+
+    Quoted rather than paraphrased so a failure shows what the product said.
+    """
+    for line in text.splitlines():
+        if line.startswith("Tree:") and ("admitted" in line or UNMEASURED_BASIS in line):
+            return line.strip()
+    return tail(text, 160)
 
 
 def instrument_problems(log_text):
@@ -242,7 +268,18 @@ class Suite(object):
         self.env["KIN_DAEMON_AUTO_EMBED"] = "0"
         self.env["KIN_EMBED_BACKEND"] = "cpu"
         self.env["KIN_VFS_DISABLE"] = "1"
-        self.env["RUST_LOG"] = "kin_cli=info,kin_daemon=info,kin_db=info"
+        # `kin_core` is load-bearing and was missing, which is why check 2 failed.
+        # The funnel line this suite counts is emitted by
+        # `kin-core/src/repository_authority.rs:367`, and a filter that does not
+        # name kin_core silently drops it. Measured on 2026-08-30 with everything
+        # else held fixed: 0 funnel lines with the old filter, 8 with kin_core
+        # added, 8 with RUST_LOG unset entirely.
+        #
+        # The failure was legible only as "this build carries no funnel
+        # instrument", which is a claim about the BINARY made by a filter in the
+        # harness. A log filter that omits the module under test cannot be told
+        # apart from the instrument being absent.
+        self.env["RUST_LOG"] = "kin_cli=info,kin_daemon=info,kin_db=info,kin_core=info"
         self.env.pop("KIN_MCP_REPO", None)
         self.env.pop("KIN_DIR", None)
         if daemon:
@@ -287,15 +324,43 @@ class Suite(object):
             raise RuntimeError("kin init exited %d: %s" % (rc, tail(out)))
         return repo
 
+    def daemon_log_path(self):
+        """Where the daemon writes for THIS store, resolved not assumed."""
+        return os.path.join(self.repo, ".kin", "daemon.log")
+
     def daemon_log(self):
-        path = os.path.join(self.repo, ".kin", "daemon.log")
+        """The daemon log, or a (None, path) pair naming what was tried.
+
+        Returns the text, or ``None`` beside the path so a caller can fail LOUDLY
+        with the location rather than reporting an unattributed UNREADABLE. The
+        old shape returned a bare ``None`` and the check said only "the daemon log
+        could not be read", which is true of a wrong path and of a daemon that
+        never started, and those need different fixes.
+        """
+        path = self.daemon_log_path()
         if not os.path.isfile(path):
-            return None
+            return None, path
         with open(path, "r", errors="replace") as handle:
-            return handle.read()
+            return handle.read(), path
 
     def status(self):
-        rc, out = self.kin_run(["graph", "status", "--json"])
+        """The artifact-coverage report, from the surface that carries it.
+
+        `kin support --json` at `health.repository_artifact_coverage`.
+
+        This suite previously called `kin graph status --json`. **That flag never
+        existed.** Searched across all 334 commits touching
+        `crates/kin-cli/src/main.rs`, `GraphAction::Status` took an argument in
+        zero of the 275 that carry the enum, while the control (`Inspect` taking
+        arguments) held in all 275. So the suite was written against a surface
+        the product never shipped, every call exited 2 on a clap usage error, and
+        both checks below reported UNREADABLE from the moment it was wired in.
+
+        The usage error is also why the third check failed: clap rejects the
+        argument before the command runs, so nothing ever started the daemon
+        whose log that check reads. One wrong flag produced all three findings.
+        """
+        rc, out = self.kin_run(["support", "--json"])
         if rc != 0:
             return None, out
         try:
@@ -304,6 +369,16 @@ class Suite(object):
             return json.loads(out[start : end + 1]), out
         except (ValueError, IndexError):
             return None, out
+
+    def status_text(self):
+        """`kin status`'s text output, which is where the basis clause lives.
+
+        Not `--json`: neither `kin status --json` nor `kin support --json`
+        carries an admission field, measured on 2026-08-30. The FIR-2820 basis is
+        a text-surface property, so the invariant check reads it there.
+        """
+        rc, out = self.kin_run(["status"])
+        return out
 
 
 def check_clean(suite):
@@ -325,42 +400,138 @@ def check_clean(suite):
 
 
 def check_diverged(suite):
-    result = Result(1, "a store whose trees differ is reported out of sync")
-    # Change a tracked file after admission, so the graph the daemon carries and
-    # the tree the authority holds are no longer the same.
+    """The read admits before it answers, so the two trees cannot be seen apart.
+
+    **This arm used to assert the opposite and it measured a pre-kin#1258 state.**
+    It edited a tracked file and required `repository_tree_in_sync` to read False,
+    on the theory that the graph the daemon carries and the tree the authority
+    holds would then differ. Since read-after-admit landed, every read surface
+    admits the working tree before it reports, so they cannot be observed
+    diverged through the CLI at all.
+
+    Measured on 2026-08-30 against a binary carrying kin#1258, every route:
+
+        start:                       in_sync=True  authority=1 graph_tree=1
+        after edit:                  in_sync=True  authority=1 graph_tree=1
+        after kin admit:             in_sync=True  authority=1 graph_tree=1
+        daemon stop + edit + admit:  in_sync=True  authority=1 graph_tree=1
+
+    `authority_artifact_count` and `graph_tree_artifact_count` move together in
+    every one. **The divergence route is unreachable and that is the thesis
+    working**, graph truth taking the working tree on read, not a gap. Do not
+    resurrect the old arm; see kin#1258 and FIR-2964.
+
+    So this asserts the invariant the runtime now guarantees instead, and it is a
+    stronger check than the one it replaces because a stale reading fails it:
+
+    1. after an edit, the trees read in sync AND the basis names the admission
+       the read just performed, rather than reporting sync off a stale reading;
+    2. with no daemon able to run, the same read names the gap and never claims
+       it measured the working copy.
+
+    Assertion 2 is what stops assertion 1 passing vacuously. A surface that
+    always said "in sync, as admitted 0s ago" would satisfy 1 forever, and only
+    the arm where nothing can admit can tell that apart from a real answer.
+    """
+    result = Result(1, "the read admits before it answers, and says so")
     with open(os.path.join(suite.repo, "src", "mod_0.py"), "w") as handle:
         handle.write("def fn_0():\n    return 99\n\ndef added_after_admission():\n    pass\n")
+
     report, out = suite.status()
     coverage = coverage_of(report)
     if coverage is None:
         result.unknown("artifact coverage was not readable: %s" % tail(out))
         return result
-    if coverage.get(IN_SYNC) is True:
-        # Two things produce this: a read serving the graph's own tree, and a
-        # divergence that never took. They are not separable from here, so this
-        # is UNREADABLE rather than a FAIL, and a green suite never rests on it.
-        result.unknown(
-            "the trees still read in sync after the worktree changed, so either the "
-            "divergence did not take on this host or the read is comparing the graph "
-            "against itself; this arm cannot separate those and does not guess"
+    if coverage.get(IN_SYNC) is not True:
+        result.bad(
+            "the trees read out of sync after an edit, but every read admits "
+            "before it answers since kin#1258, so nothing should be able to "
+            "observe them apart: %r" % coverage.get(IN_SYNC)
         )
         return result
-    problems = sync_problems(coverage, expect_in_sync=False)
-    if problems is None:
-        result.unknown("the in-sync field carried neither true nor false")
+
+    text = suite.status_text()
+    if ADMITTED_BASIS.search(text):
+        result.ok("the read admitted the edit and dated it: %s" % basis_clause(text))
+    elif UNMEASURED_BASIS in text:
+        result.bad(
+            "the trees read in sync while the basis says the working copy was "
+            "never measured, which is the FIR-2820 defect: a sync verdict resting "
+            "on a reading nothing refreshed"
+        )
         return result
-    if problems:
-        result.bad("; ".join(problems))
+    else:
+        result.unknown(
+            "the status text carried neither an admitted-ago clause nor the "
+            "unmeasured one, so this arm cannot tell a fresh answer from a stale "
+            "one: %s" % tail(text, 200)
+        )
         return result
-    result.ok("the read compared against durable truth and reported the divergence")
+
+    # The control. Nothing can bring a daemon up, so nothing can admit, and the
+    # read must say so rather than repeat the verdict above.
+    #
+    # A real executable that REFUSES, never a missing path: an absent binary
+    # tests "the binary is absent" and this arm is about "no daemon can run".
+    # And stopping the daemon is not enough, because `kin admit` starts one.
+    refusing = os.path.join(suite.workdir, "kin-daemon-that-refuses")
+    with open(refusing, "w") as handle:
+        handle.write("#!/bin/sh\necho 'stub daemon refuses' >&2\nexit 1\n")
+    os.chmod(refusing, 0o755)
+    if not os.access(refusing, os.X_OK):
+        result.unknown("the refusing-daemon stub is not executable, so the "
+                       "control would test an absent binary instead")
+        return result
+    suite.kin_run(["daemon", "stop"])
+    restore = suite.env.get("KIN_DAEMON_BIN")
+    suite.env["KIN_DAEMON_BIN"] = refusing
+    try:
+        blind = suite.status_text()
+    finally:
+        if restore is None:
+            suite.env.pop("KIN_DAEMON_BIN", None)
+        else:
+            suite.env["KIN_DAEMON_BIN"] = restore
+    if ADMITTED_BASIS.search(blind):
+        result.bad(
+            "with no daemon able to run, the read still claimed a fresh "
+            "admission, so the dated clause above proves nothing: %s"
+            % basis_clause(blind)
+        )
+        return result
+    if UNMEASURED_BASIS not in blind:
+        result.unknown(
+            "with no daemon able to run, the read named neither an admission nor "
+            "the gap, so the control cannot grade: %s" % tail(blind, 200)
+        )
+        return result
+    result.ok("and with no daemon able to run it names the gap instead of a verdict")
     return result
 
 
 def check_instrument(suite):
+    """Every authority open names its caller, read from the daemon's own log.
+
+    Fails LOUDLY with the path it tried when the log is absent. The old shape
+    said only "the daemon log could not be read", which is equally true of a
+    wrong path and of a daemon that never started, and those need opposite fixes.
+
+    That distinction was not academic here. This check reported UNREADABLE on
+    every main run, and the cause was neither: `kin graph status --json` above it
+    was rejected by clap before the command ran, so nothing ever started a daemon
+    and no log was ever written. A finding that named the path would have said so.
+    """
     result = Result(2, "every authority open names the caller that asked for it")
-    problems = instrument_problems(suite.daemon_log())
+    log_text, log_path = suite.daemon_log()
+    if log_text is None:
+        result.bad(
+            "no daemon log at %s, so no authority open can be attributed; either "
+            "nothing started a daemon for this store or the log moved" % log_path
+        )
+        return result
+    problems = instrument_problems(log_text)
     if problems is None:
-        result.unknown("the daemon log could not be read")
+        result.unknown("the daemon log at %s could not be read" % log_path)
         return result
     if problems:
         result.bad("; ".join(problems))
@@ -429,6 +600,56 @@ def self_test():
     expect(coverage_of({IN_SYNC: True}) is not None, "a flat block reads")
     expect(coverage_of({"artifact_coverage": {}}) is None, "a block without the field is unknown")
     expect(coverage_of("not a report") is None, "a non-dict is unknown")
+
+    # The real shape, from `kin support --json`. Measured against a live store on
+    # 2026-08-30: the block is nested under `health`, and reading only the two
+    # older shapes is what made every call return None even once the command was
+    # right. Both halves were broken and fixing one would have looked like no fix.
+    expect(
+        coverage_of({"health": {"repository_artifact_coverage": {IN_SYNC: True}}}) is not None,
+        "the health-nested block `kin support --json` actually emits reads",
+    )
+    expect(
+        coverage_of({"health": {"repository_artifact_coverage": {}}}) is None,
+        "a health-nested block without the field is unknown, never agreement",
+    )
+    expect(
+        coverage_of({"health": {}}) is None,
+        "an empty health block is unknown",
+    )
+    expect(
+        coverage_of({"health": "not a dict"}) is None,
+        "a non-dict health value is unknown rather than an exception",
+    )
+
+    # The basis clause, which decides the invariant arm. It lives in the TEXT
+    # surface only, so these are the exact strings the product prints.
+    FRESH = ("Kin repository-v6 status\n"
+             "Tree: 4cdf1b66 (1 artifacts, ahead of its base change as admitted 0s ago)\n")
+    STALE = ("Kin repository-v6 status\n"
+             "Tree: 9c117d6c (1 artifacts, ahead of its base change as last admitted, not "
+             "measured against the working copy: no daemon is running for this repository)\n")
+    BARE = "Kin repository-v6 status\nTree: 9c117d6c (1 artifacts, ahead of its base change)\n"
+    expect(bool(ADMITTED_BASIS.search(FRESH)), "a dated admission is recognised")
+    expect(not ADMITTED_BASIS.search(STALE), "an unmeasured basis is NOT read as an admission")
+    expect(not ADMITTED_BASIS.search(BARE), "a bare verdict is NOT read as an admission")
+    expect(UNMEASURED_BASIS in STALE, "the unmeasured clause is recognised")
+    expect(UNMEASURED_BASIS not in FRESH, "a fresh answer carries no unmeasured clause")
+    # The trap this pair exists for: the two clauses share the word "admitted",
+    # so a needle keyed on that word alone would score STALE as fresh.
+    expect("admitted" in STALE, "the stale clause DOES contain the word admitted")
+    expect(basis_clause(FRESH).startswith("Tree:"), "the failure detail quotes the tree line")
+    expect(basis_clause("no tree line here") != "", "an unparseable text still yields a detail")
+
+    # The daemon-log resolver returns a PAIR now, so a caller can name the path.
+    class _NoLog(object):
+        workdir = "/nonexistent-selftest"
+        repo = "/nonexistent-selftest/repo"
+        daemon_log_path = Suite.daemon_log_path
+        daemon_log = Suite.daemon_log
+    text, path = _NoLog().daemon_log()
+    expect(text is None, "an absent daemon log reads as None")
+    expect("nonexistent-selftest" in path, "and it names the path it tried")
 
     good = "INFO %s repository=r caller=graph_health.rs:201 opens_on_this_thread=1" % OPEN_LINE
     bare = "INFO %s repository=r opens_on_this_thread=1" % OPEN_LINE
