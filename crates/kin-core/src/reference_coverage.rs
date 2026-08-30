@@ -551,6 +551,50 @@ impl ReferenceEdgeCoverage {
             .collect()
     }
 
+    /// The missing-language-server condition as a WARNING, carrying the count
+    /// of files it affects.
+    ///
+    /// The same condition already appears as an indented detail under the
+    /// coverage section, where a reader looking for whether the graph is
+    /// trustworthy does not find it. Measured on a five-file Python corpus with
+    /// and without pyright, one arm each: entity-to-entity relations 13 against
+    /// 29, and `UsesType` absent entirely from the arm with no server while
+    /// carrying 11 edges in the arm with one. Entities were identical at 12, so
+    /// what a missing server costs is relations, not what the graph knows
+    /// exists, and a clean-looking status over that is a false all-clear.
+    ///
+    /// The count is what IS AFFECTED, never an estimate of what is missing.
+    /// Kin cannot know how many edges a server would have produced without
+    /// running one, and a warning that guessed would be wrong by an unknown
+    /// amount on any repository unlike the one measured. `files` is a number the
+    /// graph already holds.
+    pub fn missing_language_server_warning(&self) -> Option<String> {
+        let missing: Vec<&LanguageReferenceCoverage> = self
+            .languages
+            .iter()
+            .filter(|language| language.reference_enrichment.is_actionable_gap())
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+        let named: Vec<String> = missing
+            .iter()
+            .map(|language| {
+                format!(
+                    "{} ({} file{})",
+                    language.language,
+                    language.files,
+                    if language.files == 1 { "" } else { "s" }
+                )
+            })
+            .collect();
+        Some(format!(
+            "no language server for {}; cross-file reference and override edges are absent for \
+             those files, so this graph is incomplete rather than clean",
+            named.join(", ")
+        ))
+    }
+
     /// Whether any surface should present this as needing attention.
     pub fn needs_attention(&self) -> bool {
         self.holds_no_cross_file_edges()

@@ -169,6 +169,16 @@ jobs:
       - name: Falsify the authority-open scaling graders
         run: python3 scripts/acceptance/source_view_authority_opens.py --self-test
 
+      # A missing language server costs RELATIONS, not entities: measured on one
+      # five-file corpus, 13 against 29 with a whole relation kind absent, while
+      # entities held at 12 in both arms. The product already said so, as an
+      # indented detail under the coverage section rather than on the warning
+      # line. Its graders are falsified against the two mutations that matter,
+      # demoting the sentence and dropping the count, and each must red exactly
+      # one grader or a mutation is being caught by the wrong assertion.
+      - name: Falsify the language-server warning graders
+        run: python3 scripts/acceptance/language_server_warning.py --self-test
+
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
