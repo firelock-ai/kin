@@ -10,6 +10,11 @@ pub struct BlameRequest {
     pub entity: String,
     #[serde(default)]
     pub reference: Option<String>,
+    /// List every file-level revision, not only the ones that changed this
+    /// entity. `#[serde(default)]` because this crosses the daemon wire and an
+    /// older peer sends none, which means the trimmed default.
+    #[serde(default)]
+    pub all_revisions: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,9 +23,17 @@ pub struct BlameResponse {
 }
 
 /// `kin blame <entity>` — Show who/when each version of an entity was committed.
-pub async fn run(entity: String, reference: Option<String>) -> Result<()> {
+pub async fn run(entity: String, reference: Option<String>, all_revisions: bool) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
-    let response = run_daemon_blame(&layout, &BlameRequest { entity, reference }).await?;
+    let response = run_daemon_blame(
+        &layout,
+        &BlameRequest {
+            entity,
+            reference,
+            all_revisions,
+        },
+    )
+    .await?;
     for line in response.lines {
         println!("{line}");
     }
@@ -54,13 +67,33 @@ pub fn execute_blame_request(
             graph,
             &request.entity,
             &head,
+            request.reference.as_deref(),
         )?,
         None => {
             let target = crate::commands::ref_lookup::resolve_entity_query(graph, &request.entity)?;
-            let revisions =
-                crate::commands::ref_lookup::resolve_entity_revisions_at(graph, &target.id, &head)?;
+            let revisions = crate::commands::ref_lookup::resolve_entity_revisions_at(
+                graph,
+                &target.id,
+                &head,
+                request.reference.as_deref(),
+            )?;
             (target, revisions)
         }
+    };
+    // Trimmed by default: the revisions where THIS entity's own text moved.
+    //
+    // Blame's job is attribution, and the untrimmed list answers a different
+    // question. Measured on 2026-08-30: a function written once and never edited
+    // was credited with two later changes whose commit messages say, in as many
+    // words, that they edited a different function in the same file.
+    //
+    // The withheld ones are named rather than dropped, because they are real and
+    // a reader who cannot see they exist has lost information rather than been
+    // spared noise. `--all-revisions` restores them.
+    let (revisions, withheld) = if request.all_revisions {
+        (revisions, Vec::new())
+    } else {
+        crate::commands::ref_lookup::split_own_revisions(&revisions)
     };
     let mut lines = Vec::new();
     lines.push(format!(
@@ -80,8 +113,22 @@ pub fn execute_blame_request(
     ));
     lines.push("-".repeat(140));
 
+    // A revision whose change cannot be read is NAMED, not skipped.
+    //
+    // This loop used to `continue` past it while the tally below printed
+    // `revisions.len()`, so the rows could be fewer than the stated count with
+    // nothing saying so. A blame that quietly drops a row is worse than one that
+    // fails: the reader has no way to know the attribution is partial.
+    let mut unreadable = 0usize;
     for revision in &revisions {
         let Some(change) = graph.get_change(&revision.introduced_by)? else {
+            unreadable += 1;
+            lines.push(format!(
+                "{:<36}  {:<36}  {}",
+                revision.revision_id,
+                revision.introduced_by,
+                "change is not readable from this graph, so this revision cannot be attributed",
+            ));
             continue;
         };
         lines.push(format!(
@@ -91,6 +138,15 @@ pub fn execute_blame_request(
     }
 
     lines.push(format!("\n{} version(s) found.", revisions.len()));
+    if let Some(line) = crate::commands::ref_lookup::withheld_line(withheld.len()) {
+        lines.push(line);
+    }
+    if unreadable > 0 {
+        lines.push(format!(
+            "{unreadable} of them name a change this graph cannot read, so their author and \
+             message are unknown here; durable history still holds them and `kin log` reads it."
+        ));
+    }
 
     lines.push(format!("\nState at {}:", head));
     lines.push(format!("  Signature: {}", target.signature));
