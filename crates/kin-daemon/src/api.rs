@@ -35,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
-use tracing::info;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 static BOOTSTRAP_EXPORTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -5216,6 +5216,40 @@ async fn command_branch(
              authority without ambient session scope"
                 .to_string(),
         ));
+    }
+
+    // A switch reads the working copy twice, through a graph preflight and
+    // through a projection-drift check, and the daemon's ambient admission may
+    // not have taken a pending edit by the time either runs. That is a race,
+    // and the rc062j stranger measured it as three outcomes from one command:
+    // five HTTP 500s, two HTTP 409s and two successes across nine attempts of
+    // the same edit-then-switch. On this build it was worse, refusing three of
+    // three, while edit then `kin admit` then switch succeeded three of three.
+    //
+    // So the switch drives the admission `kin admit` drives, and waits for it,
+    // rather than reading a graph that has fallen behind the tree it is about
+    // to move. `repository_admit::execute` awaits the pass and a second caller
+    // attaches to a running one, so this costs a wait rather than a second
+    // pass.
+    //
+    // Ordered BEFORE the coordination gate below on purpose: the admission seam
+    // takes that gate itself and the mutex is not reentrant.
+    if matches!(
+        &request,
+        kin_cli::commands::branch::BranchRequest::Switch { .. }
+    ) && admission_seam_would_skip(&state).is_none()
+    {
+        if let Err(error) = crate::repository_admit::execute(&state).await {
+            // A pass that established no outcome does not get to decide the
+            // switch. The switch's own preflight and drift checks still run and
+            // still refuse if the working copy really has diverged, so the
+            // failure mode here is today's behaviour rather than a blocked
+            // switch, and the cause is on the record either way.
+            warn!(
+                %error,
+                "the pre-switch admission reported no outcome; the switch's own checks decide"
+            );
+        }
     }
 
     let requires_authority_gate =
