@@ -30,7 +30,7 @@ carries all of them the merge refuses and names both decisions. Nothing is
 synthesized, because kin has no textual line merge to build a third body from,
 so a projection is a choice among sides this merge already bound.
 
-Ten checks over eleven repositories, run in order because two of them are
+Eleven checks over twelve repositories, run in order because two of them are
 destructive: they publish the merge the earlier assertions are about. The first
 four grade FIR-2958's precedence rule; the last two grade rc062j finding (2),
 which is the same authority reporting conflicts that are not conflicts.
@@ -97,6 +97,8 @@ BODIES_TICKET = "FIR-2960"
 # The rc062k merge-workflow items: the exit code and the selector.
 WORKFLOW_TICKET = "FIR-2960"
 REFUSAL_TICKET = "FIR-3018"
+# The parked-merge wedge: every exit refused once the workspace moved.
+WEDGE_TICKET = "FIR-3023"
 EXIT_MERGE_CONFLICTED = 8
 
 print = functools.partial(print, flush=True)
@@ -397,6 +399,15 @@ class Suite(object):
                 os.makedirs(parent)
             with open(full, "wb") as handle:
                 handle.write(bodies[index])
+
+    def write_bytes(self, repo, rel, content):
+        """Write into a fixture's working copy the way a caller edits a file."""
+        path = os.path.join(repo, rel)
+        directory = os.path.dirname(path)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        with open(path, "wb") as handle:
+            handle.write(content)
 
     def read_bytes(self, repo, rel):
         try:
@@ -782,6 +793,66 @@ def grade_refusal_says_what_is_true(rc, out, err, published_before, published_af
     return (PASS, "the refusal names its reason, warns of no write, and published nothing")
 
 
+def grade_abort_frees_a_moved_workspace(rc, out, err, edited_after):
+    """FIR-3023. Abandoning must work from a workspace that moved.
+
+    Four claims together, because each passes alone for a wrong reason: an abort
+    that refuses everything fails the first, one that reverts the caller's edit
+    fails the third, and one that claims a restore point it no longer has fails
+    the second while doing the right thing.
+    """
+    text = (out or "") + (err or "")
+    if rc is None:
+        return (UNREADABLE, "`kin resolve --abort` produced no exit code")
+    problems = []
+    if rc != 0:
+        problems.append("abandoning was refused: %s" % text[-160:].strip())
+    if "has moved since the merge opened" not in text:
+        problems.append("it does not say the workspace moved")
+    if "is unchanged at the recorded restore point" in text:
+        problems.append("it still claims a restore point that no longer holds")
+    if not edited_after:
+        problems.append("the caller's own edit did not survive the abort")
+    if problems:
+        return (FAIL, "; ".join(problems))
+    return (PASS, "the merge is abandoned, the edit survives, and the line says what is true")
+
+
+def grade_continue_still_refuses(rc, out, err):
+    """The control. Abandoning got a door; settling did not, and must not.
+
+    Without this arm a build that accepted every resolve command would satisfy
+    the check above and lose the whole gate.
+    """
+    text = (out or "") + (err or "")
+    if rc is None:
+        return (UNREADABLE, "`kin resolve --continue` produced no exit code")
+    if rc == 0:
+        return (FAIL, "settling was accepted while conflicts were still outstanding")
+    if "unresolved conflict" not in text:
+        return (FAIL, "the refusal does not name what is outstanding: %s" % text[-160:].strip())
+    return (PASS, "settling still refuses while conflicts remain, and says how many")
+
+
+def check_wedge(suite):
+    """FIR-3023. Hand-edit a conflicted file and there must still be a way out."""
+    repo = suite.repo("wedge", BODY_FILES)
+    suite.kin_run(["merge", "feature"], repo)
+    hand = b"def summarize(rows):\n    return HAND_MERGED(rows)\n"
+    suite.write_bytes(repo, "pkg/core.py", hand)
+    suite.kin_run(["status"], repo)
+    # The control runs FIRST, because the abort below abandons the merge it
+    # needs. The first version of the probe behind this check made exactly that
+    # mistake and read "no merge in progress" as the wedge.
+    crc, cout, cerr = suite.kin_run(["resolve", "--continue"], repo)
+    rc, out, err = suite.kin_run(["resolve", "--abort"], repo)
+    survived = suite.read_bytes(repo, "pkg/core.py") == hand
+    return _combine("wedge", [
+        ("control", grade_continue_still_refuses(crc, cout, cerr)),
+        ("abandoned", grade_abort_frees_a_moved_workspace(rc, out, err, survived)),
+    ], ticket=WEDGE_TICKET)
+
+
 def check_wrotenothing(suite):
     """FIR-3018. The daemon says it wrote nothing and the CLI says so too.
 
@@ -906,6 +977,7 @@ CHECKS = [
     ("exitcode", check_exitcode),
     ("byname", check_byname),
     ("wrotenothing", check_wrotenothing),
+    ("wedge", check_wedge),
 ]
 
 
@@ -1208,6 +1280,31 @@ def self_test():
            grade_refusal_says_what_is_true(1, "", good_refusal, "change a", "change b"), FAIL)
     expect("refusal cannot read empty output",
            grade_refusal_says_what_is_true(1, "", "", "change a", "change a"), UNREADABLE)
+
+    good_abort = ("Abandoned the merge of refs/heads/feature into refs/heads/main; workspace "
+                  "8d34 has moved since the merge opened and is left exactly as it is")
+    old_abort = "Error: workspace 8d34 no longer equals the restore point this merge recorded"
+    lying_abort = ("Abandoned the merge; workspace 8d34 is unchanged at the recorded restore "
+                   "point")
+    expect("wedge passes an abort that frees a moved workspace",
+           grade_abort_frees_a_moved_workspace(0, good_abort, "", True), PASS)
+    expect("wedge fails the shipped refusal",
+           grade_abort_frees_a_moved_workspace(1, "", old_abort, True), FAIL)
+    expect("wedge fails an abort that reverted the caller's edit",
+           grade_abort_frees_a_moved_workspace(0, good_abort, "", False), FAIL)
+    # CONTROL: succeeding is not enough. An abort that works but still claims the
+    # restore point holds is telling the caller something false about their tree.
+    expect("CONTROL wedge fails an abort that claims a restore point it no longer has",
+           grade_abort_frees_a_moved_workspace(0, lying_abort, "", True), FAIL)
+    expect("wedge cannot read a missing exit code",
+           grade_abort_frees_a_moved_workspace(None, "", "", True), UNREADABLE)
+
+    expect("continue-control passes a refusal naming what is outstanding",
+           grade_continue_still_refuses(1, "", "still has 3 unresolved conflict(s)"), PASS)
+    expect("continue-control fails a settle accepted with conflicts outstanding",
+           grade_continue_still_refuses(0, "Merged", ""), FAIL)
+    expect("continue-control fails a refusal that names nothing",
+           grade_continue_still_refuses(1, "", "no"), FAIL)
 
     expect("a relative kin path is absolutized by this suite",
            (os.path.isabs(absolute_binary("target/release/kin")), "isabs"), True)
