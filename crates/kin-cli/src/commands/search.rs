@@ -1840,9 +1840,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let graph = kin_db::InMemoryGraph::with_text_index(dir.path().join("text-index"));
         let mut overview = dedupe_test_entity("describe_layers", "pkg/overview.py");
-        overview.doc_summary = Some(
-            "Nothing here opens a socket or speaks to a server over the network.".to_string(),
-        );
+        overview.doc_summary =
+            Some("Nothing here opens a socket or speaks to a server over the network.".to_string());
         graph.upsert_entity(&overview).expect("upsert");
         assert_eq!(
             graph.text_document_count(),

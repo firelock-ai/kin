@@ -19021,7 +19021,7 @@ mod tests {
             .find(|event| event.component == "artifact_candidates" && event.reason == reason)
     }
 
-    fn text_index_degradation<'a>(result: &'a LocateResult) -> Option<&'a RetrievalDegradation> {
+    fn text_index_degradation(result: &LocateResult) -> Option<&RetrievalDegradation> {
         result
             .degradations
             .iter()
@@ -19039,9 +19039,8 @@ mod tests {
     fn unflushed_prose_graph() -> kin_db::InMemoryGraph {
         let graph = kin_db::InMemoryGraph::new();
         let mut overview = test_entity("describe_layers", "pkg/overview.py", 1, 3);
-        overview.doc_summary = Some(
-            "Nothing here opens a socket or speaks to a server over the network.".to_string(),
-        );
+        overview.doc_summary =
+            Some("Nothing here opens a socket or speaks to a server over the network.".to_string());
         graph.upsert_entity(&overview).unwrap();
         let parsing = test_entity("normalize_title", "pkg/parsing.py", 1, 3);
         graph.upsert_entity(&parsing).unwrap();
@@ -19073,7 +19072,10 @@ mod tests {
              ranked this answer"
         );
         assert!(
-            result.files.iter().any(|file| file.path == "pkg/overview.py"),
+            result
+                .files
+                .iter()
+                .any(|file| file.path == "pkg/overview.py"),
             "a term only this file's docstring carries did not retrieve it; got {:?}",
             result
                 .files
