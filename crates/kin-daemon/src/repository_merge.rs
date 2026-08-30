@@ -1400,12 +1400,12 @@ fn project_artifacts_from_settled_entities(
         if inside.is_empty() {
             continue;
         }
-        let (specific, bulk) = split_specific_from_bulk(&inside, base_state, ours_state, theirs_state);
+        let (specific, bulk) =
+            split_specific_from_bulk(&inside, base_state, ours_state, theirs_state);
         if specific.is_empty() {
             continue;
         }
-        if decisions_a_side_drops(*side, &specific, base_state, ours_state, theirs_state)
-            .is_empty()
+        if decisions_a_side_drops(*side, &specific, base_state, ours_state, theirs_state).is_empty()
         {
             continue;
         }

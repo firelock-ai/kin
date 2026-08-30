@@ -776,22 +776,31 @@ fn shifting_span_repository(root: &Path) -> std::path::PathBuf {
     run_git(&repo, &["config", "user.name", "Kin"]);
     fs::write(repo.join("shared.txt"), b"shared bytes\n").expect("write shared file");
     fs::create_dir_all(repo.join("src")).expect("create source directory");
-    fs::write(repo.join("src/lib.rs"), b"pub fn base() {}\npub fn mate() {}\n")
-        .expect("write base source");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn base() {}\npub fn mate() {}\n",
+    )
+    .expect("write base source");
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "base"]);
 
     run_git(&repo, &["switch", "-c", "feature"]);
     fs::write(repo.join("shared.txt"), b"feature shared\n").expect("edit shared on feature");
-    fs::write(repo.join("src/lib.rs"), b"pub fn base(v: i32) {}\npub fn mate() {}\n")
-        .expect("edit source on feature");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn base(v: i32) {}\npub fn mate() {}\n",
+    )
+    .expect("edit source on feature");
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "feature work"]);
 
     run_git(&repo, &["switch", "main"]);
     fs::write(repo.join("shared.txt"), b"main shared\n").expect("edit shared on main");
-    fs::write(repo.join("src/lib.rs"), b"pub fn base(count: u64) {}\npub fn mate() {}\n")
-        .expect("edit source on main");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn base(count: u64) {}\npub fn mate() {}\n",
+    )
+    .expect("edit source on main");
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "main work"]);
     repo
@@ -807,8 +816,11 @@ fn opposed_entities_repository(root: &Path) -> std::path::PathBuf {
     run_git(&repo, &["config", "user.email", "kin@example.invalid"]);
     run_git(&repo, &["config", "user.name", "Kin"]);
     fs::create_dir_all(repo.join("src")).expect("create source directory");
-    fs::write(repo.join("src/lib.rs"), b"pub fn alpha() {}\npub fn beta() {}\n")
-        .expect("write base source");
+    fs::write(
+        repo.join("src/lib.rs"),
+        b"pub fn alpha() {}\npub fn beta() {}\n",
+    )
+    .expect("write base source");
     run_git(&repo, &["add", "--all"]);
     run_git(&repo, &["commit", "-m", "base"]);
 
