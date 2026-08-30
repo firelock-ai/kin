@@ -150,20 +150,13 @@ impl From<BranchRefusal> for (StatusCode, String) {
 }
 
 impl WorkspaceMutationRefusal {
-    /// Answer a client. A branch command always transitions under
-    /// `TransitionPolicy::Switch`, which never raises the tracks-another-ref
-    /// case, so this arm is unreachable from a branch route; it maps to a
-    /// conflict rather than panicking, because an answer that is merely wrong
-    /// beats one that takes the daemon down.
-    fn into_client_response(self) -> (StatusCode, String) {
-        match self {
-            Self::Client(status, message) => (status, message),
-            Self::ClientClearsWithAdmission(status, message) => (status, message),
-            Self::TracksAnotherRef(detail) => (StatusCode::CONFLICT, detail),
-        }
-    }
-
-    /// The same answer, carrying whether one admission pass would clear it.
+    /// Answer a client, carrying whether one admission pass would clear it.
+    ///
+    /// A branch command always transitions under `TransitionPolicy::Switch`,
+    /// which never raises the tracks-another-ref case, so that arm is
+    /// unreachable from a branch route; it maps to a conflict rather than
+    /// panicking, because an answer that is merely wrong beats one that takes
+    /// the daemon down.
     fn into_client_refusal(self) -> BranchRefusal {
         match self {
             Self::Client(status, message) => BranchRefusal {
