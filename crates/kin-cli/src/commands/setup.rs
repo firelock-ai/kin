@@ -13692,13 +13692,24 @@ pub(crate) fn decide_language_server_request(
         "Nothing to install. This repository's Reference edge coverage row does not report a \
          language-server gap."
     };
-    LanguageServerDecision::Explain(vec![
+    let mut lines = vec![
         headline.to_string(),
         format!(
             "Read that row above for what it does report. {}.",
             host_language_server_state(&request.missing_on_host)
         ),
-    ])
+    ];
+    // The commands, on the one refusal path that still turns a user away with
+    // servers missing. The stranger who found the loop called printing them the
+    // saving grace, because it made the detour cost a minute rather than an
+    // afternoon; they used to live on the no-gap branch, which now installs.
+    if !request.missing_on_host.is_empty() {
+        lines.push("Install them by hand with:".to_string());
+        for command in language_servers::install_commands_for(&request.missing_on_host) {
+            lines.push(format!("  {command}"));
+        }
+    }
+    LanguageServerDecision::Explain(lines)
 }
 
 /// Print an [`LanguageServerDecision::Explain`], and nothing otherwise.
@@ -23483,6 +23494,10 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert!(
             !text.contains("reports no reference-edge gap"),
             "an unread row proves nothing about the gap: {text}"
+        );
+        assert!(
+            text.contains("npm install -g pyright"),
+            "a refusal that still turns the user away owes them the command: {text}"
         );
     }
 
