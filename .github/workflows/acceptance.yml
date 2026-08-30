@@ -160,6 +160,15 @@ jobs:
       - name: Falsify the toolchain-free repair grader
         run: python3 scripts/acceptance/first_contact_honesty.py --self-test
 
+      # FIR-2955. A whole-store authority open is O(store), so a path that takes
+      # one per unit of work makes every unit proportional to the whole
+      # repository. The graders are handed a fixed cost, a per-file cost, and a
+      # funnel that logged nothing, and only the first may pass: an assertion
+      # that a count did not grow is satisfied on every tree by an instrument
+      # that reports nothing, so the silent case is UNREADABLE rather than PASS.
+      - name: Falsify the authority-open scaling graders
+        run: python3 scripts/acceptance/source_view_authority_opens.py --self-test
+
       - name: Falsify the acceptance gate
         run: python3 scripts/acceptance/gate.py --self-test
 
