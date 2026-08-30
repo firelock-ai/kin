@@ -1112,7 +1112,18 @@ fn handle_initialize(
 fn handle_tools_list(id: Option<serde_json::Value>, config: &McpServerConfig) -> JsonRpcResponse {
     let mut tools = tool_definitions();
     if let Some(allowed) = &config.allowed_tools {
+        // Captured before the filter, because the annotation below has to tell a
+        // registered tool this profile withholds from a phrase that is simply
+        // prose. After the retain, the withheld ones are gone and that
+        // distinction is unrecoverable.
+        let registered: Vec<String> = tools.tools.iter().map(|tool| tool.name.clone()).collect();
         tools.tools.retain(|tool| allowed.contains(&tool.name));
+        // A served description that sends the reader to a tool this profile does
+        // not serve is a surface contradicting itself, and it is not rare: the
+        // default profile has five of them naming seven withheld tools
+        // (FIR-3031). Answered here rather than in any description, because this
+        // is the one place the served set is known.
+        crate::tools::annotate_unserved_cross_references(&mut tools, &registered, allowed);
     }
     JsonRpcResponse::success(id, serde_json::to_value(&tools).unwrap_or_default())
 }

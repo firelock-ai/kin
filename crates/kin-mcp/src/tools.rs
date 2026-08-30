@@ -300,6 +300,100 @@ fn transaction_operation_schema() -> serde_json::Value {
     })
 }
 
+/// Whether `name` occurs in `text` as a whole identifier rather than inside a
+/// longer one.
+///
+/// The distinction is the whole check. `get_entity` is a substring of
+/// `get_entity_source`, so a plain `contains` reports eight served descriptions
+/// as pointing at a tool the profile withholds when five of them merely mention
+/// the tool they are served beside. A word here is `[A-Za-z0-9_]`, which is what
+/// every MCP tool name is spelled from.
+fn names_tool_as_a_word(text: &str, name: &str) -> bool {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(name) {
+        let start = from + offset;
+        let end = start + name.len();
+        let before_ok = start == 0 || !is_word(bytes[start - 1]);
+        let after_ok = end == bytes.len() || !is_word(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Every tool `description` points the reader at that this profile does not
+/// serve, in name order.
+///
+/// `registered` is the whole surface and `served` is this profile's slice of it,
+/// so a name is only reported when the crate really defines a tool by that name.
+/// That is what keeps ordinary prose out of the answer: a description saying
+/// "kin refs" names a CLI command, and no tool is registered under it.
+pub fn unserved_tools_named_in(
+    description: &str,
+    registered: &[String],
+    served: &std::collections::HashSet<String>,
+) -> Vec<String> {
+    let mut named: Vec<String> = registered
+        .iter()
+        .filter(|name| !served.contains(*name))
+        .filter(|name| names_tool_as_a_word(description, name))
+        .cloned()
+        .collect();
+    named.sort();
+    named.dedup();
+    named
+}
+
+/// The sentence a served description gets when it points at a tool this profile
+/// withholds.
+///
+/// A stranger doing dead-code analysis read `find_references`' own description,
+/// which says not to loop it because `bulk_check_references` does the batch in
+/// one shot, and then could not find that tool: the default profile serves 20 of
+/// 65 and not that one, so the documented right way was unreachable from the
+/// configuration Kin ships (FIR-3031). It cost 13 calls on an eleven-export
+/// file.
+///
+/// This says where the tool is rather than deleting the advice, and it is
+/// computed from the served set rather than written into any description,
+/// because the same run found FIVE served descriptions in this state naming
+/// SEVEN withheld tools. Whether `agent-default` should carry a dead-code tool
+/// is a different question and FIR-2480 owns it; this makes the surface stop
+/// contradicting itself whatever that answer turns out to be.
+fn unserved_cross_reference_note(named: &[String]) -> String {
+    let (subject, object) = if named.len() == 1 {
+        ("This tool is", "it")
+    } else {
+        ("These tools are", "them")
+    };
+    format!(
+        " {subject} named above but not served by this tool profile: {}. \
+         Set KIN_MCP_TOOL_PROFILE=full (or --tool-profile full) to reach {object}.",
+        named.join(", ")
+    )
+}
+
+/// Annotate every served description that points at a withheld tool.
+///
+/// Called after the profile filter, which is the one place both halves are
+/// known. `registered` must be the surface BEFORE filtering.
+pub fn annotate_unserved_cross_references(
+    list: &mut ToolsListResult,
+    registered: &[String],
+    served: &std::collections::HashSet<String>,
+) {
+    for tool in &mut list.tools {
+        let named = unserved_tools_named_in(&tool.description, registered, served);
+        if !named.is_empty() {
+            tool.description.push_str(&unserved_cross_reference_note(&named));
+        }
+    }
+}
+
 /// Build the list of all MCP tools that Kin exposes, in name order.
 ///
 /// The order is part of the contract. A client caches the prompt it builds from
@@ -1564,6 +1658,158 @@ mod tests {
             checked >= 11,
             "the sweep found only {checked} budget parameters, so it is not reaching the schemas"
         );
+    }
+
+    /// The served surface may not point the reader at a tool it withholds
+    /// without saying where that tool is (FIR-3031).
+    ///
+    /// Driven off a real profile rather than a hand-listed pair, because the
+    /// stranger found one instance and the profile has five. Asserting the
+    /// CLASS is the point: a description and a profile can drift apart later
+    /// without either looking wrong on its own.
+    #[test]
+    fn a_served_description_never_points_at_a_withheld_tool_in_silence() {
+        let registered: Vec<String> = tool_definitions()
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let served: BTreeSet<&str> = agent_default_tool_names().iter().copied().collect();
+        let served_set: std::collections::HashSet<String> =
+            served.iter().map(|name| (*name).to_string()).collect();
+
+        let mut list = tool_definitions();
+        list.tools.retain(|tool| served_set.contains(&tool.name));
+        assert_eq!(
+            list.tools.len(),
+            served.len(),
+            "the profile filter must serve every name the profile lists"
+        );
+        annotate_unserved_cross_references(&mut list, &registered, &served_set);
+
+        let mut annotated = 0usize;
+        for tool in &list.tools {
+            // The annotation is appended, so the names it reports are in the
+            // text too. Read the base description instead, which is what the
+            // producer wrote.
+            let base = tool
+                .description
+                .split(" This tool is named above but not served")
+                .next()
+                .and_then(|head| {
+                    head.split(" These tools are named above but not served")
+                        .next()
+                })
+                .unwrap_or(&tool.description);
+            let named = unserved_tools_named_in(base, &registered, &served_set);
+            if named.is_empty() {
+                continue;
+            }
+            annotated += 1;
+            for name in &named {
+                assert!(
+                    tool.description.contains(name)
+                        && tool.description.contains("not served by this tool profile"),
+                    "{} points at withheld `{name}` with no note saying where it is: {}",
+                    tool.name,
+                    tool.description
+                );
+            }
+        }
+        assert!(
+            annotated >= 1,
+            "the sweep annotated nothing, so it is not reaching the descriptions"
+        );
+
+        // The instance the stranger paid for, named outright so a reword that
+        // drops it fails here rather than silently.
+        let find_references = list
+            .tools
+            .iter()
+            .find(|tool| tool.name == "find_references")
+            .expect("find_references is in agent-default");
+        assert!(
+            find_references.description.contains("bulk_check_references"),
+            "the batch advice is worth keeping: {}",
+            find_references.description
+        );
+        assert!(
+            find_references
+                .description
+                .contains("not served by this tool profile"),
+            "and it must say the default profile does not serve it: {}",
+            find_references.description
+        );
+    }
+
+    /// The controls for the guard above, as a pair through the same call.
+    ///
+    /// A fabricated name must be FOUND when it is genuinely registered and
+    /// withheld, and a name that is merely a prefix of a served one must NOT be,
+    /// which is the case that broke the first measurement of this defect:
+    /// `get_entity` is a substring of `get_entity_source`, and a plain
+    /// `contains` reported eight offenders where five exist.
+    #[test]
+    fn the_withheld_tool_scan_separates_a_whole_name_from_a_prefix() {
+        let registered: Vec<String> = ["get_entity", "get_entity_source", "bulk_check_references"]
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let served: std::collections::HashSet<String> =
+            ["get_entity_source".to_string()].into_iter().collect();
+
+        // Positive: a withheld tool named as a whole word is found.
+        assert_eq!(
+            unserved_tools_named_in(
+                "don't loop this call, because bulk_check_references does the batch.",
+                &registered,
+                &served,
+            ),
+            vec!["bulk_check_references".to_string()],
+        );
+
+        // Negative: `get_entity` inside `get_entity_source` is not a mention of
+        // `get_entity`, and `get_entity_source` is served anyway.
+        assert!(
+            unserved_tools_named_in(
+                "drill to any row's entity_id with get_entity_source.",
+                &registered,
+                &served,
+            )
+            .is_empty(),
+            "a prefix of a served name is not a mention of the withheld tool"
+        );
+
+        // And a name nothing registers is prose, not a tool.
+        assert!(
+            unserved_tools_named_in(
+                "the same unit `kin refs` prints, per zzz_fab_tool.",
+                &registered,
+                &served,
+            )
+            .is_empty(),
+        );
+    }
+
+    /// The other control: a profile that withholds nothing gets no note at all.
+    #[test]
+    fn the_full_profile_annotates_nothing() {
+        let registered: Vec<String> = tool_definitions()
+            .tools
+            .iter()
+            .map(|tool| tool.name.clone())
+            .collect();
+        let served: std::collections::HashSet<String> = registered.iter().cloned().collect();
+        let mut list = tool_definitions();
+        annotate_unserved_cross_references(&mut list, &registered, &served);
+        for tool in &list.tools {
+            assert!(
+                !tool.description.contains("not served by this tool profile"),
+                "{} was annotated on a profile that withholds nothing: {}",
+                tool.name,
+                tool.description
+            );
+        }
     }
 
     #[test]
