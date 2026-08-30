@@ -22549,7 +22549,11 @@ mod tests {
                 &mut filling,
             );
         }
-        assert_eq!(filling[0].reason, "filling", "{:?}", filling[0]);
+        assert_eq!(
+            filling[0].reason, "filling",
+            "an attached index at zero is being filled, not empty: {:?}",
+            filling[0]
+        );
         assert!(
             filling[0].detail.contains("still filling"),
             "the reader has to learn a pass is running: {}",
