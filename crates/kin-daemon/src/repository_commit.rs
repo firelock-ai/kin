@@ -1143,43 +1143,33 @@ pub(crate) fn recover_native_commit(
     else {
         return Ok(None);
     };
-    let mut native_targets = receipt
+    // Reading the record's two shapes belongs to kin-core, because the CLI's own
+    // recovery asks the same question of the same record and the two cannot
+    // afford different answers. The multiple-targets refusal stays here: it is
+    // this path's own consistency check on a receipt it is about to report as a
+    // single native commit, not part of what the record says.
+    if receipt
         .operation
         .ref_mutations
         .iter()
-        .filter_map(|mutation| match mutation.new_target.as_ref() {
-            Some(RefTarget::Change { change_id }) => Some((
-                NativeCommitTarget::Branch(mutation.name.clone()),
-                *change_id,
-            )),
-            _ => None,
-        });
-    let first = native_targets.next();
-    if first.is_some() && native_targets.next().is_some() {
+        .filter(|mutation| matches!(mutation.new_target, Some(RefTarget::Change { .. })))
+        .count()
+        > 1
+    {
         return Err(invalid(format!(
             "repository receipt for MCP operation {operation_id} has multiple native change targets"
         )));
     }
-    // A detached commit moves no ref, so its change is named by the head the
-    // workspace mutation advanced rather than by a ref mutation. Reading only
-    // the ref mutations here would make an operation that landed look like one
-    // that never ran, which is precisely the reading this recovery exists to
-    // prevent.
-    let (target, change_id) = first
-        .or(match &receipt.operation.workspace_mutation {
-            Some(workspace) => match &workspace.new_head {
-                WorkspaceHead::Detached {
-                    target: RefTarget::Change { change_id },
-                } => Some((NativeCommitTarget::DetachedHead, *change_id)),
-                _ => None,
-            },
-            None => None,
-        })
-        .ok_or_else(|| {
-            invalid(format!(
-                "repository receipt for MCP operation {operation_id} has no native change target"
-            ))
-        })?;
+    let published = kin_core::published_change(&receipt.operation).ok_or_else(|| {
+        invalid(format!(
+            "repository receipt for MCP operation {operation_id} has no native change target"
+        ))
+    })?;
+    let change_id = published.change_id;
+    let target = match published.branch {
+        Some(branch) => NativeCommitTarget::Branch(branch),
+        None => NativeCommitTarget::DetachedHead,
+    };
     let change = lease
         .snapshot()
         .changes
@@ -2512,7 +2502,7 @@ mod tests {
     /// that state through an ordinary workspace mutation rather than through a
     /// Git conversion keeps these tests in one crate, and the state is the same
     /// state because durable authority is what both produce.
-    fn detach_workspace_head(layout: &kin_core::KinLayout) {
+    fn detach_workspace_head(layout: &kin_core::KinLayout) -> RepositoryCommitReceipt {
         let context = test_authority_context(layout);
         let authority = context.open().unwrap();
         let lease = authority.read_authority();
@@ -2582,7 +2572,7 @@ mod tests {
         };
         authority
             .commit_repository_transaction(transaction)
-            .expect("parking a workspace on its own base is a legal workspace mutation");
+            .expect("parking a workspace on its own base is a legal workspace mutation")
     }
 
     /// The state both arms below start from: one committed change on
@@ -2620,12 +2610,18 @@ mod tests {
     }
 
     /// Stage a second artifact and plan the commit under test.
-    fn plan_second_commit(
+    /// The path is a parameter because a test that commits twice must add two
+    /// different files. Adding the same path twice does not fail at the add; it
+    /// fails much later, inside the transaction, with `repository path
+    /// second.txt remains occupied after applying the transaction`, which reads
+    /// like a product defect rather than a fixture that asked for the impossible.
+    fn plan_next_commit(
         init: &kin_core::InitResult,
         blobs: &kin_blobs::BlobStore,
         graph: &kin_db::InMemoryGraph,
+        path: &[u8],
     ) -> Result<NativeCommitPlan> {
-        add_artifact(graph, blobs, b"second.txt", b"two\n", |hash| {
+        add_artifact(graph, blobs, path, b"more\n", |hash| {
             TreeEntry::blob(hash, false)
         });
         plan_native_commit(
@@ -2662,7 +2658,7 @@ mod tests {
     #[test]
     fn a_commit_on_a_branch_moves_the_branch_and_leaves_the_head_naming_it() {
         let (_root, init, blobs, graph, first_change) = repository_with_one_change();
-        let plan = plan_second_commit(&init, &blobs, &graph).unwrap();
+        let plan = plan_next_commit(&init, &blobs, &graph, b"second.txt").unwrap();
         assert_eq!(
             plan.target,
             NativeCommitTarget::Branch(
@@ -2709,7 +2705,7 @@ mod tests {
     #[test]
     fn a_detached_workspace_head_advances_to_the_change_it_commits() {
         let (_root, init, blobs, graph, first_change) = repository_with_one_change();
-        detach_workspace_head(&init.layout);
+        let _ = detach_workspace_head(&init.layout);
         let before = workspace_state(&init);
         assert_eq!(
             before.head,
@@ -2719,7 +2715,7 @@ mod tests {
             "the fixture must actually be detached, or this test asserts about nothing"
         );
 
-        let plan = plan_second_commit(&init, &blobs, &graph).unwrap();
+        let plan = plan_next_commit(&init, &blobs, &graph, b"second.txt").unwrap();
         assert_eq!(
             plan.target,
             NativeCommitTarget::DetachedHead,
@@ -2785,6 +2781,97 @@ mod tests {
         );
     }
 
+    /// FIR-3038. `kin_core::published_change` reads a REAL receipt of every
+    /// shape a commit writes, and refuses one that only looks like a commit.
+    ///
+    /// Both recovery paths, the daemon's here and the CLI's in `kin-cli`, call
+    /// that one function to answer "did my commit land" after a caller lost the
+    /// reply. Before this it was written twice, and both copies were tested
+    /// against inputs their own authors wrote down, so nothing proved either
+    /// answered correctly for a record a real commit produced. This drives it
+    /// from the durable receipts three real transactions leave behind.
+    ///
+    /// The third arm is the one that decides the test. A workspace parked on its
+    /// own base publishes nothing, and its record carries a head moved onto a
+    /// change, which is byte-identical in shape to what a detached commit
+    /// writes. A reader that keyed on the shapes alone would report that park as
+    /// a landed commit, and a suite whose absent arm used something obviously
+    /// different would never see it.
+    #[test]
+    fn a_receipt_names_the_change_its_operation_published_and_nothing_else() {
+        let (_root, init, blobs, graph, first_change) = repository_with_one_change();
+
+        // Arm one, a real commit on a branch.
+        let plan = plan_next_commit(&init, &blobs, &graph, b"second.txt").unwrap();
+        let on_branch = commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap();
+        let branch_published = kin_core::published_change(&on_branch.receipt.operation)
+            .expect("a branch commit published a change");
+        assert_eq!(
+            branch_published.change_id, on_branch.change.id,
+            "the receipt names the change this commit actually made"
+        );
+        assert_eq!(
+            branch_published.branch,
+            Some(kin_model::RefName::from_bytes(b"refs/heads/main".to_vec()).unwrap()),
+            "and the branch it moved"
+        );
+
+        // Arm three, the park. Taken before the detached commit so its receipt
+        // is graded on its own, and it is where the head-onto-a-change shape
+        // appears without a change behind it.
+        let parked = detach_workspace_head(&init.layout);
+        assert!(
+            matches!(
+                parked
+                    .operation
+                    .workspace_mutation
+                    .as_ref()
+                    .map(|workspace| &workspace.new_head),
+                Some(WorkspaceHead::Detached {
+                    target: RefTarget::Change { .. }
+                })
+            ),
+            "the park must write the same head shape a detached commit does, or this arm \
+             grades nothing"
+        );
+        assert_eq!(
+            kin_core::published_change(&parked.operation),
+            None,
+            "a workspace parked on its own base published no change, whatever its head looks like"
+        );
+        assert_eq!(
+            parked.operation.roots_before.history, parked.operation.roots_after.history,
+            "and the reason is readable in the record: it left change history standing"
+        );
+
+        // Arm two, a real commit on that detached head. A different path,
+        // because the branch arm above already published second.txt.
+        let plan = plan_next_commit(&init, &blobs, &graph, b"third.txt");
+        let detached = match plan {
+            Ok(plan) => commit_native_plan_with_projection(&init.layout, &blobs, plan).unwrap(),
+            Err(error) => panic!("a detached workspace must commit: {error}"),
+        };
+        let detached_published = kin_core::published_change(&detached.receipt.operation)
+            .expect("a detached commit published a change");
+        assert_eq!(
+            detached_published.change_id, detached.change.id,
+            "the receipt names the change the detached commit made"
+        );
+        assert_eq!(
+            detached_published.branch, None,
+            "and says no branch names it"
+        );
+        assert_ne!(
+            detached.receipt.operation.roots_before.history,
+            detached.receipt.operation.roots_after.history,
+            "a published change moves change history, which is what separates it from the park"
+        );
+
+        // The three answers are distinct, so no arm is satisfied by another's.
+        assert_ne!(branch_published.change_id, detached_published.change_id);
+        assert_ne!(branch_published.change_id, first_change);
+    }
+
     /// A detached commit is recoverable by the operation id that made it.
     ///
     /// The recovery path used to read only ref mutations, so a detached commit,
@@ -2794,7 +2881,7 @@ mod tests {
     #[test]
     fn a_detached_commit_is_recovered_by_its_operation_id() {
         let (_root, init, blobs, graph, _first_change) = repository_with_one_change();
-        detach_workspace_head(&init.layout);
+        let _ = detach_workspace_head(&init.layout);
         add_artifact(&graph, &blobs, b"second.txt", b"two\n", |hash| {
             TreeEntry::blob(hash, false)
         });

@@ -129,6 +129,6 @@ pub use ref_view::{
 };
 pub use repository_authority::{
     durable_semantic_enrichment_summary, open_persisted_local_repository_authority,
-    revalidate_pinned_local_namespace, DurableSemanticEnrichmentSummary,
-    LocalRepositoryAuthorityBinding, PinnedNamespaceRefusal,
+    published_change, revalidate_pinned_local_namespace, DurableSemanticEnrichmentSummary,
+    LocalRepositoryAuthorityBinding, PinnedNamespaceRefusal, PublishedChange,
 };

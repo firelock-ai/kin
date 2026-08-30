@@ -17,10 +17,83 @@ use kin_db::{
     RepositoryAuthorityState, StorageBackend,
 };
 use kin_model::{
-    EntityDelta, EntityId, RelationDelta, RelationId, RepositoryId, SemanticChangeId, WorkspaceId,
+    EntityDelta, EntityId, RefName, RefTarget, RelationDelta, RelationId, RepositoryId,
+    RepositoryOperationRecord, SemanticChangeId, WorkspaceHead, WorkspaceId,
 };
 
 use crate::{KinError, KinLayout, KinManifest, Result};
+
+/// The change one repository operation published, and where it published it.
+///
+/// `branch` is `None` when the operation moved no ref, which is what a commit on
+/// a detached workspace head does: it advances the head itself. On a branch the
+/// commit fast-forwards the branch its head names and this carries that name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublishedChange {
+    /// The branch this operation moved, absent on a detached head.
+    pub branch: Option<RefName>,
+    pub change_id: SemanticChangeId,
+}
+
+/// The change one operation record published, or `None` if it published none.
+///
+/// Two callers ask this of the same record and neither can afford a different
+/// answer: the daemon's own recovery after a restart, and the CLI's recovery
+/// when the daemon has stopped answering. Both run only after a caller has lost
+/// the reply and is deciding whether to commit again, so the wrong answer here
+/// does not degrade, it inverts. It tells someone their work is gone while it
+/// sits in authority, and the retry that reading invites is then refused as an
+/// empty successor.
+///
+/// It lives here, in the crate both already depend on, rather than once in each,
+/// because a second copy of this rule is only ever wrong in a way that looks
+/// like a passing run. A commit shape that moved no ref was added under
+/// FIR-3012, and both copies had to learn it; had one been missed, both crates'
+/// suites would have stayed green and the disagreement would have surfaced only
+/// to a user who had already lost a reply.
+///
+/// The ref mutation is preferred over the head because a branch commit writes
+/// both: the workspace mutation on that path leaves the head naming its branch
+/// rather than a change, so the head arm cannot fire, but reading the branch
+/// first keeps the answer's `branch` populated without depending on that.
+///
+/// The history root is read before either shape, and that is not belt and
+/// braces. Both shapes are inferences: a ref moved onto a change, or a head
+/// moved onto one. Neither is a claim that THIS operation published the change
+/// it names, and two ordinary operations produce exactly those shapes while
+/// publishing nothing. `kin branch create` builds a ref at the workspace base,
+/// which on a native store is a change; parking a workspace on its own base
+/// moves its head onto a change. Either would be reported as a landed commit by
+/// the shapes alone. The change history root is the fact rather than the
+/// inference: it moves when and only when a transaction publishes into history,
+/// so an operation that left it standing published nothing, whatever its ref and
+/// head look like.
+pub fn published_change(record: &RepositoryOperationRecord) -> Option<PublishedChange> {
+    if record.roots_before.history == record.roots_after.history {
+        return None;
+    }
+    record
+        .ref_mutations
+        .iter()
+        .find_map(|mutation| match mutation.new_target.as_ref() {
+            Some(RefTarget::Change { change_id }) => Some(PublishedChange {
+                branch: Some(mutation.name.clone()),
+                change_id: *change_id,
+            }),
+            _ => None,
+        })
+        .or(
+            match record.workspace_mutation.as_ref().map(|w| &w.new_head) {
+                Some(WorkspaceHead::Detached {
+                    target: RefTarget::Change { change_id },
+                }) => Some(PublishedChange {
+                    branch: None,
+                    change_id: *change_id,
+                }),
+                _ => None,
+            },
+        )
+}
 
 /// Exact semantic counts derived from one immutable repository-authority lease.
 ///
