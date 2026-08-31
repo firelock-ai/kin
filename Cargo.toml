@@ -159,7 +159,7 @@ kin-lsp = { version = "=0.7.12", registry = "kin" }
 # additively on macOS via a `[target.'cfg(target_os = "macos")'.dependencies]` block in the
 # binary/runtime crates (kin-cli, kin-daemon). Feature unification makes that additive.
 kin-db = { version = "=0.7.81", registry = "kin", default-features = false }
-kin-vfs-core = { version = "=0.4.21", registry = "kin" }
+kin-vfs-core = { version = "=0.4.22", registry = "kin" }
 
 [profile.release]
 opt-level = 3
