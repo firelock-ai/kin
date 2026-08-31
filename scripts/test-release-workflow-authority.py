@@ -4496,6 +4496,7 @@ WINDOWS_AUTHORITY_LEGS = (
     "daemon shutdown identity",
     "kin-cli Windows modules",
     "full managed uninstall safety",
+    "editor extension detection",
     "native full managed uninstall lifecycle",
     "native managed-daemon ownership scan",
     "native install authority contention and crash recovery",
@@ -4509,6 +4510,7 @@ WINDOWS_AUTHORITY_LEGS = (
     "late daemon-descendant containment",
     "daemon isolation support",
     "durable merge resolution containment compile",
+    "editor setup guidance",
 )
 
 

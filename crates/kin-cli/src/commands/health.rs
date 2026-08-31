@@ -2964,24 +2964,78 @@ fn check_setup_ledger() -> HealthCheck {
     }
 }
 
-fn check_editor() -> HealthCheck {
-    let home = home_dir().ok();
-    let extensions_glob = home.as_ref().map(|h| h.join(".vscode").join("extensions"));
+pub(crate) fn editor_extension_detected() -> bool {
+    home_dir()
+        .ok()
+        .map(|home| editor_extension_detected_in(&home.join(".vscode").join("extensions")))
+        .unwrap_or(false)
+}
 
-    let detected = extensions_glob
-        .as_ref()
-        .and_then(|dir| std::fs::read_dir(dir).ok())
-        .map(|entries| {
-            entries.filter_map(|e| e.ok()).any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains("kin-editor")
+/// Whether the default VS Code extension directory carries a current official
+/// Kin extension.
+///
+/// A directory name is only a candidate. VS Code can leave partial, obsolete,
+/// or unrelated directories under `extensions`, so only a parsed manifest with
+/// the official publisher and package name is allowed to suppress setup's
+/// install guidance.
+fn editor_extension_detected_in(extensions_dir: &Path) -> bool {
+    let obsolete_path = extensions_dir.join(".obsolete");
+    let obsolete = match std::fs::read(&obsolete_path) {
+        Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) if value.is_object() => value,
+            _ => Value::Object(serde_json::Map::new()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Value::Object(serde_json::Map::new())
+        }
+        Err(_) => Value::Object(serde_json::Map::new()),
+    };
+
+    let Ok(entries) = std::fs::read_dir(extensions_dir) else {
+        return false;
+    };
+
+    entries.filter_map(Result::ok).any(|entry| {
+        let folder = entry.file_name().to_string_lossy().into_owned();
+        let normalized = folder.to_ascii_lowercase();
+        let official_candidate =
+            normalized == "firelock.kin-editor" || normalized.starts_with("firelock.kin-editor-");
+        if !official_candidate
+            || obsolete.as_object().is_some_and(|entries| {
+                entries.iter().any(|(name, removed)| {
+                    name.eq_ignore_ascii_case(&folder) && removed.as_bool() == Some(true)
+                })
             })
-        })
-        .unwrap_or(false);
+        {
+            return false;
+        }
 
-    if detected {
+        let Ok(metadata) = std::fs::metadata(entry.path()) else {
+            return false;
+        };
+        if !metadata.is_dir() {
+            return false;
+        }
+
+        let Ok(bytes) = std::fs::read(entry.path().join("package.json")) else {
+            return false;
+        };
+        let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
+            return false;
+        };
+        manifest
+            .get("publisher")
+            .and_then(Value::as_str)
+            .is_some_and(|publisher| publisher.eq_ignore_ascii_case("firelock"))
+            && manifest
+                .get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| name.eq_ignore_ascii_case("kin-editor"))
+    })
+}
+
+fn check_editor() -> HealthCheck {
+    if editor_extension_detected() {
         HealthCheck::new(
             "editor",
             "Editor extension",
@@ -5110,6 +5164,133 @@ mod tests {
     use super::*;
     use kin_core::test_env::EnvVarGuard;
     use serial_test::serial;
+
+    fn write_editor_manifest(
+        extensions_dir: &Path,
+        folder: &str,
+        publisher: &str,
+        name: &str,
+    ) -> PathBuf {
+        let extension = extensions_dir.join(folder);
+        std::fs::create_dir_all(&extension).expect("create editor extension fixture");
+        std::fs::write(
+            extension.join("package.json"),
+            serde_json::json!({
+                "publisher": publisher,
+                "name": name,
+                "version": "0.0.0-test",
+            })
+            .to_string(),
+        )
+        .expect("write editor extension manifest");
+        extension
+    }
+
+    #[test]
+    fn editor_detection_accepts_an_official_current_manifest() {
+        let root = tempfile::tempdir().expect("extension root");
+        write_editor_manifest(
+            root.path(),
+            "firelock.kin-editor-test",
+            "firelock",
+            "kin-editor",
+        );
+
+        assert!(editor_extension_detected_in(root.path()));
+    }
+
+    #[test]
+    fn editor_detection_rejects_empty_candidates() {
+        let root = tempfile::tempdir().expect("extension root");
+        std::fs::create_dir(root.path().join("firelock.kin-editor-empty"))
+            .expect("create empty candidate directory");
+        std::fs::write(root.path().join("firelock.kin-editor-file"), b"")
+            .expect("create matching regular file");
+
+        assert!(!editor_extension_detected_in(root.path()));
+    }
+
+    #[test]
+    fn editor_detection_rejects_a_malformed_manifest() {
+        let root = tempfile::tempdir().expect("extension root");
+        let extension = root.path().join("firelock.kin-editor-malformed");
+        std::fs::create_dir(&extension).expect("create malformed candidate");
+        std::fs::write(extension.join("package.json"), b"{not-json")
+            .expect("write malformed manifest");
+
+        assert!(!editor_extension_detected_in(root.path()));
+    }
+
+    #[test]
+    fn editor_detection_rejects_wrong_manifest_identity() {
+        let root = tempfile::tempdir().expect("extension root");
+        write_editor_manifest(
+            root.path(),
+            "firelock.kin-editor-wrong-publisher",
+            "someone-else",
+            "kin-editor",
+        );
+        write_editor_manifest(
+            root.path(),
+            "firelock.kin-editor-wrong-name",
+            "firelock",
+            "something-else",
+        );
+
+        assert!(!editor_extension_detected_in(root.path()));
+    }
+
+    #[test]
+    fn editor_detection_rejects_an_obsolete_official_version() {
+        let root = tempfile::tempdir().expect("extension root");
+        let folder = "firelock.kin-editor-obsolete";
+        write_editor_manifest(root.path(), folder, "firelock", "kin-editor");
+        std::fs::write(
+            root.path().join(".obsolete"),
+            serde_json::to_string(&std::collections::BTreeMap::from([(folder, true)]))
+                .expect("serialize obsolete map"),
+        )
+        .expect("mark extension version obsolete");
+
+        assert!(!editor_extension_detected_in(root.path()));
+    }
+
+    #[test]
+    fn editor_detection_ignores_invalid_obsolete_state() {
+        let root = tempfile::tempdir().expect("extension root");
+        write_editor_manifest(
+            root.path(),
+            "firelock.kin-editor-current",
+            "firelock",
+            "kin-editor",
+        );
+
+        for invalid in [b"{not-json".as_slice(), b"[]".as_slice()] {
+            std::fs::write(root.path().join(".obsolete"), invalid)
+                .expect("write invalid obsolete state");
+            assert!(
+                editor_extension_detected_in(root.path()),
+                "invalid .obsolete state must not hide a current extension"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn editor_detection_accepts_an_official_symlinked_directory() {
+        let root = tempfile::tempdir().expect("extension root");
+        let target_root = tempfile::tempdir().expect("extension target root");
+        let target = write_editor_manifest(
+            target_root.path(),
+            "kin-editor-target",
+            "firelock",
+            "kin-editor",
+        );
+        std::os::unix::fs::symlink(target, root.path().join("firelock.kin-editor-symlinked"))
+            .expect("link official editor extension");
+
+        assert!(editor_extension_detected_in(root.path()));
+    }
 
     fn footprint(store_bytes: u64) -> crate::commands::store_footprint::StoreFootprint {
         crate::commands::store_footprint::StoreFootprint {
