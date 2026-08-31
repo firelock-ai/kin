@@ -523,7 +523,7 @@ jobs:
           repository: firelock-ai/kin-vfs
           path: kin-vfs
           # Release inputs must never move under an unchanged Kin tag.
-          ref: d6c72979a3837c484ce7a604377df1837f9de8bd
+          ref: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
           persist-credentials: false
 
       - name: Verify canonical release input bytes
@@ -1149,7 +1149,7 @@ jobs:
           ARTIFACT: ${{ matrix.artifact }}
           TARGET: ${{ matrix.target }}
           VFS_TARGET: ${{ matrix.vfs_target || matrix.target }}
-          EXPECTED_VFS_COMMIT: d6c72979a3837c484ce7a604377df1837f9de8bd
+          EXPECTED_VFS_COMMIT: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1437,7 +1437,7 @@ jobs:
         with:
           repository: firelock-ai/kin-vfs
           path: release-inputs/kin-vfs
-          ref: d6c72979a3837c484ce7a604377df1837f9de8bd
+          ref: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
           persist-credentials: false
 
       - name: Download all artifacts
@@ -1505,7 +1505,7 @@ jobs:
 
       - name: Verify and aggregate release provenance
         env:
-          EXPECTED_VFS_COMMIT: d6c72979a3837c484ce7a604377df1837f9de8bd
+          EXPECTED_VFS_COMMIT: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -1867,7 +1867,7 @@ jobs:
     uses: ./.github/workflows/install-proof.yml
     with:
       release_tag: ${{ github.ref_name }}
-      expected_vfs_commit: d6c72979a3837c484ce7a604377df1837f9de8bd
+      expected_vfs_commit: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370
     permissions:
       contents: read
       attestations: read
