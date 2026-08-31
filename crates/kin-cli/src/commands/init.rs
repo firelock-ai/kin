@@ -98,6 +98,51 @@ struct InitResultPayload<'a> {
     /// schema version, so a consumer that does not read it is unaffected.
     #[serde(skip_serializing_if = "Option::is_none")]
     daemon_killed: Option<DaemonKilledPayload>,
+    /// Whether the verified repository was also prepared for its first fast
+    /// workspace-base reopen. This is a representation outcome, not a second
+    /// semantic commit.
+    graph_section_materialization: &'a InitGraphSectionMaterialization,
+}
+
+/// The post-publication graph-section phase can fail without undoing the
+/// verified repository init that preceded it. Keep that degraded result in the
+/// init receipt while the explicit command remains a hard-failing retry.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum InitGraphSectionMaterialization {
+    Complete(super::repository_authority::GraphSectionMaterialization),
+    Failed {
+        schema: &'static str,
+        scope: super::repository_authority::GraphSectionMaterializationScope,
+        state: &'static str,
+        error: String,
+        retry: &'static str,
+    },
+}
+
+impl InitGraphSectionMaterialization {
+    fn failed(error: &anyhow::Error) -> Self {
+        Self::Failed {
+            schema: "kin.graph-section-materialization.v1",
+            scope: super::repository_authority::GraphSectionMaterializationScope::WorkspaceBase,
+            state: "failed",
+            error: format!("{error:#}"),
+            retry: "kin graph materialize",
+        }
+    }
+
+    fn is_failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+
+    fn human_line(&self) -> String {
+        match self {
+            Self::Complete(outcome) => outcome.human_line(),
+            Self::Failed { error, retry, .. } => format!(
+                "Graph-section materialization did not complete. Run `{retry}` to retry: {error}"
+            ),
+        }
+    }
 }
 
 /// What one machine-readable result says about a daemon it lost.
@@ -158,6 +203,11 @@ macro_rules! note {
 /// questions; what nobody can attest is that its enrichment finished.
 pub const EXIT_ENRICHMENT_UNATTESTED: i32 = 7;
 
+/// Exit status for a verified init whose reopen-acceleration section did not
+/// persist. The repository exists and remains graph-authoritative; the
+/// explicit graph command retries only the missing representation step.
+pub const EXIT_GRAPH_SECTION_UNMATERIALIZED: i32 = 8;
+
 pub async fn run(
     path: Option<String>,
     json: bool,
@@ -205,6 +255,21 @@ pub async fn run(
             .with_context(|| {
                 format!("initialize unborn Kin-native repository authority adopting {adopted}")
             })?,
+    };
+
+    // Core init has finished publishing and proving semantic authority here.
+    // Reopen that exact persisted authority in a short-lived scope and memoize
+    // its complete workspace base before enrichment starts a daemon. This
+    // keeps the section's capture allocation out of the calibrated publish
+    // peak and lets the first real daemon reopen consume the section.
+    let graph_section_materialization = match materialize_graph_section_after_init(&result.layout) {
+        Ok(outcome) => InitGraphSectionMaterialization::Complete(outcome),
+        Err(error) => {
+            note!(
+                "warning: repository initialization completed, but graph-section materialization did not; run `kin graph materialize` to retry: {error:#}"
+            );
+            InitGraphSectionMaterialization::failed(&error)
+        }
     };
 
     if let Err(error) = exclude_store_from_git(result.layout.working_dir()) {
@@ -271,18 +336,35 @@ pub async fn run(
     let daemon_death = crate::daemon_death::recorded_for_store(result.layout.root());
 
     if json {
-        print_json_result(&result, boundary, enrichment, daemon_death.as_ref())?;
+        print_json_result(
+            &result,
+            boundary,
+            enrichment,
+            &graph_section_materialization,
+            daemon_death.as_ref(),
+        )?;
     } else {
         print_human_result(
             &result,
             boundary,
             &enrichment,
             &cross_file,
+            &graph_section_materialization,
             model_present_before,
             daemon_death.as_ref(),
         )?;
     }
-    Ok(exit_code_for(daemon_death.as_ref()))
+    Ok(exit_code_for(
+        daemon_death.as_ref(),
+        graph_section_materialization.is_failed(),
+    ))
+}
+
+fn materialize_graph_section_after_init(
+    layout: &kin_core::KinLayout,
+) -> Result<super::repository_authority::GraphSectionMaterialization> {
+    super::repository_authority::materialize_workspace_base_offline(layout)
+        .context("prepare the initialized repository's first graph reopen")
 }
 
 /// Exit status for a conversion that finished.
@@ -299,9 +381,13 @@ pub async fn run(
 /// So the degraded outcome gets its own code rather than an error. Exit 1 would
 /// say the conversion failed and invite a re-run, which at the repository size
 /// that causes this is a loop that cannot terminate.
-fn exit_code_for(daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>) -> i32 {
+fn exit_code_for(
+    daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
+    graph_section_failed: bool,
+) -> i32 {
     match daemon_death {
         Some(_) => EXIT_ENRICHMENT_UNATTESTED,
+        None if graph_section_failed => EXIT_GRAPH_SECTION_UNMATERIALIZED,
         None => 0,
     }
 }
@@ -1110,6 +1196,7 @@ fn print_json_result(
     result: &kin_core::InitResult,
     boundary: InitBoundary,
     semantic_enrichment: SemanticEnrichmentStatus,
+    graph_section_materialization: &InitGraphSectionMaterialization,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
     let workspace = &result.authority.workspace;
@@ -1142,6 +1229,7 @@ fn print_json_result(
             summary: record.summary(),
             exit_code: EXIT_ENRICHMENT_UNATTESTED,
         }),
+        graph_section_materialization,
     };
     emit(&format!("{}\n", serde_json::to_string_pretty(&payload)?))
 }
@@ -1173,6 +1261,7 @@ fn print_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
+    graph_section_materialization: &InitGraphSectionMaterialization,
     model_present_before: bool,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<()> {
@@ -1181,6 +1270,7 @@ fn print_human_result(
         boundary,
         semantic_enrichment,
         cross_file,
+        graph_section_materialization,
         model_present_before,
         daemon_death,
     )?)
@@ -1210,6 +1300,7 @@ fn render_human_result(
     boundary: InitBoundary,
     semantic_enrichment: &SemanticEnrichmentStatus,
     cross_file: &CrossFileEnrichment,
+    graph_section_materialization: &InitGraphSectionMaterialization,
     model_present_before: bool,
     daemon_death: Option<&kin_daemon_spawn::DaemonKillRecord>,
 ) -> Result<String> {
@@ -1241,6 +1332,11 @@ fn render_human_result(
         out,
         "  Workspace head: {}",
         serde_json::to_string(&result.authority.workspace.workspace_head)?
+    )?;
+    writeln!(
+        out,
+        "  Graph reopen: {}",
+        graph_section_materialization.human_line()
     )?;
     match boundary {
         InitBoundary::ExactGit => {
@@ -2311,7 +2407,7 @@ mod tests {
             let summary =
                 render_semantic_enrichment(&status, reading, &CrossFileEnrichment::Produced);
             let names_a_kill = summary.contains("a daemon serving this store was killed");
-            let code = exit_code_for(reading);
+            let code = exit_code_for(reading, false);
             assert_eq!(
                 names_a_kill,
                 code != 0,
@@ -2321,12 +2417,12 @@ mod tests {
         }
 
         assert_eq!(
-            exit_code_for(None),
+            exit_code_for(None, false),
             0,
             "a conversion that lost no daemon must still exit 0"
         );
         assert_eq!(
-            exit_code_for(Some(&record)),
+            exit_code_for(Some(&record), false),
             EXIT_ENRICHMENT_UNATTESTED,
             "a conversion that lost one must exit the degraded code"
         );
@@ -2334,6 +2430,11 @@ mod tests {
             EXIT_ENRICHMENT_UNATTESTED, 1,
             "exit 1 says the conversion failed and invites a re-run, which at the repository \
              size that causes this is a loop that cannot terminate"
+        );
+        assert_eq!(
+            exit_code_for(None, true),
+            EXIT_GRAPH_SECTION_UNMATERIALIZED,
+            "a verified repository whose reopen section failed gets its own degraded code"
         );
     }
 

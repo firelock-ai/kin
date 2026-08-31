@@ -54,6 +54,11 @@ the consumer leaves the row bare while the reading still says the arrival could
 not be accounted for, and the two halves contradict. Which branch of the join
 runs is a property of the store, and the result names it. Every check names the
 ticket it is about, so a failure is attributable without reading the code.
+Check 25 covers FIR-2955. It initializes a committed Git repository with
+`--no-enrich`, then runs `kin graph materialize --json` twice. The first call
+must report `already_current`, proving init persisted the section before any
+daemon reopen, and the second must keep the same repository, workspace,
+authority generation and base target, proving the explicit verb is idempotent.
 
 `parse_hole_repro.py` covers what the others cannot see: a file the
 repository admits that produced no entity at all. It builds a JavaScript library

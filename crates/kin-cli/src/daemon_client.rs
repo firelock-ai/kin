@@ -2191,6 +2191,44 @@ pub struct ProcessIdentity {
     birth_token: String,
 }
 
+/// The process-lifetime repository authority shared by daemon startup and
+/// one-shot offline maintenance commands.
+pub type RepositoryRuntimeAuthority = kin_daemon_spawn::RepositoryRuntimeAuthority;
+
+/// Marker introducing the existing process-incarnation owner stamp.
+const REPOSITORY_RUNTIME_OWNER_STAMP_V2: &str = "kin-daemon-owner-v2";
+
+/// Render the byte-compatible owner stamp written under `.kin/daemon.lock`.
+///
+/// Process identity stays in this crate while the lower shared crate owns only
+/// the OS capability and treats this value as opaque.
+pub fn current_repository_runtime_owner_stamp() -> String {
+    match current_process_identity() {
+        Ok(identity) => match serde_json::to_string(&identity) {
+            Ok(encoded) => format!("{REPOSITORY_RUNTIME_OWNER_STAMP_V2} {encoded}"),
+            Err(_) => std::process::id().to_string(),
+        },
+        Err(_) => std::process::id().to_string(),
+    }
+}
+
+/// Acquire the repository runtime singleton with the standard bounded retry.
+pub fn acquire_repository_runtime_authority(
+    kin_root: &Path,
+) -> std::io::Result<Option<RepositoryRuntimeAuthority>> {
+    let owner_stamp = current_repository_runtime_owner_stamp();
+    kin_daemon_spawn::acquire_repository_runtime_authority(kin_root, &owner_stamp)
+}
+
+/// Acquire the repository runtime singleton within one caller-owned budget.
+pub fn acquire_repository_runtime_authority_within(
+    kin_root: &Path,
+    budget: Duration,
+) -> std::io::Result<Option<RepositoryRuntimeAuthority>> {
+    let owner_stamp = current_repository_runtime_owner_stamp();
+    kin_daemon_spawn::acquire_repository_runtime_authority_within(kin_root, budget, &owner_stamp)
+}
+
 impl ProcessIdentity {
     /// The PID this identity names. Only a lookup key on its own — compare
     /// whole identities to decide whether it is still the same process.

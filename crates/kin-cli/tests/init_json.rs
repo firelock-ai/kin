@@ -54,6 +54,18 @@ fn kin_init(repo: &Path, home: &Path, extra: &[&str]) -> std::process::Output {
         .expect("run kin init")
 }
 
+fn kin_graph_materialize(repo: &Path, home: &Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_kin"))
+        .args(["graph", "materialize", "--json"])
+        .env("HOME", home)
+        .env("KIN_EMBED_BACKEND", "cpu")
+        .env("KIN_NO_DAEMON", "1")
+        .env("KIN_SESSION_ID", uuid::Uuid::new_v4().to_string())
+        .current_dir(repo)
+        .output()
+        .expect("run kin graph materialize")
+}
+
 fn git_stdout(path: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
@@ -171,6 +183,19 @@ fn fresh_native_init_json_reports_exact_unborn_authority() {
     assert_eq!(payload["authority_generation"], 1);
     assert_eq!(payload["workspace_generation"], 0);
     assert!(payload["initial_change_id"].is_null());
+    assert_eq!(
+        payload["graph_section_materialization"]["schema"],
+        "kin.graph-section-materialization.v1"
+    );
+    assert_eq!(
+        payload["graph_section_materialization"]["state"],
+        "no_base_target"
+    );
+    assert_eq!(
+        payload["graph_section_materialization"]["scope"],
+        "workspace_base"
+    );
+    assert!(payload["graph_section_materialization"]["resolved_at"].is_null());
 }
 
 #[test]
@@ -215,6 +240,64 @@ fn fresh_git_init_json_reports_exact_reachable_authority() {
     assert!(
         payload["uncommitted_worktree"].is_null(),
         "a source that matched carries no disclosure: {payload}"
+    );
+    assert_eq!(
+        payload["graph_section_materialization"]["state"],
+        "persisted"
+    );
+    assert_eq!(
+        payload["graph_section_materialization"]["authority_generation"],
+        payload["authority_generation"]
+    );
+    assert!(!payload["graph_section_materialization"]["resolved_at"].is_null());
+}
+
+/// The automatic phase must persist before enrichment can start a daemon, and
+/// the explicit operator verb must observe that same durable section through
+/// the direct offline reopen path without starting or targeting a daemon.
+#[test]
+fn init_materializes_before_the_first_daemon_reopen() {
+    let root = tempdir().expect("temp root");
+    let home = root.path().join("home");
+    let repo = root.path().join("materialized");
+    fs::create_dir_all(&home).expect("create home");
+    seed_git_repo(&repo);
+
+    let init = kin_init(&repo, &home, &["--json", "--no-enrich"]);
+    assert!(
+        init.status.success(),
+        "init failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let initialized: Value =
+        serde_json::from_slice(&init.stdout).expect("init stdout should be JSON");
+    let automatic = &initialized["graph_section_materialization"];
+    assert_eq!(automatic["state"], "persisted", "{initialized}");
+    assert_eq!(automatic["scope"], "workspace_base", "{initialized}");
+    assert!(!repo.join(".kin/daemon.pid").exists());
+    assert!(!repo.join(".kin/daemon.port").exists());
+
+    let explicit = kin_graph_materialize(&repo, &home);
+    assert!(
+        explicit.status.success(),
+        "explicit materialization failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&explicit.stdout),
+        String::from_utf8_lossy(&explicit.stderr)
+    );
+    let reopened: Value =
+        serde_json::from_slice(&explicit.stdout).expect("graph materialize stdout should be JSON");
+    assert_eq!(reopened["schema"], "kin.graph-section-materialization.v1");
+    assert_eq!(reopened["state"], "already_current", "{reopened}");
+    assert_eq!(reopened["scope"], "workspace_base", "{reopened}");
+    assert_eq!(
+        reopened["authority_generation"],
+        automatic["authority_generation"]
+    );
+    assert_eq!(reopened["resolved_at"], automatic["resolved_at"]);
+    assert!(
+        !repo.join(".kin/daemon.pid").exists() && !repo.join(".kin/daemon.port").exists(),
+        "an offline representation rewrite must not leave a daemon endpoint behind"
     );
 }
 
