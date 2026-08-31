@@ -17,9 +17,10 @@
 // covers what is inside it, which is the thing a reader who has already
 // extracted can still check.
 //
-// The names written here are the ones `scripts/release-archive-shape.cjs`
-// admits at the archive root and the ones `kin update` skips by name. Changing
-// this list means changing those two together.
+// The names considered here are the ones `scripts/release-archive-shape.cjs`
+// admits at the archive root and the ones `kin update` skips by name. The
+// artifact bytes decide whether the optional projection pair is documented, so
+// this generator cannot claim that a matrix-skipped component was packaged.
 
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -36,6 +37,9 @@ if (!artifactDir || !target || !version) {
 const windows = target.includes("-windows-");
 const macos = target.endsWith("-apple-darwin");
 const exe = windows ? ".exe" : "";
+const cli = `kin${exe}`;
+const daemon = `kin-daemon${exe}`;
+const vfs = `kin-vfs${exe}`;
 const shim = windows
   ? "kin_vfs_shim.dll"
   : macos
@@ -45,21 +49,99 @@ const shim = windows
 const binDir = windows ? "%USERPROFILE%\\.kin\\bin" : "~/.kin/bin";
 const libDir = windows ? "%USERPROFILE%\\.kin\\lib" : "~/.kin/lib";
 
+function hasRegularFile(name) {
+  try {
+    return fs.statSync(path.join(artifactDir, name)).isFile();
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
+}
+
+for (const required of [cli, daemon]) {
+  if (!hasRegularFile(required)) {
+    console.error(`release archive is missing mandatory executable ${required}`);
+    process.exit(1);
+  }
+}
+
+const hasVfs = hasRegularFile(vfs);
+const hasShim = hasRegularFile(shim);
+if (hasVfs !== hasShim) {
+  console.error(
+    `release archive VFS executable and shim must be packaged together: ${vfs}=${hasVfs}, ${shim}=${hasShim}`,
+  );
+  process.exit(1);
+}
+const hasProjection = hasVfs && hasShim;
+if (!windows && !hasProjection) {
+  console.error(
+    `release archive for ${target} is missing its mandatory VFS executable and shim`,
+  );
+  process.exit(1);
+}
+
+const executableNames = [cli, daemon, ...(hasProjection ? [vfs] : [])];
+const inlineNames = executableNames
+  .map((name) => `\`${name}\``)
+  .map((name, index, names) => {
+    if (index === 0) {
+      return name;
+    }
+    return index === names.length - 1 ? ` and ${name}` : `, ${name}`;
+  })
+  .join("");
+const copyNames = executableNames.join(" ");
+const makeBinDirCommand = windows ? `mkdir "${binDir}"` : `mkdir -p ${binDir}`;
+const copyExecutablesCommand = windows
+  ? executableNames.map((name) => `copy ${name} "${binDir}\\${name}"`).join("\n    ")
+  : `cp ${copyNames} ${binDir}/`;
+const makeLibDirCommand = windows ? `mkdir "${libDir}"` : `mkdir -p ${libDir}`;
+const copyShimCommand = windows
+  ? `copy ${shim} "${libDir}\\${shim}"`
+  : `cp ${shim} ${libDir}/`;
+
+const runtimeFiles = [
+  `- \`${cli}\` is the command line interface. Start here.`,
+  `- \`${daemon}\` serves one repository's graph.\n  \`${cli}\` starts it for you; you do not run it by hand.`,
+];
+if (hasProjection) {
+  runtimeFiles.push(
+    `- \`${vfs}\` is the filesystem projection driver, which makes graph-backed\n  files look like ordinary files to any tool. It is optional. The CLI and the\n  daemon are fully functional without it.`,
+    `- \`${shim}\` is the library \`${vfs}\` injects. It belongs in\n  \`${libDir}\`, not beside the binaries. See INSTALL.md.`,
+  );
+}
+
+const projectionBoundary = hasProjection
+  ? ""
+  : `\nTransparent filesystem projection is not shipped on native Windows. Use WSL2\nfor the full Kin experience, including projection.`;
+
+const projectionInstall = hasProjection
+  ? `## 2. The shared library
+
+\`${shim}\` is not a program and does not go on PATH. It is injected into other
+processes by the projection driver, and Kin looks for it at one place:
+
+    ${makeLibDirCommand}
+    ${copyShimCommand}
+
+If you skip this, everything except filesystem projection still works, and
+\`kin doctor\` will tell you the shim is missing and offer to copy it from this
+archive for you.`
+  : `Transparent filesystem projection is not shipped on native Windows. Use WSL2
+for the full Kin experience, including projection.`;
+
 const readme = `# Kin ${version} (${target})
 
 Kin is the semantic system of record for software work. It answers questions
 about a repository from a graph rather than from raw file search.
 
-This archive carries four executables and nothing else that runs:
+This archive carries these runtime files:
 
-- \`kin${exe}\` is the command line interface. Start here.
-- \`kin-daemon${exe}\` serves one repository's graph. \`kin\` starts it for you; you do
-  not run it by hand.
-- \`kin-vfs${exe}\` is the filesystem projection driver, which makes graph-backed
-  files look like ordinary files to any tool. It is optional. The CLI and the
-  daemon are fully functional without it.
-- \`${shim}\` is the library \`kin-vfs\` injects. It belongs in
-  \`${libDir}\`, not beside the binaries. See INSTALL.md.
+${runtimeFiles.join("\n")}
+${projectionBoundary}
 
 ## After installing
 
@@ -83,7 +165,8 @@ it. The \`.sha256\` file published next to the archive covers the archive itself
 
 const install = `# Installing Kin ${version} (${target})
 
-Two decisions, both answered here, and one number to plan around first.
+Start with one number to plan around, then place each packaged runtime as
+described below.
 
 ## Requirements
 
@@ -99,28 +182,19 @@ side of that line you are on, before you spend a write finding out.
 
 ## 1. The executables
 
-Put \`kin${exe}\`, \`kin-daemon${exe}\` and \`kin-vfs${exe}\` in one directory that is on
-your PATH. Kin looks for its siblings beside the running binary, so keeping the
-three together is what lets \`kin\` find the daemon and the projection driver
-without configuration.
+Put ${inlineNames} in one directory that is on your PATH.
+Kin looks for its siblings beside the running binary, so keeping these files
+together lets \`kin\` find every packaged runtime without configuration.
 
-The managed installer uses \`${binDir}\`. Any directory works as long as all three
-land in the same one:
+The managed installer uses \`${binDir}\`. Any directory works as long as
+these files land together:
 
-    ${windows ? `mkdir %USERPROFILE%\\.kin\\bin\n    copy kin.exe kin-daemon.exe kin-vfs.exe %USERPROFILE%\\.kin\\bin\\` : `mkdir -p ~/.kin/bin\n    cp kin kin-daemon kin-vfs ~/.kin/bin/`}
+    ${makeBinDirCommand}
+    ${copyExecutablesCommand}
 
 Then add that directory to PATH.
 
-## 2. The shared library
-
-\`${shim}\` is not a program and does not go on PATH. It is injected into other
-processes by the projection driver, and Kin looks for it at one place:
-
-    ${windows ? `mkdir %USERPROFILE%\\.kin\\lib\n    copy ${shim} %USERPROFILE%\\.kin\\lib\\` : `mkdir -p ~/.kin/lib\n    cp ${shim} ~/.kin/lib/`}
-
-If you skip this, everything except filesystem projection still works, and
-\`kin doctor\` will tell you the shim is missing and offer to copy it from this
-archive for you.
+${projectionInstall}
 
 ## Then
 
