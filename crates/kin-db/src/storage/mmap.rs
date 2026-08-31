@@ -2307,7 +2307,7 @@ mod tests {
 
         atomic_write(&path, &snap).unwrap();
         let loaded = MmapReader::open(&path).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        assert_eq!(loaded.version, loaded.wire_version());
     }
 
     #[cfg(windows)]
@@ -2401,7 +2401,7 @@ mod tests {
         atomic_write(&path, &snap).unwrap();
 
         let loaded = MmapReader::open(&path).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        assert_eq!(loaded.version, loaded.wire_version());
         assert!(!tmp_path.exists());
     }
 
@@ -2533,7 +2533,7 @@ mod tests {
 
         write_recovery_candidate(&path, &snap).unwrap();
         let loaded = load_recovery_candidate(&path).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        assert_eq!(loaded.version, loaded.wire_version());
 
         promote_recovery_candidate(&path).unwrap();
         assert!(path.exists());

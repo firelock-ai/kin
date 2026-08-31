@@ -64,9 +64,10 @@ pub use merkle::{
     RETRIEVAL_AUTHORITY_HASH_VERSION, ZERO_HASH,
 };
 pub use repository::{
-    ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze, PersistedRepositoryAuthority,
-    PreparedWorkspaceGraphStats, RepositoryAuthorityManager, RepositoryAuthorityMetadata,
-    RepositoryAuthorityState, WorkspaceAdmissionSnapshot, PREPARED_WORKSPACE_GRAPH_VERSION,
+    ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze, MaterializedGraphSectionOutcome,
+    PersistedRepositoryAuthority, PreparedWorkspaceGraphStats, RepositoryAuthorityManager,
+    RepositoryAuthorityMetadata, RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
+    PREPARED_WORKSPACE_GRAPH_VERSION,
 };
 #[cfg(feature = "vector")]
 pub use snapshot::{

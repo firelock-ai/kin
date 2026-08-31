@@ -532,7 +532,12 @@ fn merge_hot_into_cold(
     hot: GraphSnapshot,
     scope: &ManagedHotScope,
 ) -> Result<GraphSnapshot, KinDbError> {
-    cold.version = GraphSnapshot::CURRENT_VERSION;
+    // A tier merge produces a snapshot whose graph is not the one any section
+    // was resolved for, and this is not a published authority snapshot, so the
+    // section is dropped rather than carried into a claim nobody checked. The
+    // version follows the contents: no section means v13.
+    cold.materialized_graph = None;
+    cold.version = GraphSnapshot::MIN_SUPPORTED_VERSION;
     let hot_entity_ids: HashSet<_> = hot.entities.keys().copied().collect();
     let deleted_managed_entities: HashSet<_> = scope
         .entity_ids

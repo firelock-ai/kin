@@ -1960,10 +1960,12 @@ pub(crate) fn checked_next_generation(
 #[derive(Debug)]
 pub struct SnapshotAuthority {
     pub snapshot_bytes: Vec<u8>,
-    /// Generation represented by `snapshot_bytes` before journal replay.
+    /// Backend publication generation represented by `snapshot_bytes` before
+    /// journal replay. This is not `RootBundle::generation`.
     pub snapshot_generation: Generation,
-    /// Last acknowledged generation. Every generation in
-    /// `(snapshot_generation, head_generation]` must have one exact delta.
+    /// Last acknowledged backend publication generation. Every generation in
+    /// `(snapshot_generation, head_generation]` must have one exact delta. This
+    /// is not `RootBundle::generation`.
     pub head_generation: Generation,
     /// Durable claim that `snapshot_bytes` already passed complete open-time
     /// validation. Backends with no durable place to bind such a claim leave
@@ -2061,12 +2063,12 @@ impl AuthorityPayloadStats {
         })
     }
 
-    /// Generation represented by the selected immutable snapshot bytes.
+    /// Backend publication generation of the selected immutable snapshot bytes.
     pub const fn snapshot_generation(self) -> Generation {
         self.snapshot_generation
     }
 
-    /// Last generation acknowledged by the coherent authority view.
+    /// Last backend publication generation acknowledged by the coherent view.
     pub const fn head_generation(self) -> Generation {
         self.head_generation
     }
@@ -2097,6 +2099,8 @@ impl AuthorityPayloadStats {
 #[derive(Debug)]
 pub struct RecoveredSnapshot {
     pub snapshot: GraphSnapshot,
+    /// Backend publication generation at the recovered head. Logical
+    /// repository generation lives in the snapshot's root bundle.
     pub generation: Generation,
     pub deltas_applied: usize,
     pub deltas_seen: usize,
@@ -3937,6 +3941,8 @@ pub(crate) const LOCAL_AUTHORITY_FRAME_JOURNAL_VERSION: u32 = 4;
 pub struct HistoryValidationProof {
     pub validator_version: u32,
     pub repository_id: String,
+    /// Backend publication generation these exact bytes and optional frame
+    /// chain occupy, not the logical repository generation.
     pub generation: Generation,
     pub snapshot_sha256: String,
     /// Digest of the acknowledged authority-frame chain the proof also
@@ -11538,7 +11544,7 @@ mod tests {
         let (loaded_bytes, gen) = backend.load_snapshot("test-repo").unwrap().unwrap();
         assert_eq!(gen, 1);
         let loaded = GraphSnapshot::from_bytes(&loaded_bytes).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        assert_eq!(loaded.version, loaded.wire_version());
     }
 
     #[test]

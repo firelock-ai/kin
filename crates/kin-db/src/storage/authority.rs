@@ -52,6 +52,30 @@ where
     fn reconcile(&self, current: &S, next: &S) -> PersistOutcome {
         self.persist(current, next)
     }
+
+    /// Persist a representation-only replacement of `current`.
+    ///
+    /// The replacement carries the same logical authority generation and may
+    /// differ only in derived, non-authoritative state. Persistence still has
+    /// to perform a fenced compare-and-swap and acknowledge the exact complete
+    /// replacement before it can be published. The default refuses because
+    /// most authority domains have no representation-only rewrite.
+    fn persist_equivalent(&self, _current: &S, _next: &S) -> PersistOutcome {
+        PersistOutcome::NotCommitted(KinDbError::StorageError(
+            "this authority persistence does not support equivalent representation rewrites"
+                .to_string(),
+        ))
+    }
+
+    /// Reconcile an indeterminate representation-only replacement.
+    ///
+    /// A persistence whose equivalent rewrite can return `Indeterminate` must
+    /// either make its ordinary reconciliation understand the same exact
+    /// candidate or override this method. The default retries through
+    /// [`persist_equivalent`](Self::persist_equivalent).
+    fn reconcile_equivalent(&self, current: &S, next: &S) -> PersistOutcome {
+        self.persist_equivalent(current, next)
+    }
 }
 
 /// Classified result of attempting to durably persist one authority candidate.
@@ -122,6 +146,19 @@ pub enum AuthorityCommitDecision<S, O> {
     IdempotentReplay { output: O },
 }
 
+/// Decision prepared for a representation-only authority rewrite.
+///
+/// Unlike [`AuthorityCommitDecision::Publish`], `Rewrite` must keep the exact
+/// logical generation. It exists for derived state whose durable bytes need a
+/// fenced replacement without fabricating a semantic repository operation.
+pub(crate) enum AuthorityRewriteDecision<S, O> {
+    /// Persist and publish an equivalent representation at the same logical
+    /// generation.
+    Rewrite { next: S, output: O },
+    /// The current representation already answers the request.
+    Unchanged { output: O },
+}
+
 /// One shared authority cell with serialized copy-on-write commits.
 ///
 /// There is deliberately no API for replacing individual fields. A commit has
@@ -138,7 +175,18 @@ where
 }
 
 struct AuthorityWriterState<S> {
-    pending: Option<Arc<S>>,
+    pending: Option<PendingAuthority<S>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAuthorityKind {
+    Successor,
+    EquivalentRewrite,
+}
+
+struct PendingAuthority<S> {
+    state: Arc<S>,
+    kind: PendingAuthorityKind,
 }
 
 impl<S, P> AuthorityPublication<S, P>
@@ -164,6 +212,43 @@ where
         &self.persistence
     }
 
+    /// Resolve one exact candidate whose persistence acknowledgement was
+    /// indeterminate before any later writer is allowed to prepare.
+    fn reconcile_pending(
+        &self,
+        writer: &mut AuthorityWriterState<S>,
+        mut current: Arc<S>,
+    ) -> Result<Arc<S>, KinDbError> {
+        let pending = writer
+            .pending
+            .as_ref()
+            .map(|pending| (pending.kind, Arc::clone(&pending.state)));
+        let Some((kind, pending)) = pending else {
+            return Ok(current);
+        };
+        let outcome = match kind {
+            PendingAuthorityKind::Successor => self
+                .persistence
+                .reconcile(current.as_ref(), pending.as_ref()),
+            PendingAuthorityKind::EquivalentRewrite => self
+                .persistence
+                .reconcile_equivalent(current.as_ref(), pending.as_ref()),
+        };
+        match outcome {
+            PersistOutcome::Committed => {
+                *self.current.write() = Arc::clone(&pending);
+                writer.pending = None;
+                current = pending;
+                Ok(current)
+            }
+            PersistOutcome::NotCommitted(error) => {
+                writer.pending = None;
+                Err(error)
+            }
+            PersistOutcome::Indeterminate(error) => Err(error),
+        }
+    }
+
     /// Commit one complete authority successor.
     ///
     /// `prepare` runs while all writers are serialized and receives the exact
@@ -175,28 +260,8 @@ where
         prepare: impl FnOnce(&S) -> Result<AuthorityCommitDecision<S, O>, KinDbError>,
     ) -> Result<O, KinDbError> {
         let mut writer = self.writer.lock();
-        let mut current = Arc::clone(&self.current.read());
-
-        // An indeterminate attempt may already have installed this exact
-        // candidate. No later operation may prepare a different successor
-        // until that uncertainty is resolved.
-        if let Some(pending) = writer.pending.as_ref().map(Arc::clone) {
-            match self
-                .persistence
-                .reconcile(current.as_ref(), pending.as_ref())
-            {
-                PersistOutcome::Committed => {
-                    *self.current.write() = Arc::clone(&pending);
-                    writer.pending = None;
-                    current = pending;
-                }
-                PersistOutcome::NotCommitted(error) => {
-                    writer.pending = None;
-                    return Err(error);
-                }
-                PersistOutcome::Indeterminate(error) => return Err(error),
-            }
-        }
+        let current = Arc::clone(&self.current.read());
+        let current = self.reconcile_pending(&mut writer, current)?;
 
         match prepare(current.as_ref())? {
             AuthorityCommitDecision::IdempotentReplay { output } => Ok(output),
@@ -224,7 +289,61 @@ where
                     }
                     PersistOutcome::NotCommitted(error) => Err(error),
                     PersistOutcome::Indeterminate(error) => {
-                        writer.pending = Some(next);
+                        writer.pending = Some(PendingAuthority {
+                            state: next,
+                            kind: PendingAuthorityKind::Successor,
+                        });
+                        Err(error)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Persist and publish an equivalent representation of current authority.
+    ///
+    /// This is the narrow escape hatch for derived state that must live beside
+    /// authority bytes but must not fabricate a semantic operation or advance
+    /// the logical generation. It shares the exact writer permit and pending
+    /// reconciliation discipline with ordinary commits. The persistence is
+    /// responsible for a fenced complete replacement; a partial or in-place
+    /// rewrite is never acknowledged here.
+    pub(crate) fn rewrite_equivalent<O>(
+        &self,
+        prepare: impl FnOnce(&S) -> Result<AuthorityRewriteDecision<S, O>, KinDbError>,
+    ) -> Result<O, KinDbError> {
+        let mut writer = self.writer.lock();
+        let current = Arc::clone(&self.current.read());
+        let current = self.reconcile_pending(&mut writer, current)?;
+
+        match prepare(current.as_ref())? {
+            AuthorityRewriteDecision::Unchanged { output } => Ok(output),
+            AuthorityRewriteDecision::Rewrite { next, output } => {
+                if next.generation() != current.generation() {
+                    return Err(KinDbError::ConcurrentAccessError(format!(
+                        "equivalent authority rewrite must remain at logical generation {}, found {}",
+                        current.generation(),
+                        next.generation()
+                    )));
+                }
+
+                // Allocate before durability. A successful acknowledgement is
+                // followed only by the infallible pointer replacement.
+                let next = Arc::new(next);
+                match self
+                    .persistence
+                    .persist_equivalent(current.as_ref(), next.as_ref())
+                {
+                    PersistOutcome::Committed => {
+                        *self.current.write() = next;
+                        Ok(output)
+                    }
+                    PersistOutcome::NotCommitted(error) => Err(error),
+                    PersistOutcome::Indeterminate(error) => {
+                        writer.pending = Some(PendingAuthority {
+                            state: next,
+                            kind: PendingAuthorityKind::EquivalentRewrite,
+                        });
                         Err(error)
                     }
                 }
@@ -247,28 +366,8 @@ where
         persist_and_retain: impl FnOnce(&P, &S, &S) -> RetainedPersistOutcome<R>,
     ) -> Result<(O, R), KinDbError> {
         let mut writer = self.writer.lock();
-        let mut current = Arc::clone(&self.current.read());
-
-        // Resolve an earlier indeterminate candidate before preparing any
-        // later successor. A resolved operation may become the idempotent
-        // replay handled below, where its exact installed state is frozen.
-        if let Some(pending) = writer.pending.as_ref().map(Arc::clone) {
-            match self
-                .persistence
-                .reconcile(current.as_ref(), pending.as_ref())
-            {
-                PersistOutcome::Committed => {
-                    *self.current.write() = Arc::clone(&pending);
-                    writer.pending = None;
-                    current = pending;
-                }
-                PersistOutcome::NotCommitted(error) => {
-                    writer.pending = None;
-                    return Err(error);
-                }
-                PersistOutcome::Indeterminate(error) => return Err(error),
-            }
-        }
+        let current = Arc::clone(&self.current.read());
+        let current = self.reconcile_pending(&mut writer, current)?;
 
         match prepare(current.as_ref())? {
             AuthorityCommitDecision::IdempotentReplay { output } => {
@@ -300,7 +399,10 @@ where
                     }
                     RetainedPersistOutcome::NotCommitted(error) => Err(error),
                     RetainedPersistOutcome::Indeterminate(error) => {
-                        writer.pending = Some(next);
+                        writer.pending = Some(PendingAuthority {
+                            state: next,
+                            kind: PendingAuthorityKind::Successor,
+                        });
                         Err(error)
                     }
                 }
@@ -349,6 +451,19 @@ mod tests {
             self.persisted_value.store(next.value, Ordering::Release);
             PersistOutcome::Committed
         }
+
+        fn persist_equivalent(&self, current: &TestState, next: &TestState) -> PersistOutcome {
+            if self.fail_next.swap(false, Ordering::SeqCst) {
+                return PersistOutcome::NotCommitted(KinDbError::StorageError(
+                    "injected authority persistence failure".to_string(),
+                ));
+            }
+            assert_eq!(next.generation, current.generation);
+            self.persisted_generation
+                .store(next.generation, Ordering::Release);
+            self.persisted_value.store(next.value, Ordering::Release);
+            PersistOutcome::Committed
+        }
     }
 
     fn publication(
@@ -383,6 +498,74 @@ mod tests {
         assert_eq!((old.generation, old.value), (0, 10));
         let current = authority.read();
         assert_eq!((current.generation, current.value), (1, 20));
+    }
+
+    #[test]
+    fn equivalent_rewrite_keeps_generation_and_old_read_lease_coherent() {
+        let authority = publication(TestPersistence::default());
+        let old = authority.read();
+
+        authority
+            .rewrite_equivalent(|current| {
+                Ok(AuthorityRewriteDecision::Rewrite {
+                    next: TestState {
+                        generation: current.generation,
+                        value: 20,
+                    },
+                    output: (),
+                })
+            })
+            .unwrap();
+
+        assert_eq!((old.generation, old.value), (0, 10));
+        let current = authority.read();
+        assert_eq!((current.generation, current.value), (0, 20));
+        assert_eq!(
+            authority
+                .persistence
+                .persisted_generation
+                .load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(
+            authority
+                .persistence
+                .persisted_value
+                .load(Ordering::Acquire),
+            20
+        );
+    }
+
+    #[test]
+    fn equivalent_rewrite_refuses_a_different_logical_generation_before_persistence() {
+        let authority = publication(TestPersistence::default());
+        let error = authority
+            .rewrite_equivalent(|current| {
+                Ok(AuthorityRewriteDecision::Rewrite {
+                    next: TestState {
+                        generation: current.generation + 1,
+                        value: 20,
+                    },
+                    output: (),
+                })
+            })
+            .expect_err("a representation rewrite cannot become a semantic successor");
+
+        assert!(error
+            .to_string()
+            .contains("must remain at logical generation 0"));
+        assert_eq!(
+            (authority.read().generation, authority.read().value),
+            (0, 10)
+        );
+        assert_eq!(
+            authority
+                .persistence
+                .persisted_value
+                .load(Ordering::Acquire),
+            0,
+            "the invalid candidate must not reach persistence"
+        );
     }
 
     #[test]
@@ -527,6 +710,122 @@ mod tests {
         assert_eq!(
             attempts[0].3, attempts[1].3,
             "reconciliation must retry the same retained Arc, not rebuild state"
+        );
+    }
+
+    struct IndeterminateRewritePersistence {
+        fail_after_install_once: AtomicBool,
+        attempts: StdMutex<Vec<(&'static str, Generation, u64, usize)>>,
+    }
+
+    impl DurableAuthorityPersistence<TestState> for IndeterminateRewritePersistence {
+        fn persist(&self, current: &TestState, next: &TestState) -> PersistOutcome {
+            self.attempts.lock().unwrap().push((
+                "successor",
+                next.generation,
+                next.value,
+                std::ptr::from_ref(next) as usize,
+            ));
+            assert_eq!(next.generation, current.generation + 1);
+            PersistOutcome::Committed
+        }
+
+        fn persist_equivalent(&self, current: &TestState, next: &TestState) -> PersistOutcome {
+            self.attempts.lock().unwrap().push((
+                "rewrite",
+                next.generation,
+                next.value,
+                std::ptr::from_ref(next) as usize,
+            ));
+            assert_eq!(next.generation, current.generation);
+            if self.fail_after_install_once.swap(false, Ordering::SeqCst) {
+                PersistOutcome::Indeterminate(KinDbError::SnapshotPersistenceIndeterminate(
+                    "injected acknowledgement loss after equivalent install".to_string(),
+                ))
+            } else {
+                PersistOutcome::Committed
+            }
+        }
+
+        fn reconcile_equivalent(&self, current: &TestState, next: &TestState) -> PersistOutcome {
+            self.attempts.lock().unwrap().push((
+                "rewrite-reconcile",
+                next.generation,
+                next.value,
+                std::ptr::from_ref(next) as usize,
+            ));
+            assert_eq!(next.generation, current.generation);
+            PersistOutcome::Committed
+        }
+    }
+
+    #[test]
+    fn indeterminate_equivalent_rewrite_is_reconciled_before_a_successor_prepares() {
+        let authority = AuthorityPublication::new(
+            TestState {
+                generation: 0,
+                value: 10,
+            },
+            IndeterminateRewritePersistence {
+                fail_after_install_once: AtomicBool::new(true),
+                attempts: StdMutex::new(Vec::new()),
+            },
+        );
+
+        authority
+            .rewrite_equivalent(|current| {
+                Ok(AuthorityRewriteDecision::Rewrite {
+                    next: TestState {
+                        generation: current.generation,
+                        value: 20,
+                    },
+                    output: (),
+                })
+            })
+            .expect_err("lost acknowledgement must retain the equivalent candidate");
+        assert_eq!(
+            (authority.read().generation, authority.read().value),
+            (0, 10)
+        );
+
+        authority
+            .commit(|current| {
+                assert_eq!(
+                    (current.generation, current.value),
+                    (0, 20),
+                    "the equivalent candidate must publish before successor preparation"
+                );
+                Ok(AuthorityCommitDecision::Publish {
+                    next: TestState {
+                        generation: 1,
+                        value: 30,
+                    },
+                    output: (),
+                })
+            })
+            .unwrap();
+
+        let attempts = authority.persistence.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(
+            (attempts[0].0, attempts[0].1, attempts[0].2),
+            ("rewrite", 0, 20)
+        );
+        assert_eq!(
+            (attempts[1].0, attempts[1].1, attempts[1].2),
+            ("rewrite-reconcile", 0, 20)
+        );
+        assert_eq!(
+            attempts[0].3, attempts[1].3,
+            "equivalent reconciliation must retain the exact candidate Arc"
+        );
+        assert_eq!(
+            (attempts[2].0, attempts[2].1, attempts[2].2),
+            ("successor", 1, 30)
+        );
+        assert_eq!(
+            (authority.read().generation, authority.read().value),
+            (1, 30)
         );
     }
 

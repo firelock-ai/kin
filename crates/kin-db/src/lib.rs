@@ -67,8 +67,8 @@ pub use storage::{
 };
 pub use storage::{
     AuthorityEnvelopeSnapshot, ChangeAdmissionPolicy, LocalRepositoryAuthorityFreeze,
-    PersistedRepositoryAuthority, RepositoryAuthorityManager, RepositoryAuthorityMetadata,
-    RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
+    MaterializedGraphSectionOutcome, PersistedRepositoryAuthority, RepositoryAuthorityManager,
+    RepositoryAuthorityMetadata, RepositoryAuthorityState, WorkspaceAdmissionSnapshot,
 };
 pub use storage::{LoadStrategy, SystemMemInfo, TieredConfig, TieredGraph};
 pub use storage::{VectorSidecarDisposition, VectorSidecarLoadOutcome};

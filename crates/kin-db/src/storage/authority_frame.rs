@@ -666,9 +666,21 @@ fn take_drained_frame_tamper() -> Option<Box<dyn FnOnce(&mut AuthorityFrame)>> {
 /// comparison names it. Collections whose element types carry `PartialEq` are
 /// compared directly; the others are compared element by element through the
 /// MessagePack form a full snapshot would have persisted them in.
-fn first_difference(reconstructed: &GraphSnapshot, next: &GraphSnapshot) -> Option<&'static str> {
+pub(crate) fn first_difference(
+    reconstructed: &GraphSnapshot,
+    next: &GraphSnapshot,
+) -> Option<&'static str> {
     let GraphSnapshot {
-        version,
+        // Bound and not compared, for the same reason `materialized_graph` is
+        // below and downstream of it. The version a snapshot declares is a pure
+        // function of whether it carries a section, and a frame deliberately
+        // carries none, so a reconstruction is v13 while a successor that
+        // stamped one is v14. Comparing the version here would compare the
+        // derived form of a field this function has already decided not to
+        // compare, and it would refuse every frame written after the first
+        // section, which is a refusal about the frame format rather than about
+        // the successor it is checking.
+        version: _,
         entities,
         relations,
         outgoing,
@@ -721,7 +733,7 @@ fn first_difference(reconstructed: &GraphSnapshot, next: &GraphSnapshot) -> Opti
         materialized_graph: _,
     } = reconstructed;
     let GraphSnapshot {
-        version: next_version,
+        version: _,
         entities: next_entities,
         relations: next_relations,
         outgoing: next_outgoing,
@@ -759,7 +771,6 @@ fn first_difference(reconstructed: &GraphSnapshot, next: &GraphSnapshot) -> Opti
         materialized_graph: _,
     } = next;
     let checks = [
-        ("versions", version == next_version),
         ("entities", entities == next_entities),
         ("relations", relations == next_relations),
         ("outgoing adjacency", outgoing == next_outgoing),

@@ -676,7 +676,7 @@ mod tests {
         let (loaded_bytes, gen) = backend.load_snapshot("test-repo").unwrap().unwrap();
         assert_eq!(gen, 1);
         let loaded = GraphSnapshot::from_bytes(&loaded_bytes).unwrap();
-        assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+        assert_eq!(loaded.version, loaded.wire_version());
     }
 
     #[test]
@@ -949,7 +949,7 @@ mod tests {
             let (loaded_bytes, gen) = backend.load_snapshot("test-repo").unwrap().unwrap();
             assert_eq!(gen, 1);
             let loaded = GraphSnapshot::from_bytes(&loaded_bytes).unwrap();
-            assert_eq!(loaded.version, GraphSnapshot::CURRENT_VERSION);
+            assert_eq!(loaded.version, loaded.wire_version());
         }
     }
 

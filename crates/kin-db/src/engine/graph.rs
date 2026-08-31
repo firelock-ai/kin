@@ -4099,7 +4099,12 @@ impl InMemoryGraph {
         ses: SessionData,
     ) -> GraphSnapshot {
         GraphSnapshot {
-            version: GraphSnapshot::CURRENT_VERSION,
+            // This export always sets `materialized_graph: None` below, and a
+            // body with no section serializes as v13, so declaring
+            // CURRENT_VERSION here would build a snapshot `to_bytes` refuses.
+            // The version a snapshot carries is a statement about its own
+            // contents, not about the binary that built it.
+            version: GraphSnapshot::MIN_SUPPORTED_VERSION,
             entities: ent.entities.into_iter().collect(),
             entity_revisions: ent.entity_revisions.into_iter().collect(),
             relations: ent.relations.into_iter().collect(),
