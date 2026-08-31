@@ -9516,7 +9516,7 @@ def assert_dev_image_publish_policy(
         "- canary",
         "- publish",
         "group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.commit || github.sha) || github.sha }}",
-        "if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
+        "if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}",
         "runs-on: ubuntu-latest",
         "id-token: write",
         "persist-credentials: false",
@@ -9932,6 +9932,19 @@ def main() -> None:
             docker_workflow.replace(
                 "(github.event.inputs.commit || github.sha)",
                 "github.run_id",
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "dev image OIDC starts admitting an unreviewed future event",
+        "missing required policy: if:",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                "if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}",
+                "if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
                 1,
             ),
             dev_image_publisher,

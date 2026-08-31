@@ -59,7 +59,7 @@ jobs:
     # above is untouched, so every commit that reaches main still runs it. A
     # manual dispatch from any other ref is skipped before it can mint GCP
     # identity; the supported helper always dispatches the workflow on main.
-    if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+    if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
