@@ -9516,7 +9516,6 @@ def assert_dev_image_publish_policy(
         "- canary",
         "- publish",
         "group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.commit || github.sha) || github.sha }}",
-        "if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}",
         "runs-on: ubuntu-latest",
         "id-token: write",
         "persist-credentials: false",
@@ -9585,6 +9584,23 @@ def assert_dev_image_publish_policy(
     )
     for policy in required_workflow:
         require(workflow, policy, "GitHub-hosted development image publisher")
+
+    expected_job_if = (
+        "if: ${{ (github.event_name == 'push' || "
+        "github.event_name == 'workflow_dispatch') && "
+        "github.ref == 'refs/heads/main' }}"
+    )
+    active_job_conditions = [
+        line.strip()
+        for line in job.splitlines()
+        if re.match(r"^    if:\s+", line)
+        and not line.lstrip().startswith("#")
+    ]
+    if active_job_conditions != [expected_job_if]:
+        raise AssertionError(
+            "development image OIDC requires exactly one active job-level "
+            "push/workflow_dispatch allowlist on refs/heads/main"
+        )
 
     # The GCP exchange and mutation must remain after every image smoke, and the
     # exact source resolver must remain before the one build. This is an order
@@ -9940,11 +9956,33 @@ def main() -> None:
     )
     expect_assertion(
         "dev image OIDC starts admitting an unreviewed future event",
-        "missing required policy: if:",
+        "requires exactly one active job-level",
         lambda: assert_dev_image_publish_policy(
             docker_workflow.replace(
                 "if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}",
                 "if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    safe_dev_image_job_if = (
+        "if: ${{ (github.event_name == 'push' || "
+        "github.event_name == 'workflow_dispatch') && "
+        "github.ref == 'refs/heads/main' }}"
+    )
+    unsafe_dev_image_job_if = (
+        "if: ${{ github.event_name != 'pull_request' && "
+        "github.ref == 'refs/heads/main' }}"
+    )
+    expect_assertion(
+        "a commented safe allowlist compensates for an unsafe active job field",
+        "requires exactly one active job-level",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                f"    {safe_dev_image_job_if}",
+                f"    {unsafe_dev_image_job_if}\n    # {safe_dev_image_job_if}",
                 1,
             ),
             dev_image_publisher,
