@@ -3664,6 +3664,10 @@ def check_25(suite):
                         (label, ", ".join(malformed),
                          json.dumps(payload, sort_keys=True)[:400]))
             return None
+        if not re.fullmatch(r"[0-9a-f]{64}", payload["resolved_at"]):
+            res.unknown("%s returned a non-canonical base target %r" %
+                        (label, payload["resolved_at"]))
+            return None
         if payload["schema"] != "kin.graph-section-materialization.v1":
             res.unknown("%s returned unknown schema %r" %
                         (label, payload["schema"]))

@@ -39,8 +39,40 @@ pub struct GraphSectionMaterialization {
     pub workspace_id: WorkspaceId,
     pub state: GraphSectionMaterializationState,
     pub authority_generation: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_semantic_change_id_hex"
+    )]
     pub resolved_at: Option<SemanticChangeId>,
+}
+
+mod optional_semantic_change_id_hex {
+    use kin_model::{Hash256, SemanticChangeId};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<SemanticChangeId>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_some(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<SemanticChangeId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| {
+                Hash256::from_hex(&value)
+                    .map(SemanticChangeId::from_hash)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -547,6 +579,25 @@ mod tests {
         assert_eq!(json["state"], "no_base_target");
         assert_eq!(json["authority_generation"], 3);
         assert!(json.get("resolved_at").is_none());
+    }
+
+    #[test]
+    fn graph_section_materialization_json_names_the_base_target_as_hex() {
+        let resolved_at = SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x29; 32]));
+        let outcome = GraphSectionMaterialization::from_kin_db(
+            RepositoryId::new("graph-section-test").unwrap(),
+            WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x31)),
+            MaterializedGraphSectionOutcome::AlreadyCurrent {
+                resolved_at,
+                authority_generation: 4,
+            },
+        );
+
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["resolved_at"], "29".repeat(32));
+
+        let round_trip: GraphSectionMaterialization = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, outcome);
     }
 
     #[test]
