@@ -319,15 +319,21 @@
       ]
     },
     {
+      "file": "crates/kin-daemon-spawn/src/runtime_authority.rs",
+      "reason": "Shared per-repository runtime capability boundary. try_acquire_repository_runtime_authority canonicalizes the exact .kin root before it opens the never-unlinked daemon.lock and daemon.lifecycle inodes, so a capability acquired for one repository cannot be replayed while opening another. It writes only the caller-owned opaque process stamp after the exclusive lock is held and answers no repository query. Function-scoped so the owner-stamp validation, retry policy, public wrappers, Drop behavior, and any newly added filesystem access remain scanned by default.",
+      "owner": "kin-daemon-spawn",
+      "expiration": "2026-12-31",
+      "allow_fn": [
+        "try_acquire_repository_runtime_authority"
+      ]
+    },
+    {
       "file": "crates/kin-daemon/src/lifecycle.rs",
-      "reason": "Daemon lifecycle boundary: starting, finding, and stopping the process that holds graph authority. Five classes, all excused per function. Singleton coordination: the lock file, its owner stamp, and the guards that decide whether this process may become the daemon. Endpoint publication and ownership: the pid, port, and owner components are written atomically, read back, and removed only after owner-bound proof; the named ownership helpers make that proof independently testable without adding query authority. Binary resolution and liveness: locating and validating the exact kin-daemon executable and probing whether an endpoint is answering before spawning another. Bounded macOS process ownership: the private launchctl capture, stable process-group guardian, deadline, and cleanup helpers. Platform registration and migration: the digest-addressed LaunchAgent plist, exact legacy-authority inspection, staged replacement, rollback, and non-macOS no-op counterparts, which is why two public names carry a count of two. Every path here reaches, supervises, or registers the authority and answers no repository query. The expression pins are process/file handle declarations and the capture file's Drop cleanup; none produces an answer. Function-scoped so the remainder of the module stays scanned.",
+      "reason": "Daemon lifecycle boundary: starting, finding, and stopping the process that holds graph authority. Five classes, all excused per function. Singleton coordination: the lock owner reader and short-lived lifecycle guards that serialize endpoint operations beside the shared runtime capability. Endpoint publication and ownership: the pid, port, and owner components are written atomically, read back, and removed only after owner-bound proof; the named ownership helpers make that proof independently testable without adding query authority. Binary resolution and liveness: locating and validating the exact kin-daemon executable and probing whether an endpoint is answering before spawning another. Bounded macOS process ownership: the private launchctl capture, stable process-group guardian, deadline, and cleanup helpers. Platform registration and migration: the digest-addressed LaunchAgent plist, exact legacy-authority inspection, staged replacement, rollback, and non-macOS no-op counterparts, which is why two public names carry a count of two. Every path here reaches, supervises, or registers the authority and answers no repository query. The expression pins are the process handle declaration and the capture file's Drop cleanup; neither produces an answer. Function-scoped so the remainder of the module stays scanned.",
       "owner": "kin-daemon",
       "expiration": "2026-12-31",
       "allow_fn": [
-        "stamp_lock_owner",
-        "current_owner_stamp",
         "read_lock_owner_stamp",
-        "acquire_singleton_lock_inner_until_with_coordination_hook",
         "acquire_singleton_coordination_guard",
         "acquire_singleton_coordination_guard_until",
         "acquire_singleton_coordination_guard_until_with_hook",
@@ -371,8 +377,7 @@
       ],
       "allow_match": [
         "use std::process::{Child, Command, ExitStatus, Output, Stdio};",
-        "let _ = std::fs::remove_file(&self.path);",
-        "file: std::fs::File,"
+        "let _ = std::fs::remove_file(&self.path);"
       ]
     },
     {
