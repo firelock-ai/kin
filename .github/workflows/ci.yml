@@ -124,6 +124,8 @@ jobs:
       - name: Test release ordering and npm provenance policy
         run: |
           python3 ./scripts/test-release-workflow-authority.py
+          bash ./scripts/test-publish-dev-container.sh
+          bash ./scripts/kin-dev-image.test.sh
           python3 ./scripts/test-kin-registry-release-receiver.py
           python3 ./scripts/test_install_optional_vfs.py
           python3 ./scripts/test_installer_parity.py
@@ -169,6 +171,10 @@ jobs:
           node --check ./scripts/verify-capability-proof.mjs
           node --check ./scripts/verify-npm-attestation.mjs
           bash -n ./scripts/publish-npm-release.sh
+          bash -n ./scripts/publish-dev-container.sh
+          bash -n ./scripts/kin-dev-image
+          bash -n ./scripts/test-publish-dev-container.sh
+          bash -n ./scripts/kin-dev-image.test.sh
           bash -n ./scripts/verify-npm-release.sh
           bash -n ./scripts/assert-windows-init-contract.sh
           bash -n ./scripts/windows-authority-legs.sh

@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# Cloud Build config for kin repo.
+# Legacy manual Cloud Build fallback for the kin repo. The normal development
+# image path is `.github/workflows/docker.yml`: the public repository builds on
+# a standard GitHub-hosted runner, smokes the image, and pushes that exact image
+# through a least-privilege OIDC writer. Keep this file for provider recovery,
+# but do not attach it to a per-push trigger.
 #
 # Tagging strategy:
 #   Every push:    {image}:{COMMIT_SHA} + {image}:{sanitized-branch}  (candidate)
@@ -12,8 +16,8 @@
 # GitHub release workflow so package publication follows the release path rather
 # than the push-to-main dev build path.
 #
-# Build cache: each hosted build runs on a fresh VM, so the local layer cache is
-# always empty and every push recompiled the whole Rust dependency graph. The
+# Fallback cache: each Cloud Build VM is fresh, so the local layer cache is
+# empty and an invocation would recompile the whole Rust dependency graph. The
 # Dockerfile now splits dependency compilation into a `cargo chef cook` layer
 # keyed only on the dependency recipe, and the buildx registry cache below is
 # what carries that layer between builds. The two changes are one mechanism:

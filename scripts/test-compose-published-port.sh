@@ -30,7 +30,7 @@ set -euo pipefail
 
 IMAGE="${1:?usage: test-compose-published-port.sh <image-ref> [host-port]}"
 HOST_PORT="${2:-14219}"
-COMPOSE_FILE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yml"
+COMPOSE_FILE="${KIN_COMPOSE_FILE:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/docker-compose.yml}"
 CID=""
 
 cleanup() {

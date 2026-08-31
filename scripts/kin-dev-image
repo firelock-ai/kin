@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Firelock, LLC
+
+# Local-first daemon image loop plus a narrow exact-SHA hosted publisher.
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+GIT="${KIN_DEV_IMAGE_GIT:-git}"
+DOCKER="${KIN_DEV_IMAGE_DOCKER:-docker}"
+GH="${KIN_DEV_IMAGE_GH:-gh}"
+UPSTREAM_REPOSITORY="firelock-ai/kin"
+
+usage() {
+  cat >&2 <<'EOF'
+usage:
+  scripts/kin-dev-image local [image-tag]
+  scripts/kin-dev-image canary [40-hex-commit]
+  scripts/kin-dev-image hosted [40-hex-commit]
+
+local   Build the current checkout locally (default tag: kin:dev). Clean
+        checkouts carry exact source identity; dirty checkouts stay explicitly
+        unknown/dirty.
+canary Dispatch a fresh gha-canary-<commit> upload for cutover proof. It never
+        promotes main or staging-latest.
+hosted Dispatch the GitHub-hosted dev image publisher for an exact commit
+        already reachable from origin/main. The workflow itself always runs
+        from main. It uses the immutable full-SHA tag and returns the exact
+        digest operators should consume. Neither hosted mode writes aliases.
+EOF
+  exit 2
+}
+
+command="${1:-}"
+case "$command" in
+  local)
+    if [ "$#" -gt 2 ]; then usage; fi
+    image="${2:-kin:dev}"
+    sha="$($GIT -C "$ROOT" rev-parse HEAD)"
+    branch="$($GIT -C "$ROOT" symbolic-ref --quiet --short HEAD 2>/dev/null || printf 'detached')"
+    dirty="$($GIT -C "$ROOT" status --porcelain --untracked-files=all)"
+    build_args=(
+      buildx build
+      --load
+      --file "$ROOT/Dockerfile"
+      --tag "$image"
+      --build-arg KIN_DB_REF=main
+      --build-arg KIN_LTO=thin
+    )
+    if [ -z "$dirty" ]; then
+      build_args+=(
+        --build-arg "KIN_BUILD_GIT_SHA=${sha}"
+        --build-arg "KIN_BUILD_DIRTY=false"
+        --build-arg "KIN_BUILD_BRANCH=${branch}"
+      )
+    else
+      echo "Building dirty checkout with unknown/dirty embedded source identity" >&2
+    fi
+    "$DOCKER" "${build_args[@]}" "$ROOT"
+    if [ -z "$dirty" ]; then
+      (cd "$ROOT" && bash scripts/verify-container-build-info.sh "$image" "$sha")
+    fi
+    echo "Built local daemon image: $image"
+    ;;
+
+  canary|hosted)
+    if [ "$#" -gt 2 ]; then usage; fi
+    if [ "$command" = canary ]; then
+      mode=canary
+    else
+      mode=publish
+    fi
+    requested="${2:-$($GIT -C "$ROOT" rev-parse HEAD)}"
+    if ! printf '%s\n' "$requested" | grep -Eq '^[0-9a-f]{40}$'; then
+      echo "error: hosted publish requires a full lowercase 40-hex commit" >&2
+      exit 2
+    fi
+
+    origin="$($GIT -C "$ROOT" remote get-url origin)"
+    case "$origin" in
+      git@github.com:firelock-ai/kin.git|https://github.com/firelock-ai/kin.git|https://github.com/firelock-ai/kin)
+        ;;
+      *)
+        echo "error: origin '$origin' is not the canonical $UPSTREAM_REPOSITORY repository" >&2
+        exit 1
+        ;;
+    esac
+
+    "$GIT" -C "$ROOT" fetch --quiet origin main
+    resolved="$($GIT -C "$ROOT" rev-parse "${requested}^{commit}")"
+    if [ "$resolved" != "$requested" ]; then
+      echo "error: requested commit resolved to $resolved instead of itself" >&2
+      exit 1
+    fi
+    if ! "$GIT" -C "$ROOT" merge-base --is-ancestor "$resolved" origin/main; then
+      echo "error: $resolved is not reachable from origin/main; push and land it first" >&2
+      exit 1
+    fi
+
+    prior_runs="$(mktemp)"
+    "$GH" run list \
+      --repo "$UPSTREAM_REPOSITORY" \
+      --workflow docker.yml \
+      --event workflow_dispatch \
+      --limit 100 \
+      --json databaseId \
+      --jq '.[].databaseId' > "$prior_runs"
+
+    "$GH" workflow run docker.yml \
+      --repo "$UPSTREAM_REPOSITORY" \
+      --ref main \
+      -f "commit=${resolved}" \
+      -f "mode=${mode}"
+    echo "Dispatched ${mode} GitHub-hosted dev image run for $resolved"
+
+    run_id=""
+    run_url=""
+    expected_title="Dev image ${mode} ${resolved}"
+    for _ in $(seq 1 30); do
+      rows="$($GH run list \
+        --repo "$UPSTREAM_REPOSITORY" \
+        --workflow docker.yml \
+        --event workflow_dispatch \
+        --limit 100 \
+        --json databaseId,displayTitle,url,status \
+        --jq '.[] | [.databaseId, .displayTitle, .url, .status] | @tsv')"
+      while IFS=$'\t' read -r candidate_id candidate_title candidate_url _status; do
+        [ "$candidate_title" = "$expected_title" ] || continue
+        if ! grep -Fxq "$candidate_id" "$prior_runs"; then
+          run_id="$candidate_id"
+          run_url="$candidate_url"
+          break
+        fi
+      done <<< "$rows"
+      [ -z "$run_id" ] || break
+      sleep 2
+    done
+    rm -f "$prior_runs"
+    if [ -z "$run_id" ] || [ -z "$run_url" ]; then
+      echo "error: dispatched workflow did not surface as '$expected_title'" >&2
+      exit 1
+    fi
+
+    echo "KIN_DEV_IMAGE_RUN id=$run_id url=$run_url"
+    if ! "$GH" run watch "$run_id" \
+      --repo "$UPSTREAM_REPOSITORY" \
+      --exit-status \
+      --interval 10; then
+      echo "error: hosted dev image run failed: $run_url" >&2
+      exit 1
+    fi
+
+    proof=""
+    for _ in $(seq 1 5); do
+      logs="$($GH run view "$run_id" --repo "$UPSTREAM_REPOSITORY" --log)"
+      proof_line="$(printf '%s\n' "$logs" \
+        | grep -F "KIN_DEV_IMAGE_PROOF mode=${mode} source=${resolved} " \
+        | tail -1 || true)"
+      if [ -n "$proof_line" ]; then
+        proof="${proof_line#*KIN_DEV_IMAGE_PROOF }"
+        break
+      fi
+      sleep 2
+    done
+    if [ "$mode" = canary ]; then
+      expected_reference="us-central1-docker.pkg.dev/kin-ecosystem/kin-dev/kin-daemon:gha-canary-${resolved}"
+      proof_pattern="^mode=canary source=${resolved} reference=${expected_reference} digest=sha256:[0-9a-f]{64} publication=published aliases_promoted=false readback=true embedded_sha=true transport=github-hosted$"
+      proof_error="a fresh GitHub canary publication"
+    else
+      expected_reference="us-central1-docker.pkg.dev/kin-ecosystem/kin-dev/kin-daemon:${resolved}"
+      proof_pattern="^mode=publish source=${resolved} reference=${expected_reference} digest=sha256:[0-9a-f]{64} publication=(published|verified_existing) aliases_promoted=false readback=true embedded_sha=true transport=github-hosted$"
+      proof_error="an exact-SHA GitHub publication"
+    fi
+    if ! printf '%s\n' "$proof" | grep -Eq "$proof_pattern"; then
+      echo "error: hosted run completed without ${proof_error} proof: $run_url" >&2
+      exit 1
+    fi
+    echo "KIN_DEV_IMAGE_PROOF $proof"
+    ;;
+
+  *) usage ;;
+esac
