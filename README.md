@@ -174,6 +174,9 @@ exec "$SHELL" -l
 kin setup --intent agent
 ```
 
+Use `kin setup --intent editor` for the VS Code path. Confirm the resulting
+machine-readable health checklist with `kin setup status --json`.
+
 The installer resolves the [latest stable release](https://github.com/firelock-ai/kin/releases/latest),
 verifies its published SHA-256 checksum, installs the managed binaries under
 `~/.kin`, and launches setup. Running the explicit `agent` intent configures the
@@ -309,6 +312,7 @@ Lua, R, Zig, Haskell, and Nix. If your language is on that list, `locate` and
 kin locate "where are webhook retries handled"
 kin refs ExactEntityName
 kin trace ExactEntityName
+kin overview
 ```
 
 Replace `ExactEntityName` with a symbol returned by `locate`. `locate` finds the

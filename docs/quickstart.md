@@ -133,6 +133,12 @@ for your **intent** rather than a bag of independent toggles:
 | **Hosted / KinLab** | Local setup, plus this machine's KinLab sign-in state and the commands that change it (see below). |
 | **Advanced / manual** | Choose shell, per-client MCP, and daemon options yourself. |
 
+To configure the editor path directly:
+
+```sh
+kin setup --intent editor
+```
+
 You can pre-select non-interactively (handy in scripts / CI):
 
 ```sh
@@ -334,6 +340,12 @@ derived runtime enrichment that has not become repository authority.
 kin status
 ```
 
+### Orient to the graph
+
+```sh
+kin overview
+```
+
 ### Commit changes
 
 Save a new semantic change snapshot:
@@ -410,6 +422,30 @@ Rank the files most relevant to a problem description:
 ```sh
 kin locate "users can't reset their password" --explain
 ```
+
+### Run the checked fixture query
+
+Kin's bounded onboarding smoke copies the readable
+[quickstart checkout fixture](../crates/kin-cli/tests/fixtures/quickstart/checkout.py)
+into a temporary repository, initializes it, and uses this exact graph query:
+
+```sh
+kin locate "apply_quickstart_discount"
+kin refs apply_quickstart_discount
+```
+
+The smoke then resolves `refs` from the entity ID returned by `locate`. It runs
+without background embedding and has a 120-second wall-clock limit. This is an
+onboarding check, not benchmark evidence or a performance claim.
+
+### Review a branch range
+
+```sh
+kin review shadow "$(git rev-parse BASE_BRANCH)..$(git rev-parse HEAD)"
+```
+
+Replace `BASE_BRANCH` with the branch you want to compare, and run `kin init`
+after both commits exist so the exact SHAs are part of Kin's imported graph.
 
 ---
 
