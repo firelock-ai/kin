@@ -1487,6 +1487,12 @@ enum GraphAction {
     Status,
     /// Structural integrity validation
     Validate,
+    /// Persist the current workspace base graph section for faster reopen
+    Materialize {
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Look up an entity by name and show its relations
     Inspect {
         /// Entity name or UUID to inspect
@@ -3567,6 +3573,7 @@ fn main() -> Result<()> {
                 Command::Graph { action } => match action {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
+                    GraphAction::Materialize { json } => commands::graph::materialize(json).await,
                     GraphAction::Inspect { name, json } => {
                         commands::graph::inspect(name, json).await
                     }

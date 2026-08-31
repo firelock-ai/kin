@@ -27,7 +27,6 @@ pub struct GraphCommandResponse {
     pub lines: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<GraphSourceRecord>,
     /// Reference-edge completeness, per language, for the status and validate
     /// surfaces.
@@ -171,6 +170,22 @@ fn append_hydration_semantics_line(
 pub async fn validate() -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Validate).await?)
+}
+
+/// `kin graph materialize` — persist the current workspace base graph section.
+///
+/// This is an explicit representation rewrite. It preserves semantic roots and
+/// logical authority generation while making future workspace-base reopens
+/// reuse the complete graph section instead of folding history again.
+pub async fn materialize(json: bool) -> Result<()> {
+    let layout = crate::commands::require_repository_layout()?;
+    let materialization = super::repository_authority::materialize_workspace_base_offline(&layout)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&materialization)?);
+        return Ok(());
+    }
+    println!("{}", materialization.human_line());
+    Ok(())
 }
 
 /// `kin graph inspect <entity>` — look up an entity (by name or UUID) and show its relations.
