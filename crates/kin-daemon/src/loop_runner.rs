@@ -2006,13 +2006,12 @@ async fn park_reconcile_loop(
 /// The loop runs on a tokio task and shares state through `DaemonState`.
 /// The reconcile loop's one-shot promise that its file watcher exists.
 ///
-/// Fired on arming, and fired again on drop if the loop never got that far.
-/// Drop-firing is the whole safety argument for making endpoint publication
-/// wait on it. A loop can end before it ever builds a watcher — filesystem
-/// reconcile switched off, a bare checkout, a watcher the host refused — and a
-/// daemon that waited on a signal none of those paths sends would never publish
-/// its endpoint at all, which is a worse failure than the unobserved window
-/// this exists to close.
+/// Fired only after the watcher exists. Dropping it without firing closes the
+/// channel, which tells endpoint publication that no watch exists rather than
+/// fabricating an `Armed` result. A loop can end before it ever builds a watcher
+/// — filesystem reconcile switched off, a bare checkout, a watcher the host
+/// refused — and a daemon that waited on a channel none of those paths closes
+/// would never publish its endpoint at all.
 #[derive(Debug)]
 pub struct WatchArmed(Option<tokio::sync::oneshot::Sender<()>>);
 
@@ -2026,12 +2025,6 @@ impl WatchArmed {
         if let Some(signal) = self.0.take() {
             let _ = signal.send(());
         }
-    }
-}
-
-impl Drop for WatchArmed {
-    fn drop(&mut self) {
-        self.arm();
     }
 }
 
@@ -2434,15 +2427,16 @@ pub async fn run_loop_armed(
     cancel: tokio::sync::watch::Receiver<bool>,
     armed: Option<WatchArmed>,
 ) -> Result<()> {
-    // Held for the whole body so every early return below still releases the
-    // daemon, through `WatchArmed`'s drop rather than through a call each of
-    // those paths would have to remember.
+    // Held for the whole body so an early return closes the channel and releases
+    // endpoint publication as a no-watch outcome. The two branches that park
+    // instead of returning must release it explicitly before they wait.
     let mut armed = armed;
     if state.filesystem_reconcile_disabled() {
         info!(
             env = DISABLE_FILESYSTEM_RECONCILE_ENV,
             "filesystem watcher and reconciliation loop disabled; remote graph remains authoritative"
         );
+        drop(armed.take());
         let mut cancel = cancel;
         while !*cancel.borrow() {
             if cancel.changed().await.is_err() {
@@ -2455,9 +2449,12 @@ pub async fn run_loop_armed(
     let working_dir = state.layout.working_dir();
     if is_bare_repository(working_dir) {
         info!(working_dir = %working_dir.display(), "working directory is a bare Git repository; reconciliation loop disabled");
+        drop(armed.take());
         let mut cancel = cancel;
-        tokio::select! {
-            _ = cancel.changed() => {}
+        while !*cancel.borrow() {
+            if cancel.changed().await.is_err() {
+                break;
+            }
         }
         return Ok(());
     }
@@ -7225,20 +7222,19 @@ mod tests {
         );
     }
 
-    /// FIR-2466. The daemon may not publish its endpoint on a promise the loop
-    /// never keeps, so the signal fires even when the loop never reaches its
-    /// watcher.
+    /// FIR-2466. Only a real watcher may report `Armed`. A loop that ends before
+    /// building one closes the channel, which releases endpoint publication as
+    /// a no-watch result instead of making a false readiness promise.
     #[test]
-    fn a_watch_signal_fires_on_drop_when_the_loop_never_arms() {
+    fn an_unarmed_watch_signal_closes_without_reporting_a_watch() {
         let (tx, mut rx) = tokio::sync::oneshot::channel();
         {
             let _armed = WatchArmed::new(tx);
         }
         assert_eq!(
             rx.try_recv(),
-            Ok(()),
-            "a dropped WatchArmed must release the daemon; a loop that ends before building a \
-             watcher would otherwise hold the endpoint back forever"
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed),
+            "a dropped WatchArmed must release the daemon without claiming a watcher exists"
         );
     }
 
@@ -7252,6 +7248,167 @@ mod tests {
         armed.arm();
         drop(armed);
         assert_eq!(rx.try_recv(), Ok(()), "the arm reaches the daemon");
+    }
+
+    /// A graph-only daemon deliberately keeps its reconciliation task alive so
+    /// shutdown still has one ordinary task to drain. That parked task cannot
+    /// keep endpoint publication behind the watch-arming bound, and it cannot
+    /// claim a watcher exists when the deployment explicitly disabled it.
+    #[tokio::test]
+    async fn a_disabled_reconcile_loop_declines_the_watch_before_it_parks() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state
+            .filesystem_reconcile_disabled
+            .store(true, Ordering::Relaxed);
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let mut handle = tokio::spawn(run_loop_armed(
+            state,
+            LoopConfig::default(),
+            cancel_rx,
+            Some(WatchArmed::new(armed_tx)),
+        ));
+
+        assert_eq!(
+            crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(1)).await,
+            crate::daemon::WatchArming::LoopGone,
+            "a disabled loop has no watcher to wait for and must not report one"
+        );
+        assert!(
+            !handle.is_finished(),
+            "declining the watcher must not end the parked reconciliation task"
+        );
+
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .expect("the disabled loop must still drain on shutdown")
+            .expect("the disabled loop task must not panic")
+            .expect("the disabled loop must exit cleanly");
+    }
+
+    /// A bare repository has no working copy and therefore no useful watcher,
+    /// but its reconciliation task is parked for the same shutdown semantics as
+    /// graph-only mode. Endpoint publication must learn that immediately.
+    #[tokio::test]
+    async fn a_bare_repository_declines_the_watch_before_it_parks() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir();
+        assert!(
+            !root.join(".git").exists(),
+            "the fixture must not hide a bare repository behind a worktree marker"
+        );
+        std::fs::write(root.join("config"), "[core]\n\tbare = true\n").unwrap();
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        std::fs::create_dir_all(root.join("refs")).unwrap();
+        assert!(
+            is_bare_repository(root),
+            "the control must be a bare repository"
+        );
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let mut handle = tokio::spawn(run_loop_armed(
+            state,
+            LoopConfig::default(),
+            cancel_rx,
+            Some(WatchArmed::new(armed_tx)),
+        ));
+
+        assert_eq!(
+            crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(1)).await,
+            crate::daemon::WatchArming::LoopGone,
+            "a bare repository has no watcher to wait for and must not report one"
+        );
+        assert!(
+            !handle.is_finished(),
+            "declining the watcher must not end the parked reconciliation task"
+        );
+
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .expect("the bare loop must still drain on shutdown")
+            .expect("the bare loop task must not panic")
+            .expect("the bare loop must exit cleanly");
+    }
+
+    /// Control for both shortcut branches above. A working-copy daemon must
+    /// keep the FIR-2466 ordering guarantee and report only after the real
+    /// watcher exists.
+    #[tokio::test]
+    async fn an_enabled_reconcile_loop_still_reports_its_real_watch() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        state
+            .filesystem_reconcile_disabled
+            .store(false, Ordering::Relaxed);
+
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let mut handle = tokio::spawn(run_loop_armed(
+            state,
+            LoopConfig::default(),
+            cancel_rx,
+            Some(WatchArmed::new(armed_tx)),
+        ));
+
+        assert_eq!(
+            crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(5)).await,
+            crate::daemon::WatchArming::Armed,
+            "a working-copy loop must not take the no-watch shortcut"
+        );
+        assert!(
+            !handle.is_finished(),
+            "the watcher control must exercise a running reconciliation loop"
+        );
+
+        cancel_tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .expect("the enabled loop must drain on shutdown")
+            .expect("the enabled loop task must not panic")
+            .expect("the enabled loop must exit cleanly");
+    }
+
+    /// A shutdown signal may arrive before a bare loop gets its first poll. The
+    /// branch must observe the value already held by the watch receiver rather
+    /// than wait forever for a second change that will never come.
+    #[tokio::test]
+    async fn an_already_cancelled_bare_loop_returns_after_declining_its_watch() {
+        let repo = tempfile::tempdir().unwrap();
+        let state = open_test_state(&repo);
+        let root = state.layout.working_dir();
+        std::fs::write(root.join("config"), "[core]\n\tbare = true\n").unwrap();
+        std::fs::create_dir_all(root.join("objects")).unwrap();
+        std::fs::create_dir_all(root.join("refs")).unwrap();
+        assert!(
+            is_bare_repository(root),
+            "the control must be a bare repository"
+        );
+
+        let (_cancel_tx, cancel_rx) = tokio::sync::watch::channel(true);
+        let (armed_tx, armed_rx) = tokio::sync::oneshot::channel();
+        let mut handle = tokio::spawn(run_loop_armed(
+            state,
+            LoopConfig::default(),
+            cancel_rx,
+            Some(WatchArmed::new(armed_tx)),
+        ));
+
+        assert_eq!(
+            crate::daemon::await_watch_armed(armed_rx, Duration::from_secs(1)).await,
+            crate::daemon::WatchArming::LoopGone,
+            "an already-cancelled bare loop still has no watcher to report"
+        );
+        tokio::time::timeout(Duration::from_secs(5), &mut handle)
+            .await
+            .expect("the already-cancelled bare loop must not wait for a second signal")
+            .expect("the already-cancelled bare loop task must not panic")
+            .expect("the already-cancelled bare loop must exit cleanly");
     }
 
     /// A store that records no complete admission names no window, so the loop
