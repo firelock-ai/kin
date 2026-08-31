@@ -177,6 +177,135 @@ fn persisted_record(layout: &kin_core::KinLayout) -> Option<kin_model::MergeTran
     record
 }
 
+/// Advance the workspace through the same transaction shape the language-server
+/// enrichment worker uses: semantic authority moves while the workspace tree
+/// does not. This is the counter-move arm the one-file CLI fixture cannot make
+/// its real enrichment sweep produce on demand.
+fn publish_non_user_semantic_move(
+    layout: &kin_core::KinLayout,
+) -> (
+    kin_model::WorkspaceState,
+    kin_model::WorkspaceState,
+    kin_model::RelationId,
+) {
+    let manager = open_authority(layout);
+    let lease = manager.read_authority();
+    let roots = lease.roots().clone();
+    let before = lease
+        .metadata()
+        .workspaces
+        .first()
+        .expect("the converted repository has one workspace")
+        .clone();
+    let graph = lease
+        .workspace_graph_snapshot(&before.workspace_id)
+        .expect("resolve the workspace graph")
+        .expect("the workspace graph exists");
+    let mut entity_ids = graph
+        .entities
+        .values()
+        .map(|entity| entity.id)
+        .collect::<Vec<_>>();
+    entity_ids.sort();
+    assert!(
+        entity_ids.len() >= 2,
+        "the non-user semantic producer needs two real entity endpoints, got {}",
+        entity_ids.len()
+    );
+    let relation = kin_model::Relation {
+        id: kin_model::RelationId::new(),
+        kind: kin_model::RelationKind::Calls,
+        src: kin_model::GraphNodeId::Entity(entity_ids[0]),
+        dst: kin_model::GraphNodeId::Entity(entity_ids[1]),
+        confidence: 1.0,
+        origin: kin_model::RelationOrigin::Lsp,
+        created_in: None,
+        import_source: None,
+        evidence: Vec::new(),
+    };
+    let semantic_delta = kin_model::WorkspaceSemanticDelta::new(
+        Vec::new(),
+        vec![kin_model::RelationDelta::Added {
+            new: relation.clone(),
+        }],
+    )
+    .expect("one LSP relation is a valid semantic transition");
+    let transaction = kin_model::RepositoryTransaction {
+        schema_version: kin_model::REPOSITORY_TRANSACTION_SCHEMA_VERSION,
+        operation_id: kin_model::OperationId::new(),
+        repository_id: repository_id(layout),
+        expected_generation: roots.generation,
+        expected_roots: roots,
+        actor: kin_model::AuthorId::new("kin-lsp-test-producer"),
+        reason: "publish a non-user semantic move while a merge is parked".to_string(),
+        external_objects: Vec::new(),
+        changes: Vec::new(),
+        aliases: Vec::new(),
+        git_authority_delta: None,
+        ref_mutations: Vec::new(),
+        default_ref_mutation: None,
+        workspace_mutation: Some(kin_model::WorkspaceMutation {
+            workspace_id: before.workspace_id,
+            expected: kin_model::WorkspaceExpectation::MustEqual {
+                generation: before.generation,
+                head: before.head.clone(),
+                base_target: before.base_target.clone(),
+                base_tree_hash: before.base_tree_hash,
+                tree_hash: before.tree_hash,
+                semantic_overlay_hash: before.semantic_overlay_hash,
+                admission_policy: before.admission_policy,
+            },
+            new_generation: before.generation + 1,
+            new_head: before.head.clone(),
+            new_base_target: before.base_target.clone(),
+            new_base_tree_hash: before.base_tree_hash,
+            tree_deltas: Vec::new(),
+            new_tree_hash: before.tree_hash,
+            semantic_delta,
+            new_shared_admission_policy: before.shared_admission_policy.clone(),
+            new_admission_policy: before.admission_policy,
+        }),
+        local_overlay_delta: None,
+        merge_transaction_delta: None,
+        sealed_observation: None,
+    };
+    drop(lease);
+    manager
+        .commit_repository_transaction(transaction)
+        .expect("the non-user semantic producer advances authority");
+
+    let lease = manager.read_authority();
+    let after = lease
+        .metadata()
+        .workspaces
+        .first()
+        .expect("the workspace survives the semantic move")
+        .clone();
+    let after_graph = lease
+        .workspace_graph_snapshot(&after.workspace_id)
+        .expect("resolve the advanced workspace graph")
+        .expect("the advanced workspace graph exists");
+    assert!(
+        after_graph.relations.contains_key(&relation.id),
+        "the counter moved because a real non-user relation was published"
+    );
+    assert_eq!(
+        after.generation,
+        before.generation + 1,
+        "the non-user producer advances the workspace generation exactly once"
+    );
+    assert_eq!(
+        after.tree_hash, before.tree_hash,
+        "semantic enrichment must not move the workspace tree"
+    );
+    assert_ne!(
+        after.semantic_overlay_hash, before.semantic_overlay_hash,
+        "the generation move must carry real semantic work rather than be a no-op fixture"
+    );
+    drop(lease);
+    (before, after, relation.id)
+}
+
 fn change_parents(
     layout: &kin_core::KinLayout,
     change: &SemanticChangeId,
@@ -530,6 +659,152 @@ fn a_resolved_merge_publishes_ordered_parents_and_advances_only_the_target_ref()
 }
 
 /// Aborting proves the workspace equals the restore point the merge recorded,
+/// Abandoning a merge works from a workspace that has moved, because it
+/// restores nothing.
+///
+/// The rc063a stranger hand-edited a conflicted file and every exit refused:
+/// `resolve --continue`, `resolve --abort` and `merge` all answered 409 while
+/// `status` and `conflicts` kept advertising the merge, and `stash push --yes`
+/// followed by `stash pop` both succeeded and left it exactly as parked. The
+/// only recovery was `kin checkout --change`.
+///
+/// The gate that refused the abort compared the whole restore point, and it was
+/// protecting a sentence rather than an operation: abort's transaction carries
+/// no workspace mutation, no ref mutation and no changes, and its execution
+/// hands the finalizer the same tree twice with an empty delta.
+///
+/// So this asserts the property that makes unblocking it safe, rather than
+/// asserting that it now succeeds and stopping there: the bytes on disk are
+/// untouched, and the line says the workspace moved instead of claiming it is
+/// unchanged. A version that abandoned the merge AND reverted the caller's edit
+/// would pass a success-only test and lose their work.
+#[test]
+fn aborting_a_merge_from_a_moved_workspace_abandons_it_and_restores_nothing() {
+    let root = tempdir().expect("temp root");
+    let repo = conflicting_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    let parked = persisted_record(&layout).expect("the merge is parked");
+
+    // Move the workspace the way a caller does: edit the conflicted file by
+    // hand, then let the daemon see it. `kin status` is what the stranger ran.
+    let edited = b"pub fn base(count: u64) {}\npub fn mate() {}\n// hand merged\n";
+    fs::write(repo.join("src/lib.rs"), edited).expect("hand edit the conflicted file");
+    ok(&run_kin(&runtime, &repo, &["status"]), "kin status");
+    let moved = persisted_record(&layout).expect("the merge is still parked after the edit");
+    assert_eq!(
+        moved.restore, parked.restore,
+        "the record's saved restore point never moves; the WORKSPACE is what moved"
+    );
+
+    let aborted_output = ok(
+        &run_kin(&runtime, &repo, &["resolve", "--abort"]),
+        "kin resolve --abort from a moved workspace",
+    );
+
+    let aborted = persisted_record(&layout).expect("the record is retained as the merge's account");
+    assert!(
+        matches!(
+            aborted.state,
+            kin_model::MergeTransactionState::Aborted { .. }
+        ),
+        "the record terminates as abandoned: {:?}",
+        aborted.state
+    );
+    assert_eq!(
+        fs::read(repo.join("src/lib.rs")).unwrap(),
+        edited,
+        "abandoning a merge must not touch the caller's own edit"
+    );
+    assert!(
+        aborted_output.contains("has moved since the merge opened"),
+        "the line must say the workspace moved rather than claim it is unchanged: \
+         {aborted_output}"
+    );
+    assert!(
+        !aborted_output.contains("is unchanged at the recorded restore point"),
+        "and must not claim the restore point still holds: {aborted_output}"
+    );
+}
+
+/// A non-user semantic producer can advance a parked workspace even when its
+/// tree is unchanged, and that background publication cannot take the abort
+/// door away.
+///
+/// The rc063a stranger saw the enrichment sweep move the workspace generation
+/// while its tree stayed at the merge's base. The compact Python fixture has no
+/// cross-file work for the real sweep to publish, so this arm commits the exact
+/// transaction shape directly: one LSP relation, no tree delta, one workspace
+/// generation. It then reopens the daemon before resolving, so success is read
+/// from durable authority rather than from a manager held across the move.
+#[test]
+fn aborting_after_a_non_user_semantic_move_does_not_wedge() {
+    let root = tempdir().expect("temp root");
+    let repo = shifting_span_repository(root.path());
+    let runtime = common::IsolatedDaemonRuntime::new(&repo);
+    let layout = initialize_kin_repo(&runtime, &repo);
+    parked_merge(
+        &run_kin(&runtime, &repo, &["merge", "feature"]),
+        "kin merge",
+    );
+    let parked = persisted_record(&layout).expect("the merge is parked");
+
+    stop_daemon(&runtime, &repo);
+    let (before, after, relation_id) = publish_non_user_semantic_move(&layout);
+    assert_eq!(
+        before.tree_hash, after.tree_hash,
+        "the arm is the stranger's unchanged-tree state"
+    );
+    assert_eq!(
+        persisted_record(&layout).expect("the merge remains parked through enrichment"),
+        parked,
+        "the non-user producer moves the workspace, not the merge record"
+    );
+
+    let aborted_output = ok(
+        &run_kin_without_enrichment(&runtime, &repo, &["resolve", "--abort"]),
+        "kin resolve --abort after a non-user semantic move",
+    );
+    assert!(
+        aborted_output.contains("has moved since the merge opened"),
+        "the abort names the durable non-user move: {aborted_output}"
+    );
+    let aborted = persisted_record(&layout).expect("the record remains as the merge's account");
+    assert!(
+        matches!(
+            aborted.state,
+            kin_model::MergeTransactionState::Aborted { .. }
+        ),
+        "the counter move cannot keep the merge parked: {:?}",
+        aborted.state
+    );
+
+    let manager = open_authority(&layout);
+    let lease = manager.read_authority();
+    let after_abort = lease
+        .metadata()
+        .workspaces
+        .first()
+        .expect("the workspace survives the abort")
+        .clone();
+    assert_eq!(
+        after_abort, after,
+        "aborting the merge leaves the non-user workspace move exactly as it found it"
+    );
+    let graph = lease
+        .workspace_graph_snapshot(&after_abort.workspace_id)
+        .expect("resolve the post-abort workspace graph")
+        .expect("the post-abort workspace graph exists");
+    assert!(
+        graph.relations.contains_key(&relation_id),
+        "aborting the merge must not discard the durable LSP relation"
+    );
+}
+
 /// moves no ref, and frees the workspace for the next merge.
 #[test]
 fn aborting_a_merge_restores_the_workspace_and_frees_the_next_merge() {

@@ -173,6 +173,22 @@ pub async fn validate() -> Result<()> {
     print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Validate).await?)
 }
 
+/// `kin graph materialize` — persist the current workspace base graph section.
+///
+/// This is an explicit representation rewrite. It preserves semantic roots and
+/// logical authority generation while making future workspace-base reopens
+/// reuse the complete graph section instead of folding history again.
+pub async fn materialize(json: bool) -> Result<()> {
+    let layout = crate::commands::require_repository_layout()?;
+    let materialization = super::repository_authority::materialize_workspace_base_offline(&layout)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&materialization)?);
+        return Ok(());
+    }
+    println!("{}", materialization.human_line());
+    Ok(())
+}
+
 /// `kin graph inspect <entity>` — look up an entity (by name or UUID) and show its relations.
 ///
 /// In `--json` mode, the full `GraphCommandResponse` ({lines, error}) is emitted
@@ -1014,6 +1030,19 @@ fn build_graph_status_response_for_store(
 
     // Warnings
     let mut warnings = health.warnings.clone();
+    // A missing language server is reported above as an indented detail under
+    // the coverage section, which is not where a reader asking "is this graph
+    // trustworthy" looks. Measured on one corpus with and without pyright, it
+    // costs relations rather than entities: 13 against 29, with a whole relation
+    // kind absent. So it belongs on the warning line, carrying the affected file
+    // count the coverage line already computes rather than any estimate of what
+    // a server would have found (FIR-2777).
+    if let Some(missing) = health
+        .reference_edge_coverage
+        .missing_language_server_warning()
+    {
+        warnings.push(missing);
+    }
     let criticals = health.critical_issues.clone();
     let all_relation_count = health
         .semantic_relation_count
@@ -4982,6 +5011,20 @@ mod tests {
             graph_wait_label(&GraphCommandRequest::Source {
                 entity: "Router".to_string()
             }),
+        );
+    }
+
+    #[test]
+    fn graph_response_from_an_older_daemon_may_omit_optional_source() {
+        let response: GraphCommandResponse = serde_json::from_value(serde_json::json!({
+            "lines": ["older daemon response"]
+        }))
+        .unwrap();
+        assert!(response.source.is_none());
+        assert_eq!(response.lines, ["older daemon response"]);
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({"lines": ["older daemon response"]})
         );
     }
 }

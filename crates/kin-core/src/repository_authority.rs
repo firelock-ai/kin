@@ -338,6 +338,37 @@ impl LocalRepositoryAuthorityBinding {
         self.workspace_id
     }
 
+    /// Load exact immutable source bytes from repository CAS **without
+    /// opening the repository authority**.
+    ///
+    /// A content address is enough to reach a body: the read needs the
+    /// retained storage capability and the repository identity, and nothing
+    /// the persisted authority decodes. Opening the authority to reach one is
+    /// how a caller that only wants source text ends up holding the whole
+    /// change map for as long as it keeps the manager, which on a converted
+    /// psf/requests store is 986.6 MiB of encoded changes and about 2.75 GiB
+    /// resident.
+    ///
+    /// Verification is not weakened by taking this route. The backend
+    /// re-verifies the returned bytes against `digest` before returning them,
+    /// fails closed on corruption, and enforces the same
+    /// [`kin_db::MAX_SOURCE_BLOB_BYTES`] boundary the manager passes. Callers
+    /// that hold a tree entry should still validate the body against it, which
+    /// is a claim about the entry rather than about the bytes.
+    ///
+    /// `Ok(None)` means the exact bytes were never persisted. An authority
+    /// path must not repair that from a filesystem or Git fallback.
+    pub fn load_source_blob(
+        &self,
+        digest: [u8; 32],
+    ) -> std::result::Result<Option<Vec<u8>>, kin_db::KinDbError> {
+        self.backend.load_source_blob_bounded(
+            self.repository_id.as_str(),
+            digest,
+            kin_db::MAX_SOURCE_BLOB_BYTES,
+        )
+    }
+
     /// Revalidate the retained storage root and per-repository authority
     /// namespace without acquiring the repository lock or decoding any
     /// snapshot.
@@ -406,6 +437,37 @@ impl LocalRepositoryAuthorityBinding {
     }
 }
 
+// Whole-store repository-authority opens this THREAD has performed.
+//
+// Counted at the funnel below rather than at any one wrapper, and that is the
+// whole point of putting it here: every path into KinDB's recovery reaches that
+// function, so a count taken there is a count for all of them. A counter on one
+// wrapper is a proxy, and a route that opens through a different wrapper moves
+// the thing while leaving the proxy still. kin-daemon already carries a
+// per-wrapper counter and it cannot see an open taken through
+// `LocalRepositoryAuthorityBinding::open_manager`.
+//
+// Per thread, for the reason kin-daemon's own counter is: a test owns its
+// thread, so a concurrent test can neither inflate nor deflate another's
+// reading. A process-wide counter would make every assertion on it flaky under
+// `cargo test`'s default parallelism, which is a test that fails for a reason
+// unrelated to its subject.
+//
+// Always compiled rather than test-only, because an open is O(store) and one
+// thread-local increment beside it is not measurable, and because a crate
+// downstream of this one cannot see a `#[cfg(test)]` item here at all.
+thread_local! {
+    static AUTHORITY_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Whole-store authority opens this thread has performed.
+///
+/// Read it as a delta across the operation under test, never as an absolute:
+/// the thread may have opened before you looked.
+pub fn authority_opens() -> u64 {
+    AUTHORITY_OPENS.with(std::cell::Cell::get)
+}
+
 /// Open an already initialized local repository through one coherent recovery.
 ///
 /// A missing authority record is not a fresh repository when its namespace is
@@ -433,6 +495,7 @@ pub fn open_persisted_local_repository_authority<B: StorageBackend + ?Sized + 's
     // nothing at runtime. Info rather than debug, for the same reason as the
     // wrapper's: the count is what an operator needs when a read is slow, and a
     // level nobody turns on is a line nobody reads.
+    AUTHORITY_OPENS.with(|count| count.set(count.get() + 1));
     let caller = std::panic::Location::caller();
     tracing::info!(
         repository = %repository_id,

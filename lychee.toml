@@ -2,9 +2,21 @@
 timeout = 30
 max_retries = 3
 max_concurrency = 8
+include_fragments = "anchor-only"
+include_verbatim = true
 
 # Badge images are decorative and frequently rate-limited. Their destination
 # links remain checked because only the image host is excluded.
+#
+# The local model endpoint and GitHub release asset prefix are exact code
+# examples rather than public destinations. GitHub's issue chooser redirects
+# anonymous checks to a login page, so a 200 there cannot prove the chooser.
+# Cursor's application deep link is not HTTP and lychee otherwise labels it
+# unsupported. Each is excluded by exact route rather than by host.
 exclude = [
-  "^https://img\\.shields\\.io/"
+  "^https://img\\.shields\\.io/",
+  "^http://localhost:1234/v1$",
+  "^https://github\\.com/firelock-ai/kin/releases/latest/download/$",
+  "^https://github\\.com/firelock-ai/kin/issues/new/choose$",
+  "^cursor://"
 ]

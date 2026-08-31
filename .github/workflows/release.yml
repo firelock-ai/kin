@@ -438,15 +438,10 @@ jobs:
           # Use an Intel host so this archive is executed before packaging;
           # building x86_64 on an arm64 runner would leave it unproven.
           #
-          # The host is Intel, and larger. This row was the release's critical
-          # path: 40m03s on v0.5.40 against 24m46s for the aarch64 row, and
-          # 34m15s of it was the one `cargo build --release` step, which is
-          # 9m20s on linux-aarch64. The workflow treats both macOS rows
-          # identically, so the gap was the runner. macos-15-intel is 4 vCPU and
-          # 14 GB; macos-15-large is the same macOS 15 on Intel with 12 vCPU and
-          # 30 GB, at $0.077 a minute against $0.062, so it is three times the
-          # cores for 1.24 times the rate and a shorter job costs less than the
-          # one it replaces.
+          # Keep this on the standard Intel pool. A tag freezes this workflow,
+          # so a paid or custom label whose budget stops assigning runners can
+          # strand an immutable release. The release authority suite pins the
+          # standard-runner boundary and falsifies the paid-runner regression.
           #
           # Cross-compiling x86_64 from the faster Apple Silicon host was the
           # other candidate and is refused, on provenance rather than on
@@ -463,7 +458,7 @@ jobs:
           # and the vector/embeddings/metal feature assertions all stop running.
           # Staying on Intel keeps RUNNER_ARCH X64, so that guard's X64:x86_64-*
           # arm still matches and nothing else in the job moves.
-          - os: macos-15-large
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             artifact: kin-macos-x86_64
             shim_name: libkin_vfs_shim.dylib

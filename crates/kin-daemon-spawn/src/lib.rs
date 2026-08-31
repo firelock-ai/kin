@@ -40,6 +40,13 @@ use std::process::Command;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+mod runtime_authority;
+
+pub use runtime_authority::{
+    acquire_repository_runtime_authority, acquire_repository_runtime_authority_within,
+    RepositoryRuntimeAuthority, REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
+};
+
 /// The port argument every daemon spawn passes.
 ///
 /// Zero means "bind an ephemeral port and report it", which is what makes the

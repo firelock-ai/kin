@@ -4457,7 +4457,12 @@ mod tests {
                     .admit_reader(AdmitReaderRequest {
                         lease: proof(&completed),
                         repositories: completed.target_repositories.clone(),
-                        reader: reader(control.runtime_reader_identity(), ttl_seconds),
+                        reader: ReaderAdmissionInput {
+                            identity: control.runtime_reader_identity().to_string(),
+                            min_snapshot_schema: record.reader.min_snapshot_schema,
+                            max_snapshot_schema: record.reader.max_snapshot_schema,
+                            valid_for_seconds: ttl_seconds,
+                        },
                         legacy_writer_drain_proof_sha256: None,
                     })
                     .unwrap();

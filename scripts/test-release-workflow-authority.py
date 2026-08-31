@@ -26,6 +26,7 @@ README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
 RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
+RC_BUILD = WORKFLOWS / "rc-build.yml"
 RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
 RELEASE_SENTINEL = WORKFLOWS / "release-sentinel.yml"
 SAST = WORKFLOWS / "sast.yml"
@@ -44,6 +45,33 @@ CAPABILITY_CONTRACT = ROOT / "scripts" / "verify-capability-proof.mjs"
 CAPABILITY_CONTRACT_POLICY = "scripts/verify-capability-proof.mjs"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
+
+# A release tag freezes the workflow that its run will execute. Keep every
+# runner selected by the pretag build, tag mint, tagged release, recovery and
+# public install proof on the standard hosted pool, so a paid or custom pool
+# exhausting its budget cannot strand an immutable release. A deliberate new
+# label has to change this reviewed allowlist, which is the explicit gate for
+# expanding runner authority.
+RELEASE_CRITICAL_STANDARD_RUNNERS = frozenset(
+    {
+        "ubuntu-latest",
+        "ubuntu-24.04-arm",
+        "macos-latest",
+        "macos-15-intel",
+        "windows-latest",
+    }
+)
+RELEASE_CRITICAL_MATRIX_JOBS = frozenset(
+    {
+        (RC_BUILD, "build"),
+        (RC_BUILD, "capability"),
+        (RELEASE, "build"),
+        (INSTALL_PROOF, "install-proof"),
+    }
+)
+RELEASE_CRITICAL_REUSABLE_JOBS = {
+    (RELEASE, "install_proof"): "./.github/workflows/install-proof.yml",
+}
 WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
 WINDOWS_INIT_CONTRACT_POLICY = "scripts/assert-windows-init-contract.sh"
 WINDOWS_WSL2_DOC = ROOT / "docs" / "windows-wsl2.md"
@@ -886,7 +914,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/release.yml",
         "build",
-    ): "7375c7f0f82227e8695aea7fc290631a9d3667dc6674dca10830c53e0a0f4564",
+    ): "ffde401b1343930965ae6a2a89ca3a81b2996af5821b332f65de7eba874e2be2",
     (
         ".github/workflows/release.yml",
         "verify_npm_published",
@@ -3248,6 +3276,121 @@ def install_proof_matrix_rows(install_job: str) -> tuple[
             f"install-proof matrix does not decode as JSON: {error}"
         ) from error
     return release, pull_request
+
+
+def assert_release_critical_runner_policy(
+    workflow_sources: dict[Path, str],
+    *,
+    expected_matrix_hashes: dict[tuple[str, str], str] = (
+        EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256
+    ),
+) -> None:
+    """Keep every immutable-release runner on the reviewed standard pool."""
+
+    critical = (RC_BUILD, RELEASE_TAG, RELEASE, RELEASE_RECOVERY, INSTALL_PROOF)
+    seen_matrix_jobs: set[tuple[Path, str]] = set()
+    seen_reusable_jobs: set[tuple[Path, str]] = set()
+    for workflow in critical:
+        source = workflow_sources.get(workflow)
+        if source is None:
+            raise AssertionError(
+                f"release-critical runner policy cannot read {workflow.name}"
+            )
+        for job_id, job in workflow_job_blocks(source).items():
+            fields = job_top_level_mapping_fields(job)
+            runs_on = [value.strip() for key, value in fields if key == "runs-on"]
+            uses = [value.strip() for key, value in fields if key == "uses"]
+            if runs_on and uses:
+                raise AssertionError(
+                    "release-critical runner policy found both runs-on and uses at "
+                    f"{workflow.name}:{job_id}"
+                )
+            if uses:
+                expected_callee = RELEASE_CRITICAL_REUSABLE_JOBS.get(
+                    (workflow, job_id)
+                )
+                if uses != [expected_callee]:
+                    raise AssertionError(
+                        "release-critical runner policy rejects unreviewed reusable "
+                        f"callee {uses} at {workflow.name}:{job_id}"
+                    )
+                seen_reusable_jobs.add((workflow, job_id))
+                continue
+            if not runs_on:
+                raise AssertionError(
+                    "release-critical runner policy found a job with neither "
+                    f"runs-on nor a reusable workflow: {workflow.name}:{job_id}"
+                )
+            if len(runs_on) != 1:
+                raise AssertionError(
+                    "release-critical runner policy requires exactly one runs-on "
+                    f"scalar for {workflow.name}:{job_id}; found {runs_on}"
+                )
+            runner = runs_on[0]
+            if runner == "${{ matrix.os }}":
+                matrix_key = (workflow, job_id)
+                if matrix_key not in RELEASE_CRITICAL_MATRIX_JOBS:
+                    raise AssertionError(
+                        "release-critical runner policy rejects an unreviewed runner "
+                        f"matrix at {workflow.name}:{job_id}"
+                    )
+                path = workflow.relative_to(ROOT).as_posix()
+                context_key = (path, job_id)
+                display_name = optional_job_display_name(job)
+                expected_hash = expected_matrix_hashes.get(context_key)
+                if display_name is None or expected_hash is None:
+                    raise AssertionError(
+                        "release-critical runner policy has no exact matrix contract "
+                        f"for {workflow.name}:{job_id}"
+                    )
+                matrix_source = dynamic_job_context_source(job)
+                actual_hash = hashlib.sha256(
+                    f"{display_name}\n{matrix_source}".encode()
+                ).hexdigest()
+                if actual_hash != expected_hash:
+                    raise AssertionError(
+                        "release-critical runner policy requires the exact canonical "
+                        f"matrix for {workflow.name}:{job_id}"
+                    )
+                matrix_runners = re.findall(
+                    r"(?m)^\s+- os:\s*([^\s#]+)\s*$", matrix_source
+                ) + re.findall(r'"os":"([^"]+)"', matrix_source)
+                if not matrix_runners:
+                    raise AssertionError(
+                        "release-critical runner policy cannot resolve the runner "
+                        f"matrix at {workflow.name}:{job_id}"
+                    )
+                rejected = [
+                    label
+                    for label in matrix_runners
+                    if label not in RELEASE_CRITICAL_STANDARD_RUNNERS
+                ]
+                if rejected:
+                    raise AssertionError(
+                        "release-critical runner policy rejects paid, custom, or "
+                        f"unreviewed matrix labels {rejected} at "
+                        f"{workflow.name}:{job_id}"
+                    )
+                seen_matrix_jobs.add(matrix_key)
+                continue
+            if runner not in RELEASE_CRITICAL_STANDARD_RUNNERS:
+                raise AssertionError(
+                    "release-critical runner policy rejects paid, custom, or "
+                    f"unreviewed label `{runner}` at {workflow.name}:{job_id}"
+                )
+
+    if seen_matrix_jobs != RELEASE_CRITICAL_MATRIX_JOBS:
+        raise AssertionError(
+            "release-critical runner policy matrix membership drifted: "
+            f"expected {sorted((path.name, job) for path, job in RELEASE_CRITICAL_MATRIX_JOBS)}, "
+            f"found {sorted((path.name, job) for path, job in seen_matrix_jobs)}"
+        )
+    if seen_reusable_jobs != set(RELEASE_CRITICAL_REUSABLE_JOBS):
+        raise AssertionError(
+            "release-critical runner policy reusable membership drifted: "
+            f"expected {sorted((path.name, job) for path, job in RELEASE_CRITICAL_REUSABLE_JOBS)}, "
+            f"found {sorted((path.name, job) for path, job in seen_reusable_jobs)}"
+        )
 
 
 INSTALL_PROOF_PULL_REQUEST_ARTIFACT = "install-proof-pr-binaries"
@@ -9660,6 +9803,178 @@ def main() -> None:
     workflow_sources = {
         workflow: workflow.read_text(encoding="utf-8") for workflow in workflow_paths()
     }
+    assert_release_critical_runner_policy(workflow_sources)
+
+    for label, workflow, original, mutation in (
+        (
+            "RC build returns to a paid runner",
+            RC_BUILD,
+            "          - os: ubuntu-latest\n",
+            "          - os: macos-15-large\n",
+        ),
+        (
+            "tag mint moves onto a custom runner",
+            RELEASE_TAG,
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: kin-16core\n",
+        ),
+        (
+            "tagged release returns to a paid runner",
+            RELEASE,
+            "          - os: macos-15-intel\n",
+            "          - os: macos-15-large\n",
+        ),
+        (
+            "release recovery hides a runner behind a variable",
+            RELEASE_RECOVERY,
+            "    runs-on: ubuntu-latest\n",
+            "    runs-on: ${{ vars.KIN_RELEASE_RUNNER || 'ubuntu-latest' }}\n",
+        ),
+        (
+            "public install proof returns to a paid runner",
+            INSTALL_PROOF,
+            '{"os":"macos-15-intel","setup-shell":"zsh"}',
+            '{"os":"macos-15-large","setup-shell":"zsh"}',
+        ),
+    ):
+        runner_spoof = dict(workflow_sources)
+        runner_spoof[workflow] = replace_exactly_once(
+            runner_spoof[workflow], original, mutation, label
+        )
+        expect_assertion(
+            label,
+            "release-critical runner policy",
+            lambda runner_spoof=runner_spoof: (
+                assert_release_critical_runner_policy(runner_spoof)
+            ),
+        )
+
+    # The canonical matrix hash and the standard-runner allowlist are separate
+    # controls. Re-pin each paid matrix mutation to its new exact hash before
+    # checking it, so these falsifiers reach the allowlist instead of stopping
+    # at hash drift. Deleting the label-rejection branch must therefore make
+    # this suite red even when a future reviewer deliberately updates a matrix
+    # contract alongside its workflow.
+    for label, workflow, job_id, original, mutation in (
+        (
+            "a repinned RC build matrix still rejects a paid runner",
+            RC_BUILD,
+            "build",
+            "          - os: ubuntu-latest\n",
+            "          - os: macos-15-large\n",
+        ),
+        (
+            "a repinned RC capability matrix still rejects a paid runner",
+            RC_BUILD,
+            "capability",
+            "          - os: macos-latest\n",
+            "          - os: macos-15-large\n",
+        ),
+        (
+            "a repinned tagged-release matrix still rejects a paid runner",
+            RELEASE,
+            "build",
+            "          - os: macos-15-intel\n",
+            "          - os: macos-15-large\n",
+        ),
+        (
+            "a repinned install-proof matrix still rejects a paid runner",
+            INSTALL_PROOF,
+            "install-proof",
+            '{"os":"macos-15-intel","setup-shell":"zsh"}',
+            '{"os":"macos-15-large","setup-shell":"zsh"}',
+        ),
+    ):
+        repinned_spoof = dict(workflow_sources)
+        original_job = workflow_job_blocks(repinned_spoof[workflow])[job_id]
+        mutated_job = replace_exactly_once(
+            original_job, original, mutation, label
+        )
+        repinned_spoof[workflow] = replace_exactly_once(
+            repinned_spoof[workflow], original_job, mutated_job, label
+        )
+        display_name = optional_job_display_name(mutated_job)
+        if display_name is None:
+            raise AssertionError(
+                f"runner policy repinned falsification lost job name for {label}"
+            )
+        repinned_hashes = dict(EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256)
+        context_key = (workflow.relative_to(ROOT).as_posix(), job_id)
+        repinned_hashes[context_key] = hashlib.sha256(
+            f"{display_name}\n{dynamic_job_context_source(mutated_job)}".encode()
+        ).hexdigest()
+        expect_assertion(
+            label,
+            "unreviewed matrix labels",
+            lambda repinned_spoof=repinned_spoof, repinned_hashes=repinned_hashes: (
+                assert_release_critical_runner_policy(
+                    repinned_spoof,
+                    expected_matrix_hashes=repinned_hashes,
+                )
+            ),
+        )
+
+    release_build = workflow_job_blocks(workflow_sources[RELEASE])["build"]
+    for label, original, mutation in (
+        (
+            "an inline YAML row adds a paid runner",
+            "          - os: windows-latest\n",
+            "          - { os: macos-15-large, target: x86_64-apple-darwin, "
+            "artifact: paid-inline, shim_name: libkin_vfs_shim.dylib, cross: false }\n"
+            "          - os: windows-latest\n",
+        ),
+        (
+            "a separate matrix axis adds a paid runner",
+            "      matrix:\n        include:\n",
+            "      matrix:\n        os: [macos-15-large]\n        include:\n",
+        ),
+    ):
+        matrix_spoof = dict(workflow_sources)
+        mutated_build = replace_exactly_once(
+            release_build, original, mutation, label
+        )
+        matrix_spoof[RELEASE] = replace_exactly_once(
+            matrix_spoof[RELEASE], release_build, mutated_build, label
+        )
+        expect_assertion(
+            label,
+            "exact canonical matrix",
+            lambda matrix_spoof=matrix_spoof: (
+                assert_release_critical_runner_policy(matrix_spoof)
+            ),
+        )
+
+    reusable_spoof = dict(workflow_sources)
+    reusable_spoof[RELEASE] = replace_exactly_once(
+        reusable_spoof[RELEASE],
+        "jobs:\n",
+        "jobs:\n  paid-hop:\n"
+        "    uses: firelock-ai/kin-actions/.github/workflows/paid-release.yml@"
+        "0123456789abcdef0123456789abcdef01234567\n",
+        "an unknown reusable workflow can hide a paid runner",
+    )
+    expect_assertion(
+        "an unknown reusable workflow can hide a paid runner",
+        "rejects unreviewed reusable callee",
+        lambda: assert_release_critical_runner_policy(reusable_spoof),
+    )
+
+    comment_control = dict(workflow_sources)
+    commented_build = replace_exactly_once(
+        release_build,
+        "        include:\n",
+        '        # diagnostic fixture only: {"os":"macos-15-large"}\n'
+        "        include:\n",
+        "runner policy comment control",
+    )
+    comment_control[RELEASE] = replace_exactly_once(
+        comment_control[RELEASE],
+        release_build,
+        commented_build,
+        "runner policy comment control",
+    )
+    assert_release_critical_runner_policy(comment_control)
+
     assert_workflow_job_census(workflow_sources)
 
     external_context_spoof = dict(workflow_sources)
@@ -12722,6 +13037,19 @@ def main() -> None:
         "actions/workflows/publish-install.yml/runs?event=repository_dispatch",
         "the workflow may still be disabled",
         'python3 scripts/verify_installer_parity.py "$KIN_TAG" --expected-sha "$KIN_SHA"',
+        # The image-promotion dispatch, third beside the two above and under the
+        # same token, whose repositories list already carries kin-infra.
+        #
+        # The payload is pinned to the TAG ALONE on purpose. kin-infra's receiver
+        # resolves the commit, the release run, the GHCR digest and both main
+        # heads itself and refuses a tag that is not exact GitHub Latest, which is
+        # the rule publish-install.yml states for this pair: payload fields are
+        # never trusted without independent API verification. Sending more would
+        # be sending a caller-supplied identity for a production image, so the
+        # exact payload text is pinned rather than only the event type.
+        'event_type:"promote-release-images"',
+        "client_payload:{schema_version:1,kin_tag:$tag}",
+        "image promotion repository dispatch returned HTTP $code",
     ):
         require(installer_callback, policy, "completed-release follow-up callback")
 

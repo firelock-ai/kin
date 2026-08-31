@@ -128,7 +128,8 @@ pub use ref_view::{
     filter_vector_results_to_scope,
 };
 pub use repository_authority::{
-    durable_semantic_enrichment_summary, open_persisted_local_repository_authority,
-    published_change, revalidate_pinned_local_namespace, DurableSemanticEnrichmentSummary,
-    LocalRepositoryAuthorityBinding, PinnedNamespaceRefusal, PublishedChange,
+    authority_opens, durable_semantic_enrichment_summary,
+    open_persisted_local_repository_authority, published_change, revalidate_pinned_local_namespace,
+    DurableSemanticEnrichmentSummary, LocalRepositoryAuthorityBinding, PinnedNamespaceRefusal,
+    PublishedChange,
 };

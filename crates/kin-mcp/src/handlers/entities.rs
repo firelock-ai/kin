@@ -1330,9 +1330,12 @@ match across the repo, with nothing at the reference site proving it). A `name_o
 is a candidate, not a fact; do not count it as use, and do not conclude something is \
 unused from the absence of anything but `name_only` rows without confirming. \
 `name_only` rows are held out of `total_upstream` and travel in `candidates`, and \
-`unconfirmed_candidates` beside the headline says how many were held, so a \
-`total_upstream` of 0 with `unconfirmed_candidates` above 0 means this answer is holding \
-rows it could not confirm and the zero may not be read alone. \
+`unconfirmed_candidates` beside the headline says how many were held. ANY \
+`total_upstream` with `unconfirmed_candidates` above 0 is a floor and not a total, the \
+zero no more than the one: `counts.upstream_including_unconfirmed` is the matching \
+ceiling, and the caller set lies between them. Read `references` alone and you get the \
+proven subset, which is the right answer to \"who provably calls this\" and the wrong \
+one to \"who calls this\". \
 `_kin.verdict` is the one verdict for the whole response and outranks every count in it. \
 The response bounds its own size (max_chars, default 45000 serialized characters, ceiling \
 60000): a symbol \
@@ -1575,6 +1578,15 @@ fn reference_counts(rows: &[ReferenceRow], receiver_name_candidates: usize) -> s
         // here so a reader who looks only at `counts` still learns the answer
         // withheld something (FIR-1552).
         "receiver_name_candidates": receiver_name_candidates,
+        // The union, because every other number here is a PROVEN count and a
+        // reader who wants "how many callers might there be" was left to add two
+        // of them together. A stranger read `total_upstream: 1` beside a
+        // `candidates` array holding the second of two real callers and wrote
+        // that reading `references` alone "would have given me a wrong answer
+        // that looked clean" (FIR-3033). This is the ceiling that headline is a
+        // floor of; it is not evidence that the extra rows are callers, which is
+        // what `receiver_name_candidates` above and `candidates` themselves say.
+        "upstream_including_unconfirmed": rows.len() + receiver_name_candidates,
     })
 }
 
@@ -8592,6 +8604,155 @@ mod tests {
             structurally_ready_envelope(),
             "find_references",
         ))
+    }
+
+    /// The psf/requests shape with TWO callers: one proven and one withheld.
+    ///
+    /// `requests_shape_response` moves its single relation between tiers, so it
+    /// can produce a headline of 0-and-1 or 1-and-0 but never the mixed answer a
+    /// stranger actually read. `proven` is the annotated caller
+    /// (`HTTPDigestAuth.handle_401` in the real repository, provable because
+    /// `Response.connection` is typed) and `withheld` is the bare-name receiver
+    /// (`Session.send`, whose adapter no static reader can pin).
+    async fn requests_shape_two_caller_response() -> serde_json::Value {
+        let store = InMemoryGraph::new();
+        let target = make_entity("send", "src/requests/adapters.rs");
+        let proven = make_entity("HTTPDigestAuth.handle_401", "src/requests/auth.rs");
+        let withheld = make_entity("Session.send", "src/requests/sessions.rs");
+        store.upsert_entity(&target).unwrap();
+        store.upsert_entity(&proven).unwrap();
+        store.upsert_entity(&withheld).unwrap();
+
+        for (caller, confidence, line) in [
+            (&proven, 1.0f32, 312u32),
+            (
+                &withheld,
+                kin_index::resolution::RECEIVER_NAME_FANOUT_CONFIDENCE,
+                784,
+            ),
+        ] {
+            let mut relation =
+                make_relation_at(caller.id, target.id, RelationKind::Calls, confidence);
+            relation.evidence = vec![RelationEvidence {
+                source_span: Some(kin_model::entity::SourceSpan {
+                    file: FilePathId::new(
+                        caller.file_origin.as_ref().unwrap().to_string().as_str(),
+                    ),
+                    start_byte: 0,
+                    end_byte: 1,
+                    start_line: line - 1,
+                    start_col: 0,
+                    end_line: line - 1,
+                    end_col: 1,
+                }),
+                ..RelationEvidence::default()
+            }];
+            store.upsert_relation(&relation).unwrap();
+        }
+        seed_cross_file_call_witness(&store);
+        let registered_root = graph_root(&store);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "requests",
+            vec![spine_entry("requests", &target)],
+            &registered_root,
+        );
+        spine.refresh_cross_repo_edges("requests", &[], &[], &["requests".to_string()]);
+
+        let args = HashMap::from([(
+            "entity_id".to_string(),
+            serde_json::json!(target.id.to_string()),
+        )]);
+        parsed_response(&crate::finalize_with_envelope(
+            handle_find_references_with_authority(
+                &args,
+                &store,
+                FindReferencesAuthority {
+                    repo_id: "requests",
+                    graph_root: &registered_root,
+                    spine: Some(&spine),
+                },
+                None,
+            )
+            .await
+            .unwrap(),
+            structurally_ready_envelope(),
+            "find_references",
+        ))
+    }
+
+    /// FIR-3033. Two real callers, one provable and one not, and no single count
+    /// in the response may be read as "the number of callers" while omitting
+    /// one.
+    ///
+    /// The stranger's line is the specification: reading `references` alone
+    /// "would have given me a wrong answer that looked clean". The split is
+    /// right and stays; what was missing is a number a reader can take as the
+    /// ceiling, so the pair brackets the truth instead of one number implying
+    /// it.
+    #[tokio::test]
+    async fn a_mixed_answer_publishes_a_ceiling_beside_its_floor() {
+        let response = requests_shape_two_caller_response().await;
+
+        assert_eq!(
+            response["total_upstream"], 1,
+            "the headline still counts only what resolved: {response:#}"
+        );
+        assert_eq!(
+            response["unconfirmed_candidates"], 1,
+            "and it still says how many it is holding: {response:#}"
+        );
+        assert_eq!(
+            response["counts"]["upstream_including_unconfirmed"], 2,
+            "the ceiling is the union of both collections: {}",
+            response["counts"]
+        );
+
+        // The property the ticket asks for, asserted over the counts the
+        // response actually carries rather than over a list written twice: every
+        // top-level count is either the proven floor, the withheld count, or the
+        // union, and the union is the only one that equals the row total.
+        let rows = response["references"].as_array().unwrap().len()
+            + response["candidates"].as_array().unwrap().len();
+        assert_eq!(rows, 2, "{response:#}");
+        assert_eq!(
+            response["counts"]["upstream_including_unconfirmed"]
+                .as_u64()
+                .unwrap() as usize,
+            rows,
+            "the ceiling must account for every row the response carries: {response:#}"
+        );
+        assert!(
+            response["counts"]["referencing_entities"].as_u64().unwrap() < rows as u64,
+            "and it must differ from the floor on this fixture, or the pair proves nothing: {}",
+            response["counts"]
+        );
+    }
+
+    /// The control for the test above: only proven callers, where the floor and
+    /// the ceiling must AGREE.
+    ///
+    /// Without it the assertion above is satisfied by a ceiling that always
+    /// exceeds the floor, which would be a different defect wearing the fix's
+    /// shape.
+    #[tokio::test]
+    async fn an_all_proven_answer_has_a_ceiling_equal_to_its_floor() {
+        let response = requests_shape_response(1.0).await;
+
+        assert_eq!(response["total_upstream"], 1, "{response:#}");
+        assert_eq!(response["unconfirmed_candidates"], 0, "{response:#}");
+        assert_eq!(
+            response["counts"]["upstream_including_unconfirmed"], 1,
+            "nothing was withheld, so the ceiling is the headline: {}",
+            response["counts"]
+        );
+        assert_eq!(
+            response["counts"]["upstream_including_unconfirmed"],
+            response["counts"]["referencing_entities"],
+            "floor and ceiling agree when the answer withheld nothing: {}",
+            response["counts"]
+        );
     }
 
     /// The control for [`a_withheld_caller_refuses_the_zero_it_was_held_out_of`]:

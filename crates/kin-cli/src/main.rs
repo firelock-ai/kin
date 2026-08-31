@@ -1487,6 +1487,12 @@ enum GraphAction {
     Status,
     /// Structural integrity validation
     Validate,
+    /// Persist the current workspace base graph section for faster reopen
+    Materialize {
+        /// Output machine-readable JSON
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     /// Look up an entity by name and show its relations
     Inspect {
         /// Entity name or UUID to inspect
@@ -2462,6 +2468,10 @@ enum HostedReleaseAction {
 /// retired name first, and a suggestion pointing at an unrelated command costs
 /// more than no suggestion at all.
 const RETIRED_COMMANDS: &[(&[&str], &str)] = &[
+    (
+        &["setup", "editor"],
+        "`kin setup --intent editor` selects the editor onboarding path; setup intents are options, not subcommands.",
+    ),
     (
         &["import"],
         "`kin clone <source>` admits a repository from elsewhere, and `kin init` admits one in place.",
@@ -3563,6 +3573,7 @@ fn main() -> Result<()> {
                 Command::Graph { action } => match action {
                     GraphAction::Status => commands::graph::status().await,
                     GraphAction::Validate => commands::graph::validate().await,
+                    GraphAction::Materialize { json } => commands::graph::materialize(json).await,
                     GraphAction::Inspect { name, json } => {
                         commands::graph::inspect(name, json).await
                     }
@@ -4756,6 +4767,125 @@ mod tests {
             .expect("spawn cli validation thread")
             .join()
             .expect("cli definition validation must succeed");
+    }
+
+    /// Public first-run commands are executable contracts, not examples the
+    /// parser is allowed to drift away from.
+    ///
+    /// These are the exact command shapes named by README.md and
+    /// docs/quickstart.md. Parsing only `kin setup` or only the leaf actions is
+    /// weaker than the contract: the intent value, JSON flag, review range and
+    /// default option values are all part of what a new developer copies.
+    #[test]
+    fn documented_onboarding_commands_parse_to_their_public_contract() {
+        on_cli_test_stack(|| {
+            let editor = Cli::try_parse_from(["kin", "setup", "--intent", "editor"])
+                .expect("the documented editor intent must parse");
+            assert!(matches!(
+                editor.command,
+                Command::Setup {
+                    action: None,
+                    intent: Some(intent),
+                    ..
+                } if intent == "editor"
+            ));
+
+            let setup_status = Cli::try_parse_from(["kin", "setup", "status", "--json"])
+                .expect("the documented setup status command must parse");
+            assert!(matches!(
+                setup_status.command,
+                Command::Setup {
+                    action: Some(SetupAction::Status { json: true }),
+                    ..
+                }
+            ));
+
+            let status = Cli::try_parse_from(["kin", "status"])
+                .expect("the documented status command must parse");
+            assert!(matches!(
+                status.command,
+                Command::Status {
+                    json: false,
+                    wait_quiesce: 0
+                }
+            ));
+
+            let overview = Cli::try_parse_from(["kin", "overview"])
+                .expect("the documented overview command must parse");
+            assert!(matches!(
+                overview.command,
+                Command::Overview {
+                    compact: false,
+                    json: false
+                }
+            ));
+
+            let review = Cli::try_parse_from(["kin", "review", "shadow", "BASE_BRANCH..HEAD"])
+                .expect("the documented shadow-review range must parse");
+            assert!(matches!(
+                review.command,
+                Command::Review {
+                    change: None,
+                    json: false,
+                    entities: None,
+                    files: None,
+                    changes: None,
+                    action: Some(ReviewAction::Shadow {
+                        range: Some(range),
+                        base: None,
+                        head: None,
+                        title: None,
+                        source_url: None,
+                        author: None,
+                        json: false,
+                    }),
+                } if range == "BASE_BRANCH..HEAD"
+            ));
+
+            let quickstart = include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../docs/quickstart.md"
+            ));
+            let readme = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"));
+            for command in [
+                "kin setup --intent editor",
+                "kin setup status --json",
+                "kin status",
+                "kin overview",
+                "kin review shadow",
+            ] {
+                assert!(
+                    quickstart.contains(command),
+                    "docs/quickstart.md must carry the parser-checked `{command}` surface"
+                );
+                assert!(
+                    readme.contains(command),
+                    "README.md must carry the parser-checked `{command}` surface"
+                );
+            }
+        });
+    }
+
+    /// The formerly documented subcommand spelling stays rejected and the
+    /// production signpost points at the canonical option spelling instead of
+    /// clap's edit-distance suggestion of the unrelated `doctor` subcommand.
+    #[test]
+    fn stale_setup_editor_form_is_rejected_with_the_canonical_replacement() {
+        on_cli_test_stack(|| {
+            let error = Cli::try_parse_from(["kin", "setup", "editor"])
+                .err()
+                .expect("setup intents must not become compatibility subcommands");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+
+            let args = vec!["setup".to_string(), "editor".to_string()];
+            let (path, guidance) = retired_command_signpost(&args)
+                .expect("production must replace clap's misleading suggestion");
+            assert_eq!(path, "setup editor");
+            assert!(
+                guidance.contains("`kin setup --intent editor`"),
+                "the rejection must name the command a developer can run: {guidance}"
+            );
+        });
     }
 
     #[test]

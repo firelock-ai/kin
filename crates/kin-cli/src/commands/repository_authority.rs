@@ -9,18 +9,151 @@
 
 use anyhow::{anyhow, Context, Result};
 use kin_db::{
-    AuthorityPayloadStats, LocalFileBackend, RepositoryAuthorityManager, RepositoryAuthorityState,
+    AuthorityPayloadStats, LocalFileBackend, MaterializedGraphSectionOutcome,
+    RepositoryAuthorityManager, RepositoryAuthorityState,
 };
 use kin_model::{
     GitObjectId, RefName, RefTarget, RepositoryId, RootBundle, SemanticChangeId, WorkspaceId,
     WorkspaceState,
 };
+use serde::{Deserialize, Serialize};
 
 pub struct ActiveRepositoryAuthority {
     manager: RepositoryAuthorityManager<LocalFileBackend>,
     payload_stats: Option<AuthorityPayloadStats>,
     pub(crate) repository_id: RepositoryId,
     pub(crate) workspace_id: WorkspaceId,
+}
+
+/// Machine-readable result of explicitly memoizing one workspace base graph.
+///
+/// This is deliberately a representation result rather than a repository
+/// commit receipt. Materialization may advance the storage backend's fenced
+/// publication cursor, but it preserves the logical authority generation and
+/// roots exactly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphSectionMaterialization {
+    pub schema: String,
+    pub scope: GraphSectionMaterializationScope,
+    pub repository_id: RepositoryId,
+    pub workspace_id: WorkspaceId,
+    pub state: GraphSectionMaterializationState,
+    pub authority_generation: u64,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "optional_semantic_change_id_hex"
+    )]
+    pub resolved_at: Option<SemanticChangeId>,
+}
+
+mod optional_semantic_change_id_hex {
+    use kin_model::{Hash256, SemanticChangeId};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S>(value: &Option<SemanticChangeId>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match value {
+            Some(value) => serializer.serialize_some(&value.to_string()),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<SemanticChangeId>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<String>::deserialize(deserializer)?
+            .map(|value| {
+                Hash256::from_hex(&value)
+                    .map(SemanticChangeId::from_hash)
+                    .map_err(serde::de::Error::custom)
+            })
+            .transpose()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphSectionMaterializationScope {
+    WorkspaceBase,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GraphSectionMaterializationState {
+    Persisted,
+    AlreadyCurrent,
+    NoBaseTarget,
+}
+
+impl GraphSectionMaterialization {
+    const SCHEMA: &'static str = "kin.graph-section-materialization.v1";
+
+    fn from_kin_db(
+        repository_id: RepositoryId,
+        workspace_id: WorkspaceId,
+        outcome: MaterializedGraphSectionOutcome,
+    ) -> Self {
+        let (state, authority_generation, resolved_at) = match outcome {
+            MaterializedGraphSectionOutcome::Persisted {
+                resolved_at,
+                authority_generation,
+            } => (
+                GraphSectionMaterializationState::Persisted,
+                authority_generation,
+                Some(resolved_at),
+            ),
+            MaterializedGraphSectionOutcome::AlreadyCurrent {
+                resolved_at,
+                authority_generation,
+            } => (
+                GraphSectionMaterializationState::AlreadyCurrent,
+                authority_generation,
+                Some(resolved_at),
+            ),
+            MaterializedGraphSectionOutcome::NoBaseTarget {
+                authority_generation,
+            } => (
+                GraphSectionMaterializationState::NoBaseTarget,
+                authority_generation,
+                None,
+            ),
+        };
+        Self {
+            schema: Self::SCHEMA.to_string(),
+            scope: GraphSectionMaterializationScope::WorkspaceBase,
+            repository_id,
+            workspace_id,
+            state,
+            authority_generation,
+            resolved_at,
+        }
+    }
+
+    pub fn human_line(&self) -> String {
+        match (&self.state, &self.resolved_at) {
+            (GraphSectionMaterializationState::Persisted, Some(resolved_at)) => format!(
+                "Persisted the workspace base graph section at {resolved_at} (authority generation {}).",
+                self.authority_generation
+            ),
+            (GraphSectionMaterializationState::AlreadyCurrent, Some(resolved_at)) => format!(
+                "The workspace base graph section is already current at {resolved_at} (authority generation {}).",
+                self.authority_generation
+            ),
+            (GraphSectionMaterializationState::NoBaseTarget, None) => format!(
+                "No workspace base graph section exists yet because this workspace is unborn (authority generation {}).",
+                self.authority_generation
+            ),
+            // Construction is private and keeps the state and target paired.
+            // This arm still prevents malformed wire input from being rendered
+            // as if it were a trustworthy product outcome.
+            _ => "The graph-section materialization response was internally inconsistent."
+                .to_string(),
+        }
+    }
 }
 
 thread_local! {
@@ -189,6 +322,34 @@ impl ActiveRepositoryAuthority {
         &self.manager
     }
 
+    /// Persist the current workspace base graph as an idempotent acceleration
+    /// section without changing semantic authority.
+    pub(crate) fn materialize_workspace_base_graph_section(
+        &self,
+    ) -> Result<GraphSectionMaterialization> {
+        let outcome = self
+            .manager
+            .materialize_workspace_base_graph_section(&self.repository_id, &self.workspace_id)
+            .with_context(|| {
+                format!(
+                    "materialize workspace {} base graph section for repository {}",
+                    self.workspace_id, self.repository_id
+                )
+            })?
+            .ok_or_else(|| {
+                anyhow!(
+                    "repository {} has no workspace {} in its authority",
+                    self.repository_id,
+                    self.workspace_id
+                )
+            })?;
+        Ok(GraphSectionMaterialization::from_kin_db(
+            self.repository_id.clone(),
+            self.workspace_id,
+            outcome,
+        ))
+    }
+
     /// Payload receipt produced by the same recovery that built this manager.
     ///
     /// `None` only where no persisted authority existed and generation zero was
@@ -255,6 +416,54 @@ impl ActiveRepositoryAuthority {
     }
 }
 
+/// Materialize the current workspace base without starting or sharing a
+/// daemon runtime.
+///
+/// The runtime capability is acquired before the first whole-authority open
+/// and remains held until that manager is dropped. A running daemon therefore
+/// makes the command fail before it can fold history or write representation
+/// bytes, and a daemon cannot begin opening the repository during the rewrite.
+pub(crate) fn materialize_workspace_base_offline(
+    layout: &kin_core::KinLayout,
+) -> Result<GraphSectionMaterialization> {
+    materialize_workspace_base_offline_within(
+        layout,
+        kin_daemon_spawn::REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET,
+    )
+}
+
+fn materialize_workspace_base_offline_within(
+    layout: &kin_core::KinLayout,
+    budget: std::time::Duration,
+) -> Result<GraphSectionMaterialization> {
+    let runtime = crate::daemon_client::acquire_repository_runtime_authority_within(
+        layout.root(),
+        budget,
+    )
+    .with_context(|| {
+        format!(
+            "acquire repository runtime authority for {}",
+            layout.root().display()
+        )
+    })?
+    .ok_or_else(|| {
+        anyhow!(
+            "another Kin process holds repository runtime authority for {}; run `kin daemon stop`, then retry `kin graph materialize`",
+            layout.root().display()
+        )
+    })?;
+
+    let outcome = {
+        let binding = kin_core::LocalRepositoryAuthorityBinding::from_layout(layout)
+            .context("bind repository authority for offline graph-section materialization")?;
+        let authority = ActiveRepositoryAuthority::open(&binding)
+            .context("open repository authority for offline graph-section materialization")?;
+        authority.materialize_workspace_base_graph_section()
+    };
+    drop(runtime);
+    outcome
+}
+
 fn resolve_target_in_authority(
     authority: &RepositoryAuthorityState,
     target: &RefTarget,
@@ -299,5 +508,137 @@ pub(crate) fn parse_git_object_id(value: &str) -> Result<GitObjectId> {
         length => anyhow::bail!(
             "invalid Git object ID '{value}': expected 20 or 32 bytes, found {length}"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn graph_section_materialization_keeps_all_three_backend_outcomes_distinct() {
+        let resolved_at = SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x29; 32]));
+        let repository_id = RepositoryId::new("graph-section-test").unwrap();
+        let workspace_id = WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x29));
+        let cases = [
+            (
+                MaterializedGraphSectionOutcome::Persisted {
+                    resolved_at,
+                    authority_generation: 7,
+                },
+                GraphSectionMaterializationState::Persisted,
+                Some(resolved_at),
+            ),
+            (
+                MaterializedGraphSectionOutcome::AlreadyCurrent {
+                    resolved_at,
+                    authority_generation: 7,
+                },
+                GraphSectionMaterializationState::AlreadyCurrent,
+                Some(resolved_at),
+            ),
+            (
+                MaterializedGraphSectionOutcome::NoBaseTarget {
+                    authority_generation: 7,
+                },
+                GraphSectionMaterializationState::NoBaseTarget,
+                None,
+            ),
+        ];
+
+        for (backend, state, target) in cases {
+            let mapped = GraphSectionMaterialization::from_kin_db(
+                repository_id.clone(),
+                workspace_id,
+                backend,
+            );
+            assert_eq!(mapped.schema, "kin.graph-section-materialization.v1");
+            assert_eq!(
+                mapped.scope,
+                GraphSectionMaterializationScope::WorkspaceBase
+            );
+            assert_eq!(mapped.state, state);
+            assert_eq!(mapped.authority_generation, 7);
+            assert_eq!(mapped.resolved_at, target);
+            assert_eq!(mapped.repository_id, repository_id);
+            assert_eq!(mapped.workspace_id, workspace_id);
+        }
+    }
+
+    #[test]
+    fn graph_section_materialization_json_names_state_and_omits_unborn_target() {
+        let outcome = GraphSectionMaterialization::from_kin_db(
+            RepositoryId::new("graph-section-test").unwrap(),
+            WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x30)),
+            MaterializedGraphSectionOutcome::NoBaseTarget {
+                authority_generation: 3,
+            },
+        );
+        let json = serde_json::to_value(outcome).unwrap();
+        assert_eq!(json["scope"], "workspace_base");
+        assert_eq!(json["state"], "no_base_target");
+        assert_eq!(json["authority_generation"], 3);
+        assert!(json.get("resolved_at").is_none());
+    }
+
+    #[test]
+    fn graph_section_materialization_json_names_the_base_target_as_hex() {
+        let resolved_at = SemanticChangeId::from_hash(kin_model::Hash256::from_bytes([0x29; 32]));
+        let outcome = GraphSectionMaterialization::from_kin_db(
+            RepositoryId::new("graph-section-test").unwrap(),
+            WorkspaceId::from_uuid(uuid::Uuid::from_u128(0x31)),
+            MaterializedGraphSectionOutcome::AlreadyCurrent {
+                resolved_at,
+                authority_generation: 4,
+            },
+        );
+
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json["resolved_at"], "29".repeat(32));
+
+        let round_trip: GraphSectionMaterialization = serde_json::from_value(json).unwrap();
+        assert_eq!(round_trip, outcome);
+    }
+
+    #[test]
+    fn offline_materialization_refuses_runtime_contention_before_authority_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let initialized = kin_core::init(directory.path()).unwrap();
+        let held = crate::daemon_client::acquire_repository_runtime_authority_within(
+            initialized.layout.root(),
+            std::time::Duration::ZERO,
+        )
+        .unwrap()
+        .expect("test owns repository runtime authority");
+        let opens_before = repository_authority_opens_on_this_thread();
+
+        let error = materialize_workspace_base_offline_within(
+            &initialized.layout,
+            std::time::Duration::ZERO,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("kin daemon stop"), "{error:#}");
+        assert_eq!(
+            repository_authority_opens_on_this_thread(),
+            opens_before,
+            "contention must be decided before a whole repository authority open"
+        );
+
+        drop(held);
+        let outcome = materialize_workspace_base_offline_within(
+            &initialized.layout,
+            std::time::Duration::ZERO,
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.state,
+            GraphSectionMaterializationState::NoBaseTarget
+        );
+        assert_eq!(
+            repository_authority_opens_on_this_thread(),
+            opens_before + 1,
+            "the successful maintenance arm opens authority exactly once"
+        );
     }
 }

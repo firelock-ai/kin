@@ -1315,9 +1315,9 @@ const WATCH_ARMING_BOUND: Duration = Duration::from_secs(30);
 pub(crate) enum WatchArming {
     /// The loop reported its watcher. Publication is safe to proceed.
     Armed,
-    /// The loop ended before reporting one, which is what a disabled
-    /// reconciler, a bare checkout or a refused watcher looks like from here.
-    /// There is no watch to wait for, so waiting longer buys nothing.
+    /// The loop closed its signal without reporting one. A disabled reconciler
+    /// or bare checkout may remain parked until shutdown; a refused watcher may
+    /// end the task. Either way, there is no watch to wait for.
     LoopGone,
     /// The bound expired with the loop neither arming nor ending.
     TimedOut,
@@ -1346,7 +1346,7 @@ fn announce_watch_arming(arming: WatchArming, bound: Duration) {
             debug!("the reconciliation watch is armed; publishing the daemon endpoint")
         }
         WatchArming::LoopGone => info!(
-            "the reconciliation loop ended before arming a watch, so this daemon observes no \
+            "the reconciliation loop will not arm a watch, so this daemon observes no \
              working-copy edits; publishing the endpoint so it stays reachable"
         ),
         WatchArming::TimedOut => warn!(
@@ -1355,6 +1355,86 @@ fn announce_watch_arming(arming: WatchArming, bound: Duration) {
              the endpoint anyway, so a host write landing now may go unobserved until an \
              explicit admission seam takes it"
         ),
+    }
+}
+
+#[cfg(test)]
+mod watch_arming_log_tests {
+    use super::{announce_watch_arming, WatchArming};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Default)]
+    struct Captured(Vec<(tracing::Level, String)>);
+
+    struct CaptureLayer(Arc<Mutex<Captured>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            #[derive(Default)]
+            struct Read {
+                message: Option<String>,
+            }
+
+            impl tracing::field::Visit for Read {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.message = Some(format!("{value:?}").trim_matches('"').to_string());
+                    }
+                }
+            }
+
+            let mut read = Read::default();
+            event.record(&mut read);
+            if let Some(message) = read.message {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .0
+                    .push((*event.metadata().level(), message));
+            }
+        }
+    }
+
+    /// The endpoint log is an operator-facing promise, not a generic progress
+    /// line. A loop that explicitly declined its watcher must say that it
+    /// observes no working-copy edits, while the enabled control alone may say
+    /// that a watcher is armed.
+    #[test]
+    fn no_watch_and_real_watch_make_different_log_promises() {
+        let captured = Arc::new(Mutex::new(Captured::default()));
+        let subscriber = tracing_subscriber::registry().with(CaptureLayer(Arc::clone(&captured)));
+        {
+            let _capture = crate::capture_events_on_this_thread(subscriber);
+            announce_watch_arming(WatchArming::LoopGone, Duration::from_secs(30));
+            announce_watch_arming(WatchArming::Armed, Duration::from_secs(30));
+        }
+
+        assert_eq!(
+            captured.lock().unwrap().0,
+            vec![
+                (
+                    tracing::Level::INFO,
+                    "the reconciliation loop will not arm a watch, so this daemon observes no \
+                     working-copy edits; publishing the endpoint so it stays reachable"
+                        .to_string(),
+                ),
+                (
+                    tracing::Level::DEBUG,
+                    "the reconciliation watch is armed; publishing the daemon endpoint".to_string(),
+                ),
+            ],
+            "the no-watch arm and enabled control must make different operator-facing promises"
+        );
     }
 }
 

@@ -13591,14 +13591,32 @@ pub(crate) fn decide_language_server_request(
     use crate::commands::health::HealthStatus;
 
     // Pending and Stale are exactly the two states the coverage row takes when
-    // a language-server gap was actually OBSERVED. Every other state either
-    // read the graph and found nothing to close, or never read it at all, and
-    // spending a user's bandwidth off the back of an unread row is the prompt
-    // this gate exists to refuse.
+    // a language-server gap was actually OBSERVED.
     let gap_observed = matches!(
         request.coverage_status,
         Some(HealthStatus::Pending | HealthStatus::Stale)
     );
+
+    // Healthy joins them for the INSTALL decision, and only for that decision.
+    //
+    // Requiring an observed gap made the advice circular: `kin init` closes by
+    // telling the user to run this, and run from that same fresh repository it
+    // answered "run this again from a repository whose Reference edge coverage
+    // row names the gap" -- and a repository only carries that gap after it has
+    // been converted without the servers, which is the outcome the init note was
+    // warning against (FIR-3036). The moment it refused was the only moment the
+    // advice was worth anything.
+    //
+    // What the old gate was really protecting is still protected, in both of its
+    // halves. A row nobody READ is still no reason to spend a user's bandwidth,
+    // so None, Unsupported, Missing, Degraded and Misconfigured install nothing;
+    // Healthy is a row that was read. And the new arm additionally requires that
+    // the user ASKED, because this gate sits above the not-requested return
+    // below and a bare `kin doctor --fix` must not fetch language servers nobody
+    // mentioned. An observed gap keeps its old behaviour under a bare `--fix`,
+    // where closing it is the repair that was requested.
+    let coverage_was_read = gap_observed
+        || (request.requested && matches!(request.coverage_status, Some(HealthStatus::Healthy)));
 
     if !request.fixing {
         // Installing downloads packages into a shared prefix, so it belongs
@@ -13615,7 +13633,7 @@ pub(crate) fn decide_language_server_request(
         ]);
     }
 
-    if gap_observed && !request.missing_on_host.is_empty() {
+    if coverage_was_read && !request.missing_on_host.is_empty() {
         return LanguageServerDecision::Install(request.missing_on_host.clone());
     }
 
@@ -13663,23 +13681,6 @@ pub(crate) fn decide_language_server_request(
     // In a repository, servers missing from the host, and no gap to close. The
     // two ways that happens read differently and are kept apart, because only
     // one of them means the graph was actually consulted.
-    if matches!(request.coverage_status, Some(HealthStatus::Healthy)) {
-        let mut lines = vec![
-            "Nothing to install. This repository's graph reports no reference-edge gap, and that \
-             gap is what the install closes."
-                .to_string(),
-            format!(
-                "This host is still missing a server for {}. Install by hand, or run this again \
-                 from a repository whose Reference edge coverage row names the gap:",
-                language_list(&request.missing_on_host)
-            ),
-        ];
-        for command in language_servers::install_commands_for(&request.missing_on_host) {
-            lines.push(format!("  {command}"));
-        }
-        return LanguageServerDecision::Explain(lines);
-    }
-
     // The row exists and reports something other than a verdict from a graph it
     // read. `Unsupported` is the reachable one, and it is always phrased "n/a"
     // by the health check, so naming it as unread is the row's own claim rather
@@ -13691,13 +13692,24 @@ pub(crate) fn decide_language_server_request(
         "Nothing to install. This repository's Reference edge coverage row does not report a \
          language-server gap."
     };
-    LanguageServerDecision::Explain(vec![
+    let mut lines = vec![
         headline.to_string(),
         format!(
             "Read that row above for what it does report. {}.",
             host_language_server_state(&request.missing_on_host)
         ),
-    ])
+    ];
+    // The commands, on the one refusal path that still turns a user away with
+    // servers missing. The stranger who found the loop called printing them the
+    // saving grace, because it made the detour cost a minute rather than an
+    // afternoon; they used to live on the no-gap branch, which now installs.
+    if !request.missing_on_host.is_empty() {
+        lines.push("Install them by hand with:".to_string());
+        for command in language_servers::install_commands_for(&request.missing_on_host) {
+            lines.push(format!("  {command}"));
+        }
+    }
+    LanguageServerDecision::Explain(lines)
 }
 
 /// Print an [`LanguageServerDecision::Explain`], and nothing otherwise.
@@ -23415,27 +23427,52 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         );
     }
 
-    /// The second half of hole two, and the state the two strangers were
-    /// actually in: servers missing from the host, and a repository whose graph
-    /// reported no gap for them to close.
+    /// FIR-3036. The state a stranger is actually in on a fresh repository:
+    /// servers missing from the host, and a coverage row that read the graph and
+    /// found no gap yet. That must INSTALL.
+    ///
+    /// It used to refuse with "run this again from a repository whose Reference
+    /// edge coverage row names the gap", which is a loop: `kin init` sends the
+    /// user here, and a repository only carries that gap once it has been
+    /// converted without the servers, which is what the init note was warning
+    /// against. The refusal was defensible and it arrived at the only moment the
+    /// advice was worth anything.
     #[test]
-    fn a_repository_with_no_gap_names_the_missing_servers_and_the_commands() {
-        let lines = explained(&super::LanguageServerRequest {
-            missing_on_host: vec![LanguageId::Python],
+    fn a_fresh_repository_missing_servers_installs_them() {
+        assert_eq!(
+            super::decide_language_server_request(&super::LanguageServerRequest {
+                coverage_status: Some(HealthStatus::Healthy),
+                missing_on_host: vec![LanguageId::Python],
+                ..request(true, true)
+            }),
+            super::LanguageServerDecision::Install(vec![LanguageId::Python]),
+            "a read row with no gap yet is the moment installing is still free"
+        );
+    }
+
+    /// The control for the test above: the same read row on a host that already
+    /// has every server. Nothing to install, and it says so as a fact about the
+    /// host rather than about the repository.
+    #[test]
+    fn a_fresh_repository_on_a_complete_host_installs_nothing() {
+        let decision = super::decide_language_server_request(&super::LanguageServerRequest {
+            coverage_status: Some(HealthStatus::Healthy),
+            missing_on_host: Vec::new(),
             ..request(true, true)
         });
-        let text = lines.join("\n");
         assert!(
-            text.contains("This repository's graph reports no reference-edge gap"),
+            !matches!(decision, super::LanguageServerDecision::Install(_)),
+            "there is nothing to install: {decision:?}"
+        );
+        let text = explained(&super::LanguageServerRequest {
+            coverage_status: Some(HealthStatus::Healthy),
+            missing_on_host: Vec::new(),
+            ..request(true, true)
+        })
+        .join("\n");
+        assert!(
+            text.contains("Every language this build enriches already has a server on this host"),
             "{text}"
-        );
-        assert!(
-            text.contains("This host is still missing a server for python"),
-            "the host fact and the repository fact are different facts: {text}"
-        );
-        assert!(
-            text.contains("npm install -g pyright"),
-            "the command is the whole value of saying anything here: {text}"
         );
     }
 
@@ -23458,13 +23495,26 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             !text.contains("reports no reference-edge gap"),
             "an unread row proves nothing about the gap: {text}"
         );
+        assert!(
+            text.contains("npm install -g pyright"),
+            "a refusal that still turns the user away owes them the command: {text}"
+        );
     }
 
-    /// The gate itself still opens on exactly the two observed-gap states, and
-    /// on nothing else. This is the behavior the honesty batch must not spend.
+    /// The gate opens on exactly the states where the coverage row was READ,
+    /// and on nothing else.
+    ///
+    /// Healthy joined Pending and Stale under FIR-3036. What the original gate
+    /// was protecting is the half that must not be spent: a row nobody read is
+    /// no reason to spend a user's bandwidth, so every unread state below still
+    /// installs nothing.
     #[test]
-    fn only_an_observed_gap_installs_anything() {
-        for status in [HealthStatus::Pending, HealthStatus::Stale] {
+    fn only_a_read_coverage_row_installs_anything() {
+        for status in [
+            HealthStatus::Pending,
+            HealthStatus::Stale,
+            HealthStatus::Healthy,
+        ] {
             assert_eq!(
                 super::decide_language_server_request(&super::LanguageServerRequest {
                     coverage_status: Some(status.clone()),
@@ -23472,12 +23522,24 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
                     ..request(true, true)
                 }),
                 super::LanguageServerDecision::Install(vec![LanguageId::Python]),
-                "{status:?} is an observed gap"
+                "{status:?} is a coverage row that was read"
             );
         }
+        // And Healthy installs only for a run that ASKED. This gate sits above
+        // the not-requested return, so without this a bare `kin doctor --fix`
+        // would fetch servers nobody mentioned.
+        assert_eq!(
+            super::decide_language_server_request(&super::LanguageServerRequest {
+                coverage_status: Some(HealthStatus::Healthy),
+                missing_on_host: vec![LanguageId::Python],
+                ..request(false, true)
+            }),
+            super::LanguageServerDecision::Silent,
+            "a bare --fix never raised the subject"
+        );
+
         for status in [
             None,
-            Some(HealthStatus::Healthy),
             Some(HealthStatus::Unsupported),
             Some(HealthStatus::Missing),
             Some(HealthStatus::Degraded),
@@ -23490,7 +23552,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             });
             assert!(
                 !matches!(decision, super::LanguageServerDecision::Install(_)),
-                "{status:?} is not an observed gap, so it must not spend bandwidth"
+                "{status:?} never read the graph, so it must not spend bandwidth"
             );
         }
     }
