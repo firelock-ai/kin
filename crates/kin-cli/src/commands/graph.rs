@@ -27,6 +27,7 @@ pub struct GraphCommandResponse {
     pub lines: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<GraphSourceRecord>,
     /// Reference-edge completeness, per language, for the status and validate
     /// surfaces.
@@ -5010,6 +5011,20 @@ mod tests {
             graph_wait_label(&GraphCommandRequest::Source {
                 entity: "Router".to_string()
             }),
+        );
+    }
+
+    #[test]
+    fn graph_response_from_an_older_daemon_may_omit_optional_source() {
+        let response: GraphCommandResponse = serde_json::from_value(serde_json::json!({
+            "lines": ["older daemon response"]
+        }))
+        .unwrap();
+        assert!(response.source.is_none());
+        assert_eq!(response.lines, ["older daemon response"]);
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({"lines": ["older daemon response"]})
         );
     }
 }
