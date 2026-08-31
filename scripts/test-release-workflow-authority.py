@@ -26,6 +26,7 @@ README = ROOT / "README.md"
 RELEASE = WORKFLOWS / "release.yml"
 RELEASE_RECOVERY = WORKFLOWS / "release-recovery.yml"
 RELEASE_TAG = WORKFLOWS / "release-tag.yml"
+RC_BUILD = WORKFLOWS / "rc-build.yml"
 RELEASE_TRAIN = WORKFLOWS / "release-train.yml"
 RELEASE_SENTINEL = WORKFLOWS / "release-sentinel.yml"
 SAST = WORKFLOWS / "sast.yml"
@@ -44,6 +45,22 @@ CAPABILITY_CONTRACT = ROOT / "scripts" / "verify-capability-proof.mjs"
 CAPABILITY_CONTRACT_POLICY = "scripts/verify-capability-proof.mjs"
 RELEASE_BOT_DOC = ROOT / "docs" / "release-bot.md"
 INSTALL_PROOF = WORKFLOWS / "install-proof.yml"
+
+# A release tag freezes the workflow that its run will execute. Keep every
+# runner selected by the pretag build, tag mint, tagged release, recovery and
+# public install proof on the standard hosted pool, so a paid or custom pool
+# exhausting its budget cannot strand an immutable release. A deliberate new
+# label has to change this reviewed allowlist, which is the explicit gate for
+# expanding runner authority.
+RELEASE_CRITICAL_STANDARD_RUNNERS = frozenset(
+    {
+        "ubuntu-latest",
+        "ubuntu-24.04-arm",
+        "macos-latest",
+        "macos-15-intel",
+        "windows-latest",
+    }
+)
 WINDOWS_INIT_CONTRACT = ROOT / "scripts" / "assert-windows-init-contract.sh"
 WINDOWS_INIT_CONTRACT_POLICY = "scripts/assert-windows-init-contract.sh"
 WINDOWS_WSL2_DOC = ROOT / "docs" / "windows-wsl2.md"
@@ -886,7 +903,7 @@ EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256 = {
     (
         ".github/workflows/release.yml",
         "build",
-    ): "7375c7f0f82227e8695aea7fc290631a9d3667dc6674dca10830c53e0a0f4564",
+    ): "ffde401b1343930965ae6a2a89ca3a81b2996af5821b332f65de7eba874e2be2",
     (
         ".github/workflows/release.yml",
         "verify_npm_published",
@@ -3248,6 +3265,61 @@ def install_proof_matrix_rows(install_job: str) -> tuple[
             f"install-proof matrix does not decode as JSON: {error}"
         ) from error
     return release, pull_request
+
+
+def assert_release_critical_runner_policy(
+    workflow_sources: dict[Path, str],
+) -> None:
+    """Keep every immutable-release runner on the reviewed standard pool."""
+
+    critical = (RC_BUILD, RELEASE_TAG, RELEASE, RELEASE_RECOVERY, INSTALL_PROOF)
+    for workflow in critical:
+        source = workflow_sources.get(workflow)
+        if source is None:
+            raise AssertionError(
+                f"release-critical runner policy cannot read {workflow.name}"
+            )
+        for job_id, job in workflow_job_blocks(source).items():
+            runs_on = re.findall(r"(?m)^    runs-on:\s*(\S.*?)\s*$", job)
+            if not runs_on:
+                if re.search(r"(?m)^    uses:\s*", job):
+                    continue
+                raise AssertionError(
+                    "release-critical runner policy found a job with neither "
+                    f"runs-on nor a reusable workflow: {workflow.name}:{job_id}"
+                )
+            if len(runs_on) != 1:
+                raise AssertionError(
+                    "release-critical runner policy requires exactly one runs-on "
+                    f"scalar for {workflow.name}:{job_id}; found {runs_on}"
+                )
+            runner = runs_on[0]
+            if runner == "${{ matrix.os }}":
+                matrix_runners = re.findall(
+                    r"(?m)^\s+- os:\s*([^\s#]+)\s*$", job
+                ) + re.findall(r'"os":"([^"]+)"', job)
+                if not matrix_runners:
+                    raise AssertionError(
+                        "release-critical runner policy cannot resolve the runner "
+                        f"matrix at {workflow.name}:{job_id}"
+                    )
+                rejected = [
+                    label
+                    for label in matrix_runners
+                    if label not in RELEASE_CRITICAL_STANDARD_RUNNERS
+                ]
+                if rejected:
+                    raise AssertionError(
+                        "release-critical runner policy rejects paid, custom, or "
+                        f"unreviewed matrix labels {rejected} at "
+                        f"{workflow.name}:{job_id}"
+                    )
+                continue
+            if runner not in RELEASE_CRITICAL_STANDARD_RUNNERS:
+                raise AssertionError(
+                    "release-critical runner policy rejects paid, custom, or "
+                    f"unreviewed label `{runner}` at {workflow.name}:{job_id}"
+                )
 
 
 INSTALL_PROOF_PULL_REQUEST_ARTIFACT = "install-proof-pr-binaries"
@@ -9660,6 +9732,42 @@ def main() -> None:
     workflow_sources = {
         workflow: workflow.read_text(encoding="utf-8") for workflow in workflow_paths()
     }
+    assert_release_critical_runner_policy(workflow_sources)
+
+    paid_runner_spoof = dict(workflow_sources)
+    paid_runner_spoof[RELEASE] = paid_runner_spoof[RELEASE].replace(
+        "          - os: macos-15-intel\n",
+        "          - os: macos-15-large\n",
+        1,
+    )
+    expect_assertion(
+        "the tagged release returns to a paid macOS runner",
+        "rejects paid, custom, or unreviewed matrix labels",
+        lambda: assert_release_critical_runner_policy(paid_runner_spoof),
+    )
+
+    custom_runner_spoof = dict(workflow_sources)
+    custom_runner_spoof[RELEASE_RECOVERY] = custom_runner_spoof[
+        RELEASE_RECOVERY
+    ].replace("    runs-on: ubuntu-latest\n", "    runs-on: kin-16core\n", 1)
+    expect_assertion(
+        "release recovery moves onto a custom runner",
+        "rejects paid, custom, or unreviewed label",
+        lambda: assert_release_critical_runner_policy(custom_runner_spoof),
+    )
+
+    variable_runner_spoof = dict(workflow_sources)
+    variable_runner_spoof[RELEASE_TAG] = variable_runner_spoof[RELEASE_TAG].replace(
+        "    runs-on: ubuntu-latest\n",
+        "    runs-on: ${{ vars.KIN_RELEASE_RUNNER || 'ubuntu-latest' }}\n",
+        1,
+    )
+    expect_assertion(
+        "tag mint hides a paid runner behind a repository variable",
+        "rejects paid, custom, or unreviewed label",
+        lambda: assert_release_critical_runner_policy(variable_runner_spoof),
+    )
+
     assert_workflow_job_census(workflow_sources)
 
     external_context_spoof = dict(workflow_sources)
