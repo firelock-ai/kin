@@ -42,9 +42,11 @@ destructive: each one sets up the next, and the last stops the daemon.
                thing that settles the question
   content      `kin admit` over that content-only edit does not report
                "nothing changed"
-  settled      the control: a second `kin admit` with nothing left to take says
-               "nothing changed" and says it plainly. Without this the others
-               are satisfied by a product that hedges every sentence
+  settled      the control: a second `kin admit` with nothing left to take gives
+               an explicit all-clear, either the legacy "nothing changed" or the
+               stronger verdict that the working copy was already admitted at a
+               named time. Without this the others are satisfied by a product
+               that hedges every sentence
   diff_scope   a workspace diff names what its entity and relation counts cannot
                show, rather than printing three zeroes that cannot move
   held_merge   a real conflicting merge is opened and `kin status` must name it.
@@ -358,19 +360,30 @@ def grade_admit_left_the_graph_holding_the_edit(before_text, after_text):
 
 def grade_admit_still_reports_a_true_no_op(text):
     body = text or ""
-    if "Admitted the complete exact tree" not in body:
+    admission = next(
+        (line for line in body.splitlines()
+         if line.startswith("Admitted the complete exact tree")),
+        None,
+    )
+    if admission is None:
         return UNREADABLE, "kin admit printed no admission line: %s" % body.strip()[:200]
-    if "content changed" in body:
+    if "content changed" in admission:
         return FAIL, (
             "a pass with nothing left to take reported a content change: %s"
-            % body.strip().splitlines()[0]
+            % admission
         )
-    if "nothing changed" not in body:
+    legacy_all_clear = "nothing changed" in admission
+    based_all_clear = re.search(
+        r"nothing was left to admit, because the working copy was already admitted at "
+        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})",
+        admission,
+    )
+    if not legacy_all_clear and based_all_clear is None:
         return FAIL, (
             "a settled tree got no all-clear, so the surface now hedges every answer: %s"
-            % body.strip().splitlines()[0]
+            % admission
         )
-    return PASS, "a settled tree still gets its all-clear: %s" % body.strip().splitlines()[0]
+    return PASS, "a settled tree still gets its all-clear: %s" % admission
 
 
 class Suite(object):
@@ -686,6 +699,19 @@ ADMIT_NO_OP_CLAIM = (
     "Admitted the complete exact tree; nothing changed. 8 tracked artifacts, 39 entities.\n"
     "Embeddings: 71 of 78 indexed; the remainder is queued for the background embed pass.\n"
 )
+ADMIT_ALREADY_CURRENT = (
+    "Admitted the complete exact tree; nothing was left to admit, because the working copy was "
+    "already admitted at 2026-08-30T21:32:59.447229962+00:00. 8 tracked artifacts, "
+    "39 entities.\n"
+)
+ADMIT_ALREADY_CURRENT_WITHOUT_BASIS = (
+    "Admitted the complete exact tree; nothing was left to admit. 8 tracked artifacts, "
+    "39 entities.\n"
+)
+ADMIT_HEDGED = (
+    "Admitted the complete exact tree; the working copy may already be current. "
+    "8 tracked artifacts, 39 entities.\n"
+)
 ADMIT_CONTENT_MOVED = (
     "Admitted the complete exact tree; content changed, with no artifact or entity added "
     "or removed. 8 tracked artifacts, 39 entities.\n"
@@ -814,6 +840,11 @@ def self_test():
         ("heldmerge/no-merge-opened", grade_status_names_a_held_merge,
          (STATUS_SILENT_DURING_MERGE, CONFLICTS_NONE), UNREADABLE),
         ("settled/no-op-claim", grade_admit_still_reports_a_true_no_op, ADMIT_NO_OP_CLAIM, PASS),
+        ("settled/already-current", grade_admit_still_reports_a_true_no_op,
+         ADMIT_ALREADY_CURRENT, PASS),
+        ("settled/already-current-without-basis", grade_admit_still_reports_a_true_no_op,
+         ADMIT_ALREADY_CURRENT_WITHOUT_BASIS, FAIL),
+        ("settled/hedged", grade_admit_still_reports_a_true_no_op, ADMIT_HEDGED, FAIL),
         ("settled/moved", grade_admit_still_reports_a_true_no_op, ADMIT_CONTENT_MOVED, FAIL),
         ("settled/unmeasured", grade_admit_still_reports_a_true_no_op, ADMIT_UNMEASURED, FAIL),
         ("settled/refused", grade_admit_still_reports_a_true_no_op, ADMIT_REFUSED, UNREADABLE),

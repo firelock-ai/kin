@@ -12722,6 +12722,19 @@ def main() -> None:
         "actions/workflows/publish-install.yml/runs?event=repository_dispatch",
         "the workflow may still be disabled",
         'python3 scripts/verify_installer_parity.py "$KIN_TAG" --expected-sha "$KIN_SHA"',
+        # The image-promotion dispatch, third beside the two above and under the
+        # same token, whose repositories list already carries kin-infra.
+        #
+        # The payload is pinned to the TAG ALONE on purpose. kin-infra's receiver
+        # resolves the commit, the release run, the GHCR digest and both main
+        # heads itself and refuses a tag that is not exact GitHub Latest, which is
+        # the rule publish-install.yml states for this pair: payload fields are
+        # never trusted without independent API verification. Sending more would
+        # be sending a caller-supplied identity for a production image, so the
+        # exact payload text is pinned rather than only the event type.
+        'event_type:"promote-release-images"',
+        "client_payload:{schema_version:1,kin_tag:$tag}",
+        "image promotion repository dispatch returned HTTP $code",
     ):
         require(installer_callback, policy, "completed-release follow-up callback")
 
