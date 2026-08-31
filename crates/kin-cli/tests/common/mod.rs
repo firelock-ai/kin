@@ -989,6 +989,15 @@ impl IsolatedDaemonRuntime {
         fresh_daemon_bin(self)
     }
 
+    /// Resolve or build the compatible daemon without outliving `deadline`.
+    ///
+    /// A smoke test with one total wall-clock budget must include harness
+    /// preparation. Otherwise the compatibility probe or fallback Cargo build
+    /// can wait longer than the product sequence the test claims to bound.
+    pub fn daemon_bin_before(&self, deadline: Instant) -> PathBuf {
+        fresh_daemon_bin_before(self, deadline)
+    }
+
     pub fn daemon_command(&self) -> Command<'_> {
         self.command(self.daemon_bin())
     }
@@ -1030,9 +1039,11 @@ impl IsolatedDaemonRuntime {
         scrub_inherited_kin_authority(command);
         command
             .env("KIN_REGISTRY_PATH", &self.registry_path)
-            // The explicit registry is authoritative. HOME/USERPROFILE are a
-            // fail-closed fallback for any child boundary that intentionally
-            // rebuilds its environment instead of inheriting the override.
+            // Bind the managed install and store root explicitly. HOME and
+            // USERPROFILE remain a fail-closed fallback for any child boundary
+            // that intentionally rebuilds its environment instead of
+            // inheriting the override.
+            .env("KIN_HOME", self.home_path.join(".kin"))
             .env("HOME", &self.home_path)
             .env("USERPROFILE", &self.home_path)
             .env("XDG_CONFIG_HOME", self.home_path.join(".config"))
@@ -1698,6 +1709,7 @@ fn is_allowed_runtime_override(key: &OsStr) -> bool {
         "KIN_SUPERVISOR_IDLE_TIMEOUT_SECS",
         "KIN_DAEMON_READY_TIMEOUT_SECS",
         "KIN_BYPASS_EMBEDDING_COVERAGE_CHECK",
+        "KIN_EMBED_BACKEND",
         // A runtime-bound command that sets this and is not carried proves the
         // opposite of what its test asserts: the child embeds, and the test
         // reads that as the product ignoring an operator. That is how the
@@ -3218,13 +3230,21 @@ pub fn daemon_compat_mismatch(
 }
 
 fn daemon_compat(runtime: &IsolatedDaemonRuntime, path: &Path) -> Result<(), String> {
+    daemon_compat_within(runtime, path, COMMAND_TIMEOUT)
+}
+
+fn daemon_compat_within(
+    runtime: &IsolatedDaemonRuntime,
+    path: &Path,
+    timeout: Duration,
+) -> Result<(), String> {
     if !path.exists() {
         return Err(format!("{} does not exist", path.display()));
     }
     let mut command = runtime.command(path);
     let output = command
         .arg("--compat-json")
-        .output()
+        .output_within(timeout)
         .map_err(|error| format!("could not run {} --compat-json: {error}", path.display()))?;
     if !output.status.success() {
         return Err(format!(
@@ -3303,9 +3323,41 @@ fn daemon_rebuild_follows_the_layout_its_own_binary_was_written_into() {
 }
 
 fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
+    fresh_daemon_bin_with_deadline(runtime, None)
+}
+
+fn fresh_daemon_bin_before(runtime: &IsolatedDaemonRuntime, deadline: Instant) -> PathBuf {
+    fresh_daemon_bin_with_deadline(runtime, Some(deadline))
+}
+
+fn daemon_preparation_budget(
+    deadline: Option<Instant>,
+    default: Duration,
+    label: &str,
+) -> Duration {
+    deadline
+        .map(|deadline| {
+            deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .unwrap_or_else(|| panic!("daemon preparation deadline expired before {label}"))
+        })
+        .unwrap_or(default)
+}
+
+fn fresh_daemon_bin_with_deadline(
+    runtime: &IsolatedDaemonRuntime,
+    deadline: Option<Instant>,
+) -> PathBuf {
     let kin_bin = PathBuf::from(env!("CARGO_BIN_EXE_kin"));
     let daemon_bin = kin_bin.with_file_name(format!("kin-daemon{}", std::env::consts::EXE_SUFFIX));
-    if daemon_compat(runtime, &daemon_bin).is_ok() {
+    if daemon_compat_within(
+        runtime,
+        &daemon_bin,
+        daemon_preparation_budget(deadline, COMMAND_TIMEOUT, "the compatibility probe"),
+    )
+    .is_ok()
+    {
         return daemon_bin;
     }
 
@@ -3325,7 +3377,11 @@ fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
         let output = build
             .args(&args)
             .current_dir(workspace_root)
-            .output_within(BUILD_TIMEOUT)
+            .output_within(daemon_preparation_budget(
+                deadline,
+                BUILD_TIMEOUT,
+                "the fallback Cargo build",
+            ))
             .expect("run cargo build -p kin-daemon");
         assert!(
             output.status.success(),
@@ -3335,7 +3391,11 @@ fn fresh_daemon_bin(runtime: &IsolatedDaemonRuntime) -> PathBuf {
         );
     });
 
-    if let Err(reason) = daemon_compat(runtime, &daemon_bin) {
+    if let Err(reason) = daemon_compat_within(
+        runtime,
+        &daemon_bin,
+        daemon_preparation_budget(deadline, COMMAND_TIMEOUT, "the final compatibility probe"),
+    ) {
         panic!(
             "kin-daemon at {} is unusable after rebuild: {reason}.\n\
              This test binary carries build identity {}. A daemon built from a \

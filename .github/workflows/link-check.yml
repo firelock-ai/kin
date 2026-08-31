@@ -11,6 +11,7 @@ on:
       - "SECURITY.md"
       - "docs/quickstart.md"
       - "lychee.toml"
+      - "scripts/fixtures/public-doc-links/**"
       - ".github/workflows/link-check.yml"
   push:
     branches: [main]
@@ -20,6 +21,7 @@ on:
       - "SECURITY.md"
       - "docs/quickstart.md"
       - "lychee.toml"
+      - "scripts/fixtures/public-doc-links/**"
       - ".github/workflows/link-check.yml"
   schedule:
     - cron: "17 13 * * 1"
@@ -63,3 +65,47 @@ jobs:
             ./docs/quickstart.md
           fail: true
           lycheeVersion: v0.24.2
+
+      # The action installs its pinned lychee into RUNNER_TEMP and publishes it
+      # on GITHUB_PATH. Exercise the same binary and config against one fixture
+      # per false-green class. Checking that each failing output names its own
+      # target prevents a shared config error from satisfying every arm.
+      - name: Falsify every public-link policy arm
+        shell: bash
+        run: |
+          set -euo pipefail
+          expect_failure() {
+            label="$1"
+            fixture="$2"
+            target="$3"
+            set +e
+            output="$(lychee --config lychee.toml "$fixture" 2>&1)"
+            rc=$?
+            set -e
+            printf '%s\n' "$output"
+            if [[ "$rc" -eq 0 ]]; then
+              echo "::error title=Link falsifier passed::$label returned success"
+              exit 1
+            fi
+            if ! grep -Fq "$target" <<<"$output"; then
+              echo "::error title=Wrong link falsified::$label did not report $target"
+              exit 1
+            fi
+          }
+
+          expect_failure \
+            "missing Markdown anchor" \
+            ./scripts/fixtures/public-doc-links/missing-anchor.md \
+            "anchor-that-does-not-exist"
+          expect_failure \
+            "missing relative file" \
+            ./scripts/fixtures/public-doc-links/missing-relative.md \
+            "relative-file-that-does-not-exist.md"
+          expect_failure \
+            "dead public HTTP link" \
+            ./scripts/fixtures/public-doc-links/dead-http.md \
+            "kin-link-check-http"
+          expect_failure \
+            "dead URL inside a code block" \
+            ./scripts/fixtures/public-doc-links/dead-verbatim.md \
+            "kin-link-check-verbatim"
