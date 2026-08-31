@@ -5717,7 +5717,7 @@ mod tests {
 
     #[cfg(feature = "embeddings")]
     #[test]
-    fn embedding_cache_reader_rejects_oversized_truncated_and_symlink_entries() {
+    fn embedding_cache_reader_rejects_oversized_and_truncated_entries() {
         let dir = tempfile::tempdir().unwrap();
         let dimensions = 4;
         let vector = [1.0, 2.0, 3.0, 4.0];
@@ -5741,7 +5741,15 @@ mod tests {
             read_cached_embedding(&truncated_path, dimensions).is_none(),
             "a truncated entry must not be accepted"
         );
+    }
 
+    #[cfg(all(feature = "embeddings", unix))]
+    #[test]
+    fn embedding_cache_reader_rejects_symlink_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let dimensions = 4;
+        let vector = [1.0, 2.0, 3.0, 4.0];
+        let producers = EmbeddingProducerSet::singleton(EmbeddingProducer::Cpu);
         let target_path = dir.path().join("target.bin");
         write_cached_embedding(&target_path, &vector, &producers).unwrap();
         let symlink_path = dir.path().join("symlink.bin");

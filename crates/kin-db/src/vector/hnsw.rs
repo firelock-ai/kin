@@ -712,7 +712,9 @@ fn stage_verified_vector_base(
         std::process::id(),
         uuid::Uuid::new_v4()
     ));
-    let mut directory_builder = std::fs::DirBuilder::new();
+    let directory_builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut directory_builder = directory_builder;
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
