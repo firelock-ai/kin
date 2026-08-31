@@ -367,6 +367,30 @@ class Suite(object):
             raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
         self._kin_init(repo)
 
+    def _build_graphsection(self, repo):
+        """A committed Git base whose first daemon reopen must be prepared.
+
+        `--no-enrich` is load-bearing: no daemon may open the store before the
+        check asks the explicit materialize verb whether init already wrote the
+        section.
+        """
+        rc, out, err = self.git(["init", "-q", "."], repo)
+        if rc != 0:
+            raise RuntimeError("git init failed: %s" % (err or out)[-300:])
+        self._write(repo, "src/lib.py", "def graph_truth():\n    return 29\n")
+        rc, out, err = self.git(["add", "-A"], repo)
+        if rc != 0:
+            raise RuntimeError("git add failed: %s" % (err or out)[-300:])
+        rc, out, err = self.git(
+            ["commit", "-q", "-m", "graph section fixture"], repo)
+        if rc != 0:
+            raise RuntimeError("git commit failed: %s" % (err or out)[-300:])
+        rc, out, err = self.kin_run(["init", ".", "--no-enrich"], repo)
+        if rc != 0:
+            raise RuntimeError(
+                "kin init --no-enrich failed in %s: %s"
+                % (repo, (err or out)[-300:]))
+
     def _build_threestate(self, repo):
         """A store converted from Git holding one file of each parse outcome.
 
@@ -3588,6 +3612,113 @@ def check_24(suite):
     return res
 
 
+def check_25(suite):
+    """FIR-2955: init prepares the first workspace-base reopen.
+
+    The explicit verb runs twice. `persisted` on its first run proves init
+    omitted the phase; `already_current` twice proves both the init tail and
+    the operator retry are durable and idempotent.
+    """
+    res = Result("25", "FIR-2955",
+                 "init leaves the workspace base graph section materialized")
+    repo = suite.fixture("graphsection")
+
+    endpoint_files = [os.path.join(repo, ".kin", name)
+                      for name in ("daemon.pid", "daemon.port")]
+    present = [path for path in endpoint_files if os.path.exists(path)]
+    if present:
+        res.bad("init --no-enrich left a daemon endpoint before the offline retry: %s" %
+                ", ".join(present))
+        return res
+
+    def materialize(label):
+        rc, out, err = suite.kin_run(
+            ["graph", "materialize", "--json"], repo)
+        if rc != 0:
+            res.bad("%s exited %d: %s" %
+                    (label, rc, (err or out).strip()[-300:]))
+            return None
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            res.unknown("%s printed non-JSON stdout: %r" %
+                        (label, out.strip()[-300:]))
+            return None
+        required = {
+            "schema": str,
+            "scope": str,
+            "repository_id": str,
+            "workspace_id": str,
+            "state": str,
+            "authority_generation": int,
+            "resolved_at": str,
+        }
+        malformed = [
+            "%s:%s" % (field, type(payload.get(field)).__name__)
+            for field, expected in required.items()
+            if not isinstance(payload.get(field), expected)
+            or (expected is str and not payload.get(field))
+        ]
+        if malformed:
+            res.unknown("%s response has an unreadable contract (%s): %s" %
+                        (label, ", ".join(malformed),
+                         json.dumps(payload, sort_keys=True)[:400]))
+            return None
+        if not re.fullmatch(r"[0-9a-f]{64}", payload["resolved_at"]):
+            res.unknown("%s returned a non-canonical base target %r" %
+                        (label, payload["resolved_at"]))
+            return None
+        if payload["schema"] != "kin.graph-section-materialization.v1":
+            res.unknown("%s returned unknown schema %r" %
+                        (label, payload["schema"]))
+            return None
+        if payload["scope"] != "workspace_base":
+            res.bad("%s materialized scope %r instead of workspace_base" %
+                    (label, payload["scope"]))
+            return None
+        if payload["authority_generation"] < 0:
+            res.unknown("%s returned a negative authority generation" % label)
+            return None
+        return payload
+
+    first = materialize("first explicit materialize after init")
+    if first is None:
+        return res
+    if first["state"] == "persisted":
+        res.bad("the first explicit materialize persisted the section, proving kin init "
+                "omitted its post-publication materialization phase")
+        return res
+    if first["state"] != "already_current":
+        res.bad("the first explicit materialize returned %r, not already_current" %
+                first["state"])
+        return res
+    res.ok("the first explicit retry found init's durable section already current")
+
+    second = materialize("second explicit materialize")
+    if second is None:
+        return res
+    if second["state"] != "already_current":
+        res.bad("the idempotent retry returned %r, not already_current" %
+                second["state"])
+        return res
+    stable = ["repository_id", "workspace_id", "authority_generation", "resolved_at"]
+    changed = [field for field in stable if second[field] != first[field]]
+    if changed:
+        res.bad("the second retry changed %s: first=%s second=%s" %
+                (", ".join(changed), json.dumps(first, sort_keys=True),
+                 json.dumps(second, sort_keys=True)))
+    else:
+        res.ok("the second retry stayed already_current at the same identity, generation, "
+               "and base target")
+    present = [path for path in endpoint_files if os.path.exists(path)]
+    if present:
+        res.bad("offline materialization created a daemon endpoint: %s" %
+                ", ".join(present))
+    else:
+        res.ok("both explicit retries completed without starting a daemon")
+    return res
+
+
 CHECKS = [
     ("0", check_0),
     ("1", check_1),
@@ -3614,6 +3745,7 @@ CHECKS = [
     ("22", check_22),
     ("23", check_23),
     ("24", check_24),
+    ("25", check_25),
 ]
 
 

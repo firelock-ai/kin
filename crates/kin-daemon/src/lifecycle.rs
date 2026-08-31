@@ -7,14 +7,13 @@
 //! The CLI reads those files to connect. If the daemon isn't running, the
 //! CLI spawns it and waits for the port to open.
 
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use std::fs::{File, OpenOptions};
 #[cfg(target_os = "macos")]
-use std::io::Read as _;
+use std::io::{Read as _, Seek, SeekFrom, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 #[cfg(target_os = "macos")]
@@ -30,74 +29,8 @@ pub use kin_cli::daemon_client::AutoStartError;
 
 // ── Daemon Singleton Lock ───────────────────────────────────────────────
 
-/// An exclusive, per-repo daemon lock.
-///
-/// Held for the daemon's entire lifetime to guarantee at most one daemon
-/// process per repo. The lock is an OS-level advisory `flock(2)` on
-/// `.kin/daemon.lock`. Because the kernel ties the lock to the open file
-/// description, it is released automatically when this handle is dropped *or*
-/// when the last process holding that description exits. A forked child can
-/// inherit the description and keep it locked after the stamped daemon dies;
-/// that case is detected and reported, but not automatically unlinked.
-///
-/// Current builds never unlink this pathname automatically. The separate
-/// lifecycle coordination lock serializes all current acquisition and endpoint
-/// publication paths, but it cannot exclude a compatible older writer that
-/// does not participate. Recovery therefore fails closed rather than replacing
-/// an inode that a legacy process could have acquired after a userspace check.
-#[derive(Debug)]
-pub struct DaemonLock {
-    file: std::fs::File,
-    canonical_kin_root: PathBuf,
-}
-
-impl DaemonLock {
-    /// Canonical `.kin` root whose singleton this capability protects.
-    ///
-    /// Carrying the repository identity with the file handle prevents a caller
-    /// from replaying authority acquired for repo A while starting state opened
-    /// from repo B.
-    pub fn canonical_kin_root(&self) -> &Path {
-        &self.canonical_kin_root
-    }
-}
-
-impl Drop for DaemonLock {
-    /// Clear the owner stamp before releasing the lock.
-    ///
-    /// This is what makes the stamp mean something precise: a non-empty
-    /// `daemon.lock` body says a process took the lock and did *not* release it
-    /// cleanly. A clean exit runs this drop; a `SIGKILL` cannot, which is
-    /// exactly the case reclaim needs to identify. Without the clear, every
-    /// ordinary shutdown would leave a dead-owner record and the next startup
-    /// would "reclaim" locks that were never stale.
-    fn drop(&mut self) {
-        let _ = self.file.set_len(0);
-        let _ = self.file.flush();
-    }
-}
-
-/// Stamp the acquiring process's PID into the lock file body.
-///
-/// The flock lives on the open file description, so the file's *contents* are
-/// free real estate. Recording the owner there gives every other process a
-/// piece of evidence about who holds the repo that does not depend on
-/// `daemon.pid` surviving: `daemon.pid` is written by the daemon and can be
-/// removed by any other participant, while this stamp is written under the
-/// lock by the only process that could have taken it.
-fn stamp_lock_owner(file: &mut std::fs::File) {
-    let stamp = current_owner_stamp();
-    if file.set_len(0).is_err() {
-        return;
-    }
-    if file.seek(SeekFrom::Start(0)).is_err() {
-        return;
-    }
-    if write!(file, "{stamp}").is_err() {
-        return;
-    }
-    let _ = file.flush();
-}
+/// Compatibility name for the shared per-repository runtime capability.
+pub type DaemonLock = kin_cli::daemon_client::RepositoryRuntimeAuthority;
 
 /// Marker introducing an owner stamp that carries process identity rather than
 /// a bare PID.
@@ -113,14 +46,9 @@ const OWNER_STAMP_V2: &str = "kin-daemon-owner-v2";
 ///
 /// Falls back to the bare-PID form when identity cannot be read at all, which
 /// is the same evidence the previous format carried and never less.
+#[cfg(test)]
 fn current_owner_stamp() -> String {
-    match kin_cli::daemon_client::current_process_identity() {
-        Ok(identity) => match serde_json::to_string(&identity) {
-            Ok(encoded) => format!("{OWNER_STAMP_V2} {encoded}"),
-            Err(_) => std::process::id().to_string(),
-        },
-        Err(_) => std::process::id().to_string(),
-    }
+    kin_cli::daemon_client::current_repository_runtime_owner_stamp()
 }
 
 /// What a lock file's owner stamp records.
@@ -231,57 +159,7 @@ pub fn singleton_lock_holder(kin_root: &Path) -> Option<SingletonLockHolder> {
 ///   not start a second daemon and should exit cleanly.
 /// - `Err(_)` — an unexpected IO error opening the lock file.
 pub fn acquire_singleton_lock(kin_root: &Path) -> std::io::Result<Option<DaemonLock>> {
-    without_blocking_runtime_worker(|| acquire_singleton_lock_inner(kin_root))
-}
-
-fn acquire_singleton_lock_inner(kin_root: &Path) -> std::io::Result<Option<DaemonLock>> {
-    acquire_singleton_lock_inner_until(kin_root, Instant::now() + SINGLETON_LOCK_RETRY_BUDGET)
-}
-
-fn acquire_singleton_lock_inner_until(
-    kin_root: &Path,
-    deadline: Instant,
-) -> std::io::Result<Option<DaemonLock>> {
-    acquire_singleton_lock_inner_until_with_coordination_hook(kin_root, deadline, || {})
-}
-
-fn acquire_singleton_lock_inner_until_with_coordination_hook<F>(
-    kin_root: &Path,
-    deadline: Instant,
-    on_coordination_contention: F,
-) -> std::io::Result<Option<DaemonLock>>
-where
-    F: FnMut(),
-{
-    let canonical_kin_root = kin_root.canonicalize()?;
-    let _coordination = acquire_singleton_coordination_guard_until_with_hook(
-        &canonical_kin_root,
-        deadline,
-        on_coordination_contention,
-    )?;
-    let path = canonical_kin_root.join("daemon.lock");
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&path)?;
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            // Record ownership while holding the lock, so a contender that
-            // fails to acquire can always name the process it lost to.
-            stamp_lock_owner(&mut file);
-            Ok(Some(DaemonLock {
-                file,
-                canonical_kin_root,
-            }))
-        }
-        // fs2 reports contention with the platform's "would block" error
-        // (EWOULDBLOCK on Unix). Treat that — and only that — as "already
-        // held"; surface every other IO error to the caller.
-        Err(err) if err.kind() == fs2::lock_contended_error().kind() => Ok(None),
-        Err(err) => Err(err),
-    }
+    kin_cli::daemon_client::acquire_repository_runtime_authority(kin_root)
 }
 
 /// Serialize current daemon acquisition, evidence reads, and endpoint changes.
@@ -355,29 +233,7 @@ pub fn acquire_singleton_lock_within(
     kin_root: &Path,
     budget: Duration,
 ) -> std::io::Result<Option<DaemonLock>> {
-    without_blocking_runtime_worker(|| {
-        let deadline = Instant::now() + budget;
-        loop {
-            match acquire_singleton_lock_inner_until(kin_root, deadline) {
-                Ok(Some(lock)) => return Ok(Some(lock)),
-                Ok(None) => {}
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::WouldBlock
-                        && Instant::now() >= deadline =>
-                {
-                    return Ok(None);
-                }
-                Err(error) => return Err(error),
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Ok(None);
-            }
-            std::thread::sleep(
-                SINGLETON_LOCK_RETRY_INTERVAL.min(deadline.saturating_duration_since(now)),
-            );
-        }
-    })
+    kin_cli::daemon_client::acquire_repository_runtime_authority_within(kin_root, budget)
 }
 
 /// Run a blocking step without holding a tokio worker thread hostage.
@@ -406,7 +262,8 @@ pub(crate) fn without_blocking_runtime_worker<T>(work: impl FnOnce() -> T) -> T 
 /// How long a contended starter keeps retrying the singleton lock before it
 /// reports the holder. Long enough to cover an exiting daemon's teardown,
 /// short enough that a genuine second daemon fails fast and loudly.
-pub const SINGLETON_LOCK_RETRY_BUDGET: Duration = Duration::from_secs(5);
+pub const SINGLETON_LOCK_RETRY_BUDGET: Duration =
+    kin_daemon_spawn::REPOSITORY_RUNTIME_AUTHORITY_RETRY_BUDGET;
 
 const SINGLETON_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -2677,6 +2534,8 @@ pub(crate) fn unregister_launch_agent(_kin_root: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use std::io::{Seek as _, SeekFrom, Write as _};
 
     #[cfg(target_os = "macos")]
     const LIFECYCLE_WORKER_MODE: &str = "KINTEST_LIFECYCLE_WORKER_MODE";

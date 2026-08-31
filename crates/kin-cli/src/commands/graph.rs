@@ -173,6 +173,22 @@ pub async fn validate() -> Result<()> {
     print_graph_response(run_daemon_graph(&layout, &GraphCommandRequest::Validate).await?)
 }
 
+/// `kin graph materialize` — persist the current workspace base graph section.
+///
+/// This is an explicit representation rewrite. It preserves semantic roots and
+/// logical authority generation while making future workspace-base reopens
+/// reuse the complete graph section instead of folding history again.
+pub async fn materialize(json: bool) -> Result<()> {
+    let layout = crate::commands::require_repository_layout()?;
+    let materialization = super::repository_authority::materialize_workspace_base_offline(&layout)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&materialization)?);
+        return Ok(());
+    }
+    println!("{}", materialization.human_line());
+    Ok(())
+}
+
 /// `kin graph inspect <entity>` — look up an entity (by name or UUID) and show its relations.
 ///
 /// In `--json` mode, the full `GraphCommandResponse` ({lines, error}) is emitted
@@ -4995,6 +5011,20 @@ mod tests {
             graph_wait_label(&GraphCommandRequest::Source {
                 entity: "Router".to_string()
             }),
+        );
+    }
+
+    #[test]
+    fn graph_response_from_an_older_daemon_may_omit_optional_source() {
+        let response: GraphCommandResponse = serde_json::from_value(serde_json::json!({
+            "lines": ["older daemon response"]
+        }))
+        .unwrap();
+        assert!(response.source.is_none());
+        assert_eq!(response.lines, ["older daemon response"]);
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::json!({"lines": ["older daemon response"]})
         );
     }
 }
