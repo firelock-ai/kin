@@ -4496,6 +4496,7 @@ WINDOWS_AUTHORITY_LEGS = (
     "daemon shutdown identity",
     "kin-cli Windows modules",
     "full managed uninstall safety",
+    "editor extension detection",
     "native full managed uninstall lifecycle",
     "native managed-daemon ownership scan",
     "native install authority contention and crash recovery",
@@ -4509,6 +4510,7 @@ WINDOWS_AUTHORITY_LEGS = (
     "late daemon-descendant containment",
     "daemon isolation support",
     "durable merge resolution containment compile",
+    "editor setup guidance",
 )
 
 
@@ -16173,7 +16175,7 @@ jobs:
         "always()",
         "needs.publish.result == 'success'",
         "uses: ./.github/workflows/install-proof.yml",
-        "expected_vfs_commit: d6c72979a3837c484ce7a604377df1837f9de8bd",
+        "expected_vfs_commit: 2cab0e11e9b1ae0adc422ef8e0d09c24d296d370",
     ):
         require(install_proof_job, policy, "mandatory public install proof")
 
