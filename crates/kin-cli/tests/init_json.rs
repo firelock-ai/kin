@@ -275,6 +275,16 @@ fn init_materializes_before_the_first_daemon_reopen() {
     let automatic = &initialized["graph_section_materialization"];
     assert_eq!(automatic["state"], "persisted", "{initialized}");
     assert_eq!(automatic["scope"], "workspace_base", "{initialized}");
+    let automatic_resolved_at = automatic["resolved_at"]
+        .as_str()
+        .expect("init materialization target should be a JSON string");
+    assert_eq!(automatic_resolved_at.len(), 64, "{initialized}");
+    assert!(
+        automatic_resolved_at
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "init materialization target should be lowercase hex: {initialized}"
+    );
     assert!(!repo.join(".kin/daemon.pid").exists());
     assert!(!repo.join(".kin/daemon.port").exists());
 
@@ -290,6 +300,16 @@ fn init_materializes_before_the_first_daemon_reopen() {
     assert_eq!(reopened["schema"], "kin.graph-section-materialization.v1");
     assert_eq!(reopened["state"], "already_current", "{reopened}");
     assert_eq!(reopened["scope"], "workspace_base", "{reopened}");
+    let reopened_resolved_at = reopened["resolved_at"]
+        .as_str()
+        .expect("explicit materialization target should be a JSON string");
+    assert_eq!(reopened_resolved_at.len(), 64, "{reopened}");
+    assert!(
+        reopened_resolved_at
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "explicit materialization target should be lowercase hex: {reopened}"
+    );
     assert_eq!(
         reopened["authority_generation"],
         automatic["authority_generation"]
