@@ -2534,6 +2534,8 @@ pub(crate) fn unregister_launch_agent(_kin_root: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use std::io::{Seek as _, SeekFrom, Write as _};
 
     #[cfg(target_os = "macos")]
     const LIFECYCLE_WORKER_MODE: &str = "KINTEST_LIFECYCLE_WORKER_MODE";
