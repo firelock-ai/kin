@@ -1137,10 +1137,13 @@ impl SetupIntent {
         }
     }
 
-    fn description(self) -> &'static str {
+    fn description(self, editor_extension_installed: bool) -> &'static str {
         match self {
             Self::LocalOnly => "shell integration + auto-daemon; no AI client config",
             Self::AgentOnly => "configure Kin's MCP server for detected AI clients + auto-daemon",
+            Self::Editor if editor_extension_installed => {
+                "local-only, with the kin-editor extension already installed"
+            }
             Self::Editor => "local-only, plus how to install the kin-editor extension",
             Self::Hosted => {
                 "local setup, plus the sign-in state and commands for a KinLab workspace"
@@ -12132,13 +12135,17 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     println!();
 
     let assistants = detect_ai_assistants();
-    let intent = resolve_intent(&opts, interactive);
+    // Take one snapshot for setup's editor-intent rendering. The health check
+    // owns detection; reusing its probe here prevents the plan and follow-up
+    // from being rendered from competing setup-only guesses.
+    let editor_extension_installed = crate::commands::health::editor_extension_detected();
+    let intent = resolve_intent(&opts, interactive, editor_extension_installed);
 
     println!();
     println!(
         "Plan: {} — {}",
         style(intent.title()).bold(),
-        intent.description()
+        intent.description(editor_extension_installed)
     );
     println!();
 
@@ -12148,7 +12155,7 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let configured_assistants =
         apply_plan(&plan, &assistants, shell_name, !opts.skip_mcp_check).await?;
 
-    print_intent_followups(&plan, interactive);
+    print_intent_followups(&plan, interactive, editor_extension_installed);
 
     // Language servers are what turn Kin's cross-file answers from bare-name
     // matches into resolved ones, and setup is the one moment a person is
@@ -12287,7 +12294,11 @@ fn request_notification_authorization(interactive: bool) {
 
 /// Decide the first-run intent: explicit flag, else interactive menu, else the
 /// non-interactive default (`AgentOnly`, the smallest path to value).
-fn resolve_intent(opts: &WizardOptions, interactive: bool) -> SetupIntent {
+fn resolve_intent(
+    opts: &WizardOptions,
+    interactive: bool,
+    editor_extension_installed: bool,
+) -> SetupIntent {
     if let Some(flag) = opts.intent.as_deref() {
         if let Some(intent) = SetupIntent::from_flag(flag) {
             return intent;
@@ -12312,7 +12323,13 @@ fn resolve_intent(opts: &WizardOptions, interactive: bool) -> SetupIntent {
     ];
     let items: Vec<String> = intents
         .iter()
-        .map(|i| format!("{:<34} {}", i.title(), i.description()))
+        .map(|i| {
+            format!(
+                "{:<34} {}",
+                i.title(),
+                i.description(editor_extension_installed)
+            )
+        })
         .collect();
 
     println!("What do you want Kin for?");
@@ -12818,15 +12835,34 @@ fn configure_assistant_by_index(idx: usize) -> Option<Result<PathBuf>> {
 
 /// Intent-specific guidance shown before the health checklist, driven by the
 /// applied [`SetupPlan`].
-fn print_intent_followups(plan: &SetupPlan, interactive: bool) {
+fn editor_followup(editor_extension_installed: bool) -> (bool, &'static str, &'static str) {
+    if editor_extension_installed {
+        (
+            true,
+            "kin-editor is already installed; open an initialized repository in VS Code,",
+            "then run `Kin: Setup Workspace` and `Kin: Semantic Search`.",
+        )
+    } else {
+        (
+            false,
+            "Install the kin-editor VS Code extension for the entity explorer,",
+            "semantic search, and trace surfaces. See the kin-editor README.",
+        )
+    }
+}
+
+fn print_intent_followups(plan: &SetupPlan, interactive: bool, editor_extension_installed: bool) {
     if plan.show_editor_hint {
         println!();
         println!("Editor extension:");
-        println!(
-            "  {} Install the kin-editor VS Code extension for the entity explorer,",
+        let (installed, first, second) = editor_followup(editor_extension_installed);
+        let mark = if installed {
+            style("✓").green()
+        } else {
             style("→").cyan()
-        );
-        println!("    semantic search, and trace surfaces. See the kin-editor README.");
+        };
+        println!("  {mark} {first}");
+        println!("    {second}");
     }
     if plan.show_hosted_hint {
         println!();
@@ -19859,14 +19895,17 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
 
     #[test]
     fn non_interactive_defaults_to_agent_intent() {
-        assert_eq!(resolve_intent(&opts(), false), SetupIntent::AgentOnly);
+        assert_eq!(
+            resolve_intent(&opts(), false, false),
+            SetupIntent::AgentOnly
+        );
     }
 
     #[test]
     fn intent_flag_overrides_default() {
         let mut o = opts();
         o.intent = Some("local".to_string());
-        assert_eq!(resolve_intent(&o, false), SetupIntent::LocalOnly);
+        assert_eq!(resolve_intent(&o, false, false), SetupIntent::LocalOnly);
     }
 
     #[test]
@@ -19898,6 +19937,60 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         assert!(plan.show_editor_hint);
         assert!(!plan.configure_mcp);
         assert!(plan.install_shell_hook);
+    }
+
+    #[test]
+    #[serial]
+    fn editor_followup_acknowledges_an_installed_extension() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let extension = home
+            .join(".vscode")
+            .join("extensions")
+            .join("firelock.kin-editor-test");
+        fs::create_dir_all(&extension).unwrap();
+        fs::write(
+            extension.join("package.json"),
+            r#"{"publisher":"firelock","name":"kin-editor","version":"0.0.0-test"}"#,
+        )
+        .unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _user_profile = EnvVarGuard::set("USERPROFILE", &home);
+
+        let editor_extension_installed = crate::commands::health::editor_extension_detected();
+        let (installed, first, second) = editor_followup(editor_extension_installed);
+        let rendered = format!("{first}\n{second}");
+        assert!(installed, "the installed VSIX was not detected: {rendered}");
+        assert!(
+            rendered.contains("already installed"),
+            "setup did not acknowledge the state its health check reports: {rendered}"
+        );
+        assert!(
+            !rendered.contains("Install the kin-editor"),
+            "setup recommended work the developer had already completed: {rendered}"
+        );
+        assert!(
+            !SetupIntent::Editor
+                .description(editor_extension_installed)
+                .contains("install the kin-editor"),
+            "the plan contradicted the follow-up for an installed extension"
+        );
+
+        fs::remove_dir_all(home.join(".vscode").join("extensions")).unwrap();
+        let editor_extension_installed = crate::commands::health::editor_extension_detected();
+        let (missing, first, second) = editor_followup(editor_extension_installed);
+        let missing_rendered = format!("{first}\n{second}");
+        assert!(!missing, "an absent extension was reported installed");
+        assert!(
+            missing_rendered.contains("Install the kin-editor"),
+            "a developer without the extension lost the install path: {missing_rendered}"
+        );
+        assert!(
+            SetupIntent::Editor
+                .description(editor_extension_installed)
+                .contains("install the kin-editor"),
+            "the plan lost the install path for a missing extension"
+        );
     }
 
     /// The hosted surface is where a first-time caller learns whether they can
@@ -20011,7 +20104,7 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
         let entry = format!(
             "{} {}",
             SetupIntent::Hosted.title(),
-            SetupIntent::Hosted.description()
+            SetupIntent::Hosted.description(false)
         )
         .to_lowercase();
         for denial in ["coming soon", "no first-run flow yet", "not yet"] {

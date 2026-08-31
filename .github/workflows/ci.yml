@@ -492,6 +492,10 @@ jobs:
             "commands::setup::tests::full_uninstall" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --lib
+          run_required_filter "editor extension detection" \
+            "commands::health::tests::editor_detection" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --lib
           run_required_exact "native full managed uninstall lifecycle" \
             "commands::setup::tests::native_full_uninstall_runtime_executes_retirement_and_user_path_cleanup" \
             --locked --target x86_64-pc-windows-msvc \
@@ -598,6 +602,10 @@ jobs:
             "concurrent_resolutions_from_one_view_leave_one_winner" \
             --locked --target x86_64-pc-windows-msvc \
             -p kin-cli --no-default-features --test repository_merge_resolution
+          run_required_target "editor setup guidance" \
+            "full_setup_output_recommends_install_only_when_the_editor_extension_is_missing" \
+            --locked --target x86_64-pc-windows-msvc \
+            -p kin-cli --no-default-features --test setup_editor_guidance
 
   windows-installer:
     # Renamed from "Windows installer + vector-free release build" when native
