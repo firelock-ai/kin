@@ -3280,6 +3280,10 @@ def install_proof_matrix_rows(install_job: str) -> tuple[
 
 def assert_release_critical_runner_policy(
     workflow_sources: dict[Path, str],
+    *,
+    expected_matrix_hashes: dict[tuple[str, str], str] = (
+        EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256
+    ),
 ) -> None:
     """Keep every immutable-release runner on the reviewed standard pool."""
 
@@ -3333,7 +3337,7 @@ def assert_release_critical_runner_policy(
                 path = workflow.relative_to(ROOT).as_posix()
                 context_key = (path, job_id)
                 display_name = optional_job_display_name(job)
-                expected_hash = EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256.get(context_key)
+                expected_hash = expected_matrix_hashes.get(context_key)
                 if display_name is None or expected_hash is None:
                     raise AssertionError(
                         "release-critical runner policy has no exact matrix contract "
@@ -9842,6 +9846,71 @@ def main() -> None:
             "release-critical runner policy",
             lambda runner_spoof=runner_spoof: (
                 assert_release_critical_runner_policy(runner_spoof)
+            ),
+        )
+
+    # The canonical matrix hash and the standard-runner allowlist are separate
+    # controls. Re-pin each paid matrix mutation to its new exact hash before
+    # checking it, so these falsifiers reach the allowlist instead of stopping
+    # at hash drift. Deleting the label-rejection branch must therefore make
+    # this suite red even when a future reviewer deliberately updates a matrix
+    # contract alongside its workflow.
+    for label, workflow, job_id, original, mutation in (
+        (
+            "a repinned RC build matrix still rejects a paid runner",
+            RC_BUILD,
+            "build",
+            "          - os: ubuntu-latest\n",
+            "          - os: macos-15-large\n",
+        ),
+        (
+            "a repinned RC capability matrix still rejects a paid runner",
+            RC_BUILD,
+            "capability",
+            "          - os: macos-latest\n",
+            "          - os: macos-15-large\n",
+        ),
+        (
+            "a repinned tagged-release matrix still rejects a paid runner",
+            RELEASE,
+            "build",
+            "          - os: macos-15-intel\n",
+            "          - os: macos-15-large\n",
+        ),
+        (
+            "a repinned install-proof matrix still rejects a paid runner",
+            INSTALL_PROOF,
+            "install-proof",
+            '{"os":"macos-15-intel","setup-shell":"zsh"}',
+            '{"os":"macos-15-large","setup-shell":"zsh"}',
+        ),
+    ):
+        repinned_spoof = dict(workflow_sources)
+        original_job = workflow_job_blocks(repinned_spoof[workflow])[job_id]
+        mutated_job = replace_exactly_once(
+            original_job, original, mutation, label
+        )
+        repinned_spoof[workflow] = replace_exactly_once(
+            repinned_spoof[workflow], original_job, mutated_job, label
+        )
+        display_name = optional_job_display_name(mutated_job)
+        if display_name is None:
+            raise AssertionError(
+                f"runner policy repinned falsification lost job name for {label}"
+            )
+        repinned_hashes = dict(EXPECTED_DYNAMIC_JOB_CONTEXT_SHA256)
+        context_key = (workflow.relative_to(ROOT).as_posix(), job_id)
+        repinned_hashes[context_key] = hashlib.sha256(
+            f"{display_name}\n{dynamic_job_context_source(mutated_job)}".encode()
+        ).hexdigest()
+        expect_assertion(
+            label,
+            "unreviewed matrix labels",
+            lambda repinned_spoof=repinned_spoof, repinned_hashes=repinned_hashes: (
+                assert_release_critical_runner_policy(
+                    repinned_spoof,
+                    expected_matrix_hashes=repinned_hashes,
+                )
             ),
         )
 
