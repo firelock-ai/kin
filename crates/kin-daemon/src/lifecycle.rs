@@ -7,14 +7,13 @@
 //! The CLI reads those files to connect. If the daemon isn't running, the
 //! CLI spawns it and waits for the port to open.
 
-use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 #[cfg(target_os = "macos")]
 use std::fs::{File, OpenOptions};
 #[cfg(target_os = "macos")]
-use std::io::Read as _;
+use std::io::{Read as _, Seek, SeekFrom, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
 #[cfg(target_os = "macos")]
