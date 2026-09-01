@@ -37,6 +37,12 @@ export const EVIDENCE_REF = 'release-evidence';
 export const PREFLIGHT_SCHEMA = 'kin.release-preflight.v1';
 export const PREFLIGHT_RECORD = 'preflight.json';
 export const STRANGER_RECORD = 'stranger.env';
+// A primetime release must make it through the three distinct first-contact
+// surfaces Kin asks a developer to trust: a new repository, a brownfield
+// repository, and the version-control replacement path. `kin-stranger` writes
+// these names into run.env, so this is a contract with the proof harness rather
+// than a prose convention in a release note.
+export const REQUIRED_STRANGER_ARMS = Object.freeze(['green', 'brown', 'vcs']);
 // The release train's version bump branch, and the ONLY branch whose head ever
 // carried proof records. It bounds the bridge below. release-train.yml declares
 // the same literal, and the authority suite pins the two together so they
@@ -45,6 +51,24 @@ export const BUMP_BRANCH = 'automation/release-next';
 
 const COMMIT_SHA = /^[0-9a-f]{40}$/;
 const ARCHIVE_SHA = /^[0-9a-f]{64}$/;
+
+function armList(env, field, { allowEmpty = false } = {}) {
+  if (!Object.prototype.hasOwnProperty.call(env ?? {}, field)) {
+    throw new Error(`stranger record carries no ${field}, so its arm coverage is unknown`);
+  }
+  const raw = env[field];
+  if (typeof raw !== 'string') {
+    throw new Error(`stranger record carries non-text ${field}, so its arm coverage is unknown`);
+  }
+  const arms = raw.split(',').map((arm) => arm.trim()).filter(Boolean);
+  if (!allowEmpty && arms.length === 0) {
+    throw new Error(`stranger record carries no ${field}, so its arm coverage is unknown`);
+  }
+  if (new Set(arms).size !== arms.length) {
+    throw new Error(`stranger record repeats an arm in ${field}, so its coverage is ambiguous`);
+  }
+  return arms;
+}
 
 export function evidencePath(sha, name) {
   if (typeof sha !== 'string' || !COMMIT_SHA.test(sha)) {
@@ -70,7 +94,13 @@ export function parseRunEnv(text) {
     if (eq <= 0) {
       continue;
     }
-    out[line.slice(0, eq)] = line.slice(eq + 1);
+    const key = line.slice(0, eq);
+    if (Object.prototype.hasOwnProperty.call(out, key)) {
+      throw new Error(
+        `stranger record repeats key "${key}", so its evidence is ambiguous`,
+      );
+    }
+    out[key] = line.slice(eq + 1);
   }
   return out;
 }
@@ -138,29 +168,17 @@ export function judgePreflight(record, sha) {
 
 // What a satisfied gate does and does not say.
 //
-// This accepts a record from a stranger run that FAILED, and that is deliberate.
-// The tests are that the run finished and that it ran the bytes a preflight leg
-// judged; the arm's own result is not a test, because the doctrine is that the
-// report must EXIST, and "the run found nothing" is a finding about the run
-// rather than about the build. The first real back-fill proves the point rather
-// than leaving it theoretical: rc0545's run.env finished at 2026-08-20T21:35:26Z
-// with its brown arm having exited rc=30, and this function accepts it.
+// A record may still contain useful findings. This gate does not decide that
+// Kin is defect-free. It does decide that all three required first-contact arms
+// completed their two phases on the same archived bytes the preflight judged.
+// That distinction is intentional: an unfinished arm cannot be treated as a
+// finding, because it has not supplied a result that a human can review.
 //
-// So a gate that passes means A STRANGER RUN HAPPENED ON THESE BYTES. It never
-// means the stranger passed. Those two readings are one careless sentence apart
-// in a status update, and only one of them is true. Anyone quoting this gate as
-// evidence of a good release is quoting it wrong.
-//
-// It also never means the stranger ran EVERYTHING. Nothing below reads the
-// `arms` field, deliberately: a green-only run.env satisfies this function
-// exactly as a two-arm one does, because a gate that demanded every arm would
-// block every budget-constrained release, which is the deferred-instrument
-// problem arriving by another door. The consequence is that a release evidenced
-// by one arm carries less coverage than one evidenced by two, and this gate
-// cannot tell you which you are holding. Where that difference matters it goes
-// in the release note, not here. The two halves of this misreading are
-// neighbours and a reader will meet them together, so they are written
-// together.
+// `finished_at` alone is insufficient. The v0.6.3 record reached that terminal
+// field with `arms_complete=` and all three arms in `arms_incomplete`; accepting
+// it let a partial local-model run look like release evidence. Require the
+// harness's explicit coverage fields, refuse any incomplete arm, and preserve
+// the complete arm set in the returned result for callers and logs.
 export function judgeStranger(env, sha, archives) {
   const where = evidencePath(sha, STRANGER_RECORD);
   const archive = env?.archive_sha256;
@@ -183,7 +201,52 @@ export function judgeStranger(env, sha, archives) {
       'these bytes',
     );
   }
-  return { archive };
+
+  const requested = armList(env, 'arms');
+  // An empty completed list is distinct from an absent field: the latter
+  // makes coverage unknowable, while the former is an explicit statement that
+  // none completed. Keep it long enough to name an incomplete arm when one is
+  // recorded, then reject it below if no arm is complete.
+  const completed = armList(env, 'arms_complete', { allowEmpty: true });
+  const incomplete = armList(env, 'arms_incomplete', { allowEmpty: true });
+  const requestedSet = new Set(requested);
+
+  const missingRequired = REQUIRED_STRANGER_ARMS.filter((arm) => !requestedSet.has(arm));
+  if (missingRequired.length > 0) {
+    throw new Error(
+      `${where} omits required stranger arm(s) ${missingRequired.join(', ')}, ` +
+      'so the release lacks complete first-contact coverage',
+    );
+  }
+
+  const unexpectedCompleted = completed.filter((arm) => !requestedSet.has(arm));
+  if (unexpectedCompleted.length > 0) {
+    throw new Error(
+      `${where} marks undeclared arm(s) ${unexpectedCompleted.join(', ')} complete, ` +
+      'so its coverage record is inconsistent',
+    );
+  }
+  const unexpectedIncomplete = incomplete.filter((arm) => !requestedSet.has(arm));
+  if (unexpectedIncomplete.length > 0) {
+    throw new Error(
+      `${where} marks undeclared arm(s) ${unexpectedIncomplete.join(', ')} incomplete, ` +
+      'so its coverage record is inconsistent',
+    );
+  }
+  if (incomplete.length > 0) {
+    throw new Error(
+      `${where} records incomplete stranger arm(s) ${incomplete.join(', ')}, ` +
+      'so the stranger proof did not finish',
+    );
+  }
+  const missingCompleted = requested.filter((arm) => !completed.includes(arm));
+  if (missingCompleted.length > 0) {
+    throw new Error(
+      `${where} does not mark requested arm(s) ${missingCompleted.join(', ')} complete, ` +
+      'so the stranger proof did not finish',
+    );
+  }
+  return { archive, arms: requested };
 }
 
 // Fails closed. An unreadable record is not a passing check, so a transport
@@ -424,11 +487,11 @@ export async function main({
   const { archives } = judgePreflight(preflight, sha);
 
   const strangerText = await fetchEvidence(sha, STRANGER_RECORD, options);
-  const { archive } = judgeStranger(parseRunEnv(strangerText), sha, archives);
+  const { archive, arms } = judgeStranger(parseRunEnv(strangerText), sha, archives);
 
   log(
     `Verified release proof artifacts for ${sha}: preflight PASS across ` +
-    `${archives.length} leg(s), stranger ran archive sha256 ${archive}`,
+    `${archives.length} leg(s), stranger completed ${arms.join(', ')} on archive sha256 ${archive}`,
   );
   return { sha, archives, archive };
 }
