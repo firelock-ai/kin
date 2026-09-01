@@ -731,12 +731,16 @@ jobs:
             sha256: sha256(name),
             size_bytes: fs.statSync(name).size,
           });
-          // The content inventory covers the archive's component files. The macOS
-          // notification bundle is a sealed directory rather than a component, so
-          // it is classified and shape-checked here but stays out of the manifest:
-          // an installed updater refuses any inventory name outside its managed
-          // component list, and the bundle's bytes are already covered by the
-          // archive digest, its code signature, and its stapled notarization.
+          // The content inventory covers the archive's component files and nothing
+          // else. An installed updater refuses any inventory name outside its
+          // managed component list, so the macOS notification bundle, a sealed
+          // directory rather than a component, and the three documentation
+          // members are classified and shape-checked here but stay out of the
+          // manifest. v0.6.2 refused the v0.6.3 manifest on `checksums-sha256.txt`,
+          // the first documentation record in it, and no managed install could
+          // update across any release from v0.5.45 on. Their bytes are covered by
+          // the archive digest; the bundle's also by its code signature and
+          // stapled notarization, the docs' also by the in-archive checksum file.
           const contents = classifyReleaseArchiveRoot(artifact, { target })
             .files
             .map((name) => {

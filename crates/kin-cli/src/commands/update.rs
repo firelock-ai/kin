@@ -6514,6 +6514,18 @@ fn validate_notifier_bundle_shape(members: &[BundleMember]) -> Result<()> {
 ///
 /// Adding a name here without adding it to the archive shape (or the reverse)
 /// is the failure this pair exists to prevent, so the two lists name each other.
+///
+/// They are archive members, not inventory records. The provenance manifest's
+/// `archive_contents` names only platform components, because an updater that
+/// is already installed judges the manifest with its own frozen component list
+/// and refuses any other name (`validate_artifact_provenance_metadata`): the
+/// v0.6.2 updater refused the v0.6.3 manifest on `checksums-sha256.txt`, the
+/// first documentation record in it, and every manifest from v0.5.45 on carried
+/// the same three, so no managed install could update across that range. The
+/// release side keeps them out of the manifest (`classifyReleaseArchiveRoot`
+/// returns them as `docs`, never `files`), and this side sets them aside
+/// wherever an archive or a manifest names them, so a manifest that names one
+/// again can never strand another release for the updaters built from here on.
 pub(crate) const RELEASE_ARCHIVE_DOC_FILES: &[&str] =
     &["README.md", "INSTALL.md", "checksums-sha256.txt"];
 
@@ -7785,6 +7797,14 @@ where
         let Some(name) = file_name.to_str() else {
             anyhow::bail!("release zip contains a non-UTF-8 file name");
         };
+        if RELEASE_ARCHIVE_DOC_FILES.contains(&name) {
+            // The same documentation skip the tar walker applies, for the same
+            // reason. The Windows zip has carried these members since the docs
+            // were added, and without this skip every such zip was refused
+            // below as an unexpected file before any component was looked at.
+            // Any other unmanaged name still aborts the staging.
+            continue;
+        }
         let Some(component) = spec.iter().copied().find(|item| item.name == name) else {
             anyhow::bail!("release archive contains unexpected file '{name}'");
         };
@@ -10701,6 +10721,7 @@ fn validate_artifact_provenance_metadata(
     let (cli_name, daemon_name) = static_identity_component_names(spec)?;
 
     let mut verified_identities = VerifiedStagedIdentities::new();
+    let mut documented = HashSet::new();
     let mut static_graph_version = None;
     for record in &provenance.archive_contents {
         validate_hex(
@@ -10708,6 +10729,29 @@ fn validate_artifact_provenance_metadata(
             64,
             &format!("component '{}' SHA-256", record.name),
         )?;
+        if RELEASE_ARCHIVE_DOC_FILES.contains(&record.name.as_str()) {
+            // Documentation travels in the archive and is installed nowhere, so
+            // a manifest that inventories it is describing the archive rather
+            // than smuggling a component. The record is accepted and set aside:
+            // it never enters the verified identity set, because every later
+            // count compares that set against the components actually staged
+            // and a doc file is never staged. It may not carry a static build
+            // identity, which only the CLI and daemon authorities have, and it
+            // may not appear twice.
+            if record.build_identity.is_some() {
+                anyhow::bail!(
+                    "artifact provenance carries a static build identity for documentation file '{}'",
+                    record.name
+                );
+            }
+            if !documented.insert(record.name.as_str()) {
+                anyhow::bail!(
+                    "artifact provenance contains duplicate documentation file '{}'",
+                    record.name
+                );
+            }
+            continue;
+        }
         if !spec
             .iter()
             .any(|component| component.name == record.name.as_str())
@@ -13923,6 +13967,57 @@ cwd = {:?}
         );
     }
 
+    /// The Windows archive is a zip and carries the same three documentation
+    /// members as the tarballs. The zip walker had no skip for them, so every
+    /// zip that carried them was refused as an unexpected file before any
+    /// component was looked at.
+    #[test]
+    fn documentation_members_are_skipped_in_a_zip_and_unknown_names_still_abort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = make_zip(&[
+            ("kin.exe", b"kin"),
+            ("kin-daemon.exe", b"daemon"),
+            ("README.md", b"# Kin"),
+            ("INSTALL.md", b"# Install"),
+            ("checksums-sha256.txt", b"abc  kin.exe"),
+        ]);
+        stage_archive(
+            &archive,
+            "kin-windows-x86_64.zip",
+            tmp.path(),
+            WINDOWS_COMPONENTS,
+        )
+        .expect("a zip carrying its own documentation must stage");
+        for doc in RELEASE_ARCHIVE_DOC_FILES {
+            assert!(
+                !tmp.path().join("bin").join(doc).exists(),
+                "{doc} was installed as a binary"
+            );
+            assert!(
+                !tmp.path().join("lib").join(doc).exists(),
+                "{doc} was installed as a library"
+            );
+        }
+        assert_eq!(fs::read(tmp.path().join("bin/kin.exe")).unwrap(), b"kin");
+
+        let stray = make_zip(&[
+            ("kin.exe", b"kin"),
+            ("kin-daemon.exe", b"daemon"),
+            ("NOTES.md", b"stray"),
+        ]);
+        let error = stage_archive(
+            &stray,
+            "kin-windows-x86_64.zip",
+            tempfile::tempdir().unwrap().path(),
+            WINDOWS_COMPONENTS,
+        )
+        .expect_err("an unmanaged zip member must still abort the staging");
+        assert!(
+            format!("{error:#}").contains("unexpected file"),
+            "error: {error:#}"
+        );
+    }
+
     /// A macOS release archive carries KinNotifier.app as a directory. The
     /// stager materializes it under the staging tree's `lib`, preserving the
     /// executable bit its executable needs to be launchable at all.
@@ -15819,6 +15914,194 @@ cwd = {:?}
         assert!(format!("{err:#}").contains("does not match artifact provenance"));
         assert_bundle_matches(&kin_home, LINUX_COMPONENTS, &old);
         assert!(transaction_dirs(&kin_home).unwrap().is_empty());
+    }
+
+    /// A release manifest may inventory the documentation members beside the
+    /// components, and an updater must set those records aside rather than
+    /// refuse them or count them against the staged bundle. The order mirrors
+    /// the published manifests, which sort case-insensitively and so put
+    /// `checksums-sha256.txt` first: that is the record the v0.6.2 updater
+    /// named when it refused every manifest from v0.5.45 to v0.6.3.
+    #[test]
+    fn documentation_records_in_the_provenance_inventory_are_set_aside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        let identity = test_static_build_identity();
+        let cli = bytes_with_static_build_identity(b"new-kin", &identity);
+        let daemon = bytes_with_static_build_identity(b"new-daemon", &identity);
+        let docs = RELEASE_ARCHIVE_DOC_FILES
+            .iter()
+            .map(|doc| {
+                (
+                    format!("kin-linux-x86_64/{doc}"),
+                    format!("words in {doc}\n").into_bytes(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut entries: Vec<(&str, &[u8])> = vec![
+            ("kin-linux-x86_64/kin", cli.as_slice()),
+            ("kin-linux-x86_64/kin-daemon", daemon.as_slice()),
+            ("kin-linux-x86_64/kin-vfs", b"new-vfs".as_slice()),
+            (
+                "kin-linux-x86_64/libkin_vfs_shim.so",
+                b"new-shim".as_slice(),
+            ),
+        ];
+        entries.extend(
+            docs.iter()
+                .map(|(name, bytes)| (name.as_str(), bytes.as_slice())),
+        );
+        let archive = make_tar_gz(&entries);
+        stage_archive(
+            &archive,
+            "kin-linux-x86_64.tar.gz",
+            &stage,
+            LINUX_COMPONENTS,
+        )
+        .unwrap();
+        let mut provenance = test_provenance(
+            &stage,
+            LINUX_COMPONENTS,
+            "kin-linux-x86_64.tar.gz",
+            &archive,
+        );
+        for (name, bytes) in &docs {
+            provenance.archive_contents.push(ProvenanceFile {
+                name: name.rsplit('/').next().unwrap().to_string(),
+                sha256: hex::encode(Sha256::digest(bytes)),
+                size_bytes: bytes.len() as u64,
+                build_identity: None,
+            });
+        }
+        provenance
+            .archive_contents
+            .sort_by_key(|record| record.name.to_lowercase());
+        assert_eq!(
+            provenance.archive_contents[0].name, "checksums-sha256.txt",
+            "the fixture must lead with the record the field refusal named"
+        );
+        let release = GithubRelease {
+            tag_name: "v0.2.22".to_string(),
+            prerelease: false,
+            assets: Vec::new(),
+        };
+        let asset = GithubAsset {
+            name: "kin-linux-x86_64.tar.gz".to_string(),
+            browser_download_url: "https://example.invalid/archive".to_string(),
+        };
+        let validate = |provenance: &ArtifactProvenance| {
+            validate_artifact_provenance(
+                provenance,
+                &release,
+                &"a".repeat(40),
+                &asset,
+                &archive,
+                &stage,
+                LINUX_COMPONENTS,
+                true,
+            )
+        };
+
+        let identities = validate(&provenance)
+            .expect("a manifest inventorying the archive's documentation must be accepted");
+        let mut verified = identities.keys().cloned().collect::<Vec<_>>();
+        verified.sort();
+        assert_eq!(
+            verified,
+            ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"],
+            "documentation records must not enter the verified identity set"
+        );
+        for doc in RELEASE_ARCHIVE_DOC_FILES {
+            assert!(
+                !stage.join("bin").join(doc).exists() && !stage.join("lib").join(doc).exists(),
+                "{doc} was staged as a component"
+            );
+        }
+
+        // The skip is not a side door: a documentation record may neither claim
+        // a static build identity nor appear twice.
+        let mut with_identity = provenance.clone();
+        with_identity
+            .archive_contents
+            .iter_mut()
+            .find(|record| record.name == "README.md")
+            .unwrap()
+            .build_identity = Some(test_static_build_identity());
+        let err = validate(&with_identity)
+            .expect_err("a documentation record carrying a build identity must be refused");
+        assert!(
+            format!("{err:#}").contains("static build identity for documentation file 'README.md'"),
+            "error: {err:#}"
+        );
+        let mut duplicated = provenance.clone();
+        let readme = duplicated
+            .archive_contents
+            .iter()
+            .find(|record| record.name == "README.md")
+            .unwrap()
+            .clone();
+        duplicated.archive_contents.push(readme);
+        let err =
+            validate(&duplicated).expect_err("a duplicate documentation record must be refused");
+        assert!(
+            format!("{err:#}").contains("duplicate documentation file 'README.md'"),
+            "error: {err:#}"
+        );
+    }
+
+    /// The tolerance above must not turn the inventory guard off: a name that is
+    /// neither a component nor a documentation member still stops the update,
+    /// and the refusal names it.
+    #[test]
+    fn unknown_provenance_inventory_names_are_still_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stage = tmp.path().join("stage");
+        let archive = full_linux_static_archive("kin-linux-x86_64");
+        stage_archive(
+            &archive,
+            "kin-linux-x86_64.tar.gz",
+            &stage,
+            LINUX_COMPONENTS,
+        )
+        .unwrap();
+        let mut provenance = test_provenance(
+            &stage,
+            LINUX_COMPONENTS,
+            "kin-linux-x86_64.tar.gz",
+            &archive,
+        );
+        provenance.archive_contents.push(ProvenanceFile {
+            name: "NOTES.md".to_string(),
+            sha256: hex::encode(Sha256::digest(b"stray")),
+            size_bytes: 5,
+            build_identity: None,
+        });
+        let release = GithubRelease {
+            tag_name: "v0.2.22".to_string(),
+            prerelease: false,
+            assets: Vec::new(),
+        };
+        let asset = GithubAsset {
+            name: "kin-linux-x86_64.tar.gz".to_string(),
+            browser_download_url: "https://example.invalid/archive".to_string(),
+        };
+        let err = validate_artifact_provenance(
+            &provenance,
+            &release,
+            &"a".repeat(40),
+            &asset,
+            &archive,
+            &stage,
+            LINUX_COMPONENTS,
+            true,
+        )
+        .expect_err("an inventory record outside the platform bundle must be refused");
+        assert!(
+            format!("{err:#}").contains(
+                "artifact provenance inventory contains file 'NOTES.md' outside the managed platform bundle"
+            ),
+            "error: {err:#}"
+        );
     }
 
     #[cfg(unix)]
