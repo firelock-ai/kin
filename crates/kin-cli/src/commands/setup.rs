@@ -22,7 +22,7 @@ use crate::commands::language_servers;
 const ZSH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# kin-vfs zsh integration — auto-activates the VFS overlay when entering
+# kin-vfs zsh integration: auto-activates the VFS overlay when entering
 # a Kin repository (a directory whose .kin/ carries a repository manifest).
 #
 # Installed by: kin setup
@@ -264,7 +264,7 @@ _kin_vfs_chpwd
 const BASH_HOOK: &str = r#"# SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Firelock, LLC
 #
-# kin-vfs bash integration — auto-activates the VFS overlay when entering
+# kin-vfs bash integration: auto-activates the VFS overlay when entering
 # a Kin repository (a directory whose .kin/ carries a repository manifest).
 #
 # Installed by: kin setup
@@ -1807,7 +1807,7 @@ fn merge_mcp_config_with_topology(
     let mut root: serde_json::Value = if let Some(content) = original.as_deref() {
         serde_json::from_slice(content).with_context(|| {
             format!(
-                "existing file {} is not valid JSON — refusing to overwrite it. \
+                "refusing to overwrite {}: the existing file is not valid JSON. \
                  Fix or remove the file and try again.",
                 path.display()
             )
@@ -1818,7 +1818,7 @@ fn merge_mcp_config_with_topology(
 
     if !root.is_object() {
         anyhow::bail!(
-            "existing file {} has a non-object JSON root — refusing to overwrite it",
+            "refusing to overwrite {}: the existing file has a non-object JSON root",
             path.display()
         );
     }
@@ -1827,7 +1827,7 @@ fn merge_mcp_config_with_topology(
         .is_some_and(|value| !value.is_object())
     {
         anyhow::bail!(
-            "existing file {} has a non-object mcpServers value — refusing to overwrite it",
+            "refusing to overwrite {}: the existing file has a non-object mcpServers value",
             path.display()
         );
     }
@@ -1844,7 +1844,7 @@ fn merge_mcp_config_with_topology(
         .expect("mcpServers was validated as an object");
     if servers.get("kin").is_some_and(|value| !value.is_object()) {
         anyhow::bail!(
-            "existing file {} has a non-object mcpServers.kin value — refusing to overwrite it",
+            "refusing to overwrite {}: the existing file has a non-object mcpServers.kin value",
             path.display()
         );
     }
@@ -1864,7 +1864,7 @@ fn merge_mcp_config_with_topology(
     }
     if entry.get("env").is_some_and(|value| !value.is_object()) {
         anyhow::bail!(
-            "existing file {} has a non-object mcpServers.kin.env value — refusing to overwrite it",
+            "refusing to overwrite {}: the existing file has a non-object mcpServers.kin.env value",
             path.display()
         );
     }
@@ -1976,7 +1976,7 @@ fn merge_mcp_config_toml_locked(
             .parse()
             .with_context(|| {
                 format!(
-                    "existing file {} is not valid TOML — refusing to overwrite it. \
+                    "refusing to overwrite {}: the existing file is not valid TOML. \
                  Fix or remove the file and try again.",
                     path.display()
                 )
@@ -1995,7 +1995,7 @@ fn merge_mcp_config_toml_locked(
                 Err(item) => match item.into_value() {
                     Ok(toml_edit::Value::InlineTable(inline)) => inline.into_table(),
                     _ => anyhow::bail!(
-                        "existing file {} has an incompatible mcp_servers value — refusing to overwrite it",
+                        "refusing to overwrite {}: the existing file has an incompatible mcp_servers value",
                         path.display()
                     ),
                 },
@@ -2017,7 +2017,7 @@ fn merge_mcp_config_toml_locked(
             Err(item) => match item.into_value() {
                 Ok(toml_edit::Value::InlineTable(inline)) => inline.into_table(),
                 _ => anyhow::bail!(
-                    "existing file {} has an incompatible mcp_servers.kin value — refusing to overwrite it",
+                    "refusing to overwrite {}: the existing file has an incompatible mcp_servers.kin value",
                     path.display()
                 ),
             },
@@ -2051,7 +2051,7 @@ fn merge_mcp_config_toml_locked(
             kin.insert("env", value(env));
         }
         Some(_) => anyhow::bail!(
-            "existing file {} has an incompatible mcp_servers.kin.env value — refusing to overwrite it",
+            "refusing to overwrite {}: the existing file has an incompatible mcp_servers.kin.env value",
             path.display()
         ),
     }
@@ -2190,9 +2190,9 @@ const KIN_DISCOVERY_REMINDER: &str = r#"
 When exploring a Kin repository, always start with Kin's semantic MCP tools
 before falling back to grep or raw file reads:
 
-1. `semantic_locate`    — find symbols, functions, types by semantic meaning
-2. `get_context_pack`  — get a structured context bundle for a file or symbol
-3. `trace_data_flow`   — trace data lineage and cross-file dependencies
+1. `semantic_locate`: find symbols, functions, types by semantic meaning
+2. `get_context_pack`: get a structured context bundle for a file or symbol
+3. `trace_data_flow`: trace data lineage and cross-file dependencies
 
 These tools operate on the graph-native substrate and return richer, more
 accurate results than filesystem heuristics. Use them first.
@@ -2306,14 +2306,14 @@ fn apply_discovery_reminders(
             if discovery_reminder_present(&path) {
                 println!(
                     "  {} {label} reminder is present at {} but Kin's MCP server is not \
-                     registered for it — `kin setup uninstall` removes it when a setup run \
+                     registered for it. `kin setup uninstall` removes it when a setup run \
                      recorded it; an unrecorded reminder stays until removed by hand",
                     style("!").yellow(),
                     path.display()
                 );
             } else {
                 println!(
-                    "  {} {label} reminder skipped — Kin's MCP server was not registered for it",
+                    "  {} {label} reminder skipped because Kin's MCP server was not registered for it",
                     style("→").cyan()
                 );
             }
@@ -3855,9 +3855,16 @@ fn launcher_spelling(path: &Path) -> String {
     launcher_spelling_for(&path.to_string_lossy(), env::consts::OS)
 }
 
-pub(crate) fn managed_mcp_launcher() -> Result<String> {
+/// The managed launcher's path under `kin_home`: the file `kin update`
+/// replaces in place, so a client config that names it is repaired by every
+/// update.
+fn managed_mcp_launcher_path(kin_home: &Path) -> PathBuf {
     let name = if cfg!(windows) { "kin.exe" } else { "kin" };
-    let path = kin_dir()?.join("bin").join(name);
+    kin_home.join("bin").join(name)
+}
+
+pub(crate) fn managed_mcp_launcher() -> Result<String> {
+    let path = managed_mcp_launcher_path(&kin_dir()?);
     let metadata = fs::symlink_metadata(&path)
         .with_context(|| format!("managed Kin launcher is missing at {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -3876,6 +3883,24 @@ pub(crate) fn managed_mcp_launcher() -> Result<String> {
     Ok(launcher_spelling(&path))
 }
 
+/// Where the launcher a client config names comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum McpLauncherOrigin {
+    /// `<kin_home>/bin/kin`, the binary `kin update` replaces in place.
+    Managed,
+    /// The running executable, or the `kin` on PATH that is the same file: a
+    /// source checkout, a scratch build, or a Homebrew or manual install.
+    /// Nothing manages that path, so an update leaves configs naming it behind.
+    Unmanaged,
+}
+
+/// The launcher `kin setup` registers, with where it came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct McpLauncher {
+    pub(crate) command: String,
+    pub(crate) origin: McpLauncherOrigin,
+}
+
 /// Resolve the stable launcher that ordinary setup, health, and doctor must
 /// agree on for the installation channel currently running Kin.
 ///
@@ -3884,9 +3909,12 @@ pub(crate) fn managed_mcp_launcher() -> Result<String> {
 /// channels, prefer the `kin` path on PATH only when it resolves to this exact
 /// running executable, then fall back to `current_exe`. The updater keeps using
 /// [`managed_mcp_launcher`] directly after it has installed managed bytes.
-pub(crate) fn configured_mcp_launcher() -> Result<String> {
-    if let Ok(managed) = managed_mcp_launcher() {
-        return Ok(managed);
+pub(crate) fn resolve_mcp_launcher() -> Result<McpLauncher> {
+    if let Ok(command) = managed_mcp_launcher() {
+        return Ok(McpLauncher {
+            command,
+            origin: McpLauncherOrigin::Managed,
+        });
     }
 
     let current = env::current_exe().context("could not resolve the running Kin executable")?;
@@ -3896,10 +3924,58 @@ pub(crate) fn configured_mcp_launcher() -> Result<String> {
         let current_target = fs::canonicalize(&current).ok();
         if candidate_target.is_some() && candidate_target == current_target {
             validate_running_mcp_launcher(&path_candidate)?;
-            return Ok(launcher_spelling(&path_candidate));
+            return Ok(McpLauncher {
+                command: launcher_spelling(&path_candidate),
+                origin: McpLauncherOrigin::Unmanaged,
+            });
         }
     }
-    Ok(launcher_spelling(&current))
+    Ok(McpLauncher {
+        command: launcher_spelling(&current),
+        origin: McpLauncherOrigin::Unmanaged,
+    })
+}
+
+/// The launcher command alone, for the callers that compare or write it.
+pub(crate) fn configured_mcp_launcher() -> Result<String> {
+    resolve_mcp_launcher().map(|launcher| launcher.command)
+}
+
+/// The warning setup prints before it registers an unmanaged launcher, or
+/// `None` when the launcher is the managed binary.
+///
+/// A client config is a standing pointer, and `kin update` repairs only
+/// pointers at the managed binary. Registering a source checkout or a scratch
+/// build without saying so is how every agent client on one machine came to
+/// launch a lane build out of a scratch directory nothing manages.
+fn unmanaged_mcp_launcher_warning(launcher: &McpLauncher, kin_home: &Path) -> Option<String> {
+    match launcher.origin {
+        McpLauncherOrigin::Managed => None,
+        McpLauncherOrigin::Unmanaged => Some(format!(
+            "registering {} as the Kin MCP launcher: no managed binary exists at {}, so this \
+             path is a source checkout, a scratch build or a package-manager install that Kin \
+             does not manage, and `kin update` will not repair client configs that point at \
+             it. If this machine should be on the managed install, install Kin through the \
+             installer or npm and re-run `kin setup` to register the managed binary.",
+            launcher.command,
+            managed_mcp_launcher_path(kin_home).display()
+        )),
+    }
+}
+
+/// Print the unmanaged-launcher warning once per setup run, ahead of the
+/// per-client writes that all name the same launcher. A resolution failure is
+/// left to those writes, which report it against the client they were writing.
+fn announce_mcp_launcher_origin() {
+    let Ok(kin_home) = kin_dir() else {
+        return;
+    };
+    let Ok(launcher) = resolve_mcp_launcher() else {
+        return;
+    };
+    if let Some(warning) = unmanaged_mcp_launcher_warning(&launcher, &kin_home) {
+        println!("  {} {warning}", style("!").yellow());
+    }
 }
 
 fn validate_running_mcp_launcher(path: &Path) -> Result<()> {
@@ -12142,11 +12218,8 @@ pub async fn run_wizard(opts: WizardOptions) -> Result<()> {
     let intent = resolve_intent(&opts, interactive, editor_extension_installed);
 
     println!();
-    println!(
-        "Plan: {} — {}",
-        style(intent.title()).bold(),
-        intent.description(editor_extension_installed)
-    );
+    println!("Plan: {}", style(intent.title()).bold());
+    println!("      {}", intent.description(editor_extension_installed));
     println!();
 
     let shell_name = opts.shell.as_deref().unwrap_or_else(|| detect_shell());
@@ -12489,7 +12562,7 @@ async fn apply_plan(
                 .unwrap_or(false);
         if already {
             println!(
-                "Shell integration: {} already sources the kin-vfs hook — refreshing the hook file in place, leaving your rc untouched.",
+                "Shell integration: {} already sources the kin-vfs hook, so the hook file is refreshed in place and your rc is left untouched.",
                 rc_path.display()
             );
         } else {
@@ -12502,7 +12575,7 @@ async fn apply_plan(
         if cfg!(target_os = "windows") {
             println!(
                 "  {} On Windows the VFS shim/ProjFS is an optional feature and is not \
-                 shell-auto-injected — the PowerShell hook only manages env state.",
+                 shell-auto-injected. The PowerShell hook only manages env state.",
                 style("!").yellow()
             );
         }
@@ -12520,6 +12593,7 @@ async fn apply_plan(
     let mut registered_clients: Vec<usize> = Vec::new();
     if plan.configure_mcp {
         println!("AI client MCP configuration:");
+        announce_mcp_launcher_origin();
         for idx in &plan.mcp_assistant_indices {
             let Some(a) = assistants.get(*idx) else {
                 continue;
@@ -12528,14 +12602,14 @@ async fn apply_plan(
             if let Some(p) = &existing_path {
                 if has_kin_mcp_config(p) {
                     println!(
-                        "  {} {} already has a kin MCP entry at {} — re-merging to the agent-default profile (other servers untouched).",
+                        "  {} {} already has a kin MCP entry at {}, so it is re-merged to the agent-default profile (other servers untouched).",
                         style("→").cyan(),
                         a.name,
                         p.display()
                     );
                 } else if p.exists() {
                     println!(
-                        "  {} {} has a config at {} — merging the kin server entry in (other servers untouched).",
+                        "  {} {} has a config at {}, so the kin server entry is merged in (other servers untouched).",
                         style("→").cyan(),
                         a.name,
                         p.display()
@@ -12575,7 +12649,7 @@ async fn apply_plan(
         }
         for a in assistants.iter().filter(|a| !a.detected) {
             println!(
-                "  {} {} not detected — {}",
+                "  {} {} not detected ({})",
                 style("→").cyan(),
                 a.name,
                 a.install_hint
@@ -15478,9 +15552,9 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
 
     if outcomes.is_empty() {
         if all {
-            println!("No install ledger found — continuing with full managed-install cleanup.");
+            println!("No install ledger found. Continuing with full managed-install cleanup.");
         } else {
-            println!("No install ledger found — nothing recorded to uninstall.");
+            println!("No install ledger found, so nothing is recorded to uninstall.");
             println!(
                 "(The ledger is written by `kin setup`; run it first if you expected entries.)"
             );
@@ -15489,7 +15563,7 @@ pub async fn uninstall(all: bool, dry_run: bool, force: bool, json: bool) -> Res
     }
 
     if dry_run {
-        println!("Dry run — no changes will be written.");
+        println!("Dry run: no changes will be written.");
     } else {
         println!("Uninstalling Kin-written artifacts (ledger-verified)...");
     }
@@ -20435,6 +20509,92 @@ $value = if ($env:KIN_TEST_PATH_PRESENT -eq '1') { $env:KIN_TEST_PATH_VALUE } el
             read_kin_mcp_entry(&config).unwrap()["command"].as_str(),
             Some(expected.as_str())
         );
+    }
+
+    /// `kin update` replaces `<kin_home>/bin/kin` in place, so a client config
+    /// naming that path is repaired by every update. When it exists, setup
+    /// registers it rather than whichever binary happens to be running, and
+    /// has nothing to warn about.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn setup_registers_the_managed_launcher_when_it_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(kin_home.join("bin")).unwrap();
+        let managed = kin_home.join("bin").join("kin");
+        fs::copy(env::current_exe().unwrap(), &managed).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+
+        let launcher = resolve_mcp_launcher().unwrap();
+        assert_eq!(launcher.origin, McpLauncherOrigin::Managed);
+        assert_eq!(launcher.command, launcher_spelling(&managed));
+        assert_ne!(
+            fs::canonicalize(&launcher.command).unwrap(),
+            fs::canonicalize(env::current_exe().unwrap()).unwrap(),
+            "the fixture must be able to tell the managed copy from the running binary"
+        );
+        assert_eq!(unmanaged_mcp_launcher_warning(&launcher, &kin_home), None);
+
+        let config = configure_cursor().unwrap();
+        assert_eq!(
+            read_kin_mcp_entry(&config).unwrap()["command"].as_str(),
+            Some(launcher.command.as_str())
+        );
+    }
+
+    /// Without a managed binary, setup falls back to the running executable
+    /// and says so: nothing manages that path, and `kin update` will not
+    /// repair a client config that points at it.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn setup_warns_when_the_registered_launcher_is_unmanaged() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let kin_home = dir.path().join("kin-home");
+        fs::create_dir_all(&home).unwrap();
+        let _home = EnvVarGuard::set("HOME", &home);
+        let _kin_home = EnvVarGuard::set("KIN_HOME", &kin_home);
+        assert!(!kin_home.join("bin").join("kin").exists());
+
+        let launcher = resolve_mcp_launcher().unwrap();
+        assert_eq!(launcher.origin, McpLauncherOrigin::Unmanaged);
+        assert_eq!(
+            fs::canonicalize(&launcher.command).unwrap(),
+            fs::canonicalize(env::current_exe().unwrap()).unwrap()
+        );
+        let warning = unmanaged_mcp_launcher_warning(&launcher, &kin_home)
+            .expect("an unmanaged launcher must be announced");
+        assert!(warning.contains(&launcher.command), "{warning}");
+        assert!(
+            warning.contains(&kin_home.join("bin").join("kin").display().to_string()),
+            "{warning}"
+        );
+        assert!(
+            warning.contains("`kin update` will not repair"),
+            "{warning}"
+        );
+        assert!(!warning.contains('\u{2014}'), "{warning}");
+    }
+
+    /// Setup writes these bytes into files a person reads: the discovery
+    /// reminder lands in every agent instruction file and the hooks in the
+    /// user's shell, so none of them may carry an em dash.
+    #[test]
+    fn text_setup_writes_for_people_carries_no_em_dash() {
+        for (name, text) in [
+            ("KIN_DISCOVERY_REMINDER", KIN_DISCOVERY_REMINDER),
+            ("ZSH_HOOK", ZSH_HOOK),
+            ("BASH_HOOK", BASH_HOOK),
+            ("POWERSHELL_HOOK", POWERSHELL_HOOK),
+            ("FISH_HOOK", FISH_HOOK),
+        ] {
+            assert!(!text.contains('\u{2014}'), "{name} carries an em dash");
+        }
     }
 
     #[test]
