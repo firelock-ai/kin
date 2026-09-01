@@ -60,8 +60,14 @@ const strangerEnv = (over = {}) => ({
   archive_name: 'kin-linux-aarch64.tar.gz',
   archive_sha256: ARCHIVE_A,
   finished_at: '2026-08-18T21:53:25Z',
+  arms: 'green,brown,vcs',
+  arms_complete: 'green,brown,vcs',
+  arms_incomplete: '',
   ...over,
 });
+
+const strangerRecordText = (over = {}) =>
+  `${Object.entries(strangerEnv(over)).map(([key, value]) => `${key}=${value}`).join('\n')}\n`;
 
 const throwsWith = (fn, fragment) =>
   assert.throws(fn, (error) => {
@@ -97,6 +103,13 @@ test('parseRunEnv reads the stranger key=value record', () => {
   assert.equal(parsed.continue_mission, '');
   // Values may contain '=': split on the first one only.
   assert.equal(parsed.image_id, 'sha256:881ca213=weird');
+});
+
+test('parseRunEnv refuses a duplicated proof-record key', () => {
+  throwsWith(
+    () => parseRunEnv('arms_incomplete=green\narms_incomplete=\n'),
+    /repeats key "arms_incomplete", so its evidence is ambiguous/,
+  );
 });
 
 test('judgePreflight accepts a well-formed record and returns its archives', () => {
@@ -182,6 +195,7 @@ test('judgePreflight refuses a leg with no archive to link a stranger run to', (
 test('judgeStranger accepts a run on bytes a preflight leg judged', () => {
   assert.deepEqual(judgeStranger(strangerEnv(), SHA, [ARCHIVE_A, ARCHIVE_B]), {
     archive: ARCHIVE_A,
+    arms: ['green', 'brown', 'vcs'],
   });
 });
 
@@ -205,6 +219,76 @@ test('judgeStranger refuses a real run on bytes no preflight leg judged', () => 
       ARCHIVE_B,
     ]),
     /the stranger ran, but not on these bytes/,
+  );
+});
+
+test('judgeStranger refuses missing, partial, and internally inconsistent arm coverage', () => {
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms: 'green,brown' }), SHA, [ARCHIVE_A]),
+    /omits required stranger arm\(s\) vcs/,
+  );
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms_incomplete: 'green,brown,vcs' }), SHA, [ARCHIVE_A]),
+    /records incomplete stranger arm\(s\) green, brown, vcs/,
+  );
+  throwsWith(
+    () => judgeStranger(
+      strangerEnv({ arms_complete: '', arms_incomplete: 'green,brown,vcs' }),
+      SHA,
+      [ARCHIVE_A],
+    ),
+    /records incomplete stranger arm\(s\) green, brown, vcs/,
+  );
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms_complete: 'green,brown' }), SHA, [ARCHIVE_A]),
+    /does not mark requested arm\(s\) vcs complete/,
+  );
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms_complete: '', arms_incomplete: '' }), SHA, [ARCHIVE_A]),
+    /does not mark requested arm\(s\) green, brown, vcs complete/,
+  );
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms_complete: 'green,brown,vcs,other' }), SHA, [ARCHIVE_A]),
+    /marks undeclared arm\(s\) other complete/,
+  );
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms_incomplete: 'other' }), SHA, [ARCHIVE_A]),
+    /marks undeclared arm\(s\) other incomplete/,
+  );
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms_complete: 'green,brown,vcs,vcs' }), SHA, [ARCHIVE_A]),
+    /repeats an arm in arms_complete/,
+  );
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms: 'green,green,brown,vcs' }), SHA, [ARCHIVE_A]),
+    /repeats an arm in arms/,
+  );
+  throwsWith(
+    () => judgeStranger(strangerEnv({ arms_incomplete: 'green,green' }), SHA, [ARCHIVE_A]),
+    /repeats an arm in arms_incomplete/,
+  );
+});
+
+test('judgeStranger refuses a record that never declares its coverage fields', () => {
+  const withoutRequested = strangerEnv();
+  delete withoutRequested.arms;
+  throwsWith(
+    () => judgeStranger(withoutRequested, SHA, [ARCHIVE_A]),
+    /carries no arms, so its arm coverage is unknown/,
+  );
+
+  const withoutCompleted = strangerEnv();
+  delete withoutCompleted.arms_complete;
+  throwsWith(
+    () => judgeStranger(withoutCompleted, SHA, [ARCHIVE_A]),
+    /carries no arms_complete, so its arm coverage is unknown/,
+  );
+
+  const withoutIncomplete = strangerEnv();
+  delete withoutIncomplete.arms_incomplete;
+  throwsWith(
+    () => judgeStranger(withoutIncomplete, SHA, [ARCHIVE_A]),
+    /carries no arms_incomplete, so its arm coverage is unknown/,
   );
 });
 
@@ -272,12 +356,29 @@ test('main proceeds when both records exist for the exact candidate', async () =
     log: (line) => lines.push(line),
     fetchImpl: stubFetch({
       [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
-      [STRANGER_RECORD]: ok(`archive_sha256=${ARCHIVE_A}\nfinished_at=2026-08-18T21:53:25Z\n`),
+      [STRANGER_RECORD]: ok(strangerRecordText()),
     }),
   });
   assert.equal(result.archive, ARCHIVE_A);
   assert.deepEqual(result.archives, [ARCHIVE_A, ARCHIVE_B]);
   assert.match(lines.join('\n'), /Verified release proof artifacts/);
+});
+
+test('main refuses a duplicate key that tries to hide an incomplete stranger arm', async () => {
+  const duplicateIncomplete = `${strangerRecordText({ arms_incomplete: 'green' })}arms_incomplete=\n`;
+  await assert.rejects(
+    main({
+      sha: SHA,
+      repository: REPO,
+      env: {},
+      log: () => {},
+      fetchImpl: stubFetch({
+        [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
+        [STRANGER_RECORD]: ok(duplicateIncomplete),
+      }),
+    }),
+    /repeats key "arms_incomplete", so its evidence is ambiguous/,
+  );
 });
 
 test('main holds a candidate with no preflight record', async () => {
@@ -317,7 +418,7 @@ test('main holds when the records exist but describe a different build', async (
       log: () => {},
       fetchImpl: stubFetch({
         [PREFLIGHT_RECORD]: ok(JSON.stringify(preflightRecord())),
-        [STRANGER_RECORD]: ok(`archive_sha256=${ARCHIVE_A}\nfinished_at=2026-08-18T21:53:25Z\n`),
+        [STRANGER_RECORD]: ok(strangerRecordText()),
       }),
     }),
     /the record exists but is about a different build/,
@@ -473,7 +574,7 @@ test('main bridges a landed commit to the candidate that was proven', async () =
         });
         return ok(JSON.stringify(record));
       }
-      return ok(`archive_sha256=${ARCHIVE_A}\nfinished_at=2026-08-18T21:53:25Z\n`);
+      return ok(strangerRecordText());
     },
   });
   assert.equal(result.sha, RC_HEAD);
@@ -504,7 +605,7 @@ test('main answers from the direct key without asking about pull requests', asyn
       if (url.includes(PREFLIGHT_RECORD)) {
         return ok(JSON.stringify(preflightRecord()));
       }
-      return ok(`archive_sha256=${ARCHIVE_A}\nfinished_at=2026-08-18T21:53:25Z\n`);
+      return ok(strangerRecordText());
     },
   });
   assert.equal(result.sha, SHA);
@@ -541,7 +642,7 @@ test('main bridges when the direct key is absent and a commit is given', async (
         });
         return ok(JSON.stringify(record));
       }
-      return ok(`archive_sha256=${ARCHIVE_A}\nfinished_at=2026-08-18T21:53:25Z\n`);
+      return ok(strangerRecordText());
     },
   });
   assert.equal(result.sha, RC_HEAD);
