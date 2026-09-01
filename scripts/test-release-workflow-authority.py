@@ -178,6 +178,8 @@ EXPECTED_SELECTOR_INVOCATIONS = {
 HEALTH = ROOT / "crates" / "kin-cli" / "src" / "commands" / "health.rs"
 SETUP = ROOT / "crates" / "kin-cli" / "src" / "commands" / "setup.rs"
 DOCKERFILE = ROOT / "Dockerfile"
+DEV_IMAGE_PUBLISHER = ROOT / "scripts" / "publish-dev-container.sh"
+DEV_IMAGE_TOOL = ROOT / "scripts" / "kin-dev-image"
 CI_APT_INSTALL = ROOT / "scripts" / "ci-apt-install.sh"
 BASE_IMAGE_REGISTRY = "docker.io"
 BASE_IMAGE_MIRROR = 'mirrors = ["mirror.gcr.io"]'
@@ -774,7 +776,7 @@ EXPECTED_WORKFLOW_JOB_DISPLAY_NAMES: dict[str, dict[str, str | None]] = {
         "dco": "DCO sign-off",
     },
     ".github/workflows/docker.yml": {
-        "build-image": "Docker Image Build (no push)",
+        "build-image": "Build and publish dev daemon image",
     },
     ".github/workflows/fuzz.yml": {
         "fuzz": "cargo-fuzz (${{ matrix.target }})",
@@ -9551,7 +9553,7 @@ def assert_container_base_image_authority(
 ) -> None:
     """Keep one registry from being able to refuse a release on its own.
 
-    `Docker Image Build (no push)` publishes a check-run against every commit
+    `Build and publish dev daemon image` publishes a check-run against every commit
     that reaches main, and release-tag.yml's second sweep refuses a release
     commit carrying any non-green check-run whether or not a ruleset requires
     it. Minutes of registry unavailability therefore refuse a release
@@ -9637,6 +9639,269 @@ def assert_pin_prover_cannot_refuse_a_release(pins_workflow: str) -> None:
         "pin prover checkout, whose failure would fail the job regardless of "
         "the guard below it",
     )
+
+
+def assert_dev_image_publish_policy(
+    workflow: str,
+    publisher: str,
+    local_tool: str,
+) -> None:
+    """Keep the free hosted builder narrow, exact, and replayable."""
+
+    job = workflow_job_blocks(workflow).get("build-image")
+    if job is None:
+        raise AssertionError("dev image workflow no longer declares build-image")
+
+    required_workflow = (
+        "run-name: ${{ github.event_name == 'workflow_dispatch' && format('Dev image {0} {1}', github.event.inputs.mode || 'canary', github.event.inputs.commit || github.sha) || format('Dev image main {0}', github.sha) }}",
+        "workflow_dispatch:",
+        "description: Full 40-hex commit reachable from main",
+        "description: Canary proves GitHub upload; publish writes the supported dev image",
+        "type: choice",
+        "- canary",
+        "- publish",
+        "group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && (github.event.inputs.commit || github.sha) || github.sha }}",
+        "runs-on: ubuntu-latest",
+        "id-token: write",
+        "persist-credentials: false",
+        "fetch-depth: 0",
+        "REQUESTED_COMMIT: ${{ github.event.inputs.commit || '' }}",
+        "REQUESTED_MODE: ${{ github.event.inputs.mode || '' }}",
+        "EVENT_NAME: ${{ github.event_name }}",
+        "^[0-9a-f]{40}$",
+        'git merge-base --is-ancestor "$commit" origin/main',
+        'install -m 0755 "scripts/${helper}" "$RUNNER_TEMP/${helper}"',
+        'install -m 0644 docker-compose.yml "$RUNNER_TEMP/docker-compose.yml"',
+        'echo "mode=${mode}" >> "$GITHUB_OUTPUT"',
+        'echo "publish_tag=gha-canary-${commit}" >> "$GITHUB_OUTPUT"',
+        'echo "publish_tag=${commit}" >> "$GITHUB_OUTPUT"',
+        "publish-dev-container.sh",
+        "verify-container-build-info.sh",
+        "test-entrypoint-workspace-mount.sh",
+        "test-compose-published-port.sh",
+        "test-gcs-emulator-endpoint.sh",
+        "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a",
+        "push: false",
+        "load: true",
+        "KIN_BUILD_GIT_SHA=${{ steps.source.outputs.commit }}",
+        "KIN_BUILD_DIRTY=false",
+        "KIN_BUILD_BRANCH=${{ steps.source.outputs.branch }}",
+        "KIN_LTO=fat",
+        "cache-from: type=gha",
+        "cache-to: type=gha,mode=max",
+        "EXPECTED_SHA: ${{ steps.source.outputs.commit }}",
+        'bash "$RUNNER_TEMP/verify-container-build-info.sh" kin:ci "$EXPECTED_SHA"',
+        'bash "$RUNNER_TEMP/test-entrypoint-workspace-mount.sh" kin:ci',
+        'KIN_COMPOSE_FILE: ${{ runner.temp }}/docker-compose.yml',
+        'bash "$RUNNER_TEMP/test-compose-published-port.sh" kin:ci',
+        'bash "$RUNNER_TEMP/test-gcs-emulator-endpoint.sh" kin:ci',
+        "GCP_WORKLOAD_IDENTITY_PROVIDER",
+        "GCP_BUILD_SERVICE_ACCOUNT",
+        "GCP_ARTIFACT_REGISTRY",
+        "projects/642331057243/locations/global/workloadIdentityPools/github-actions/providers/kin-build-oidc",
+        "kin-github-builder@kin-ecosystem.iam.gserviceaccount.com",
+        "us-central1-docker.pkg.dev/kin-ecosystem/kin-dev",
+        "id: publisher-config",
+        "development image OIDC is not activated; build and smoke passed, publish skipped",
+        'echo "ready=false" >> "$GITHUB_OUTPUT"',
+        'echo "ready=true" >> "$GITHUB_OUTPUT"',
+        "if: steps.publisher-config.outputs.ready == 'true'",
+        "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093",
+        "token_format: access_token",
+        "create_credentials_file: false",
+        "docker/login-action@dbcb813823bdd20940b903addbd779551569679f",
+        "username: oauth2accesstoken",
+        "password: ${{ steps.gcp-auth.outputs.access_token }}",
+        "KIN_DEV_IMAGE_VERIFIER: ${{ runner.temp }}/verify-container-build-info.sh",
+        "id: publish",
+        "DIGEST: ${{ steps.publish.outputs.digest }}",
+        "ALIASES_PROMOTED: ${{ steps.publish.outputs.aliases_promoted }}",
+        "REFERENCE: ${{ steps.publish.outputs.reference }}",
+        "PUBLICATION: ${{ steps.publish.outputs.publication }}",
+        "READBACK: ${{ steps.publish.outputs.readback }}",
+        "EMBEDDED_SHA: ${{ steps.publish.outputs.embedded_sha }}",
+        'if [ "$ALIASES_PROMOTED" != false ]',
+        "GitHub publisher must never write mutable aliases",
+        "## Development image proof",
+        "KIN_DEV_IMAGE_PROOF mode=${MODE} source=${COMMIT} reference=${REFERENCE} digest=${DIGEST} publication=${PUBLICATION} aliases_promoted=${ALIASES_PROMOTED} readback=${READBACK} embedded_sha=${EMBEDDED_SHA} transport=github-hosted",
+        "standard GitHub-hosted runner with GCP OIDC",
+        'kin:ci "${REGISTRY}/kin-daemon" "$COMMIT" "$PUBLISH_TAG"',
+    )
+    for policy in required_workflow:
+        require(workflow, policy, "GitHub-hosted development image publisher")
+
+    expected_job_if = (
+        "if: ${{ (github.event_name == 'push' || "
+        "github.event_name == 'workflow_dispatch') && "
+        "github.ref == 'refs/heads/main' }}"
+    )
+    active_job_conditions = [
+        line.strip()
+        for line in job.splitlines()
+        if re.match(r"^    if:\s+", line)
+        and not line.lstrip().startswith("#")
+    ]
+    if active_job_conditions != [expected_job_if]:
+        raise AssertionError(
+            "development image OIDC requires exactly one active job-level "
+            "push/workflow_dispatch allowlist on refs/heads/main"
+        )
+
+    # The GCP exchange and mutation must remain after every image smoke, and the
+    # exact source resolver must remain before the one build. This is an order
+    # contract, not merely a census of strings comments could satisfy.
+    ordered_markers = (
+        "      - name: Resolve exact main source",
+        "      - name: Build image",
+        "      - name: Verify container build provenance",
+        "      - name: Entrypoint smoke",
+        "      - name: Entrypoint contract with a volume mounted inside .kin",
+        "      - name: Published port reachable from outside the container namespace",
+        "      - name: GCS emulator endpoint acceptance",
+        "      - name: Validate development registry identity",
+        "      - name: Authenticate development image writer",
+        "      - name: Log in to Artifact Registry",
+        "      - name: Publish immutable development image",
+        "      - name: Record development image proof",
+    )
+    positions = [job.index(marker) for marker in ordered_markers]
+    if positions != sorted(positions):
+        raise AssertionError(
+            "development image auth or publish moved ahead of build provenance smoke"
+        )
+
+    for forbidden in (
+        "packages: write",
+        "contents: write",
+        "secrets.",
+        "gcloud ",
+        "gcloud-builds",
+        "cloudbuild.yaml",
+        "ghcr.io",
+        "github.run_id",
+        "staging-latest",
+        "imagetools create",
+    ):
+        if forbidden in job:
+            raise AssertionError(
+                f"development image publisher contains forbidden authority: {forbidden}"
+            )
+    if job.count("id-token: write") != 1:
+        raise AssertionError(
+            "development image publisher must grant exactly one job-scoped id-token writer"
+        )
+    if job.count("if: steps.publisher-config.outputs.ready == 'true'") != 4:
+        raise AssertionError(
+            "auth, registry login, publish, and proof must all skip before OIDC activation"
+        )
+    if re.search(r"(?m)^\s+run:\s+bash scripts/", job):
+        raise AssertionError(
+            "historical checkout shell must not execute on the OIDC-capable host"
+        )
+
+    required_publisher = (
+        "<40-hex-commit> <publish-tag>",
+        "KIN_DEV_IMAGE_VERIFIER",
+        "^[0-9a-f]{40}$",
+        'canary_tag="gha-canary-${commit}"',
+        'if [ "$publish_tag" != "$commit" ] && [ "$publish_tag" != "$canary_tag" ]',
+        'source_ref="${registry_image}:${publish_tag}"',
+        'if source_digest="$(inspect_digest "$source_ref")"',
+        '"${registry_image}@${source_digest}" "$commit"',
+        'bash "$verifier"',
+        'if [ "$inspect_status" -ne 44 ]',
+        'docker image tag "$local_image" "$source_ref"',
+        'docker push "$source_ref"',
+        "^sha256:[0-9a-f]{64}$",
+        'references=("$source_ref")',
+        'for reference in "${references[@]}"',
+        'if [ "$actual_digest" != "$source_digest" ]',
+        'echo "digest=$source_digest"',
+        'echo "aliases_promoted=false"',
+        'echo "reference=$source_ref"',
+        'echo "publication=$publication"',
+        'publication="verified_existing"',
+        'publication="published"',
+        'echo "readback=true"',
+        'echo "embedded_sha=true"',
+    )
+    for policy in required_publisher:
+        require(publisher, policy, "immutable development image helper")
+
+    existing_start = publisher.index(
+        'if source_digest="$(inspect_digest "$source_ref")"'
+    )
+    first_push = publisher.index('docker push "$source_ref"', existing_start)
+    first_verify = publisher.index(
+        'bash "$verifier"', existing_start
+    )
+    readback = publisher.index(
+        'for reference in "${references[@]}"', first_push
+    )
+    served_verify = publisher.rindex('bash "$verifier"')
+    proof_outputs = publisher.index('echo "readback=true"', served_verify)
+    if not (
+        existing_start
+        < first_verify
+        < first_push
+        < readback
+        < served_verify
+        < proof_outputs
+    ):
+        raise AssertionError(
+            "existing commit provenance must pass before a replay is accepted, "
+            "and the immutable registry reference plus served digest must be "
+            "verified before proof outputs are recorded"
+        )
+    for forbidden in (
+        "docker build ",
+        "docker buildx build",
+        "docker buildx imagetools create",
+        "gcloud ",
+        ":latest",
+        ":main",
+        "staging-latest",
+        "promote_aliases",
+        "branch_ref",
+    ):
+        if forbidden in publisher:
+            raise AssertionError(
+                f"immutable development image helper contains forbidden behavior: {forbidden}"
+            )
+
+    required_tool = (
+        "scripts/kin-dev-image local [image-tag]",
+        "scripts/kin-dev-image canary [40-hex-commit]",
+        "scripts/kin-dev-image hosted [40-hex-commit]",
+        'if [ "$command" = canary ]',
+        "mode=canary",
+        "mode=publish",
+        "KIN_LTO=thin",
+        "KIN_BUILD_DIRTY=false",
+        "full lowercase 40-hex commit",
+        'remote get-url origin',
+        "firelock-ai/kin.git",
+        'merge-base --is-ancestor "$resolved" origin/main',
+        'workflow run docker.yml',
+        '--repo "$UPSTREAM_REPOSITORY"',
+        "--ref main",
+        '-f "commit=${resolved}"',
+        '-f "mode=${mode}"',
+        "--event workflow_dispatch",
+        'expected_title="Dev image ${mode} ${resolved}"',
+        'if ! grep -Fxq "$candidate_id" "$prior_runs"',
+        'run watch "$run_id"',
+        "--exit-status",
+        'run view "$run_id"',
+        'grep -F "KIN_DEV_IMAGE_PROOF mode=${mode} source=${resolved} "',
+        "us-central1-docker.pkg.dev/kin-ecosystem/kin-dev/kin-daemon:gha-canary-${resolved}",
+        "publication=published aliases_promoted=false readback=true embedded_sha=true transport=github-hosted",
+        "publication=(published|verified_existing) aliases_promoted=false readback=true embedded_sha=true transport=github-hosted",
+        'echo "KIN_DEV_IMAGE_RUN id=$run_id url=$run_url"',
+        'echo "KIN_DEV_IMAGE_PROOF $proof"',
+    )
+    for policy in required_tool:
+        require(local_tool, policy, "local-first development image tool")
 
 
 def job_step_active_lines(workflow: str, job: str, marker: str) -> list[str]:
@@ -9802,6 +10067,8 @@ def main() -> None:
     mcp_tools = MCP_TOOLS_DOC.read_text(encoding="utf-8")
     npm_canonical_readme = NPM_CANONICAL_README.read_text(encoding="utf-8")
     docker_workflow = (WORKFLOWS / "docker.yml").read_text(encoding="utf-8")
+    dev_image_publisher = DEV_IMAGE_PUBLISHER.read_text(encoding="utf-8")
+    dev_image_tool = DEV_IMAGE_TOOL.read_text(encoding="utf-8")
     workflow_sources = {
         workflow: workflow.read_text(encoding="utf-8") for workflow in workflow_paths()
     }
@@ -9978,6 +10245,173 @@ def main() -> None:
     assert_release_critical_runner_policy(comment_control)
 
     assert_workflow_job_census(workflow_sources)
+
+    assert_dev_image_publish_policy(
+        docker_workflow,
+        dev_image_publisher,
+        dev_image_tool,
+    )
+    for invocation in (
+        "bash ./scripts/test-publish-dev-container.sh",
+        "bash ./scripts/kin-dev-image.test.sh",
+        "bash -n ./scripts/publish-dev-container.sh",
+        "bash -n ./scripts/kin-dev-image",
+    ):
+        require(ci_workflow, invocation, "development image guard reachability")
+    expect_assertion(
+        "same-commit manual publishers stop sharing one serial group",
+        "missing required policy: group:",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                "(github.event.inputs.commit || github.sha)",
+                "github.run_id",
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "dev image OIDC starts admitting an unreviewed future event",
+        "requires exactly one active job-level",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                "if: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main' }}",
+                "if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}",
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    safe_dev_image_job_if = (
+        "if: ${{ (github.event_name == 'push' || "
+        "github.event_name == 'workflow_dispatch') && "
+        "github.ref == 'refs/heads/main' }}"
+    )
+    unsafe_dev_image_job_if = (
+        "if: ${{ github.event_name != 'pull_request' && "
+        "github.ref == 'refs/heads/main' }}"
+    )
+    expect_assertion(
+        "a commented safe allowlist compensates for an unsafe active job field",
+        "requires exactly one active job-level",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                f"    {safe_dev_image_job_if}",
+                f"    {unsafe_dev_image_job_if}\n    # {safe_dev_image_job_if}",
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "manual canary reuses the legacy full-SHA tag",
+        "missing required policy: echo \"publish_tag=gha-canary-",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                'echo "publish_tag=gha-canary-${commit}"',
+                'echo "publish_tag=${commit}"',
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "historical compose data reaches the OIDC-capable runner",
+        "missing required policy: KIN_COMPOSE_FILE:",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                "KIN_COMPOSE_FILE: ${{ runner.temp }}/docker-compose.yml",
+                "KIN_COMPOSE_FILE: ${{ github.workspace }}/docker-compose.yml",
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "registry login runs while the development OIDC contract is inactive",
+        "auth, registry login, publish, and proof must all skip",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                "        if: steps.publisher-config.outputs.ready == 'true'\n",
+                "",
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "historical checkout shell executes on the OIDC-capable runner",
+        "historical checkout shell must not execute",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                "      - name: Authenticate development image writer\n",
+                "      - name: Execute historical helper\n"
+                "        run: bash scripts/verify-container-build-info.sh kin:ci "
+                '"$GITHUB_SHA"\n\n'
+                "      - name: Authenticate development image writer\n",
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "manual image publish accepts a commit outside main",
+        "missing required policy: git merge-base --is-ancestor",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow.replace(
+                'git merge-base --is-ancestor "$commit" origin/main',
+                'git cat-file -e "$commit"',
+                1,
+            ),
+            dev_image_publisher,
+            dev_image_tool,
+        ),
+    )
+    existing_verify_start = dev_image_publisher.index(
+        '  bash "$verifier"'
+    )
+    existing_verify_end = dev_image_publisher.index(
+        '  publication="verified_existing"', existing_verify_start
+    )
+    publisher_without_existing_verify = (
+        dev_image_publisher[:existing_verify_start]
+        + dev_image_publisher[existing_verify_end:]
+    )
+    expect_assertion(
+        "an existing commit tag is accepted before its provenance is checked",
+        "existing commit provenance must pass before a replay is accepted",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow,
+            publisher_without_existing_verify,
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "the immutable publisher reintroduces a staging alias",
+        "contains forbidden behavior: docker buildx imagetools create",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow,
+            dev_image_publisher
+            + "\ndocker buildx imagetools create --tag image:staging-latest image@sha256:bad\n",
+            dev_image_tool,
+        ),
+    )
+    expect_assertion(
+        "local helper dispatches branch-controlled workflow code",
+        "missing required policy: --ref main",
+        lambda: assert_dev_image_publish_policy(
+            docker_workflow,
+            dev_image_publisher,
+            dev_image_tool.replace("--ref main", '--ref "$branch"', 1),
+        ),
+    )
 
     external_context_spoof = dict(workflow_sources)
     external_context_spoof[WORKFLOWS / "required-context-spoof.yaml"] = (
@@ -13111,7 +13545,7 @@ def main() -> None:
         "docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a",
         "Keep polling the bounded log authority even",
         "cache-from: type=gha",
-        "cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max' || '' }}",
+        "cache-to: type=gha,mode=max",
     ):
         require(docker_workflow, policy, "Docker CI authority and smoke gate")
 
@@ -15646,7 +16080,7 @@ def main() -> None:
             }
         )
         check_runs.append(
-            non_required_check("Docker Image Build (no push)", 303, 31_001)
+            non_required_check("Build and publish dev daemon image", 303, 31_001)
         )
 
     assert_release_gate_admits(
@@ -15654,7 +16088,7 @@ def main() -> None:
         "a red landing-push check that no required context covers",
         (
             "admitting over a red check no required context covers: "
-            "Docker Image Build (no push) (conclusion=failure",
+            "Build and publish dev daemon image (conclusion=failure",
         ),
         add_red_non_required_push_job,
     )
@@ -16356,7 +16790,10 @@ jobs:
             writes = re.findall(
                 r"(?m)^\s+(contents|packages|id-token):\s*write\s*$", content
             )
-            if writes:
+            dev_image_oidc_only = (
+                workflow.name == "docker.yml" and writes == ["id-token"]
+            )
+            if writes and not dev_image_oidc_only:
                 raise AssertionError(
                     f"{workflow.name} grants {sorted(set(writes))} on a main-push workflow"
                 )
@@ -16377,8 +16814,9 @@ jobs:
 
     print(
         "release workflow authority is reviewed-PR to App-tag automatic, "
-        "protected, pinned, GCP-free, cross-platform byte-canonical, and npm "
-        "automatic through short-lived OIDC with post-public proof"
+        "protected, pinned, GCP-free on release writes, cross-platform "
+        "byte-canonical, with dev-only Artifact Registry OIDC and npm automatic "
+        "through short-lived OIDC with post-public proof"
     )
 
 
