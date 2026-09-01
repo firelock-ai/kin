@@ -5,7 +5,7 @@
 # release.yml), and falls back to docker.io when the mirror cannot serve the
 # digest, so neither registry is a single point of failure.
 #
-# This matters beyond reproducibility. `Docker Image Build (no push)` publishes
+# This matters beyond reproducibility. `Build and publish dev daemon image` publishes
 # a check-run against every commit that reaches main, and release-tag.yml's
 # second sweep refuses a release commit carrying any non-green check-run,
 # required or not. A registry blip lasting minutes therefore refuses a release
@@ -16,8 +16,10 @@
 # Dependency compilation is split away from workspace compilation. `cargo chef
 # prepare` distills the workspace manifests into a recipe whose bytes change
 # only when a dependency changes, so the `cook` layer in the builder keys on
-# dependencies alone and survives across source-only commits in the
-# registry-backed BuildKit cache that cloudbuild.yaml imports and exports.
+# dependencies alone and survives across source-only commits. The normal
+# GitHub-hosted development builder carries that layer in its Actions cache;
+# legacy cloudbuild.yaml carries the same layer in a registry cache only when
+# an operator deliberately invokes that fallback.
 # Before the split, `COPY . /build/kin` preceded the only cargo invocation, so
 # every push to main recompiled the entire dependency graph from scratch and
 # each hosted build burned 11-20 minutes on E2_HIGHCPU_8.

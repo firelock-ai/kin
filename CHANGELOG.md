@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-09-01
+
+### Changed
+
+- Harden stranger proof coverage gate (#1337)
+- Migrate dev images to GitHub-hosted builds (#1331)
+
+
 ## [0.6.3] - 2026-08-30
 
 ### Changed
