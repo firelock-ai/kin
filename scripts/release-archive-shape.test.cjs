@@ -9,6 +9,7 @@ const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
 const {
+  DOC_FILES: SHAPE_DOC_FILES,
   MAX_BUNDLE_ENTRIES,
   NOTIFIER_BUNDLE_DIR,
   assertReleaseArchiveMemberPaths,
@@ -59,20 +60,20 @@ const LINUX_LISTING = [
 // artifact prefix at all.
 const WINDOWS_LISTING = ["kin.exe", "kin-daemon.exe", "kin-vfs.exe"];
 
-// Documentation members ride on every family, so the per-family expectations
-// below are the executables plus these, sorted.
-const DOC_FILES = ["INSTALL.md", "README.md", "checksums-sha256.txt"];
-const MACOS_FILES = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib", ...DOC_FILES].sort();
-const LINUX_FILES = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so", ...DOC_FILES].sort();
+// Documentation members ride on every family, so the per-family admitted root
+// sets below are the components plus these, sorted. They are admitted at the
+// root and kept out of the provenance inventory: an installed updater judges the
+// inventory by its own component list and refuses any other name, which is how
+// v0.6.2 refused v0.6.3 on `checksums-sha256.txt`.
+const DOC_FILES = ["INSTALL.md", "README.md", "checksums-sha256.txt"].sort();
+const MACOS_COMPONENTS = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.dylib"].sort();
+const LINUX_COMPONENTS = ["kin", "kin-daemon", "kin-vfs", "libkin_vfs_shim.so"].sort();
 // Sorted the way the classifier returns names, which puts the bare CLI between
 // the hyphenated binaries and the underscored shim.
-const WINDOWS_FILES = [
-  "kin-daemon.exe",
-  "kin-vfs.exe",
-  "kin.exe",
-  "kin_vfs_shim.dll",
-  ...DOC_FILES,
-].sort();
+const WINDOWS_COMPONENTS = ["kin-daemon.exe", "kin-vfs.exe", "kin.exe", "kin_vfs_shim.dll"].sort();
+const MACOS_FILES = [...MACOS_COMPONENTS, ...DOC_FILES].sort();
+const LINUX_FILES = [...LINUX_COMPONENTS, ...DOC_FILES].sort();
+const WINDOWS_FILES = [...WINDOWS_COMPONENTS, ...DOC_FILES].sort();
 
 function tempRoot() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "release-archive-shape-"));
@@ -219,21 +220,66 @@ test("the bundle is required on macOS listings and refused on every other target
 
 test("the extracted macOS root yields exactly the four provenance-bearing files", () => {
   const root = macosRoot();
-  const { files, bundles } = classifyReleaseArchiveRoot(root, { target: MACOS_TARGET });
-  assert.deepEqual(files, MACOS_FILES);
+  const { files, docs, bundles } = classifyReleaseArchiveRoot(root, { target: MACOS_TARGET });
+  assert.deepEqual(files, MACOS_COMPONENTS);
+  assert.deepEqual(docs, DOC_FILES);
   assert.deepEqual(bundles, [NOTIFIER_BUNDLE_DIR]);
 });
 
 test("the extracted Linux root yields its files and no bundle", () => {
-  const { files, bundles } = classifyReleaseArchiveRoot(linuxRoot(), { target: LINUX_TARGET });
-  assert.deepEqual(files, LINUX_FILES);
+  const { files, docs, bundles } = classifyReleaseArchiveRoot(linuxRoot(), {
+    target: LINUX_TARGET,
+  });
+  assert.deepEqual(files, LINUX_COMPONENTS);
+  assert.deepEqual(docs, DOC_FILES);
   assert.deepEqual(bundles, []);
 });
 
 test("the extracted Windows root yields its files and no bundle", () => {
-  const { files, bundles } = classifyReleaseArchiveRoot(windowsRoot(), { target: WINDOWS_TARGET });
-  assert.deepEqual(files, WINDOWS_FILES);
+  const { files, docs, bundles } = classifyReleaseArchiveRoot(windowsRoot(), {
+    target: WINDOWS_TARGET,
+  });
+  assert.deepEqual(files, WINDOWS_COMPONENTS);
+  assert.deepEqual(docs, DOC_FILES);
   assert.deepEqual(bundles, []);
+});
+
+// The `files` list the classifier returns is what the build job writes into the
+// provenance manifest's `archive_contents`, and an installed updater then judges
+// that list with its own frozen component list. Every manifest from v0.5.45 to
+// v0.6.3 carried the three documentation members, and the v0.6.2 updater refused
+// v0.6.3 on the first of them, so no managed install could update across that
+// range. The documentation stays a sanctioned root member; it is the inventory
+// it must never reach.
+test("documentation members are admitted at the root and never enter the inventory", () => {
+  assert.deepEqual([...SHAPE_DOC_FILES].sort(), DOC_FILES);
+  for (const [root, target, components] of [
+    [macosRoot(), MACOS_TARGET, MACOS_COMPONENTS],
+    [linuxRoot(), LINUX_TARGET, LINUX_COMPONENTS],
+    [windowsRoot(), WINDOWS_TARGET, WINDOWS_COMPONENTS],
+  ]) {
+    const { files, docs } = classifyReleaseArchiveRoot(root, { target });
+    assert.deepEqual(
+      files.filter((name) => DOC_FILES.includes(name)),
+      [],
+      `${target}: the provenance inventory names documentation the installed updater refuses`
+    );
+    assert.deepEqual(files, components, `${target}: the inventory is not exactly the components`);
+    assert.deepEqual(docs, DOC_FILES, `${target}: a documentation member was dropped`);
+    assert.ok(
+      DOC_FILES.every((name) => releaseArchiveRootFiles(target).includes(name)),
+      `${target}: documentation is no longer admitted at the archive root`
+    );
+  }
+  // An archive without its documentation still classifies. Whether the docs are
+  // mandatory is the packaging step's presence assertion, not the classifier's.
+  const bare = linuxRoot();
+  for (const name of DOC_FILES) {
+    fs.rmSync(path.join(bare, name));
+  }
+  const { files, docs } = classifyReleaseArchiveRoot(bare, { target: LINUX_TARGET });
+  assert.deepEqual(files, LINUX_COMPONENTS);
+  assert.deepEqual(docs, []);
 });
 
 test("the sanctioned root files are read per target family", () => {

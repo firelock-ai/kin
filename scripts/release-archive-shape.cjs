@@ -59,6 +59,14 @@ const MAX_BUNDLE_DEPTH = 6;
 // They are members of the archive and nothing installs them: `kin update` skips
 // them by name (see RELEASE_ARCHIVE_DOC_FILES in the updater) and `scripts/
 // install.sh` moves a fixed list of binaries, so neither changes behaviour.
+//
+// They are archive members and not inventory records. `classifyReleaseArchiveRoot`
+// returns them as `docs`, never in `files`, because `files` becomes the
+// provenance manifest's `archive_contents` and an installed updater judges that
+// list with its own frozen component list, refusing any other name. Every
+// manifest from v0.5.45 to v0.6.3 carried these three, and the v0.6.2 updater
+// refused v0.6.3 on `checksums-sha256.txt`, the first of them in sort order, so
+// no managed install could update across that whole range.
 const DOC_FILES = Object.freeze(["README.md", "INSTALL.md", "checksums-sha256.txt"]);
 
 const ROOT_FILES_BY_FAMILY = {
@@ -267,18 +275,27 @@ function assertNotifierBundle(bundleRoot, bundleName) {
   }
 }
 
-// Classify the extracted root of a release archive into its component files and
-// its sanctioned bundles, refusing every other shape.
+// Classify the extracted root of a release archive into its component files,
+// its documentation members and its sanctioned bundles, refusing every other
+// shape.
 //
-// The returned file list is the release's content inventory: it is what the
+// The returned `files` list is the release's content inventory: it is what the
 // build job hashes into the per-artifact provenance manifest and what the
 // publish job compares that manifest against, so both sides agree on which
-// entries carry per-file provenance and which travel as a sealed bundle.
+// entries carry per-file provenance. Documentation is admitted at the root and
+// returned separately as `docs`, never in `files`. An installed updater refuses
+// any inventory name outside its managed component list and only ever installs
+// components, so a doc record in the manifest does not describe the archive
+// more fully, it stops every update on that platform: v0.6.2 refused the v0.6.3
+// manifest on `checksums-sha256.txt`, the first foreign name in it. The docs'
+// bytes stay covered by the archive digest and by the in-archive checksum
+// manifest, the same way the notification bundle's are covered by the digest.
 function classifyReleaseArchiveRoot(contentRoot, options) {
   const { target } = options ?? {};
   const bundleAllowed = targetCarriesNotifierBundle(target);
   const rootFiles = releaseArchiveRootFiles(target);
   const files = [];
+  const docs = [];
   const bundles = [];
   for (const entry of fs.readdirSync(contentRoot, { withFileTypes: true })) {
     if (entry.isSymbolicLink()) {
@@ -290,7 +307,11 @@ function classifyReleaseArchiveRoot(contentRoot, options) {
           `release archive root for ${target} holds unexpected file '${entry.name}'`
         );
       }
-      files.push(entry.name);
+      if (DOC_FILES.includes(entry.name)) {
+        docs.push(entry.name);
+      } else {
+        files.push(entry.name);
+      }
       continue;
     }
     if (!entry.isDirectory()) {
@@ -312,8 +333,9 @@ function classifyReleaseArchiveRoot(contentRoot, options) {
     throw new Error(`release archive root for ${target} is missing ${NOTIFIER_BUNDLE_DIR}`);
   }
   files.sort();
+  docs.sort();
   bundles.sort();
-  return { files, bundles };
+  return { files, docs, bundles };
 }
 
 module.exports = {
