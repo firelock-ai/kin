@@ -1166,9 +1166,9 @@ async fn handle_tools_call<G: PersistableMcpStore>(
     // Resolve the served name to the registered one here, once, before anything
     // keyed on a tool name reads it: the profile filter below, the dispatcher,
     // the response-budget shape, the negative-evidence spec and the envelope.
-    // `agent-default` serves the declaration filter as `find_declarations`
-    // because `semantic_search` does not search semantically; everything
-    // internal stays keyed on the registered name.
+    // `agent-default` served the declaration filter as `find_declarations` for
+    // four landings, so that name is still accepted here; every profile now
+    // advertises the registered name, and everything internal stays keyed on it.
     crate::agent_belt::canonicalize_tool_name(&mut call_params.name);
     // The belt asks for the compact locate shape on its agents' behalf, only
     // when the caller named no surface. Applied here rather than in the daemon
@@ -1276,9 +1276,9 @@ async fn handle_tools_call_daemon(
     // Resolve the served name to the registered one here, once, before anything
     // keyed on a tool name reads it: the profile filter below, the dispatcher,
     // the response-budget shape, the negative-evidence spec and the envelope.
-    // `agent-default` serves the declaration filter as `find_declarations`
-    // because `semantic_search` does not search semantically; everything
-    // internal stays keyed on the registered name.
+    // `agent-default` served the declaration filter as `find_declarations` for
+    // four landings, so that name is still accepted here; every profile now
+    // advertises the registered name, and everything internal stays keyed on it.
     crate::agent_belt::canonicalize_tool_name(&mut call_params.name);
     // The belt asks for the compact locate shape on its agents' behalf, only
     // when the caller named no surface. Applied here rather than in the daemon

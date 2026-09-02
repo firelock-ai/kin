@@ -66,7 +66,8 @@ pub const AGENT_DEFAULT_DESCRIPTION_BUDGET: usize = 520;
 /// per-tool budget would be a profile that had learned nothing.
 pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 10_000;
 
-/// The honest name for the declaration filter.
+/// The honest name for the declaration filter, accepted on a call and never
+/// served.
 ///
 /// `semantic_search` does not search semantically. Its own registered
 /// description opens "Find code declarations in the semantic graph by name,
@@ -76,18 +77,29 @@ pub const AGENT_DEFAULT_PROFILE_DESCRIPTION_BUDGET: usize = 10_000;
 /// before it reads five thousand characters of prose, and these two names are
 /// the wrong way round.
 ///
-/// Served under this name on `agent-default` only. The registration, the
-/// dispatch key, the budget shape and the negative-evidence spec all stay on
-/// `semantic_search`, so nothing internal is renamed and no existing caller
-/// breaks; [`canonical_tool_name`] maps this name back before any of them see
-/// it. `find_declarations` also reads as a pair with
-/// `find_references`, which is the tool an agent reaches for next.
+/// That reading still holds, and it was not enough to move the served name.
+/// `agent-default` advertised the filter under this name for four landings, and
+/// two proofs that run only on `main` went red on every one of them: the
+/// install proof throws `MCP tools/list omitted semantic_search`
+/// (`.github/workflows/install-proof.yml`) and the Windows npm proof asserts
+/// `toolNames.includes('semantic_search')`
+/// (`scripts/prove-windows-npm-first-run.mjs`). Renaming a public MCP tool on
+/// the default profile is a product decision that has to move those proofs, the
+/// docs and the acceptance suite in one deliberate change, rather than ride
+/// along inside a payload compaction.
+///
+/// So the name lives on as an accepted input only. [`canonical_tool_name`] maps
+/// it back at each dispatch entry, so a caller that learned it during those four
+/// landings still reaches the same handler, while `tools/list` advertises the
+/// registered name on every profile.
+/// `agent_default_serves_every_name_the_shipped_proofs_assert` is what holds
+/// that per pull request.
 pub const DECLARATION_FILTER_ALIAS: &str = "find_declarations";
 
 /// The registered name [`DECLARATION_FILTER_ALIAS`] stands in for.
 pub const DECLARATION_FILTER_CANONICAL: &str = "semantic_search";
 
-/// Map a served tool name back to the name everything internal is keyed on.
+/// Map an accepted tool name back to the name everything internal is keyed on.
 ///
 /// One function, called once per call at the point the name is parsed, so the
 /// profile filter, the dispatcher, the response-budget shape, the
@@ -159,7 +171,7 @@ fn short_descriptions() -> BTreeMap<&'static str, &'static str> {
              name, kind, file, line, signature and score. Read `ranked_by` first: with no \
              embeddings the ranking is lexical, so a plain word of your question can match a \
              symbol of that name and crowd the first rows. If you already know the exact symbol \
-             name, call find_declarations instead.",
+             name, call semantic_search instead.",
         ),
         (
             DECLARATION_FILTER_CANONICAL,
@@ -364,8 +376,9 @@ fn schema_keep_lists() -> BTreeMap<&'static str, &'static [&'static str]> {
 }
 
 /// Rewrite one served tool list for the `agent-default` profile: short
-/// descriptions, trimmed schemas, and the declaration filter under its honest
-/// name.
+/// descriptions and trimmed schemas. Tool names are left exactly as
+/// registered, because two proofs that run only on `main` read `tools/list` and
+/// assert a name literally.
 ///
 /// A tool with no short form keeps its registered description, so adding a tool
 /// to the profile is never silently a tool with no description. The
@@ -381,14 +394,10 @@ pub fn compact_for_agent_default(list: &mut ToolsListResult) {
         if let Some(keep) = keeps.get(tool.name.as_str()) {
             trim_schema(&mut tool.input_schema, keep);
         }
-        if tool.name == DECLARATION_FILTER_CANONICAL {
-            tool.name = DECLARATION_FILTER_ALIAS.to_string();
-        }
     }
-    // The list is served in name order, and renaming a tool moves it. Re-sorting
-    // keeps that contract: a client caches the prompt it builds from
-    // `tools/list`, so an order that depended on a rename would miss the cache.
-    list.tools.sort_by(|left, right| left.name.cmp(&right.name));
+    // No name is rewritten here, so the name order `tools::tool_definitions`
+    // built survives untouched. A client caches the prompt it builds from
+    // `tools/list`, and an order this function moved would miss that cache.
 }
 
 /// Keep only the named properties, and narrow `required` to what survives.
@@ -545,28 +554,33 @@ mod tests {
                 .tools
                 .iter()
                 .any(|t| t.name == DECLARATION_FILTER_ALIAS),
-            "the alias is served, never registered"
+            "the alias is accepted on a call, never registered and never served"
         );
     }
 
-    /// The rename, on both halves: `agent-default` serves the honest name, and
-    /// a call under either name reaches the same handler.
+    /// Both halves: `agent-default` serves the registered name, and a call
+    /// under either name reaches the same handler.
+    ///
+    /// The alias was served for four landings and took two main-only proofs red
+    /// on each of them. Serving the registered name is what those proofs assert;
+    /// accepting the alias on a call is what keeps a caller that learned it in
+    /// the meantime working.
     #[test]
-    fn agent_default_serves_the_declaration_filter_under_its_honest_name() {
+    fn agent_default_serves_the_declaration_filter_under_its_registered_name() {
         let served = served_agent_default();
         assert!(
             served
                 .tools
                 .iter()
-                .any(|t| t.name == DECLARATION_FILTER_ALIAS),
-            "agent-default must serve {DECLARATION_FILTER_ALIAS}"
+                .any(|t| t.name == DECLARATION_FILTER_CANONICAL),
+            "agent-default must serve {DECLARATION_FILTER_CANONICAL}"
         );
         assert!(
             !served
                 .tools
                 .iter()
-                .any(|t| t.name == DECLARATION_FILTER_CANONICAL),
-            "and must not also serve the misleading name"
+                .any(|t| t.name == DECLARATION_FILTER_ALIAS),
+            "and must not serve the alias, which the shipped proofs do not know"
         );
         assert_eq!(
             canonical_tool_name(DECLARATION_FILTER_ALIAS),
@@ -581,6 +595,62 @@ mod tests {
         for name in ["semantic_locate", "find_references", "get_entity_source"] {
             assert_eq!(canonical_tool_name(name), name);
         }
+    }
+
+    /// Every tool name the shipped proofs assert by name must be served under
+    /// exactly that name on `agent-default`, and no tool may be served under a
+    /// name the registry does not carry.
+    ///
+    /// Two proofs read `tools/list` and assert a tool name literally.
+    /// `.github/workflows/install-proof.yml`, in its "Graph query and MCP
+    /// tool-call proof" step, throws `MCP tools/list omitted semantic_search`
+    /// and then calls that tool twice through `tools/call`.
+    /// `scripts/prove-windows-npm-first-run.mjs` asserts
+    /// `toolNames.includes('semantic_search')` for both npm entrypoints. Both
+    /// jobs are `skipped` on a pull request and graded only on `main`'s push
+    /// run, so before this test nothing per-PR could see a served name move:
+    /// the change that introduced this module served `semantic_search` as
+    /// `find_declarations`, and both proofs stayed red for four landings.
+    ///
+    /// The second assertion is the general form of that class. A served name
+    /// the registry does not carry is a rename by another route, whatever tool
+    /// it lands on, and it fails here rather than on `main` a landing later. If
+    /// you added a name to one of those two files, add it to
+    /// `PROOF_ASSERTED_NAMES` as well. If this test is in your way because you
+    /// meant to move a served name, that move takes those two files,
+    /// `docs/mcp-tools.md` and the acceptance suite with it, in one change.
+    #[test]
+    fn agent_default_serves_every_name_the_shipped_proofs_assert() {
+        // Read out of the two files named above on 2026-09-02. Both assert
+        // `semantic_search` and no other tool name.
+        const PROOF_ASSERTED_NAMES: &[&str] = &["semantic_search"];
+
+        let served: Vec<String> = served_agent_default()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        for name in PROOF_ASSERTED_NAMES {
+            assert!(
+                served.iter().any(|candidate| candidate == name),
+                "the shipped proofs call {name} by name and agent-default serves {served:?}"
+            );
+        }
+
+        let registered: Vec<String> = crate::tools::tool_definitions()
+            .tools
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let unregistered: Vec<&String> = served
+            .iter()
+            .filter(|name| !registered.contains(*name))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "agent-default serves {unregistered:?} under a name the registry does not carry, \
+             which is a public rename no per-PR check but this one can see"
+        );
     }
 
     /// The in-place form the dispatchers call must agree with the borrowing one,
@@ -600,9 +670,9 @@ mod tests {
         }
     }
 
-    /// The served list stays in name order after the rename moved a tool.
+    /// The served list stays in name order.
     #[test]
-    fn the_served_list_stays_sorted_after_the_rename() {
+    fn the_served_list_stays_sorted() {
         let names: Vec<String> = served_agent_default()
             .tools
             .into_iter()
@@ -702,7 +772,7 @@ mod tests {
         let locate = descriptions["semantic_locate"];
         let filter = descriptions[DECLARATION_FILTER_CANONICAL];
         assert!(
-            locate.contains(DECLARATION_FILTER_ALIAS),
+            locate.contains(DECLARATION_FILTER_CANONICAL),
             "semantic_locate must name the tool a caller reaches for by mistake"
         );
         assert!(

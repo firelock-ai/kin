@@ -13085,11 +13085,11 @@ async fn mcp_tools_call(
     State(state): State<Arc<DaemonState>>,
     Json(mut request): Json<McpToolCallRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    // Resolve a served alias to the registered name before anything keyed on a
-    // tool name reads it. `agent-default` serves the declaration filter as
-    // `find_declarations`, because `semantic_search` does not search
-    // semantically; the dispatcher, the budget shape and the negative spec all
-    // stay keyed on the registered name. Every other name passes through.
+    // Resolve an accepted alias to the registered name before anything keyed on
+    // a tool name reads it. `agent-default` served the declaration filter as
+    // `find_declarations` for four landings, so that name is still accepted; the
+    // dispatcher, the budget shape and the negative spec all stay keyed on the
+    // registered name. Every other name passes through.
     kin_mcp::agent_belt::canonicalize_tool_name(&mut request.name);
     let budget =
         kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments).less_envelope_reserve();
