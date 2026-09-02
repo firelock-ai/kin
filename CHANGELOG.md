@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-09-02
+
+### Changed
+
+- Judge the registry wave on its own CI completion, a typed kick and a proven rebased head (#1386)
+- Rejoin a persisted receipt with the operation it names, and pin kin-db 0.7.89 (#1387)
+- chore(deps): refresh Kin registry dependency pins (#1360)
+- Spend one file-anchor budget across the ranked window by structural mass (#1389)
+- Bound the Windows cargo cache so its save cannot outlive the job (#1388)
+- Serve a query-only MCP profile and bring a deep trace inside its ceiling (#1390)
+- Select and preflight the release candidate with nobody at the keyboard (#1391)
+- chore(deps): refresh Kin registry pins after kin-db@0.7.90 (#1393)
+
+
 ## [0.6.4] - 2026-09-01
 
 ### Changed
