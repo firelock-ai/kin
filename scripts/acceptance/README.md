@@ -1,9 +1,20 @@
 # Product acceptance suites
 
 Falsifiable suites that ask whether the product still answers correctly, and one
-that asks whether it still tells the truth before it answers anything.
-`.github/workflows/acceptance.yml` runs them all on every pull request against
-that pull request's own build. None is release proof; all are regression gates.
+that asks whether it still tells the truth before it answers anything. None is
+release proof; all are regression gates.
+
+`.github/workflows/acceptance.yml` runs them on main's push, not on a pull
+request. Its `Product Acceptance` job carries
+`if: ${{ github.event_name != 'pull_request' }}`, so it graded pull requests
+only through `merge_group` and kin has had none since the 2026-08-27 classic
+flip. That is the founder's chosen shape, thin-green landing plus continuous
+acceptance on main, and it is not a gap to close by re-adding the whole suite
+per pull request. What it means for anyone writing a check here is narrower and
+sharper: **a rule you add to a suite in this directory will not run on the pull
+request that breaks it.** `mcp_surface_contract.py` is the one exception and the
+pattern for the next one, and the entry in `ci.yml` that runs it is
+`MCP surface contract`.
 
 Each suite prints one line per check:
 
@@ -561,9 +572,29 @@ reading `tree=0` must fail, a one-parent change must read UNREADABLE rather than
 graded, and a refusal that names the file but neither entity, or both entities
 but only one side, must each fail on their own assertion.
 
-`brownfield_repro.py --self-test` and `response_budget_elisions.py --self-test`
-exercise their verdict graders on fixed payloads and need no binary and no
-corpus. Each case is paired with its inverse, so a grader that cannot tell its
+`mcp_surface_contract.py` is the one suite here that runs per pull request, and
+it exists because the other suites do not. Five assertions in this repository
+read the served `agent-default` MCP surface and all five are graded only on
+main's push: `install-proof.yml`'s "Graph query and MCP tool-call proof" step,
+`scripts/prove-windows-npm-first-run.mjs`, and this directory's `magic:6`,
+`magic:14` and `response_budget:2`. A change to that profile moved a served tool
+name and trimmed three schema knobs and a description sentence; all five were
+`skipped` across 44 of 44 check runs on its own pull request and red on main for
+four landings. This suite is those five assertions on one small fixture over one
+spawned stdio server, in about 13 s.
+
+It imports the graders rather than restating them.
+`response_budget_elisions.grade_advertised_budget` grades the served schemas,
+and `magic_repro.trace_shape_knob` and `magic_repro.graph_status_description`
+are the readers `check_6` and `check_14` use, which is what keeps the per pull
+request gate and main's gate one gate. Its check 0 is a positive control on the
+resolved tool profile: a run that graded `full` would pass every assertion below
+while saying nothing about the surface an agent is served. Check 6 is the
+general form, and refuses any served name the registry does not carry.
+
+`mcp_surface_contract.py --self-test`, `brownfield_repro.py --self-test` and
+`response_budget_elisions.py --self-test` exercise their verdict graders on
+fixed payloads and need no binary and no corpus. Each case is paired with its inverse, so a grader that cannot tell its
 own cases apart fails rather than reporting a clean product on a broken one. That
 pairing has already earned its keep: one elision grader passed a deliberately
 broken product because its fixture sat under the budget and never reached the
