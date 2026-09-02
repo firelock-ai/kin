@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{self, Shell};
 use kin_cli::commands;
+use kin_cli::{eprintln, println};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::Instrument;
@@ -2622,7 +2623,26 @@ fn parse_cli_or_report_retired_command() -> Cli {
     }
 }
 
-fn main() -> Result<()> {
+/// The process entry. The outcome of [`run`] becomes an exit status in one
+/// place, so a refusal is reported the same way whether or not anyone still
+/// reads stderr, and the `println!` and `eprintln!` this file imports from
+/// `kin_cli` are the ones that tolerate a reader going away, so nothing here
+/// ends early because a pipe closed. Two cases, told apart by the status. A
+/// command that ran to its end exits 0, or its own error status, whatever
+/// happened to its streams on the way, because its work is done and the
+/// status reports the work. A command that stopped at a write outside those
+/// macros, an `io::Error` of kind `BrokenPipe` that came back through `?`,
+/// exits 141: its work after that write never ran, and 141 is a status nobody
+/// can read as success of work that never happened. `kin_cli::broken_pipe`
+/// decides the status; this is the process boundary, so it is where the exit
+/// happens.
+fn main() {
+    if let Err(error) = run() {
+        std::process::exit(kin_cli::broken_pipe::exit_status(&error));
+    }
+}
+
+fn run() -> Result<()> {
     // Select this process's resource profile before anything reads it: the GPU
     // kernel plan and the Metal submission depth are each resolved once per
     // process, and mutating the environment is only safe while the process is
@@ -3780,12 +3800,16 @@ fn main() -> Result<()> {
                     }
                 }
                 Command::Completions { shell } => {
-                    clap_complete::generate(
-                        shell,
-                        &mut Cli::command(),
-                        "kin",
-                        &mut std::io::stdout(),
-                    );
+                    // Rendered into memory and written from here. clap_complete
+                    // writes straight into the sink it is handed and turns a
+                    // failed write into a panic of its own, `failed to write
+                    // completion file`, so the write that can meet a closed
+                    // pipe has to be one this crate makes: a reader that takes
+                    // one line of the script and leaves gets the same clean
+                    // exit as one that takes it all.
+                    let mut script = Vec::new();
+                    clap_complete::generate(shell, &mut Cli::command(), "kin", &mut script);
+                    kin_cli::broken_pipe::write_stdout(&script);
                     Ok(())
                 }
                 Command::Update {

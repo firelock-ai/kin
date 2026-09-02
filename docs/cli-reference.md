@@ -25,6 +25,8 @@ These apply to every command.
 | `-h, --help` | Print help. |
 | `-V, --version` | Print the build version. |
 
+Every command also shares one rule for a reader that goes away. When the process reading kin's output closes the pipe, as `kin log | head -1` does once `head` has its line, kin stops writing to that stream, finishes what it was doing, and exits with the status its work earned: `0` for a command that completed and its own error status for one that was refused. A `kin commit -m ... 2>&1 | head -1` still records its change and exits `0`, and a `kin init 2>&1 | head -1` still leaves a complete store. The one exception is a write kin could not skip meeting the closed pipe, which ends the command at that write with `141`, the status a shell reports for a process `SIGPIPE` ended, and never with a `0` for work that did not run. Neither is a panic, and a command whose output goes to a file is unaffected.
+
 ## Contents
 
 - [Start here](#start-here): `init`, `clone`, `status`, `commit`, `log`, `diff`
