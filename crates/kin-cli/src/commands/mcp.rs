@@ -31,6 +31,19 @@ use std::pin::Pin;
 /// immediately, and a `tools/call` that arrives before the binding settles is
 /// answered honestly that the daemon is still starting.
 ///
+/// Attach early, start on request (FIR-3099). Answering early moved the wait
+/// off the handshake; it did not make the work free. Resolving a repo daemon
+/// STARTS one when none is serving, and a daemon that starts opens the store
+/// and schedules the background embedding pass, so a session that made no Kin
+/// call at all was paying for a full embed of that repository: measured at 1.80
+/// GiB resident and 99 percent of a core sixty seconds after the handshake, on
+/// a 657.8 KiB store, with the fleet's gpu lock held by somebody else. Every
+/// bind this process performs before a caller asks for a graph answer therefore
+/// attaches to a daemon that is already serving and starts none, which keeps a
+/// warm session exactly as fast as it was; the first `tools/call` admits the
+/// spawn, and the binding task waiting on that admission then starts the daemon
+/// and settles as before.
+///
 /// `--no-spawn` is the probe contract (FIR-2341): this server binds only a
 /// daemon that is already serving and never starts one, neither in the
 /// startup binding nor through tool-call revival. It is carried as the
@@ -107,7 +120,12 @@ pub async fn start(
         move |roots: Vec<PathBuf>| -> Pin<Box<dyn Future<Output = kin_mcp::WorkspaceBinding> + Send>> {
             let startup = std::sync::Arc::clone(&binder_startup);
             Box::pin(async move {
-                bind_first_kin_repo(roots, startup.pinned_by_operator()).await
+                bind_first_kin_repo(
+                    roots,
+                    startup.pinned_by_operator(),
+                    DaemonBindMode::for_admission(startup.daemon_spawn_admitted()),
+                )
+                .await
             })
         },
     ));
@@ -157,6 +175,15 @@ async fn run_startup_binding(
     // later: once `kin init` has run, nothing on disk still says what the
     // launch directory looked like before it.
     kin_mcp::note_startup_repository(discovered.is_some());
+    // Publish the operator pin now rather than when its daemon binds. The
+    // workspace-roots binder reads it from this handle on the client's
+    // `roots/list` answer, which on a cold repository now always arrives before
+    // the bind settles, and a binder reading `false` would follow the client off
+    // the repository `--repo`/`KIN_MCP_REPO` named. A pin that resolves to no
+    // repository is still not a pin, which is why this is gated on discovery.
+    if repo_override.is_some() && discovered.is_some() {
+        startup.note_operator_pin();
+    }
     if let Some(layout) = &discovered {
         let kin_root = layout.root().to_path_buf();
         startup.set_phase_probe(Box::new(move || {
@@ -164,7 +191,7 @@ async fn run_startup_binding(
         }));
     }
 
-    let unbound_reason = match bind_daemon_for_repo_dir(&cwd).await {
+    let unbound_reason = match bind_daemon_when_asked(&cwd, &startup).await {
         Ok(daemon_url) => {
             eprintln!("{}", session_authority_notice());
             eprintln!("Kin MCP: forwarding graph tools to repo daemon at {daemon_url}");
@@ -486,7 +513,7 @@ async fn bind_from_registry(startup: &kin_mcp::StartupDaemonBinding) -> Option<k
                     crate::daemon_client::daemon_startup_phase(&kin_root)
                 }));
             }
-            match bind_daemon_for_repo_dir(&path).await {
+            match bind_daemon_when_asked(&path, startup).await {
                 Ok(daemon_url) => {
                     // Match the roots path: the daemon delegate reads the
                     // per-install loopback token from <root>/.kin/daemon.token
@@ -550,8 +577,9 @@ async fn bind_from_registry(startup: &kin_mcp::StartupDaemonBinding) -> Option<k
 async fn bind_first_kin_repo(
     roots: Vec<PathBuf>,
     pinned_by_operator: bool,
+    mode: DaemonBindMode,
 ) -> kin_mcp::WorkspaceBinding {
-    bind_first_kin_repo_against(roots, bound_repo_working_dir(), pinned_by_operator).await
+    bind_first_kin_repo_against(roots, bound_repo_working_dir(), pinned_by_operator, mode).await
 }
 
 /// Core of [`bind_first_kin_repo`] with the currently bound repository as an
@@ -562,6 +590,7 @@ async fn bind_first_kin_repo_against(
     roots: Vec<PathBuf>,
     bound_repo: Option<PathBuf>,
     pinned_by_operator: bool,
+    mode: DaemonBindMode,
 ) -> kin_mcp::WorkspaceBinding {
     // `KinLayout::discover` is filesystem-rooted: it walks up from each root and
     // finds a `.kin/` or nothing, regardless of which daemon this process is
@@ -625,7 +654,14 @@ async fn bind_first_kin_repo_against(
     }
 
     for working_dir in candidates.iter() {
-        let Ok(url) = bind_daemon_for_repo_dir(working_dir).await else {
+        // `mode` is the whole of this loop's part in FIR-3099. This binder runs
+        // inline in the stdio loop, on the client's `roots/list` answer, which
+        // arrives before the client has asked Kin anything. Attaching to a
+        // daemon that is already serving is free; starting one is not, so
+        // before the first `tools/call` a candidate with no running daemon is
+        // skipped and reported as `OtherRepository`, which the server keeps and
+        // puts through this binder again on that first call.
+        let Ok(url) = bind_daemon_for_repo_dir(working_dir, mode).await else {
             continue;
         };
         // Point the process at the bound repo so the daemon delegate resolves
@@ -719,22 +755,128 @@ fn resolve_repo_override(repo_arg: Option<PathBuf>) -> Option<PathBuf> {
 /// hard error: `kin mcp start` must always reach the stdio loop so
 /// `initialize`/`tools/list` succeed even when no repository is bound yet,
 /// with individual `tools/call` requests failing loud instead.
-async fn bind_daemon_for_repo_dir(dir: &Path) -> std::result::Result<String, String> {
+async fn bind_daemon_for_repo_dir(
+    dir: &Path,
+    mode: DaemonBindMode,
+) -> std::result::Result<String, BindRefusal> {
     if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
         if !url.trim().is_empty() {
             return Ok(url);
         }
     }
     let layout = crate::commands::require_repository_layout_at(dir)
-        .map_err(|refusal| format!("{refusal:#}"))?;
+        .map_err(|refusal| BindRefusal::Reason(format!("{refusal:#}")))?;
+    if mode == DaemonBindMode::AttachOnly {
+        // Deliberately the resolver `kin doctor` reads from, not a second
+        // opinion: it answers for a daemon that is already serving and starts
+        // nothing. `None` here is not a failure, it is "a repository is here and
+        // nobody is serving it yet", which is the state a session that has asked
+        // for nothing is supposed to be left in.
+        return match crate::daemon_client::resolve_daemon_url_if_running_async(&layout).await {
+            Some(url) => {
+                std::env::set_var("KIN_DAEMON_URL", &url);
+                Ok(url)
+            }
+            None => Err(BindRefusal::SpawnNotAdmitted),
+        };
+    }
     let url = crate::daemon_client::resolve_daemon_url_for_mcp(&layout)
         .await
-        .map_err(|e| format!("{e:#}"))?
+        .map_err(|e| BindRefusal::Reason(format!("{e:#}")))?
         .ok_or_else(|| {
-            crate::daemon_client::daemon_required_error("MCP startup", &layout).to_string()
+            BindRefusal::Reason(
+                crate::daemon_client::daemon_required_error("MCP startup", &layout).to_string(),
+            )
         })?;
     std::env::set_var("KIN_DAEMON_URL", &url);
     Ok(url)
+}
+
+/// Whether a bind may START a repo daemon or may only attach to one that is
+/// already serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DaemonBindMode {
+    /// Bind a daemon already serving this repository. Start none.
+    AttachOnly,
+    /// Start a daemon when none is serving.
+    SpawnIfNeeded,
+}
+
+impl DaemonBindMode {
+    /// The mode a bind runs in, from whether a `tools/call` has admitted a
+    /// spawn. Pure, so the rule is readable without a server.
+    pub(crate) fn for_admission(spawn_admitted: bool) -> Self {
+        if spawn_admitted {
+            Self::SpawnIfNeeded
+        } else {
+            Self::AttachOnly
+        }
+    }
+}
+
+/// Why a bind produced no daemon URL.
+///
+/// The two are kept apart because they mean opposite things to a caller. A
+/// reason is final for this bind's inputs and is what the operator is told. A
+/// spawn that was not admitted is a state, not a failure: the repository is
+/// there, nothing is serving it, and the same bind will succeed the moment
+/// somebody asks Kin a question.
+#[derive(Debug)]
+pub(crate) enum BindRefusal {
+    /// No daemon, and none can be had here. Carries the sentence to report.
+    Reason(String),
+    /// A Kin repository is here with no daemon serving it, and no caller has
+    /// asked for a graph answer yet.
+    SpawnNotAdmitted,
+}
+
+impl BindRefusal {
+    /// The sentence a caller reports for this refusal.
+    pub(crate) fn reason(self) -> String {
+        match self {
+            Self::Reason(reason) => reason,
+            Self::SpawnNotAdmitted => {
+                "no daemon is serving this repository yet and no tool call has asked for one"
+                    .to_string()
+            }
+        }
+    }
+}
+
+/// Bind the daemon for `dir`, attaching to a running one now and starting one
+/// only once a `tools/call` has asked for a graph answer.
+///
+/// For the launcher's background binding task, which is the one place that has
+/// somewhere to wait: the stdio loop keeps serving `initialize` and
+/// `tools/list` the whole time this is parked. The workspace-roots binder runs
+/// inside that loop and so cannot wait here; it asks the admission instead and
+/// leaves its roots for the first tool call to retry.
+async fn bind_daemon_when_asked(
+    dir: &Path,
+    startup: &kin_mcp::StartupDaemonBinding,
+) -> std::result::Result<String, String> {
+    match bind_daemon_for_repo_dir(dir, DaemonBindMode::AttachOnly).await {
+        Ok(url) => return Ok(url),
+        // Not a repository, or a repository whose daemon this process cannot
+        // reach for a reason of its own. Neither improves by waiting.
+        Err(BindRefusal::Reason(reason)) => return Err(reason),
+        Err(BindRefusal::SpawnNotAdmitted) => {}
+    }
+    if crate::daemon_client::daemon_spawns_are_disabled() {
+        // The probe contract. No tool call will ever start a daemon here, so
+        // waiting for one to ask would leave this binding pending forever and
+        // every call answered "the daemon is still starting" about a daemon
+        // nothing will start. Settle now and let each call fail loud instead.
+        return Err(
+            "KIN_NO_DAEMON is set (or --no-spawn was passed) and no daemon is already \
+             serving this repository, so this server binds none"
+                .to_string(),
+        );
+    }
+    startup.await_daemon_spawn_admission().await;
+    bind_daemon_for_repo_dir(dir, DaemonBindMode::SpawnIfNeeded)
+        .await
+        .map_err(BindRefusal::reason)
 }
 
 #[cfg(test)]
@@ -742,8 +884,8 @@ mod tests {
     use super::{
         bind_daemon_for_repo_dir, bind_first_kin_repo_against, build_mcp_start_config,
         registry_should_resolve, registry_startup_choice, resolve_repo_override,
-        resolve_tool_profile, session_authority_notice, McpToolProfile, RegistryStartupChoice,
-        ToolProfileSource,
+        resolve_tool_profile, session_authority_notice, BindRefusal, DaemonBindMode,
+        McpToolProfile, RegistryStartupChoice, ToolProfileSource,
     };
     use kin_core::registry::{KinRegistry, RegisteredRepo};
     use kin_core::test_env::EnvVarGuard;
@@ -1010,9 +1152,10 @@ mod tests {
         // propagated out of `start`.
         let _daemon_guard = EnvVarGuard::unset("KIN_DAEMON_URL");
         let tmp = tempfile::tempdir().unwrap();
-        let reason = bind_daemon_for_repo_dir(tmp.path())
+        let reason = bind_daemon_for_repo_dir(tmp.path(), DaemonBindMode::SpawnIfNeeded)
             .await
-            .expect_err("a directory with no .kin/ must not resolve a daemon");
+            .expect_err("a directory with no .kin/ must not resolve a daemon")
+            .reason();
         assert!(
             reason.contains("not a Kin repository"),
             "unexpected reason: {reason}"
@@ -1052,6 +1195,7 @@ mod tests {
                 vec![repo.path().to_path_buf()],
                 Some(repo_dir.clone()),
                 false,
+                DaemonBindMode::SpawnIfNeeded,
             )
             .await,
             "the bound repository still being open must stay bound",
@@ -1083,6 +1227,7 @@ mod tests {
             vec![switched_to.path().to_path_buf()],
             Some(std::fs::canonicalize(previous.path()).unwrap()),
             false,
+            DaemonBindMode::SpawnIfNeeded,
         )
         .await;
 
@@ -1114,6 +1259,7 @@ mod tests {
                 vec![other.path().to_path_buf(), bound.path().to_path_buf()],
                 Some(bound_dir.clone()),
                 false,
+                DaemonBindMode::SpawnIfNeeded,
             )
             .await,
             "the bound repository being open anywhere must keep the binding",
@@ -1139,6 +1285,7 @@ mod tests {
             vec![other.path().to_path_buf()],
             Some(std::fs::canonicalize(pinned.path()).unwrap()),
             true,
+            DaemonBindMode::SpawnIfNeeded,
         )
         .await;
 
@@ -1166,6 +1313,7 @@ mod tests {
                 vec![pinned.path().to_path_buf()],
                 Some(pinned_dir.clone()),
                 true,
+                DaemonBindMode::SpawnIfNeeded,
             )
             .await,
             "roots naming the pinned repository must stay bound",
@@ -1183,7 +1331,13 @@ mod tests {
         let _no_daemon_guard = EnvVarGuard::set("KIN_NO_DAEMON", "1");
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(
-            bind_first_kin_repo_against(vec![plain.path().to_path_buf()], None, false).await,
+            bind_first_kin_repo_against(
+                vec![plain.path().to_path_buf()],
+                None,
+                false,
+                DaemonBindMode::SpawnIfNeeded,
+            )
+            .await,
             kin_mcp::WorkspaceBinding::Unresolvable,
         );
     }
@@ -1212,7 +1366,13 @@ mod tests {
         );
 
         assert_eq!(
-            bind_first_kin_repo_against(vec![host_only], Some(served_dir.clone()), false).await,
+            bind_first_kin_repo_against(
+                vec![host_only],
+                Some(served_dir.clone()),
+                false,
+                DaemonBindMode::SpawnIfNeeded,
+            )
+            .await,
             kin_mcp::WorkspaceBinding::Unresolvable,
             "a root that resolves to no Kin repository here must not be reported as a switch"
         );
@@ -1222,9 +1382,13 @@ mod tests {
         // verdict tracks what the filesystem says rather than always answering
         // `Unresolvable`.
         let other = kin_repo_fixture();
-        let moved =
-            bind_first_kin_repo_against(vec![other.path().to_path_buf()], Some(served_dir), false)
-                .await;
+        let moved = bind_first_kin_repo_against(
+            vec![other.path().to_path_buf()],
+            Some(served_dir),
+            false,
+            DaemonBindMode::SpawnIfNeeded,
+        )
+        .await;
         assert!(
             matches!(moved, kin_mcp::WorkspaceBinding::OtherRepository(_)),
             "a visible second repository must be reported as another repository: {moved:?}"
@@ -1240,9 +1404,51 @@ mod tests {
         // survive the lazy-binding rework unchanged.
         let _guard = EnvVarGuard::set("KIN_DAEMON_URL", "http://127.0.0.1:4242");
         let tmp = tempfile::tempdir().unwrap();
-        let url = bind_daemon_for_repo_dir(tmp.path())
+        let url = bind_daemon_for_repo_dir(tmp.path(), DaemonBindMode::SpawnIfNeeded)
             .await
             .expect("an explicit KIN_DAEMON_URL must be trusted without repo discovery");
         assert_eq!(url, "http://127.0.0.1:4242");
+    }
+
+    /// FIR-3099, at the seam that decides it. Whether a bind may start a daemon
+    /// is a function of one thing: whether a caller has asked for a graph
+    /// answer. Both directions, because a mode that is always `SpawnIfNeeded`
+    /// would pass a test that only checked the admitted case.
+    #[test]
+    fn only_an_admitted_spawn_lets_a_bind_start_a_daemon() {
+        assert_eq!(
+            DaemonBindMode::for_admission(false),
+            DaemonBindMode::AttachOnly,
+            "before a tool call a bind must attach to a running daemon and start none"
+        );
+        assert_eq!(
+            DaemonBindMode::for_admission(true),
+            DaemonBindMode::SpawnIfNeeded,
+            "once a caller has asked for a graph answer the bind must be able to start one"
+        );
+    }
+
+    /// A repository with no daemon yet is a state, not a failure, and the two
+    /// must not collapse into one message. The operator-facing sentence belongs
+    /// to a bind that genuinely cannot produce a daemon.
+    #[tokio::test]
+    #[serial]
+    async fn an_unadmitted_spawn_refuses_without_claiming_the_repository_is_broken() {
+        let _daemon_guard = EnvVarGuard::unset("KIN_DAEMON_URL");
+        let repo = kin_repo_fixture();
+        let refusal = bind_daemon_for_repo_dir(repo.path(), DaemonBindMode::AttachOnly)
+            .await
+            .expect_err("no daemon is running for a fresh fixture, and none may be started");
+        assert!(
+            matches!(refusal, BindRefusal::SpawnNotAdmitted),
+            "an attach-only bind over a real repository with no daemon must report the \
+             unadmitted spawn, not a reason: {refusal:?}"
+        );
+        assert!(
+            std::env::var("KIN_DAEMON_URL")
+                .map(|url| url.trim().is_empty())
+                .unwrap_or(true),
+            "an attach-only bind that found no daemon must not pin a daemon URL"
+        );
     }
 }

@@ -17,6 +17,18 @@
 //! daemon is still starting instead of hanging or failing as if no daemon
 //! could ever exist.
 //!
+//! The handle carries a second gate for the same reason it carries the first.
+//! Moving the bind behind the loop made the handshake fast; it did not make it
+//! free. A bind that resolves cold STARTS a daemon, and a daemon that starts
+//! opens the store and schedules the background embedding pass, so a session
+//! that asked Kin nothing was paying minutes of CPU or GPU and gigabytes of
+//! resident memory for a repository nobody had queried (FIR-3099: 1.80 GiB and
+//! 99 percent of a core sixty seconds after a handshake, on a 657.8 KiB store).
+//! So spawning is admitted rather than assumed: the launcher may attach to a
+//! daemon that is already serving, which costs nothing, and waits here for the
+//! server to admit a spawn. The server admits it on the first `tools/call`,
+//! which is the first moment a caller has actually asked for a graph answer.
+//!
 //! This crate is an answer surface under the zero-file-search rule and carries
 //! no filesystem primitive. The startup-phase detail in the still-starting
 //! report comes from a probe the launcher injects; the daemon-lifecycle IO
@@ -67,6 +79,10 @@ pub struct StartupDaemonBinding {
     /// The workspace-roots binder must not repoint such a binding, and with the
     /// bind running behind the loop this is only known once it settles.
     pinned_by_operator: AtomicBool,
+    /// Whether a caller has asked for a graph answer yet, which is what admits
+    /// starting a daemon for this repository. A watch channel rather than a
+    /// flag because the launcher's binding task waits on it.
+    spawn_admitted: tokio::sync::watch::Sender<bool>,
     began: Instant,
 }
 
@@ -75,6 +91,7 @@ impl std::fmt::Debug for StartupDaemonBinding {
         f.debug_struct("StartupDaemonBinding")
             .field("state", &*self.state.borrow())
             .field("pinned_by_operator", &self.pinned_by_operator())
+            .field("daemon_spawn_admitted", &self.daemon_spawn_admitted())
             .finish_non_exhaustive()
     }
 }
@@ -86,6 +103,7 @@ impl StartupDaemonBinding {
             state,
             phase_probe: Mutex::new(None),
             pinned_by_operator: AtomicBool::new(false),
+            spawn_admitted: tokio::sync::watch::channel(false).0,
             began: Instant::now(),
         })
     }
@@ -98,6 +116,21 @@ impl StartupDaemonBinding {
         if let Ok(mut guard) = self.phase_probe.lock() {
             *guard = Some(probe);
         }
+    }
+
+    /// Record that `--repo`/`KIN_MCP_REPO` names a repository this process can
+    /// see, before its daemon has been resolved.
+    ///
+    /// The pin used to be published only by `resolve_bound`, which meant it was
+    /// unknown until the daemon bound. That was already a race with the
+    /// client's `roots/list` answer, and deferring the daemon start until the
+    /// first `tools/call` would have widened it into the normal case: on a cold
+    /// repository the roots answer ALWAYS arrives first, and a binder reading
+    /// `false` here is free to follow the client off the repository the
+    /// operator pinned. A pin that names no repository still does not count,
+    /// which is the distinction this keeps.
+    pub fn note_operator_pin(&self) {
+        self.pinned_by_operator.store(true, Ordering::Release);
     }
 
     /// Settle the binding with a bound daemon. `pinned_by_operator` marks a
@@ -119,6 +152,48 @@ impl StartupDaemonBinding {
         self.state.send_replace(StartupBindingState::Unbound {
             reason: reason.into(),
         });
+    }
+
+    /// Record that a caller has asked for a graph answer, which admits starting
+    /// a daemon for this repository.
+    ///
+    /// Called by the stdio loop on `tools/call` and by nothing else: the
+    /// handshake, the tool list and the client's workspace roots are all things
+    /// a client sends before it has asked Kin anything, and none of them is a
+    /// reason to open a store and start an embedding pass. Idempotent, and
+    /// `send_replace` rather than `send` for the same reason the state channel
+    /// uses it: there is usually no subscriber, because the launcher's binding
+    /// task subscribes only while it is actually waiting.
+    pub fn admit_daemon_spawn(&self) {
+        self.spawn_admitted.send_replace(true);
+    }
+
+    /// Whether a `tools/call` has admitted starting a daemon.
+    ///
+    /// Read by every bind path that could start one, including the
+    /// workspace-roots binder, which runs inline in the stdio loop and so must
+    /// ask rather than wait.
+    pub fn daemon_spawn_admitted(&self) -> bool {
+        *self.spawn_admitted.borrow()
+    }
+
+    /// Resolve once a `tools/call` has admitted starting a daemon.
+    ///
+    /// For the launcher's background binding task, which has somewhere to wait.
+    /// Returns immediately when admission already happened.
+    pub async fn await_daemon_spawn_admission(&self) {
+        let mut receiver = self.spawn_admitted.subscribe();
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                // The sender lives in this same struct, so this arm is
+                // unreachable while `self` is alive. Returning rather than
+                // spinning keeps a future refactor from wedging the binder.
+                return;
+            }
+        }
     }
 
     pub fn pinned_by_operator(&self) -> bool {
@@ -239,6 +314,87 @@ mod tests {
         assert!(
             began.elapsed() < Duration::from_secs(5),
             "a settled binding must answer immediately, not sit out the grace"
+        );
+    }
+
+    /// The whole of FIR-3099 in one assertion: nothing about creating a
+    /// binding, settling it, or pinning it admits starting a daemon. Only a
+    /// `tools/call` does, and the stdio loop is the only caller of
+    /// `admit_daemon_spawn`.
+    /// A pin is known as soon as the launch directory resolves, not when its
+    /// daemon does, because the workspace-roots binder asks before then.
+    #[test]
+    fn an_operator_pin_is_published_before_its_daemon_binds() {
+        let binding = StartupDaemonBinding::new();
+        assert!(!binding.pinned_by_operator());
+        binding.note_operator_pin();
+        assert!(
+            binding.pinned_by_operator(),
+            "a pin must be readable while the binding is still pending, or a roots answer that \
+             arrives first repoints the repository the operator named"
+        );
+        assert!(matches!(binding.snapshot(), StartupBindingState::Pending));
+        // Settling later must not unset it.
+        binding.resolve_bound(
+            BoundRepo {
+                root: PathBuf::from("/repo"),
+                daemon_url: "http://127.0.0.1:4242".to_string(),
+            },
+            true,
+        );
+        assert!(binding.pinned_by_operator());
+    }
+
+    #[test]
+    fn a_fresh_binding_does_not_admit_starting_a_daemon() {
+        let binding = StartupDaemonBinding::new();
+        assert!(
+            !binding.daemon_spawn_admitted(),
+            "a server that has been asked nothing must not admit starting a daemon"
+        );
+        binding.resolve_bound(
+            BoundRepo {
+                root: PathBuf::from("/repo"),
+                daemon_url: "http://127.0.0.1:4242".to_string(),
+            },
+            true,
+        );
+        assert!(
+            !binding.daemon_spawn_admitted(),
+            "attaching to a daemon that was already serving is not a caller asking for one"
+        );
+        binding.admit_daemon_spawn();
+        assert!(binding.daemon_spawn_admitted());
+        binding.admit_daemon_spawn();
+        assert!(
+            binding.daemon_spawn_admitted(),
+            "admission is idempotent: a second tool call must not unset it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_binder_waits_for_admission_and_wakes_on_it() {
+        let binding = StartupDaemonBinding::new();
+        let waiter = std::sync::Arc::clone(&binding);
+        let wait = tokio::spawn(async move { waiter.await_daemon_spawn_admission().await });
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(
+            !wait.is_finished(),
+            "with no tool call the binding task must still be waiting an hour later,              not have started a daemon"
+        );
+        binding.admit_daemon_spawn();
+        wait.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admission_that_already_happened_is_not_waited_for() {
+        let binding = StartupDaemonBinding::new();
+        binding.admit_daemon_spawn();
+        let began = Instant::now();
+        binding.await_daemon_spawn_admission().await;
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "an already-admitted spawn must not make the binder wait for a second call"
         );
     }
 

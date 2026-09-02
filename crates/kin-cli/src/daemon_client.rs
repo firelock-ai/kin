@@ -7823,6 +7823,18 @@ pub fn resolve_daemon_url_if_running(layout: &KinLayout) -> Option<String> {
     None
 }
 
+/// Whether this process is forbidden to start daemons at all.
+///
+/// `KIN_NO_DAEMON` is the variable behind `kin mcp start --no-spawn`, and the
+/// MCP launcher needs the answer to tell two states apart that otherwise look
+/// identical from a bind that found no daemon: "nobody has asked for one yet",
+/// which is worth waiting on, and "this process will never start one", which
+/// settles now so every tool call fails loud with the remedy instead of being
+/// told a daemon is on its way.
+pub(crate) fn daemon_spawns_are_disabled() -> bool {
+    is_transient_bool_env("KIN_NO_DAEMON")
+}
+
 pub async fn resolve_daemon_url_if_running_async(layout: &KinLayout) -> Option<String> {
     if let Ok(url) = std::env::var("KIN_DAEMON_URL") {
         if url.trim().is_empty() {
