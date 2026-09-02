@@ -589,9 +589,467 @@ pub fn verdict_for_with_allowance(
     }
 }
 
+// ------------------------------------------------- the plan's own projection
+
+/// Bytes a conversion holds for each artifact in the head tree it admits.
+///
+/// The term [`HistorySurvey`] does not have. Its per-artifact coefficient is
+/// multiplied by the commit count, so a one-commit snapshot forecasts one
+/// tree's worth of tree ENTRIES and nothing at all for what deriving semantics
+/// from those artifacts costs. That derivation is where the memory goes: on a
+/// measured 18,508-file snapshot the conversion reached 13.68 GiB inside phase
+/// 5, before a single byte of it had been staged, and the phase-1 forecast for
+/// the same repository was 74 MB.
+///
+/// Same discipline as the coefficients above: the SMALLEST demand per head
+/// artifact measured across snapshot conversions, so the projection understates
+/// every one of them rather than fitting any. Measured on three one-commit
+/// snapshots, peak resident bytes per head artifact: react 254,734 over 7,210
+/// files, redis 947,678 over 1,857, vscode 968,025 over 18,508. React is the
+/// floor and this rounds under it.
+const BYTES_PER_HEAD_ARTIFACT: u64 = 250_000;
+
+/// Bytes a conversion holds for each byte of source it admits.
+///
+/// Paired with [`BYTES_PER_HEAD_ARTIFACT`] and taken as the larger of the two,
+/// because neither alone survives both shapes: a tree of many tiny files is
+/// driven by its file count, and a tree of few large files by its bytes. A
+/// repository that is extreme in either direction is one the other term
+/// forecasts at nothing, and the measured subjects sit on opposite sides of
+/// that line: react's projection comes from its file count and vscode's from
+/// its bytes.
+///
+/// Same floor discipline. Peak resident bytes per byte of captured object:
+/// redis 82.76, react 45.37, vscode 33.69. Vscode is the floor and this rounds
+/// under it.
+const BYTES_PER_SOURCE_BYTE: u64 = 33;
+
+/// What the import plan knows about the conversion it has just planned.
+///
+/// Distinct from [`HistorySurvey`], which is counted from the source before
+/// anything is read and can therefore only see history depth. By phase 4 the
+/// plan holds the head tree it is going to admit and a size for every object it
+/// captured, so the width of the conversion is finally a number rather than a
+/// guess. Both are needed: the survey refuses a deep history before capture
+/// spends minutes on it, and this one describes the shape the survey is blind
+/// to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImportSurvey {
+    /// Changes the plan carries, one per admitted commit.
+    pub commits: u64,
+    /// Artifacts in the head tree the workspace seed admits.
+    pub head_artifacts: u64,
+    /// Bytes of captured Git objects the plan records.
+    pub object_bytes: u64,
+}
+
+impl ImportSurvey {
+    /// Bytes this conversion is projected to hold at its peak.
+    ///
+    /// The largest of three floors rather than their sum, for the reason
+    /// [`HistorySurvey::forecast_peak_bytes`] gives: each coefficient is
+    /// already the smallest any measured conversion justified, and adding
+    /// independently minimised terms is how a floor stops being one.
+    ///
+    /// The first two terms are the history-depth forecast this repeats so a
+    /// deep history is never projected LOWER at phase 4 than it was at phase 1.
+    /// The third is the snapshot term, and it is the one that fires on a
+    /// shallow clone of a wide tree.
+    pub fn projected_peak_bytes(&self) -> u64 {
+        let by_commit = self.commits.saturating_mul(BYTES_PER_COMMIT);
+        let by_tree = self
+            .commits
+            .saturating_mul(self.head_artifacts)
+            .saturating_mul(BYTES_PER_COMMIT_ARTIFACT);
+        let by_head = self
+            .head_artifacts
+            .saturating_mul(BYTES_PER_HEAD_ARTIFACT)
+            .max(self.object_bytes.saturating_mul(BYTES_PER_SOURCE_BYTE));
+        by_commit.max(by_tree).max(by_head)
+    }
+}
+
+/// What the ladder decided about this conversion's peak once it had a plan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImportProjection {
+    /// The machine could not be measured, so nothing is claimed.
+    Unmeasured { reason: String },
+    /// The projection fits in what the machine still has.
+    Fits {
+        survey: ImportSurvey,
+        projected_bytes: u64,
+        available_bytes: u64,
+    },
+    /// The projection is larger than what the machine still has.
+    Short {
+        survey: ImportSurvey,
+        projected_bytes: u64,
+        available_bytes: u64,
+    },
+}
+
+impl ImportProjection {
+    /// The line an operator sees, or `None` when there is nothing to say.
+    ///
+    /// Silent unless the projection is short, because a memory line on a
+    /// conversion with room to spare is the noise that trains an operator to
+    /// skip the line that matters.
+    ///
+    /// It warns and does not refuse. Phase 1 already owns the refusal, decided
+    /// against a ceiling with a documented calibration and an environment
+    /// variable to override it. This runs four phases later on a conversion
+    /// that has already been admitted and captured, and its own coefficients
+    /// are calibrated on far fewer subjects, so turning it into a second
+    /// refusal would spend a user's completed capture on the least-tested
+    /// number in the module.
+    pub fn advisory_line(&self) -> Option<String> {
+        let Self::Short {
+            survey,
+            projected_bytes,
+            available_bytes,
+        } = self
+        else {
+            return None;
+        };
+        // Names the head tree rather than the history, because that is what
+        // drove the number, and because the remedy differs. A deep history is
+        // helped by a shallow clone. This is not: the measured subject WAS a
+        // shallow clone, one commit deep, and it still needed sixteen
+        // gigabytes. Telling that operator to clone shallower would send them
+        // round a loop they are already standing in.
+        Some(format!(
+            "  this conversion is projected to hold about {}, and this {} has about {} left, \
+             because {} files over {} of source is a wide tree. A shallower clone will not help: \
+             the tree is the size, not the history. It will probably not finish; to be sure, give \
+             it more than {} or convert a smaller subtree",
+            human_bytes(*projected_bytes),
+            ceiling_noun(),
+            human_bytes(*available_bytes),
+            survey.head_artifacts,
+            human_bytes(survey.object_bytes),
+            human_bytes(*projected_bytes),
+        ))
+    }
+}
+
+/// Project this conversion's peak against what it still has to spend.
+///
+/// Reads the machine and the environment, so the pure decision lives in
+/// [`projection_for`] and this is the only part a test cannot run without one.
+pub fn project_import(survey: ImportSurvey) -> ImportProjection {
+    match headroom_bytes() {
+        Ok(available_bytes) => projection_for(survey, available_bytes),
+        Err(reason) => ImportProjection::Unmeasured { reason },
+    }
+}
+
+/// Bytes this conversion still has, judged against the ceiling phase 1 used.
+///
+/// Not simply [`memory_pressure::MemoryReading::available_bytes`], because
+/// [`INIT_MEMORY_CEILING_ENV`] exists and phase 1 already honours it. An
+/// operator sets that variable for one of two reasons, a container whose real
+/// cap Kin reads wrongly or a forecast they have judged wrong for their own
+/// repository, and either way they stated the true ceiling once and phase 1
+/// took them at their word. Reading the machine again four phases later would
+/// warn that same operator with the number they overrode, and this projection
+/// has no second variable to turn it off.
+///
+/// The machine is still asked what is charged against that ceiling, because by
+/// phase 4 the conversion has already spent some of it. With no override set
+/// that arithmetic is `limit_bytes - used_bytes`, which is exactly what
+/// [`memory_pressure::MemoryReading::available_bytes`] returns, so an
+/// unoverridden conversion is judged against the number it was judged against
+/// before.
+fn headroom_bytes() -> Result<u64, String> {
+    let charged_bytes = memory_pressure::read()
+        .reading()
+        .map_or(0, |reading| reading.used_bytes);
+    headroom_for(ceiling(), charged_bytes)
+}
+
+/// The same arithmetic over values, so the override's effect is testable
+/// without a process-wide environment variable.
+fn headroom_for(ceiling: Ceiling, charged_bytes: u64) -> Result<u64, String> {
+    match ceiling {
+        // Saturating, so a machine already charged past its own ceiling
+        // projects against nothing left rather than wrapping to everything.
+        Ceiling::Bytes(bytes) => Ok(bytes.saturating_sub(charged_bytes)),
+        // Unreachable inside a conversion: phase 1 refuses an override it
+        // cannot parse and never reaches this phase. Answered rather than
+        // asserted, so a future caller that arrives here earlier is left
+        // silent instead of panicking.
+        Ceiling::Invalid(raw) => Err(format!(
+            "{INIT_MEMORY_CEILING_ENV} is set to {raw:?}, which is not a byte count, so this \
+             conversion's peak was not projected"
+        )),
+        Ceiling::Unreadable(reason) => Err(reason),
+    }
+}
+
+/// The same decision over numbers, so the threshold is testable without a
+/// machine of any particular size.
+pub fn projection_for(survey: ImportSurvey, available_bytes: u64) -> ImportProjection {
+    let projected_bytes = survey.projected_peak_bytes();
+    if projected_bytes > available_bytes {
+        ImportProjection::Short {
+            survey,
+            projected_bytes,
+            available_bytes,
+        }
+    } else {
+        ImportProjection::Fits {
+            survey,
+            projected_bytes,
+            available_bytes,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Peak resident bytes measured converting a fresh one-commit snapshot of
+    /// each, on kin 0.6.3, `--no-enrich`, with a scratch `KIN_HOME`.
+    ///
+    /// Name, head artifacts, captured object bytes, measured peak. These are
+    /// the subjects both snapshot coefficients were read off, so a change to
+    /// either that stops flooring them is a change that broke its own
+    /// calibration.
+    const MEASURED_SNAPSHOTS: [(&str, u64, u64, u64); 3] = [
+        ("redis", 1_857, 21_264_703, 1_759_838_208),
+        ("react", 7_210, 40_479_046, 1_836_630_016),
+        ("vscode", 18_508, 531_828_795, 17_916_215_296),
+    ];
+
+    fn snapshot(head_artifacts: u64, object_bytes: u64) -> ImportSurvey {
+        ImportSurvey {
+            commits: 1,
+            head_artifacts,
+            object_bytes,
+        }
+    }
+
+    /// The case this projection exists for.
+    ///
+    /// A one-commit snapshot of vscode, which is what `git clone --depth 1`
+    /// leaves behind, measured at 16.69 GiB. On a 16 GB machine that must be
+    /// spoken about before phase 5 spends the memory rather than after the
+    /// kernel spends it for us.
+    #[test]
+    fn a_one_commit_snapshot_of_a_wide_tree_is_projected_over_a_small_machine() {
+        let survey = snapshot(18_508, 531_828_795);
+        let projection = projection_for(survey, 16 * 1000 * 1000 * 1000);
+        assert!(
+            matches!(projection, ImportProjection::Short { .. }),
+            "expected a short projection, got {projection:?}"
+        );
+        assert!(projection.advisory_line().is_some());
+    }
+
+    /// The blindness this was written to cover, pinned so it cannot be argued
+    /// away later.
+    ///
+    /// [`HistorySurvey`] multiplies its per-artifact term by the commit count.
+    /// At one commit that term collapses, and the same repository the
+    /// projection puts at over sixteen gigabytes the phase-1 forecast puts at
+    /// well under one. Both numbers are in this assertion on purpose: a future
+    /// change that fixes the phase-1 forecast makes this test fail loudly
+    /// rather than leaving two forecasts silently disagreeing.
+    #[test]
+    fn the_phase_one_forecast_is_blind_to_the_shape_this_projection_catches() {
+        let head_artifacts = 18_508;
+        let object_bytes = 531_828_795;
+        let forecast = HistorySurvey {
+            commits: 1,
+            tracked_artifacts: head_artifacts,
+        }
+        .forecast_peak_bytes();
+        let projected = snapshot(head_artifacts, object_bytes).projected_peak_bytes();
+        assert!(
+            forecast < 1024 * 1024 * 1024,
+            "the phase-1 forecast for a one-commit snapshot was {forecast}, which is no longer \
+             the blindness this projection covers"
+        );
+        assert!(
+            projected > 16 * 1000 * 1000 * 1000,
+            "the projection has to see what the forecast cannot, got {projected}"
+        );
+    }
+
+    /// Silent when there is room, for the reason the module's own
+    /// `TIGHT_FRACTION` gives: a memory line on a conversion that fits is the
+    /// noise that trains an operator to skip the one that matters.
+    #[test]
+    fn a_projection_that_fits_says_nothing() {
+        let projection = projection_for(snapshot(1_857, 21_264_703), 64 * 1024 * 1024 * 1024);
+        assert!(matches!(projection, ImportProjection::Fits { .. }));
+        assert_eq!(projection.advisory_line(), None);
+    }
+
+    /// The remedy has to be one the reader is not already standing in.
+    ///
+    /// The phase-1 refusal offers `git clone --depth`, which is right for a
+    /// deep history and useless here: the measured subject WAS one commit deep
+    /// and still needed sixteen gigabytes. A line that sent that operator to
+    /// clone shallower would send them round a loop.
+    #[test]
+    fn the_advisory_names_the_tree_and_does_not_offer_a_shallower_clone() {
+        let line = projection_for(snapshot(18_508, 531_828_795), 16 * 1000 * 1000 * 1000)
+            .advisory_line()
+            .expect("a short projection states itself");
+        assert!(line.contains("18508 files"), "line was: {line}");
+        assert!(line.contains("wide tree"), "line was: {line}");
+        assert!(
+            line.contains("shallower clone will not help"),
+            "the one remedy that cannot work here has to be ruled out by name: {line}"
+        );
+        assert!(
+            line.contains("smaller subtree"),
+            "a warning with no remedy is most of the way back to silence: {line}"
+        );
+    }
+
+    /// Every subject the coefficients were read off is still floored by them.
+    ///
+    /// This is the calibration's own guard. Raising either coefficient past a
+    /// measured subject turns the projection from a floor into a guess, and a
+    /// guess that overstates is how a warning starts firing on conversions
+    /// that would have finished.
+    #[test]
+    fn the_projection_floors_every_measured_subject() {
+        for (name, head_artifacts, object_bytes, measured_peak) in MEASURED_SNAPSHOTS {
+            let projected = snapshot(head_artifacts, object_bytes).projected_peak_bytes();
+            assert!(
+                projected <= measured_peak,
+                "{name} projected {projected} over a measured peak of {measured_peak}, so the \
+                 projection is no longer a floor"
+            );
+        }
+    }
+
+    /// A deep history is never projected lower here than it was forecast at
+    /// phase 1.
+    ///
+    /// The two run four phases apart on the same conversion, and a second
+    /// number that undercut the first would read as the danger having passed.
+    /// It has not: the projection adds a term, it does not replace one.
+    #[test]
+    fn a_deep_history_is_never_projected_below_its_phase_one_forecast() {
+        for (commits, tracked) in [(18_514u64, 1_676u64), (6_493, 900), (200, 40), (1, 18_508)] {
+            let forecast = HistorySurvey {
+                commits,
+                tracked_artifacts: tracked,
+            }
+            .forecast_peak_bytes();
+            let projected = ImportSurvey {
+                commits,
+                head_artifacts: tracked,
+                object_bytes: 0,
+            }
+            .projected_peak_bytes();
+            assert!(
+                projected >= forecast,
+                "{commits} commits over {tracked} files projected {projected} against a phase-1 \
+                 forecast of {forecast}"
+            );
+        }
+    }
+
+    /// A repository large enough to overflow the product saturates high rather
+    /// than wrapping to a projection of nothing, which is the direction a
+    /// forecast is allowed to be wrong in.
+    ///
+    /// Each case overflows exactly one of the two terms this projection adds,
+    /// while the terms it inherited stay small. A survey that is `u64::MAX` in
+    /// every field would saturate on the inherited per-commit term alone and
+    /// pass with both new multiplications wrapping, which is a test that cannot
+    /// fail for the code it was written for.
+    #[test]
+    fn a_projection_large_enough_to_overflow_saturates_high() {
+        // Over u64::MAX at 250,000 bytes per artifact, still under it at the
+        // 4,000 the inherited per-commit-artifact term charges.
+        let by_artifact_count = ImportSurvey {
+            commits: 1,
+            head_artifacts: 100_000_000_000_000,
+            object_bytes: 0,
+        };
+        assert_eq!(by_artifact_count.projected_peak_bytes(), u64::MAX);
+        // Over u64::MAX at 33 bytes per source byte, with no artifacts at all,
+        // so nothing but the source-byte term can produce the saturation.
+        let by_source_bytes = ImportSurvey {
+            commits: 1,
+            head_artifacts: 0,
+            object_bytes: 1_000_000_000_000_000_000,
+        };
+        assert_eq!(by_source_bytes.projected_peak_bytes(), u64::MAX);
+        assert!(matches!(
+            projection_for(by_source_bytes, u64::MAX - 1),
+            ImportProjection::Short { .. }
+        ));
+    }
+
+    /// An operator who told this module its real ceiling is not warned four
+    /// phases later with the number they overrode.
+    ///
+    /// [`INIT_MEMORY_CEILING_ENV`] is this module's only lever and phase 1
+    /// honours it. This projection has no lever of its own, so a projection
+    /// that read the machine anyway would fire on precisely the operator who
+    /// has already answered it, with no way to stop it.
+    #[test]
+    fn a_raised_ceiling_is_what_this_projection_is_judged_against() {
+        let survey = snapshot(18_508, 531_828_795);
+        let machine = headroom_for(Ceiling::Bytes(16 * 1000 * 1000 * 1000), 0)
+            .expect("a readable ceiling has a headroom");
+        assert!(
+            projection_for(survey, machine).advisory_line().is_some(),
+            "this subject has to be short against the machine before an override can matter"
+        );
+        let raised = headroom_for(
+            Ceiling::Bytes(64 * 1024 * 1024 * 1024),
+            8 * 1024 * 1024 * 1024,
+        )
+        .expect("an operator's ceiling has a headroom");
+        assert_eq!(raised, 56 * 1024 * 1024 * 1024);
+        assert_eq!(
+            projection_for(survey, raised).advisory_line(),
+            None,
+            "an operator who raised the ceiling past this projection is still being warned by it"
+        );
+    }
+
+    /// The headroom is the ceiling less what is already charged against it.
+    ///
+    /// By phase 4 the conversion has spent four phases of memory, so judging a
+    /// projection against the whole ceiling would compare a peak against room
+    /// that is already gone.
+    #[test]
+    fn the_headroom_is_the_ceiling_less_what_is_already_charged() {
+        assert_eq!(
+            headroom_for(Ceiling::Bytes(16_000_000_000), 15_000_000_000),
+            Ok(1_000_000_000)
+        );
+        // A machine charged past its own ceiling has nothing left rather than
+        // everything, which is what a wrapping subtraction would report.
+        assert_eq!(headroom_for(Ceiling::Bytes(8), 9), Ok(0));
+    }
+
+    /// A ceiling this module cannot read projects nothing and says nothing.
+    ///
+    /// The same discipline as the phase-1 verdict: a check that could not run
+    /// leaves the conversion exactly as it was rather than guessing at it.
+    #[test]
+    fn an_unreadable_ceiling_projects_nothing() {
+        assert!(headroom_for(Ceiling::Unreadable("no ceiling here".to_string()), 0).is_err());
+        assert!(headroom_for(Ceiling::Invalid("twelve".to_string()), 0).is_err());
+        assert_eq!(
+            ImportProjection::Unmeasured {
+                reason: "no ceiling here".to_string(),
+            }
+            .advisory_line(),
+            None
+        );
+    }
 
     fn survey(commits: u64, tracked_artifacts: u64) -> HistorySurvey {
         HistorySurvey {
