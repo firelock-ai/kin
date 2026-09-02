@@ -3209,13 +3209,32 @@ def check_22(suite):
     else:
         res.ok("`canonical_title` resolves after one commit")
 
-    rc, out, _ = suite.kin_run(["refs", "normalize_title"], repo)
-    old_name = strip_ansi(out)
-    if "not found" not in old_name:
+    # A resolution miss is an error, not an answer: it exits non-zero with the
+    # message on stderr and leaves stdout empty (FIR-3071). This arm used to read
+    # stdout alone for "not found", which stopped being able to tell "the name is
+    # gone" from "the name resolved" the moment the message moved, because both
+    # are silent on stdout. It read the empty string as a live resolution and
+    # failed the gate on a product that had just got stricter.
+    #
+    # Reading all three facts is what makes it a check rather than a coincidence:
+    # the exit code says a miss happened, stderr says it was a RESOLUTION miss
+    # and not some other refusal, and the empty stdout is the property a caller
+    # piping this into a prompt depends on.
+    rc, out, err = suite.kin_run(["refs", "normalize_title"], repo)
+    old_out = strip_ansi(out)
+    old_err = strip_ansi(err)
+    if rc == 0:
         res.bad("the old name still resolves after the rename, so the graph is carrying a "
-                "declaration the file no longer has: %r" % old_name[:300])
+                "declaration the file no longer has: rc=0 %r" % old_out[:300])
+    elif "not found" not in old_err:
+        res.bad("the old name was refused, but not as a resolution miss, so this check cannot "
+                "say the rename landed: rc=%d stderr=%r" % (rc, old_err[:300]))
+    elif old_out.strip():
+        res.bad("a resolution miss must leave stdout empty, or a caller pipes the apology into "
+                "a prompt as repository material: %r" % old_out[:300])
     else:
-        res.ok("the old name is gone from the graph")
+        res.ok("the old name is gone from the graph, refused at rc=%d with the message on "
+               "stderr and nothing on stdout" % rc)
 
     # The callers. Both files that called it were edited in the same commit, so
     # a rename that landed has both edges; the rc061a run had none.

@@ -74,6 +74,12 @@ pub struct RefsResponse {
     /// the CLI and the MCP tool cannot disagree about one store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative: Option<serde_json::Value>,
+    /// Set when the query resolved to no entity. Without it a caller reading the
+    /// exit code takes the guidance for an answer, which for `kin refs` is an
+    /// empty reference list: the exact shape a "safe to delete?" sweep acts on
+    /// (FIR-3071). The same text stays in `lines` for an older client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,6 +118,10 @@ pub async fn run(entity: String, kind: String) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let _scope = announce_active_scope(&layout, "refs").await?;
     let response = run_daemon_refs(&layout, &RefsRequest { entity, kind }).await?;
+    // Refuse before printing, so a miss leaves stdout empty.
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
     for line in response.lines {
         println!("{}", crate::output_style::paint_refs_line(&line));
     }
@@ -186,7 +196,19 @@ pub fn build_refs_response(
     let target = if let Some(uuid) = addressed_by_id {
         graph.get_entity(&EntityId(uuid))?
     } else {
-        entity_ranking::select_best_entity(graph, &request.entity)?
+        // `select_best_entity` scores name quality, export status, kind and
+        // reference counts, all of which tie for a prototype and its definition,
+        // so on a C repository it answered about the header (FIR-3071). The
+        // ranked answer stands unless it is a declaration whose definition the
+        // same name also reaches, which is the one case its key cannot decide.
+        entity_ranking::select_best_entity(graph, &request.entity)?.map(|entity| {
+            let filter = kin_model::EntityFilter {
+                name_pattern: Some(entity.name.clone()),
+                ..Default::default()
+            };
+            let pool = graph.query_entities(&filter).unwrap_or_default();
+            kin_core::prefer_definition_among_same_name(entity, &pool)
+        })
     };
     // `None` means the focal was pinned by id, which is the rule the shared
     // producer switches on. Kept beside the resolution so the two cannot drift.
@@ -199,8 +221,10 @@ pub fn build_refs_response(
         // Not an absence claim about references: the focal never resolved, so
         // nothing was walked and there is no coverage question to answer. A
         // verdict here would qualify a lookup failure as if it were a finding.
+        let lines = refs_not_found_guidance(&request.entity);
         return Ok(RefsResponse {
-            lines: refs_not_found_guidance(&request.entity),
+            error: Some(lines.join("\n")),
+            lines,
             negative: None,
         });
     };
@@ -238,7 +262,11 @@ pub fn build_refs_response(
         ));
         let neighbors = declaration_neighbors::collect(graph, target, &relation_kinds)?;
         lines.extend(empty_result_context(target, &neighbors));
-        return Ok(RefsResponse { lines, negative });
+        return Ok(RefsResponse {
+            lines,
+            negative,
+            error: None,
+        });
     }
 
     // FIR-1552. A receiver-method call the linker matched on the bare leaf name
@@ -324,6 +352,7 @@ pub fn build_refs_response(
     Ok(RefsResponse {
         lines,
         negative: None,
+        error: None,
     })
 }
 
@@ -1024,6 +1053,131 @@ mod tests {
         parse_relation_kinds, refs_not_found_guidance, BulkRefsRequest, BulkRefsResponse,
         ReferenceLinesAbsent, RefsRequest, RelationResolution,
     };
+
+    /// MEASUREMENT, not an assertion. Prints which of a C prototype and its
+    /// definition `kin refs` resolves to, and why.
+    ///
+    /// `kin refs` ranks through `kin_ranking::entity_ranking::select_best_entity`,
+    /// whose key has no definition term and whose earlier terms include incoming
+    /// reference counts. Whether those counts separate a prototype from its
+    /// definition depends on which one the linker bound the callers to, which is
+    /// a fact about the graph rather than about this ranking, so it is measured
+    /// before anything here is changed. Run with --nocapture.
+    #[test]
+    fn measure_which_c_twin_refs_resolves_to_today() {
+        use kin_model::{EntityId, EntityStore as _, FilePathId};
+
+        fn twin(
+            base: &kin_model::Entity,
+            file: &str,
+            signature: &str,
+            line: u32,
+        ) -> kin_model::Entity {
+            let file_id = FilePathId::new(file);
+            let mut e = base.clone();
+            e.id = EntityId::from_content(&file_id.0, &e.name, "Function", line);
+            e.signature = signature.to_string();
+            e.file_origin = Some(file_id);
+            e
+        }
+
+        let (graph, _layout, _dir) = orphan_fixture();
+        let base = graph
+            .query_entities(&kin_model::EntityFilter::default())
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the fixture holds at least one entity");
+
+        let graph2 = kin_db::InMemoryGraph::new();
+        let mut decl = twin(&base, "hiredis.h", "int f(int a);", 338);
+        decl.name = "measuredTwin".to_string();
+        decl.id = EntityId::from_content("hiredis.h", "measuredTwin", "Function", 338);
+        let mut def = twin(&base, "hiredis.c", "int f(int a)", 1052);
+        def.name = "measuredTwin".to_string();
+        def.id = EntityId::from_content("hiredis.c", "measuredTwin", "Function", 1052);
+        graph2.upsert_entity(&decl).unwrap();
+        graph2.upsert_entity(&def).unwrap();
+
+        let picked = kin_ranking::entity_ranking::select_best_entity(&graph2, "measuredTwin")
+            .unwrap()
+            .map(|e| {
+                (
+                    e.file_origin
+                        .as_ref()
+                        .map(|f| f.0.clone())
+                        .unwrap_or_default(),
+                    e.signature.clone(),
+                )
+            });
+        println!("\nrefs select_best_entity picked: {picked:?}");
+        println!("  declaration id {} ({})", decl.id, decl.signature);
+        println!("  definition  id {} ({})", def.id, def.signature);
+        println!(
+            "  lower id is the {}",
+            if decl.id < def.id {
+                "DECLARATION"
+            } else {
+                "DEFINITION"
+            }
+        );
+    }
+
+    /// A miss has to be readable as a miss by a caller that only checks the exit
+    /// code. For `kin refs` the guidance reads as an empty reference list, which
+    /// is the shape a "safe to delete?" sweep acts on, so the discriminator
+    /// beside the prose is what makes the command refuse (FIR-3071).
+    #[test]
+    fn refs_miss_carries_the_discriminator_and_not_just_the_prose() {
+        let (graph, layout, _dir) = orphan_fixture();
+        let healthy = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+        }));
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "definitelyMissingEntity".to_string(),
+                kind: "all".to_string(),
+            },
+            &healthy,
+        )
+        .expect("refs response");
+
+        let joined = response.lines.join("\n");
+        assert!(joined.contains("not found"), "{joined}");
+        assert_eq!(response.error.as_deref(), Some(joined.as_str()));
+    }
+
+    /// The other side of the same rule: a resolved answer must not carry the
+    /// discriminator, or every `kin refs` would refuse.
+    #[test]
+    fn a_resolved_refs_answer_carries_no_error_discriminator() {
+        let (graph, layout, _dir) = orphan_fixture();
+        let healthy = kin_mcp::Envelope::daemon().with_health(&serde_json::json!({
+            "initialized": true,
+            "graph_loaded": true,
+            "graph_entity_count": 3,
+            "graph_generation": 1,
+        }));
+
+        let response = build_refs_response(
+            &layout,
+            &graph,
+            &RefsRequest {
+                entity: "orphan".to_string(),
+                kind: "all".to_string(),
+            },
+            &healthy,
+        )
+        .expect("refs response");
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+    }
 
     /// THE SPINE (FIR-2524 rung three). A degraded daemon must make `kin refs`
     /// inherit the MCP verdict for that degradation.

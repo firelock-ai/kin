@@ -8,7 +8,7 @@ Kin is pre-1.0 and the command surface moves. Where this page and your build dis
 
 Descriptions are the command's own help text. A `--json` flag switches that command to machine-readable output. Angle brackets mark a required argument, square brackets an optional one, and a trailing `...` an argument that takes the rest of the line.
 
-83 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
+84 commands are documented below. 4 further commands (`bench-meta`, `contextbench-locate`, `prepared-state`, `semantic-only-guard`) are hidden from `kin --help` because they exist for benchmark and internal orchestration, and they are not part of the supported surface.
 
 `kin capabilities` prints the readiness matrix for the Git-replacement command set, and `kin capabilities --json` gives the same inventory to a machine. Reach for it before scripting against a command you have not used.
 
@@ -25,10 +25,12 @@ These apply to every command.
 | `-h, --help` | Print help. |
 | `-V, --version` | Print the build version. |
 
+Every command also shares one rule for a reader that goes away. When the process reading kin's output closes the pipe, as `kin log | head -1` does once `head` has its line, kin stops writing to that stream, finishes what it was doing, and exits with the status its work earned: `0` for a command that completed and its own error status for one that was refused. A `kin commit -m ... 2>&1 | head -1` still records its change and exits `0`, and a `kin init 2>&1 | head -1` still leaves a complete store. The one exception is a write kin could not skip meeting the closed pipe, which ends the command at that write with `141`, the status a shell reports for a process `SIGPIPE` ended, and never with a `0` for work that did not run. Neither is a panic, and a command whose output goes to a file is unaffected.
+
 ## Contents
 
 - [Start here](#start-here): `init`, `clone`, `status`, `commit`, `log`, `diff`
-- [Ask the graph](#ask-the-graph): `locate`, `search`, `trace`, `impact`, `refs`, `context`
+- [Ask the graph](#ask-the-graph): `locate`, `search`, `trace`, `path`, `impact`, `refs`, `context`
 - [More graph queries](#more-graph-queries): `history`, `blame`, `overview`, `deps`, `xref`, `dead-code`, `trace-data-flow`, `security`, `languages`, `scope`, `locate-debug`
 - [Branches, merges, and exact trees](#branches-merges-and-exact-trees): `branch`, `checkout`, `merge`, `conflicts`, `resolve`, `stash`, `rollback`, `tag`, `semver`, `purge-ignored`, `admit`, `reconcile`, `migrate`, `eject`, `git`
 - [Review and verification](#review-and-verification): `review`, `approvals`, `verify`, `spec`, `audit`, `rename`
@@ -182,6 +184,17 @@ kin locate [text] [options]
 | `--next` |  | Fetch the NEXT page of ranked entities from the previous query, reading the cursor persisted in `.kin/locate-cursor`. No retrieval re-run; pages the daemon's cached ranking. Query text is not required. Conflicts with `--cursor`. |
 | `--cursor <cursor>` |  | Fetch a specific entity page using an explicit cursor token (from a prior result's `next_cursor`). Lower-level alternative to `--next`. |
 | `--page-size <page-size>` |  | Entities per page for the graph-native `entities` surface (`KIN_LOCATE_ENTITY_CAP` otherwise). |
+| `--include-tests` | off | Rank test-role entities alongside source. Off by default: locate demotes tests unless the query text itself reads as being about them. The response says how many test paths a default run withheld. |
+| `--surface <shape>` | `full` | Which JSON shape `--json` emits. `full` is every field, the schema `POST /locate` and the MCP `semantic_locate` tool share. `compact` is the agent surface: per hit `id`, `name`, `kind`, `file`, `line`, `signature` and `score`, plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause and a `_kin` object carrying `embedding_state` with its counts. Refused with `--diagnose`, which needs the full payload. |
+
+`--surface compact` is for a tool loop with a token budget. The full shape spends most of its bytes
+on the back-compat `files[].symbols` roll-up of entities the `entities` block already carries, and
+`--no-snippets` does not remove it: on a 730-entity store, twelve results are 38,819 bytes full and
+3,472 compact. Keep `full` for anything that parses the shared locate schema, which includes
+ContextBench and the acceptance scripts.
+
+The MCP `semantic_locate` tool is the other way round: compact is its default at entity granularity,
+and `surface: "full"` opts back out. See [mcp-tools.md](mcp-tools.md).
 
 ### `kin search`
 
@@ -218,6 +231,8 @@ kin trace <entity> [options]
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--file <file>` |  | Exact repo-relative file qualifier for stable identity resolution |
+| `--kind <kind>` |  | Exact entity-kind qualifier (for example: function or method) |
 | `--json` |  | Output machine-readable JSON for editor integrations |
 | `--compact` |  | Render a smaller, cheaper trace tuned for assistant workflows |
 | `--show-body` |  | Compatibility no-op: trace already shows the focal body by default |
@@ -227,6 +242,54 @@ kin trace <entity> [options]
 | `--max-lines <max-lines>` | `40` | Max lines to print for any single source snippet |
 | `--nearby <nearby>` | `4` | Max nearby entries to print |
 | `--transitive <transitive>` | `2` | Max transitive entries to print |
+
+The argument takes either form. An entity id, exactly as `kin search --json` prints it, names one
+entity and needs no qualifier. A name may reach several: a C function declared in a header and
+defined in a source file is two entities under one name, and so is an overload set.
+
+When a name reaches several and nothing pins one, `kin trace` prefers the definition over the
+declaration, then the earlier file path, then the earlier line, then the id. Every one of those is
+read off the entity record, so the same tree answers the same way in every store built from it.
+The trace then says which entity it chose and names the others, so you can pin one:
+
+```
+kin trace buffer_grow --file src/buffer.h --kind function
+```
+
+`--file` takes the repo-relative path the answer prints and `--kind` the lowercase kind, the same
+spellings `kin impact` takes.
+
+A query that resolves to no entity exits non-zero and puts the message on stderr, leaving stdout
+empty. That holds for the name form, for an id this repository's graph does not hold, and for a
+qualifier that excludes every match, which reports what the name alone does reach rather than
+claiming the entity is absent. `kin context`, `kin refs`, `kin xref` and `kin impact` refuse the
+same way.
+
+### `kin path`
+
+Find the shortest routes from one entity to another over the graph's call, instantiation, reference, import and include edges. Each end is an entity name, an entity id, or `name@file` to pin one of two same-named entities. A class stands for its members, so a route between two classes runs through the methods that carry it. Exits 3 when the graph holds no route inside the depth bound, with the gap on stderr.
+
+```
+kin path <from> <to> [options]
+```
+
+| Argument | Required | Description |
+| --- | --- | --- |
+| `<from>` | yes | Source entity: name, id, or name@file |
+| `<to>` | yes | Target entity: name, id, or name@file |
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--from-file <file>` |  | Pin the source to the entity of that name in this file (path or path suffix) |
+| `--to-file <file>` |  | Pin the target the same way |
+| `--max-depth <n>` |  | Hops walked between the two ends (default 6, ceiling 12); containment hops are not counted |
+| `--limit <k>` |  | Routes printed, shortest first (default 3, ceiling 25) |
+| `--direction <dir>` |  | `forward` (from reaches to), `reverse` (to reaches from), or `either` (default; forward first, reports which held) |
+| `--include-type-edges` |  | Walk through type-annotation edges too |
+| `--json` |  | Output machine-readable JSON, `_kin` envelope included |
+| `--compact` |  | One line per hop and nothing else, sized for a prompt |
+
+Every hop names the entity, its kind, its file and line, the relation that joins it to the next hop and the 1-based lines of the syntax that produced that edge (or, when the graph recorded no site, why under `site_lines_absent_reason`). The answer says which sense held (`direction`), how many shortest routes exist (`routes_total`), what each walk explored and why it stopped (`explored`), and how each end resolved, including how many entities carry the same exact name (`same_name_candidates`). A qualified name (`Worker::search`) that names no entity resolves to its bare leaf when exactly one entity carries it, and is refused with the candidates listed when several do, so a twin is never chosen silently under a qualifier. A no-route answer is explicit: `found: false`, an empty `routes`, and a `gap` naming what stopped the walk (`frontier_exhausted`, `depth_bound`, `edge_ceiling`, `time_budget`) with the remedy, and the `_kin.verdict` beside it says whether that absence can be trusted. The same query is served to agents as the `trace_path` MCP tool.
 
 ### `kin impact`
 
@@ -270,21 +333,58 @@ kin refs [entity] [options]
 
 ### `kin context`
 
-Build a context pack for an entity
+Build a context pack for one entity, several, or a question
 
 ```
-kin context <entity> [options]
+kin context <entity>... [options]
+kin context --question "<text>" [options]
 ```
 
 | Argument | Required | Description |
 | --- | --- | --- |
-| `<entity>` | yes | Entity name or ID |
+| `<entity>...` | unless `--question` | Entity names or IDs. A name with twins in the store can pin the one it means: `Name@file`, `Name@file:line`, `Name#Kind` |
 
 | Flag | Default | Description |
 | --- | --- | --- |
+| `--question <text>` |  | Build the pack from the entities this question ranks for, through kin's own locate ranking |
 | `-b, --budget <budget>` | `8k` | Token budget (8k, 16k, 32k, or custom number) |
 | `--assistant <assistant>` |  | Assistant hint for tuning context pack strategy |
-| `--json` |  | Emit the resolved target and the whole context pack as JSON |
+| `--max-focals <n>` | `5` | Most focal entities a question may resolve to |
+| `--json` |  | Emit the resolved targets and the whole context pack as JSON |
+
+A question that names several things needs a pack that carries all of them.
+"When I type a character in the editor, how does it end up in the document"
+names three, and a pack built around any one of them answers something
+narrower. Naming several focals, or asking a question and letting the ranking
+name them, builds one pack from all of them: every focal first, then the graph
+route between focals the graph connects, then each focal's neighbourhood
+water-filled into what is left, so a short neighbourhood never holds budget a
+long one needed.
+
+```
+kin context handleKeyboardInput TextDocument --budget 1500
+kin context --question "when I type a character, how does it reach the document" --budget 1500
+kin context 'apply@src/model.c' TextDocument      # pin the twin you mean
+```
+
+The output states its method in one line: which focals, how each resolved
+(named, pinned, by id, or located from the question with its score), what each
+contributed, the route material between connected focals, what the pack
+measured, and the store's semantic coverage. `--json` carries the same facts
+under `multi_focal`, plus `routes`, `route_search` and the per-section
+`budget_elisions`.
+
+**Budgets differ between the two shapes, on purpose.** A multi-focal pack comes
+in at or under `--budget`: it is rendered, measured with the estimator kin
+builds packs with, and rows are dropped until it fits. A single-focal pack can
+exceed its budget, because every section there keeps a row whatever the budget
+says, and the rendering says so. Both report `measured_tokens` in `--json`, which
+is what the bytes actually cost.
+
+`route_search.bounded` is worth reading before concluding two entities are
+unrelated. It is true when a route search stopped at its own bound, in which
+case an absent route says nobody looked far enough rather than that the graph
+joins nothing.
 
 ## More graph queries
 

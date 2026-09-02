@@ -1909,7 +1909,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19753d40da53d0ec41604750eeb969097a90fb2d7f7992730d904541c04e2c19"
 dependencies = [
  "bstr",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
 ]
 
 [[package]]
@@ -2844,7 +2844,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20fd6de4ccfcc187e38bc21cfa543cb5a302cb86a8b114eb7f0bf0dc9f8ac00f"
 dependencies = [
  "io-lifetimes 3.0.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -3289,9 +3289,9 @@ dependencies = [
 
 [[package]]
 name = "kin-db"
-version = "0.7.81"
+version = "0.7.84"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "81af647f5d6309ff18d9818e33eebc6e7cfcdfad87793df561a1e6d584086780"
+checksum = "7f72d12b426a54d459e31d1834b9e23eaf84d5a5c110ea23cce959b861ec1c90"
 dependencies = [
  "bincode",
  "bstr",
@@ -3317,6 +3317,7 @@ dependencies = [
  "parking_lot",
  "rayon",
  "reqwest 0.12.28",
+ "rmp",
  "rmp-serde",
  "rustc-hash 2.1.3",
  "safetensors",
@@ -3507,9 +3508,9 @@ dependencies = [
 
 [[package]]
 name = "kin-model"
-version = "0.7.22"
+version = "0.7.23"
 source = "sparse+https://kinlab.ai/registry/cargo/"
-checksum = "3550abd2115b4885d7594e8d1cfe045f68ff1b62c374217bbf0e7f24c81a7a86"
+checksum = "f8fa9147250a6ed0344f4b4d6e9503972f3a119d8034e26a23728b2d5baa62a2"
 dependencies = [
  "chrono",
  "gix-hash",
@@ -4667,7 +4668,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6670,7 +6671,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

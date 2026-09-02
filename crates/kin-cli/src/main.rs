@@ -8,6 +8,7 @@ use anyhow::Result;
 use clap::{CommandFactory, Parser, Subcommand};
 use clap_complete::{self, Shell};
 use kin_cli::commands;
+use kin_cli::{eprintln, println};
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use tracing::Instrument;
@@ -211,17 +212,26 @@ enum Command {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Build a context pack for an entity
+    /// Build a context pack for one entity, several, or a question
     Context {
-        /// Entity name or ID
-        entity: String,
+        /// Entity names or IDs. A name that has twins in the store can pin the
+        /// one it means: `Name@file`, `Name@file:line`, `Name#Kind`
+        #[arg(value_name = "ENTITY")]
+        entities: Vec<String>,
+        /// Build the pack from the entities this question ranks for, through
+        /// kin's own locate ranking
+        #[arg(long, value_name = "TEXT")]
+        question: Option<String>,
         /// Token budget (8k, 16k, 32k, or custom number)
         #[arg(short, long, default_value = "8k")]
         budget: String,
         /// Assistant hint for tuning context pack strategy
         #[arg(long)]
         assistant: Option<String>,
-        /// Emit the resolved target and the whole context pack as JSON
+        /// Most focal entities a question may resolve to
+        #[arg(long, value_name = "N")]
+        max_focals: Option<usize>,
+        /// Emit the resolved targets and the whole context pack as JSON
         #[arg(long, default_value_t = false)]
         json: bool,
     },
@@ -242,6 +252,12 @@ enum Command {
     Trace {
         /// Entity name or ID
         entity: String,
+        /// Exact repo-relative file qualifier for stable identity resolution
+        #[arg(long)]
+        file: Option<String>,
+        /// Exact entity-kind qualifier (for example: function or method)
+        #[arg(long)]
+        kind: Option<String>,
         /// Output machine-readable JSON for editor integrations
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -269,6 +285,43 @@ enum Command {
         /// Max transitive entries to print
         #[arg(long, default_value_t = 2)]
         transitive: usize,
+    },
+    /// Find the shortest routes from one entity to another over the graph's
+    /// call, instantiation, reference, import and include edges.
+    ///
+    /// Each end is an entity name, an entity id, or `name@file` to pin one of
+    /// two same-named entities. A class stands for its members, so a route
+    /// between two classes runs through the methods that carry it. Exits 3 when
+    /// the graph holds no route inside the depth bound, with the gap on stderr.
+    Path {
+        /// Source entity: name, id, or name@file
+        from: String,
+        /// Target entity: name, id, or name@file
+        to: String,
+        /// Pin the source to the entity of that name in this file (path or path suffix)
+        #[arg(long = "from-file", value_name = "FILE")]
+        from_file: Option<String>,
+        /// Pin the target the same way
+        #[arg(long = "to-file", value_name = "FILE")]
+        to_file: Option<String>,
+        /// Hops walked between the two ends (default 6, ceiling 12); containment hops are not counted
+        #[arg(long = "max-depth", value_name = "N")]
+        max_depth: Option<usize>,
+        /// Routes printed, shortest first (default 3, ceiling 25)
+        #[arg(long, value_name = "K")]
+        limit: Option<usize>,
+        /// `forward` (from reaches to), `reverse` (to reaches from), or `either` (default; forward first, reports which held)
+        #[arg(long, value_name = "DIR")]
+        direction: Option<String>,
+        /// Walk through type-annotation edges too
+        #[arg(long = "include-type-edges", default_value_t = false)]
+        include_type_edges: bool,
+        /// Output machine-readable JSON, `_kin` envelope included
+        #[arg(long, default_value_t = false)]
+        json: bool,
+        /// One line per hop and nothing else, sized for a prompt
+        #[arg(long, default_value_t = false)]
+        compact: bool,
     },
     /// Search entities in the graph
     Search {
@@ -378,6 +431,19 @@ enum Command {
         /// how many test paths a default run withheld.
         #[arg(long = "include-tests", default_value_t = false)]
         include_tests: bool,
+        /// Which JSON shape `--json` emits: `full` (every field, the default) or
+        /// `compact` (the agent surface: id, name, kind, file, line, signature
+        /// and score per hit, ranked file paths, and a `_kin` envelope naming
+        /// the embedding coverage behind the ranking).
+        ///
+        /// `full` stays the default because it is what ContextBench, the
+        /// acceptance scripts and `--diagnose` read. `compact` is roughly a
+        /// tenth the bytes: on a 730-entity store twelve results are 38,819
+        /// bytes full and 3,472 compact, because the back-compat
+        /// `files[].symbols` roll-up is 69 percent of the full payload and
+        /// `--no-snippets` does not remove it.
+        #[arg(long = "surface", value_name = "SHAPE", default_value = "full")]
+        surface: String,
     },
     /// Debug locate results: show per-signal breakdown, rank gold files,
     /// and diagnose why targets were missed.
@@ -2622,7 +2688,26 @@ fn parse_cli_or_report_retired_command() -> Cli {
     }
 }
 
-fn main() -> Result<()> {
+/// The process entry. The outcome of [`run`] becomes an exit status in one
+/// place, so a refusal is reported the same way whether or not anyone still
+/// reads stderr, and the `println!` and `eprintln!` this file imports from
+/// `kin_cli` are the ones that tolerate a reader going away, so nothing here
+/// ends early because a pipe closed. Two cases, told apart by the status. A
+/// command that ran to its end exits 0, or its own error status, whatever
+/// happened to its streams on the way, because its work is done and the
+/// status reports the work. A command that stopped at a write outside those
+/// macros, an `io::Error` of kind `BrokenPipe` that came back through `?`,
+/// exits 141: its work after that write never ran, and 141 is a status nobody
+/// can read as success of work that never happened. `kin_cli::broken_pipe`
+/// decides the status; this is the process boundary, so it is where the exit
+/// happens.
+fn main() {
+    if let Err(error) = run() {
+        std::process::exit(kin_cli::broken_pipe::exit_status(&error));
+    }
+}
+
+fn run() -> Result<()> {
     // Select this process's resource profile before anything reads it: the GPU
     // kernel plan and the Metal submission depth are each resolved once per
     // process, and mutating the environment is only safe while the process is
@@ -2786,18 +2871,57 @@ fn main() -> Result<()> {
                     json,
                 } => commands::impact::run(entity, depth, file, kind, signature, json).await,
                 Command::Context {
-                    entity,
+                    entities,
+                    question,
                     budget,
                     assistant,
+                    max_focals,
                     json,
-                } => commands::context::run(entity, budget, assistant, json).await,
+                } => {
+                    commands::context::run(entities, question, budget, assistant, max_focals, json)
+                        .await
+                }
                 Command::ContextbenchLocate {
                     task_file,
                     json,
                     debug,
                 } => commands::contextbench_locate::run(task_file, json, debug).await,
+                Command::Path {
+                    from,
+                    to,
+                    from_file,
+                    to_file,
+                    max_depth,
+                    limit,
+                    direction,
+                    include_type_edges,
+                    json,
+                    compact,
+                } => {
+                    // No route is an answer, not an error, and it travels in
+                    // the exit code the way a parked merge does.
+                    let code = commands::path::run(
+                        from,
+                        to,
+                        from_file,
+                        to_file,
+                        max_depth,
+                        limit,
+                        direction,
+                        include_type_edges,
+                        json,
+                        compact,
+                    )
+                    .await?;
+                    if code != 0 {
+                        std::process::exit(code);
+                    }
+                    Ok(())
+                }
                 Command::Trace {
                     entity,
+                    file,
+                    kind,
                     json,
                     compact,
                     show_body: _,
@@ -2817,6 +2941,8 @@ fn main() -> Result<()> {
                             max_lines,
                             limit.unwrap_or(nearby),
                             transitive,
+                            file,
+                            kind,
                         )
                         .await
                     } else {
@@ -2828,6 +2954,8 @@ fn main() -> Result<()> {
                             max_lines,
                             limit.unwrap_or(nearby),
                             transitive,
+                            file,
+                            kind,
                         )
                         .await
                     }
@@ -2894,7 +3022,18 @@ fn main() -> Result<()> {
                     cursor,
                     page_size,
                     include_tests,
+                    surface,
                 } => {
+                    // Refuse an unknown shape rather than falling back to the
+                    // default: a misspelled --surface that silently emitted the
+                    // full payload would look exactly like a compact surface
+                    // that stopped compacting.
+                    let surface = commands::locate_compact::LocateSurface::parse(&surface)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "unknown --surface '{surface}'; expected 'full' or 'compact'"
+                            )
+                        })?;
                     // Inline snippets default ON for the structured/agent `--json`
                     // surface (so an agent gets code on the first locate);
                     // --diagnose stays lean unless --snippets is explicit;
@@ -2941,6 +3080,14 @@ fn main() -> Result<()> {
                     } else {
                         anyhow::bail!("provide problem text, --file, or --stdin");
                     };
+                    if diagnose && surface == commands::locate_compact::LocateSurface::Compact {
+                        // Refused rather than silently overridden. --diagnose
+                        // exists to show every stage, seed and score, and the
+                        // compact surface drops all of them; taking the flag and
+                        // ignoring it would print a diagnostic missing the
+                        // diagnosis.
+                        anyhow::bail!("--diagnose needs the full payload; drop --surface compact");
+                    }
                     if diagnose {
                         // Diagnostic mode: capture result, print JSON, then
                         // print gold file comparison to stderr.
@@ -3080,6 +3227,7 @@ fn main() -> Result<()> {
                             want_snippets,
                             paging,
                             commands::locate::LocateScope::with_tests(include_tests),
+                            surface,
                         )
                         .await
                     }
@@ -3780,12 +3928,16 @@ fn main() -> Result<()> {
                     }
                 }
                 Command::Completions { shell } => {
-                    clap_complete::generate(
-                        shell,
-                        &mut Cli::command(),
-                        "kin",
-                        &mut std::io::stdout(),
-                    );
+                    // Rendered into memory and written from here. clap_complete
+                    // writes straight into the sink it is handed and turns a
+                    // failed write into a panic of its own, `failed to write
+                    // completion file`, so the write that can meet a closed
+                    // pipe has to be one this crate makes: a reader that takes
+                    // one line of the script and leaves gets the same clean
+                    // exit as one that takes it all.
+                    let mut script = Vec::new();
+                    clap_complete::generate(shell, &mut Cli::command(), "kin", &mut script);
+                    kin_cli::broken_pipe::write_stdout(&script);
                     Ok(())
                 }
                 Command::Update {

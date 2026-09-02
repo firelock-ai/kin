@@ -2,7 +2,7 @@
 // Copyright 2026 Firelock, LLC
 
 use anyhow::{Context, Result};
-use kin_model::{EntityFilter, EntityId, EntityStore, GraphNodeId};
+use kin_model::{EntityId, EntityStore, GraphNodeId};
 use serde::{Deserialize, Serialize};
 
 pub const IMPACT_RESPONSE_SCHEMA_VERSION: &str = "kin-impact-response-v1";
@@ -118,6 +118,16 @@ pub async fn run(
             anyhow::bail!("impact resolution failed: {}", response.resolution);
         }
     } else {
+        // The same refusal the --json path already made, on the path a person
+        // and a shell script both take. Guidance printed at exit 0 is what let a
+        // caller embed "Entity ... not found" as though it were an analysis
+        // (FIR-3071).
+        if response.resolution != "resolved" && !response.resolution.is_empty() {
+            for line in response.lines {
+                eprintln!("{}", crate::output_style::paint_impact_line(&line));
+            }
+            anyhow::bail!("impact resolution failed: {}", response.resolution);
+        }
         for line in response.lines {
             println!("{}", crate::output_style::paint_impact_line(&line));
         }
@@ -602,85 +612,41 @@ struct ResolvedEntities {
     exact_name: bool,
 }
 
+/// Resolve this request's entity through the one resolver every read command
+/// shares.
+///
+/// The rules here used to live in this function alone, which is why `kin trace`
+/// and `kin xref` could not read an id and no command but this one could take
+/// `--file` (FIR-3071). They now live in [`crate::entity_identity`]; this stays
+/// as the thin adapter between `ImpactRequest` and that resolver.
 fn resolve_entities(
     graph: &kin_db::InMemoryGraph,
     request: &ImpactRequest,
 ) -> Result<ResolvedEntities> {
-    let mut matches = if let Ok(uuid) = uuid::Uuid::parse_str(&request.entity) {
-        graph.get_entity(&EntityId(uuid))?.into_iter().collect()
-    } else {
-        let filter = EntityFilter {
-            name_pattern: Some(request.entity.clone()),
-            ..Default::default()
-        };
-        let mut matches = graph.query_entities(&filter)?;
-        // An external reference target carries the imported symbol's name, so a
-        // name query returns it beside the local declaration that shares that
-        // name. It is never a subject of impact analysis: this repository holds
-        // no definition, no file, and no relations out of it, so nothing can be
-        // said about what changing it would reach. Leaving it in the match set
-        // inflates the count, and under a structured caller's fail-closed
-        // resolution it turns a repository's own `Error` or `Result` into an
-        // ambiguous query answered with no analysis at all.
-        matches.retain(|entity| !kin_index::is_external_reference_target(entity));
-        // Broad matching is for discovery: "resolve" should still find
-        // resolve_binary. But when the query names an entity exactly, substring
-        // cousins (try_resolve_binary alongside resolve_binary) force an
-        // ambiguity note onto an unambiguous ask, so an exact-name hit narrows
-        // the set to the exact matches.
-        //
-        // One rule for both surfaces. A structured caller used to RETAIN the
-        // exact matches here instead, which empties the set for every name that
-        // resolves only inexactly: Python methods are named `HTTPAdapter.send`,
-        // so `kin impact send --json` retained nothing and was then reported as
-        // an entity the graph does not hold, with an empty candidate list,
-        // because the name snapshot below was taken after the retain (FIR-2478).
-        // Fail-closed resolution survives the move: it is enforced where it can
-        // still see what the name found, in `build_impact_response`.
-        let exact: Vec<kin_model::Entity> = matches
-            .iter()
-            .filter(|entity| entity.name == request.entity)
-            .cloned()
-            .collect();
-        if !exact.is_empty() {
-            matches = exact;
-        }
-        matches
-    };
-    let exact_name = matches.iter().any(|entity| entity.name == request.entity);
-    let name_matches = matches.clone();
-    if let Some(file) = request.file.as_deref() {
-        matches.retain(|entity| kin_review::StableEntityIdentity::from_entity(entity).file == file);
-    }
-    if let Some(kind) = request.kind.as_deref() {
-        matches.retain(|entity| kin_review::StableEntityIdentity::from_entity(entity).kind == kind);
-    }
-    if let Some(signature) = request.signature.as_deref() {
-        let normalized = signature.split_whitespace().collect::<Vec<_>>().join(" ");
-        matches.retain(|entity| {
-            kin_review::StableEntityIdentity::from_entity(entity).signature == normalized
-        });
-    }
+    let resolved = crate::entity_identity::resolve_identity(
+        graph,
+        &request.entity,
+        &crate::entity_identity::IdentityQualifiers {
+            file: request.file.clone(),
+            kind: request.kind.clone(),
+            signature: request.signature.clone(),
+        },
+    )?;
     Ok(ResolvedEntities {
-        matches,
-        name_matches,
-        exact_name,
+        matches: resolved.matches,
+        name_matches: resolved.name_matches,
+        exact_name: resolved.exact_name,
     })
 }
 
 /// The qualifiers a request carried, spelled the way the user passed them.
 fn active_qualifiers(request: &ImpactRequest) -> Vec<String> {
-    [
-        request.file.as_deref().map(|v| format!("--file {v}")),
-        request.kind.as_deref().map(|v| format!("--kind {v}")),
-        request
-            .signature
-            .as_deref()
-            .map(|v| format!("--signature {v}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+    crate::entity_identity::IdentityQualifiers {
+        file: request.file.clone(),
+        kind: request.kind.clone(),
+        signature: request.signature.clone(),
+    }
+    .labels()
 }
 
 /// The answer when a name resolves but the identity qualifiers exclude every

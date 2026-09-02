@@ -345,6 +345,36 @@ fn init_from_git_with_hooks(
         plan
     };
 
+    // What phase 1 could not see. Its forecast multiplies a per-artifact term
+    // by the commit count, so a one-commit snapshot of a wide tree forecasts
+    // one tree's worth of entries, stays silent, and dies in the phase below.
+    // The plan now holds the head tree it will admit and a recorded size for
+    // every object it captured, so the conversion's width is finally a number
+    // rather than a guess, and reading it costs one pass over structures that
+    // are already in hand.
+    //
+    // Reported as well as judged. The count is the phase's own size and is
+    // worth a line whatever the machine has, because the phase after it is the
+    // one that spends minutes and gigabytes on exactly this many files.
+    {
+        let survey = crate::init_budget::ImportSurvey {
+            commits: semantic_plan.changes.len() as u64,
+            head_artifacts: semantic_plan.workspace_seed.base_tree.len() as u64,
+            object_bytes: semantic_plan
+                .external_objects
+                .iter()
+                .map(|record| record.body_len)
+                .sum(),
+        };
+        progress.detail(format_args!(
+            "{} files, {} commits",
+            survey.head_artifacts, survey.commits
+        ));
+        if let Some(line) = crate::init_budget::project_import(survey).advisory_line() {
+            crate::init_attempt::disclose_line(&line);
+        }
+    }
+
     progress.begin("derive semantic history");
     let semantic_plan = {
         let _span = info_span!(
@@ -406,6 +436,10 @@ fn init_from_git_with_hooks(
     // Consuming the plan is what frees them. The closure carries the facts and
     // never carried the bodies, so a future reader that wants one has to say so
     // rather than be handed silence.
+    // Read before the bodies go, because the closure that replaces the plan
+    // exposes this count only through a trait, and phase 11 wants the number
+    // rather than the trait.
+    let admitted_changes = semantic_plan.changes.len();
     let semantic_plan = {
         let _span = info_span!("kin.init.release_plan_bodies").entered();
         ProvedImportClosure::from_proved_plan(semantic_plan)
@@ -472,6 +506,15 @@ fn init_from_git_with_hooks(
             observed_entries = sealed_observation.observed_entries
         )
         .entered();
+        // Every second of this phase is spent inside two calls that report
+        // nothing: the transaction build below and the workspace-semantics
+        // derivation inside `bind_workspace_authority`. Measured on an
+        // 18,508-file snapshot the pair took 38 seconds and printed no line at
+        // all. The heartbeat cannot see inside either, so it says what it does
+        // know, which is how large the work is and how long it has been going.
+        let _beat = progress.heartbeat(format!(
+            "{admitted_tracked_artifacts} files, {admitted_changes} changes"
+        ));
         let mut transaction = admitted
             .into_generation_zero_repository_transaction(
                 &capture_store,
@@ -504,6 +547,17 @@ fn init_from_git_with_hooks(
     progress.begin("commit bootstrap transaction");
     {
         let _span = info_span!("kin.init.commit_bootstrap_transaction").entered();
+        // The phase that goes quietest. `kin_db::storage::history_replay` is
+        // the only periodic emitter below this call, and it finishes early: on
+        // an 18,508-file snapshot its last line landed at 68 seconds and the
+        // phase then ran for over half an hour in silence. The store's own
+        // commit reports nothing and this crate cannot make it, so the line
+        // that keeps moving is this one.
+        let _beat = progress.heartbeat(format!(
+            "{admitted_tracked_artifacts} files, {} changes, {} objects",
+            transaction.changes.len(),
+            transaction.external_objects.len()
+        ));
         prepared.commit_repository_bootstrap(transaction)?;
     }
 

@@ -17,8 +17,9 @@
 use std::cell::RefCell;
 use std::fmt::Arguments;
 use std::io::{IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::init_attempt::InitAttemptJournal;
 
@@ -130,6 +131,21 @@ impl PhaseProgress {
         Self { ladder }
     }
 
+    /// Tick the open phase with `detail` until the returned handle is dropped.
+    ///
+    /// For a phase whose body is one blocking call this crate cannot
+    /// instrument from the inside. The caller states what the work is; the
+    /// ladder supplies how long it has been going.
+    pub(crate) fn heartbeat(&self, detail: String) -> PhaseHeartbeat {
+        self.heartbeat_every(detail, HEARTBEAT_INTERVAL)
+    }
+
+    /// [`Self::heartbeat`] with the cadence named, so a test can drive one
+    /// without waiting the production interval for a single tick.
+    fn heartbeat_every(&self, detail: String, interval: Duration) -> PhaseHeartbeat {
+        PhaseHeartbeat::start(Arc::clone(&self.ladder), detail, interval)
+    }
+
     fn with<R>(&mut self, act: impl FnOnce(&mut Ladder) -> R) -> Option<R> {
         self.ladder.lock().ok().map(|mut ladder| act(&mut ladder))
     }
@@ -196,6 +212,89 @@ impl PhaseProgress {
     #[cfg(test)]
     pub(crate) fn detail_updates(&self) -> usize {
         self.ladder.lock().expect("ladder lock").detail_updates
+    }
+}
+
+/// How often a heartbeat ticks the phase it was started for.
+///
+/// Short enough that a terminal redraw looks alive, long enough that the
+/// throttle off a terminal still leaves a readable line rate: the ladder
+/// prints the first detail and then every tenth, so this cadence puts a line
+/// in a pipe roughly every fifty seconds.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How finely the heartbeat wakes to check whether it has been stopped.
+///
+/// Separate from the tick interval so dropping the handle does not wait a full
+/// tick to be noticed. A phase that ends promptly must not be held open by its
+/// own progress reporting.
+const HEARTBEAT_POLL: Duration = Duration::from_millis(100);
+
+/// Advance an open phase from another thread while this one blocks.
+///
+/// Several phases spend all of their minutes inside a single call into a crate
+/// below this one, and those crates report through `tracing` or not at all.
+/// `kin_db::storage::history_replay` is the only periodic emitter any of them
+/// has, so a conversion that finishes replay and goes on to commit prints two
+/// lines and then nothing: a measured 18,508-file snapshot sat in phase 13 for
+/// over half an hour with a line that last moved at 68 seconds. Nothing was
+/// wrong, and there was no way to know that from the outside.
+///
+/// A heartbeat does not invent progress it cannot see. It carries the size of
+/// the work, which the caller knows before it blocks, and the phase line's own
+/// elapsed time, which the ladder already keeps. That turns silence into a
+/// statement an operator can act on: this many files, still going, this long.
+///
+/// It takes the ladder by handle rather than through [`ACTIVE_LADDER`],
+/// because that slot belongs to the thread that installed it and a spawned
+/// thread has none. Handing the `Arc` over directly leaves that discipline
+/// exactly as it was.
+pub(crate) struct PhaseHeartbeat {
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PhaseHeartbeat {
+    fn start(ladder: Arc<Mutex<Ladder>>, detail: String, interval: Duration) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("kin-init-heartbeat".to_string())
+            .spawn(move || {
+                let mut waited = Duration::ZERO;
+                while !flag.load(Ordering::Relaxed) {
+                    std::thread::sleep(HEARTBEAT_POLL);
+                    waited += HEARTBEAT_POLL;
+                    if waited < interval {
+                        continue;
+                    }
+                    waited = Duration::ZERO;
+                    // A poisoned ladder means the reporting thread panicked
+                    // mid-redraw. Ticking it again would be writing through a
+                    // lock whose invariant is already broken, so the heartbeat
+                    // simply stops reporting rather than taking the process
+                    // down with a second panic.
+                    let Ok(mut ladder) = ladder.lock() else {
+                        return;
+                    };
+                    ladder.detail(format_args!("{detail}"));
+                }
+            })
+            .ok();
+        Self { stop, thread }
+    }
+}
+
+impl Drop for PhaseHeartbeat {
+    /// Stop ticking and wait for the tick in flight.
+    ///
+    /// Joined rather than detached, so a heartbeat can never draw over the
+    /// phase line after the phase that owns it has closed.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -327,6 +426,82 @@ impl Ladder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A phase whose body is one blocking call still advances.
+    ///
+    /// The behaviour this guards is the whole point of the type: a conversion
+    /// that sits in phase 13 for half an hour must not look identical to one
+    /// that has hung. Falsified by removing the `ladder.detail` call from the
+    /// heartbeat loop, which leaves the thread running and the count at zero.
+    #[test]
+    fn a_heartbeat_advances_the_phase_it_was_started_for() {
+        let mut progress = PhaseProgress::new(2);
+        progress.begin("commit bootstrap transaction");
+        let before = progress.detail_updates();
+        let beat = progress.heartbeat_every("18508 files".to_string(), Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while progress.detail_updates() <= before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(beat);
+        assert!(
+            progress.detail_updates() > before,
+            "a heartbeat that never ticks leaves a long phase as silent as it was"
+        );
+    }
+
+    /// Dropping the handle stops the ticking, and stops it before the drop
+    /// returns.
+    ///
+    /// A heartbeat that outlived its phase would draw its own line over the
+    /// next phase's, which is worse than the silence it replaced. Falsified by
+    /// dropping the join in `Drop`, which lets a tick in flight land after the
+    /// phase closed.
+    #[test]
+    fn a_dropped_heartbeat_stops_ticking() {
+        let mut progress = PhaseProgress::new(2);
+        progress.begin("commit bootstrap transaction");
+        let beat = progress.heartbeat_every("18508 files".to_string(), Duration::from_millis(20));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while progress.detail_updates() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(beat);
+        let settled = progress.detail_updates();
+        assert!(
+            settled > 0,
+            "the heartbeat has to have started to prove it stops"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            progress.detail_updates(),
+            settled,
+            "a heartbeat kept ticking after its handle was dropped"
+        );
+    }
+
+    /// The cadence is what makes a piped log readable rather than a flood.
+    ///
+    /// Off a terminal the ladder prints the first detail and then every tenth,
+    /// so the production interval has to be short enough to redraw a terminal
+    /// and long enough that ten of them is not a wall of text. Guarded as a
+    /// range rather than a value, so tuning the cadence does not fail the test
+    /// but replacing it with a per-second tick does.
+    #[test]
+    fn the_heartbeat_cadence_stays_in_the_band_a_piped_log_can_take() {
+        assert!(
+            HEARTBEAT_INTERVAL >= Duration::from_secs(2),
+            "a tick faster than this floods a pipe once the tenth-line throttle lets it through"
+        );
+        assert!(
+            HEARTBEAT_INTERVAL <= Duration::from_secs(15),
+            "ten of these is the gap between piped lines, and past this it reads as a hang again"
+        );
+        assert!(
+            HEARTBEAT_POLL < HEARTBEAT_INTERVAL,
+            "a poll coarser than the interval cannot stop the thread inside one tick"
+        );
+    }
 
     #[test]
     fn a_phase_ladder_numbers_every_phase_it_enters() {

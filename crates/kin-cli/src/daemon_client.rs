@@ -1565,6 +1565,26 @@ impl DaemonClient {
             .context("parse daemon trace-data-flow response")
     }
 
+    /// `POST /commands/path`: the shortest routes between two entities, answered
+    /// as the annotated JSON the daemon built, envelope and negative included.
+    pub async fn path(
+        &self,
+        request: &kin_mcp::handlers::path::PathRequest,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .send(
+                self.client
+                    .post(format!("{}/commands/path", self.base_url))
+                    .json(request),
+                "path",
+            )
+            .await?;
+        if !resp.status().is_success() {
+            return Err(self.http_refusal("path", resp).await);
+        }
+        resp.json().await.context("parse daemon path response")
+    }
+
     pub async fn refs(
         &self,
         request: &crate::commands::refs::RefsRequest,

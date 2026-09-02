@@ -1,6 +1,6 @@
 # Model Context Protocol (MCP) Tool Surface Reference
 
-The Kin MCP server exposes 65 semantic tools to AI assistants (Claude, Cursor, Gemini,
+The Kin MCP server exposes 66 semantic tools to AI assistants (Claude, Cursor, Gemini,
 Codex, etc.). These tools bridge the gap between traditional file-first navigation and
 Kin's graph-first semantic substrate: instead of issuing raw shell commands or reading raw
 files, an assistant interacts with the codebase through entity-level primitives.
@@ -171,18 +171,40 @@ it does not constrain a local process that already holds your repo daemon's cred
 Reach for it to keep an agent's belt focused and its context small, not as a capability
 boundary you can rely on.
 
+#### `agent-default` serves short descriptions
+
+`agent-default` does not serve the long descriptions on this page. Each tool gets one or two
+sentences saying when to call it and what comes back, and an input schema trimmed to the
+properties that change which entities come back rather than how the response is shaped
+(`max_chars`, `compact`, `explain`, `snippet_alias` and `pipeline` are not advertised there).
+Trimming hides a property; it does not remove it. No tool sets `additionalProperties: false`,
+so a caller that knows a withheld property can still pass it, and `full` still advertises
+every one.
+
+This is a context budget, measured. On 2026-09-02 the profile's `tools/list` was 82,262 bytes
+over 20 tools, 47,739 of it descriptions and 30,456 input schemas, spent before the model
+asked anything. `full`, `benchmark` and `context-bench` keep the long forms: the last two
+because their `tools/list` bytes are an input to a citable benchmark result.
+
+`agent-default` also serves the declaration filter as **`find_declarations`** rather than
+`semantic_search`, because it filters declarations by name, kind and language and does not
+rank by your query, while `semantic_locate` is the tool that ranks by meaning. The two names
+read the wrong way round, and a model reads a name before it reads a description. Nothing is
+renamed underneath: the tool is registered as `semantic_search`, both names dispatch to the
+same handler on every profile, and `full` serves it under the registered name.
+
 ---
 
 ## 1. Retrieval & Codebase Exploration
 *Tools:* `semantic_search`, `semantic_locate`, `list_file_entities`, `get_entity`, `get_entity_source`, `get_entity_body`, `get_entity_sources`, `get_context_pack`, `explore_codebase`, `graph_neighborhood`
 
-- **`semantic_search`**: Find declarations by **name, kind, or language** (functions, classes, structs, traits, enums, interfaces, types, constants). This matches real parsed declarations rather than raw string occurrences like grep, and returns each match's file path, line range, signature, and stable entity ID. Note: despite the name, this is a metadata matcher; it does **not** rank by vector similarity. Use it as your first step to find "the thing called X."
-- **`semantic_locate`**: Rank the code most relevant to a **natural-language** query using Kin's vector index, the same embedding-backed retrieval that powers `kin locate`. Use it when you only have a description of the behavior, not an exact symbol name. Supports `granularity` of `entity` (default) or `file`, reports `semantic_coverage` as the counter object, and requires the running daemon. Each hit carries its inline source once: on `body` for the fused pipeline (the default, `routing: "fused-v1"`) and on `snippet` for the cosine pipeline. Multi-query fan-out echoes the variants once under `queries`, and a hit names the ones that surfaced it by position in `matched_variant_indexes`.
+- **`semantic_search`** (served as **`find_declarations`** on `agent-default`): Find declarations by **name, kind, or language** (functions, classes, structs, traits, enums, interfaces, types, constants). This matches real parsed declarations rather than raw string occurrences like grep, and returns each match's file path, line range, signature, and stable entity ID. Note: despite the name, this is a metadata matcher; it does **not** rank by vector similarity. Use it as your first step to find "the thing called X."
+- **`semantic_locate`**: Rank the code most relevant to a **natural-language** query using Kin's vector index, the same embedding-backed retrieval that powers `kin locate`. Use it when you only have a description of the behavior, not an exact symbol name. Supports `granularity` of `entity` (default) or `file`, reports `semantic_coverage` as the counter object, and requires the running daemon. Each hit carries its inline source once: on `body` for the fused pipeline (the default, `routing: "fused-v1"`) and on `snippet` for the cosine pipeline. Multi-query fan-out echoes the variants once under `queries`, and a hit names the ones that surfaced it by position in `matched_variant_indexes`. **The `agent-default` belt asks for a compact response shape** at entity granularity: per hit `id`, `name`, `kind`, `file`, `line`, `signature` and `score`, plus the ranked file paths, `total_ranked`, `next_cursor`, `all_fallback`, a `ranked_by` clause, and the `semantic_coverage` object the `_kin` envelope carries. The shared `kin locate --json` schema described above stays the default on the wire and on every other profile, because this payload deserializes straight back into that type and a consumer needs one parser across all three locate surfaces. Pass `surface: "compact"` to ask for the small shape yourself, or `surface: "full"` on the belt to opt back out. Two arguments force the shared schema whatever else is set: `explain: true`, since every field an explanation adds lives on it, and an explicit `include_snippet: true`, since that asks for source text per hit and the compact shape carries none. File granularity is always full, because there the file roll-up is the answer. The compact default exists because the full shape spends most of its bytes on the back-compat `files[].symbols` roll-up of entities `entities` already carries: on a 730-entity store a twelve-hit page is 38,819 bytes full and 3,472 compact.
 - **`list_file_entities`**: Enumerate every entity the graph holds for one repository-relative file. This is the enumeration surface, and it is the one to reach for when the question is "what is in this file" rather than "what is most relevant to this query". `semantic_search` and `semantic_locate` both return a bounded set they cannot certify, so a short answer and a whole one read identically; this one reports `total_in_file` on every page and says whether the set is complete. Completeness rests on the file's own parse record rather than on store-wide health: `file_coverage.parsed` is `full` only when a language adapter parsed the file completely, and `_kin.completeness` and `negative.safe_to_conclude_absent` follow that fact. A path the graph does not track is refused by name instead of answered with an empty list, because a caller cannot tell those two answers apart and only one of them means the file holds no entities. Large files page through `next_cursor`.
 - **`get_entity`**: Fetch metadata about a specific entity (kind, language, path, line range, signature) without its source body.
 - **`get_entity_source` / `get_entity_body`**: Retrieve the implementation source of an entity, served from the graph.
 - **`get_entity_sources`**: The batch form of `get_entity_source`. Hand it up to 50 entity IDs in priority order and it returns each entity's metadata plus its body in one budgeted call, which replaces the N separate round-trips and N response envelopes those reads would otherwise cost. Bodies fill in the order you list the IDs until the shared `token_budget` is reached, and entities past that point come back signature-only with `omitted=true`.
-- **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle. The two directions come back as separate named groups: `dependencies` is what the focal needs to run, `dependents` is what breaks if you change it, and every row carries a `relation` saying which way its edge points.
+- **`get_context_pack`**: Package a target entity alongside its caller/import neighborhood into a single prompt-friendly bundle. The two directions come back as separate named groups: `dependencies` is what the focal needs to run, `dependents` is what breaks if you change it, and every row carries a `relation` saying which way its edge points. A question that names several things takes several focals: pass `entities` with their names or ids (a name with twins can pin the one it means, `Name@file`, `Name@file:line`, `Name#Kind`), or pass `question` and let Kin's ranking pick them, which needs the running daemon because that is where the ranking lives. That shape carries every focal, the graph route between connected focals before either focal's neighborhood, and each neighborhood water-filled into what remains, and it returns `method` (one sentence naming each focal, how it resolved and what it contributed), `routes`, `route_search.bounded` (true when a search stopped at its bound, so an absent route is not evidence there is none), and `measured_tokens`, which is never above `token_budget` because rows are dropped until it is not.
 - **`explore_codebase`**: Get a one-shot map of the codebase via a selectable strategy (e.g. `overview`: entity counts by kind and language, plus the top public declarations).
 - **`graph_neighborhood`**: Return the dependency neighborhood of an entity, traversed to a given depth. The neighborhood covers what it depends on and what depends on it. `direction` selects which side to walk: `out` for dependencies, `in` for dependents (blast radius), `both` (default) for the merged neighborhood; every returned edge is tagged with the direction it was traversed in.
 
@@ -197,10 +219,11 @@ reported rather than served as a confident answer.
 ---
 
 ## 2. Tracing & References
-*Tools:* `trace_computation`, `trace_data_flow`, `find_references`, `bulk_check_references`, `entity_history`
+*Tools:* `trace_computation`, `trace_data_flow`, `trace_path`, `find_references`, `bulk_check_references`, `entity_history`
 
 - **`trace_computation`**: Get a focal entity together with its control-/data-flow neighborhood in one structured response (a flat snapshot, not an ordered walk). The response carries its body plus callers, callees, and imports.
 - **`trace_data_flow`**: Walk the directional call/data-flow chain rooted at a focal entity and return it as an ordered list of steps (the path-walk counterpart to `trace_computation`'s flat neighborhood).
+- **`trace_path`**: The route between two named entities, for the question "how does A reach B" that no single-rooted walk answers. It resolves both ends (by exact name, entity id, or `name@file` to pin a twin; a qualified name that matches nothing takes its bare leaf when that is unique and is refused with the candidates listed when it is not), searches breadth-first over call, instantiation, reference, import and include edges, and returns up to `limit` shortest routes, every hop carrying its kind, file, line, the relation into the next hop and the syntax lines that produced it. A class stands for its members, so a route between two classes runs through the methods that carry it, and those containment hops are shown. `direction` defaults to `either`: forward (A reaches B) is tried first and the answer says which sense held. No route is explicit rather than plausible: `found: false`, `routes: []`, a `gap` naming what stopped the walk and how much of the graph it explored, and the same-name twin count on each end; the `negative` and `_kin.verdict` beside it say whether the absence can be trusted. In the `agent-default` profile.
 - **`find_references`**: Find all entities that import, call, or reference a target symbol. One row is one referencing entity, so two callers in one file are two rows, and `total_upstream` counts those entities, the same unit `kin refs` prints. The `counts` object names the unit and adds the file and reference-site totals beside it. A row's `reference_lines` gives the lines inside that caller which reference the target, and names why under `reference_lines_absent_reason` when the graph does not carry them. Rows omit the caller's body by default; pass `include_snippets=true` for it.
 - **`bulk_check_references`**: Classify many entities by reachability in one call.
 - **`entity_history`**: Retrieve version changes scoped to a specific entity.

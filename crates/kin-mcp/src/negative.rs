@@ -63,6 +63,8 @@ pub const NEGATIVE_KEY: &str = "negative";
 /// The file-enumeration tool, named once here so the spec, the gate and the
 /// dependency declaration below cannot drift from the registry that serves it.
 const FILE_ENTITIES_TOOL: &str = crate::handlers::file_entities::TOOL_NAME;
+/// The route query, named from the handler that defines it for the same reason.
+const TRACE_PATH_TOOL: &str = crate::handlers::path::TOOL_NAME;
 
 /// Why a file enumeration cannot be certified as the file's whole entity set,
 /// or `None` when nothing stops it.
@@ -268,6 +270,17 @@ fn spec_for(tool: &str) -> Option<RetrievalSpec> {
             always: false,
             class: NegativeClass::Structural,
         },
+        // The route query. Its empty answer is the sharpest absence a graph
+        // walk can claim, "A never reaches B", and it rests on the same typed
+        // reference edges the walkers above read, so it is gated by the same
+        // coverage facts plus the two-ended resolution gaps `path_gaps` adds.
+        TRACE_PATH_TOOL => RetrievalSpec {
+            field: "routes",
+            kind: "no_route",
+            subject: "no route was found between the two entities that were named",
+            always: false,
+            class: NegativeClass::Structural,
+        },
         // Bare-array payloads (wrapped under `result` by the annotator).
         "dead_code" => RetrievalSpec {
             field: "",
@@ -369,7 +382,9 @@ pub(crate) fn absence_cross_file_classes(tool: &str, payload: &Value) -> Vec<Str
                     .collect()
             })
             .unwrap_or_else(reference_classes),
-        "trace_data_flow" | "impact_analysis" | "get_context_pack" => reference_classes(),
+        "trace_data_flow" | "impact_analysis" | "get_context_pack" | TRACE_PATH_TOOL => {
+            reference_classes()
+        }
         _ => Vec::new(),
     }
 }
@@ -410,6 +425,7 @@ fn absence_is_language_scoped(tool: &str) -> bool {
             | "find_dead_code_seeded"
             | "graph_neighborhood"
             | "get_context_pack"
+            | TRACE_PATH_TOOL
     )
 }
 
@@ -2558,6 +2574,16 @@ pub fn negative_for(
         }
     }
 
+    // A route has two ends and a bound, and each is a way an empty answer can
+    // be true of something other than what was asked: a twin that was never
+    // walked, or a depth the walk stopped at before its frontier emptied.
+    if tool == TRACE_PATH_TOOL {
+        let gaps = path_gaps(payload);
+        if !gaps.is_empty() {
+            push_gap(&mut trustworthy, &mut trust_reason, gaps.join("; "));
+        }
+    }
+
     // The payload's own `degradations[]` is a report about THIS query, and the
     // verdict has to consume it or contradict it. A page that names an active
     // degradation beside a negative claiming none is the shape this whole
@@ -2680,6 +2706,58 @@ pub fn negative_for(
 /// see them at all: there is no payload to count, and the response used to
 /// arrive as a bare `{"message": ...}` with the envelope but no negative beside
 /// it, which is the one shape an agent cannot calibrate.
+/// Every reason an empty route set is unsafe to read as "A never reaches B",
+/// in a stable order.
+///
+/// The walker publishes both ends with `addressed_by` and the count of entities
+/// carrying the same exact name. An end the caller pinned (by id or by file)
+/// was chosen by the caller and is no gap whatever the count says; an end the
+/// ranking chose among several is, because the walk ran from one twin and the
+/// others were never seeds or goals. The stop reason is the other half: a walk
+/// that emptied its frontier explored everything reachable inside `max_depth`,
+/// while one that stopped at the bound or at a work ceiling did not.
+fn path_gaps(payload: &Value) -> Vec<String> {
+    let mut gaps = Vec::new();
+    for which in ["from", "to"] {
+        let end = payload.get(which).unwrap_or(&Value::Null);
+        let pinned = matches!(
+            end.get("addressed_by").and_then(Value::as_str),
+            Some("entity_id") | Some("name_and_file")
+        );
+        match end.get("same_name_candidates").and_then(Value::as_u64) {
+            None => gaps.push(format!(
+                "{which}_resolution_unreported: this answer did not report how many entities its \
+                 '{which}' end could have been resolved from, so an empty route set may describe \
+                 a same-named sibling rather than the entity that was asked about"
+            )),
+            Some(candidates) if candidates > 1 && !pinned => gaps.push(format!(
+                "{which}_ambiguous: {candidates} entities carry the name '{}' and the walk used one \
+                 of them, so no route from or to the others was looked for; pin the one you mean \
+                 with name@file or its entity id",
+                end.get("name").and_then(Value::as_str).unwrap_or("?")
+            )),
+            _ => {}
+        }
+    }
+    match payload
+        .get("gap")
+        .and_then(|gap| gap.get("reason"))
+        .and_then(Value::as_str)
+    {
+        Some("depth_bound") => gaps.push(
+            "walk_depth_bounded: the walk stopped at max_depth before its frontier emptied, so a \
+             longer route may exist; raise max_depth"
+                .to_string(),
+        ),
+        Some(reason @ ("edge_ceiling" | "time_budget" | "cancelled")) => gaps.push(format!(
+            "walk_bounded: the walk stopped at its {reason} before its frontier emptied, so a route \
+             may exist beyond what was explored"
+        )),
+        _ => {}
+    }
+    gaps
+}
+
 fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
     match tool {
         // The review family's files mode resolves each named path to the
@@ -2699,6 +2777,10 @@ fn resolution_miss_spec(tool: &str) -> Option<(&'static str, &'static str)> {
         "trace_data_flow" => Some((
             "focal_not_resolved",
             "the focal that was asked about could not be resolved, so no data-flow chain was walked",
+        )),
+        TRACE_PATH_TOOL => Some((
+            "endpoint_not_resolved",
+            "one of the two entities that were named could not be resolved, so no route was walked",
         )),
         // An unknown id and an entity with no recorded history are the same
         // shape on this tool's success path — change_count 0, latest_change
@@ -7268,5 +7350,78 @@ mod tests {
         let gap = absence_coverage_gap("trace_data_flow", &unlinked)
             .expect("a graph holding no cross-file calls cannot complete a call chain");
         assert!(gap.starts_with("cross_file_edges_absent"), "{gap}");
+    }
+
+    /// A route query's empty answer is a claim about two names. A twin the
+    /// ranking chose among makes it inconclusive; a twin the caller pinned by
+    /// file does not, because the caller chose.
+    #[test]
+    fn a_no_route_answer_across_an_unpinned_twin_is_inconclusive() {
+        let payload = json!({
+            "from": {"name": "run", "addressed_by": "name", "same_name_candidates": 2},
+            "to": {"name": "target", "addressed_by": "name", "same_name_candidates": 1},
+            "found": false,
+            "routes": [],
+            "routes_total": 0,
+            "gap": {"reason": "frontier_exhausted", "detail": "", "remediation": ""},
+            "degradations": [],
+        });
+        let negative = negative_for(
+            crate::handlers::path::TOOL_NAME,
+            &payload,
+            &structural_ready_envelope(),
+        )
+        .expect("a route query is negative-capable");
+        assert_eq!(negative["kind"], json!("no_route"));
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("from_ambiguous"), "{reason}");
+        assert!(!reason.contains("to_ambiguous"), "{reason}");
+
+        let mut pinned = payload.clone();
+        pinned["from"]["addressed_by"] = json!("name_and_file");
+        let negative = negative_for(
+            crate::handlers::path::TOOL_NAME,
+            &pinned,
+            &structural_ready_envelope(),
+        )
+        .unwrap();
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(!reason.contains("from_ambiguous"), "{reason}");
+    }
+
+    /// A walk that stopped at its depth bound did not explore the graph it
+    /// claims nothing about, and the verdict says so.
+    #[test]
+    fn a_depth_bounded_no_route_answer_is_inconclusive() {
+        let payload = json!({
+            "from": {"name": "a", "addressed_by": "entity_id", "same_name_candidates": 1},
+            "to": {"name": "b", "addressed_by": "entity_id", "same_name_candidates": 1},
+            "found": false,
+            "routes": [],
+            "routes_total": 0,
+            "gap": {"reason": "depth_bound", "detail": "", "remediation": ""},
+            "degradations": [],
+        });
+        let negative = negative_for(
+            crate::handlers::path::TOOL_NAME,
+            &payload,
+            &structural_ready_envelope(),
+        )
+        .unwrap();
+        assert_eq!(negative["safe_to_conclude_absent"], json!(false));
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(reason.contains("walk_depth_bounded"), "{reason}");
+
+        let mut exhausted = payload.clone();
+        exhausted["gap"]["reason"] = json!("frontier_exhausted");
+        let negative = negative_for(
+            crate::handlers::path::TOOL_NAME,
+            &exhausted,
+            &structural_ready_envelope(),
+        )
+        .unwrap();
+        let reason = negative["trust_reason"].as_str().unwrap();
+        assert!(!reason.contains("walk_depth_bounded"), "{reason}");
     }
 }

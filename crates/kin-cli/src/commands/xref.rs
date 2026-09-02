@@ -20,11 +20,20 @@ pub struct XrefResponse {
     /// authority, revision, roots, and anchor information at this boundary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spine: Option<::kin_spine::SpineXrefResponse>,
+    /// Set when the query resolved to no entity, so a caller reading the exit
+    /// code is not handed guidance as though it were an anchor listing
+    /// (FIR-3071). The same text stays in `lines` for an older client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 pub async fn run(entity: String) -> Result<()> {
     let layout = crate::commands::require_repository_layout()?;
     let response = run_daemon_xref(&layout, &XrefRequest { entity }).await?;
+    // Refuse before printing, so a miss leaves stdout empty.
+    if let Some(error) = response.error {
+        anyhow::bail!(error);
+    }
     for line in response.lines {
         println!("{line}");
     }
@@ -61,13 +70,34 @@ pub async fn build_xref_response(
     let matches = graph.query_entities(&filter)?;
 
     if matches.is_empty() {
+        let lines = xref_not_found_guidance(&request.entity);
         return Ok(XrefResponse {
-            lines: xref_not_found_guidance(&request.entity),
+            error: Some(lines.join("\n")),
+            lines,
             spine: None,
         });
     }
 
-    let target = &matches[0];
+    // Not `&matches[0]`. The graph returns name matches in an order decided at
+    // ingest, so taking the first made `kin xref` answer about whichever twin
+    // the store happened to list first, the same defect `kin trace` carried:
+    // six stores built from one tree split three and three on which of
+    // `buffer_grow`'s two entities came first (FIR-3071). `select_best_match`
+    // ranks by name quality and breaks its ties on facts read off the entity
+    // record, so the answer is a property of the candidates.
+    let target = match kin_core::select_best_match(&request.entity, &matches, |entity, hint| {
+        kin_core::normalize_symbol_hint(&entity.name).contains(hint)
+    }) {
+        Some(target) => target,
+        None => {
+            let lines = xref_not_found_guidance(&request.entity);
+            return Ok(XrefResponse {
+                error: Some(lines.join("\n")),
+                lines,
+                spine: None,
+            });
+        }
+    };
     let mut lines = vec![format!(
         "Cross-repo references (xrefs) for '{}':",
         target.name
@@ -106,7 +136,11 @@ pub async fn build_xref_response(
         spine = Some(response);
     }
 
-    Ok(XrefResponse { lines, spine })
+    Ok(XrefResponse {
+        lines,
+        spine,
+        error: None,
+    })
 }
 
 fn spine_xref_lines(
@@ -314,6 +348,7 @@ mod tests {
         let response = XrefResponse {
             lines: vec!["partial".to_string()],
             spine: Some(kin_spine::SpineXrefResponse::new(Vec::new(), Vec::new())),
+            error: None,
         };
         let encoded = serde_json::to_vec(&response).unwrap();
         let decoded: XrefResponse = serde_json::from_slice(&encoded).unwrap();
@@ -321,6 +356,93 @@ mod tests {
         assert!(!spine.authority_complete);
         assert!(spine.authority_revision.is_none());
         assert!(spine.authority_roots.is_empty());
+    }
+
+    /// A miss has to be readable as a miss by a caller that only checks the exit
+    /// code. The prose stays in `lines` for an older client; the discriminator
+    /// beside it is what makes `kin xref` refuse (FIR-3071).
+    /// The same store-order defect `kin trace` carried, on the other command
+    /// that resolved a name to a listing position.
+    ///
+    /// Asserting only that two insertion orders agree would prove nothing here:
+    /// the store returns name matches sorted by entity id, so insertion order
+    /// never reaches the caller and such a test passes with the defect in place.
+    /// It has to assert WHICH twin is chosen. The header's declaration sorts
+    /// first by id (a9988b12 against b477cab2), so `matches.first()` answers
+    /// about the declaration while the ranked choice answers about the
+    /// definition, and the spine anchor is where that choice is observable.
+    #[tokio::test]
+    async fn xref_resolves_the_definition_rather_than_the_first_listed_twin() {
+        fn twin(file: &str, signature: &str, line: u32) -> Entity {
+            let file_id = FilePathId::new(file);
+            let mut e = entity("buffer_grow");
+            e.id = EntityId::from_content(&file_id.0, "buffer_grow", "Function", line);
+            e.signature = signature.to_string();
+            e.file_origin = Some(file_id);
+            e
+        }
+        let declaration = twin("src/buffer.h", "int buffer_grow(buf_t *b, size_t need);", 5);
+        let definition = twin("src/buffer.c", "int buffer_grow(buf_t *b, size_t need)", 5);
+        assert!(
+            declaration.id < definition.id,
+            "fixture precondition: the declaration must sort first, or this test cannot catch \
+             a resolver that takes the first listed match"
+        );
+
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&declaration).unwrap();
+        graph.upsert_entity(&definition).unwrap();
+        let root = graph_root(&graph);
+
+        let spine = kin_spine::InMemorySpineBackend::new();
+        spine.register_repo(
+            "repo",
+            vec![entry("repo", &declaration), entry("repo", &definition)],
+            &root,
+        );
+        spine.refresh_cross_repo_edges("repo", &[], &[], &["repo".to_string()]);
+
+        let response = build_xref_response(
+            &graph,
+            &XrefRequest {
+                entity: "buffer_grow".to_string(),
+            },
+            "repo",
+            &root,
+            Some(&spine),
+        )
+        .await
+        .expect("xref response");
+
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let payload = response.spine.expect("typed spine response");
+        assert!(
+            payload.authority_complete_for("repo", &definition.id),
+            "xref answered about the twin the store listed first, not the definition"
+        );
+    }
+
+    #[tokio::test]
+    async fn xref_miss_carries_the_discriminator_and_not_just_the_prose() {
+        let graph = kin_db::InMemoryGraph::new();
+        graph.upsert_entity(&entity("target")).unwrap();
+        let root = graph_root(&graph);
+
+        let response = build_xref_response(
+            &graph,
+            &XrefRequest {
+                entity: "definitelyMissingEntity".to_string(),
+            },
+            "repo",
+            &root,
+            None::<&dyn kin_spine::SpineBackend>,
+        )
+        .await
+        .unwrap();
+
+        let joined = response.lines.join("\n");
+        assert!(joined.contains("not found"), "{joined}");
+        assert_eq!(response.error.as_deref(), Some(joined.as_str()));
     }
 
     #[tokio::test]

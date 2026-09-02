@@ -84,3 +84,11 @@ KIN_CLOCKHALF_COMMITS
 KIN_CLOCKHALF_FILES
 KIN_CLOCKHALF_FLAT
 KIN_CLOCKHALF_CHURN
+
+# kin-db storage/repository.rs: the two inputs to its FIR-3064 open-cost
+# harness, a `#[cfg(test)] mod fir3064_open_cost` whose only test is `#[ignore]`d
+# because it opens a real on-disk store by hand to read the resident set after
+# each step of a daemon startup. Same shape as the FIR-2334 pair above, and
+# nothing in a kin process reads either name.
+KIN_FIR3064_STORE
+KIN_FIR3064_REPO

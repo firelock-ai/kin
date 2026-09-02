@@ -1963,6 +1963,7 @@ fn api_routes() -> Router<Arc<DaemonState>> {
         .route("/commands/dead-code", post(command_dead_code))
         .route("/commands/dead-code-seeded", post(command_dead_code_seeded))
         .route("/commands/trace-data-flow", post(command_trace_data_flow))
+        .route("/commands/path", post(command_path))
         .route("/commands/refs", post(command_refs))
         .route("/commands/bulk-refs", post(command_bulk_refs))
         .route("/commands/xref", post(command_xref))
@@ -4972,6 +4973,95 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// POST /commands/path: the shortest routes from one entity to another over the
+/// relation graph, the query `kin path` and the `trace_path` MCP tool share.
+///
+/// Reads no bodies, so it opens no repository authority: every hop is identity
+/// and location, and the walk runs off the runtime under the same cancel-on-drop
+/// seam as trace-data-flow. The answer carries the `_kin` envelope and its
+/// negative, so a client that prints `found: false` prints the verdict beside it
+/// and the CLI's JSON is byte-for-byte the MCP tool's payload.
+async fn command_path(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+    Json(request): Json<kin_mcp::handlers::path::PathRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if !state
+        .is_initialized
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon not fully initialized".to_string(),
+        ));
+    }
+    let session_id = extract_session_id_from_headers(&headers)?;
+    let graph = resolve_session_graph(&state, session_id.as_ref()).await;
+    let cancel = kin_mcp::handlers::path::PathCancel::new();
+    let _abandon = PathCancelOnDrop(cancel.clone());
+    let budget = kin_mcp::handlers::path::PathBudget::cancellable(cancel);
+    let outcome = tokio::task::spawn_blocking(move || {
+        kin_mcp::handlers::path::build_path_response_within(graph.as_ref(), &request, budget)
+    })
+    .await
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("path worker failed: {error}"),
+        )
+    })?;
+    let response = match outcome {
+        Ok(response) => response,
+        Err(error) => return Err(path_refusal(error)),
+    };
+    let envelope = kin_mcp::Envelope::daemon().with_health(&daemon_health_snapshot(&state).await);
+    let text = serde_json::to_string(&response)
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let finalized = kin_mcp::finalize_with_envelope(
+        kin_mcp::ToolCallResult::text(text),
+        envelope,
+        kin_mcp::handlers::path::TOOL_NAME,
+    );
+    let payload = finalized
+        .content
+        .into_iter()
+        .find_map(|block| {
+            let kin_mcp::ContentBlock::Text { text } = block;
+            serde_json::from_str::<serde_json::Value>(&text).ok()
+        })
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "path response could not be annotated".to_string(),
+            )
+        })?;
+    Ok(Json(payload))
+}
+
+/// An end that did not resolve is the caller's to fix, and says so with 422
+/// rather than hiding behind a 500 the client would retry.
+fn path_refusal(error: kin_mcp::handlers::path::PathError) -> (StatusCode, String) {
+    use kin_mcp::handlers::path::PathError;
+    let status = match &error {
+        PathError::InvalidRequest(_) => StatusCode::BAD_REQUEST,
+        PathError::EndpointNotFound { .. } | PathError::EndpointAmbiguous { .. } => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+        PathError::Graph(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, error.to_string())
+}
+
+/// Cancels the route walk when the request future is dropped, for the reason
+/// [`CancelOnDrop`] does the same for a trace.
+struct PathCancelOnDrop(kin_mcp::handlers::path::PathCancel);
+
+impl Drop for PathCancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// POST /commands/refs — render incoming references from daemon-owned graph state.
 async fn command_refs(
     headers: axum::http::HeaderMap,
@@ -7948,6 +8038,95 @@ async fn search(
     Ok(Json(result))
 }
 
+/// Turn a `get_context_pack` call's names and question into focal entities
+/// before the pack builder sees it.
+///
+/// The identity resolver lives in kin-cli, which kin-mcp cannot reach, so this
+/// is where a name becomes an entity. Names are resolved first and in the
+/// caller's order, because a name is a stronger claim than a ranking's
+/// suggestion, and each resolved entry carries how it was resolved so the
+/// pack's method line can still say.
+///
+/// Leaves an argument in place when nothing resolved it, so the builder refuses
+/// over it. That is deliberate: a name the graph does not carry and a name
+/// nobody tried to resolve are different failures, and quietly dropping the
+/// field would report the first as the second.
+fn resolve_context_pack_focals(
+    graph: &kin_db::InMemoryGraph,
+    arguments: &HashMap<String, serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
+    let mut arguments = arguments.clone();
+    let limit = arguments
+        .get("max_focals")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(kin_cli::commands::context::QUESTION_FOCAL_MAX as u64)
+        .clamp(1, 32) as usize;
+    let mut focals: Vec<serde_json::Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+
+    let named: Vec<String> = arguments
+        .get("entities")
+        .and_then(serde_json::Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    for token in &named {
+        let Ok(Some(entry)) = kin_cli::commands::context::resolve_focal_for_mcp(graph, token)
+        else {
+            continue;
+        };
+        let id = entry
+            .get("entity_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if id.is_empty() || seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
+        focals.push(entry);
+    }
+    if !named.is_empty() && !focals.is_empty() {
+        arguments.remove("entities");
+    }
+
+    let question = arguments
+        .get("question")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    if let Some(question) = question {
+        if let Ok((ranked, coverage)) =
+            kin_cli::commands::context::question_focals(graph, &question, limit)
+        {
+            arguments.insert("coverage".to_string(), json!(coverage));
+            for hit in ranked {
+                if focals.len() >= limit || seen.contains(&hit.entity_id) {
+                    continue;
+                }
+                seen.push(hit.entity_id.clone());
+                focals.push(json!({
+                    "entity_id": hit.entity_id,
+                    "score": hit.score,
+                    "route": "question",
+                }));
+            }
+            if !focals.is_empty() {
+                arguments.remove("question");
+            }
+        }
+    }
+
+    if !focals.is_empty() {
+        focals.truncate(limit);
+        arguments.insert("question_focals".to_string(), json!(focals));
+    }
+    arguments
+}
+
 /// POST /context — build context packs against daemon-owned graph state.
 async fn context(
     headers: axum::http::HeaderMap,
@@ -10352,6 +10531,135 @@ fn build_semantic_locate_result(
     )
 }
 
+/// Which locate shape this `semantic_locate` call gets.
+///
+/// Compact unless the caller asked for something only the full shape carries.
+/// Three things count as asking, in order:
+///
+/// 1. An explicit `surface`, which wins outright.
+/// 2. `explain: true`, because every field an explanation adds (`match_evidence`
+///    and the per-signal and per-stage breakdowns) lives on the shape compact
+///    drops.
+/// 3. An EXPLICIT `include_snippet: true`, because that argument asks for source
+///    text per hit and compact carries none. Keyed on the caller having written
+///    it rather than on the resolved value, since `include_snippet` defaults to
+///    true: reading the resolved value would send every default call to the full
+///    shape and there would be no compact surface at all.
+///
+/// The third rule is the one this got wrong first. Compact took precedence over
+/// an explicit `include_snippet: true` and dropped the bodies anyway, which is a
+/// silent refusal of a request the caller stated: the argument was accepted,
+/// bodies were hydrated, and the payload came back without them. A
+/// `distinct_query_tools_share_one_authority_load_per_publication` non-vacuity
+/// guard caught it, and it was right to.
+///
+/// An unrecognized `surface` value takes the default rather than erroring. This
+/// argument narrows a response, and refusing the whole call over a misspelling
+/// would turn a formatting preference into a failed retrieval.
+fn fused_locate_surface(
+    arguments: &HashMap<String, serde_json::Value>,
+    explain: bool,
+) -> kin_cli::commands::locate_compact::LocateSurface {
+    use kin_cli::commands::locate_compact::LocateSurface;
+    // An explanation outranks an explicit compact, because every field it adds
+    // lives on the shape compact drops: honouring both would serve a response
+    // that answered neither request.
+    if explain {
+        return LocateSurface::Full;
+    }
+    // An explicit snippet request outranks an explicit `surface`, and the order
+    // is the whole point. Compact carries no source text, so honouring
+    // `surface: "compact"` beside `include_snippet: true` would accept a request
+    // for source and answer without it. That is the silent refusal a
+    // `distinct_query_tools_share_one_authority_load_per_publication` guard
+    // already caught once here.
+    //
+    // The order also keeps the rule REACHABLE. Below the `surface` check it
+    // could only fire when no surface was named, where the default is Full
+    // anyway, so it could never change an outcome: a check that cannot fail.
+    // Above it, it is what stops the `agent-default` belt's injected
+    // `surface: "compact"` from dropping bodies an agent explicitly asked for.
+    let asked_for_snippets = arguments
+        .get("include_snippet")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if asked_for_snippets {
+        return LocateSurface::Full;
+    }
+    if let Some(named) = arguments
+        .get("surface")
+        .and_then(serde_json::Value::as_str)
+        .and_then(LocateSurface::parse)
+    {
+        return named;
+    }
+    // Full is the default ON THE WIRE, and that is a contract rather than a
+    // preference: `mcp_semantic_locate_fused_payload_round_trips_into_locate_schema`
+    // deserializes this payload straight back into `LocateResult`, so a consumer
+    // needs one parser across `kin locate --json`, `POST /locate` and this tool.
+    // Two more tests guard the same invariant from other angles.
+    //
+    // The compact shape is therefore opt-in here, and the `agent-default` belt
+    // opts in on behalf of the agents it serves: `kin-mcp`'s tools/call injects
+    // `surface: "compact"` when that profile is active and the caller named no
+    // surface. An agent gets the small payload, and every consumer parsing the
+    // shared schema keeps getting it.
+    LocateSurface::Full
+}
+
+/// Serialize a fused entity ranking onto the compact agent surface: per hit the
+/// graph id, name, kind, file, line, signature and score, plus the ranked file
+/// paths, `total_ranked`, `next_cursor`, `all_fallback`, the `ranked_by` clause
+/// and the `semantic_coverage` object.
+///
+/// The four keys the rest of the MCP layer reads a locate payload by are written
+/// here explicitly, for the same reason the full builder writes them: `query`,
+/// `granularity`, `routing` and `page`. `budget`'s primary-collection detection
+/// keys on `granularity`, `routing` and the presence of `entities`, and
+/// `negative`'s ranking check reads `all_fallback` and `total_ranked` from the
+/// top level, so a compact response is classified by exactly the logic a full
+/// one is.
+///
+/// `semantic_coverage` rides at the top level unchanged rather than being
+/// summarized, because `kin-mcp`'s envelope builder lifts that object into the
+/// `_kin` it attaches. Summarizing it here would empty the envelope's coverage
+/// block, which is the one thing this surface exists to make visible.
+///
+/// Serialized compactly. The full builder pretty-prints, and on this store the
+/// indentation alone is roughly a third of the bytes; a surface whose reason to
+/// exist is fitting a tool budget should not spend a third of it on whitespace.
+fn compact_semantic_locate_payload(
+    result: &kin_cli::commands::locate::LocateResult,
+    query: &str,
+) -> kin_mcp::ToolCallResult {
+    let compact = kin_cli::commands::locate_compact::project_for_mcp(result);
+    let mut payload = match serde_json::to_value(&compact) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(_) => {
+            return kin_mcp::ToolCallResult::error(
+                "compact locate result did not serialize to a JSON object".to_string(),
+            );
+        }
+        Err(error) => return kin_mcp::ToolCallResult::error(error.to_string()),
+    };
+    payload.insert("query".to_string(), json!(query));
+    payload.insert("granularity".to_string(), json!("entity"));
+    payload.insert("routing".to_string(), json!("fused-v1"));
+    payload.insert("page".to_string(), json!(result.page));
+    payload.insert("surface".to_string(), json!("compact"));
+    // `entities` states itself even when empty, for the reason the full builder
+    // does: the one page that most needs to read as empty must not ship a
+    // `files` list as its first present array and be read as a file answer.
+    payload
+        .entry("entities".to_string())
+        .or_insert_with(|| json!([]));
+    payload.insert("total_ranked".to_string(), json!(result.total_ranked));
+    match serde_json::to_string(&serde_json::Value::Object(payload)) {
+        Ok(text) => kin_mcp::ToolCallResult::text(text),
+        Err(error) => kin_mcp::ToolCallResult::error(error.to_string()),
+    }
+}
+
 /// Serialize a fused-locate [`LocateResult`] into the `semantic_locate` tool
 /// result. The body is the SAME schema `kin locate --json` and `POST /locate`
 /// emit — the reused `LocateResult` types verbatim: `files[].symbols[]`, the
@@ -10380,6 +10688,7 @@ fn fused_semantic_locate_payload(
     query: &str,
     file_granularity: bool,
     snippet_alias: bool,
+    surface: kin_cli::commands::locate_compact::LocateSurface,
 ) -> kin_mcp::ToolCallResult {
     if file_granularity {
         // `all_fallback` classifies entity-name evidence. A file-granularity
@@ -10394,6 +10703,24 @@ fn fused_semantic_locate_payload(
         });
     } else if result.all_fallback {
         kin_cli::commands::locate::record_description_query_guidance(&mut result.degradations);
+    }
+    // The compact agent surface, and the reason it is the default.
+    //
+    // The full shape below is one schema shared with `kin locate --json` and
+    // `POST /locate`, and it is the right answer for a consumer that parses all
+    // three. It is the wrong answer for the caller this tool actually has. On
+    // the 730-entity hiredis store a fused entity page serializes 38,819 bytes
+    // at twelve results, 69 percent of it the back-compat `files[].symbols`
+    // roll-up of entities the `entities[]` block already carries; the same page
+    // through this projection is 3,472. On the live VS Code runs of 2026-09-01
+    // three of five tool results were cut to a 1,500-token budget and the model
+    // spent three of its five calls re-locating.
+    //
+    // Entity granularity only. A file-granularity answer IS the file roll-up,
+    // and this projection reduces `files` to paths, so compacting it would
+    // delete the answer rather than the packaging.
+    if !file_granularity && surface == kin_cli::commands::locate_compact::LocateSurface::Compact {
+        return compact_semantic_locate_payload(&result, query);
     }
     // The variant list every hit indexes, serialized ONCE per response. Seeded
     // from the fused echo the `LocateResult` already carries, then extended with
@@ -10682,6 +11009,13 @@ async fn build_fused_semantic_locate_result(
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
     let explain = fused_explanation_requested(arguments);
+    // Compact is the default. `surface: "full"` restores the shared
+    // `kin locate --json` schema for a consumer that parses all three locate
+    // surfaces with one parser. An explain request implies full, because every
+    // field explain adds (`match_evidence`, per-signal and per-stage breakdowns)
+    // lives on the shape compact drops: taking `explain: true` and answering
+    // with a surface that carries no explanation would be a silent refusal.
+    let surface = fused_locate_surface(arguments, explain);
 
     // `entities[]` is the graph-native surface this tool answers with, so it is
     // projected either way. Only the body text follows `include_snippet`. The
@@ -10886,6 +11220,10 @@ async fn build_fused_semantic_locate_result(
                     &cached_query,
                     cached_file_granularity,
                     cached_snippet_alias,
+                    // The surface is a property of THIS call, not of the cached
+                    // ranking a cursor pages. A caller that asked for the full
+                    // shape on page two gets it whichever page zero asked for.
+                    surface,
                 ));
             }
         }
@@ -11072,6 +11410,7 @@ async fn build_fused_semantic_locate_result(
         &query,
         file_granularity,
         snippet_alias,
+        surface,
     ))
 }
 
@@ -12138,6 +12477,10 @@ fn validate_repo_scoped_tool_arguments(
                     "compact",
                     "max_chars",
                     "max_response_chars",
+                    // Which response shape this call gets: "compact" (the
+                    // default agent surface) or "full" (the shared
+                    // `kin locate --json` schema).
+                    "surface",
                 ],
             )?;
             let cursor = match arguments.get("cursor") {
@@ -12740,8 +13083,14 @@ fn hosted_trace_data_flow_result(
 async fn mcp_tools_call(
     headers: axum::http::HeaderMap,
     State(state): State<Arc<DaemonState>>,
-    Json(request): Json<McpToolCallRequest>,
+    Json(mut request): Json<McpToolCallRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    // Resolve a served alias to the registered name before anything keyed on a
+    // tool name reads it. `agent-default` serves the declaration filter as
+    // `find_declarations`, because `semantic_search` does not search
+    // semantically; the dispatcher, the budget shape and the negative spec all
+    // stay keyed on the registered name. Every other name passes through.
+    kin_mcp::agent_belt::canonicalize_tool_name(&mut request.name);
     let budget =
         kin_mcp::budget::ResponseBudget::from_arguments(&request.arguments).less_envelope_reserve();
     let tool = request.name.clone();
@@ -13429,7 +13778,40 @@ async fn mcp_tools_call_inner(
         ))
     } else {
         let repository_authority = mcp_repository_authority_source(&state);
-        let handled = if request.name == "find_references" {
+        let handled = if request.name == "get_context_pack"
+            && (request
+                .arguments
+                .get("question")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|question| !question.trim().is_empty())
+                || request
+                    .arguments
+                    .get("entities")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|entities| !entities.is_empty()))
+        {
+            // The identity resolver and the ranking live in kin-cli, the pack
+            // builder in kin-mcp, and this is the one layer holding all three.
+            // Names and questions are both turned into focal entities here, so
+            // the builder is handed entities rather than being asked to resolve
+            // or to rank, and so either argument reaching the builder still raw
+            // means what it means everywhere else: no daemon.
+            match repository_authority {
+                Ok(repository_authority) => {
+                    let arguments = resolve_context_pack_focals(graph.as_ref(), &request.arguments);
+                    kin_mcp::handlers::handle_tool_call(
+                        &request.name,
+                        &arguments,
+                        graph.as_ref(),
+                        &sessions,
+                        kin_mcp::SessionAuthorityMode::OfflineFallback,
+                        repository_authority.as_ref(),
+                    )
+                    .await
+                }
+                Err(error) => Err(error),
+            }
+        } else if request.name == "find_references" {
             mcp_find_references_with_stable_authority(
                 &state,
                 session_id.as_ref(),
@@ -19575,6 +19957,413 @@ mod tests {
         );
     }
 
+    /// A fixture standing in for one ranked page: the shape the compact tests
+    /// below measure against.
+    fn compact_surface_fixture(hits: usize) -> kin_cli::commands::locate::LocateResult {
+        use kin_cli::commands::locate::{
+            EmbeddingState, LocateEntity, LocateFileEntry, LocateProvenance, LocateResult,
+            LocateSymbol, SemanticCoverage,
+        };
+        let symbol = |index: usize| LocateSymbol {
+            name: format!("redisAsyncHandleWrite{index}"),
+            span: Some([256, 301]),
+            score: 570.908_43,
+            kind: "function".into(),
+            definition: true,
+            origin: "text".into(),
+            cosine: None,
+            snippet: Some("static int redisAsyncHandleWrite(...) { /* body */ }".into()),
+        };
+        LocateResult {
+            entities: (0..hits)
+                .map(|index| LocateEntity {
+                    entity_id: format!("11111111-2222-3333-4444-5555555555{index:02}"),
+                    id_space: kin_cli::commands::locate::LocateIdSpace::Entity,
+                    artifact_path: None,
+                    kind: "function".into(),
+                    name: format!("redisAsyncHandleWrite{index}"),
+                    signature: format!(
+                        "static int redisAsyncHandleWrite{index}(redisAsyncContext *ac, int flags)"
+                    ),
+                    score: 570.908_43,
+                    definition: true,
+                    span: Some([256, 301]),
+                    body: Some(
+                        "static int redisAsyncHandleWrite(redisAsyncContext *ac) {\n    \
+                         /* several lines of body that the compact surface drops */\n}"
+                            .into(),
+                    ),
+                    match_kind: Some(kin_cli::commands::locate::LocateMatchKind::TextFallback),
+                    provenance: LocateProvenance {
+                        file: Some("async.c".into()),
+                        origin: "text".into(),
+                        cosine: None,
+                    },
+                    matched_queries: Vec::new(),
+                })
+                .collect(),
+            files: (0..hits)
+                .map(|index| LocateFileEntry {
+                    path: format!("src/async{index}.c"),
+                    score: 12.5,
+                    signals: vec!["text".into()],
+                    spans: vec![[1, 40]],
+                    // The block this whole change is about: 69 percent of a real
+                    // payload.
+                    symbols: (0..6).map(symbol).collect(),
+                    explain: vec!["a per-file explain line".into()],
+                    provenance: None,
+                    signal_scores: None,
+                    score_breakdown: None,
+                    matched_queries: Vec::new(),
+                })
+                .collect(),
+            total_ranked: 41,
+            semantic_coverage: Some(SemanticCoverage {
+                supported: true,
+                indexed: 0,
+                total: 1460,
+                pending: 1460,
+                complete: false,
+                embedding_state: EmbeddingState::Absent,
+                limited_by: vec!["embeddings_incomplete".into()],
+                read_at: None,
+                note: Some("semantic signal absent".into()),
+                graph_bodies: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn compact_payload_json(hits: usize) -> serde_json::Value {
+        let tool = fused_semantic_locate_payload(
+            compact_surface_fixture(hits),
+            "how does the async connection callback handle a write error",
+            false,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Compact,
+        );
+        serde_json::from_str(
+            tool_result_json(&tool)["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap()
+    }
+
+    /// The size cut, stated as a ratio against the full shape of the same
+    /// fixture rather than as a bare ceiling. A ceiling with no baseline beside
+    /// it passes just as happily when the projection stops projecting.
+    #[test]
+    fn the_compact_surface_is_a_fraction_of_the_full_one() {
+        let query = "how does the async connection callback handle a write error";
+        let full = mcp_result_text(&fused_semantic_locate_payload(
+            compact_surface_fixture(12),
+            query,
+            false,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Full,
+        ))
+        .len();
+        let compact = mcp_result_text(&fused_semantic_locate_payload(
+            compact_surface_fixture(12),
+            query,
+            false,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Compact,
+        ))
+        .len();
+        assert!(
+            full > compact * 4,
+            "the compact surface must be well under a quarter of the full one: \
+             full {full}, compact {compact}"
+        );
+        assert!(
+            compact < 4096,
+            "twelve compact hits must stay under 4 KB; got {compact}"
+        );
+    }
+
+    /// Compact is what a caller gets without asking, and `surface: "full"` is
+    /// how it opts back out. This is the default flip the whole change is.
+    /// The dispatcher holds its arguments as a map, so the test builds one
+    /// rather than a `Value`: a helper that reshaped the input would be testing
+    /// a shape this function never receives.
+    fn tool_arguments(value: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        value
+            .as_object()
+            .expect("tool arguments are a JSON object")
+            .iter()
+            .map(|(key, val)| (key.clone(), val.clone()))
+            .collect()
+    }
+
+    /// The shared schema is the default ON THE WIRE, and compact is opt-in.
+    ///
+    /// This is the direction the three schema-parity tests require: the fused
+    /// payload deserializes straight back into `LocateResult`, so narrowing it
+    /// by default would break every consumer that parses the shared shape. The
+    /// `agent-default` belt opts in on its agents' behalf in `kin-mcp`.
+    #[test]
+    fn the_wire_default_is_the_shared_schema_and_compact_is_opt_in() {
+        use kin_cli::commands::locate_compact::LocateSurface;
+        let args = tool_arguments(json!({"query": "q"}));
+        assert_eq!(
+            fused_locate_surface(&args, false),
+            LocateSurface::Full,
+            "saying nothing must get the schema every other locate surface serves"
+        );
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"surface": "compact"})), false),
+            LocateSurface::Compact,
+            "and naming compact must get it"
+        );
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"surface": "full"})), false),
+            LocateSurface::Full
+        );
+        // An explanation only the full shape can carry implies the full shape,
+        // even when the caller also asked for compact.
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"surface": "compact"})), true),
+            LocateSurface::Full
+        );
+        // A misspelling narrows nothing rather than failing the retrieval.
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"surface": "entities"})), false),
+            LocateSurface::Full
+        );
+    }
+
+    /// A caller that explicitly asks for source text gets the shape that carries
+    /// it, rather than the argument being accepted and quietly dropped.
+    ///
+    /// Keyed on the caller having WRITTEN `include_snippet`, not on its resolved
+    /// value, because it defaults to true: reading the resolved value would send
+    /// every default call to the full shape and leave no compact surface at all.
+    /// The second assertion is what pins that difference, and it is the one that
+    /// fails if someone "simplifies" this to read the effective value.
+    /// A caller that explicitly asks for source text gets the shape that carries
+    /// it, even against an explicit `surface: "compact"`.
+    ///
+    /// The third case is the one that matters and the reason this rule sits
+    /// ABOVE the surface check. The `agent-default` belt injects
+    /// `surface: "compact"`, so without this an agent that asked for snippets
+    /// would have the argument accepted, the bodies hydrated, and a payload
+    /// returned without them. Below the surface check the rule would also be
+    /// unreachable, since the default is Full anyway.
+    #[test]
+    fn an_explicit_snippet_request_gets_the_shape_that_carries_snippets() {
+        use kin_cli::commands::locate_compact::LocateSurface;
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"include_snippet": true})), false),
+            LocateSurface::Full,
+            "an explicit snippet request must not be silently dropped"
+        );
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"query": "q"})), false),
+            LocateSurface::Full,
+            "and saying nothing gets the shared schema every locate surface serves"
+        );
+        assert_eq!(
+            fused_locate_surface(
+                &tool_arguments(json!({"include_snippet": true, "surface": "compact"})),
+                false
+            ),
+            LocateSurface::Full,
+            "a request for source outranks a request for a shape that has none, \
+             or the belt's injected compact silently drops what an agent asked for"
+        );
+        // The control on the other side: without the snippet request, an
+        // explicit compact is honoured. Otherwise the rule above would be
+        // swallowing every compact request rather than the contradictory ones.
+        assert_eq!(
+            fused_locate_surface(&tool_arguments(json!({"surface": "compact"})), false),
+            LocateSurface::Compact,
+            "an uncontradicted compact request must still be honoured"
+        );
+        // Asking for NO snippets is not a reason to widen the response.
+        assert_eq!(
+            fused_locate_surface(
+                &tool_arguments(json!({"include_snippet": false, "surface": "compact"})),
+                false
+            ),
+            LocateSurface::Compact
+        );
+    }
+
+    /// The keys the rest of the MCP layer classifies a locate payload by have to
+    /// be on a compact response too, or the budget ladder and the negative logic
+    /// read it as some other tool's answer.
+    #[test]
+    fn the_compact_payload_keeps_every_key_the_mcp_layer_reads() {
+        let payload = compact_payload_json(3);
+        assert_eq!(payload["granularity"], "entity");
+        assert_eq!(payload["routing"], "fused-v1");
+        assert_eq!(payload["surface"], "compact");
+        assert_eq!(payload["total_ranked"], 41);
+        assert_eq!(payload["page"], 0);
+        assert!(payload["entities"].is_array());
+        assert!(
+            payload["query"]
+                .as_str()
+                .is_some_and(|q| q.contains("write error")),
+            "the query echo must survive"
+        );
+        // The envelope builder lifts this object into `_kin`; summarizing it
+        // here would empty the envelope's coverage block.
+        assert_eq!(payload["semantic_coverage"]["embedding_state"], "absent");
+        assert_eq!(payload["semantic_coverage"]["indexed"], 0);
+        assert_eq!(payload["semantic_coverage"]["total"], 1460);
+        // And no second envelope beside the one kin-mcp attaches.
+        assert!(payload.get("_kin").is_none(), "{payload}");
+    }
+
+    /// The claim this whole surface rests on, asserted against the real
+    /// classifier rather than against my reading of it.
+    ///
+    /// Every other test here checks that the compact payload CARRIES the keys
+    /// the MCP layer classifies a locate response by. None of them checks that
+    /// the layer then reaches the right answer, and that is the assertion the
+    /// change actually depends on: `budget::primary_collection_for` decides
+    /// which collection a response answers with, and `negative` reads its count
+    /// from that same rule. If a compact response classified as a FILE answer,
+    /// the budget ladder would strip the wrong block and an empty page would be
+    /// read as a file result rather than as "nothing found".
+    ///
+    /// Run against the actual function, on a payload built by the actual
+    /// builder, so a change to either side breaks it.
+    #[test]
+    fn the_mcp_layer_classifies_a_compact_payload_as_an_entity_answer() {
+        let payload = compact_payload_json(3);
+        assert_eq!(
+            kin_mcp::budget::primary_collection_for(&payload, "semantic_locate"),
+            Some("entities"),
+            "a compact response must classify as an entity answer: {payload}"
+        );
+
+        // And an EMPTY compact page, which is the case that used to be read as a
+        // file answer because `files` was the first present array.
+        let empty = compact_payload_json(0);
+        assert_eq!(
+            kin_mcp::budget::primary_collection_for(&empty, "semantic_locate"),
+            Some("entities"),
+            "an empty compact page must still classify as an entity answer: {empty}"
+        );
+
+        // The control: the full shape of the same fixture classifies identically,
+        // so this is testing the compact projection rather than a rule that
+        // answers `entities` for everything.
+        let full: serde_json::Value = serde_json::from_str(
+            tool_result_json(&fused_semantic_locate_payload(
+                compact_surface_fixture(3),
+                "q",
+                false,
+                false,
+                kin_cli::commands::locate_compact::LocateSurface::Full,
+            ))["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            kin_mcp::budget::primary_collection_for(&full, "semantic_locate"),
+            Some("entities"),
+            "the full shape must classify the same way, or this proves nothing"
+        );
+
+        // The other control: a FILE-granularity answer must classify as `files`,
+        // so the rule is reading the payload rather than returning a constant.
+        let file_answer: serde_json::Value = serde_json::from_str(
+            tool_result_json(&fused_semantic_locate_payload(
+                compact_surface_fixture(3),
+                "q",
+                true,
+                false,
+                kin_cli::commands::locate_compact::LocateSurface::Compact,
+            ))["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            kin_mcp::budget::primary_collection_for(&file_answer, "semantic_locate"),
+            Some("files"),
+            "a file answer must still classify as a file answer"
+        );
+    }
+
+    /// An empty compact page must still state `entities`, for the reason the
+    /// full builder states it: a `files` list read as the first present array is
+    /// how an empty entity answer became a file answer.
+    #[test]
+    fn an_empty_compact_page_still_states_its_primary_collection() {
+        let payload = compact_payload_json(0);
+        assert_eq!(payload["entities"], json!([]));
+    }
+
+    /// What the compact surface drops, asserted on the bytes rather than the
+    /// struct: the back-compat symbol roll-up, the per-hit bodies, and the
+    /// per-file explain prose.
+    #[test]
+    fn the_compact_payload_drops_the_back_compat_rollup() {
+        let text = mcp_result_text(&fused_semantic_locate_payload(
+            compact_surface_fixture(6),
+            "q",
+            false,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Compact,
+        ));
+        for gone in [
+            "symbols",
+            "several lines of body",
+            "a per-file explain line",
+        ] {
+            assert!(!text.contains(gone), "compact still carries {gone}: {text}");
+        }
+        // The control: the same fixture through the full surface carries all
+        // three, so the assertions above are testing the projection and not a
+        // fixture that never had them.
+        let full = mcp_result_text(&fused_semantic_locate_payload(
+            compact_surface_fixture(6),
+            "q",
+            false,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Full,
+        ));
+        for present in [
+            "symbols",
+            "several lines of body",
+            "a per-file explain line",
+        ] {
+            assert!(full.contains(present), "the full control lost {present}");
+        }
+    }
+
+    /// A file-granularity answer IS the file roll-up, so compact must not touch
+    /// it: reducing `files` to paths there deletes the answer.
+    #[test]
+    fn file_granularity_ignores_the_compact_request() {
+        let tool = fused_semantic_locate_payload(
+            compact_surface_fixture(3),
+            "q",
+            true,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Compact,
+        );
+        let payload: serde_json::Value = serde_json::from_str(
+            tool_result_json(&tool)["content"][0]["text"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["granularity"], "file");
+        assert!(
+            payload["files"][0]["symbols"].is_array(),
+            "file granularity keeps its symbols: {payload}"
+        );
+    }
+
     #[test]
     fn fused_payload_attaches_match_evidence_additively_and_in_order() {
         use kin_cli::commands::locate::{LocateEntity, LocateProvenance, LocateResult};
@@ -19601,7 +20390,13 @@ mod tests {
             entities: vec![mk("a", "alpha"), mk("b", "beta")],
             ..Default::default()
         };
-        let tool = fused_semantic_locate_payload(result, "alpha", false, false);
+        let tool = fused_semantic_locate_payload(
+            result,
+            "alpha",
+            false,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Full,
+        );
         let payload: serde_json::Value = serde_json::from_str(
             tool_result_json(&tool)["content"][0]["text"]
                 .as_str()
@@ -19646,7 +20441,13 @@ mod tests {
         query: &str,
         snippet_alias: bool,
     ) -> serde_json::Value {
-        let tool = fused_semantic_locate_payload(result, query, false, snippet_alias);
+        let tool = fused_semantic_locate_payload(
+            result,
+            query,
+            false,
+            snippet_alias,
+            kin_cli::commands::locate_compact::LocateSurface::Full,
+        );
         serde_json::from_str(
             tool_result_json(&tool)["content"][0]["text"]
                 .as_str()
@@ -48777,6 +49578,7 @@ mod tests {
             "where HTTP redirects are actually resolved and followed",
             false,
             false,
+            kin_cli::commands::locate_compact::LocateSurface::Full,
         ));
         assert!(
             unbounded.len() > kin_mcp::budget::RESPONSE_DEFAULT_MAX_CHARS,
@@ -48793,6 +49595,7 @@ mod tests {
                 "where HTTP redirects are actually resolved and followed",
                 false,
                 false,
+                kin_cli::commands::locate_compact::LocateSurface::Full,
             ),
             "semantic_locate",
             &budget,
@@ -49027,7 +49830,13 @@ mod tests {
             ..Default::default()
         };
         kin_cli::commands::locate::record_description_query_guidance(&mut result.degradations);
-        let tool = fused_semantic_locate_payload(result, "where is config read", true, false);
+        let tool = fused_semantic_locate_payload(
+            result,
+            "where is config read",
+            true,
+            false,
+            kin_cli::commands::locate_compact::LocateSurface::Full,
+        );
         let payload: serde_json::Value = serde_json::from_str(
             tool_result_json(&tool)["content"][0]["text"]
                 .as_str()
@@ -49596,6 +50405,7 @@ mod tests {
                 query,
                 false,
                 false,
+                kin_cli::commands::locate_compact::LocateSurface::Full,
             ))
             .len();
             let two = mcp_result_text(&fused_semantic_locate_payload(
@@ -49603,6 +50413,7 @@ mod tests {
                 query,
                 false,
                 false,
+                kin_cli::commands::locate_compact::LocateSurface::Full,
             ))
             .len();
             two.saturating_sub(one).max(1)
@@ -49615,10 +50426,17 @@ mod tests {
                 query,
                 false,
                 snippet_alias,
+                kin_cli::commands::locate_compact::LocateSurface::Full,
             ))
             .len();
             let bounded = mcp_result_text(&bound_mcp_tool_result(
-                fused_semantic_locate_payload(make_result(hit_count), query, false, snippet_alias),
+                fused_semantic_locate_payload(
+                    make_result(hit_count),
+                    query,
+                    false,
+                    snippet_alias,
+                    kin_cli::commands::locate_compact::LocateSurface::Full,
+                ),
                 "semantic_locate",
                 &budget,
             ));

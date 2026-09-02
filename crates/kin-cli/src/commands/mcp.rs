@@ -83,6 +83,7 @@ pub async fn start(
                 .collect::<HashSet<_>>(),
         );
     }
+    config.agent_belt = resolved_profile.profile.is_agent_belt();
 
     let startup = kin_mcp::StartupDaemonBinding::new();
 
@@ -262,6 +263,18 @@ impl McpToolProfile {
             Self::ContextBench => Some(kin_mcp::context_bench_tool_names()),
             Self::Full => None,
         }
+    }
+
+    /// Whether this profile IS the curated agent belt: short descriptions,
+    /// trimmed input schemas, and the compact `semantic_locate` shape.
+    ///
+    /// `agent-default` only. `full` is the whole documented surface by
+    /// definition. `benchmark` and `context-bench` keep the long forms and the
+    /// shared payload because their bytes are an input to a citable result, and
+    /// a benchmark number must not move because a description was rewritten or a
+    /// payload was narrowed.
+    pub(crate) fn is_agent_belt(self) -> bool {
+        matches!(self, Self::AgentDefault)
     }
 
     pub(crate) fn token(self) -> &'static str {
