@@ -1112,6 +1112,7 @@ jobs:
         run: |
           bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
+          python3 scripts/test-release-tag-evaluate-dispatch.py
           python3 scripts/test-select-release-candidate.py
           python3 scripts/test-guard-duplicate-release-run.py
           node --test \
@@ -1684,6 +1685,7 @@ jobs:
         run: |
           bash scripts/release-policy-gate.sh <<'RELEASE_POLICY'
           python3 scripts/test-release-workflow-authority.py
+          python3 scripts/test-release-tag-evaluate-dispatch.py
           python3 scripts/test-select-release-candidate.py
           python3 scripts/test-guard-duplicate-release-run.py
           node --test \
